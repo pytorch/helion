@@ -25,6 +25,7 @@ from torch.fx.node import map_arg
 from ... import exc
 from ...language import _tracing_ops
 from ...language import creation_ops
+from ...language import inline_asm_ops
 from ...language import matmul_ops
 from ...language import memory_ops
 from ...language import scan_ops
@@ -38,6 +39,7 @@ from ..device_ir import HelperFunctionGraphInfo
 from ..device_ir import IfGraphInfo
 from ..device_ir import control_flow_parent_entries
 from ..host_function import HostFunction
+from ..indexing_strategy import SubscriptIndexing
 from ..inductor_lowering import GenerateASTFromInductor
 from ..inductor_lowering import PointwiseLowering
 from ..inductor_lowering import ReductionLowering
@@ -45,6 +47,7 @@ from ..inductor_lowering import SympyExprLowering
 from ..inductor_lowering import install_inductor_kernel_handlers
 from ..matmul_utils import _compute_out_dtype
 from ..matmul_utils import _needs_f32_accumulator
+from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
@@ -176,19 +179,50 @@ class FragmentCompiler:
             ],
         ]
 
+    def configured_expr(self, value: sympy.Basic) -> sympy.Basic:
+        """Resolve logical dimensions using their owning block, not aliases.
+
+        Reduction blocks can reuse a tile symbol or have a derived full-axis
+        extent. Fragment roots own their iteration/reduction geometry, so a
+        reduction's logical numel is required rather than a padded tracing hint.
+        Runtime symbols with no block-size origin remain symbolic.
+        """
+        origins = HostFunction.current().expr_to_origin
+
+        def resolve(expr: sympy.Basic, visiting: frozenset[sympy.Basic]) -> sympy.Basic:
+            substitutions = {}
+            for symbol in expr.free_symbols:
+                info = origins.get(symbol)
+                if info is None or not isinstance(info.origin, BlockSizeOrigin):
+                    continue
+                if symbol in visiting:
+                    raise exc.InvalidConfig(
+                        f"cyclic computed fragment block-size extent: {symbol}"
+                    )
+                block = self.env.block_sizes[info.origin.block_id]
+                replacement = (
+                    block.numel
+                    if block.reduction
+                    else self.df.resolved_block_size(block.block_id)
+                )
+                if replacement is None:
+                    continue
+                if isinstance(replacement, torch.SymInt):
+                    replacement = replacement._sympy_()
+                substitutions[symbol] = resolve(
+                    sympy.sympify(replacement), visiting | {symbol}
+                )
+            return expr.xreplace(substitutions)
+
+        return resolve(value, frozenset())
+
     def extent(self, value: object) -> int:
         if isinstance(value, int):
             return value
         if isinstance(value, torch.SymInt):
             value = value._sympy_()
         assert isinstance(value, sympy.Expr)
-        value = value.xreplace(
-            {
-                bs.var._sympy_(): self.df.resolved_block_size(bs.block_id)
-                for bs in self.env.block_sizes
-                if bs.var._sympy_() in value.free_symbols
-            }
-        )
+        value = self.configured_expr(value)
         value = self.env.specialize_expr(sympy.sympify(value))
         if not value.is_number:
             raise exc.InvalidConfig(
@@ -205,15 +239,7 @@ class FragmentCompiler:
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
         if isinstance(value, sympy.Basic):
-            value = sympy.sympify(
-                value.xreplace(
-                    {
-                        bs.var._sympy_(): self.df.resolved_block_size(bs.block_id)
-                        for bs in self.env.block_sizes
-                        if bs.var._sympy_() in value.free_symbols
-                    }
-                )
-            )
+            value = sympy.sympify(self.configured_expr(value))
 
             def symbol_expression(symbol: sympy.Symbol) -> str:
                 if symbol in self.sym_indices:
@@ -369,16 +395,48 @@ class FragmentCompiler:
 
     def memory(self, node: Node, values: dict[Node, object], store: bool) -> object:
         tensor = values[cast("Node", node.args[0])]
-        assert isinstance(tensor, HostTensor)
         indices = cast("list[object]", node.args[1])
         output = (
-            cast("torch.Tensor", cast("Node", node.args[2]).meta["val"])
+            cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
             if store
             else cast("torch.Tensor", node.meta["val"])
         )
-        shape = self.shape(output.shape)
+        # A scalar or broadcast value does not describe the indexed write
+        # domain. Use the same destination shape rule as fake tensor loads.
+        shape = self.shape(
+            SubscriptIndexing.compute_shape(
+                output,
+                [
+                    index.meta["val"] if isinstance(index, Node) else index
+                    for index in indices
+                ],
+            )
+            if store
+            else output.shape
+        )
         extra_mask = node.args[3] if store else node.args[2]
         mask_value = values[extra_mask] if isinstance(extra_mask, Node) else extra_mask
+        if isinstance(tensor, Fragment):
+            if (
+                store
+                or extra_mask is not None
+                or node.args[3] is not None
+                or any(index is not None and index != slice(None) for index in indices)
+            ):
+                raise exc.BackendUnsupported("cute", "computed fragment indexed memory")
+
+            def view(coords: tuple[str, ...]) -> str:
+                selected = tuple(
+                    coord
+                    for coord, index in zip(coords, indices, strict=False)
+                    if index is not None
+                )
+                return tensor.read((*selected, *coords[len(indices) :]))
+
+            return Fragment(
+                shape, output.dtype, view, tensor.resident, dependencies=(tensor,)
+            )
+        assert isinstance(tensor, HostTensor)
 
         def address(coords: tuple[str, ...]) -> tuple[str, str]:
             position = 0
@@ -441,13 +499,17 @@ class FragmentCompiler:
             ) or "True"
 
         if store:
-            value = values[cast("Node", node.args[2])]
-            assert isinstance(value, Fragment)
+            value = _resolve(node.args[2], values)
 
             def write(coords: tuple[str, ...]) -> None:
                 pointer, mask = address(coords)
+                stored = (
+                    value.broadcast(coords)
+                    if isinstance(value, Fragment)
+                    else self.scalar(value)
+                )
                 self.emit(
-                    f"if {mask}:\n    {pointer}.store({self.cast(value.read(coords), tensor.value.dtype)})"
+                    f"if {mask}:\n    {pointer}.store({self.cast(stored, tensor.value.dtype)})"
                 )
 
             self.elements(shape, write)
@@ -557,16 +619,29 @@ class FragmentCompiler:
         if isinstance(lowering, ReductionLowering):
             assert isinstance(lowering.buffer.data, Reduction)
             reduction_shape = self.shape(lowering.buffer.data.reduction_ranges)
+            indexed = lowering.reduction_type in ("argmin", "argmax")
+            value_dtype = lowering.buffer.data.src_dtype if indexed else fake.dtype
             compute_dtype = (
                 torch.float32
-                if fake.dtype in (torch.float16, torch.bfloat16)
-                else fake.dtype
+                if value_dtype in (torch.float16, torch.bfloat16)
+                else value_dtype
             )
 
             def reduce(coords: tuple[str, ...]) -> str:
-                total = self.df.new_var("fragment_sum")
+                reduction_type = lowering.reduction_type
+                total = self.df.new_var(f"fragment_{reduction_type}")
                 index = self.df.new_var("fragment_reduce_index")
-                self.emit(f"{total} = {self.cast('0', compute_dtype)}")
+                identity = (
+                    0
+                    if indexed
+                    else Reduction.default_accumulator(reduction_type, compute_dtype)
+                )
+                self.emit(
+                    f"{total} = {self.cast(self.scalar(identity), compute_dtype)}"
+                )
+                selected = self.df.new_var("fragment_selected_index") if indexed else ""
+                if indexed:
+                    self.emit(f"{selected} = {self.cast('0', fake.dtype)}")
                 loop = statement_from_string(
                     f"for {index} in range({math.prod(reduction_shape)}):\n    pass"
                 )
@@ -574,9 +649,35 @@ class FragmentCompiler:
                 loop.body.clear()
                 with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
                     value = element(coords, self.coordinates(index, reduction_shape))
-                    self.emit(f"{total} = {total} + {self.cast(value, compute_dtype)}")
+                    if indexed:
+                        value = self.cast(value, compute_dtype)
+                        compare = ">" if reduction_type == "argmax" else "<"
+                        better = f"({value}) {compare} {total}"
+                        if compute_dtype.is_floating_point:
+                            better = f"({better}) or (({value}) != ({value}) and {total} == {total})"
+                        # The increasing local reduction coordinate and strict
+                        # comparison preserve the first tie, including NaNs.
+                        self.emit(
+                            f"if {index} == 0 or ({better}):\n"
+                            f"    {total} = {value}\n"
+                            f"    {selected} = {self.cast(index, fake.dtype)}"
+                        )
+                    else:
+                        combined = self.env.backend.reduction_combine_expr(
+                            reduction_type, total, value, compute_dtype
+                        )
+                        if (
+                            reduction_type in ("min", "max")
+                            and compute_dtype.is_floating_point
+                        ):
+                            # Compare/select propagates an incoming NaN, but would
+                            # overwrite a NaN already encountered in this fold.
+                            combined = (
+                                f"{total} if {total} != {total} else ({combined})"
+                            )
+                        self.emit(f"{total} = {combined}")
                 self.cg.add_statement(loop)
-                return self.cast(total, fake.dtype)
+                return selected if indexed else self.cast(total, fake.dtype)
 
             return self.materialize(
                 Fragment(
@@ -679,9 +780,11 @@ class FragmentCompiler:
     def scan(self, node: Node, values: dict[Node, object]) -> Fragment:
         source = values[cast("Node", node.args[1])]
         assert isinstance(source, Fragment)
-        source = self.materialize(source)
         self.held.append(source)
-        result = self.allocate(source)
+        current = self.allocate(source)
+        self.held.append(current)
+        other = self.allocate(source)
+        self.held.append(other)
         dim = cast("int", node.args[2]) % len(source.shape)
         reverse = bool(node.args[3])
         fake = cast("torch.Tensor", node.meta["val"])
@@ -693,31 +796,52 @@ class FragmentCompiler:
             elif self.env.block_sizes[bid].reduction:
                 extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
 
-        def line(coords: tuple[str, ...]) -> None:
-            total = self.df.new_var("fragment_scan")
-            index = self.df.new_var("fragment_scan_index")
-            initialized = self.df.new_var("fragment_scan_initialized")
-            self.emit(f"{total} = {self.cast('0', source.dtype)}")
-            self.emit(f"{initialized} = False")
-            position = f"{source.shape[dim] - 1} - {index}" if reverse else index
-            location = (*coords[:dim], position, *coords[dim:])
-            value = source.read(location)
+        def initialize(coords: tuple[str, ...]) -> None:
             self.emit(
-                f"for {index} in range({source.shape[dim]}):\n"
-                f"    if ({position}) < ({extent}):\n"
-                f"        if {initialized}:\n"
-                f"            {total} = {self.cast(f'{total} + {value}', source.dtype)}\n"
-                f"        else:\n"
-                f"            {total} = {value}\n"
-                f"        {initialized} = True\n"
-                f"        {result.read(location)} = {total}\n"
-                f"    else:\n"
-                f"        {result.read(location)} = {self.cast('0', source.dtype)}"
+                f"if ({coords[dim]}) < ({extent}):\n"
+                f"    {current.read(coords)} = {self.cast(source.read(coords), source.dtype)}\n"
+                f"else:\n"
+                f"    {current.read(coords)} = {self.cast('0', source.dtype)}"
             )
 
-        self.elements((*source.shape[:dim], *source.shape[dim + 1 :]), line)
+        self.elements(source.shape, initialize)
+        # Every stage reads only the preceding stage. A CTA barrier follows
+        # each complete tile write, including when a thread owns several
+        # elements. Never overwrite the input: it may have other consumers.
+        for stage in range((source.shape[dim] - 1).bit_length()):
+            distance = 1 << stage
+
+            def combine(
+                coords: tuple[str, ...],
+                distance: int = distance,
+                current: Fragment = current,
+                other: Fragment = other,
+            ) -> None:
+                position = coords[dim]
+                neighbor = (
+                    f"({position}) + {distance}"
+                    if reverse
+                    else f"({position}) - {distance}"
+                )
+                in_range = (
+                    f"({neighbor}) < ({extent})" if reverse else f"({neighbor}) >= 0"
+                )
+                location = (*coords[:dim], neighbor, *coords[dim + 1 :])
+                left = current.read(location)
+                right = current.read(coords)
+                self.emit(
+                    f"if ({position}) < ({extent}) and ({in_range}):\n"
+                    f"    {other.read(coords)} = {self.cast(f'{left} + {right}', source.dtype)}\n"
+                    f"else:\n"
+                    f"    {other.read(coords)} = {right}"
+                )
+
+            self.elements(source.shape, combine)
+            current, other = other, current
         self.held.pop()
-        return result
+        self.held.pop()
+        self.held.pop()
+        return current
 
     def conditional(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
         info = self.cg.get_graph(cast("int", node.args[1]))
@@ -831,8 +955,46 @@ class FragmentCompiler:
             return self.dot(node, values)
         if target is scan_ops._associative_scan:
             return self.scan(node, values)
+        if target is inline_asm_ops.inline_asm_elementwise:
+            assert isinstance(fake, torch.Tensor)
+            asm, constraints, operands, dtype, _is_pure, _pack = args
+            assert isinstance(operands, (tuple, list))
+            fragments = tuple(cast("Fragment", operand) for operand in operands)
+
+            def inline_asm(coords: tuple[str, ...]) -> str:
+                inputs = ", ".join(
+                    self.cast(operand.broadcast(coords), operand.dtype)
+                    for operand in fragments
+                )
+                arguments = f"({inputs},)" if inputs else "()"
+                return (
+                    f"_cute_inline_asm_elementwise({arguments}, asm={asm!r}, "
+                    f"constraints={constraints!r}, dtype={self.dtype(fake.dtype)}, "
+                    "is_pure=True)"
+                )
+
+            # Opaque scalar programs may be expensive and can feed several
+            # consumers. Evaluate each logical element once before sharing it.
+            return self.materialize(
+                Fragment(
+                    self.shape(fake.shape),
+                    fake.dtype,
+                    inline_asm,
+                    dependencies=fragments,
+                )
+            )
         if target in (tile_ops.tile_begin, tile_ops.tile_end, tile_ops.tile_id):
             return fake
+        if target is tile_ops.tile_index:
+            assert isinstance(fake, torch.Tensor)
+            block_id = self.env.resolve_block_id(args[0])
+            assert block_id in self.offsets
+            offset = self.offsets[block_id]
+            return Fragment(
+                self.shape(fake.shape),
+                fake.dtype,
+                lambda coords: self.cast(f"({offset}) + ({coords[0]})", fake.dtype),
+            )
         if isinstance(node.meta["lowering"], (PointwiseLowering, ReductionLowering)):
             return self.pointwise(node, values)
         if not isinstance(fake, torch.Tensor):
@@ -840,10 +1002,15 @@ class FragmentCompiler:
         shape = self.shape(fake.shape)
         if target in (
             creation_ops.full,
+            torch.ops.aten.full.default,
             torch.ops.aten.scalar_tensor.default,
             _tracing_ops._constant_tensor,
         ):
-            value = args[1] if target is creation_ops.full else args[0]
+            value = (
+                args[1]
+                if target in (creation_ops.full, torch.ops.aten.full.default)
+                else args[0]
+            )
             return Fragment(
                 shape,
                 fake.dtype,
@@ -862,6 +1029,20 @@ class FragmentCompiler:
             )
         source = args[0]
         assert isinstance(source, Fragment)
+        if target is torch.ops.aten.alias.default:
+            return source
+        if target is torch.ops.aten.view.dtype:
+            # Equal-width reinterpretation retains element ownership. Round
+            # any widened arithmetic back to its declared dtype first.
+            return Fragment(
+                shape,
+                fake.dtype,
+                lambda coords: (
+                    f"{self.cast(source.read(coords), source.dtype)}"
+                    f".bitcast({self.dtype(fake.dtype)})"
+                ),
+                dependencies=(source,),
+            )
         if target is _tracing_ops._mask_to:
             source_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
 
@@ -1031,9 +1212,44 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     def needs_coordinates(node: Node) -> bool:
         if node.target is _tracing_ops._host_tensor:
             return False
+        if node.target in (
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten._unsafe_view.default,
+        ):
+            source = node.args[0]
+            assert isinstance(source, Node)
+            before = cast("torch.Tensor", source.meta["val"])
+            after = cast("torch.Tensor", node.meta["val"])
+            # Factoring a full static axis requires independent coordinates for
+            # every factor. A scalar recipe for its producer cannot represent
+            # both the original flat consumer and the factored consumer.
+            static_before = [
+                size for size in before.shape if isinstance(size, int) and size != 1
+            ]
+            static_after = [
+                size for size in after.shape if isinstance(size, int) and size != 1
+            ]
+            symbolic_before = [
+                size._sympy_()
+                for size in before.shape
+                if isinstance(size, torch.SymInt)
+            ]
+            symbolic_after = [
+                size._sympy_() for size in after.shape if isinstance(size, torch.SymInt)
+            ]
+            if (
+                static_before != static_after
+                and math.prod(static_before) == math.prod(static_after)
+                and symbolic_before == symbolic_after
+            ):
+                return True
         if node.target is scan_ops._associative_scan:
             source = node.args[1]
             return isinstance(source, Node) and computed(source)
+        if isinstance(node.meta.get("lowering"), ReductionLowering):
+            if any(reads_carry(source) for source in node.all_input_nodes):
+                return True
         value = node.meta.get("val")
         if isinstance(value, torch.Tensor) and node.target in (
             torch.ops.aten.gt.Tensor,
@@ -1098,11 +1314,14 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         memory_ops.store,
         matmul_ops.dot,
         scan_ops._associative_scan,
+        inline_asm_ops.inline_asm_elementwise,
         creation_ops.full,
+        torch.ops.aten.full.default,
         view_ops.subscript,
         tile_ops.tile_begin,
         tile_ops.tile_end,
         tile_ops.tile_id,
+        tile_ops.tile_index,
         operator.getitem,
         torch.ops.aten.sym_size.int,
         torch.ops.prims.iota.default,
@@ -1114,6 +1333,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         torch.ops.aten.reshape.default,
         torch.ops.aten._unsafe_view.default,
         torch.ops.aten.where.self,
+        torch.ops.aten.view.dtype,
+        torch.ops.aten.alias.default,
     }
     if any(
         node.op == "call_function"
@@ -1129,13 +1350,43 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     compiler = FragmentCompiler(cg)
     for info in graphs:
         for node in info.graph.nodes:
+            if node.target is torch.ops.aten.view.dtype:
+                source = cast("Node", node.args[0]).meta["val"]
+                target = node.meta["val"]
+                if (
+                    not isinstance(source, torch.Tensor)
+                    or not isinstance(target, torch.Tensor)
+                    or source.dtype == torch.bool
+                    or target.dtype == torch.bool
+                    or source.dtype.itemsize != target.dtype.itemsize
+                ):
+                    return False
+            if node.target is inline_asm_ops.inline_asm_elementwise:
+                if (
+                    node.args[4] is not True
+                    or node.args[5] != 1
+                    or not isinstance(node.args[3], torch.dtype)
+                    or not isinstance(node.meta.get("val"), torch.Tensor)
+                ):
+                    return False
             if node.target is scan_ops._associative_scan:
                 if node.args[4]:
                     return False
                 value = node.meta["val"]
                 if (
                     not isinstance(value, torch.Tensor)
-                    or value.dtype != torch.float32
+                    or value.dtype
+                    not in (
+                        torch.int8,
+                        torch.uint8,
+                        torch.int16,
+                        torch.int32,
+                        torch.int64,
+                        torch.float16,
+                        torch.bfloat16,
+                        torch.float32,
+                        torch.float64,
+                    )
                     or value.ndim == 0
                 ):
                     return False
@@ -1158,9 +1409,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 ):
                     return False
             lowering = node.meta.get("lowering")
-            if (
-                isinstance(lowering, ReductionLowering)
-                and lowering.reduction_type != "sum"
+            if isinstance(
+                lowering, ReductionLowering
+            ) and lowering.reduction_type not in (
+                "sum",
+                "max",
+                "min",
+                "prod",
+                "argmin",
+                "argmax",
             ):
                 return False
             if _tracing_ops.is_for_loop_target(node.target) and any(

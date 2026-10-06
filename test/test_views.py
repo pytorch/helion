@@ -770,6 +770,89 @@ class TestViews(RefEagerTestBase, TestCase):
                 "Expected bitcast to int16 via .to() or tl.cast()",
             )
 
+    @onlyBackends(["cute"])
+    @skipIfRefEager("checks generated numeric bitcasts")
+    def test_numeric_view_dtype_preserves_bits(self):
+        @helion.kernel(static_shapes=True)
+        def reinterpret(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+            out = torch.empty(x.shape, device=x.device, dtype=dtype)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile].view(dtype)
+            return out
+
+        for source, target in [
+            (torch.float16, torch.int16),
+            (torch.bfloat16, torch.int16),
+            (torch.float32, torch.int32),
+            (torch.float64, torch.int64),
+            (torch.int8, torch.uint8),
+            (torch.int32, torch.uint32),
+            (torch.int64, torch.uint64),
+        ]:
+            with self.subTest(source=source, target=target):
+                x = torch.arange(137, device=DEVICE).to(source)
+                if source.is_floating_point:
+                    x[:4] = torch.tensor(
+                        [float("inf"), -float("inf"), float("nan"), -0.0],
+                        device=DEVICE,
+                        dtype=source,
+                    )
+                code, actual = code_and_output(
+                    reinterpret, (x, target), block_sizes=[32]
+                )
+                self.assertNotIn("view_dtype_smem", code)
+                self.assertIn(".bitcast(", code)
+                self.assertTrue(
+                    torch.equal(actual.view(torch.uint8), x.view(torch.uint8))
+                )
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("checks declared dtype boundary")
+    def test_view_dtype_after_low_precision_arithmetic(self):
+        @helion.kernel(static_shapes=True)
+        def reinterpret(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape, device=x.device, dtype=torch.int16)
+            for tile in hl.tile(x.numel()):
+                values = x[tile] + 0.0078125
+                out[tile] = values.view(torch.int16)
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.linspace(0.5, 2, 137, device=DEVICE, dtype=dtype)
+                _, actual = code_and_output(reinterpret, (x,), block_sizes=[32])
+                self.assertTrue(torch.equal(actual, (x + 0.0078125).view(torch.int16)))
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("requires replicated physical thread axes")
+    def test_view_dtype_reduction_with_independent_output_axis(self):
+        @helion.kernel(static_shapes=True)
+        def count_bits(x: torch.Tensor, cutoff: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape, dtype=torch.int32, device=x.device)
+            for row in hl.tile(x.size(0)):
+                count = (
+                    (x[row, :].view(torch.int32) >= cutoff[row, None])
+                    .to(torch.int32)
+                    .sum(-1)
+                )
+                for col in hl.tile(x.size(1)):
+                    bits = x[row, col].view(torch.int32)
+                    out[row, col] = count[:, None] + (bits & 15)
+            return out
+
+        x = torch.rand((17, 64), device=DEVICE)
+        cutoff = x[:, 0].contiguous().view(torch.int32)
+        code, actual = code_and_output(
+            count_bits,
+            (x, cutoff),
+            block_sizes=[8, 32],
+            reduction_loops=[4],
+        )
+        bits = x.view(torch.int32)
+        expected = (bits >= cutoff[:, None]).sum(-1)[:, None] + (bits & 15)
+        self.assertNotIn("view_dtype_smem", code)
+        torch.testing.assert_close(actual, expected.to(torch.int32), rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
