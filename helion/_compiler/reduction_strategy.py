@@ -3717,8 +3717,21 @@ class BlockReductionStrategy(ReductionStrategy):
         group_span: int,
         group_count: int,
     ) -> str:
-        result_var = self.fn.new_var("strided_reduce_result", dce=True)
+        from .cute.integer_loop_reduction import defer_collective
+
         cluster_n = self._lane_reduce_cluster_n()
+        if cluster_n == 1 and defer_collective(
+            state,
+            block=self.block_index,
+            operation=reduction_type,
+            dtype=acc_dtype,
+            identity=identity_expr,
+            pre=pre,
+            span=group_span,
+            groups=group_count,
+        ):
+            return input_name
+        result_var = self.fn.new_var("strided_reduce_result", dce=True)
         if cluster_n > 1 and pre == 1 and group_count == 1:
             # The reduced axis is additionally split across the CTAs of a
             # thread-block cluster (``cute_cluster_n``): combine within-CTA
