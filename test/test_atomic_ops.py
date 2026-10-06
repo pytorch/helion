@@ -11559,3 +11559,586 @@ class TestCompletedLocalIndexedReadSemanticsCPU(unittest.TestCase):
                         mode,
                     ),
                 )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_uniform_local_histogram(x, lengths, out, totals, bins: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        column = hl.arange(helion.next_power_of_2(x.size(1)))
+        if lengths[row] > 2:
+            histogram = hl.zeros([bins], dtype=x.dtype)
+            value = hl.load(x, [row, column], extra_mask=column < x.size(1))
+            contribution = torch.where(column < lengths[row], value, 0)
+            hl.atomic_add(histogram, [column % bins], contribution)
+            total = histogram.sum()
+            hl.store(
+                out, [row, column], total + column * 0, extra_mask=column < x.size(1)
+            )
+        else:
+            other = hl.full([3], 1, dtype=x.dtype)
+            hl.atomic_add(
+                other,
+                [column % 3],
+                torch.where(column < lengths[row], 2, 0).to(x.dtype),
+            )
+            short = other.sum()
+            hl.store(
+                out, [row, column], short + column * 0, extra_mask=column < x.size(1)
+            )
+        # A second lexical epoch follows the join. It cannot borrow a pending
+        # update or leave a predicate reader live in a reused physical buffer.
+        final = hl.zeros([1], dtype=torch.int32)
+        hl.atomic_add(final, [column * 0], (column < lengths[row]).to(torch.int32))
+        totals[row] = final.sum()
+    return out, totals
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_uniform_local_rejected(x, lengths, out, mode: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        column = hl.arange(x.size(1))
+        if mode == "vector":
+            condition = x[row, :] > 0
+        elif mode == "singleton":
+            condition = x[row, :1] > 0
+        else:
+            condition = lengths[row] > 2
+        if mode == "captured":
+            parent = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(parent, [column % 17], x[row, :])
+        if condition:
+            local = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(local, [column % 17], x[row, :])
+            if mode == "read_before_update":
+                value = local.sum()
+                hl.atomic_add(local, [column % 17], x[row, :])
+                out[row, :] = value
+            elif mode == "captured":
+                hl.atomic_add(parent, [column % 17], x[row, :])
+                out[row, :] = parent.sum() + local.sum()
+            elif mode == "nested":
+                if lengths[row] > 3:
+                    out[row, :] = local.sum()
+            elif mode == "escape":
+                value = local
+            else:
+                out[row, :] = local.sum()
+        else:
+            if mode == "escape":
+                value = hl.zeros([17], dtype=torch.int32)
+            out[row, :] = -1
+        if mode == "escape":
+            out[row, :] = value
+    return out
+
+
+class TestFragmentUniformLocalBranchesCPU(unittest.TestCase):
+    def test_fresh_both_arms_tail_and_post_join_epoch(self):
+        for dtype in (torch.int32, torch.float32):
+            for width, bins, threads in ((17, 3, 32), (65, 17, 128), (257, 2048, 128)):
+                with self.subTest(dtype=dtype, width=width, bins=bins, threads=threads):
+                    x = (torch.arange(4 * width).reshape(4, width) % 7 - 3).to(dtype)
+                    lengths = torch.tensor([0, 2, width - 1, width], dtype=torch.int32)
+                    out = torch.full_like(x, -777)
+                    totals = torch.full((4,), -999, dtype=torch.int32)
+                    source = _fragment_ordered_codegen(
+                        _fragment_uniform_local_histogram,
+                        (x, lengths, out, totals, bins),
+                        threads,
+                    )
+                    for reverse in (False, True):
+                        out.fill_(-777)
+                        totals.fill_(-999)
+                        _simulate_register_load_program(
+                            source,
+                            x,
+                            threads,
+                            host_tensors={
+                                "lengths": lengths,
+                                "out": out,
+                                "totals": totals,
+                            },
+                            lane_order=list(reversed(range(threads)))
+                            if reverse
+                            else None,
+                        )
+                        expected = torch.tensor(
+                            [3, 7, x[2, : width - 1].sum().item(), x[3].sum().item()],
+                            dtype=dtype,
+                        )
+                        torch.testing.assert_close(
+                            out, expected[:, None].expand_as(out), rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(totals, lengths, rtol=0, atol=0)
+
+    def test_divergence_alias_escape_nested_and_second_update_decline(self):
+        for mode in (
+            "vector",
+            "singleton",
+            "captured",
+            "read_before_update",
+            "nested",
+            "escape",
+        ):
+            with self.subTest(mode=mode), self.assertRaises(helion.exc.InvalidConfig):
+                _fragment_ordered_codegen(
+                    _fragment_uniform_local_rejected,
+                    (
+                        torch.ones((3, 17), dtype=torch.int32),
+                        torch.tensor([0, 2, 17], dtype=torch.int32),
+                        torch.empty((3, 17), dtype=torch.int32),
+                        mode,
+                    ),
+                )
+
+    def test_predicate_host_alias_declines(self):
+        x = torch.ones((3, 17), dtype=torch.int32)
+        out = torch.zeros_like(x)
+        lengths = out[:, 0]
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "readonly bound host storage"
+        ):
+            _fragment_ordered_codegen(
+                _fragment_uniform_local_histogram,
+                (x, lengths, out, torch.empty((3,), dtype=torch.int32), 17),
+            )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_uniform_local_epochs(x, lengths, out):
+    for row in hl.grid(x.size(0)):
+        col = hl.arange(x.size(1))
+        # Incoming pending writes must complete outside both arms.
+        outer = hl.zeros([17], dtype=torch.int32)
+        hl.atomic_add(outer, [col % 17], x[row, :])
+        if lengths[row] > 2:
+            left = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(left, [col % 17], x[row, :])
+        else:
+            right = hl.zeros([33], dtype=torch.int32)
+            hl.atomic_add(right, [col % 33], x[row, :])
+        # Reuse after an executed or skipped arm, followed by a second branch.
+        if lengths[row] < 8:
+            second = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(second, [col % 17], x[row, :])
+            out[row, :] = second + outer
+        else:
+            out[row, :] = outer
+    return out
+
+
+class TestFragmentUniformLocalBranchEpochsCPU(unittest.TestCase):
+    def test_pending_arms_retire_and_sequential_join_preserves_outer_capture(self):
+        import ast
+        from unittest.mock import patch
+
+        from helion._compiler.cute.computed_fragment import FragmentCompiler
+        from helion._compiler.device_ir import ElseGraphInfo
+        from helion._compiler.device_ir import IfGraphInfo
+
+        original = FragmentCompiler.graph
+        entries = []
+
+        def graph(compiler, graph, values):
+            info = next(info for info in compiler.graphs if info.graph is graph)
+            if isinstance(info, (IfGraphInfo, ElseGraphInfo)):
+                self.assertFalse(compiler.pending_local_atomics)
+                entries.append(info.graph_id)
+            return original(compiler, graph, values)
+
+        x = (torch.arange(4 * 65).reshape(4, 65) % 7 - 3).to(torch.int32)
+        lengths = torch.tensor([0, 3, 7, 65], dtype=torch.int32)
+        out = torch.full((4, 17), -99, dtype=torch.int32)
+        with patch.object(FragmentCompiler, "graph", graph):
+            source = _fragment_ordered_codegen(
+                _fragment_uniform_local_epochs, (x, lengths, out)
+            )
+        self.assertEqual(len(entries), 4)
+        fn = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef))
+        branches = [
+            n
+            for n in fn.body
+            if isinstance(n, ast.If) and isinstance(n.test, ast.Subscript)
+        ]
+        self.assertEqual(len(branches), 2)
+        for branch in branches:
+            self.assertEqual(
+                ast.unparse(fn.body[fn.body.index(branch) + 1]),
+                "cute.arch.sync_threads()",
+            )
+        for body in (branches[0].body, branches[0].orelse):
+            self.assertEqual(ast.unparse(body[-1]), "cute.arch.sync_threads()")
+        expected = torch.zeros_like(out)
+        expected.scatter_add_(1, (torch.arange(65) % 17).expand(4, -1), x)
+        expected = expected * torch.where(lengths < 8, 2, 1).to(torch.int32)[:, None]
+        for order in (list(range(128)), list(reversed(range(128)))):
+            _simulate_register_load_program(
+                source,
+                x,
+                128,
+                host_tensors={"lengths": lengths, "out": out},
+                lane_order=order,
+            )
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_current_call_capture_type_and_arm_identity(self):
+        from unittest.mock import patch
+
+        from helion._compiler.cute.computed_fragment import FragmentCompiler
+        from helion._compiler.cute.local_atomic import uniform_local_branch_inputs
+
+        original = FragmentCompiler.conditional
+        for mode in ("same_arm", "capture_type"):
+
+            def conditional(compiler, node, values, mode=mode):
+                if mode == "same_arm":
+                    previous = node.args
+                    node.args = (*previous[:2], previous[1], *previous[3:])
+                    try:
+                        with self.assertRaises(helion.exc.InvalidConfig):
+                            uniform_local_branch_inputs(node, compiler.graphs)
+                    finally:
+                        node.args = previous
+                else:
+                    info = compiler.graphs[node.args[1]]
+                    placeholder = next(
+                        n
+                        for n in info.graph.nodes
+                        if n.op == "placeholder"
+                        and isinstance(n.meta.get("val"), torch.Tensor)
+                    )
+                    previous = placeholder.meta["val"]
+                    placeholder.meta["val"] = previous.to(torch.float64)
+                    try:
+                        with self.assertRaises(helion.exc.InvalidConfig):
+                            uniform_local_branch_inputs(node, compiler.graphs)
+                    finally:
+                        placeholder.meta["val"] = previous
+                return original(compiler, node, values)
+
+            with (
+                self.subTest(mode=mode),
+                patch.object(FragmentCompiler, "conditional", conditional),
+            ):
+                _fragment_ordered_codegen(
+                    _fragment_uniform_local_histogram,
+                    (
+                        torch.ones((3, 17), dtype=torch.int32),
+                        torch.tensor([0, 2, 17], dtype=torch.int32),
+                        torch.empty((3, 17), dtype=torch.int32),
+                        torch.empty((3,), dtype=torch.int32),
+                        17,
+                    ),
+                )
+
+
+@onlyBackends("cute")
+class TestFragmentUniformLocalBranchesNative(TestCase):
+    def _check_histogram(self, width, bins, dtype):
+        cpu = (torch.arange(5 * width).reshape(5, width) % 7 - 3).to(dtype)
+        lengths_cpu = torch.tensor([0, 1, 2, width - 1, width], dtype=torch.int32)
+        expected = torch.stack(
+            [
+                cpu[row, : int(count)].sum().to(dtype)
+                if count > 2
+                else torch.tensor(3 + 2 * int(count), dtype=dtype)
+                for row, count in enumerate(lengths_cpu)
+            ]
+        )[:, None].expand_as(cpu)
+        x, lengths = cpu.to(DEVICE), lengths_cpu.to(DEVICE)
+        out = torch.full_like(x, -777)
+        totals = torch.full((5,), -999, dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(
+            _fragment_uniform_local_histogram,
+            (x, lengths, out, totals, bins),
+            cute_fragment_threads=128,
+        )
+        self.assertIs(result[0], out)
+        self.assertIs(result[1], totals)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(totals.cpu(), lengths_cpu, rtol=0, atol=0)
+        self.assertTrue(torch.equal(x.view(torch.int32).cpu(), cpu.view(torch.int32)))
+        self.assertTrue(torch.equal(lengths.cpu(), lengths_cpu))
+
+    def test_int32_histogram_both_arms_and_padded_tail(self):
+        self._check_histogram(257, 2048, torch.int32)
+
+    def test_float32_histogram_nonzero_init_and_padded_tail(self):
+        self._check_histogram(17, 3, torch.float32)
+
+    def test_sequential_joins_and_completed_outer_capture(self):
+        width = 65
+        cpu = (torch.arange(4 * width).reshape(4, width) % 7 - 3).to(torch.int32)
+        lengths_cpu = torch.tensor([0, 3, 7, width], dtype=torch.int32)
+        expected = torch.zeros((4, 17), dtype=torch.int32)
+        expected.scatter_add_(1, (torch.arange(width) % 17).expand(4, -1), cpu)
+        expected *= torch.where(lengths_cpu < 8, 2, 1).to(torch.int32)[:, None]
+        x, lengths = cpu.to(DEVICE), lengths_cpu.to(DEVICE)
+        out = torch.full((4, 17), -777, dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(
+            _fragment_uniform_local_epochs,
+            (x, lengths, out),
+            cute_fragment_threads=128,
+        )
+        self.assertIs(result, out)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        self.assertTrue(torch.equal(x.cpu(), cpu))
+        self.assertTrue(torch.equal(lengths.cpu(), lengths_cpu))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_uniform_local_while(x, limits, out, bins: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        column = hl.arange(helion.next_power_of_2(x.size(1)))
+        limit = limits[row]
+        value = hl.load(x, [row, column], extra_mask=column < x.size(1))
+        iteration = hl.full([], 0, dtype=torch.int32)
+        total = hl.full([], 7, dtype=x.dtype)
+        left = hl.full([], 3, dtype=torch.int32)
+        right = hl.full([], 5, dtype=torch.int32)
+        # This unused incoming epoch must close even when the while is skipped.
+        incoming = hl.zeros([1], dtype=torch.int32)
+        hl.atomic_add(incoming, [column * 0], (column < x.size(1)).to(torch.int32))
+        while iteration < limit:
+            histogram = hl.full([bins], 1, dtype=x.dtype)
+            hl.atomic_add(
+                histogram,
+                [column % bins],
+                torch.where(column < iteration + 1, value, 0),
+            )
+            total = total + histogram.sum(dtype=x.dtype)
+            left, right = left + right, left - right
+            iteration = iteration + 1
+            unused = hl.zeros([3], dtype=torch.int32)
+            hl.atomic_add(unused, [column % 3], (column < x.size(1)).to(torch.int32))
+        out[row, 0] = total
+        out[row, 1] = left
+        out[row, 2] = right
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_uniform_local_while_scan(x, limits, out):
+    for row in hl.grid(x.size(0)):
+        column = hl.arange(helion.next_power_of_2(x.size(1)))
+        keys = (
+            hl.load(x, [row, column], extra_mask=column < x.size(1)).to(torch.int32)
+            & 15
+        )
+        limit = limits[row]
+        remaining = hl.full([], 5, dtype=torch.int32)
+        iteration = hl.full([], 0, dtype=torch.int32)
+        while (remaining > 0) & (iteration < limit):
+            histogram = hl.zeros([16], dtype=torch.int32)
+            hl.atomic_add(
+                histogram,
+                [keys],
+                ((column <= iteration) & (column < x.size(1))).to(torch.int32),
+            )
+            cumulative = hl.cumsum(histogram, dim=0)
+            cut = torch.where(cumulative >= remaining, hl.arange(16), 15).min()
+            remaining = remaining - (histogram * (hl.arange(16) <= cut)).sum(
+                dtype=torch.int32
+            )
+            iteration += 1
+        out[row] = remaining
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_uniform_local_while_rejected(x, limits, out, mode: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        column = hl.arange(x.size(1))
+        iteration = hl.full([], 0, dtype=torch.int32)
+        total = hl.full([], 0, dtype=torch.int32)
+        if mode == "vector_carry":
+            state = hl.zeros([17], dtype=torch.int32)
+        if mode == "captured":
+            outer = hl.zeros([17], dtype=torch.int32)
+        while iteration < limits[row]:
+            histogram = hl.zeros([17], dtype=torch.int32)
+            if mode == "captured":
+                hl.atomic_add(outer, [column % 17], x[row, :])
+            if mode == "early_read":
+                total = total + histogram.sum(dtype=torch.int32)
+            hl.atomic_add(histogram, [column % 17], x[row, :])
+            if mode == "vector_carry":
+                state = histogram + state
+            if mode == "second_update":
+                old = histogram + 1
+                hl.atomic_add(histogram, [column % 17], x[row, :])
+                total = total + old.sum(dtype=torch.int32)
+            if mode == "nested":
+                if iteration > 0:
+                    total = total + histogram.sum(dtype=torch.int32)
+            elif mode == "dynamic_init":
+                other = hl.full([17], iteration, dtype=torch.int32)
+                hl.atomic_add(other, [column % 17], x[row, :])
+                total = total + other.sum(dtype=torch.int32)
+            else:
+                total = total + histogram.sum(dtype=torch.int32)
+            iteration += 1
+        if mode == "vector_carry":
+            total += state.sum(dtype=torch.int32)
+        out[row] = total
+    return out
+
+
+class TestFragmentUniformLocalWhilesCPU(unittest.TestCase):
+    def test_fresh_epochs_zero_trip_simultaneous_carries_and_unused_updates(self):
+        for dtype in (torch.int32, torch.float32):
+            x = (torch.arange(4 * 17).reshape(4, 17) % 7 - 3).to(dtype)
+            limits = torch.tensor([0, 1, 4, 2], dtype=torch.int32)
+            out = torch.full((4, 3), -99, dtype=dtype)
+            code = _fragment_ordered_codegen(
+                _fragment_uniform_local_while, (x, limits, out, 3)
+            )
+            expected = []
+            for row, limit in zip(x, limits, strict=True):
+                total, left, right = 7, 3, 5
+                for iteration in range(int(limit)):
+                    total += 3 + row[: iteration + 1].sum().item()
+                    left, right = left + right, left - right
+                expected.append([total, left, right])
+            for reverse in (False, True):
+                with self.subTest(dtype=dtype, reverse=reverse):
+                    out.fill_(-99)
+                    _simulate_register_load_program(
+                        code,
+                        x,
+                        128,
+                        host_tensors={"limits": limits, "out": out},
+                        lane_order=list(reversed(range(128))) if reverse else None,
+                    )
+                    torch.testing.assert_close(
+                        out, torch.tensor(expected, dtype=dtype), rtol=0, atol=0
+                    )
+
+    def test_completed_histogram_scan_and_adaptive_scalar_carry(self):
+        x = torch.arange(3 * 17, dtype=torch.int32).reshape(3, 17)
+        limits = torch.tensor([0, 1, 4], dtype=torch.int32)
+        out = torch.full((3,), -99, dtype=torch.int32)
+        code = _fragment_ordered_codegen(
+            _fragment_uniform_local_while_scan, (x, limits, out)
+        )
+        expected = []
+        for row, limit in zip(x, limits, strict=True):
+            remaining = 5
+            for iteration in range(int(limit)):
+                if remaining <= 0:
+                    break
+                histogram = torch.zeros(16, dtype=torch.int32)
+                histogram.scatter_add_(
+                    0,
+                    (row & 15).long(),
+                    (torch.arange(17) <= iteration).to(torch.int32),
+                )
+                cdf = histogram.cumsum(0)
+                cut = torch.where(cdf >= remaining, torch.arange(16), 15).min()
+                remaining -= int(histogram[: int(cut) + 1].sum())
+            expected.append(remaining)
+        _simulate_register_load_program(
+            code, x, 128, host_tensors={"limits": limits, "out": out}
+        )
+        torch.testing.assert_close(
+            out, torch.tensor(expected, dtype=torch.int32), rtol=0, atol=0
+        )
+
+    def test_captured_mutation_read_order_nested_control_and_dynamic_init_decline(self):
+        for mode in (
+            "captured",
+            "early_read",
+            "second_update",
+            "nested",
+            "dynamic_init",
+            "vector_carry",
+        ):
+            with self.subTest(mode=mode), self.assertRaises(helion.exc.InvalidConfig):
+                _fragment_ordered_codegen(
+                    _fragment_uniform_local_while_rejected,
+                    (
+                        torch.ones((3, 17), dtype=torch.int32),
+                        torch.tensor([0, 1, 4], dtype=torch.int32),
+                        torch.empty((3,), dtype=torch.int32),
+                        mode,
+                    ),
+                )
+
+    def test_readonly_limit_and_value_aliases_decline(self):
+        x = torch.arange(3 * 17, dtype=torch.int32).reshape(3, 17)
+        limits = torch.tensor([0, 1, 4], dtype=torch.int32)
+        for out in (limits, x[:, 0]):
+            with (
+                self.subTest(alias="limits" if out is limits else "x"),
+                self.assertRaises(helion.exc.InvalidConfig),
+            ):
+                _fragment_ordered_codegen(
+                    _fragment_uniform_local_while_scan, (x, limits, out)
+                )
+
+
+@onlyBackends("cute")
+class TestFragmentUniformLocalWhilesNative(TestCase):
+    def _check_epochs(self, dtype):
+        cpu = (torch.arange(4 * 17).reshape(4, 17) % 7 - 3).to(dtype)
+        limits_cpu = torch.tensor([0, 1, 4, 2], dtype=torch.int32)
+        expected = []
+        for row, limit in zip(cpu, limits_cpu, strict=True):
+            total, left, right = 7, 3, 5
+            for iteration in range(int(limit)):
+                total += 3 + row[: iteration + 1].sum().item()
+                left, right = left + right, left - right
+            expected.append([total, left, right])
+        x, limits = cpu.to(DEVICE), limits_cpu.to(DEVICE)
+        out = torch.full((4, 3), -99, dtype=dtype, device=DEVICE)
+        _, result = code_and_output(
+            _fragment_uniform_local_while,
+            (x, limits, out, 3),
+            cute_fragment_threads=128,
+        )
+        self.assertIs(result, out)
+        torch.testing.assert_close(
+            out.cpu(), torch.tensor(expected, dtype=dtype), rtol=0, atol=0
+        )
+        self.assertTrue(torch.equal(x.cpu(), cpu))
+        self.assertTrue(torch.equal(limits.cpu(), limits_cpu))
+
+    def test_int32_fresh_epochs_zero_trip_and_simultaneous_carries(self):
+        self._check_epochs(torch.int32)
+
+    def test_float32_fresh_epochs_zero_trip_and_simultaneous_carries(self):
+        self._check_epochs(torch.float32)
+
+    def test_completed_histogram_scan_and_adaptive_scalar_carry(self):
+        cpu = torch.arange(3 * 17, dtype=torch.int32).reshape(3, 17)
+        limits_cpu = torch.tensor([0, 1, 4], dtype=torch.int32)
+        expected = []
+        for row, limit in zip(cpu, limits_cpu, strict=True):
+            remaining = 5
+            for iteration in range(int(limit)):
+                if remaining <= 0:
+                    break
+                histogram = torch.zeros(16, dtype=torch.int32)
+                histogram.scatter_add_(
+                    0,
+                    (row & 15).long(),
+                    (torch.arange(17) <= iteration).to(torch.int32),
+                )
+                cut = torch.where(
+                    histogram.cumsum(0) >= remaining, torch.arange(16), 15
+                ).min()
+                remaining -= int(histogram[: int(cut) + 1].sum())
+            expected.append(remaining)
+        x, limits = cpu.to(DEVICE), limits_cpu.to(DEVICE)
+        out = torch.full((3,), -99, dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(
+            _fragment_uniform_local_while_scan,
+            (x, limits, out),
+            cute_fragment_threads=128,
+        )
+        self.assertIs(result, out)
+        torch.testing.assert_close(
+            out.cpu(), torch.tensor(expected, dtype=torch.int32), rtol=0, atol=0
+        )
+        self.assertTrue(torch.equal(x.cpu(), cpu))
+        self.assertTrue(torch.equal(limits.cpu(), limits_cpu))
