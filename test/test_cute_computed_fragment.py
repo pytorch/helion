@@ -1435,6 +1435,8 @@ def test_fragment_singleton_view_logical_coordinates(
     expected = target(value, *arguments)
     compiler = object.__new__(FragmentCompiler)
     compiler.pending_local_atomics = set()
+    compiler.local_register_nodes = set()
+    compiler.local_register_slot = None
     compiler.shape = lambda sizes: tuple(sizes)
     compiler.coordinate_locals = lambda coordinates: coordinates
     graph = torch.fx.Graph()
@@ -2444,7 +2446,7 @@ def test_captured_conditional_explicit_outputs_keep_generated_values(steps):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
 def test_fragment_threads_mixed_warp_reduction_cpu(threads, dtype):
     x = _fragment_warp_reduction_inputs(3, 65, dtype, "max")
@@ -2463,7 +2465,7 @@ def test_fragment_threads_mixed_warp_reduction_cpu(threads, dtype):
 
 
 @skipUnlessBackends(["cute"])
-@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512, 1024])
 def test_fragment_threads_native_mixed_reduction(threads):
     x = _fragment_warp_reduction_inputs(3, 65, torch.int64, "max", "cuda")
     bound = _fragment_warp_reduction_mixed.bind((x, "max"))
@@ -2477,7 +2479,7 @@ def test_fragment_threads_native_mixed_reduction(threads):
     )
 
 
-@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("kind", ["min", "max"])
 def test_fragment_threads_nan_order_cpu(threads, kind):
     x = torch.full((3, 128), 0.5)
@@ -2496,7 +2498,7 @@ def test_fragment_threads_nan_order_cpu(threads, kind):
 
 
 @skipUnlessBackends(["cute"])
-@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("mode", ["serial", "cooperative"])
 def test_fragment_threads_native_scan(threads, mode):
     from test.test_cute_fragment_scan_config import _computed_scan
@@ -3500,7 +3502,7 @@ def test_fragment_producer_cache_preserves_special_value_bits():
 )
 @pytest.mark.parametrize(
     "axis,reverse,columns,threads",
-    [(2, False, 65, 32), (2, True, 250, 128), (1, True, 33, 512)],
+    [(2, False, 65, 32), (2, True, 250, 128), (1, True, 33, 512), (2, True, 513, 1024)],
 )
 def test_fragment_warp_scan_cpu_typed_axes_tail_and_input_reuse(
     dtype, axis, reverse, columns, threads
@@ -3656,7 +3658,9 @@ def test_fragment_warp_scan_sdk_shuffles_preserve_32_and_64_bit_types():
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
 )
-@pytest.mark.parametrize("reverse,threads", [(False, 32), (True, 128), (True, 512)])
+@pytest.mark.parametrize(
+    "reverse,threads", [(False, 32), (True, 128), (True, 512), (True, 1024)]
+)
 def test_fragment_warp_scan_native_tails_typed_reuse(dtype, reverse, threads):
     from test.test_cute_fragment_scan_config import _computed_scan
 
@@ -3835,10 +3839,14 @@ def test_fragment_warp_scan_cpu_empty_logical_extent(reverse):
     assert torch.equal(out, torch.zeros_like(out))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
 )
-def test_fragment_warp_scan_sdk_staged_values_and_guarded_load(dtype, tmp_path):
+@pytest.mark.parametrize("threads", [32, 1024])
+def test_fragment_warp_scan_sdk_staged_values_and_guarded_load(
+    dtype, threads, tmp_path
+):
     import importlib.util
 
     import cutlass
@@ -3854,7 +3862,7 @@ def test_fragment_warp_scan_sdk_staged_values_and_guarded_load(dtype, tmp_path):
             dict(bound.config_spec.default_config())
             | {
                 "block_sizes": [2],
-                "cute_fragment_threads": 32,
+                "cute_fragment_threads": threads,
                 "cute_fragment_warp_scan": True,
             }
         )

@@ -200,6 +200,21 @@ def _(
 def _(
     target: torch.Tensor, index: list[object], value: torch.Tensor, sem: str = "relaxed"
 ) -> torch.Tensor:
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.host_function import HostFunction
+
+    if (
+        CompileEnvironment.current().backend.name == "cute"
+        and target not in HostFunction.current().tensor_to_origin
+        and target.dtype == torch.int32
+        and target.ndim == 1
+        and len(index) == 1
+        and isinstance(index[0], torch.Tensor)
+    ):
+        # Local fetch-add returns one old value per logical index. Normalizing
+        # a concrete index extent to a padded reduction block here changes the
+        # meaning of downstream views (for example, flip reverses padding).
+        return torch.empty_like(index[0], dtype=target.dtype)
     target_shape = SubscriptIndexing.compute_shape(target, index)
     return target.new_empty(target_shape)
 
