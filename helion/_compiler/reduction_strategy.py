@@ -51,6 +51,21 @@ def _dtype_str(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
 
 
+def _reduction_computation_dtype(
+    reduction_type: str, fake_input: torch.Tensor, fake_output: torch.Tensor
+) -> torch.dtype:
+    # Indexed reductions return indices but compare input values. Ordinary
+    # reductions honor Torch's result dtype, including integer promotion and
+    # explicit dtype=; Inductor has already converted their scalar operands.
+    backend = CompileEnvironment.current().backend
+    dtype = (
+        fake_input.dtype
+        if backend.is_indexed_reduction(reduction_type)
+        else fake_output.dtype
+    )
+    return get_computation_dtype(dtype)
+
+
 def _cute_shared_memory_budget_bytes() -> int:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     default_shared = int(props.shared_memory_per_block)
@@ -800,9 +815,11 @@ class ReductionStrategy(TileStrategy):
         fake_output: torch.Tensor,
     ) -> str:
         backend = CompileEnvironment.current().backend
-        acc_dtype = get_computation_dtype(fake_input.dtype)
+        acc_dtype = _reduction_computation_dtype(
+            reduction_type, fake_input, fake_output
+        )
         if backend.is_indexed_reduction(reduction_type):
-            index_var = self.index_var(self.block_index)
+            index_var = self._indexed_reduction_index()
             return self.call_indexed_reduction(
                 input_name,
                 self.broadcast_str(index_var, fake_input, dim),
@@ -818,6 +835,9 @@ class ReductionStrategy(TileStrategy):
             block_size_var=self.block_size_var(self.block_index),
             dtype=acc_dtype,
         )
+
+    def _indexed_reduction_index(self) -> str:
+        return self.index_var(self.block_index)
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
@@ -924,7 +944,17 @@ class PersistentReductionStrategy(ReductionStrategy):
         if isinstance(numel, (int, sympy.Integer)):
             size_hint = int(numel)
         elif isinstance(numel, sympy.Expr):
-            size_hint = shape_env_size_hint(env.shape_env, numel)
+            # Reduction extents can refer to tile sizes. Resolve those symbols
+            # from this config before planning physical threads or lane loops;
+            # the tracing hint can be larger or smaller than the chosen tile.
+            block_symbols, _ = find_block_size_symbols(numel)
+            configured_sizes = {
+                symbol: sympy.Integer(size)
+                for symbol, block_id in block_symbols.items()
+                if isinstance(size := fn.resolved_block_size(block_id), int)
+            }
+            resolved_numel = numel.xreplace(configured_sizes)
+            size_hint = shape_env_size_hint(env.shape_env, resolved_numel)
         else:
             size_hint = env.size_hint(numel)
         if (
@@ -1437,8 +1467,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
         )
-        # The two-stage shared reduce takes ``dtype`` (the accumulation dtype,
-        # ``get_computation_dtype(fake_input.dtype)``) from ``type(identity)``.
+        # The two-stage shared reduce infers the accumulation dtype from
+        # ``type(identity)``.
         # Upcast the (possibly fp16/bf16) masked input to that same dtype so the
         # helper's ``input if mask else identity`` selection unifies cleanly and
         # the reduction still accumulates in the wider accumulation dtype.
@@ -1605,7 +1635,10 @@ class PersistentReductionStrategy(ReductionStrategy):
             state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
         numel = env.block_sizes[self.block_index].numel
         if isinstance(numel, sympy.Integer) and numel == 0:
-            default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
+            default = ir.Reduction.default_accumulator(
+                reduction_type,
+                _reduction_computation_dtype(reduction_type, fake_input, fake_output),
+            )
             assert isinstance(default, (float, int, bool))
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
             return expr_from_string(
@@ -1626,7 +1659,9 @@ class PersistentReductionStrategy(ReductionStrategy):
             )
             if packed is not None:
                 return packed
-        acc_dtype = get_computation_dtype(fake_input.dtype)
+        acc_dtype = _reduction_computation_dtype(
+            reduction_type, fake_input, fake_output
+        )
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
             self._synthetic_cute_lane_var is not None
@@ -2006,36 +2041,48 @@ class LoopedReductionStrategy(ReductionStrategy):
         if num_threads % group_span != 0:
             unsupported("thread axes do not tile the reduce group")
             return None
-        # The two-stage shared-memory reduction assumes its ``lane_var`` is
-        # the linear thread index across ALL of the launch block's threads.
-        # If ``axis_sizes`` only covers a subset of the planned block dims
-        # (e.g. an inner reduction strategy contributes another thread axis
-        # that hasn't been entered yet), the emitted reduction would race
-        # across the missing axis. Bail out and fall back to the warp-level
-        # path in that case.
-        planned_dims = tuple(
-            starmap(
-                max,
-                zip(
-                    self._planned_thread_dims(),
-                    state.codegen.max_thread_block_dims,
-                    strict=True,
-                ),
+        if reduction_axis == 0 and cluster_n == 1:
+            # An independent output axis can be entered after this reduction,
+            # but still enlarge the launch. Each duplicate reduction needs its
+            # own shared-memory slots, keyed by the complete physical thread ID.
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            index_type = backend.index_type_str(env.index_dtype)
+            tid0 = backend.cast_expr("cute.arch.thread_idx()[0]", index_type)
+            tid1 = backend.cast_expr("cute.arch.thread_idx()[1]", index_type)
+            tid2 = backend.cast_expr("cute.arch.thread_idx()[2]", index_type)
+            bdim0 = backend.cast_expr("cute.arch.block_dim()[0]", index_type)
+            bdim1 = backend.cast_expr("cute.arch.block_dim()[1]", index_type)
+            lane_expr = (
+                f"{tid0} + ({tid1}) * ({bdim0}) + ({tid2}) * ({bdim0}) * ({bdim1})"
             )
-        )
-        planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
-        if num_threads != planned_block_threads:
-            unsupported("another strategy contributes unentered thread axes")
-            return None
-        lane_expr = backend.thread_linear_index_expr(axis_sizes)
-        if lane_expr is None:
-            unsupported("no linear thread index for the block layout")
-            return None
+            group_count = (MAX_THREADS_PER_BLOCK + group_span - 1) // group_span
+        else:
+            # Other layouts require every planned or previously emitted axis
+            # to participate in the shared reduction's linear thread index.
+            planned_dims = tuple(
+                starmap(
+                    max,
+                    zip(
+                        self._planned_thread_dims(),
+                        state.codegen.max_thread_block_dims,
+                        strict=True,
+                    ),
+                )
+            )
+            planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
+            if num_threads != planned_block_threads:
+                unsupported("another strategy contributes unentered thread axes")
+                return None
+            lane_expr = backend.thread_linear_index_expr(axis_sizes)
+            if lane_expr is None:
+                unsupported("no linear thread index for the block layout")
+                return None
+            group_count = num_threads // group_span
 
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
         )
-        group_count = num_threads // group_span
         if cluster_n > 1:
             if group_count != 1:
                 # The cluster reduce combines across the WHOLE CTA; a
@@ -2462,7 +2509,9 @@ class LoopedReductionStrategy(ReductionStrategy):
                 if packed is not None:
                     return packed
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
-            acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
+            acc_dtype = _reduction_computation_dtype(
+                reduction_type, fake_input, fake_output
+            )
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
@@ -2603,6 +2652,29 @@ class BlockReductionStrategy(ReductionStrategy):
         # instead of the newly created one from TileStrategy.__init__
         return self._codegen.index_var(block_idx)
 
+    def _indexed_reduction_index(self) -> str:
+        index = self.index_var(self.block_index)
+        env = CompileEnvironment.current()
+        if env.codegen_name == "triton":
+            block_size = self.block_size_var(self.block_index)
+            assert block_size is not None
+            return env.backend.reduction_index_expr(
+                block_size, env.index_type(), self.block_index, axis=0
+            )
+        if env.backend.name == "cute":
+            strategy = self._codegen.active_device_loops[self.block_index][-1].strategy
+            if isinstance(strategy, PerThreadFlattenedTileStrategy):
+                # Flattened offsets already include the lane, but precede
+                # applying the iteration range's begin and step.
+                offset = strategy.offset_var(self.block_index)
+                block_size = strategy.block_size_var(self.block_index)
+                return f"({offset}) % ({block_size})"
+            offset = self._codegen.offset_var(self.block_index)
+            # torch.argmin/argmax return offsets within the current tile.
+            # Memory indexing still uses the global coordinate above.
+            return f"({index}) - ({offset})"
+        return index
+
     def _reduction_thread_count(self) -> int:
         """Return the live thread extent of the reduced tile block.
 
@@ -2663,6 +2735,11 @@ class BlockReductionStrategy(ReductionStrategy):
         }
         if reduce_axis not in logical_axis_sizes:
             return None
+        # Earlier full-slice reductions can own physical axes absent from
+        # the active tile mapping. Their lanes still stride this reduction.
+        for axis, size in enumerate(self._planned_thread_dims()):
+            if size > 1:
+                logical_axis_sizes.setdefault(axis, size)
         pre = 1
         for axis in range(reduce_axis):
             pre *= logical_axis_sizes.get(axis, 1)
@@ -3136,6 +3213,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 self._codegen.max_thread_block_dims[reduce_axis],
             )
 
+        # Earlier full-slice reductions can own physical axes absent from
+        # the active tile mapping. Their lanes still stride this reduction.
+        for axis, size in enumerate(self._planned_thread_dims()):
+            if size > 1:
+                logical_axis_sizes.setdefault(axis, size)
+
         # Every axis the tile is distributed over spans the launch's threads
         # along it: the surplus threads of a sibling narrower than the launch
         # execute this combine holding the identity, and the lane expression
@@ -3370,6 +3453,7 @@ class BlockReductionStrategy(ReductionStrategy):
         default: float | bool,
         threads: int,
         *,
+        acc_dtype: torch.dtype,
         strided_restore: bool = False,
     ) -> str:
         """Emit the two-pass lane-reduction marker for a lane-looped block.
@@ -3385,7 +3469,6 @@ class BlockReductionStrategy(ReductionStrategy):
         from .tile_strategy import _lane_reduce_marker_expr
 
         env = CompileEnvironment.current()
-        acc_dtype = get_computation_dtype(fake_input.dtype)
         identity_expr = env.backend.cast_expr(
             constant_repr(default), _dtype_str(acc_dtype)
         )
@@ -3445,6 +3528,8 @@ class BlockReductionStrategy(ReductionStrategy):
         reduction_type: str,
         fake_input: torch.Tensor,
         default: float | bool,
+        *,
+        acc_dtype: torch.dtype,
     ) -> str | None:
         """Two-pass marker for a block distributed by a ``DeviceLoopState``
         lane loop, or ``None`` when this reduction is not lane-looped.
@@ -3494,6 +3579,7 @@ class BlockReductionStrategy(ReductionStrategy):
             fake_input,
             default,
             threads,
+            acc_dtype=acc_dtype,
             strided_restore=True,
         )
 
@@ -3581,7 +3667,13 @@ class BlockReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         _log_cute_reduction_layout(state)
-        default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
+        acc_dtype = _reduction_computation_dtype(
+            reduction_type, fake_input, fake_output
+        )
+        default = ir.Reduction.default_accumulator(
+            reduction_type,
+            acc_dtype,
+        )
         assert isinstance(default, (float, int, bool))
         env = CompileEnvironment.current()
         dim_size = fake_input.size(dim)
@@ -3646,7 +3738,12 @@ class BlockReductionStrategy(ReductionStrategy):
             expr = sequence_expr
         elif (
             lane_marker_expr := self._device_lane_loop_marker_expr(
-                state, input_name, reduction_type, fake_input, default
+                state,
+                input_name,
+                reduction_type,
+                fake_input,
+                default,
+                acc_dtype=acc_dtype,
             )
         ) is not None:
             expr = lane_marker_expr
@@ -3658,7 +3755,7 @@ class BlockReductionStrategy(ReductionStrategy):
                 dim,
                 fake_input,
                 default,
-                get_computation_dtype(fake_output.dtype),
+                acc_dtype,
             )
         ) is not None:
             expr = strided_expr
@@ -3678,7 +3775,13 @@ class BlockReductionStrategy(ReductionStrategy):
                 # into a two-pass (accumulate across lanes -> combine across
                 # ``threads`` -> consume) lane structure.
                 expr = self._lane_loop_marker_expr(
-                    state, input_name, reduction_type, fake_input, default, threads
+                    state,
+                    input_name,
+                    reduction_type,
+                    fake_input,
+                    default,
+                    threads,
+                    acc_dtype=acc_dtype,
                 )
             else:
                 # A serial device loop (or no thread axis at all). A warp-level

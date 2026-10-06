@@ -14,6 +14,7 @@ from ...language._tracing_ops import _get_symnode
 from ...language._tracing_ops import _host_tensor
 from ...language.memory_ops import load
 from ...language.memory_ops import store
+from ...language.tile_ops import tile_index
 from ..compile_environment import CompileEnvironment
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
@@ -251,7 +252,7 @@ def match_row_topk(
     if (
         source_tensor is None
         or source_tensor.ndim != 2
-        or source_tensor.dtype not in (torch.float16, torch.bfloat16)
+        or source_tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32)
     ):
         return None
     n = _extent(source_tensor.size(1))
@@ -272,6 +273,36 @@ def match_row_topk(
     if m is None or m <= 0:
         return None
     widths = {1, n, k}
+
+    def row_index_interval(value: object) -> tuple[int, int] | None:
+        if type(value) is int:
+            return value, value
+        if not isinstance(value, Node):
+            return None
+        if value.target is tile_index and len(value.args) == 1:
+            return (0, m - 1) if _row_block(value.args[0]) == row_block_id else None
+        floor_division = (
+            value.target is torch.ops.aten.div.Tensor_mode
+            and value.kwargs == {"rounding_mode": "floor"}
+        )
+        if len(value.args) != 2 or (value.kwargs and not floor_division):
+            return None
+        left = row_index_interval(value.args[0])
+        divisor = value.args[1]
+        if left is None or type(divisor) is not int or divisor <= 0:
+            return None
+        if floor_division or value.target in (
+            torch.ops.aten.floor_divide.default,
+            torch.ops.aten.floor_divide.Scalar,
+        ):
+            return left[0] // divisor, left[1] // divisor
+        if value.target in (
+            torch.ops.aten.remainder.Tensor,
+            torch.ops.aten.remainder.Scalar,
+        ):
+            return 0, divisor - 1
+        return None
+
     anchor: torch.Tensor | None = None
     for node in loads:
         if len(node.args) != 4 or node.args[2:] != (None, None) or node.kwargs:
@@ -296,7 +327,11 @@ def match_row_topk(
                 or tensor.size(1) not in widths
             ):
                 return None
-            if tensor.size(1) == n and tensor.dtype == source_tensor.dtype:
+            if tensor.size(1) == n and tensor.dtype in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            ):
                 anchor = tensor if anchor is None else anchor
         elif tensor.ndim == 1:
             column_load = (
@@ -306,9 +341,14 @@ def match_row_topk(
                 or subscript == (None, slice(None))
             )
             row_load = len(subscript) == 1 and _row_block(subscript[0]) == row_block_id
+            interval = row_index_interval(subscript[0]) if len(subscript) == 1 else None
+            indexed_row_load = interval is not None and 0 <= interval[0] <= interval[
+                1
+            ] < tensor.size(0)
             if not (
                 (column_load and tensor.size(0) in widths)
                 or (row_load and tensor.size(0) == m)
+                or indexed_row_load
             ):
                 return None
         else:
@@ -407,6 +447,10 @@ def match_row_topk(
             ):
                 return None
             continue
+        if node.target is tile_index and (
+            len(node.args) != 1 or _row_block(node.args[0]) != row_block_id
+        ):
+            return None
         tensor = _tensor(node)
         if (
             not supports_row_fragment_node(node)

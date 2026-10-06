@@ -5253,3 +5253,266 @@ def test_subgroup_vector_layout_roundtrip(
     )
     assert torch.equal(x.view(torch.uint8), output.view(torch.uint8))
     assert torch.equal(x.view(torch.uint8), restored.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize(
+    "value_mode,rank_mode", [("gather", "signed"), ("decode", "ordinal")]
+)
+def test_fp32_ordered_selection_preserves_full_precision(
+    largest: bool, layout: str, value_mode: str, rank_mode: str
+) -> None:
+    x = _inputs(65, torch.float32)
+    # Adjacent FP32 values share the same BF16/FP16 representation.
+    x[8] = (torch.arange(65, device=x.device).float() * 2**-23 + 1).flip(0)
+    x[9] = (torch.arange(65, device=x.device).float() + 1) * 2**-149
+    x[10] = -x[9]
+    x[11].view(torch.int32)[:8] = torch.tensor(
+        [
+            0x7FC00001,
+            0x7FC00002,
+            -4194303,
+            -4194302,
+            0,
+            -2147483648,
+            0x7F800000,
+            -8388608,
+        ],
+        device=x.device,
+        dtype=torch.int32,
+    )
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _row_topk,
+        (x, 8, largest),
+        block_sizes=[8],
+        cute_topk_selection_layout=layout,
+        cute_topk_value_mode=value_mode,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_lanes_per_row=8,
+        cute_topk_vector_width=4,
+        cute_topk_output_vector_width=4,
+    )
+    assert "cutlass.Int64(-9223372036854775808)" in code
+    _assert_topk_output(original, values, indices, 8, largest)
+    assert torch.equal(x.view(torch.int32), original.view(torch.int32))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fp32_masked_row_topk(
+    x: torch.Tensor, lengths: torch.Tensor, k: int, next_n: int
+) -> torch.Tensor:
+    k = hl.specialize(k)
+    next_n = hl.specialize(next_n)
+    output = torch.empty((x.size(0), k), device=x.device, dtype=torch.int32)
+    for row in hl.tile(x.size(0)):
+        count = lengths[row.index // next_n] - next_n + row.index % next_n + 1
+        col = hl.arange(x.size(1))
+        masked = torch.where(col[None, :] < count[:, None], x[row, :], float("-inf"))
+        _, indices = torch.topk(masked, k, dim=-1)
+        output[row, :] = torch.where(indices < count[:, None], indices, -1).to(
+            torch.int32
+        )
+    return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_fp32_ordered_selection_runtime_lengths(next_n: int) -> None:
+    x = torch.randn((6 * next_n, 64), device=DEVICE)
+    x[0] = float("-inf")
+    x[1] = float("-inf")
+    lengths = torch.tensor([0, 3, 8, 64, 65, 81], device=DEVICE, dtype=torch.int32)
+    code, indices = code_and_output(
+        _fp32_masked_row_topk,
+        (x, lengths, 8, next_n),
+        block_sizes=[8],
+        cute_topk_selection_layout="distributed",
+        cute_topk_lanes_per_row=8,
+    )
+    assert "cutlass.Int64(-9223372036854775808)" in code
+    for r in range(x.size(0)):
+        n = max(0, min(64, int(lengths[r // next_n]) - next_n + r % next_n + 1))
+        real = indices[r][indices[r] >= 0].long()
+        assert len(real) == min(8, n) and len(real.unique()) == len(real)
+        assert bool((real < n).all())
+        torch.testing.assert_close(
+            x[r, real].sort().values,
+            x[r, :n].topk(min(8, n)).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_fp32_ordered_selection_config_legality(topk_spec: ConfigSpec) -> None:
+    spec = topk_spec
+    spec.enable_cute_topk_search(torch.float32)
+    config = spec.default_config()
+    assert config["cute_topk_key_dtype"] == "int64"
+    assert spec.cute_topk_choices["cute_topk_key_encoder"] == ("dsl",)
+    assert spec.cute_topk_choices["cute_topk_defer_value_gathers"] == (False,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "layout,value_mode", [("distributed", "decode"), ("replicated", "gather")]
+)
+def test_fp32_ordered_selection_transformed_values(
+    layout: str, value_mode: str
+) -> None:
+    x = _inputs(65, torch.float32)
+    x[0] = 1 + torch.arange(65, device=x.device).float() * 2**-23
+    code, (values, indices, processed) = code_and_output(
+        _preprocessed_row_topk,
+        (x, 8, True),
+        block_sizes=[8],
+        cute_topk_selection_layout=layout,
+        cute_topk_value_mode=value_mode,
+        cute_topk_lanes_per_row=8,
+        cute_topk_rank_mode="ordinal",
+    )
+    assert "cutlass.Int64(-9223372036854775808)" in code
+    expected = x * 0.5 + -0.0
+    torch.testing.assert_close(processed, expected, rtol=0, atol=0, equal_nan=True)
+    _assert_topk_output(expected, values, indices, 8)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mixed_dtype_row_topk(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    k: int,
+    producer: hl.constexpr,
+    largest: hl.constexpr,
+    normalize_selected: hl.constexpr,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), device=x.device, dtype=torch.float32)
+    indices = torch.empty((x.size(0), k), device=x.device, dtype=torch.int64)
+    processed = torch.empty(x.shape, device=x.device, dtype=torch.float32)
+    for row in hl.tile(x.size(0)):
+        scores = x[row, :].float()
+        if producer != "cast":
+            scores = scores + bias[:]
+        if producer == "rounded":
+            scores = scores.to(x.dtype).float()
+        elif producer == "sigmoid":
+            scores = torch.sigmoid(scores)
+        elif producer == "softmax":
+            scores = torch.softmax(scores, dim=-1)
+        selected, selected_indices = torch.topk(scores, k, dim=-1, largest=largest)
+        if normalize_selected:
+            selected = torch.softmax(selected, dim=-1)
+        values[row, :] = selected
+        indices[row, :] = selected_indices
+        processed[row, :] = scores
+    return values, indices, processed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "layout,value_mode", [("distributed", "decode"), ("replicated", "gather")]
+)
+@pytest.mark.parametrize(
+    "producer,largest,normalize_selected",
+    [
+        ("affine", True, False),
+        ("affine", False, False),
+        ("rounded", True, False),
+        ("sigmoid", True, False),
+        ("softmax", True, False),
+        ("affine", True, True),
+        ("cast", True, False),
+    ],
+)
+def test_mixed_dtype_selection_preserves_producer_boundaries(
+    dtype: torch.dtype,
+    layout: str,
+    value_mode: str,
+    producer: str,
+    largest: bool,
+    normalize_selected: bool,
+) -> None:
+    x = (
+        _inputs(65, dtype)
+        if producer == "cast"
+        else torch.randn(17, 65, device=DEVICE, dtype=dtype)
+    )
+    # These FP32 score differences vanish when rounded to the input dtype.
+    x[0].fill_(1)
+    bias = torch.arange(65, device=x.device, dtype=torch.float32) * 2**-23
+    code, (values, indices, processed) = code_and_output(
+        _mixed_dtype_row_topk,
+        (x, bias, 8, producer, largest, normalize_selected),
+        block_sizes=[8],
+        cute_topk_selection_layout=layout,
+        cute_topk_value_mode=value_mode,
+        cute_topk_rank_mode="ordinal",
+        cute_topk_lanes_per_row=8,
+        cute_topk_output_vector_width=4,
+    )
+    assert "cutlass.Int64(-9223372036854775808)" in code
+    expected = x.float()
+    if producer != "cast":
+        expected = expected + bias
+    if producer == "rounded":
+        expected = expected.to(dtype).float()
+    elif producer == "sigmoid":
+        expected = expected.sigmoid()
+    elif producer == "softmax":
+        expected = expected.softmax(-1)
+    tolerance = 2e-6 if producer in ("sigmoid", "softmax") else 0
+    torch.testing.assert_close(
+        processed, expected, rtol=tolerance, atol=tolerance, equal_nan=True
+    )
+    if normalize_selected:
+        expected_values = expected.topk(8, largest=largest).values.softmax(-1)
+        torch.testing.assert_close(values, expected_values, rtol=3e-5, atol=2e-6)
+        assert bool(((indices >= 0) & (indices < x.size(1))).all())
+        sorted_indices = indices.sort(-1).values
+        assert bool((sorted_indices[:, 1:] != sorted_indices[:, :-1]).all())
+        torch.testing.assert_close(
+            values, processed.gather(1, indices).softmax(-1), rtol=3e-5, atol=2e-6
+        )
+    else:
+        # Exact recovery is relative to the actual typed producer, including
+        # NaN payloads and signed zero; numeric producer error is checked above.
+        _assert_topk_output(processed, values, indices, 8, largest)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _narrowed_row_topk(
+    x: torch.Tensor, selection_dtype: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = torch.empty((x.size(0), 8), device=x.device, dtype=selection_dtype)
+    indices = torch.empty((x.size(0), 8), device=x.device, dtype=torch.int64)
+    for row in hl.tile(x.size(0)):
+        scores = x[row, :].to(selection_dtype)
+        selected, selected_indices = torch.topk(scores, 8, dim=-1)
+        values[row, :] = selected
+        indices[row, :] = selected_indices
+    return values, indices
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_mixed_dtype_selection_uses_narrowed_keys(
+    dtype: torch.dtype, layout: str
+) -> None:
+    x = _inputs(65, torch.float32)
+    x[0] = 1 + torch.arange(65, device=x.device).float() * 2**-23
+    code, (values, indices) = code_and_output(
+        _narrowed_row_topk,
+        (x, dtype),
+        block_sizes=[8],
+        cute_topk_selection_layout=layout,
+        cute_topk_value_mode="decode",
+        cute_topk_rank_mode="ordinal",
+        cute_topk_lanes_per_row=8,
+    )
+    assert "cutlass.Int64(-9223372036854775808)" not in code
+    _assert_topk_output(x.to(dtype), values, indices, 8)

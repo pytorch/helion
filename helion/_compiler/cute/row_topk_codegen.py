@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx import Node
 
+from ...language._tracing_ops import _get_symnode
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
@@ -50,6 +51,9 @@ def codegen_row_topk(
     group_guard: str,
     input_name: str,
     use_asm_encoder: bool,
+    packed_type: str,
+    input_word_type: str,
+    selection_word_type: str,
 ) -> bool:
     graph = plan.fragment_graph
     assert graph is not None
@@ -81,7 +85,16 @@ def codegen_row_topk(
             node = graph.aliases[node]
         return node
 
-    io = RowFragmentIO(cg, row=row, lane=lane, valid_row=valid_row)
+    def index_expression(node: Node) -> str:
+        if node.target is _get_symnode:
+            return row
+        fragment = emit(node)
+        assert fragment.replicated
+        return ast.unparse(fragment.element(0))
+
+    io = RowFragmentIO(
+        cg, row=row, lane=lane, valid_row=valid_row, index_expression=index_expression
+    )
     value_uses = RowValueUses(graph.stores, resolve=resolve)
     value_nodes = [
         node
@@ -107,6 +120,7 @@ def codegen_row_topk(
         valid_row=valid_row,
         resolve=resolve,
         numeric_uses_only=value_uses.numeric_only,
+        row_expr=row,
     )
 
     def emit(node: Node) -> RowFragment:
@@ -131,7 +145,7 @@ def codegen_row_topk(
             scalar_source(argument, column)
             for argument in row_fragment_tensor_inputs(node)
         ]
-        return emitter.emit_pointwise_scalar(node, inputs)
+        return emitter.emit_pointwise_scalar(node, inputs, logical_column=column)
 
     with cg.set_statements(statements):
         generated(f"""
@@ -153,14 +167,16 @@ topk_keys.fill({key_padding})
         ):
             generated(f"""
 topk_input_bits = cute.make_tensor(
-    cute.recast_ptr({input_name}.iterator, dtype=cutlass.Uint16), {input_name}.layout
+    cute.recast_ptr({input_name}.iterator, dtype={input_word_type}), {input_name}.layout
 )
 {loads}
 """)
         else:
             fragment = emit(source)
-            bits = f"{fragment.name}[topk_i].bitcast(cutlass.Uint16)"
-            if not use_asm_encoder:
+            bits = f"{fragment.name}[topk_i].bitcast({selection_word_type})"
+            if plan.selection_dtype == torch.float32:
+                bits = f"({bits}).bitcast(cutlass.Int32)"
+            elif not use_asm_encoder:
                 bits = f"cutlass.Int32(({bits}).bitcast(cutlass.Int16))"
             generated(f"""
 for topk_i in cutlass.range_constexpr({fragment.num_registers}):
@@ -179,8 +195,8 @@ topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row},
         registers = output_layout.num_registers(plan.k)
         selected = fn.new_var("row_selected_keys")
         add(
-            f"{selected} = cute.make_rmem_tensor({registers}, cutlass.Int32)\n"
-            f"{selected}.fill(cutlass.Int32(0))"
+            f"{selected} = cute.make_rmem_tensor({registers}, {packed_type})\n"
+            f"{selected}.fill({packed_type}(0))"
         )
         if plan.selection_layout == "distributed":
             key = selected_key.replace("topk_output", "topk_j")
@@ -232,7 +248,7 @@ for topk_output in cutlass.range_constexpr({plan.k}):
         values = (
             RowFragment(
                 fn.new_var("row_selected_values"),
-                plan.x.dtype,
+                plan.selection_dtype,
                 plan.k,
                 output_layout,
                 order=RowFragmentOrder(plan.largest),
@@ -297,6 +313,7 @@ for {loop} in cutlass.range_constexpr({registers}):
             valid_row=valid_row,
             resolve=resolve,
             numeric_uses_only=value_uses.numeric_only,
+            row_expr=row,
         )
         for node in graph.selection.users:
             if node.target is operator.getitem:

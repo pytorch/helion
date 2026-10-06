@@ -14,6 +14,7 @@ import functools
 import cutlass
 from cutlass import Float32
 from cutlass import Int32
+from cutlass import Int64
 import cutlass.cute as cute
 
 from .ordered_key import encode_ordered_key_16 as encode_ordered_topk_key
@@ -170,7 +171,7 @@ def local_topk(
 ) -> cute.Tensor:
     """Return the sorted largest ``k`` keys across a contiguous lane subgroup.
 
-    Each lane supplies a one-dimensional Int32 or Float32 register fragment. Its size
+    Each lane supplies a one-dimensional Int32, Int64 or Float32 register fragment. Its size
     and ``k`` must be powers of two, with fragment size at least ``k``.  The
     subgroup width must be a power of two no larger than a warp.  After the
     butterfly merges, every lane holds the same descending top-k sequence.
@@ -181,7 +182,7 @@ def local_topk(
     The input fragment is not modified.
     """
     size = cute.size(keys.shape)
-    assert keys.element_type in (Int32, Float32)
+    assert keys.element_type in (Int32, Int64, Float32)
     assert cute.rank(keys.shape) == 1
     assert k > 0 and (k & (k - 1)) == 0
     assert size >= k and (size & (size - 1)) == 0

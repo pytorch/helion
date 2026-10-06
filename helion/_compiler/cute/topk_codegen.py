@@ -87,6 +87,12 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
             level=0,
         )
     )
+    full_precision = plan.selection_dtype == torch.float32
+    packed_type = "cutlass.Int64" if full_precision else "cutlass.Int32"
+    selection_word_type = "cutlass.Uint32" if full_precision else "cutlass.Uint16"
+    input_bytes = plan.x.element_size()
+    input_word_type = "cutlass.Uint32" if input_bytes == 4 else "cutlass.Uint16"
+    output_bytes = torch.finfo(plan.selection_dtype).bits // 8
     index_bits = (plan.n - 1).bit_length()
     index_mask = (1 << index_bits) - 1
     # NaNs use rank 32767. For either dtype, ordinal negative infinity
@@ -97,7 +103,7 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
     key_padding = "cutlass.Int32(-2147483648)"
     encoded_key = "topk_packed"
     selected_key = "topk_selected[topk_output]"
-    if plan.key_dtype == "float32" and max_key <= 2**24:
+    if not full_precision and plan.key_dtype == "float32" and max_key <= 2**24:
         # Numeric conversion preserves every packed integer, including the
         # power-of-two padding sentinel, within Float32's exact integer range.
         key_type = "cutlass.Float32"
@@ -105,7 +111,8 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
         encoded_key = "cutlass.Float32(topk_packed)"
         selected_key = "cutlass.Int32(topk_selected[topk_output])"
     elif (
-        plan.key_dtype == "float32_bits"
+        not full_precision
+        and plan.key_dtype == "float32_bits"
         and 0x40000000 + min_key >= 0x00800000
         and 0x40000000 + max_key <= 0x7F7FFFFF
     ):
@@ -121,8 +128,10 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
             "topk_selected[topk_output].bitcast(cutlass.Int32)"
             " - cutlass.Int32(1073741824)"
         )
-    native_float = plan.key_dtype == "float32_native" and plan.n <= (
-        16384 if plan.x.dtype == torch.bfloat16 else 8192
+    native_float = (
+        not full_precision
+        and plan.key_dtype == "float32_native"
+        and plan.n <= (16384 if plan.selection_dtype == torch.bfloat16 else 8192)
     )
     if native_float:
         key_type = "cutlass.Float32"
@@ -136,7 +145,7 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
         1 if distributed else padded_k,
         plan.vector_width,
     )
-    infinity_bits = 0x7F80 if plan.x.dtype == torch.bfloat16 else 0x7C00
+    infinity_bits = 0x7F80 if plan.selection_dtype == torch.bfloat16 else 0x7C00
     reverse = "topk_ordered = -topk_ordered" if not plan.largest else ""
     # Ordinal ranks preserve both zero signs; ordering these otherwise tied
     # values is permitted by top-k's unspecified tie ordering.
@@ -156,7 +165,11 @@ topk_packed = ((topk_ordered << cutlass.Int32({index_bits}))
                | (cutlass.Int32({index_mask}) - topk_col))
 topk_keys[topk_i] = {encoded_key}
 """
-    use_asm_encoder = not native_float and plan.key_encoder in ("asm", "paired")
+    use_asm_encoder = (
+        not full_precision
+        and not native_float
+        and plan.key_encoder in ("asm", "paired")
+    )
     if use_asm_encoder:
         encode_helper = f"_cute_encode_ordered_topk_{helper_hash}"
         cg.module_statements.append(
@@ -176,7 +189,9 @@ topk_keys[topk_i] = {encoded_key}
         # values use finite keys above the largest BF16 value and are gathered
         # on output, preserving NaN payloads exactly.
         input_type = (
-            "cutlass.BFloat16" if plan.x.dtype == torch.bfloat16 else "cutlass.Float16"
+            "cutlass.BFloat16"
+            if plan.selection_dtype == torch.bfloat16
+            else "cutlass.Float16"
         )
         # BF16 leaves 16 low Float32 bits free. Reserve bit 14 above the index
         # payload: a quarter-ULP bias separates signed zeros and rounds back to
@@ -184,7 +199,7 @@ topk_keys[topk_i] = {encoded_key}
         # its zero-only bias because it has fewer free mantissa bits.
         zero_bias = (
             "topk_native_bits = topk_native_bits | cutlass.Int32(16384)"
-            if plan.x.dtype == torch.bfloat16
+            if plan.selection_dtype == torch.bfloat16
             else "if topk_magnitude == 0:\n    topk_native_bits = topk_native_bits | cutlass.Int32(32768)"
         )
         flip = "topk_native_key = -topk_native_key" if not plan.largest else ""
@@ -203,9 +218,35 @@ topk_native_key = (topk_native_bits | topk_encoded_index).bitcast(cutlass.Float3
 {flip}
 topk_keys[topk_i] = topk_native_key
 """
-    vector_word = "cutlass.Uint16(topk_vector[topk_element])"
+    if full_precision:
+        # Keep all 32 value bits and the complete tie-breaking column payload.
+        # Sign-extended ordered ranks occupy the high bits of a signed 64-bit
+        # key. Even the smallest real key remains above Int64-min padding.
+        key_type = packed_type
+        key_padding = "cutlass.Int64(-9223372036854775808)"
+        selected_key = "topk_selected[topk_output]"
+        rank_expression = (
+            "topk_bits ^ (topk_sign & cutlass.Int32(2147483647))"
+            if plan.rank_mode == "ordinal"
+            else "(topk_magnitude ^ topk_sign) - topk_sign"
+        )
+        encode = f"""
+topk_magnitude = topk_bits & cutlass.Int32(2147483647)
+topk_sign = topk_bits >> cutlass.Int32(31)
+topk_ordered = {rank_expression}
+if topk_magnitude > cutlass.Int32(2139095040):
+    topk_ordered = cutlass.Int32(2147483647)
+{reverse}
+topk_packed = ((cutlass.Int64(topk_ordered) << cutlass.Int32({index_bits}))
+               | cutlass.Int64(cutlass.Int32({index_mask}) - topk_col))
+topk_keys[topk_i] = topk_packed
+"""
+    vector_word = f"{input_word_type}(topk_vector[topk_element])"
     scalar_word = "topk_input_bits[topk_row, topk_col]"
-    if not use_asm_encoder:
+    if full_precision:
+        vector_word = f"{vector_word}.bitcast(cutlass.Int32)"
+        scalar_word = f"{scalar_word}.bitcast(cutlass.Int32)"
+    elif not use_asm_encoder:
         vector_word = f"cutlass.Int32({vector_word}.bitcast(cutlass.Int16))"
         scalar_word = f"cutlass.Int32({scalar_word}.bitcast(cutlass.Int16))"
     # Vector loads require an aligned logical base and complete aligned rows.
@@ -268,7 +309,7 @@ for topk_chunk in cutlass.range({fragment_size // plan.vector_width}, unroll_ful
     if topk_valid_row & ({vector_col_guard}):
         topk_vector = cute.arch.load(
             topk_input_bits.iterator + topk_row * {index_type}({row_stride}) + {index_type}(topk_col_base),
-            ir.VectorType.get([{plan.vector_width}], cutlass.Uint16.mlir_type),
+            ir.VectorType.get([{plan.vector_width}], {input_word_type}.mlir_type),
         )
         for topk_element in cutlass.range_constexpr({plan.vector_width}):
             topk_i = topk_chunk * {plan.vector_width} + topk_element
@@ -338,13 +379,17 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
     loads = scalar_loads
     if vectorized:
         loads = (
-            f"if cutlass.const_expr(topk_input_bits.iterator.alignment >= {plan.vector_width * 2}):\n"
+            f"if cutlass.const_expr(topk_input_bits.iterator.alignment >= {plan.vector_width * input_bytes}):\n"
             + textwrap.indent(vector_loads, "    ")
             + "else:\n"
             + textwrap.indent(scalar_loads, "    ")
         )
     value_dtype = (
-        "cutlass.BFloat16" if plan.x.dtype == torch.bfloat16 else "cutlass.Float16"
+        "cutlass.Float32"
+        if full_precision
+        else "cutlass.BFloat16"
+        if plan.selection_dtype == torch.bfloat16
+        else "cutlass.Float16"
     )
     output_index_dtype = (
         "cutlass.Int32"
@@ -356,7 +401,7 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
     def selected_index(key: str) -> str:
         if native_float:
             return f"(({key} ^ (({key} >> cutlass.Int32(31)) ^ cutlass.Int32(-1))) & cutlass.Int32({index_mask}))"
-        return f"(cutlass.Int32({index_mask}) - ({key} & cutlass.Int32({index_mask})))"
+        return f"(cutlass.Int32({index_mask}) - cutlass.Int32({key} & {packed_type}({index_mask})))"
 
     def value_store(
         key: str,
@@ -373,6 +418,28 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
             source = f"{x}[topk_row, topk_selected_index]"
         if plan.value_mode == "gather":
             return f"{destination} = {source}\n"
+        if full_precision:
+            undo_reverse = (
+                "topk_value_rank = -topk_value_rank" if not plan.largest else ""
+            )
+            if plan.rank_mode == "ordinal":
+                bits = "topk_value_rank ^ ((topk_value_rank >> cutlass.Int32(31)) & cutlass.Int32(2147483647))"
+                decodable = "topk_value_rank != cutlass.Int32(2147483647)"
+            else:
+                bits = "topk_value_magnitude | (topk_value_sign & cutlass.Int32(-2147483648))"
+                decodable = "(topk_value_magnitude != 0) & (topk_value_magnitude <= cutlass.Int32(2139095040))"
+            recovery = (
+                "" if numeric else f"if not ({decodable}):\n    topk_value = {source}"
+            )
+            return f"""
+topk_value_rank = cutlass.Int32({key} >> cutlass.Int32({index_bits}))
+{undo_reverse}
+topk_value_sign = topk_value_rank >> cutlass.Int32(31)
+topk_value_magnitude = (topk_value_rank ^ topk_value_sign) - topk_value_sign
+topk_value = ({bits}).bitcast(cutlass.Float32)
+{recovery}
+{destination} = topk_value
+"""
         if native_float:
             if numeric:
                 # Both infinity sentinels round to signed infinity in FP16
@@ -448,6 +515,9 @@ if not topk_value_decodable:
             group_guard=group_guard,
             input_name=x,
             use_asm_encoder=use_asm_encoder,
+            packed_type=packed_type,
+            input_word_type=input_word_type,
+            selection_word_type=selection_word_type,
         )
 
     softmax_name = f"_cute_softmax_topk_values_{helper_hash}"
@@ -531,8 +601,8 @@ for topk_j in cutlass.range_constexpr({groups}):
     scalar_stores = f"""
 # Redistribute registers before storing so each memory instruction serves
 # the entire lane subgroup instead of issuing one instruction per output rank.
-topk_local = cute.make_rmem_tensor({(plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row}, cutlass.Int32)
-topk_local.fill(cutlass.Int32(0))
+topk_local = cute.make_rmem_tensor({(plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row}, {packed_type})
+topk_local.fill({packed_type}(0))
 for topk_output in cutlass.range_constexpr({plan.k}):
     if topk_lane == cutlass.Int32(topk_output % {plan.lanes_per_row}):
         topk_local[topk_output // {plan.lanes_per_row}] = {selected_key}
@@ -545,8 +615,8 @@ for topk_j in cutlass.range_constexpr({(plan.k + plan.lanes_per_row - 1) // plan
 """
     if plan.softmax:
         scalar_setup = f"""
-topk_local = cute.make_rmem_tensor({(plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row}, cutlass.Int32)
-topk_local.fill(cutlass.Int32(0))
+topk_local = cute.make_rmem_tensor({(plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row}, {packed_type})
+topk_local.fill({packed_type}(0))
 for topk_output in cutlass.range_constexpr({plan.k}):
     if topk_lane == cutlass.Int32(topk_output % {plan.lanes_per_row}):
         topk_local[topk_output // {plan.lanes_per_row}] = {selected_key}
@@ -641,8 +711,8 @@ topk_output_lane = ((topk_lane % cutlass.Int32({output_vector}))
             output_key = selected_key.replace("topk_selected[topk_output]", output_key)
         else:
             vector_setup = f"""
-topk_output_keys = cute.make_rmem_tensor({output_groups * output_vector}, cutlass.Int32)
-topk_output_keys.fill(cutlass.Int32(0))
+topk_output_keys = cute.make_rmem_tensor({output_groups * output_vector}, {packed_type})
+topk_output_keys.fill({packed_type}(0))
 for topk_output in cutlass.range_constexpr({plan.k}):
     if topk_lane == cutlass.Int32((topk_output // {output_vector}) % {plan.lanes_per_row}):
         topk_output_keys[(topk_output // {group_width}) * {output_vector} + topk_output % {output_vector}] = {selected_key}
@@ -677,7 +747,8 @@ for topk_j in cutlass.range_constexpr({output_groups}):
         cute.autovec_copy(topk_index_fragment, topk_index_destination)
 """
         if (
-            plan.defer_value_gathers
+            not full_precision
+            and plan.defer_value_gathers
             and not native_float
             and plan.rank_mode == "ordinal"
             and plan.value_mode == "decode"
@@ -748,7 +819,7 @@ if topk_valid_row:
         # Launcher schemas specialize the actual pointer alignment, including
         # shifted out-parameters. Larger vectors use multiple 128-bit stores.
         stores = (
-            f"if cutlass.const_expr({values}.iterator.alignment >= {2 * output_vector} "
+            f"if cutlass.const_expr({values}.iterator.alignment >= {output_bytes * output_vector} "
             f"and {indices}.iterator.alignment >= {min(16, output_index_bytes * output_vector)}):\n"
             + textwrap.indent(vector_stores, "    ")
             + "else:\n"
@@ -762,7 +833,7 @@ topk_row = ({index_type}(cute.arch.block_idx()[0])
             * {index_type}({plan.rows_per_block}) + {index_type}(topk_group))
 topk_valid_row = ({row_guard}) & ({group_guard})
 topk_input_bits = cute.make_tensor(
-    cute.recast_ptr({x}.iterator, dtype=cutlass.Uint16), {x}.layout
+    cute.recast_ptr({x}.iterator, dtype={input_word_type}), {x}.layout
 )
 topk_keys = cute.make_rmem_tensor({fragment_size}, {key_type})
 topk_keys.fill({key_padding})

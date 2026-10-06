@@ -25,6 +25,8 @@ from ... import exc
 from ...language._tracing_ops import _mask_to
 from ...language._tracing_ops import _new_var
 from ...language.memory_ops import load
+from ...language.tile_ops import tile_index
+from ...language.view_ops import subscript
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..aten_lowering import LoweringContext
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
 _VIEW_TARGETS = frozenset(
     {
         _new_var,
+        subscript,
         torch.ops.aten.view.default,
         torch.ops.aten.reshape.default,
         torch.ops.aten._unsafe_view.default,
@@ -187,6 +190,18 @@ def _preserves_row_columns(node: Node) -> bool:
     if len(inputs) != 1 or output is None:
         return False
     source = inputs[0].meta["val"]
+    if node.target is subscript:
+        if (
+            len(node.args) != 2
+            or node.kwargs
+            or not isinstance(node.args[1], (tuple, list))
+        ):
+            return False
+        indices = node.args[1]
+        if any(index is not None and index != slice(None) for index in indices):
+            return False
+        if sum(index is not None for index in indices) != source.ndim:
+            return False
     if node.target is torch.ops.aten.expand.default:
         # Expand can broadcast a row scalar, but cannot change a non-unit
         # logical dimension or introduce another non-unit row axis.
@@ -225,6 +240,27 @@ def _row_reduction(node: Node) -> str | None:
     return reduction
 
 
+def row_fragment_arange(node: Node) -> tuple[int, int, int] | None:
+    """Prove a static integer progression independent of the tile schedule."""
+    output = _tensor(node)
+    if (
+        node.target not in (torch.ops.aten.arange.default, torch.ops.prims.iota.default)
+        or len(node.args) != 1
+        or type(node.args[0]) is not int
+        or output is None
+        or output.ndim != 1
+        or output.dtype not in (torch.int32, torch.int64)
+        or not isinstance(output.size(0), int)
+        or output.size(0) != node.args[0]
+        or output.size(0) <= 0
+    ):
+        return None
+    start, step = node.kwargs.get("start", 0), node.kwargs.get("step", 1)
+    if type(start) is not int or type(step) is not int:
+        return None
+    return start, step, output.size(0)
+
+
 def supports_row_fragment_node(node: Node) -> bool:
     """Whether this node has a producer-independent fragment implementation.
 
@@ -233,6 +269,8 @@ def supports_row_fragment_node(node: Node) -> bool:
     """
     if node.op != "call_function" or _tensor(node) is None:
         return False
+    if node.target is tile_index or row_fragment_arange(node) is not None:
+        return True
     if node.target is load or node.target is _mask_to or node.target in _CAST_TARGETS:
         return True
     if node.target in _VIEW_TARGETS:
@@ -265,6 +303,7 @@ class RowFragmentEmitter:
         valid_row: str = "True",
         resolve: Callable[[Node], Node] | None = None,
         numeric_uses_only: Callable[[Node], bool] | None = None,
+        row_expr: str | None = None,
     ) -> None:
         self.cg = cg
         self.load = load
@@ -272,6 +311,7 @@ class RowFragmentEmitter:
         self.valid_row = valid_row
         self.resolve = resolve
         self.numeric_uses_only = numeric_uses_only
+        self.row_expr = row_expr
         self.fragments: dict[Node, RowFragment] = {}
 
     def bind(self, node: Node, fragment: RowFragment) -> None:
@@ -311,6 +351,7 @@ class RowFragmentEmitter:
         input_values: list[ast.AST],
         *,
         valid: str = "True",
+        logical_column: str | None = None,
     ) -> ast.AST:
         """Apply ordinary scalar lowering, preserving each node's dtype boundary.
 
@@ -320,7 +361,16 @@ class RowFragmentEmitter:
         backend = CompileEnvironment.current().backend
         output = _tensor(node)
         assert output is not None
-        if node.target in _VIEW_TARGETS or node.target in _CAST_TARGETS:
+        if (progression := row_fragment_arange(node)) is not None:
+            if logical_column is None:
+                raise self._unsupported(node, "missing logical column")
+            start, step, _ = progression
+            result = expr_from_string(f"({logical_column}) * {step} + {start}")
+        elif node.target is tile_index:
+            if self.row_expr is None:
+                raise self._unsupported(node, "missing logical row")
+            result = expr_from_string(self.row_expr)
+        elif node.target in _VIEW_TARGETS or node.target in _CAST_TARGETS:
             assert len(input_values) == 1
             result = input_values[0]
         elif node.target is _mask_to:
@@ -600,6 +650,23 @@ class RowFragmentEmitter:
             )
         return result
 
+    def _emit_coordinate(self, node: Node) -> RowFragment:
+        progression = row_fragment_arange(node)
+        is_row = node.target is tile_index
+        if not is_row:
+            assert progression is not None
+        extent = 1 if progression is None else progression[2]
+        result = self._new_fragment(node, extent, self.layout, replicated=is_row)
+        register = self.cg.device_function.new_var("row_coordinate")
+        expression = self.emit_pointwise_scalar(
+            node, [], logical_column=self.layout.column(register)
+        )
+        self._add(
+            f"for {register} in cutlass.range_constexpr({result.num_registers}):\n"
+            f"    {result.name}[{register}] = {ast.unparse(expression)}"
+        )
+        return result
+
     def emit(self, node: Node) -> RowFragment:
         if node in self.fragments:
             return self.fragments[node]
@@ -609,7 +676,9 @@ class RowFragmentEmitter:
             return fragment
         if not supports_row_fragment_node(node):
             raise self._unsupported(node, "unsupported operation or shape")
-        if node.target is load:
+        if node.target is tile_index or row_fragment_arange(node) is not None:
+            fragment = self._emit_coordinate(node)
+        elif node.target is load:
             fragment = self.load(node)
         elif node.target in _VIEW_TARGETS:
             fragment = self._emit_view(node)

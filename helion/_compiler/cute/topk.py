@@ -41,9 +41,11 @@ class CuteTopKPlan:
     n: int
     k: int
     largest: bool
+    # A physical full-row load anchor; typed producers can change its dtype.
     x: torch.Tensor
     values: torch.Tensor | None
     indices: torch.Tensor | None
+    selection_dtype: torch.dtype  # Dtype at the ordered selection boundary.
     fragment_graph: RowTopKGraph | None = None
     softmax: bool = False
     lanes_per_row: int = 16
@@ -229,7 +231,7 @@ def _match_direct_topk_root(
     if (
         x is None
         or x.ndim != 2
-        or x.dtype not in (torch.float16, torch.bfloat16)
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or not isinstance(subscript, (list, tuple))
         or len(subscript) != 2
         or subscript[1] != slice(None)
@@ -352,6 +354,7 @@ def _match_direct_topk_root(
         x,
         values,
         indices,
+        selection_dtype=x.dtype,
         softmax=softmax,
         stable_ties=stable_ties,
     )
@@ -379,6 +382,7 @@ def match_topk_root(
         graph.x,
         None,
         None,
+        selection_dtype=graph.source.meta["val"].dtype,
         fragment_graph=graph,
         stable_ties=graph.stable_ties,
     )

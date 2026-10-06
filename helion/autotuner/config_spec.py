@@ -1450,6 +1450,7 @@ class ConfigSpec:
         # Enabled only when the whole root is a supported top-k load/store
         # dataflow. Its emitter owns the row geometry and vector layout.
         self.cute_topk_search_enabled = False
+        self.cute_topk_choices = dict(CUTE_TOPK_CHOICES)
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
         # A separately launched, proved pointwise producer can share one
@@ -2745,9 +2746,20 @@ class ConfigSpec:
             choices=direct_affine_schedule_choices(step_count)
         )
 
-    def enable_cute_topk_search(self) -> None:
+    def enable_cute_topk_search(
+        self, selection_dtype: torch.dtype | None = None
+    ) -> None:
         """Expose the independent row, lane, and vector geometry of top-k."""
         self.cute_topk_search_enabled = True
+        if selection_dtype == torch.float32:
+            # A full FP32 value plus an index cannot fit any 32-bit key.
+            # The 16-bit packed encoders are not legal for this representation.
+            self.cute_topk_choices = {
+                **CUTE_TOPK_CHOICES,
+                "cute_topk_key_dtype": ("int64",),
+                "cute_topk_key_encoder": ("dsl",),
+                "cute_topk_defer_value_gathers": (False,),
+            }
         # The root emitter supplies its own tiling. Ordinary block sizes do
         # not change its code; retain valid defaults for shared compiler
         # bookkeeping without searching duplicate generated kernels.
@@ -3762,7 +3774,7 @@ class ConfigSpec:
     def _normalize_cute_topk(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        for key, choices in CUTE_TOPK_CHOICES.items():
+        for key, choices in self.cute_topk_choices.items():
             if not self.cute_topk_search_enabled:
                 if key in config and not fix_invalid:
                     raise InvalidConfig(f"{key} requires a compatible top-k root")
@@ -5542,7 +5554,7 @@ class ConfigSpec:
             if self.cute_topk_search_enabled:
                 fields.update(
                     (key, EnumFragment(choices=choices))
-                    for key, choices in CUTE_TOPK_CHOICES.items()
+                    for key, choices in self.cute_topk_choices.items()
                 )
             elif self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())

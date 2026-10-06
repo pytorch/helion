@@ -5223,7 +5223,7 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                 # registration pass may not have installed its alias facts.
                 register_cute_tensor_alias_specializations(env)
                 if topk_tensors_are_proven_disjoint(plan, env, allow_unbound=True):
-                    env.config_spec.enable_cute_topk_search()
+                    env.config_spec.enable_cute_topk_search(plan.selection_dtype)
         return frozenset()
 
     @classmethod
@@ -5249,6 +5249,8 @@ class CuteTopKHeuristic(AutotunerHeuristic):
             # proof. Do not seed its specialized schedule without that proof.
             if plan is None or not topk_tensors_are_proven_disjoint(plan, env):
                 return None
+        full_precision = plan.selection_dtype == torch.float32
+        integer_key = "int64" if full_precision else "int32"
         padded_k = 1 << (plan.k - 1).bit_length()
         seeds = []
         # Retain the original register-pressure and occupancy candidates. All
@@ -5269,7 +5271,7 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                 cute_topk_vector_width=8,
                 cute_topk_output_vector_width=4,
                 cute_topk_value_mode=value_mode,
-                cute_topk_key_dtype="int32",
+                cute_topk_key_dtype=integer_key,
                 cute_topk_rank_mode=rank_mode,
                 cute_topk_selection_layout=layout,
             )
@@ -5301,12 +5303,14 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                 cute_topk_vector_width=input_vector,
                 cute_topk_output_vector_width=4,
                 cute_topk_value_mode="decode",
-                cute_topk_key_dtype=key_dtype,
+                cute_topk_key_dtype=integer_key if full_precision else key_dtype,
                 cute_topk_rank_mode="ordinal",
                 cute_topk_selection_layout=layout,
                 cute_topk_sort_network="compact_pruned",
             )
             seeds.append(config)
+        if full_precision:
+            return dedupe_configs(seeds)
         # Replicated ordinal decoding can avoid irregular value gathers. Add
         # all encoder implementations at two bounded register-fragment sizes;
         # these remain unpromoted search hints with the ordinary merge default.
@@ -5322,7 +5326,7 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                     cute_topk_vector_width=8,
                     cute_topk_output_vector_width=4,
                     cute_topk_value_mode="decode",
-                    cute_topk_key_dtype="int32",
+                    cute_topk_key_dtype=integer_key,
                     cute_topk_rank_mode="ordinal",
                     cute_topk_selection_layout="replicated",
                     cute_topk_sort_network="compact_pruned",

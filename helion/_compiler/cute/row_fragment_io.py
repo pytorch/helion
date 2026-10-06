@@ -13,6 +13,8 @@ from ..compile_environment import CompileEnvironment
 from .row_fragment import RowFragment
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..generate_ast import GenerateAST
     from .row_fragment import RowFragmentLayout
 
@@ -25,11 +27,20 @@ class RowFragmentIO:
     alignment; all other accesses retain scalar bounds checks.
     """
 
-    def __init__(self, cg: GenerateAST, *, row: str, lane: str, valid_row: str) -> None:
+    def __init__(
+        self,
+        cg: GenerateAST,
+        *,
+        row: str,
+        lane: str,
+        valid_row: str,
+        index_expression: Callable[[Node], str] | None = None,
+    ) -> None:
         self.cg = cg
         self.row = row
         self.lane = lane
         self.valid_row = valid_row
+        self.index_expression = index_expression
 
     def _add(self, source: str) -> None:
         for statement in ast.parse(source).body:
@@ -50,7 +61,11 @@ class RowFragmentIO:
         indices = []
         for dimension, index in enumerate(subscript):
             if isinstance(index, Node):
-                indices.append(self.row)
+                indices.append(
+                    self.row
+                    if self.index_expression is None
+                    else self.index_expression(index)
+                )
             elif index == slice(None):
                 indices.append("0" if tensor.size(dimension) == 1 else column)
             else:
