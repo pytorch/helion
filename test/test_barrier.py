@@ -595,3 +595,190 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
             r"under the hl\.barrier\(\) launch \(2, 64, 8\)",
         ):
             code_and_output(two_reductions_then_wide, (x, y))
+
+
+@onlyBackends(["cute"])
+class TestCuteOrderedPhases(RefEagerTestBase, TestCase):
+    @skipIfRefEager("checks separately launched grid phases")
+    def test_explicit_barrier_launch_order(self) -> None:
+        x = torch.randn(137, device=DEVICE)
+        for kernel, expected, phases in (
+            (barrier_dep_single, x * 2 + 1, 2),
+            (barrier_multiple, (x + 3) * 2 - 5, 3),
+        ):
+            with self.subTest(phases=phases):
+                code, output = code_and_output(
+                    kernel, (x,), block_sizes=[32] * phases, pid_type="flat"
+                )
+                torch.testing.assert_close(output, expected)
+                self.assertIn("_helion_cute_kernels", code)
+                self.assertIn(f"_helion_cute_region_{phases - 1}_module", code)
+
+    @skipIfRefEager("checks differently shaped phase grids")
+    def test_explicit_barrier_grid_to_row_reduction(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def transform_reduce(x: torch.Tensor) -> torch.Tensor:
+            scratch = torch.empty_like(x)
+            output = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+            for row, col in hl.tile(x.shape):
+                scratch[row, col] = x[row, col] * 2
+            hl.barrier()
+            for row in hl.tile(x.size(0)):
+                output[row] = scratch[row, :].sum(-1)
+            return output
+
+        x = torch.randn(17, 65, device=DEVICE)
+        _, output = code_and_output(
+            transform_reduce, (x,), block_sizes=[4, 32, 4], pid_type="flat"
+        )
+        torch.testing.assert_close(output, (x * 2).sum(-1))
+
+    @skipIfRefEager("checks a shared registered tile across different grid ranks")
+    def test_explicit_barrier_shared_tile_loop_order(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def transform_reduce(x: torch.Tensor) -> torch.Tensor:
+            row_block = hl.register_block_size(x.size(0))
+            scratch = torch.empty_like(x)
+            output = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+            for row, col in hl.tile(x.shape, block_size=[row_block, None]):
+                scratch[row, col] = x[row, col] * 2
+            hl.barrier()
+            for row in hl.tile(x.size(0), block_size=row_block):
+                output[row] = scratch[row, :].sum(-1)
+            return output
+
+        x = torch.randn(17, 65, device=DEVICE)
+        for order in ([0, 1], [1, 0]):
+            with self.subTest(order=order):
+                _, output = code_and_output(
+                    transform_reduce,
+                    (x,),
+                    block_sizes=[4, 32],
+                    loop_orders=[order],
+                    pid_type="flat",
+                )
+                torch.testing.assert_close(output, (x * 2).sum(-1))
+
+    @skipIfRefEager("checks scan and custom-reduction combine graphs across phases")
+    def test_explicit_barrier_scan_and_custom_reduction(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def scan_reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            scratch = torch.empty_like(x)
+            prefix = torch.empty_like(x)
+            total = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+            for row, col in hl.tile(x.shape):
+                scratch[row, col] = x[row, col] * 2
+            hl.barrier()
+            for row in hl.tile(x.size(0)):
+                values = scratch[row, :]
+                prefix[row, :] = hl.cumsum(values, dim=-1)
+                total[row] = hl.reduce(torch.add, values, dim=-1)
+            return prefix, total
+
+        x = torch.randn(17, 65, device=DEVICE)
+        _, (prefix, total) = code_and_output(
+            scan_reduce, (x,), block_sizes=[4, 32, 4], pid_type="flat"
+        )
+        torch.testing.assert_close(prefix, (x * 2).cumsum(-1))
+        torch.testing.assert_close(total, (x * 2).sum(-1))
+
+    @skipIfRefEager("checks runtime input aliases across phases")
+    def test_explicit_barrier_input_alias(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def mutate(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile] * 2
+            hl.barrier()
+            for tile in hl.tile(x.numel()):
+                x[tile] = out[tile] + 1
+            return x
+
+        for alias in (False, True):
+            with self.subTest(alias=alias):
+                x = torch.randn(137, device=DEVICE)
+                expected = x * 2 + 1
+                out = x if alias else torch.empty_like(x)
+                _, actual = code_and_output(
+                    mutate, (x, out), block_sizes=[32, 32], pid_type="flat"
+                )
+                torch.testing.assert_close(actual, expected)
+
+    @skipIfRefEager("checks ordered launch graph replay")
+    def test_explicit_barrier_graph_replay_with_alias(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            autotune_effort="none",
+            config=helion.Config(block_sizes=[32, 32], pid_type="flat"),
+        )
+        def mutate(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            scratch = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                scratch[tile] = x[tile] * 2
+            hl.barrier()
+            for tile in hl.tile(x.numel()):
+                out[tile] = scratch[tile] + 1
+            return out
+
+        x = torch.randn(137, device=DEVICE)
+        mutate(x, x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = mutate(x, x)
+        for _repeat in range(3):
+            source = torch.randn_like(x)
+            x.copy_(source)
+            graph.replay()
+            torch.testing.assert_close(output, source * 2 + 1)
+
+    @skipIfRefEager("checks unsupported phase ownership")
+    def test_explicit_barrier_grouped_roots_rejected(self) -> None:
+        x = torch.randn(137, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "each phase must contain one top-level grid loop"
+        ):
+            code_and_output(
+                barrier_groups, (x, x), block_sizes=[32] * 4, pid_type="flat"
+            )
+
+    @skipIfRefEager("checks host effects between grid phases")
+    def test_explicit_barrier_host_effect_rejected(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def allocate_between_phases(x: torch.Tensor) -> torch.Tensor:
+            scratch = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                scratch[tile] = x[tile] * 2
+            hl.barrier()
+            output = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                output[tile] = scratch[tile] + 1
+            return output
+
+        x = torch.randn(137, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.TopLevelStatementBetweenLoops, "Statements cannot appear between"
+        ):
+            code_and_output(
+                allocate_between_phases, (x,), block_sizes=[32, 32], pid_type="flat"
+            )
+
+    @skipIfRefEager("checks runtime conditional ownership")
+    def test_explicit_barrier_runtime_conditional_rejected(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def conditional(x: torch.Tensor) -> torch.Tensor:
+            scratch = torch.empty_like(x)
+            output = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                if tile.begin == 0:
+                    scratch[tile] = x[tile] * 2
+                else:
+                    scratch[tile] = x[tile] * 3
+            hl.barrier()
+            for tile in hl.tile(x.numel()):
+                output[tile] = scratch[tile] + 1
+            return output
+
+        x = torch.randn(137, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "runtime conditionals inside grid phases"
+        ):
+            code_and_output(conditional, (x,), block_sizes=[32, 32], pid_type="flat")

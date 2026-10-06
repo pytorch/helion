@@ -6,6 +6,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import get_triton_version
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -21,6 +22,7 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
@@ -72,6 +74,327 @@ def reduce_kernel(
 
 @onlyBackends(["triton", "cute", "pallas", "metal"])
 class TestReductions(RefEagerTestBase, TestCase):
+    @skipUnlessBackends(["cute", "triton"])
+    def test_factored_reductions_preserve_computed_coordinates(self):
+        @helion.kernel(static_shapes=True)
+        def factored(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            width = hl.specialize(x.size(1))
+            assert width == 64
+            maxima = torch.empty((x.size(0), 4), device=x.device, dtype=torch.int64)
+            minima = torch.empty_like(maxima)
+            selected = torch.empty_like(x)
+            columns = torch.arange(16, device=x.device)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :] * 3 + 1
+                groups = values.reshape(values.size(0), 4, 16)
+                high = groups.argmax(-1)
+                low = groups.argmin(-1)
+                retained = torch.where(
+                    columns[None, None, :] == high[:, :, None],
+                    groups,
+                    torch.zeros_like(groups),
+                ).reshape(values.size(0), 64)
+                # Reuse the same producer with both flat and factored maps.
+                selected[row, :] = retained + values - values.amax(-1, keepdim=True)
+                maxima[row, :] = high
+                minima[row, :] = low
+            return maxima, minima, selected
+
+        for dtype in (torch.float32, torch.float64, torch.int64):
+            for block_rows in (1, 8):
+                with self.subTest(dtype=dtype, block_rows=block_rows):
+                    x = torch.randint(-100, 100, (17, 128), device=DEVICE).to(dtype)[
+                        :, ::2
+                    ]
+                    if dtype == torch.int64:
+                        x = x + 2**53
+                    values = x * 3 + 1
+                    groups = values.reshape(17, 4, 16)
+                    high, low = groups.argmax(-1), groups.argmin(-1)
+                    retained = torch.zeros_like(groups).scatter(
+                        -1, high[:, :, None], groups.amax(-1, keepdim=True)
+                    )
+                    expected = (
+                        retained.reshape(17, 64)
+                        + values
+                        - values.amax(-1, keepdim=True)
+                    )
+                    code, actual = code_and_output(
+                        factored, (x,), block_sizes=[block_rows]
+                    )
+                    if _get_backend() == "cute":
+                        self.assertIn("fragment_selected_index", code)
+                    torch.testing.assert_close(
+                        actual, (high, low, expected), rtol=0, atol=0
+                    )
+
+    @skipUnlessBackends(["cute", "triton"])
+    def test_carried_argreduce_preserves_input_dtype_and_first_tie(self):
+        @helion.kernel(static_shapes=True)
+        def extrema(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            low_out = torch.empty((x.size(0),), device=x.device, dtype=torch.int64)
+            high_out = torch.empty_like(low_out)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                low = hl.full([row], 0, dtype=torch.int64)
+                high = hl.full([row], 0, dtype=torch.int64)
+                for _step in range(2):
+                    low = values.argmin(-1)
+                    high = values.argmax(-1)
+                    values = -values
+                low_out[row] = low
+                high_out[row] = high
+            return low_out, high_out
+
+        for dtype in (torch.float16, torch.float32, torch.float64, torch.int64):
+            with self.subTest(dtype=dtype):
+                if (
+                    dtype == torch.int64
+                    and _get_backend() == "tileir"
+                    and get_triton_version().release == (3, 6, 0)
+                ):
+                    self.skipTest(
+                        "TileIR 3.6.0 (0d9283bf) miscompiles carried int64 argreduce"
+                    )
+                x = torch.tensor(
+                    [
+                        [1, 4, 4, -2, -2, 0, 3],
+                        [0, 0, 0, 0, 0, 0, 0],
+                        [3, 1, 2, 3, 1, 2, 3],
+                        [2, 3, 1, 3, 2, 1, 3],
+                        [4, 4, -2, 4, -2, 4, -2],
+                    ],
+                    device=DEVICE,
+                    dtype=dtype,
+                )
+                if dtype.is_floating_point:
+                    x[0, 0] = float("nan")
+                    x[2, 3] = float("nan")
+                    x[3, -1] = float("nan")
+                    x[4, 1] = x[4, 5] = float("nan")
+                    x[1, 0] = -0.0
+                else:
+                    x = x + 2**53
+                code, actual = code_and_output(extrema, (x,), block_sizes=[8])
+                if _get_backend() == "cute":
+                    self.assertIn("fragment_selected_index", code)
+                torch.testing.assert_close(actual, ((-x).argmin(-1), (-x).argmax(-1)))
+
+    @onlyBackends(["cute", "triton"])
+    def test_integer_reductions_use_promoted_accumulators(self):
+        @helion.kernel(static_shapes=True)
+        def reduce_integer(x: torch.Tensor, product: hl.constexpr) -> torch.Tensor:
+            out = torch.empty((x.size(0),), device=x.device, dtype=torch.int64)
+            for row in hl.tile(x.size(0)):
+                if product:
+                    out[row] = x[row, :].prod(-1)
+                else:
+                    out[row] = x[row, :].sum(-1)
+            return out
+
+        cases = [
+            (torch.bool, False, 97, 1),
+            (torch.int8, False, 97, 3),
+            (torch.int8, True, 9, 2),
+        ]
+        for dtype, product, width, value in cases:
+            x = torch.full((17, width), value, device=DEVICE, dtype=dtype)
+            expected = x.prod(-1) if product else x.sum(-1)
+            for reduction_loop in (None, 4):
+                with self.subTest(dtype=dtype, product=product, loop=reduction_loop):
+                    _, output = code_and_output(
+                        reduce_integer,
+                        (x, product),
+                        block_sizes=[1],
+                        reduction_loops=[reduction_loop],
+                    )
+                    torch.testing.assert_close(output, expected)
+
+    @onlyBackends(["cute", "triton"])
+    def test_reduction_explicit_accumulator_dtype(self):
+        @helion.kernel(static_shapes=True)
+        def sum_as(x: torch.Tensor, dtype: hl.constexpr) -> torch.Tensor:
+            out = torch.empty((x.size(0),), device=x.device, dtype=dtype)
+            for row in hl.tile(x.size(0)):
+                out[row] = x[row, :].sum(-1, dtype=dtype)
+            return out
+
+        integer_input = torch.full((17, 97), 3, device=DEVICE, dtype=torch.int8)
+        # Exact in FP64, but FP32 accumulation loses the terms of magnitude 1.
+        floating_input = (
+            torch.tensor([1e8, 1, -1e8, 1] * 8, device=DEVICE, dtype=torch.float32)[
+                None, :
+            ]
+            .expand(17, -1)
+            .contiguous()
+        )
+        for x, dtype in [
+            (integer_input, torch.int32),
+            (floating_input, torch.float64),
+        ]:
+            for reduction_loop in (None, 4):
+                with self.subTest(dtype=dtype, loop=reduction_loop):
+                    _, output = code_and_output(
+                        sum_as,
+                        (x, dtype),
+                        block_sizes=[1],
+                        reduction_loops=[reduction_loop],
+                    )
+                    torch.testing.assert_close(
+                        output, x.sum(-1, dtype=dtype), rtol=0, atol=0
+                    )
+
+    @onlyBackends(["cute", "triton"])
+    def test_tiled_boolean_sum_uses_promoted_accumulator(self):
+        @helion.kernel(static_shapes=True)
+        def tile_count(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x, dtype=torch.int64)
+            for row in hl.tile(x.size(0)):
+                for col in hl.tile(x.size(1), block_size=64):
+                    out[row, col] = x[row, col].sum(-1)[:, None]
+            return out
+
+        x = torch.ones((17, 128), device=DEVICE, dtype=torch.bool)
+        for rows_per_block in (1, 16):
+            with self.subTest(rows_per_block=rows_per_block):
+                _, output = code_and_output(
+                    tile_count, (x,), block_sizes=[rows_per_block]
+                )
+                torch.testing.assert_close(output, torch.full_like(output, 64))
+
+    @onlyBackends(["cute"])
+    def test_carried_min_max_preserve_nan(self):
+        @helion.kernel(static_shapes=True)
+        def extrema(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            low_out = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            high_out = torch.empty_like(low_out)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                low = hl.full([row], 0.0, dtype=x.dtype)
+                high = hl.full([row], 0.0, dtype=x.dtype)
+                for _step in range(2):
+                    low = values.amin(-1)
+                    high = values.amax(-1)
+                    values = values + 1
+                low_out[row] = low
+                high_out[row] = high
+            return low_out, high_out
+
+        x = torch.randn(5, 8, device=DEVICE)
+        x[0, 0] = float("nan")
+        x[1, 4] = float("nan")
+        x[2, 7] = float("nan")
+        x[3, 0] = -float("inf")
+        x[3, 7] = float("inf")
+        code, (low, high) = code_and_output(extrema, (x,), block_sizes=[8])
+        self.assertIn("fragment_reduce_index", code)
+        torch.testing.assert_close(low, (x + 1).amin(-1), equal_nan=True)
+        torch.testing.assert_close(high, (x + 1).amax(-1), equal_nan=True)
+
+    @onlyBackends(["cute"])
+    def test_tile_reduction_after_full_slice_reduction(self):
+        @helion.kernel(static_shapes=True)
+        def filtered_max(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                threshold = x[row, :].amax(-1) * 0.3
+                best = hl.full([row], -float("inf"), dtype=x.dtype)
+                for col in hl.tile(x.size(1)):
+                    values = x[row, col]
+                    valid = torch.where(values >= threshold[:, None], values, 0.0)
+                    best = torch.maximum(best, valid.amax(-1))
+                out[row] = best
+            return out
+
+        for rows_per_block, reduction_size in [(16, 8), (32, 4)]:
+            with self.subTest(rows_per_block=rows_per_block):
+                x = torch.rand(65, 8, device=DEVICE)
+                _, output = code_and_output(
+                    filtered_max,
+                    (x,),
+                    block_sizes=[rows_per_block, 8],
+                    reduction_loops=[reduction_size],
+                )
+                torch.testing.assert_close(output, x.amax(-1))
+
+    @onlyBackends(["cute", "triton"])
+    def test_tiled_argreduce_returns_local_indices(self):
+        @helion.kernel(static_shapes=True)
+        def tile_extrema(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            minima = torch.empty_like(x, dtype=torch.int64)
+            maxima = torch.empty_like(x, dtype=torch.int64)
+            for row in hl.tile(x.size(0)):
+                for col in hl.tile(x.size(1), block_size=32):
+                    values = x[row, col]
+                    minima[row, col] = values.argmin(-1)[:, None]
+                    maxima[row, col] = values.argmax(-1)[:, None]
+            return minima, maxima
+
+        x = (
+            torch.arange(256, device=DEVICE, dtype=torch.float32)[None, :]
+            .expand(3, -1)
+            .contiguous()
+        )
+        _, (minima, maxima) = code_and_output(tile_extrema, (x,), block_sizes=[1])
+        torch.testing.assert_close(minima, torch.zeros_like(minima))
+        torch.testing.assert_close(maxima, torch.full_like(maxima, 31))
+
+    @onlyBackends(["cute"])
+    def test_runtime_loop_reductions_preserve_tensor_carries(self):
+        @helion.kernel(static_shapes=True)
+        def normalize_twice(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                for _step in range(2):
+                    low = values.amin(-1, keepdim=True)
+                    high = values.amax(-1, keepdim=True)
+                    scaled = (values - low) / (1 + high - low)
+                    product = (1 + scaled * 0.001).prod(-1, keepdim=True)
+                    values = scaled / product
+                out[row, :] = values
+            return out
+
+        x = torch.randn(17, 64, device=DEVICE)
+        expected = x
+        for _step in range(2):
+            low = expected.amin(-1, keepdim=True)
+            high = expected.amax(-1, keepdim=True)
+            scaled = (expected - low) / (1 + high - low)
+            expected = scaled / (1 + scaled * 0.001).prod(-1, keepdim=True)
+        code, output = code_and_output(normalize_twice, (x,), block_sizes=[32])
+        self.assertIn("fragment_reduce_index", code)
+        torch.testing.assert_close(output, expected, rtol=2e-5, atol=2e-6)
+
+    @onlyBackends(["cute"])
+    def test_reduction_with_independent_output_axis(self):
+        @helion.kernel(static_shapes=True)
+        def sum_outer(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((x.size(0), y.numel()), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                total = x[row, :].sum(-1, keepdim=True)
+                out[row, :] = total + y[:]
+            return out
+
+        for n, k, rows_per_block, reduction_size in [(128, 2, 32, 32), (256, 8, 1, 64)]:
+            with self.subTest(n=n, k=k, rows_per_block=rows_per_block):
+                x = torch.randn(17, n, device=DEVICE)
+                y = torch.arange(k, device=DEVICE, dtype=x.dtype)
+                code, output = code_and_output(
+                    sum_outer,
+                    (x, y),
+                    block_sizes=[rows_per_block],
+                    reduction_loops=[reduction_size],
+                )
+                torch.testing.assert_close(
+                    output, x.sum(-1, keepdim=True) + y, rtol=1e-5, atol=1e-5
+                )
+                if reduction_size > 32:
+                    self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+                    self.assertNotIn("threads_in_group=64", code)
+
     @skipIfPallas("non-power-of-2 reduction dims not supported on Pallas")
     def test_strided_threaded_reduction_non_sum_ops(self):
         """Exercise strided threaded block reduction lowering for non-sum ops."""

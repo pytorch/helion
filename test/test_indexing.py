@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import math
 import unittest
 from unittest.mock import patch
@@ -3343,6 +3344,75 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
 
+    @onlyBackends(["cute", "triton"])
+    def test_computed_tile_coordinates_with_singleton_views(self):
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def coordinates(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            prefix = torch.empty_like(x)
+            reused = torch.empty_like(x)
+            for row, col in hl.tile(x.shape, block_size=[2, 32]):
+                values = (row.index[:, None] * x.size(1) + col.index[None, :]).to(
+                    torch.float32
+                )
+                prefix[row, col] = hl.cumsum(values, dim=-1)
+                reused[row, col] = values + 1
+            return prefix, reused
+
+        x = torch.zeros(5, 65, device=DEVICE)
+        _, (prefix, reused) = code_and_output(coordinates, (x,))
+        values = torch.arange(5 * 65, device=DEVICE, dtype=x.dtype).reshape(5, 65)
+        expected = torch.cat([part.cumsum(-1) for part in values.split(32, -1)], -1)
+        torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
+        torch.testing.assert_close(reused, values + 1, rtol=0, atol=0)
+
+    @onlyBackends(["cute", "triton"])
+    def test_indexed_store_preserves_earlier_aliased_writes(self):
+        @helion.kernel(static_shapes=True)
+        def initialize_and_select(
+            slots: torch.Tensor, scores: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty(
+                (slots.numel(), 2), device=slots.device, dtype=torch.int32
+            )
+            flat = out.reshape(-1)
+            flat_scores = scores.reshape(-1)
+            for row in hl.tile(slots.numel()):
+                out[row, 0] = -1
+                out[row, 1] = -1
+                original = slots[row]
+                gathered = flat_scores[row.index * scores.size(1) + original]
+                chosen = torch.where(gathered >= 0, original, 1 - original)
+                best = hl.full([row], -float("inf"), dtype=scores.dtype)
+                for col in hl.tile(scores.size(1)):
+                    offsets = (
+                        row.index[:, None].to(torch.int64) * scores.size(1)
+                        + col.index[None, :]
+                    )
+                    uniform = hl.rand([], seed=7524, offsets=offsets)
+                    values = torch.where(uniform >= 0, scores[row, col], -float("inf"))
+                    best = torch.maximum(best, values.amax(-1))
+                flat[row.index * 2 + chosen] = best.to(torch.int32)
+            return out
+
+        # Exact tile multiples omit the ordinary row mask. The indexed store
+        # must not acquire extra iterations from the tracing-time tile hint.
+        slots = torch.arange(256, device=DEVICE, dtype=torch.int32) % 2
+        expected = torch.full((256, 2), -1, device=DEVICE, dtype=torch.int32)
+        scores = torch.arange(256 * 4, device=DEVICE, dtype=torch.float32).reshape(
+            256, 4
+        )
+        expected.scatter_(
+            1, slots.long()[:, None], scores.amax(-1).to(torch.int32)[:, None]
+        )
+        for rows_per_block in (16, 128):
+            with self.subTest(rows_per_block=rows_per_block):
+                _, output = code_and_output(
+                    initialize_and_select,
+                    (slots, scores),
+                    block_sizes=[rows_per_block, 4],
+                )
+                torch.testing.assert_close(output, expected)
+
     def test_scalar_tensor_index_with_grid(self):
         """Index a tensor with a 0-dim scalar tensor from a grid load."""
 
@@ -3373,6 +3443,99 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(gather_kernel, (data, ids), block_sizes=[64])
         expected = data[ids.long()]
         torch.testing.assert_close(result, expected)
+
+
+def _execute_pointwise_thread_program(source, inputs):
+    """Execute the actual scalar program for every launched CTA/thread on CPU."""
+    import itertools
+    import operator
+    from types import SimpleNamespace
+
+    writes = {}
+
+    class Pointer:
+        def __init__(self, tensor, offset=0):
+            self.tensor, self.offset = tensor, int(offset)
+
+        def __add__(self, offset):
+            return Pointer(self.tensor, self.offset + int(offset))
+
+        def load(self):
+            storage = self.tensor.as_strided(
+                (self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),),
+                (1,),
+                storage_offset=0,
+            )
+            offset = self.tensor.storage_offset() + self.offset
+            assert 0 <= offset < storage.numel()
+            return storage[offset].item()
+
+        def store(self, value):
+            storage = self.tensor.as_strided(
+                (self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),),
+                (1,),
+                storage_offset=0,
+            )
+            offset = self.tensor.storage_offset() + self.offset
+            assert 0 <= offset < storage.numel()
+            key = (self.tensor.untyped_storage().data_ptr(), offset)
+            writes[key] = writes.get(key, 0) + 1
+            storage[offset] = value
+
+    current = {"block": (0, 0, 0), "thread": (0, 0, 0)}
+    launches = []
+
+    def launcher(function, grid, *arguments, block):
+        launches.append(block)
+        args = [
+            SimpleNamespace(
+                iterator=Pointer(arg), layout=SimpleNamespace(stride=arg.stride())
+            )
+            if isinstance(arg, torch.Tensor)
+            else arg
+            for arg in arguments
+        ]
+        for cta in itertools.product(*(range(size) for size in grid)):
+            current["block"] = (*cta, *((0,) * (3 - len(cta))))
+            for thread in itertools.product(*(range(size) for size in block)):
+                current["thread"] = thread
+                function(*args)
+
+    tree = ast.parse(source)
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.FunctionDef):
+            node.decorator_list = []
+        body.append(node)
+    namespace = {
+        "torch": torch,
+        "operator": operator,
+        "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float, Boolean=bool),
+        "cute": SimpleNamespace(
+            arch=SimpleNamespace(
+                block_idx=lambda: current["block"], thread_idx=lambda: current["thread"]
+            )
+        ),
+        "_default_cute_launcher": launcher,
+        "_next_power_of_2": lambda value: 1 << (value - 1).bit_length(),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
+            "<pointwise-thread-model>",
+            "exec",
+        ),
+        namespace,
+    )
+    wrapper = next(
+        node.name for node in reversed(body) if isinstance(node, ast.FunctionDef)
+    )
+    result = namespace[wrapper](*inputs)
+    assert len(writes) == result.numel()
+    assert set(writes.values()) == {1}, "duplicate or missing output ownership"
+    return result, launches
 
 
 if __name__ == "__main__":

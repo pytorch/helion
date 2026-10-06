@@ -345,6 +345,7 @@ def test_reshape_records_only_complete_physical_group_proofs(mode: str) -> None:
     state = SimpleNamespace(
         codegen=SimpleNamespace(active_device_loops=active, current_grid_state=None)
     )
+    fn.codegen = state.codegen
     with patch.object(CompileEnvironment, "current", return_value=env):
         group = strategy._reshape_merged_reduction_group_params()
         if mode == "conflict":
