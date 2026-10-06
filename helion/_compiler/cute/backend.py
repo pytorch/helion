@@ -1480,6 +1480,7 @@ class CuteBackend(Backend):
                 "cute_fragment_register_loads",
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
+                "cute_fragment_topk_network",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_warp_results",
                 "cute_fragment_private_scalar_loops",
@@ -1554,6 +1555,8 @@ class CuteBackend(Backend):
                 "cute_topk_key_encoder",
                 "cute_topk_defer_value_gathers",
                 "cute_topk_merge_schedule",
+                "cute_topk_coarse_keys",
+                "cute_topk_key_recovery",
             )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")

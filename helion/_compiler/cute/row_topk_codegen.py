@@ -45,6 +45,7 @@ def codegen_row_topk(
     selected_index: Callable[[str], str],
     value_store: Callable[[str, str, str | None, RowValueRequirement | None], str],
     helper_name: str,
+    helper_arguments: str,
     helper_hash: str,
     index_type: str,
     row_guard: str,
@@ -109,6 +110,13 @@ def codegen_row_topk(
         if RowValueRequirement.NUMERIC in requirements
         else RowValueRequirement.UNUSED
     )
+
+    # Every selected value is either unused or recovered from its original
+    # producer at the selected index. All remaining consumers read index bits.
+    if plan.coarse_keys and (
+        value_requirement is RowValueRequirement.UNUSED or plan.value_mode == "gather"
+    ):
+        helper_arguments += ", payload_only=True"
 
     def load_fragment(node: Node) -> RowFragment:
         return io.load(node, emitter.layout)
@@ -188,7 +196,7 @@ for topk_i in cutlass.range_constexpr({fragment.num_registers}):
 """)
         generated(f"""
 topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row},
-                             {plan.sort_network!r}, {plan.merge_schedule!r})
+                             {plan.sort_network!r}, {plan.merge_schedule!r}{helper_arguments})
 """)
 
         # Give every selected rank exactly one owner, including K < subgroup size.

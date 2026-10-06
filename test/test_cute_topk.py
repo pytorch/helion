@@ -5875,3 +5875,2517 @@ def test_mixed_dtype_selection_uses_narrowed_keys(
     )
     assert "cutlass.Int64(-9223372036854775808)" not in code
     _assert_topk_output(x.to(dtype), values, indices, 8)
+
+
+# Guarded coarse-rank selection: execute the emitted helper's scalar control
+# flow, resolving its collective requests for a complete physical warp.
+def _coarse_rank_helper_model(
+    rows,
+    k,
+    lanes,
+    vector,
+    *,
+    recovery="direct",
+    rank_only=False,
+    payload_only=False,
+    active_rows=None,
+    index_bits=None,
+):
+    import inspect
+    import struct
+
+    from helion.runtime.cute.coarse_topk import coarse_rank_topk
+
+    class I32(int):
+        def __new__(cls, value=0):
+            return int.__new__(cls, (int(value) + (1 << 31)) % (1 << 32) - (1 << 31))
+
+        def __and__(self, other):
+            return I32(int(self) & int(other))
+
+        def __or__(self, other):
+            return I32(int(self) | int(other))
+
+        def bitcast(self, dtype):
+            assert dtype is F32
+            return F32(struct.unpack("f", struct.pack("i", self))[0])
+
+    class F32(float):
+        inf = float("inf")
+
+        def bitcast(self, dtype):
+            assert dtype is I32
+            return I32(struct.unpack("i", struct.pack("f", self))[0])
+
+    class Tensor:
+        def __init__(self, size, dtype):
+            self.shape = size
+            self.element_type = dtype
+            self.values = {}
+
+        def __getitem__(self, index):
+            assert int(index) in self.values, "read before initialization"
+            return self.element_type(self.values[int(index)])
+
+        def __setitem__(self, index, value):
+            assert 0 <= int(index) < self.shape
+            self.values[int(index)] = self.element_type(value)
+
+    class Collectives(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            name = ast.unparse(node.func)
+            if name == "distributed_topk" or name.startswith("cute.arch.shuffle_sync"):
+                return ast.Yield(
+                    ast.Tuple(
+                        elts=[
+                            ast.Constant(name),
+                            ast.Tuple(elts=node.args, ctx=ast.Load()),
+                            ast.Dict(
+                                keys=[ast.Constant(x.arg) for x in node.keywords],
+                                values=[x.value for x in node.keywords],
+                            ),
+                        ],
+                        ctx=ast.Load(),
+                    )
+                )
+            return node
+
+    node = ast.parse(
+        textwrap.dedent(inspect.getsource(inspect.unwrap(coarse_rank_topk)))
+    ).body[0]
+    node.decorator_list = []
+    node.returns = None
+    for arg in node.args.args:
+        arg.annotation = None
+    node = Collectives().visit(node)
+    state = {"lane": 0}
+    namespace = {
+        "Int32": I32,
+        "Int64": int,
+        "Float32": F32,
+        "cutlass": SimpleNamespace(
+            range_constexpr=range, const_expr=lambda value: value
+        ),
+        "cute": SimpleNamespace(
+            size=lambda x: x,
+            make_rmem_tensor=Tensor,
+            arch=SimpleNamespace(thread_idx=lambda: (state["lane"], 0, 0)),
+        ),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+            "<actual coarse helper>",
+            "exec",
+        ),
+        namespace,
+    )
+    n = len(rows[0])
+    assert len(rows) == 32 // lanes and all(len(x) == n for x in rows)
+    bits = (n - 1).bit_length() if index_bits is None else index_bits
+    assert n <= 1 << bits
+    mask = (1 << bits) - 1
+    if active_rows is None:
+        active_rows = len(rows)
+    size = max(1 << (((n + lanes - 1) // lanes) - 1).bit_length(), vector)
+    inputs = []
+    for lane in range(32):
+        tensor = Tensor(size, I32 if rank_only else int)
+        for i in range(size):
+            col = ((i // vector) * lanes + lane % lanes) * vector + i % vector
+            if lane // lanes >= active_rows:
+                tensor[i] = -(1 << 31) if rank_only else -(1 << 63)
+            elif rank_only:
+                tensor[i] = rows[lane // lanes][col] if col < n else -(1 << 31)
+            else:
+                tensor[i] = (
+                    (int(rows[lane // lanes][col]) << bits) | (mask - col)
+                    if col < n
+                    else -(1 << 63)
+                )
+        inputs.append(tensor)
+    tasks = [
+        namespace["coarse_rank_topk"](
+            x, k, lanes, "batcher", "sequential", bits, vector, recovery, payload_only
+        )
+        for x in inputs
+    ]
+    requests = []
+    results = [None] * 32
+    events = []
+    for lane, g in enumerate(tasks):
+        state["lane"] = lane
+        requests.append(next(g))
+    while any(x is not None for x in requests):
+        assert all(x is not None for x in requests), (
+            "nonuniform physical warp termination"
+        )
+        kind = requests[0][0]
+        assert all(x[0] == kind for x in requests), "divergent collective"
+        reply = []
+        if kind == "distributed_topk":
+            assert len({x[1][1:] for x in requests}) == 1
+            _, selected, width, *_ = requests[0][1]
+            dtype = requests[0][1][0].element_type
+            events.append(("sort", dtype is int, requests[0][1][0].shape))
+            for lane in range(32):
+                base = lane // width * width
+                values = sorted(
+                    [
+                        t[j]
+                        for t, *_ in [x[1] for x in requests[base : base + width]]
+                        for j in range(t.shape)
+                    ],
+                    reverse=True,
+                )[:selected]
+                t = Tensor(max(1, selected // width), dtype)
+                for j in range(t.shape):
+                    t[j] = values[j * width + lane % width % selected]
+                reply.append(t)
+        elif kind == "cute.arch.shuffle_sync_bfly":
+            for lane, (_, _args, kw) in enumerate(requests):
+                reply.append(requests[lane ^ kw["offset"]][1][0])
+        else:
+            assert kind == "cute.arch.shuffle_sync"
+            events.append(("indexed_shuffle", False, 1))
+            for lane, (_, _args, kw) in enumerate(requests):
+                width = 32 - (kw["mask_and_clamp"] >> 8)
+                peer = lane // width * width + int(kw["offset"])
+                assert lane // width == peer // width
+                reply.append(requests[peer][1][0])
+        for lane, g in enumerate(tasks):
+            state["lane"] = lane
+            try:
+                requests[lane] = g.send(reply[lane])
+            except StopIteration as e:
+                requests[lane] = None
+                results[lane] = e.value
+    actual = []
+    for group in range(active_rows):
+        row = [
+            results[group * lanes + rank % lanes][rank // lanes] for rank in range(k)
+        ]
+        expected = sorted(
+            [(int(v) << bits) | (mask - col) for col, v in enumerate(rows[group])],
+            reverse=True,
+        )[:k]
+        if payload_only:
+            assert [v & mask for v in row] == [v & mask for v in expected]
+        else:
+            assert row == expected
+        actual.append(row)
+    return events, actual
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize(
+    "lanes,vector,n,k",
+    [
+        (1, 1, 17, 8),
+        (2, 8, 65, 32),
+        (4, 4, 64, 8),
+        (8, 8, 256, 8),
+        (16, 8, 256, 8),
+        (32, 4, 65, 64),
+        (32, 1, 128, 1),
+    ],
+)
+def test_coarse_rank_topk_actual_helper_exact_membership(lanes, vector, n, k):
+    rng = random.Random(61)
+    rows = []
+    for _ in range(32 // lanes):
+        ranks = [0x3E800000 + i * 8192 for i in range(n)]
+        rng.shuffle(ranks)
+        rows.append(ranks)
+    events, _ = _coarse_rank_helper_model(rows, k, lanes, vector)
+    assert events[-1] == ("sort", True, max(1, k // lanes))
+    # Reverse the sub-bucket order of selected ranks. Refinement must restore it.
+    for row in rows:
+        row[:k] = [0x3F000000 + i for i in reversed(range(k))]
+    _coarse_rank_helper_model(rows, k, lanes, vector)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("exception", [0, -1, 1, 0x7F800000, 0x7FFFFFFF, -0x7FFFFFFF])
+def test_coarse_rank_topk_exceptional_and_cross_subgroup_fallback(exception):
+    rows = [[0x3E800000 + i * 8192 for i in range(65)] for _ in range(4)]
+    # Above-range ranks require a whole-warp fallback. Below-range ranks
+    # cannot displace the eight accepted ranks, whose keys remain exact.
+    rows[-1][3] = exception
+    events, _ = _coarse_rank_helper_model(rows, 8, 8, 4)
+    assert events[-1] == ("sort", True, 16 if exception >= 0x7F800000 else 1)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("k", [1, 8, 16, 32, 64])
+def test_coarse_rank_topk_duplicate_cutoff_and_padding(k):
+    rows = [[0x3F000000 + i for i in range(65)] for _ in range(2)]
+    events, _ = _coarse_rank_helper_model(rows, k, 16, 8)
+    assert events[-1] == ("sort", True, 8)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+def test_coarse_rank_topk_codegen_default_and_eligibility():
+    x = torch.empty((5, 65), dtype=torch.float32)
+    bound = _preprocessed_row_topk._bind_isolated((x, 8, True))
+    config = bound.config_spec.default_config()
+    config.config.update(_composition_config(16, "distributed"))
+    old = bound.to_code(config)
+    config.config["cute_topk_coarse_keys"] = False
+    assert old == bound.to_code(config)
+    config.config["cute_topk_coarse_keys"] = True
+    new = bound.to_code(config)
+    assert "import coarse_rank_topk as" in new
+    assert ", 7, 8)" in new
+    for invalid in ("replicated",):
+        config.config["cute_topk_selection_layout"] = invalid
+        with pytest.raises(exc.InvalidConfig, match="complete FP32 distributed"):
+            bound.to_code(config)
+    half = _preprocessed_row_topk._bind_isolated((x.to(torch.float16), 8, True))
+    cfg = half.config_spec.default_config()
+    cfg.config.update(_composition_config(16, "distributed"))
+    cfg.config["cute_topk_coarse_keys"] = True
+    with pytest.raises(exc.InvalidConfig, match="complete FP32 distributed"):
+        half.to_code(cfg)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_coarse_rank_topk_installed_sdk_preprocessor():
+    import inspect
+
+    from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor
+
+    from helion.runtime.cute.coarse_topk import coarse_rank_topk
+
+    raw = inspect.unwrap(coarse_rank_topk)
+    with DSLPreprocessor(["cutlass"]).get_session() as session:
+        tree = session.transform(raw, dict(raw.__globals__))
+        compile(tree, raw.__code__.co_filename, "exec", dont_inherit=True)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("seed", [31, 61, 97])
+def test_coarse_rank_topk_old_population_prefix_and_rng(seed):
+    from test.cute_population_contracts import checked_initial_population
+
+    from helion.autotuner.pattern_search import PatternSearch
+
+    args = (torch.empty((5, 256), dtype=torch.float32), 8, True)
+    results = []
+    states = []
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch(
+            "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
+        ),
+    ):
+        for enabled in (False, True):
+            kernel = helion.kernel(
+                _row_topk.fn, backend="cute", static_shapes=True, autotune_effort="full"
+            )
+            context = patch(
+                "helion._compiler.autotuner_heuristics.register_topk_coarse_keys_coverage"
+            )
+            if not enabled:
+                with context:
+                    bound = _cpu_bind(kernel, args)
+            else:
+                bound = _cpu_bind(kernel, args)
+            spec = bound.config_spec
+            assert "cute_topk_coarse_keys" not in spec.default_config()
+            assert all(
+                "cute_topk_coarse_keys" not in s for s in spec.compiler_seed_configs
+            )
+            with bound.env:
+                random.seed(seed)
+                search = PatternSearch(bound, args, initial_population=100)
+                population = checked_initial_population(search)
+                configs = [
+                    dict(search.config_gen.canonicalize_flat(x)[1]) for x in population
+                ]
+                results.append(configs)
+                states.append(random.getstate())
+            if enabled:
+                group = next(
+                    g
+                    for g in spec.compiler_coverage_groups
+                    if g.key == "cute_topk_coarse_keys"
+                )
+                assert group.deferred and group.legacy is False
+                assert configs[-1]["cute_topk_coarse_keys"] is True
+        assert results[1][:-1] == results[0]
+        assert states[0] == states[1]
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_coarse_rank_topk_sdk_rank_bitcasts_and_recovery():
+    import cutlass
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import func
+    import cutlass.cute as cute
+
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp(
+                "coarse_bits", ([cutlass.Int64.mlir_type, cutlass.Int32.mlir_type], [])
+            )
+            block = function.add_entry_block()
+            with ir.InsertionPoint(block):
+                key = cutlass.Int64(block.arguments[0])
+                owner = cutlass.Int32(block.arguments[1])
+                rank = cutlass.Int32(key >> 8)
+                bits = (rank & cutlass.Int32(-256)) | cutlass.Int32(key & 255)
+                coarse = bits.bitcast(cutlass.Float32)
+                assert coarse.dtype == cutlass.Float32
+                recovered = cute.arch.shuffle_sync(
+                    rank, offset=owner, mask_and_clamp=(16 << 8) | 31
+                )
+                exact = (cutlass.Int64(recovered) << 8) | cutlass.Int64(
+                    coarse.bitcast(cutlass.Int32) & 255
+                )
+                assert exact.dtype == cutlass.Int64
+                func.ReturnOp([])
+        assert module.operation.verify()
+        text = str(module)
+        assert "arith.bitcast" in text and "nvvm.shfl.sync" in text
+        assert "arith.shrsi" in text and "arith.extsi" in text
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "n,k,lanes,vector,largest",
+    [
+        (17, 3, 1, 1, True),
+        (65, 8, 8, 4, True),
+        (256, 8, 16, 8, True),
+        (65, 32, 32, 4, False),
+    ],
+)
+def test_coarse_rank_topk_native_exact_special_values(n, k, lanes, vector, largest):
+    x = torch.arange(5 * n, device=DEVICE, dtype=torch.float32).reshape(5, n) / 128 + 1
+    x[1].fill_(1)
+    x[2, 0] = float("nan")
+    x[2, 1] = float("inf")
+    x[2, 2] = -float("inf")
+    x[3, 0] = -0.0
+    x[3, 1] = 0.0
+    x[3, 2] = torch.finfo(torch.float32).tiny / 2
+    if not largest:
+        x = -x
+    if not largest:
+        storage = torch.zeros((5, n * 3), device=x.device, dtype=x.dtype)
+        storage[:, ::3] = x
+        x = storage[:, ::3]
+    before = x.clone()
+    code, (values, indices) = code_and_output(
+        _row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=vector,
+        cute_topk_selection_layout="distributed",
+        cute_topk_key_dtype="int64",
+        cute_topk_coarse_keys=True,
+    )
+    assert "import coarse_rank_topk as" in code
+    _assert_topk_output(x, values, indices, k, largest)
+    assert torch.equal(x.view(torch.int32), before.view(torch.int32))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("producer", ["sigmoid", "softmax"])
+def test_coarse_rank_topk_native_composed_producer(producer):
+    x = torch.randn((17, 256), device=DEVICE, dtype=torch.float32)
+    bias = torch.linspace(-0.25, 0.25, 256, device=DEVICE)
+    before = (x.clone(), bias.clone())
+    code, (values, indices, processed) = code_and_output(
+        _mixed_dtype_row_topk,
+        (x, bias, 8, producer, True, False),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=16,
+        cute_topk_rows_per_block=8,
+        cute_topk_vector_width=8,
+        cute_topk_selection_layout="distributed",
+        cute_topk_key_dtype="int64",
+        cute_topk_coarse_keys=True,
+    )
+    assert "import coarse_rank_topk as" in code
+    _assert_topk_output(processed, values, indices, 8, True)
+    expected = (x + bias).sigmoid() if producer == "sigmoid" else (x + bias).softmax(-1)
+    torch.testing.assert_close(processed, expected, rtol=3e-5, atol=2e-6)
+    assert torch.equal(before[0], x) and torch.equal(before[1], bias)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("n,k", [(1, 1), (65, 65)])
+def test_coarse_rank_topk_rejects_unsupported_extent(n, k):
+    bound = _row_topk._bind_isolated((torch.ones(3, n), k, True))
+    cfg = bound.config_spec.default_config()
+    cfg.config.update(
+        cute_topk_selection_layout="distributed", cute_topk_coarse_keys=True
+    )
+    with pytest.raises(exc.InvalidConfig, match="complete FP32 distributed"):
+        bound.to_code(cfg)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_coarse_rank_topk_model_detects_missing_ambiguity_guard():
+    import inspect
+
+    from helion.runtime.cute.coarse_topk import coarse_rank_topk
+
+    original = inspect.getsource
+    raw = inspect.unwrap(coarse_rank_topk)
+
+    def unsafe(function):
+        text = original(function)
+        if function is raw:
+            text = text.replace("(matches != 1) | (bad != 0)", "bad != 0")
+        return text
+
+    with (
+        patch.object(inspect, "getsource", side_effect=unsafe),
+        pytest.raises(AssertionError),
+    ):
+        _coarse_rank_helper_model(
+            [[0x3F000000 + i for i in range(65)] for _ in range(2)], 8, 16, 8
+        )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("size,k,lanes,vector", [(16, 8, 16, 8), (4, 32, 8, 2)])
+def test_coarse_rank_topk_entire_sdk_module(
+    size, k, lanes, vector, recovery="direct", rank_only=False, payload_only=False
+):
+    import inspect
+
+    import cutlass
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import func
+    from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor
+    import cutlass.cute as cute
+
+    from helion.runtime.cute import coarse_topk
+    from helion.runtime.cute import topk
+
+    # Use the installed, unmodified AST processor and IR builders for every
+    # selection helper. No native compiler, GPU context, or arithmetic mock.
+    namespace = dict(vars(topk))
+    for module, name in [
+        (topk, "_sort_descending"),
+        (topk, "_merge_descending"),
+        (topk, "_merge_topk"),
+        (topk, "local_topk"),
+        (topk, "_merge_cyclic_fragment"),
+        (topk, "distributed_topk"),
+        (coarse_topk, "coarse_rank_topk"),
+    ]:
+        raw = inspect.unwrap(getattr(module, name))
+        with DSLPreprocessor(["cutlass"]).get_session() as session:
+            tree = session.transform(raw, dict(raw.__globals__))
+            exec(
+                compile(tree, raw.__code__.co_filename, "exec", dont_inherit=True),
+                namespace,
+            )
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            input_type = cutlass.Int32 if rank_only else cutlass.Int64
+            function = func.FuncOp("coarse_full", ([input_type.mlir_type], []))
+            block = function.add_entry_block()
+            with ir.InsertionPoint(block):
+                keys = cute.make_rmem_tensor(size, input_type)
+                for i in range(size):
+                    keys[i] = input_type(block.arguments[0])
+                result = namespace["coarse_rank_topk"](
+                    keys,
+                    k,
+                    lanes,
+                    "compact_pruned",
+                    "balanced",
+                    8,
+                    vector,
+                    recovery,
+                    payload_only,
+                )
+                assert result.element_type == cutlass.Int64
+                assert cute.size(result.shape) == max(1, k // lanes)
+                func.ReturnOp([])
+        assert module.operation.verify()
+        text = str(module)
+        assert "scf.if" in text and "nvvm.shfl.sync" in text
+        assert "arith.bitcast" in text
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("layout", ["strided", "transposed", "offset"])
+def test_coarse_rank_topk_resident_mapping_ignores_host_strides(layout):
+    import re
+
+    if layout == "strided":
+        x = torch.empty((5, 195))[:, ::3]
+    elif layout == "transposed":
+        x = torch.empty((65, 5)).t()
+    else:
+        x = torch.empty((7, 67))[1:6, 1:66]
+    bound = _row_topk._bind_isolated((x, 8, True))
+    cfg = bound.config_spec.default_config()
+    cfg.config.update(_composition_config(16, "distributed"))
+    before = bound.to_code(cfg)
+    cfg.config["cute_topk_coarse_keys"] = True
+    after = bound.to_code(cfg)
+
+    # Restoring the exact full-key packing at each Int32 rank store must recover
+    # the complete old AST. This checks every host address, mask and physical
+    # register mapping, including sliced bases and transposed input storage.
+    class SelectionOnly(ast.NodeTransformer):
+        rank_buffers = 0
+        rank_stores = 0
+        rank_padding = 0
+
+        def visit_Assign(self, node):
+            if (
+                len(node.targets) == 1
+                and ast.unparse(node.targets[0]) == "topk_keys"
+                and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func) == "cute.make_rmem_tensor"
+                and ast.unparse(node.value.args[1]) == "cutlass.Int32"
+            ):
+                self.rank_buffers += 1
+                node.value.args[1] = ast.parse("cutlass.Int64", mode="eval").body
+            if (
+                len(node.targets) == 1
+                and ast.unparse(node.targets[0]) == "topk_keys[topk_i]"
+                and ast.unparse(node.value) == "topk_ordered"
+            ):
+                self.rank_stores += 1
+                return ast.parse(
+                    "topk_packed = ((cutlass.Int64(topk_ordered) << cutlass.Int32(7)) "
+                    "| cutlass.Int64(cutlass.Int32(127) - topk_col))\n"
+                    "topk_keys[topk_i] = topk_packed"
+                ).body
+            return self.generic_visit(node)
+
+        def visit_ImportFrom(self, node):
+            if node.module == "helion.runtime.cute.coarse_topk":
+                node.module = "helion.runtime.cute.topk"
+                node.names[0].name = "distributed_topk"
+            for alias in node.names:
+                if alias.asname:
+                    alias.asname = re.sub(r"_[0-9a-f]{16}$", "", alias.asname).replace(
+                        "_cute_coarse_rank_topk", "_cute_distributed_topk"
+                    )
+            return node
+
+        def visit_Name(self, node):
+            node.id = re.sub(r"_[0-9a-f]{16}$", "", node.id).replace(
+                "_cute_coarse_rank_topk", "_cute_distributed_topk"
+            )
+            return node
+
+        def visit_Call(self, node):
+            if (
+                ast.unparse(node.func) == "topk_keys.fill"
+                and ast.unparse(node.args[0]) == "cutlass.Int32(-2147483648)"
+            ):
+                self.rank_padding += 1
+                node.args[0] = ast.parse(
+                    "cutlass.Int64(-9223372036854775808)", mode="eval"
+                ).body
+            if isinstance(node.func, ast.Name) and node.func.id.startswith(
+                "_cute_coarse_rank_topk_"
+            ):
+                assert len(node.args) == 7
+                assert [x.value for x in node.args[5:]] == [7, 8]
+                node.args = node.args[:5]
+            return self.generic_visit(node)
+
+    restored = SelectionOnly()
+    old = SelectionOnly().visit(ast.parse(before))
+    new = restored.visit(ast.parse(after))
+    assert restored.rank_buffers == restored.rank_padding == 1
+    assert restored.rank_stores > 0
+    assert ast.dump(old) == ast.dump(new)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize(
+    "n,k,lanes,vector",
+    [
+        (2, 1, 1, 1),
+        (17, 4, 4, 8),
+        (65, 8, 16, 4),
+        (256, 8, 16, 8),
+        (257, 64, 16, 4),
+        (1025, 16, 32, 8),
+        (8193, 32, 32, 4),
+        (32768, 8, 32, 8),
+    ],
+)
+def test_coarse_rank_topk_packed_residues_exact_and_shuffle_count(n, k, lanes, vector):
+    bits = (n - 1).bit_length()
+    mask = (1 << bits) - 1
+    rng = random.Random(173)
+    rows = []
+    for row in range(32 // lanes):
+        ranks = [
+            0x08000000 + i * (mask + 1) + ((i * 137 + row) & mask) for i in range(n)
+        ]
+        rng.shuffle(ranks)
+        rows.append(ranks)
+    events, _ = _coarse_rank_helper_model(rows, k, lanes, vector, recovery="packed")
+    size = max(1 << (((n + lanes - 1) // lanes) - 1).bit_length(), vector)
+    pack = min(size, 1 << ((32 // bits).bit_length() - 1))
+    recovery = ((size + pack - 1) // pack) * max(1, k // lanes)
+    indexed = sum(event[0] == "indexed_shuffle" for event in events)
+    assert events[-1] == ("sort", True, max(1, k // lanes))
+    assert indexed == 1 + recovery  # One cutoff broadcast, then packed recovery.
+    assert recovery <= size * max(1, k // lanes)
+    if n == 256:
+        assert recovery == 4 and size == 16
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_coarse_rank_topk_packed_residue_sign_bit_is_masked():
+    import inspect
+
+    from helion.runtime.cute.coarse_topk import coarse_rank_topk
+
+    original = inspect.getsource
+    raw = inspect.unwrap(coarse_rank_topk)
+    # Every residue is 0xff: each packed Int32 has its sign bit set.
+    rows = [[0x3F0000FF + i * 256 for i in range(256)] for _ in range(2)]
+    _coarse_rank_helper_model(rows, 8, 16, 8, recovery="packed")
+
+    def unsafe(function):
+        text = original(function)
+        if function is raw:
+            text = text.replace("(word >> shift) & Int32(index_mask)", "word >> shift")
+        return text
+
+    with (
+        patch.object(inspect, "getsource", side_effect=unsafe),
+        pytest.raises(AssertionError),
+    ):
+        _coarse_rank_helper_model(rows, 8, 16, 8, recovery="packed")
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("seed", [31, 61, 97])
+def test_coarse_rank_topk_key_recovery_population(seed):
+    from test.cute_population_contracts import checked_initial_population
+
+    from helion.autotuner.pattern_search import PatternSearch
+
+    args = (torch.empty((5, 256), dtype=torch.float32), 8, True)
+    results, states = [], []
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        for enabled in (False, True):
+            kernel = helion.kernel(
+                _row_topk.fn, backend="cute", static_shapes=True, autotune_effort="full"
+            )
+            if enabled:
+                bound = _cpu_bind(kernel, args)
+            else:
+                with patch(
+                    "helion._compiler.autotuner_heuristics.register_topk_key_recovery_coverage"
+                ):
+                    bound = _cpu_bind(kernel, args)
+            spec = bound.config_spec
+            assert "cute_topk_key_recovery" not in spec.default_config()
+            assert all(
+                "cute_topk_key_recovery" not in x for x in spec.compiler_seed_configs
+            )
+            with bound.env:
+                random.seed(seed)
+                search = PatternSearch(bound, args, initial_population=100)
+                population = checked_initial_population(search)
+                results.append(
+                    [
+                        dict(search.config_gen.canonicalize_flat(x)[1])
+                        for x in population
+                    ]
+                )
+                states.append(random.getstate())
+            if enabled:
+                group = next(
+                    g
+                    for g in spec.compiler_coverage_groups
+                    if g.key == "cute_topk_key_recovery"
+                )
+                assert group.deferred and group.legacy == "direct"
+                assert group.dependencies[0].key == "cute_topk_coarse_keys"
+                assert results[-1][-1]["cute_topk_key_recovery"] == "packed"
+                assert results[-1][-1]["cute_topk_coarse_keys"] is True
+        assert results[1][:-1] == results[0]
+        assert states[0] == states[1]
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("mode", ["direct", "packed"])
+def test_coarse_rank_topk_key_recovery_config_and_codegen(mode):
+    bound = _row_topk._bind_isolated((torch.empty(5, 256), 8, True))
+    spec = bound.config_spec
+    generation = spec.create_config_generation()
+    cfg = spec.default_config()
+    cfg.config.update(
+        cute_topk_selection_layout="distributed",
+        cute_topk_key_dtype="int64",
+        cute_topk_coarse_keys=True,
+        cute_topk_key_recovery=mode,
+    )
+    _, normalized = generation.strict_config_pair(cfg)
+    assert normalized.config.get("cute_topk_key_recovery", "direct") == mode
+    _, repeated = generation.strict_config_pair(
+        helion.Config.from_dict(normalized.config)
+    )
+    assert repeated.config == normalized.config
+    code = bound.to_code(cfg)
+    calls = [
+        n
+        for n in ast.walk(ast.parse(code))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id.startswith("_cute_coarse_rank_topk_")
+    ]
+    assert len(calls) == 1
+    assert [(x.arg, x.value.value) for x in calls[0].keywords] == (
+        ([] if mode == "direct" else [("recovery", "packed")])
+        + [("payload_only", True)]
+    )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize(
+    "mode,coarse,dtype",
+    [
+        ("packed", False, torch.float32),
+        ("bad", True, torch.float32),
+        (True, True, torch.float32),
+        ("packed", True, torch.float16),
+    ],
+)
+def test_coarse_rank_topk_key_recovery_rejects_invalid(mode, coarse, dtype):
+    bound = _row_topk._bind_isolated((torch.empty(5, 256, dtype=dtype), 8, True))
+    cfg = bound.config_spec.default_config()
+    cfg.config.update(
+        cute_topk_selection_layout="distributed",
+        cute_topk_key_dtype="int64",
+        cute_topk_coarse_keys=coarse,
+        cute_topk_key_recovery=mode,
+    )
+    with pytest.raises(exc.InvalidConfig):
+        bound.config_spec.create_config_generation().strict_config_pair(cfg)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize(
+    "n,k,lanes,vector",
+    [(17, 8, 4, 4), (65, 32, 32, 4), (256, 8, 16, 8), (1025, 16, 32, 8)],
+)
+def test_coarse_rank_topk_key_recovery_modes_exact(n, k, lanes, vector):
+    rng = random.Random(812)
+    rows = []
+    for _ in range(32 // lanes):
+        ranks = [0x3E800000 + i * 4096 + rng.randrange(128) for i in range(n)]
+        rng.shuffle(ranks)
+        rows.append(ranks)
+    direct_events, direct = _coarse_rank_helper_model(
+        rows, k, lanes, vector, recovery="direct"
+    )
+    packed_events, packed = _coarse_rank_helper_model(
+        rows, k, lanes, vector, recovery="packed"
+    )
+    assert direct == packed
+    assert sum(x[0] == "indexed_shuffle" for x in packed_events) <= sum(
+        x[0] == "indexed_shuffle" for x in direct_events
+    )
+    rows[0] = [0x3F000001] * n
+    for recovery in ("direct", "packed"):
+        events, _ = _coarse_rank_helper_model(rows, k, lanes, vector, recovery=recovery)
+        assert sum(x[0] == "indexed_shuffle" for x in events) == 1
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("mode", ["direct", "packed"])
+def test_coarse_rank_topk_key_recovery_full_sdk(mode):
+    test_coarse_rank_topk_entire_sdk_module(16, 8, 16, 8, mode)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode", ["direct", "packed"])
+def test_coarse_rank_topk_key_recovery_native(mode):
+    x = (
+        torch.arange(5 * 256, device=DEVICE, dtype=torch.float32).reshape(5, 256) / 128
+        + 1
+    )
+    x[1].fill_(1)
+    x[2, 0] = float("nan")
+    x[3, 0] = -0.0
+    x[4, 0] = float("inf")
+    original = x.clone()
+    cfg = _composition_config(16, "distributed")
+    cfg.update(
+        cute_topk_key_dtype="int64",
+        cute_topk_coarse_keys=True,
+        cute_topk_key_recovery=mode,
+    )
+    _, (values, indices) = code_and_output(_row_topk, (x, 8, True), **cfg)
+    _assert_topk_output(x, values, indices, 8, True)
+    assert torch.equal(original.view(torch.int32), x.view(torch.int32))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize(
+    "n,k,lanes,vector",
+    [(17, 8, 1, 1), (65, 32, 8, 4), (256, 8, 16, 8), (257, 64, 32, 4)],
+)
+def test_coarse_rank_topk_rank_input_exact(n, k, lanes, vector, recovery):
+    rng = random.Random(117)
+    rows = []
+    for _ in range(32 // lanes):
+        row = [0x3E800000 + i * 16384 + rng.randrange(128) for i in range(n)]
+        rng.shuffle(row)
+        rows.append(row)
+    for fallback in (False, True):
+        if fallback:
+            # One ambiguous subrow must force the same full-warp fallback even
+            # while the other subrows could take the narrow path.
+            rows[0] = [0x3F000001] * n
+        old_events, old = _coarse_rank_helper_model(
+            rows, k, lanes, vector, recovery=recovery
+        )
+        events, actual = _coarse_rank_helper_model(
+            rows, k, lanes, vector, recovery=recovery, rank_only=True
+        )
+        assert actual == old and events == old_events
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_coarse_rank_topk_rank_input_special_values(recovery, rank_mode, largest):
+    # These are the complete classes surrounding both ends of the admitted
+    # FP32 rank domain: NaNs, infinities, normals, subnormals and signed zeros.
+    words = [
+        0,
+        0x80000000,
+        1,
+        0x80000001,
+        0x007FFFFF,
+        0x807FFFFF,
+        0x00800000,
+        0x80800000,
+        0x7F7FFFFF,
+        0xFF7FFFFF,
+        0x7F800000,
+        0xFF800000,
+        0x7F800001,
+        0xFF800001,
+        0x7FFFFFFF,
+        0xFFFFFFFF,
+        0x3F800000,
+    ]
+    ranks = []
+    for word in words:
+        bits = word if word < 1 << 31 else word - (1 << 32)
+        sign = bits >> 31
+        magnitude = bits & 0x7FFFFFFF
+        rank = (
+            (bits ^ (sign & 0x7FFFFFFF))
+            if rank_mode == "ordinal"
+            else (magnitude ^ sign) - sign
+        )
+        if magnitude > 0x7F800000:
+            rank = 0x7FFFFFFF
+        ranks.append(rank if largest else -rank)
+    assert all(-(1 << 31) < rank < (1 << 31) for rank in ranks)
+    rows = [ranks, list(reversed(ranks))]
+    old_events, old = _coarse_rank_helper_model(rows, 16, 16, 8, recovery=recovery)
+    events, actual = _coarse_rank_helper_model(
+        rows, 16, 16, 8, recovery=recovery, rank_only=True
+    )
+    assert actual == old and events == old_events
+    assert events[-1] == ("sort", True, 8)  # Complete resident fallback, with tails.
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("size,k,lanes,vector", [(16, 8, 16, 8), (4, 32, 8, 2)])
+def test_coarse_rank_topk_rank_input_full_sdk(size, k, lanes, vector, recovery):
+    test_coarse_rank_topk_entire_sdk_module(size, k, lanes, vector, recovery, True)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_coarse_rank_topk_rank_input_actual_encoder(rank_mode, largest):
+    bound = _row_topk._bind_isolated((torch.empty(5, 65), 8, largest))
+    cfg = bound.config_spec.default_config()
+    cfg.config.update(_composition_config(16, "distributed"))
+    cfg.config.update(cute_topk_rank_mode=rank_mode, cute_topk_key_dtype="int64")
+    encoders = []
+    for enabled in (False, True):
+        cfg.config["cute_topk_coarse_keys"] = enabled
+        tree = ast.parse(bound.to_code(cfg))
+        body = next(
+            node.body
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(stmt, ast.Assign)
+                and ast.unparse(stmt.targets[0]) == "topk_magnitude"
+                for stmt in node.body
+            )
+        )
+        start = next(
+            i
+            for i, stmt in enumerate(body)
+            if isinstance(stmt, ast.Assign)
+            and ast.unparse(stmt.targets[0]) == "topk_magnitude"
+        )
+        end = next(
+            i
+            for i, stmt in enumerate(body)
+            if isinstance(stmt, ast.Assign)
+            and ast.unparse(stmt.targets[0]) == "topk_keys[topk_i]"
+        )
+        encoders.append(
+            compile(
+                ast.Module(body=body[start : end + 1], type_ignores=[]),
+                "<actual rank encoder>",
+                "exec",
+            )
+        )
+    rng = random.Random(113)
+    words = [rng.getrandbits(32) for _ in range(4096)]
+    # Both signs at every exponent boundary, including all non-finite classes.
+    words += [
+        sign | (exponent << 23) | mantissa
+        for sign in (0, 1 << 31)
+        for exponent in range(256)
+        for mantissa in (0, 1, (1 << 23) - 1)
+    ]
+    for index, word in enumerate(words):
+        bits = word if word < 1 << 31 else word - (1 << 32)
+        column = index % 65
+        values = []
+        for encoder in encoders:
+            local = {
+                "topk_bits": bits,
+                "topk_col": column,
+                "topk_i": 0,
+                "topk_keys": {},
+            }
+            exec(encoder, {"cutlass": SimpleNamespace(Int32=int, Int64=int)}, local)
+            values.append(local["topk_keys"][0])
+        full_key, rank = values
+        assert -(1 << 31) < rank < (1 << 31)
+        assert full_key == (rank << 7) | (127 - column)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_coarse_rank_topk_rank_input_native(rank_mode, largest):
+    # Narrow input padding must stay distinct from either extreme canonical
+    # rank. Include scalar loads, row tails, subrows and both recovery paths.
+    storage = torch.randn((7, 195), device=DEVICE, dtype=torch.float32)
+    x = storage[1:6, ::3]
+    x[0, :7] = torch.tensor(
+        [float("nan"), float("inf"), -float("inf"), -0.0, 0.0, 1e-40, -1e-40],
+        device=x.device,
+    )
+    x[1].fill_(1)
+    original = storage.clone()
+    cfg = _composition_config(16, "distributed")
+    cfg.update(
+        cute_topk_coarse_keys=True,
+        cute_topk_key_dtype="int64",
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_key_recovery="direct" if largest else "packed",
+    )
+    _, (values, indices) = code_and_output(_row_topk, (x, 8, largest), **cfg)
+    _assert_topk_output(x, values, indices, 8, largest)
+    assert torch.equal(original.view(torch.int32), storage.view(torch.int32))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+def test_coarse_rank_topk_payload_sorted_models(rank_only, recovery):
+    rng = random.Random(701)
+    for lanes, vector, n, k in (
+        (1, 1, 17, 8),
+        (2, 4, 33, 16),
+        (4, 4, 65, 32),
+        (8, 8, 65, 16),
+        (16, 8, 129, 8),
+        (32, 4, 65, 64),
+        (32, 1, 33, 1),
+    ):
+        rows = []
+        for group in range(32 // lanes):
+            row = [0x3E800000 + column * 8192 + group for column in range(n)]
+            rng.shuffle(row)
+            rows.append(row)
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            k,
+            lanes,
+            vector,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=True,
+        )
+        assert [event for event in events if event[0] == "sort"] == [
+            (
+                "sort",
+                False,
+                max(vector, 1 << (((n + lanes - 1) // lanes) - 1).bit_length()),
+            )
+        ]
+        # A padded row makes its whole physical warp take the exact fallback.
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            k,
+            lanes,
+            vector,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=True,
+            active_rows=len(rows) - 1,
+        )
+        assert events[-1][0:2] == ("sort", True)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+def test_coarse_rank_topk_payload_every_collision(rank_only, recovery):
+    n, k, lanes = 65, 32, 8
+    for position in range(k - 1):
+        rows = [[0x3F000000 - column * 8192 for column in range(n)] for _ in range(4)]
+        # Reverse the true order within this bucket, while coarse payload order
+        # puts the earlier column first. Keep the final cutoff bucket unique.
+        rows[-1][position + 1] = rows[-1][position] + 1
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            k,
+            lanes,
+            4,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=True,
+        )
+        assert events[-1] == ("sort", True, 16)
+    for invalid in (0, -1, 1, 0x7F800000, 0x7FFFFFFF):
+        rows = [[0x3F000000 - column * 8192 for column in range(n)] for _ in range(4)]
+        rows[-1][1] = invalid
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            k,
+            lanes,
+            4,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=True,
+        )
+        sorts = [event for event in events if event[0] == "sort"]
+        if invalid >= 0x7F800000:
+            assert sorts[-1] == ("sort", True, 16)
+        else:
+            assert sorts == [("sort", False, 16)]
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("mutation", ["omit", "wrong_slot"])
+def test_coarse_rank_topk_payload_guard_counterexamples(mutation):
+    import inspect
+
+    from helion.runtime.cute.coarse_topk import coarse_rank_topk
+
+    raw = inspect.unwrap(coarse_rank_topk)
+    original = inspect.getsource
+
+    def mutate(function):
+        source = original(function)
+        if function is raw:
+            source = (
+                source.replace("fallback |= collision", "fallback |= Int32(0)")
+                if mutation == "omit"
+                else source.replace("previous = previous_last", "previous = previous")
+            )
+        return source
+
+    rows = [[0x3F000000 - column * 8192 for column in range(65)] for _ in range(4)]
+    rows[-1][8] = rows[-1][7] + 1
+    with (
+        patch.object(inspect, "getsource", side_effect=mutate),
+        pytest.raises(AssertionError),
+    ):
+        _coarse_rank_helper_model(rows, 32, 8, 4, payload_only=True)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("size,k,lanes,vector", [(16, 8, 16, 8), (16, 32, 8, 4)])
+def test_coarse_rank_topk_payload_full_sdk(size, k, lanes, vector, recovery, rank_only):
+    test_coarse_rank_topk_entire_sdk_module(
+        size, k, lanes, vector, recovery, rank_only, True
+    )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+def test_coarse_rank_topk_payload_consumer_proof(recovery):
+    x = torch.empty((5, 65), dtype=torch.float32)
+    cases = (
+        (_row_topk, (x, 8, True), False),
+        (_preprocessed_row_topk, (x, 8, True), False),
+        (_indices_only_composed_row_topk, (x, 8), True),
+        (_semantic_row_topk, (x, 8, "softmax"), False),
+    )
+    for kernel, args, unused in cases:
+        bound = kernel._bind_isolated(args)
+        for mode in ("decode", "gather"):
+            cfg = bound.config_spec.default_config()
+            cfg.config.update(_composition_config(16, "distributed"))
+            cfg.config.update(
+                cute_topk_coarse_keys=True,
+                cute_topk_key_recovery=recovery,
+                cute_topk_value_mode=mode,
+            )
+            code = bound.to_code(cfg)
+            calls = [
+                node
+                for node in ast.walk(ast.parse(code))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id.startswith("_cute_coarse_rank_topk_")
+            ]
+            assert len(calls) == 1
+            kwargs = {
+                item.arg: ast.literal_eval(item.value) for item in calls[0].keywords
+            }
+            assert kwargs.get("payload_only", False) == (unused or mode == "gather")
+            assert code.count("@cute.kernel") == 1
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("k,lanes", [(8, 16), (13, 8), (32, 8)])
+def test_coarse_rank_topk_payload_sorted_native(recovery, k, lanes):
+    # The first four rows form a complete fast-path warp for both layouts.
+    # Other positive rows exercise
+    # an internal collision, a register boundary, exact ties, and padding.
+    storage = torch.empty((11, 195), dtype=torch.float32, device=DEVICE)
+    x = storage[1:10, ::3]
+    words = 0x3F000000 - torch.arange(65, device=x.device, dtype=torch.int32) * 8192
+    x.copy_(words.view(torch.float32))
+    x[4, 2] = (words[1] + 1).view(torch.float32)
+    x[5, 8] = (words[7] + 1).view(torch.float32)
+    x[6].fill_(1)
+    x[7, 0] = float("nan")
+    original = x.view(torch.int32).clone()
+    cfg = _composition_config(lanes, "distributed")
+    cfg.update(
+        cute_topk_coarse_keys=True,
+        cute_topk_key_recovery=recovery,
+        cute_topk_value_mode="gather",
+        cute_topk_key_dtype="int64",
+    )
+    code, (values, indices) = code_and_output(_row_topk, (x, k, True), **cfg)
+    assert "payload_only=True" in code
+    _assert_topk_output(x, values, indices, k)
+    assert torch.equal(original, x.view(torch.int32))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+def test_coarse_rank_topk_payload_index_bit_boundaries(rank_only, recovery):
+    for bits in range(1, 24):
+        n = 2 if bits == 1 else 4
+        rows = [
+            [0x00800000 + (n - i) * (1 << bits) for i in range(n)] for _ in range(8)
+        ]
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            2,
+            4,
+            1,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=True,
+            index_bits=bits,
+        )
+        assert [event[1] for event in events if event[0] == "sort"] == [False]
+        rows[-1][1] = rows[-1][0] + 1
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            2,
+            4,
+            1,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=True,
+            index_bits=bits,
+        )
+        assert events[-1][0:2] == ("sort", True)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("payload_only", [False, True])
+def test_coarse_rank_topk_below_domain_count_proof(rank_only, recovery, payload_only):
+    rng = random.Random(809)
+    for n, k, lanes, vector in (
+        (17, 8, 1, 1),
+        (65, 32, 8, 4),
+        (129, 8, 16, 8),
+        (65, 64, 32, 4),
+    ):
+        for accepted in (k - 1, k, k + 1):
+            lower = [-0x7FFFFFFF, -0x00800000, -1, 0, 1, 0x007FFFFF]
+            rows = []
+            for group in range(32 // lanes):
+                row = [0x3E800000 + i * 8192 + group for i in range(accepted)]
+                row += [lower[i % len(lower)] for i in range(n - accepted)]
+                rng.shuffle(row)
+                rows.append(row)
+            events, _ = _coarse_rank_helper_model(
+                rows,
+                k,
+                lanes,
+                vector,
+                recovery=recovery,
+                rank_only=rank_only,
+                payload_only=payload_only,
+            )
+            sorts = [event for event in events if event[0] == "sort"]
+            if accepted < k:
+                assert sorts[-1][1] and sorts[-1][2] == max(
+                    vector, 1 << (((n + lanes - 1) // lanes) - 1).bit_length()
+                )
+            elif payload_only:
+                assert len(sorts) == 1
+            else:
+                assert sorts[-1] == ("sort", True, max(1, k // lanes))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("payload_only", [False, True])
+def test_coarse_rank_topk_below_domain_sentinel_counterexample(
+    rank_only, recovery, payload_only
+):
+    import inspect
+
+    from helion.runtime.cute.coarse_topk import coarse_rank_topk
+
+    # Exactly one live negative bucket equals the -inf sentinel bit pattern,
+    # while only seven values are accepted. Cutoff uniqueness alone is unsafe.
+    rows = [[0x3E800000 + i * 8192 for i in range(17)] for _ in range(4)]
+    rows[-1] = rows[-1][:7] + [-0x00800000] + [-1] * 9
+    events, _ = _coarse_rank_helper_model(
+        rows, 8, 8, 4, recovery=recovery, rank_only=rank_only, payload_only=payload_only
+    )
+    assert events[-1] == ("sort", True, 4)
+    raw = inspect.unwrap(coarse_rank_topk)
+    original = inspect.getsource
+
+    def omit_cutoff_domain(function):
+        source = original(function)
+        if function is raw:
+            source = source.replace(" | (not cutoff_valid)", "")
+        return source
+
+    with (
+        patch.object(inspect, "getsource", side_effect=omit_cutoff_domain),
+        pytest.raises(AssertionError),
+    ):
+        _coarse_rank_helper_model(
+            rows,
+            8,
+            8,
+            4,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=payload_only,
+        )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("payload_only", [False, True])
+def test_coarse_rank_topk_below_domain_full_warp_fallback(
+    rank_only, recovery, payload_only
+):
+    base = [[0x3E800000 + i * 8192 for i in range(65)] for _ in range(4)]
+    for cause in ("above", "short", "tie", "inactive"):
+        rows = [row.copy() for row in base]
+        if cause == "above":
+            rows[-1][-1] = 0x7F800000
+        elif cause == "short":
+            rows[-1] = rows[-1][:7] + [-1] * 58
+        elif cause == "tie":
+            rows[-1] = [0x3E800000] * 65
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            8,
+            8,
+            4,
+            recovery=recovery,
+            rank_only=rank_only,
+            payload_only=payload_only,
+            active_rows=3 if cause == "inactive" else 4,
+        )
+        assert events[-1] == ("sort", True, 16)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_coarse_rank_topk_below_domain_fp32_classes(rank_only, rank_mode, largest):
+    # Exercise each exceptional class separately so an above-range value does
+    # not mask the opportunity to discard an unrelated below-range value.
+    words = [
+        0,
+        0x80000000,
+        1,
+        0x80000001,
+        0x007FFFFF,
+        0x807FFFFF,
+        0x00800000,
+        0x80800000,
+        0x7F7FFFFF,
+        0xFF7FFFFF,
+        0x7F800000,
+        0xFF800000,
+        0x7F800001,
+        0xFF800001,
+        0x7FFFFFFF,
+        0xFFFFFFFF,
+    ]
+
+    def rank(word):
+        bits = word if word < 1 << 31 else word - (1 << 32)
+        sign = bits >> 31
+        magnitude = bits & 0x7FFFFFFF
+        ordered = (
+            (bits ^ (sign & 0x7FFFFFFF))
+            if rank_mode == "ordinal"
+            else (magnitude ^ sign) - sign
+        )
+        if magnitude > 0x7F800000:
+            ordered = 0x7FFFFFFF
+        return ordered if largest else -ordered
+
+    for word in words:
+        base = [
+            rank((0x3E800000 + i * 8192) | (0 if largest else 0x80000000))
+            for i in range(65)
+        ]
+        rows = [base.copy() for _ in range(4)]
+        rows[-1][0] = rank(word)
+        for recovery in ("direct", "packed"):
+            events, _ = _coarse_rank_helper_model(
+                rows, 8, 8, 4, recovery=recovery, rank_only=rank_only, payload_only=True
+            )
+            sorts = [event for event in events if event[0] == "sort"]
+            if rank(word) >= 0x7F800000:
+                assert sorts[-1] == ("sort", True, 16)
+            else:
+                assert len(sorts) == 1
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("recovery", ["direct", "packed"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_coarse_rank_topk_below_domain_native(recovery, largest):
+    storage = torch.zeros((7, 195), device=DEVICE, dtype=torch.float32)
+    x = storage[:, ::3]
+    x[:] = (torch.arange(65, device=x.device).float() - 37) / 128
+    x[0, :] = -1
+    x[0, :7] = torch.arange(7, device=x.device).float() + 1
+    x[0, 7] = -torch.finfo(torch.float32).tiny
+    x[1, :] = -float("inf")
+    x[1, :8] = torch.arange(8, device=x.device).float() + 1
+    x[2, 0:4] = torch.tensor([0.0, -0.0, 1e-40, -1e-40], device=x.device)
+    x[3, :3] = torch.tensor(
+        [float("nan"), float("inf"), -float("inf")], device=x.device
+    )
+    x[4, :] = 1
+    if not largest:
+        x.neg_()
+    before = x.clone()
+    for value_mode in ("gather", "decode"):
+        code, (values, indices) = code_and_output(
+            _row_topk,
+            (x, 8, largest),
+            block_sizes=[1],
+            cute_topk_selection_layout="distributed",
+            cute_topk_lanes_per_row=8,
+            cute_topk_rows_per_block=4,
+            cute_topk_vector_width=4,
+            cute_topk_key_dtype="int64",
+            cute_topk_rank_mode="ordinal",
+            cute_topk_value_mode=value_mode,
+            cute_topk_coarse_keys=True,
+            cute_topk_key_recovery=recovery,
+        )
+        assert "import coarse_rank_topk as" in code
+        _assert_topk_output(x, values, indices, 8, largest)
+        assert torch.equal(x.view(torch.int32), before.view(torch.int32))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("rank_only", [False, True])
+@pytest.mark.parametrize("payload_only", [False, True])
+def test_coarse_rank_topk_below_domain_index_bit_boundaries(rank_only, payload_only):
+    for bits in range(1, 24):
+        rows = [[-0x00800000, 0x3E800000] for _ in range(16)]
+        events, _ = _coarse_rank_helper_model(
+            rows,
+            2,
+            2,
+            1,
+            recovery="direct" if bits % 2 else "packed",
+            rank_only=rank_only,
+            payload_only=payload_only,
+            index_bits=bits,
+        )
+        assert events[-1] == ("sort", True, 1)
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_leading_axes_topk(x, k: hl.constexpr, largest: hl.constexpr):
+    values = torch.empty((x.size(0), x.size(1), k), device=x.device, dtype=x.dtype)
+    indices = torch.empty((x.size(0), x.size(1), k), device=x.device, dtype=torch.int64)
+    for row in hl.tile(x.size(0)):
+        selected, index = torch.topk(x[row, :, :], k, dim=-1, largest=largest)
+        values[row, :, :] = selected
+        indices[row, :, :] = index
+    return values, indices
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_composed_topk_gather(x, k: hl.constexpr):
+    values = torch.empty((x.size(0), k), device=x.device, dtype=x.dtype)
+    gathered = torch.empty_like(values)
+    for row in hl.tile(x.size(0)):
+        first, _ = torch.topk(x[row, :], k + 2, dim=-1)
+        second, index = torch.topk(first, k, dim=-1, largest=False)
+        values[row, :] = second
+        gathered[row, :] = torch.gather(first, -1, index)
+    return values, gathered
+
+
+def _simulate_topk_fragment(source, inputs, outputs, blocks):
+    import inspect
+    import math
+
+    from test.test_cute_computed_fragment import _simulate_independent_fragment
+
+    text = inspect.getsource(_simulate_independent_fragment)
+    text = text.replace("Int32=int,", "Int32=np.int32,").replace(
+        "Int64=int,", "Int64=np.int64,"
+    )
+    text = text.replace(
+        '"operator": operator,', '"operator": operator, "_bitcast": _bitcast,'
+    )
+    text = text.replace(
+        "Float32=np.float32,", "Float32=np.float32, Float16=np.float16, Int16=np.int16,"
+    )
+
+    def bitcast(value, dtype):
+        return np.asarray(value).view(dtype)[()]
+
+    class Bitcasts(ast.NodeTransformer):
+        def visit_Call(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id="_bitcast", ctx=ast.Load()),
+                        args=[node.func.value, *node.args],
+                        keywords=[],
+                    ),
+                    node,
+                )
+            return node
+
+    namespace = {
+        "ast": ast,
+        "math": math,
+        "torch": torch,
+        "SimpleNamespace": SimpleNamespace,
+        "_bitcast": bitcast,
+    }
+    exec(compile(text, "<existing-fragment-model-with-bitcast>", "exec"), namespace)
+    modeled = ast.unparse(
+        ast.fix_missing_locations(Bitcasts().visit(ast.parse(source)))
+    )
+    namespace["_simulate_independent_fragment"](modeled, inputs, outputs, blocks)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("width,k", [(17, 3), (7, 7), (1, 1)])
+def test_fragment_leading_axes_topk_generated_values(dtype, largest, width, k):
+    rows, groups = 5, 3
+    x = (
+        (torch.arange(rows * groups * width).reshape(rows, groups, width) * 7) % 13 - 6
+    ).to(dtype)
+    if dtype in (torch.float16, torch.float32) and width >= 7:
+        x[:, :, :7] = torch.tensor(
+            [
+                float("nan"),
+                float("inf"),
+                -float("inf"),
+                0.0,
+                -0.0,
+                1.401298464324817e-45,
+                -1.401298464324817e-45,
+            ]
+        )
+    if dtype == torch.int64 and width >= 2:
+        x[:, :, 0] = torch.iinfo(torch.int64).min
+        x[:, :, 1] = torch.iinfo(torch.int64).max
+    snapshot = x.clone()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+        cfg = bound.config_spec.default_config()
+        source = bound.to_code(cfg)
+    values = torch.empty((rows, groups, k), dtype=dtype)
+    indices = torch.full((rows, groups, k), -99, dtype=torch.int64)
+    _simulate_topk_fragment(
+        source,
+        {"x": x},
+        {"values": values, "indices": indices},
+        (rows + cfg.block_sizes[0] - 1) // cfg.block_sizes[0],
+    )
+    expected = torch.argsort(x, dim=-1, descending=largest, stable=True)[:, :, :k]
+    torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        values, x.gather(-1, expected), rtol=0, atol=0, equal_nan=True
+    )
+    torch.testing.assert_close(x, snapshot, rtol=0, atol=0, equal_nan=True)
+    if dtype in (torch.float16, torch.float32):
+        bits = torch.int16 if dtype == torch.float16 else torch.int32
+        assert torch.equal(values.view(bits), x.gather(-1, expected).view(bits))
+    assert "fragment_topk_previous_rank" in source
+
+
+def test_fragment_composed_topk_gather_generated_values():
+    x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_composed_topk_gather, (x, 3))
+        cfg = bound.config_spec.default_config()
+        source = bound.to_code(cfg)
+    values, gathered = torch.empty((5, 3)), torch.empty((5, 3))
+    _simulate_topk_fragment(
+        source,
+        {"x": x},
+        {"values": values, "gathered": gathered},
+        (5 + cfg.block_sizes[0] - 1) // cfg.block_sizes[0],
+    )
+    first = x.sort(dim=-1, descending=True, stable=True).values[:, :5]
+    expected = first.sort(dim=-1, stable=True).values[:, :3]
+    torch.testing.assert_close(values, expected, rtol=0, atol=0)
+    torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int32, torch.int64]
+)
+def test_fragment_leading_axes_topk_native(dtype):
+    x = ((torch.arange(5 * 3 * 17, device=DEVICE).reshape(5, 3, 17) * 7) % 13 - 6).to(
+        dtype
+    )
+    before = x.clone()
+    for largest in (False, True):
+        values, indices = _fragment_leading_axes_topk(x, 3, largest)
+        expected = torch.argsort(x, dim=-1, descending=largest, stable=True)[:, :, :3]
+        torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+        torch.testing.assert_close(values, x.gather(-1, expected), rtol=0, atol=0)
+        torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.float32, torch.int32, torch.int64]
+)
+def test_fragment_leading_axes_topk_strided_generated_values(dtype):
+    storage = torch.arange(3 * 17 * 10).reshape(3, 17, 10).to(dtype)
+    x = storage[:, :, ::2].permute(2, 0, 1)
+    before = storage.clone()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
+        cfg = bound.config_spec.default_config()
+        source = bound.to_code(cfg)
+    values = torch.empty((5, 3, 3), dtype=dtype)
+    indices = torch.full((5, 3, 3), -99, dtype=torch.int64)
+    _simulate_topk_fragment(
+        source,
+        {"x": x},
+        {"values": values, "indices": indices},
+        (5 + cfg.block_sizes[0] - 1) // cfg.block_sizes[0],
+    )
+    expected = torch.argsort(x, dim=-1, descending=True, stable=True)[:, :, :3]
+    torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+    torch.testing.assert_close(values, x.gather(-1, expected), rtol=0, atol=0)
+    torch.testing.assert_close(storage, before, rtol=0, atol=0)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fragment_composed_topk_gather_native():
+    x = ((torch.arange(5 * 17, device=DEVICE).reshape(5, 17) * 3) % 11).float()
+    before = x.clone()
+    values, gathered = _fragment_composed_topk_gather(x, 3)
+    first = x.sort(dim=-1, descending=True, stable=True).values[:, :5]
+    expected = first.sort(dim=-1, stable=True).values[:, :3]
+    torch.testing.assert_close(values, expected, rtol=0, atol=0)
+    torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_topk_padded_producer(x, largest: hl.constexpr, mode: hl.constexpr):
+    tail_values = torch.empty_like(x)
+    tail_indices = torch.empty(x.shape, device=x.device, dtype=torch.int64)
+    for tail_row in hl.tile(x.size(0)):
+        tail_columns = hl.arange(x.size(2))
+        if mode == 0:
+            tail_condition = tail_columns % 3 == 0
+        elif mode == 1:
+            tail_condition = tail_columns >= 0
+        else:
+            tail_condition = tail_columns < 0
+        tail_computed = torch.where(
+            tail_condition[None, None, :], x[tail_row, :, :] + 1, 1.0
+        )
+        tail_selected, tail_index = torch.topk(
+            tail_computed, x.size(2), dim=-1, largest=largest
+        )
+        tail_values[tail_row, :, :] = tail_selected
+        tail_indices[tail_row, :, :] = tail_index
+    return tail_values, tail_indices
+
+
+def _topk_padded_producer_reference(x, largest, mode):
+    columns = torch.arange(x.size(2), device=x.device)
+    condition = (
+        (columns % 3 == 0)
+        if mode == 0
+        else (columns >= 0 if mode == 1 else columns < 0)
+    )
+    computed = torch.where(condition[None, None, :], x + 1, 1.0)
+    indices = torch.argsort(computed, dim=-1, descending=largest, stable=True)
+    return computed.gather(-1, indices), indices
+
+
+@pytest.mark.parametrize("width,rows", [(17, 5), (33, 1)])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_fragment_topk_computed_logical_tail(width, rows, largest, mode):
+    x = (torch.arange(rows * 3 * width).reshape(rows, 3, width) % 11 + 2).float()
+    if largest:
+        x = -x
+    before = x.clone()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
+        cfg = bound.config_spec.default_config()
+        source = bound.to_code(cfg)
+    values, indices = torch.empty_like(x), torch.full(x.shape, -99, dtype=torch.int64)
+    _simulate_topk_fragment(
+        source,
+        {"x": x},
+        {"tail_values": values, "tail_indices": indices},
+        (rows + cfg.block_sizes[0] - 1) // cfg.block_sizes[0],
+    )
+    expected_values, expected_indices = _topk_padded_producer_reference(
+        x, largest, mode
+    )
+    assert torch.equal(values, expected_values)
+    assert torch.equal(indices, expected_indices)
+    assert torch.equal(x, before)
+    scans = [
+        n
+        for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.For)
+        and isinstance(n.target, ast.Name)
+        and n.target.id.startswith("fragment_topk_column")
+    ]
+    assert len(scans) == 1 and ast.literal_eval(scans[0].iter.args[0]) == width
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_topk_ambiguous_padded_reshape(x):
+    result = torch.empty((x.size(0), 3), device=x.device, dtype=x.dtype)
+    for row in hl.tile(x.size(0)):
+        columns = hl.arange(x.size(2))
+        transformed = torch.where(columns[None, None, :] >= 0, x[row, :, :] + 1, 1.0)
+        flattened = transformed.reshape(transformed.size(0), -1)
+        first, _ = torch.topk(flattened, 5, dim=-1)
+        second, _ = torch.topk(first, 3, dim=-1)
+        result[row, :] = second
+    return result
+
+
+def test_fragment_topk_padded_reshape_without_coordinate_proof_declines():
+    x = torch.ones((5, 3, 17))
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_topk_ambiguous_padded_reshape, (x,))
+        with pytest.raises(helion.exc.BackendUnsupported):
+            bound.to_code(bound.config_spec.default_config())
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fragment_topk_computed_logical_tail_native():
+    for largest in (False, True):
+        for mode in (0, 1, 2):
+            x = (
+                torch.arange(5 * 3 * 17, device=DEVICE).reshape(5, 3, 17) % 11 + 2
+            ).float()
+            if largest:
+                x = -x
+            before = x.clone()
+            values, indices = _fragment_topk_padded_producer(x, largest, mode)
+            expected_values, expected_indices = _topk_padded_producer_reference(
+                x, largest, mode
+            )
+            torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
+            torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+            torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_topk_tiled_selected_axis(x):
+    tile_result = torch.empty((x.size(0), x.size(1), 3), device=x.device, dtype=x.dtype)
+    for tile_row in hl.tile(x.size(0)):
+        for tile_col in hl.tile(x.size(2), block_size=8):
+            tile_picked, _ = torch.topk(x[tile_row, :, tile_col], 3, dim=-1)
+            tile_result[tile_row, :, :] = tile_picked
+    return tile_result
+
+
+def test_fragment_topk_tiled_selected_axis_declines():
+    from helion._compiler.cute.computed_fragment import computed_fragment_supported
+
+    x = torch.ones((5, 3, 17))
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_topk_tiled_selected_axis, (x,))
+        with bound.env, bound.host_function:
+            assert not computed_fragment_supported(
+                bound.env, bound.host_function.device_ir.graphs
+            )
+        source = bound.to_code(bound.config_spec.default_config())
+    assert "fragment_topk_slot" not in source
+    assert "for sort_k in range" in source
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_masked_computed_row_topk(x, bias, k: hl.constexpr, largest: hl.constexpr):
+    values = torch.empty((x.size(0), k), dtype=x.dtype, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        data = x[row, :]
+        valid = torch.isfinite(data) & torch.isfinite(bias[:])
+        if largest:
+            ranked = torch.where(valid, data + bias[:], float("-inf"))
+        else:
+            ranked = torch.where(valid, data + bias[:], float("inf"))
+        _, index = torch.topk(ranked, k, dim=-1, largest=largest)
+        values[row, :] = torch.gather(torch.where(valid, data, 0.0), -1, index)
+        indices[row, :] = index
+    return values, indices
+
+
+@pytest.mark.parametrize("width,k", [(17, 3), (65, 8)])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("tile", [1, 4])
+def test_fragment_single_computed_topk_fallback_values(width, k, largest, tile):
+    storage = ((torch.arange(5 * width * 2).reshape(5, -1) * 3) % 11).float()
+    x = storage[:, ::2]
+    x[0] = 2
+    x[1] = float("nan")
+    x[2, :4] = torch.tensor([float("inf"), -float("inf"), 0.0, -0.0])
+    bias = torch.zeros(width)
+    before = storage.clone()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_masked_computed_row_topk, (x, bias, k, largest))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [tile]
+        source = bound.to_code(config)
+    assert "fragment_topk_previous_rank" in source
+    values = torch.empty((5, k))
+    indices = torch.full((5, k), -1, dtype=torch.int64)
+    _simulate_topk_fragment(
+        source,
+        {"x": x, "bias": bias},
+        {"values": values, "indices": indices},
+        (5 + tile - 1) // tile,
+    )
+    valid = torch.isfinite(x) & torch.isfinite(bias)
+    ranked = torch.where(valid, x + bias, -torch.inf if largest else torch.inf)
+    expected = torch.argsort(ranked, dim=-1, descending=largest, stable=True)[:, :k]
+    assert torch.equal(indices, expected)
+    assert torch.equal(
+        values.view(torch.int32),
+        torch.where(valid, x, 0.0).gather(-1, expected).view(torch.int32),
+    )
+    assert torch.equal(storage.view(torch.int32), before.view(torch.int32))
+
+
+@pytest.mark.parametrize("kind", ["direct", "pointwise", "prologue", "softmax"])
+def test_fragment_single_topk_preserves_optimized_owner(kind):
+    from helion._compiler.cute.computed_fragment import computed_fragment_supported
+
+    x = torch.ones(5, 64)
+    kernel, args = {
+        "direct": (_row_topk, (x, 8, True)),
+        "pointwise": (_pointwise_row_topk, (x, 8)),
+        "prologue": (_preprocessed_row_topk, (x, 8, True)),
+        "softmax": (_temperature_row_topk, (x, 8)),
+    }[kind]
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        with bound.env, bound.host_function:
+            ir = bound.host_function.device_ir
+            assert (
+                match_topk_root(
+                    ir.graphs,
+                    noncanonical_block_ids=ir.noncanonical_task_origin_block_ids,
+                )
+                is not None
+            )
+            assert not computed_fragment_supported(bound.env, ir.graphs)
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+    assert "_cute_local_topk" in source
+    assert "fragment_topk_slot" not in source
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width,k", [(17, 3), (65, 8)])
+def test_fragment_single_computed_topk_fallback_native(width, k):
+    x = ((torch.arange(5 * width, device=DEVICE).reshape(5, width) * 3) % 11).float()
+    x[0] = 2
+    x[1] = float("nan")
+    bias = torch.zeros(width, device=DEVICE)
+    before = x.clone()
+    for largest in (False, True):
+        _, (values, indices) = code_and_output(
+            _fragment_masked_computed_row_topk, (x, bias, k, largest), block_sizes=[4]
+        )
+        valid = torch.isfinite(x)
+        ranked = torch.where(valid, x + bias, -torch.inf if largest else torch.inf)
+        expected = torch.argsort(ranked, dim=-1, descending=largest, stable=True)[:, :k]
+        assert torch.equal(indices, expected)
+        assert torch.equal(values, torch.where(valid, x, 0.0).gather(-1, expected))
+        assert torch.equal(x.view(torch.int32), before.view(torch.int32))
+
+
+def _simulate_network_topk_fragment(source, inputs, outputs, blocks, threads=128):
+    """Reuse the fragment phase/warp model with an exact selection collective.
+
+    Encoding, masks, physical row ownership, cyclic slots, payload gathers and
+    shared lifetime execute the actual emitted AST. The already-tested runtime
+    network is represented by its exact Int64 collective contract here; separate
+    installed-SDK checks exercise its real implementation with the emitted code.
+    """
+    import inspect
+    import math
+
+    from test.test_cute_computed_fragment import _simulate_fragment_warp_reduction
+
+    text = inspect.getsource(_simulate_fragment_warp_reduction)
+    text = text.replace(
+        "min=np.minimum, max=np.maximum", "min=np.minimum, max=np.maximum, tanh=np.tanh"
+    )
+    text = text.replace(
+        '"operator": operator,', '"operator": operator, "_bitcast": _bitcast,'
+    )
+    text = text.replace(
+        "Float16=np.float16,",
+        "Float16=np.float16, Int16=np.int16, range_constexpr=range,",
+    )
+    text = text.replace(
+        "BFloat16=lambda value: torch.tensor(float(value)).bfloat16().item(),",
+        "BFloat16=lambda value: torch.tensor(float(value)).bfloat16(),",
+    )
+    text = text.replace(
+        "make_layout=lambda shape: shape,",
+        "make_layout=lambda shape: shape, make_rmem_tensor=lambda shape, dtype: np.empty(shape, dtype=dtype),",
+    )
+    text = text.replace(
+        'if kind == "index":',
+        """if kind == "topk":
+                k = offset
+                ordered = sorted((int(key) for event in events for key in event[0]), reverse=True)[:k]
+                peers = [np.asarray([ordered[(i * 32 + lane) % k] for i in range(max(1, k // 32))], dtype=np.int64) for lane in range(32)]
+            elif kind == "index":""",
+    )
+    text = text.replace(
+        """            kind = {
+""",
+        """            if isinstance(node.func, ast.Name) and node.func.id.startswith("_fragment_distributed_topk_"):
+                assert ast.literal_eval(node.args[2]) == 32
+                return ast.Yield(ast.Tuple([node.args[0], node.args[1], ast.Constant("topk")], ast.Load()))
+            kind = {
+""",
+    )
+    # The scalar model's Pointer is contiguous-only. Keep actual storage strides
+    # and offsets here, exactly as the independent fragment pointer model does.
+    text = text.replace(
+        """            assert 0 <= self.offset < self.tensor.numel()
+            return self.tensor.reshape(-1)[self.offset].item()""",
+        """            storage = self.tensor.as_strided((self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),), (1,), storage_offset=0)
+            offset = self.tensor.storage_offset() + int(self.offset)
+            assert 0 <= offset < storage.numel()
+            return storage[offset].item()""",
+    )
+    namespace = {
+        "ast": ast,
+        "math": math,
+        "torch": torch,
+        "SimpleNamespace": SimpleNamespace,
+        "Counter": __import__("collections").Counter,
+        "itertools": __import__("itertools"),
+    }
+
+    def bitcast(value, dtype):
+        if isinstance(value, torch.Tensor):
+            assert value.dtype == torch.bfloat16 and dtype == np.int16
+            return np.int16(value.view(torch.int16).item())
+        return np.asarray(value).view(dtype)[()]
+
+    class Bitcasts(ast.NodeTransformer):
+        def visit_Call(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
+                return ast.copy_location(
+                    ast.Call(
+                        ast.Name("_bitcast", ast.Load()),
+                        [node.func.value, *node.args],
+                        [],
+                    ),
+                    node,
+                )
+            return node
+
+    namespace["_bitcast"] = bitcast
+    exec(compile(text, "<existing-fragment-model-network>", "exec"), namespace)
+    modeled = ast.unparse(
+        ast.fix_missing_locations(Bitcasts().visit(ast.parse(source)))
+    )
+    return namespace["_simulate_fragment_warp_reduction"](
+        modeled, inputs, outputs, blocks, threads, allow_lane_stores=True
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int32]
+)
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,threads", [(1, 1, 32), (17, 3, 128), (65, 33, 256), (129, 129, 64)]
+)
+def test_fragment_network_topk_values(
+    dtype, largest, width, k, threads, block_rows=None
+):
+    x = ((torch.arange(5 * 3 * width).reshape(5, 3, width) * 7) % 13 - 6).to(dtype)
+    if dtype.is_floating_point and width >= 7:
+        x[:, :, :7] = torch.tensor(
+            [
+                float("nan"),
+                float("inf"),
+                -float("inf"),
+                0.0,
+                -0.0,
+                1.401298464324817e-45,
+                -1.401298464324817e-45,
+            ]
+        ).to(dtype)
+    if dtype == torch.int32:
+        x[:, :, 0] = torch.iinfo(dtype).min
+        if width > 1:
+            x[:, :, 1] = torch.iinfo(dtype).max
+    original = x.clone()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+        c = b.config_spec.default_config()
+        c.config.update(cute_fragment_topk_network=True, cute_fragment_threads=threads)
+        if block_rows is not None:
+            c.config["block_sizes"] = [block_rows]
+        source = b.to_code(c)
+    actual = torch.empty((5, 3, k), dtype=dtype)
+    indices = torch.full((5, 3, k), -99, dtype=torch.int64)
+    state = _simulate_network_topk_fragment(
+        source,
+        {"x": x},
+        {"values": actual, "indices": indices},
+        (5 + c.block_sizes[0] - 1) // c.block_sizes[0],
+        threads,
+    )
+    expected = torch.argsort(x, dim=-1, descending=largest, stable=True)[:, :, :k]
+    assert torch.equal(indices, expected)
+    bits = torch.int16 if dtype in (torch.float16, torch.bfloat16) else torch.int32
+    assert torch.equal(actual.view(bits), x.view(bits).gather(-1, expected))
+    assert torch.equal(x.view(bits), original.view(bits))
+    assert state.exchanges > 0 and "fragment_topk_previous_rank" not in source
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("largest", [False, True])
+def test_fragment_network_topk_masked_producer(mode, largest):
+    x = ((torch.arange(5 * 3 * 17).reshape(5, 3, 17) * 7) % 13 - 20).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_topk_padded_producer, (x, largest, mode))
+        c = b.config_spec.default_config()
+        before = b.to_code(c)
+        c.config["cute_fragment_topk_network"] = True
+        after = b.to_code(c)
+    expected = (torch.empty_like(x), torch.empty(x.shape, dtype=torch.int64))
+    actual = (torch.empty_like(expected[0]), torch.empty_like(expected[1]))
+    blocks = (5 + c.block_sizes[0] - 1) // c.block_sizes[0]
+    _simulate_topk_fragment(
+        before,
+        {"x": x},
+        {"tail_values": expected[0], "tail_indices": expected[1]},
+        blocks,
+    )
+    _simulate_network_topk_fragment(
+        after, {"x": x}, {"tail_values": actual[0], "tail_indices": actual[1]}, blocks
+    )
+    assert torch.equal(actual[1], expected[1])
+    assert torch.equal(actual[0].view(torch.int32), expected[0].view(torch.int32))
+
+
+def test_fragment_network_topk_composed_gather():
+    x = ((torch.arange(5 * 17).reshape(5, 17) * 3) % 11).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_composed_topk_gather, (x, 3))
+        c = b.config_spec.default_config()
+        c.config["cute_fragment_topk_network"] = True
+        source = b.to_code(c)
+    actual = (torch.empty((5, 3)), torch.empty((5, 3)))
+    _simulate_network_topk_fragment(
+        source,
+        {"x": x},
+        {"values": actual[0], "gathered": actual[1]},
+        (5 + c.block_sizes[0] - 1) // c.block_sizes[0],
+    )
+    first = x.sort(dim=-1, descending=True, stable=True).values[:, :5]
+    expected = first.sort(dim=-1, stable=True).values[:, :3]
+    assert torch.equal(actual[0], expected) and torch.equal(actual[1], expected)
+
+
+@pytest.mark.parametrize("layout", ["strided", "transposed", "offset"])
+def test_fragment_network_topk_strides(layout):
+    storage = (torch.arange(7 * 3 * 35).reshape(7, 3, 35) % 29).float()
+    x = (
+        storage[:5, :, :34:2]
+        if layout == "strided"
+        else storage[:5, :, :17].transpose(0, 1)
+        if layout == "transposed"
+        else storage[1:6, :, 1:18]
+    )
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_leading_axes_topk, (x, 3, True))
+        c = b.config_spec.default_config()
+        c.config["cute_fragment_topk_network"] = True
+        source = b.to_code(c)
+    actual = torch.empty((*x.shape[:-1], 3))
+    indices = torch.full(actual.shape, -99, dtype=torch.int64)
+    _simulate_network_topk_fragment(
+        source,
+        {"x": x},
+        {"values": actual, "indices": indices},
+        (x.shape[0] + c.block_sizes[0] - 1) // c.block_sizes[0],
+    )
+    expected = torch.argsort(x, dim=-1, descending=True, stable=True)[:, :, :3]
+    assert torch.equal(indices, expected) and torch.equal(
+        actual, x.gather(-1, expected)
+    )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize(
+    "dtype,width,k,largest",
+    [
+        (torch.float16, 17, 3, True),
+        (torch.bfloat16, 65, 33, False),
+        (torch.float32, 129, 129, True),
+        (torch.int32, 33, 7, False),
+    ],
+)
+def test_fragment_network_topk_sdk(tmp_path, dtype, width, k, largest, block_rows=None):
+    import importlib.util
+
+    import cutlass
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import func
+    import cutlass.cute as cute
+
+    x = torch.empty((5, 3, width), dtype=dtype)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_topk_network"] = True
+        if block_rows is not None:
+            config.config["block_sizes"] = [block_rows]
+        source = bound.to_code(config)
+    tree = ast.parse(source)
+    kernel = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    kernel.name = "staged_network_topk"
+    kernel.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+    module = ast.fix_missing_locations(
+        ast.Module(
+            body=[
+                *[
+                    n
+                    for n in tree.body
+                    if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign))
+                ],
+                kernel,
+            ],
+            type_ignores=[],
+        )
+    )
+    path = tmp_path / "sdk_payload.py"
+    path.write_text(ast.unparse(module) + "\n")
+    spec = importlib.util.spec_from_file_location("network_sdk", path)
+    sdk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sdk)
+    ctype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+        torch.int32: cutlass.Int32,
+    }[dtype]
+    with ir.Context(), ir.Location.unknown():
+        emitted = ir.Module.create()
+        with ir.InsertionPoint(emitted.body):
+            entry = func.FuncOp("entry", ([], []))
+            block = entry.add_entry_block()
+            with ir.InsertionPoint(block):
+                tensors = [
+                    cute.make_tensor(
+                        cute.make_ptr(t, 0, cute.AddressSpace.gmem, assumed_align=16),
+                        cute.make_layout(shape, stride=strides),
+                    )
+                    for t, shape, strides in [
+                        (ctype, (5, 3, width), (3 * width, width, 1)),
+                        (ctype, (5, 3, k), (3 * k, k, 1)),
+                        (cutlass.Int64, (5, 3, k), (3 * k, k, 1)),
+                    ]
+                ]
+                sdk.staged_network_topk(*tensors)
+                func.ReturnOp([])
+        assert emitted.operation.verify()
+        text = str(emitted)
+        (tmp_path / "sdk.mlir").write_text(text)
+        assert "nvvm.shfl.sync" in text and "scf.for" in text
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("seed", [31, 61, 97])
+def test_fragment_network_topk_population_prefix(seed):
+    from test.cute_population_contracts import checked_initial_population
+
+    from helion.autotuner.pattern_search import PatternSearch
+
+    args = (torch.empty((5, 3, 65)), 7, True)
+    results = []
+    states = []
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        for enabled in (False, True):
+            kernel = helion.kernel(
+                _fragment_leading_axes_topk.fn,
+                backend="cute",
+                static_shapes=True,
+                autotune_effort="full",
+            )
+            if not enabled:
+                with patch(
+                    "helion._compiler.autotuner_heuristics.register_fragment_topk_network_coverage"
+                ):
+                    bound = _cpu_bind(kernel, args)
+            else:
+                bound = _cpu_bind(kernel, args)
+            spec = bound.config_spec
+            assert "cute_fragment_topk_network" not in spec.default_config()
+            with bound.env:
+                random.seed(seed)
+                search = PatternSearch(bound, args, initial_population=100)
+                population = checked_initial_population(search)
+                configs = [
+                    dict(search.config_gen.canonicalize_flat(x)[1]) for x in population
+                ]
+                results.append(configs)
+                states.append(random.getstate())
+            if enabled:
+                assert configs[-1]["cute_fragment_topk_network"] is True
+                group = next(
+                    g
+                    for g in spec.compiler_coverage_groups
+                    if g.key == "cute_fragment_topk_network"
+                )
+                assert group.deferred and group.legacy is False
+        assert results[1][:-1] == results[0] and states[0] == states[1]
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "dtype", "width"])
+def test_fragment_network_topk_unsupported_request(kind):
+    from helion.exc import InvalidConfig
+
+    kernel = _row_topk if kind == "ordinary" else _fragment_leading_axes_topk
+    x = (
+        torch.empty((5, 65))
+        if kind == "ordinary"
+        else torch.empty(
+            (5, 3, 2049 if kind == "width" else 17),
+            dtype=torch.int64 if kind == "dtype" else torch.float32,
+        )
+    )
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, (x, 3, True))
+        c = bound.config_spec.default_config()
+        before = bound.to_code(c)
+        c.config["cute_fragment_topk_network"] = False
+        assert bound.to_code(c) == before
+        c.config["cute_fragment_topk_network"] = True
+        with pytest.raises(InvalidConfig, match="complete fragment top-k"):
+            bound.to_code(c)
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_mixed_network_topk(x, y):
+    output = torch.empty((x.size(0), x.size(1), 3), dtype=x.dtype, device=x.device)
+    control = torch.empty((y.size(0), y.size(1), 3), dtype=y.dtype, device=y.device)
+    for row in hl.tile(x.size(0)):
+        a, _ = torch.topk(x[row, :, :], 3, dim=-1)
+        b, _ = torch.topk(y[row, :, :], 3, dim=-1, largest=False)
+        output[row, :, :] = a
+        control[row, :, :] = b
+    return output, control
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_fragment_network_topk_mixed_fallback(wide):
+    x = ((torch.arange(2 * 3 * 17).reshape(2, 3, 17) * 5) % 19).float()
+    width = 1025 if wide else 17
+    y = ((torch.arange(2 * 3 * width).reshape(2, 3, width) * 11) % 31).to(
+        torch.float32 if wide else torch.int64
+    )
+    if not wide:
+        y[:, :, 0] = torch.iinfo(torch.int64).min
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_mixed_network_topk, (x, y))
+        c = b.config_spec.default_config()
+        c.config["cute_fragment_topk_network"] = True
+        source = b.to_code(c)
+    actual = (torch.empty((2, 3, 3)), torch.empty((2, 3, 3), dtype=y.dtype))
+    _simulate_network_topk_fragment(
+        source,
+        {"x": x, "y": y},
+        {"output": actual[0], "control": actual[1]},
+        (2 + c.block_sizes[0] - 1) // c.block_sizes[0],
+    )
+    assert torch.equal(
+        actual[0], x.sort(dim=-1, descending=True, stable=True).values[:, :, :3]
+    )
+    assert torch.equal(actual[1], y.sort(dim=-1, stable=True).values[:, :, :3])
+    assert (
+        "fragment_topk_previous_rank" in source
+        and "_fragment_distributed_topk_" in source
+    )
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_network_topk_reshaped(x):
+    output = torch.empty((x.size(0), 2), device=x.device, dtype=x.dtype)
+    output_indices = torch.empty((x.size(0), 2), device=x.device, dtype=torch.int64)
+    for row in hl.tile(x.size(0)):
+        values = x[row, :]
+        grouped = values.reshape(values.size(0) * 4, x.size(1) // 4)
+        selected, _ = torch.topk(grouped, 2, dim=-1)
+        scores = selected.sum(dim=-1).reshape(values.size(0), 4)
+        values, indices = torch.topk(scores, 2, dim=-1)
+        output[row, :] = values
+        output_indices[row, :] = indices
+    return output, output_indices
+
+
+def test_fragment_network_topk_resident_reshape():
+    x = ((torch.arange(5 * 4 * 16).reshape(5, 64) * 7) % 31).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_network_topk_reshaped, (x,))
+        c = b.config_spec.default_config()
+        before = b.to_code(c)
+        c.config["cute_fragment_topk_network"] = True
+        after = b.to_code(c)
+    actual = (torch.empty((5, 2)), torch.empty((5, 2), dtype=torch.int64))
+    expected = tuple(torch.empty_like(x) for x in actual)
+    blocks = (5 + c.block_sizes[0] - 1) // c.block_sizes[0]
+    _simulate_topk_fragment(
+        before, {"x": x}, {"output": expected[0], "output_indices": expected[1]}, blocks
+    )
+    _simulate_network_topk_fragment(
+        after, {"x": x}, {"output": actual[0], "output_indices": actual[1]}, blocks
+    )
+    assert all(itertools.starmap(torch.equal, zip(actual, expected, strict=True)))
+
+
+@pytest.mark.parametrize("mutation", ["padding", "slots", "barrier"])
+def test_fragment_network_topk_generated_mutations(mutation):
+    x = -torch.arange(1, 5 * 3 * 17 + 1).reshape(5, 3, 17).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_leading_axes_topk, (x, 17, True))
+        c = b.config_spec.default_config()
+        c.config["cute_fragment_topk_network"] = True
+        source = b.to_code(c)
+    tree = ast.parse(source)
+    if mutation == "padding":
+        loop = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id.startswith("fragment_topk_col")
+        )
+        loop.value = ast.BinOp(loop.value, ast.Mod(), ast.Constant(17))
+    elif mutation == "slots":
+        slot = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id.startswith("fragment_topk_slot")
+        )
+        slot.value = ast.Constant(0)
+    else:
+        function = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+        )
+        index = next(
+            i
+            for i, n in enumerate(function.body)
+            if isinstance(n, ast.Expr) and ast.unparse(n) == "cute.arch.sync_threads()"
+        )
+        function.body.pop(index)
+    actual = torch.empty((5, 3, 17))
+    indices = torch.full(actual.shape, -99, dtype=torch.int64)
+    with pytest.raises((AssertionError, IndexError)):
+        _simulate_network_topk_fragment(
+            ast.unparse(tree),
+            {"x": x},
+            {"values": actual, "indices": indices},
+            (5 + c.block_sizes[0] - 1) // c.block_sizes[0],
+        )
+        expected = torch.argsort(x, dim=-1, descending=True, stable=True)
+        assert torch.equal(indices, expected)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int32]
+)
+def test_fragment_network_topk_native(dtype):
+    x = ((torch.arange(5 * 3 * 65, device=DEVICE).reshape(5, 3, 65) * 7) % 31 - 15).to(
+        dtype
+    )
+    original = x.clone()
+    for largest in (False, True):
+        _, (values, indices) = code_and_output(
+            _fragment_leading_axes_topk,
+            (x, 33, largest),
+            block_sizes=[4],
+            cute_fragment_topk_network=True,
+        )
+        expected = torch.argsort(x, dim=-1, descending=largest, stable=True)[:, :, :33]
+        assert torch.equal(indices, expected) and torch.equal(
+            values, x.gather(-1, expected)
+        )
+    assert torch.equal(x, original)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fragment_network_topk_resident_reshape_native():
+    x = ((torch.arange(5 * 4 * 16, device=DEVICE).reshape(5, 64) * 7) % 31).float()
+    original = x.clone()
+    _, (values, indices) = code_and_output(
+        _fragment_network_topk_reshaped,
+        (x,),
+        block_sizes=[4],
+        cute_fragment_topk_network=True,
+    )
+    first = (
+        x.reshape(5, 4, 16)
+        .sort(dim=-1, descending=True, stable=True)
+        .values[:, :, :2]
+        .sum(dim=-1)
+    )
+    expected = torch.argsort(first, dim=-1, descending=True, stable=True)[:, :2]
+    assert torch.equal(indices, expected) and torch.equal(
+        values, first.gather(-1, expected)
+    )
+    assert torch.equal(x, original)
+
+
+def test_fragment_network_topk_capacity_boundary():
+    test_fragment_network_topk_values(
+        torch.float32, False, 1024, 513, 512, block_rows=1
+    )
+
+
+@pytest.mark.parametrize("value", [1, "network", None])
+def test_fragment_network_topk_strict_boolean(value):
+    from helion.exc import InvalidConfig
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        b = _cpu_bind(_fragment_leading_axes_topk, (torch.empty(5, 3, 17), 3, True))
+        c = b.config_spec.default_config()
+        c.config["cute_fragment_topk_network"] = value
+        with pytest.raises(InvalidConfig, match="complete fragment top-k"):
+            b.to_code(c)

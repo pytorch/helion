@@ -61,6 +61,8 @@ class CuteTopKPlan:
     defer_value_gathers: bool = False
     merge_schedule: str = "sequential"
     stable_ties: bool = False
+    coarse_keys: bool = False
+    key_recovery: str = "direct"
 
     @property
     def threads(self) -> int:
@@ -469,6 +471,8 @@ def plan_topk_root(
         defer_value_gathers=cast(
             "bool", config.get("cute_topk_defer_value_gathers", False)
         ),
+        coarse_keys=cast("bool", config.get("cute_topk_coarse_keys", False)),
+        key_recovery=cast("str", config.get("cute_topk_key_recovery", "direct")),
         merge_schedule=cast(
             "str", config.get("cute_topk_merge_schedule", "sequential")
         ),

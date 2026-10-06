@@ -82,6 +82,8 @@ from .cute_fragment_scan import CuteFragmentScanHeuristic
 from .cute_fragment_scan import register_fragment_scan_coverage
 from .cute_fragment_threads import CuteFragmentThreadsHeuristic
 from .cute_fragment_threads import register_fragment_threads_coverage
+from .cute_fragment_topk_network import CuteFragmentTopKNetworkHeuristic
+from .cute_fragment_topk_network import register_fragment_topk_network_coverage
 from .cute_fragment_warp_results import CuteFragmentWarpResultsHeuristic
 from .cute_fragment_warp_results import register_fragment_warp_results_coverage
 from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
@@ -103,6 +105,8 @@ from .cute_split_k_cluster import CuteSplitKClusterHeuristic
 from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
+from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
+from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .register_chain import CuteRegisterChainHeuristic
@@ -184,6 +188,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentWarpResultsHeuristic,
         CuteFragmentProducerCacheHeuristic,
         CuteFragmentWarpScanHeuristic,
+        CuteFragmentTopKNetworkHeuristic,
         CuteFragmentAtomicAggregationHeuristic,
     ),
     "triton": (
@@ -628,5 +633,10 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_atomic_aggregation_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_topk_coarse_keys_coverage(env)
+    register_topk_key_recovery_coverage(env)
+    register_fragment_topk_network_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )

@@ -78,11 +78,32 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
             + inspect.getsource(runtime_register_layout)
         ).encode("utf-8")
     ).hexdigest()[:16]
+    helper_module = "helion.runtime.cute.topk"
     helper_function = "distributed_topk" if distributed else "local_topk"
+    helper_arguments = ""
+    if plan.coarse_keys:
+        from ...runtime.cute import coarse_topk as runtime_coarse_topk
+
+        assert distributed and plan.selection_dtype == torch.float32
+        assert plan.n > 1 and padded_k <= plan.n
+        helper_hash = hashlib.sha256(
+            (helper_hash + inspect.getsource(runtime_coarse_topk)).encode("utf-8")
+        ).hexdigest()[:16]
+        helper_module = "helion.runtime.cute.coarse_topk"
+        helper_function = "coarse_rank_topk"
+        helper_arguments = f", {(plan.n - 1).bit_length()}, {plan.vector_width}"
+        if plan.key_recovery != "direct":
+            helper_arguments += f", recovery={plan.key_recovery!r}"
+        # Fragment consumers are checked by row_topk_codegen after use analysis.
+        # Direct roots only consume rank bits when selected values are decoded.
+        if plan.fragment_graph is None and (
+            plan.values is None or plan.value_mode == "gather"
+        ):
+            helper_arguments += ", payload_only=True"
     helper_name = f"_cute_{helper_function}_{helper_hash}"
     cg.module_statements.append(
         ast.ImportFrom(
-            module="helion.runtime.cute.topk",
+            module=helper_module,
             names=[ast.alias(name=helper_function, asname=helper_name)],
             level=0,
         )
@@ -219,17 +240,31 @@ topk_native_key = (topk_native_bits | topk_encoded_index).bitcast(cutlass.Float3
 topk_keys[topk_i] = topk_native_key
 """
     if full_precision:
-        # Keep all 32 value bits and the complete tie-breaking column payload.
-        # Sign-extended ordered ranks occupy the high bits of a signed 64-bit
-        # key. Even the smallest real key remains above Int64-min padding.
-        key_type = packed_type
-        key_padding = "cutlass.Int64(-9223372036854775808)"
+        # Output keys retain all 32 value bits and the complete column payload.
+        # Coarse input stores ranks alone; its helper reconstructs the payload.
+        # Sign-extended ranks occupy the high bits of signed 64-bit output keys,
+        # where even the smallest real key remains above Int64-min padding.
+        key_type = "cutlass.Int32" if plan.coarse_keys else packed_type
+        key_padding = (
+            "cutlass.Int32(-2147483648)"
+            if plan.coarse_keys
+            else "cutlass.Int64(-9223372036854775808)"
+        )
         selected_key = "topk_selected[topk_output]"
         rank_expression = (
             "topk_bits ^ (topk_sign & cutlass.Int32(2147483647))"
             if plan.rank_mode == "ordinal"
             else "(topk_magnitude ^ topk_sign) - topk_sign"
         )
+        full_key = f"""
+topk_packed = ((cutlass.Int64(topk_ordered) << cutlass.Int32({index_bits}))
+               | cutlass.Int64(cutlass.Int32({index_mask}) - topk_col))
+topk_keys[topk_i] = topk_packed
+"""
+        # Coarse selection reconstructs column payloads from its proved blocked
+        # resident layout. All real canonical ranks exclude Int32-min, including
+        # both zero encodings, infinities, NaNs and smallest-first reversal.
+        key_store = "topk_keys[topk_i] = topk_ordered" if plan.coarse_keys else full_key
         encode = f"""
 topk_magnitude = topk_bits & cutlass.Int32(2147483647)
 topk_sign = topk_bits >> cutlass.Int32(31)
@@ -237,9 +272,7 @@ topk_ordered = {rank_expression}
 if topk_magnitude > cutlass.Int32(2139095040):
     topk_ordered = cutlass.Int32(2147483647)
 {reverse}
-topk_packed = ((cutlass.Int64(topk_ordered) << cutlass.Int32({index_bits}))
-               | cutlass.Int64(cutlass.Int32({index_mask}) - topk_col))
-topk_keys[topk_i] = topk_packed
+{key_store}
 """
     vector_word = f"{input_word_type}(topk_vector[topk_element])"
     scalar_word = "topk_input_bits[topk_row, topk_col]"
@@ -509,6 +542,7 @@ if not topk_value_decodable:
             selected_index=selected_index,
             value_store=value_store,
             helper_name=helper_name,
+            helper_arguments=helper_arguments,
             helper_hash=helper_hash,
             index_type=index_type,
             row_guard=row_guard,
@@ -839,7 +873,7 @@ topk_keys = cute.make_rmem_tensor({fragment_size}, {key_type})
 topk_keys.fill({key_padding})
 {loads}
 
-topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row}, {plan.sort_network!r}, {plan.merge_schedule!r})
+topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row}, {plan.sort_network!r}, {plan.merge_schedule!r}{helper_arguments})
 {stores}
 """
     statements: list[ast.AST] = []

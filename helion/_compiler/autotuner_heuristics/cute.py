@@ -5224,6 +5224,11 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                 register_cute_tensor_alias_specializations(env)
                 if topk_tensors_are_proven_disjoint(plan, env, allow_unbound=True):
                     env.config_spec.enable_cute_topk_search(plan.selection_dtype)
+                    env.config_spec.cute_topk_coarse_keys_available = (
+                        plan.selection_dtype == torch.float32
+                        and 1 < plan.n <= (1 << 23)
+                        and (1 << (plan.k - 1).bit_length()) <= plan.n
+                    )
         return frozenset()
 
     @classmethod

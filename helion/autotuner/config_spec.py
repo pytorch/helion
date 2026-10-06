@@ -954,7 +954,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1065,7 +1068,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1180,7 +1186,10 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1477,6 +1486,9 @@ class ConfigSpec:
         # Enabled only when the whole root is a supported top-k load/store
         # dataflow. Its emitter owns the row geometry and vector layout.
         self.cute_topk_search_enabled = False
+        self.cute_topk_coarse_keys_available = False
+        self.cute_topk_coarse_keys_search_enabled = False
+        self.cute_topk_key_recovery_search_enabled = False
         self.cute_topk_choices = dict(CUTE_TOPK_CHOICES)
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
@@ -1504,6 +1516,8 @@ class ConfigSpec:
         self.cute_fragment_register_load_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_scan_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_scan_search_enabled = False
+        self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_topk_network_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_atomic_aggregation_search_enabled = False
         self.cute_fragment_register_loads_search_enabled = False
@@ -3391,6 +3405,28 @@ class ConfigSpec:
             f"{key}={value!r} requires a supported bounded warp-prefix scan"
         )
 
+    def _normalize_cute_fragment_topk_network(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_topk_network"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_topk_network_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a supported complete fragment top-k"
+        )
+
     def _normalize_cute_fragment_atomic_aggregation(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4051,6 +4087,36 @@ class ConfigSpec:
                         "must not exceed 1024 threads"
                     )
 
+        key = "cute_topk_coarse_keys"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+        elif not (
+            value is True
+            and self.cute_topk_search_enabled
+            and self.cute_topk_coarse_keys_available
+            and config.get("cute_topk_selection_layout") == "distributed"
+            and config.get("cute_topk_key_dtype") == "int64"
+        ):
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires a complete FP32 distributed Int64-key selection"
+                )
+
+        key = "cute_topk_key_recovery"
+        value = config.get(key, "direct")
+        if value == "direct":
+            config.pop(key, None)
+        elif value != "packed" or config.get("cute_topk_coarse_keys") is not True:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires an enabled coarse-key selection and direct/packed mode"
+                )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -4435,6 +4501,7 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_topk_network(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
@@ -5628,9 +5695,13 @@ class ConfigSpec:
             if key in (
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
+                "cute_fragment_topk_network",
                 "cute_fragment_atomic_aggregation",
+                "cute_topk_coarse_keys",
             ):
                 return True, False
+            if key == "cute_topk_key_recovery":
+                return True, "direct"
             if key == "cute_fragment_threads":
                 return True, 128
             if key in ("cute_fragment_scan", "cute_fragment_reduction"):
@@ -5861,10 +5932,18 @@ class ConfigSpec:
                 fields["cute_fragment_producer_cache"] = BooleanFragment()
             if self.cute_fragment_warp_results_search_enabled:
                 fields["cute_fragment_warp_results"] = BooleanFragment()
+            if self.cute_topk_coarse_keys_search_enabled:
+                fields["cute_topk_coarse_keys"] = BooleanFragment()
+            if self.cute_topk_key_recovery_search_enabled:
+                fields["cute_topk_key_recovery"] = EnumFragment(
+                    choices=("direct", "packed")
+                )
             if self.cute_fragment_atomic_aggregation_search_enabled:
                 fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
+            if self.cute_fragment_topk_network_search_enabled:
+                fields["cute_fragment_topk_network"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:
