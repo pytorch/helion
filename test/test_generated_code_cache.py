@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import inspect
 import json
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -19,9 +21,16 @@ import helion.language as hl
 from helion.runtime import generated_code_cache as cache
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
+from helion.runtime.ref_mode import is_ref_mode_enabled
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+pytestmark = pytest.mark.skipif(
+    is_ref_mode_enabled(helion.Settings()),
+    reason="generated source caching requires frontend compilation",
+)
 
 
 @helion.kernel(backend="triton")
@@ -108,6 +117,33 @@ def test_fresh_binding_skips_codegen(cache_root: Path) -> None:
             second.set_config(config)
     assert sources[0] == sources[1]
     assert counters["generated_code_cache"] == {"miss": 1, "hit": 1, "frontend_hit": 1}
+
+
+def test_dependency_discovery_order_does_not_change_binding(cache_root: Path) -> None:
+    x = torch.ones(16)
+    config = helion.Config(block_sizes=[32])
+    sources: list[str] = []
+    getclosurevars = inspect.getclosurevars
+
+    def reverse_dependencies(fn):
+        closure = getclosurevars(fn)
+        return closure._replace(
+            globals=dict(reversed(closure.globals.items())),
+            nonlocals=dict(reversed(closure.nonlocals.items())),
+        )
+
+    with patch.object(
+        PyCodeCache, "load", side_effect=_source_loader(cache_root, sources)
+    ):
+        _bound(x).set_config(config)
+        with (
+            patch.object(cache.inspect, "getclosurevars", reverse_dependencies),
+            patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ),
+        ):
+            _bound(x).set_config(config)
+    assert sources[0] == sources[1]
 
 
 def test_only_selected_config_is_saved(cache_root: Path) -> None:
@@ -410,7 +446,8 @@ def test_atomic_writes_and_failed_publish(cache_root: Path) -> None:
     assert sorted(path.name for path in directory.iterdir()) == ["shared.json"]
 
 
-def test_cpu_reload_in_fresh_process(cache_root: Path) -> None:
+@pytest.mark.parametrize("hash_seed", ["0", "1"])
+def test_cpu_reload_in_fresh_process(cache_root: Path, hash_seed: str) -> None:
     bound = _bound(torch.ones(16))
     sources: list[str] = []
     with patch.object(
@@ -447,6 +484,7 @@ assert module.counters["generated_code_cache"]["hit"] == 1
             str(cache_root),
         ],
         check=True,
+        env={**os.environ, "PYTHONHASHSEED": hash_seed},
         timeout=30,
     )
 

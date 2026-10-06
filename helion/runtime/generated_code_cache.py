@@ -107,7 +107,11 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
             return "recursive", value.__module__, value.__qualname__
         seen = seen | {id(value)}
         closure = inspect.getclosurevars(value)
-        dependencies = _dependency_key({**closure.globals, **closure.nonlocals}, seen)
+        # Dependency discovery order can vary with Python's hash seed.
+        # Variable bindings are unordered; user-provided dict inputs are not.
+        dependencies = _dependency_key(
+            dict(sorted({**closure.globals, **closure.nonlocals}.items())), seen
+        )
         defaults = _dependency_key((value.__defaults__, value.__kwdefaults__), seen)
         if dependencies is _UNCACHEABLE or defaults is _UNCACHEABLE:
             return _UNCACHEABLE
