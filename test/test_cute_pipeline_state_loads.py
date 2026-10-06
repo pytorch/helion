@@ -1438,6 +1438,7 @@ def test_proven_stride_rejects_post_bind_metadata_mutation() -> None:
     current = torch.empty_strided((4, 8), (1, 4))
     source = LocalSource("value", is_input=True)
     env = SimpleNamespace(
+        settings=SimpleNamespace(static_shapes=False),
         compiler_fact_specialization_facts=frozenset(("input_tensor_metadata",)),
         tensor_input_source=lambda _: source,
         runtime_value_for_tensor=lambda _: current,
@@ -1455,6 +1456,31 @@ def test_proven_stride_rejects_post_bind_metadata_mutation() -> None:
             ("value", 0): 8,
             ("value", 1): 1,
         }
+
+
+def test_proven_stride_static_shapes_needs_no_metadata_fact() -> None:
+    """``static_shapes`` keys the kernel on exact strides, so they are proven
+    without the ``input_tensor_metadata`` fact or an ``hl.specialize`` guard."""
+    traced = torch.empty_strided((4, 8), (8, 1))
+    env = SimpleNamespace(
+        settings=SimpleNamespace(static_shapes=True),
+        compiler_fact_specialization_facts=frozenset(),
+        tensor_input_source=lambda _: LocalSource("value", is_input=True),
+        runtime_value_for_tensor=lambda _: traced,
+        specialized_strides=set(),
+        size_hint=int,
+    )
+    device_function = object.__new__(DeviceFunction)
+    device_function.arguments = [TensorArg("value", traced, "value")]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(CompileEnvironment, "current", lambda: env)
+        assert device_function.proven_tensor_stride_values() == {
+            ("value", 0): 8,
+            ("value", 1): 1,
+        }
+        env.settings = SimpleNamespace(static_shapes=False)
+        assert device_function.proven_tensor_stride_values() == {}
 
 
 def test_scalar_pair_parity_uses_assignment_time_reaching_definitions() -> None:

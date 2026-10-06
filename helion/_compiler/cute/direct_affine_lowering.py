@@ -962,6 +962,14 @@ def resolve_direct_affine_lowering(
             return None
         if schedule is None:
             return None
+        tile_strategy = codegen.device_function.tile_strategy
+        if any(
+            tile_strategy.symbolic_thread_extent_expr(block_id) is not None
+            for block_id in grid.block_thread_axes
+        ):
+            # An argument-sized block has a thread axis but no static extent;
+            # the plan's CTA shape would hold a one for it.
+            return None
         replay = resolve_direct_affine_replay(
             candidate,
             graph_info,

@@ -16,9 +16,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_interleaved_bench_large_repeat() -> None:
-    # This many live events crashed final autotune verification on ROCm 7.2.
-    # An uneven repeat also exercises the last partially filled event batch.
-    repeat = 20003
+    # Unbounded live events crashed final autotune verification on ROCm 7.2;
+    # interleaved_bench now reuses batches of _ROCM_INTERLEAVED_EVENT_PAIRS
+    # (128 per function here). Several batches plus an uneven tail exercise
+    # both the reuse and the last partially filled batch. Every timed
+    # iteration also zeroes the 256 MiB benchmark cache, so keep the repeat
+    # small enough to fit the per-test CI budget on a GPU shared by four
+    # xdist workers.
+    repeat = 1003
     counters = torch.zeros((8, 1024), device=DEVICE)
     functions = [functools.partial(row.add_, 1) for row in counters]
     timings = interleaved_bench(functions, repeat=repeat)

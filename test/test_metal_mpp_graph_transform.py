@@ -6,11 +6,13 @@ import unittest
 import torch
 from torch.fx import Graph
 
+from helion import exc
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.metal.mpp_graph_codegen import MPPGraphInfo
 from helion._compiler.metal.mpp_graph_codegen import _mpp_graph
+from helion._compiler.metal.mpp_graph_transform import _classify_mpp_operand
 from helion._compiler.metal.mpp_graph_transform import rewrite_mpp_graphs
 from helion.language import _tracing_ops
 from helion.language import memory_ops
@@ -249,6 +251,43 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
         self.assertEqual(len(mpp_nodes), 1)
         self.assertEqual(mpp_nodes[0].args[0], 2)
         self.assertIsInstance(mpp_nodes[0].args[1], list)
+
+
+class TestMetalMPPOperandLayout(unittest.TestCase):
+    def test_packed_operand_is_not_transposed(self) -> None:
+        tensor = torch.empty(32, 48)
+        layout = _classify_mpp_operand(tensor, role="lhs")
+        self.assertFalse(layout.transposed)
+        self.assertEqual(layout.storage_row_width, 48)
+
+    def test_transposed_operand_sets_transpose_flag(self) -> None:
+        tensor = torch.empty(48, 32).t()
+        self.assertEqual(tensor.stride(), (1, 32))
+        layout = _classify_mpp_operand(tensor, role="rhs")
+        self.assertTrue(layout.transposed)
+        self.assertEqual(layout.storage_row_width, 32)
+
+    def test_row_padded_operand_widens_storage_row_width(self) -> None:
+        tensor = torch.empty(64, 64)[:32, :48]
+        layout = _classify_mpp_operand(tensor, role="lhs")
+        self.assertFalse(layout.transposed)
+        self.assertEqual(layout.storage_row_width, 64)
+
+    def test_offset_view_uses_bound_tensor_pointer(self) -> None:
+        tensor = torch.empty(64, 64)[4:36, 8:40]
+        layout = _classify_mpp_operand(tensor, role="lhs")
+        self.assertFalse(layout.transposed)
+        self.assertEqual(layout.storage_row_width, 64)
+
+    def test_column_strided_operand_is_refused(self) -> None:
+        tensor = torch.empty(64, 64)[:32, :32][:, ::2]
+        with self.assertRaisesRegex(exc.BackendUnsupported, "packed, transposed"):
+            _classify_mpp_operand(tensor, role="lhs")
+
+    def test_broadcast_operand_is_refused(self) -> None:
+        tensor = torch.empty(1, 32).expand(32, 32)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "packed, transposed"):
+            _classify_mpp_operand(tensor, role="rhs")
 
 
 if __name__ == "__main__":

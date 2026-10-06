@@ -38,7 +38,7 @@ from typing import cast
 import torch
 
 from ...language import view_ops
-from ..ast_extension import ExtendedAST
+from ..ast_extension import clone_ast
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
@@ -866,22 +866,6 @@ _AST_PURE_OPERATOR_CALLS = {
 _AST_GLOBAL_NAMES = {"cutlass", "cute", "operator"}
 
 
-def _clone_extended_ast(value: object) -> object:
-    """Clone Python/ExtendedAST nodes without losing Helion metadata."""
-    if isinstance(value, list):
-        return [_clone_extended_ast(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_extended_ast(item) for item in value)
-    if isinstance(value, ast.AST):
-        fields = {
-            field: _clone_extended_ast(getattr(value, field)) for field in value._fields
-        }
-        if isinstance(value, ExtendedAST):
-            return value.copy(**fields)
-        return ast.copy_location(type(value)(**fields), value)
-    return value
-
-
 def _safe_invariant_expression(
     expression: ast.expr,
     *,
@@ -1201,13 +1185,13 @@ class _ClonePairLane(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == self.lane_name and isinstance(node.ctx, ast.Load):
             return ast.copy_location(
-                cast("ast.expr", _clone_extended_ast(self.lane_expression)),
+                cast("ast.expr", clone_ast(self.lane_expression)),
                 node,
             )
         replacement = self.renames.get(node.id)
         if replacement is None:
             return node
-        cloned = cast("ast.Name", _clone_extended_ast(node))
+        cloned = cast("ast.Name", clone_ast(node))
         cloned.id = replacement
         return cloned
 
@@ -1222,7 +1206,7 @@ def _clone_pair_expression(
     return cast(
         "ast.expr",
         _ClonePairLane(lane_name, lane_expression, renames).visit(
-            cast("ast.expr", _clone_extended_ast(expression))
+            cast("ast.expr", clone_ast(expression))
         ),
     )
 
@@ -1559,7 +1543,7 @@ class _InlineSingleUseProducts(ast.NodeTransformer):
         self.inlined.add(node.id)
         self.resolving.add(node.id)
         try:
-            return self.visit(cast("ast.expr", _clone_extended_ast(product)))
+            return self.visit(cast("ast.expr", clone_ast(product)))
         finally:
             self.resolving.remove(node.id)
 
@@ -1583,7 +1567,7 @@ def _prepare_packed_product(
     )
     prepared = cast(
         "ast.BinOp",
-        inliner.visit(cast("ast.BinOp", _clone_extended_ast(product))),
+        inliner.visit(cast("ast.BinOp", clone_ast(product))),
     )
     skipped = set(inliner.inlined)
     if name is not None:
@@ -1615,7 +1599,7 @@ def _clone_statement_for_pair(
     return cast(
         "ast.stmt",
         _ClonePairLane(lane_name, lane_expression, renames).visit(
-            cast("ast.stmt", _clone_extended_ast(statement))
+            cast("ast.stmt", clone_ast(statement))
         ),
     )
 
@@ -2789,10 +2773,9 @@ def _try_hoist_one_packed_reduction(
         ):
             continue
 
-        inner_copy = cast("ast.For", _clone_extended_ast(inner_loop))
+        inner_copy = cast("ast.For", clone_ast(inner_loop))
         inner_copy.body = [
-            cast("ast.stmt", _clone_extended_ast(statement))
-            for statement in selected_inner
+            cast("ast.stmt", clone_ast(statement)) for statement in selected_inner
         ]
         hoisted = [
             body[index],
@@ -3100,7 +3083,7 @@ def _try_fuse_adjacent_reduction_loops(loop: ast.For, rmem_names: set[str]) -> b
         ):
             continue
 
-        second_loop_copy = cast("ast.For", _clone_extended_ast(second_loop))
+        second_loop_copy = cast("ast.For", clone_ast(second_loop))
         if second_lane != first_lane:
             rename = _RenameAstName(second_lane, first_lane)
             for statement in second_loop_copy.body:

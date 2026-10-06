@@ -7,7 +7,9 @@ import itertools
 import math
 import operator
 import random
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import TypeVar
@@ -17,6 +19,7 @@ from .._compat import warps_to_threads
 from ..exc import AutotuneError
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
+from .compiler_coverage import same_value
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
@@ -120,6 +123,12 @@ def _value_or(value: object, fallback: Callable[[], object]) -> object:
 
 
 class ConfigGeneration:
+    # Families whose neutral request the overrides normalize away (telemetry,
+    # not a design defect). The coverage design assigns the instance value; the
+    # class default keeps the validator usable on an instance built without
+    # ``__init__`` (tests mock the design method).
+    _flash_coverage_override_unreachable_families_cache: Sequence[object] = ()
+
     def __init__(
         self,
         config_spec: ConfigSpec,
@@ -128,6 +137,10 @@ class ConfigGeneration:
         _flash_pipeline_family_override: str | None = None,
         advanced_controls_files: list[str] | None = None,
         process_group_name: str | None = None,
+        compiler_coverage_enabled: bool = True,
+        _field_view: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment]
+        | None = None,
+        _initial_sampling: bool = False,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -144,6 +157,9 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self._field_view = _field_view
+        self._initial_sampling = _initial_sampling
+        self.compiler_coverage_enabled = compiler_coverage_enabled
         self.process_group_name = process_group_name
         self._advanced_controls_files = advanced_controls_files
         self._flash_pipeline_family_override = (
@@ -152,7 +168,13 @@ class ConfigGeneration:
             else None
         )
         self.flat_spec: list[ConfigSpecFragment] = []
-        if self._flash_pipeline_family_override is None:
+        if self._field_view is not None:
+            config_spec._flat_config_from_fields(
+                _collect_spec,
+                self._field_view,
+                advanced_controls_files=advanced_controls_files,
+            )
+        elif self._flash_pipeline_family_override is None:
             config_spec.flat_config(
                 _collect_spec,
                 advanced_controls_files=advanced_controls_files,
@@ -174,6 +196,7 @@ class ConfigGeneration:
         self._cute_num_thread_block_pairs: list[tuple[int, int]] = []
         self._cute_block_index_by_id: dict[int, int] = {}
         self._cute_num_thread_index_by_id: dict[int, int] = {}
+        self._cute_loop_order_index_by_id: dict[int, int] = {}
         self._cute_flatten_loop_groups: list[tuple[int, list[int]]] = []
         if self.config_spec.backend_name == "cute":
             self._init_cute_num_thread_pairs()
@@ -199,6 +222,7 @@ class ConfigGeneration:
         self._flash_coverage_cache: list[FlatConfig] | None = None
         self._flash_coverage_active_values_cache: list[tuple[str, object]] | None = None
         self._flash_coverage_uncovered_cache: list[tuple[str, object]] | None = None
+        self._flash_coverage_override_unreachable_families_cache = []
         self._flash_coverage_underqualified_cache: (
             list[tuple[str, object, int]] | None
         ) = None
@@ -219,6 +243,9 @@ class ConfigGeneration:
         ) = None
         self._flash_structural_underqualified_leaves_cache: (
             list[tuple[FlashStructuralLeaf, int]] | None
+        ) = None
+        self._flash_structural_singleton_leaves_cache: (
+            list[FlashStructuralLeaf] | None
         ) = None
         self._flash_coverage_uncovered_interactions_cache: (
             list[tuple[tuple[str, ...], tuple[object, ...]]] | None
@@ -254,6 +281,12 @@ class ConfigGeneration:
             for i, spec in enumerate(self.config_spec.num_threads)
             if i < len(num_thread_indices) and spec.block_id in block_index_by_id
         ]
+        loop_order_indices, _ = self._key_to_flat_indices.get("loop_orders", ([], True))
+        self._cute_loop_order_index_by_id = {
+            spec.block_ids[0]: loop_order_indices[i]
+            for i, spec in enumerate(self.config_spec.loop_orders)
+            if i < len(loop_order_indices)
+        }
         try:
             flatten_indices, _ = self._key_to_flat_indices["flatten_loops"]
         except KeyError:
@@ -275,14 +308,101 @@ class ConfigGeneration:
     @functools.cached_property
     def overridden_flat_indices(self) -> set[int]:
         """Return flat_spec indices that are frozen by config overrides."""
-        if not self._override_values:
-            return set()
         result: set[int] = set()
         for key in self._override_values:
             if key in self._key_to_flat_indices:
                 indices, _ = self._key_to_flat_indices[key]
                 result.update(indices)
+        if not self.compiler_coverage_enabled:
+            for group in self.config_spec.compiler_coverage_groups:
+                if group.key in self._key_to_flat_indices:
+                    result.update(self._key_to_flat_indices[group.key][0])
         return result
+
+    def _flat_fields(self) -> Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        if self._field_view is not None:
+            return self._field_view
+        if self._flash_pipeline_family_override is None:
+            return self.config_spec._flat_fields()
+        return self.config_spec._flat_fields_with_flash_family(
+            self._flash_pipeline_family_override
+        )
+
+    def initial_population_view(self) -> ConfigGeneration:
+        """Own a full-layout view whose random draws use only old coordinates."""
+        if not self.config_spec.compiler_coverage_groups:
+            return self
+        self.config_spec.validate_compiler_coverage_groups()
+        return ConfigGeneration(
+            self.config_spec,
+            overrides=copy.deepcopy(self._override_values),
+            _flash_pipeline_family_override=self._flash_pipeline_family_override,
+            advanced_controls_files=copy.deepcopy(self._advanced_controls_files),
+            process_group_name=self.process_group_name,
+            compiler_coverage_enabled=self.compiler_coverage_enabled,
+            _field_view=MappingProxyType(copy.deepcopy(dict(self._flat_fields()))),
+            _initial_sampling=True,
+        )
+
+    @functools.cached_property
+    def _compiler_coverage_sampler(self) -> ConfigGeneration | None:
+        if not self._initial_sampling and self.compiler_coverage_enabled:
+            return None
+        owned = {group.key for group in self.config_spec.compiler_coverage_groups}
+        fields = self._flat_fields()
+        if not owned.intersection(fields):
+            return None
+        return ConfigGeneration(
+            self.config_spec,
+            overrides=copy.deepcopy(
+                {
+                    key: value
+                    for key, value in self._override_values.items()
+                    if key not in owned
+                }
+            ),
+            _flash_pipeline_family_override=self._flash_pipeline_family_override,
+            advanced_controls_files=copy.deepcopy(self._advanced_controls_files),
+            process_group_name=self.process_group_name,
+            _field_view=MappingProxyType(
+                copy.deepcopy(
+                    {key: value for key, value in fields.items() if key not in owned}
+                )
+            ),
+        )
+
+    def _lift_projected_raw(self, flat: FlatConfig) -> FlatConfig:
+        """Transfer raw slots by name without normalization, repair or RNG draws."""
+        sampler = self._compiler_coverage_sampler
+        assert sampler is not None
+        if len(flat) != len(sampler.flat_spec):
+            raise ValueError("Cached flat config does not match the projected layout")
+        legacy = {
+            group.key: group.legacy
+            for group in self.config_spec.compiler_coverage_groups
+        }
+        result: FlatConfig = [None] * len(self.flat_spec)
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
+            if key in legacy:
+                assert len(indices) == 1 and not is_sequence
+                result[indices[0]] = legacy[key]
+                continue
+            old_indices, old_sequence = sampler._key_to_flat_indices[key]
+            if old_sequence != is_sequence or len(old_indices) != len(indices):
+                raise ValueError("Compiler coverage changed old flat slots")
+            for index, old_index in zip(indices, old_indices, strict=True):
+                result[index] = copy.deepcopy(flat[old_index])
+        return result
+
+    def projected_cache_flat_pair(self, flat: FlatConfig) -> tuple[FlatConfig, Config]:
+        sampler = self._compiler_coverage_sampler
+        assert self._initial_sampling and sampler is not None
+        old_flat = copy.deepcopy(flat)
+        # Decode only with the old layout. Preserve the same raw slots the old
+        # best-available builder retains after its normal unflatten call.
+        sampler.unflatten(old_flat)
+        lifted = self._lift_projected_raw(old_flat)
+        return lifted, self.unflatten(lifted)
 
     @functools.cached_property
     def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
@@ -292,16 +412,27 @@ class ConfigGeneration:
         """
         mapping: dict[str, tuple[list[int], bool]] = {}
         idx = 0
-        layout = (
-            self.config_spec.flat_key_layout(
+        if self._field_view is not None:
+            layout = [
+                (key, *field._flat_key_info())
+                for key, field in self._field_view.items()
+            ]
+            if (
+                self.config_spec._advanced_controls_file_fragment(
+                    self._advanced_controls_files
+                )
+                is not None
+            ):
+                layout.append(("advanced_controls_file", 1, False))
+        elif self._flash_pipeline_family_override is None:
+            layout = self.config_spec.flat_key_layout(
                 advanced_controls_files=self._advanced_controls_files
             )
-            if self._flash_pipeline_family_override is None
-            else self.config_spec._flat_key_layout_with_flash_family(
+        else:
+            layout = self.config_spec._flat_key_layout_with_flash_family(
                 advanced_controls_files=self._advanced_controls_files,
                 flash_pipeline_family=self._flash_pipeline_family_override,
             )
-        )
         for key, count, is_sequence in layout:
             mapping[key] = (list(range(idx, idx + count)), is_sequence)
             idx += count
@@ -326,8 +457,32 @@ class ConfigGeneration:
     def _largest_power_of_two_at_most(value: int) -> int:
         return 1 << (max(value, 1).bit_length() - 1)
 
+    def _repair_cute_packet_prefetch(self, flat_config: FlatConfig) -> None:
+        """Keep the packet choice consistent with its complete-tile gate."""
+        if self.config_spec.backend_name != "cute":
+            return
+        prefetch = self._key_to_flat_indices.get("cute_packet_prefetch")
+        bounds = self._key_to_flat_indices.get("cute_proven_bounds")
+        if prefetch is None or bounds is None:
+            return
+        if flat_config[bounds[0][0]] is not True:
+            flat_config[prefetch[0][0]] = 0
+
+    def _repair_cute_reduction_pipeline_depth(self, flat_config: FlatConfig) -> None:
+        """Keep inactive ring coordinates at the existing two-slot default."""
+        if self.config_spec.backend_name != "cute":
+            return
+        depth = self._key_to_flat_indices.get("cute_reduction_pipeline_depth")
+        schedule = self._key_to_flat_indices.get("cute_reduction_schedule")
+        if depth is None or schedule is None:
+            return
+        if flat_config[schedule[0][0]] != "pipelined":
+            flat_config[depth[0][0]] = 2
+
     def _repair_cute_num_threads(self, flat_config: FlatConfig) -> None:
         """Keep CuTe launch-thread choices compatible with tuned block sizes."""
+        self._repair_cute_packet_prefetch(flat_config)
+        self._repair_cute_reduction_pipeline_depth(flat_config)
         if not self._cute_num_thread_block_pairs:
             return
 
@@ -395,37 +550,118 @@ class ConfigGeneration:
                 )
                 thread_product = (thread_product // resolved_threads) * next_threads
 
+        if self.config_spec.cute_tile_loop_paths and not self.config_spec.matmul_facts:
+            self._repair_cute_tile_loop_threads(flat_config)
+            return
+
         explicit_indices = [
             idx
             for idx, _ in self._cute_num_thread_block_pairs
             if type(flat_config[idx]) is int and cast("int", flat_config[idx]) > 0
         ]
-        thread_product = functools.reduce(
-            operator.mul,
-            (cast("int", flat_config[idx]) for idx in explicit_indices),
-            1,
-        )
-        while thread_product > 1024 and explicit_indices:
-            largest_idx = max(
-                explicit_indices,
-                key=lambda idx: cast("int", flat_config[idx]),
+        for indices in self._cute_coexisting_thread_groups(explicit_indices):
+            thread_product = math.prod(cast("int", flat_config[idx]) for idx in indices)
+            while thread_product > 1024 and indices:
+                largest_idx = max(
+                    indices,
+                    key=lambda idx: cast("int", flat_config[idx]),
+                )
+                largest = cast("int", flat_config[largest_idx])
+                if largest <= 1:
+                    break
+                flat_config[largest_idx] = largest // 2
+                thread_product //= 2
+
+    def _cute_coexisting_thread_groups(self, indices: list[int]) -> list[list[int]]:
+        """Repair simultaneous axes, not the product of independent root grids.
+
+        Root ownership does not predict physical axis placement. The backend's
+        final-AST launch check still rejects independent grids whose per-axis
+        maximum requires more than 1024 threads. Unowned/nested axes remain in
+        every group conservatively; missing topology retains the old bound.
+        """
+        topology = self.config_spec.kernel_grid_fact
+        if topology is None or len(topology.roots) < 2:
+            return [indices]
+        roots = [set(root.block_ids) for root in topology.roots]
+        root_ids = set().union(*roots)
+        owners = {
+            self._cute_num_thread_index_by_id[item.block_id]: set(item.block_ids)
+            for item in self.config_spec.num_threads
+            if item.block_id in self._cute_num_thread_index_by_id
+        }
+        return [
+            [
+                index
+                for index in indices
+                if not owners[index].intersection(root_ids)
+                or owners[index].intersection(root)
+            ]
+            for root in roots
+        ]
+
+    def _repair_cute_tile_loop_threads(self, flat_config: FlatConfig) -> None:
+        """Fit simultaneous SIMT axes without multiplying sequential passes."""
+        spec = self.config_spec
+        inactive = spec.cute_inactive_tile_block_ids | spec.reduction_block_ids
+
+        def launch_axes() -> list[dict[int, int]]:
+            axes: list[dict[int, int]] = []
+            for path in spec.cute_tile_loop_paths:
+                position = 0
+                seen: set[int] = set()
+                for block_ids in path:
+                    order_index = self._cute_loop_order_index_by_id.get(block_ids[0])
+                    order = (
+                        cast("list[int]", flat_config[order_index])
+                        if order_index is not None
+                        else range(len(block_ids))
+                    )
+                    for dimension in order:
+                        block_id = block_ids[dimension]
+                        if block_id in inactive or block_id in seen:
+                            continue
+                        seen.add(block_id)
+                        thread_index = self._cute_num_thread_index_by_id.get(block_id)
+                        block_index = self._cute_block_index_by_id.get(block_id)
+                        if thread_index is None or block_index is None:
+                            continue
+                        threads = flat_config[thread_index]
+                        size = flat_config[block_index]
+                        if type(threads) is not int or type(size) is not int:
+                            continue
+                        extent = threads if threads > 0 else size
+                        if extent <= 1:
+                            continue
+                        if position == len(axes):
+                            axes.append({})
+                        axes[position][thread_index] = extent
+                        position += 1
+            return axes
+
+        while True:
+            axes = launch_axes()
+            extents = [max(axis.values()) for axis in axes]
+            if functools.reduce(operator.mul, extents, 1) <= 1024:
+                return
+            # The physical launch uses the maximum of each axis across paths,
+            # not the largest path product. Only shrink a current maximum;
+            # equally wide siblings may need to shrink together.
+            index, threads = max(
+                (
+                    (index, extent)
+                    for axis, maximum in zip(axes, extents, strict=True)
+                    for index, extent in axis.items()
+                    if extent == maximum
+                ),
+                key=operator.itemgetter(1),
             )
-            largest = cast("int", flat_config[largest_idx])
-            if largest <= 1:
-                break
-            flat_config[largest_idx] = largest // 2
-            thread_product //= 2
+            flat_config[index] = self._largest_power_of_two_at_most(threads // 2)
 
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self._fragment_default_flat()
-        flat_fields = (
-            self.config_spec._flat_fields()
-            if self._flash_pipeline_family_override is None
-            else self.config_spec._flat_fields_with_flash_family(
-                self._flash_pipeline_family_override
-            )
-        )
+        flat_fields = self._flat_fields()
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
                 has_default, value = self.config_spec.flatten_missing_field_default(
@@ -705,15 +941,32 @@ class ConfigGeneration:
             The full configuration object.
         """
 
+        return self._unflatten(flat_values)
+
+    def _unflatten(
+        self,
+        flat_values: FlatConfig,
+        *,
+        fix_invalid: bool = True,
+        repair: bool = True,
+    ) -> Config:
         def get_next_value(spec: ConfigSpecFragment) -> object:
             i = next(count)
             assert type(self.flat_spec[i]) is type(spec)
             return flat_values[i]
 
         assert len(flat_values) == len(self.flat_spec)
-        self._repair_cute_num_threads(flat_values)
+        if repair:
+            self._repair_cute_num_threads(flat_values)
         count: itertools.count[int] = itertools.count()
-        if self._flash_pipeline_family_override is None:
+        if self._field_view is not None or not fix_invalid:
+            config = self.config_spec._flat_config_from_fields(
+                get_next_value,
+                self._flat_fields(),
+                advanced_controls_files=self._advanced_controls_files,
+                _fix_invalid=fix_invalid,
+            )
+        elif self._flash_pipeline_family_override is None:
             config = self.config_spec.flat_config(
                 get_next_value,
                 advanced_controls_files=self._advanced_controls_files,
@@ -729,6 +982,31 @@ class ConfigGeneration:
         # Overrides may reintroduce pointer stores that break subtiled outputs
         self.config_spec.fix_epilogue_subtile_store_indexing(config.config)
         return config
+
+    def strict_config_pair(self, config: Config) -> tuple[FlatConfig, Config]:
+        """Validate a complete effective coverage config before repair can hide it."""
+        prepared = self._apply_overrides(copy.deepcopy(config))
+        self.config_spec.normalize(prepared.config)
+        for group in self.config_spec.compiler_coverage_groups:
+            value = prepared.config.get(group.key, group.legacy)
+            if not any(same_value(value, mode) for mode in group.domain):
+                raise InvalidConfig(
+                    f"Invalid compiler coverage mode {group.key}={value!r}"
+                )
+        flat = self.flatten(prepared)
+        strict = self._unflatten(copy.deepcopy(flat), fix_invalid=False, repair=False)
+        for key, value in prepared.config.items():
+            if key not in strict.config or strict.config[key] != value:
+                raise InvalidConfig(f"Coverage transfer changed supplied field {key!r}")
+        normalized_flat, normalized = self.canonicalize_flat(flat)
+        if strict != normalized:
+            raise InvalidConfig("Coverage transfer requires config repair")
+        self.config_spec.normalize(normalized.config)
+        return normalized_flat, normalized
+
+    def strict_unflatten(self, flat: FlatConfig) -> Config:
+        """Decode an expanded warm witness without first repairing its mode."""
+        return self._unflatten(copy.deepcopy(flat), fix_invalid=False, repair=False)
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
@@ -831,6 +1109,7 @@ class ConfigGeneration:
             self._flash_coverage_cache = []
             self._flash_coverage_active_values_cache = []
             self._flash_coverage_uncovered_cache = []
+            self._flash_coverage_override_unreachable_families_cache = []
             self._flash_coverage_underqualified_cache = []
             self._flash_structural_leaf_catalog_cache = []
             self._flash_pipeline_lane_catalog_cache = {}
@@ -838,6 +1117,7 @@ class ConfigGeneration:
             self._flash_clc_lane_catalog_cache = {}
             self._flash_clc_lane_witness_cache = {}
             self._flash_structural_underqualified_leaves_cache = []
+            self._flash_structural_singleton_leaves_cache = []
             self._flash_coverage_uncovered_interactions_cache = []
             self._flash_coverage_active_interactions_cache = []
             self._flash_parent_coverage_prefix_count_cache = 0
@@ -845,6 +1125,7 @@ class ConfigGeneration:
             return []
         from .._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
         from .._compiler.cute.cute_flash import FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS
+        from .._compiler.cute.cute_flash import FLASH_AUTOTUNE_VALUE_DEPENDENCIES
         from .._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
         from .._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
         from .._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
@@ -899,6 +1180,7 @@ class ConfigGeneration:
             self._flash_coverage_cache = []
             self._flash_coverage_active_values_cache = []
             self._flash_coverage_uncovered_cache = []
+            self._flash_coverage_override_unreachable_families_cache = []
             self._flash_coverage_underqualified_cache = []
             self._flash_structural_leaf_catalog_cache = []
             self._flash_pipeline_lane_catalog_cache = {}
@@ -906,6 +1188,7 @@ class ConfigGeneration:
             self._flash_clc_lane_catalog_cache = {}
             self._flash_clc_lane_witness_cache = {}
             self._flash_structural_underqualified_leaves_cache = []
+            self._flash_structural_singleton_leaves_cache = []
             self._flash_coverage_uncovered_interactions_cache = []
             self._flash_coverage_active_interactions_cache = []
             self._flash_parent_coverage_prefix_count_cache = 0
@@ -936,6 +1219,19 @@ class ConfigGeneration:
             if axis is not None:
                 for value in axis[1]:
                     append_variant({key: value})
+
+        # Declared dependency witnesses: an active value that is legal only
+        # together with other knob values gets a context carrying all of them.
+        for (
+            dependent_key,
+            dependent_value,
+        ), deps in FLASH_AUTOTUNE_VALUE_DEPENDENCIES.items():
+            axis = axes.get(dependent_key)
+            if axis is None or dependent_value not in axis[1]:
+                continue
+            if any(key not in enum_axes for key in deps):
+                continue
+            append_variant({**deps, dependent_key: dependent_value})
 
         interaction_groups = tuple(
             group
@@ -1070,6 +1366,25 @@ class ConfigGeneration:
 
         for raw in raw_contexts:
             add_candidate(normalize(raw))
+
+        # The surface advertises a family because its neutral request survives
+        # normalization; an override can still make it unreachable (a family
+        # whose only output path is the TMA store under a direct-epilogue
+        # override). It stays in the uncovered telemetry but is not a defect
+        # of the design.
+        unreachable_families: list[object] = []
+        family_axis = axes.get(FLASH_PIPELINE_FAMILY_KEY)
+        if family_axis is not None:
+            for value in family_axis[1]:
+                flat = copy.deepcopy(base)
+                flat[family_axis[0]] = value
+                normalized = normalize(flat)
+                if (
+                    normalized is None
+                    or normalized[0].config.get(FLASH_PIPELINE_FAMILY_KEY) != value
+                ):
+                    unreachable_families.append(value)
+        self._flash_coverage_override_unreachable_families_cache = unreachable_families
 
         interaction_goal_order: list[tuple[tuple[str, ...], tuple[object, ...]]] = []
         seen_interactions: set[tuple[tuple[str, ...], tuple[object, ...]]] = set()
@@ -1468,6 +1783,15 @@ class ConfigGeneration:
             )
             < 2
         ]
+        # An ordinary leaf the witness expansion above could not give a
+        # second distinct normalized config (every searchable knob of its
+        # family overridden, say) is complete after one row.
+        self._flash_structural_singleton_leaves_cache = [
+            leaf
+            for leaf in leaf_catalog
+            if leaf.compound_exp2_packet is None
+            and witness_count((_FLASH_STRUCTURAL_LEAF_GOAL_KEY, leaf)) < 2
+        ]
         return copy.deepcopy(selected)
 
     def flash_structural_coverage_uncovered_values(
@@ -1541,6 +1865,17 @@ class ConfigGeneration:
         self._flash_deterministic_coverage_flats()
         assert self._flash_structural_underqualified_leaves_cache is not None
         return copy.deepcopy(self._flash_structural_underqualified_leaves_cache)
+
+    def flash_structural_singleton_leaves(self) -> list[FlashStructuralLeaf]:
+        """Return ordinary leaves with a single reachable normalized config.
+
+        Qualification reserves no second row for them: there is no other
+        config of the leaf to rank against, so one witness measures it
+        completely.
+        """
+        self._flash_deterministic_coverage_flats()
+        assert self._flash_structural_singleton_leaves_cache is not None
+        return copy.deepcopy(self._flash_structural_singleton_leaves_cache)
 
     def flash_structural_coverage_uncovered_interactions(
         self,
@@ -1686,12 +2021,18 @@ class ConfigGeneration:
         assert self._flash_coverage_uncovered_interactions_cache is not None
         # A normalized family can legitimately have only one distinct effective
         # config. Keep two-witness shortfalls as strict-harness telemetry rather
-        # than rejecting an otherwise complete ordinary search.
+        # than rejecting an otherwise complete ordinary search. A family the
+        # overrides make unreachable is telemetry as well, not a design defect.
+        unreachable_families = self._flash_coverage_override_unreachable_families_cache
+        uncovered = [
+            goal
+            for goal in self._flash_coverage_uncovered_cache
+            if goal[0] != FLASH_PIPELINE_FAMILY_KEY
+            or goal[1] not in unreachable_families
+        ]
         problems: list[str] = []
-        if self._flash_coverage_uncovered_cache:
-            problems.append(
-                f"uncovered values={self._flash_coverage_uncovered_cache!r}"
-            )
+        if uncovered:
+            problems.append(f"uncovered values={uncovered!r}")
         if self._flash_coverage_uncovered_interactions_cache:
             problems.append(
                 "uncovered interactions="
@@ -1702,6 +2043,20 @@ class ConfigGeneration:
                 "incomplete CuTe flash structural coverage design: "
                 + "; ".join(problems)
             )
+
+    def flash_population_floor(self, n: int) -> int:
+        """Raise a flash population to one row per structural leaf.
+
+        The parent-coverage prefix measures every ordinary family schedule
+        and compound packet once; a smaller population would leave a
+        pipeline family unmeasured. Searches apply this to the effort
+        profile's population when they are constructed; an explicit
+        population request is honored as given. Non-flash surfaces and
+        non-positive requests are returned unchanged.
+        """
+        if n <= 0 or not self.config_spec.cute_flash_search_enabled:
+            return n
+        return max(n, self.flash_structural_parent_coverage_prefix_count())
 
     def flash_structural_population_budget(self, population_size: int) -> int:
         """Return the deterministic-row budget for a flash population size."""
@@ -1821,16 +2176,20 @@ class ConfigGeneration:
         """Enumerate a small CuTe-flash space after config normalization.
 
         The global flat surface can contain aliases that normalize to the same
-        conditional schedule.  When its raw Cartesian product is bounded, this
-        returns every distinct normalized config in stable product order.  A
-        larger or non-enumerable space returns ``None`` without partial work.
+        conditional schedule.  The space is enumerated family by family: each
+        live pipeline family contributes the product of the knobs live for it
+        (every other knob pinned as that family's fragments pin it), so the
+        knobs of one family do not multiply another family's product.  When
+        every family's raw product is bounded, this returns every distinct
+        normalized config in stable product order.  A larger or
+        non-enumerable space returns ``None`` without partial work.
         """
         if max_raw_configs < 1:
             raise ValueError("max_raw_configs must be positive")
         if not self.config_spec.cute_flash_search_enabled:
             return None
+        from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
 
-        value_sets: list[list[object]] = []
         overridden = self.overridden_flat_indices
         frozen_flat: FlatConfig | None = None
         if overridden:
@@ -1841,36 +2200,84 @@ class ConfigGeneration:
             from ..runtime.config import Config
 
             frozen_flat = self.flatten(Config.from_dict(self._override_values))
-        raw_size = 1
-        for index, fragment in enumerate(self.flat_spec):
-            if index in overridden:
-                assert frozen_flat is not None
-                value_sets.append([frozen_flat[index]])
-                continue
-            cardinality = fragment.cardinality()
-            if (
-                cardinality is None
-                or cardinality < 1
-                or raw_size > max_raw_configs // cardinality
-            ):
+        family_index: int | None = None
+        families: list[object | None] = [None]
+        family_layout = self._key_to_flat_indices.get(FLASH_PIPELINE_FAMILY_KEY)
+        if (
+            family_layout is not None
+            and not family_layout[1]
+            and len(family_layout[0]) == 1
+            and family_layout[0][0] not in overridden
+        ):
+            family_fragment = self.flat_spec[family_layout[0][0]]
+            if isinstance(family_fragment, EnumFragment):
+                family_values = family_fragment.search_values(max_raw_configs)
+                if family_values is not None and len(family_values) > 1:
+                    family_index = family_layout[0][0]
+                    families = list(family_values)
+        index_to_key = {
+            indices[0]: key
+            for key, (indices, is_sequence) in self._key_to_flat_indices.items()
+            if not is_sequence and len(indices) == 1
+        }
+
+        def family_value_sets(family: object | None) -> list[list[object]] | None:
+            fragments_for_family: Mapping[str, ConfigSpecFragment] = (
+                self.config_spec._cute_flash_autotune_fragments(
+                    None, cast("str", family)
+                )
+                if family is not None
+                else {}
+            )
+            value_sets: list[list[object]] = []
+            raw_size = 1
+            for index, fragment in enumerate(self.flat_spec):
+                if index in overridden:
+                    assert frozen_flat is not None
+                    value_sets.append([frozen_flat[index]])
+                    continue
+                if index == family_index:
+                    value_sets.append([family])
+                    continue
+                key = index_to_key.get(index)
+                live_fragment = (
+                    fragments_for_family.get(key, fragment)
+                    if key is not None
+                    else fragment
+                )
+                cardinality = live_fragment.cardinality()
+                if (
+                    cardinality is None
+                    or cardinality < 1
+                    or raw_size > max_raw_configs // cardinality
+                ):
+                    return None
+                values = live_fragment.search_values(max_raw_configs)
+                if values is None or len(values) != cardinality:
+                    return None
+                raw_size *= cardinality
+                value_sets.append(values)
+            return value_sets
+
+        products: list[list[list[object]]] = []
+        for family in families:
+            value_sets = family_value_sets(family)
+            if value_sets is None:
                 return None
-            values = fragment.search_values(max_raw_configs)
-            if values is None or len(values) != cardinality:
-                return None
-            raw_size *= cardinality
-            value_sets.append(values)
+            products.append(value_sets)
 
         result: list[Config] = []
         seen: set[Config] = set()
-        for values in itertools.product(*value_sets):
-            try:
-                config = self.unflatten(list(values))
-            except InvalidConfig:
-                continue
-            if config in seen:
-                continue
-            seen.add(config)
-            result.append(config)
+        for value_sets in products:
+            for values in itertools.product(*value_sets):
+                try:
+                    config = self.unflatten(list(values))
+                except InvalidConfig:
+                    continue
+                if config in seen:
+                    continue
+                seen.add(config)
+                result.append(config)
         return result
 
     def seed_flat_config_pairs(
@@ -1939,6 +2346,9 @@ class ConfigGeneration:
             A random flat configuration.
         """
 
+        sampler = self._compiler_coverage_sampler
+        if sampler is not None:
+            return self._lift_projected_raw(sampler.random_flat())
         with sync_seed(process_group_name=self.process_group_name):
             config = [spec.random() for spec in self.flat_spec]
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
@@ -1948,7 +2358,15 @@ class ConfigGeneration:
     @functools.cached_property
     def _config_value_priors(self) -> dict[str, ValuePrior]:
         """Per-config-key sampling priors supplied by the active backend."""
-        return dict(self.config_spec.backend.config_value_priors(self.config_spec))
+        sampler = self._compiler_coverage_sampler
+        if sampler is not None:
+            return sampler._config_value_priors
+        result = dict(self.config_spec.backend.config_value_priors(self.config_spec))
+        if self._field_view is not None:
+            for group in self.config_spec.compiler_coverage_groups:
+                if group.key not in self._field_view:
+                    result.pop(group.key, None)
+        return result
 
     @functools.cached_property
     def _flat_index_to_key_pos(self) -> dict[int, tuple[str, int]]:
@@ -1968,6 +2386,9 @@ class ConfigGeneration:
         declines). Used for half of the random portion of the initial
         population; with no priors this is exactly ``random_flat``.
         """
+        sampler = self._compiler_coverage_sampler
+        if sampler is not None:
+            return self._lift_projected_raw(sampler.biased_random_flat())
         priors = self._config_value_priors
         if not priors:
             return self.random_flat()

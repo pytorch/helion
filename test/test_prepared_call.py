@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 import importlib
 import threading
 from typing import TYPE_CHECKING
@@ -32,6 +33,12 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
 kernel_module = importlib.import_module("helion.runtime.kernel")
+
+
+@dataclasses.dataclass
+class _TensorContainer:
+    x: torch.Tensor
+
 
 _RESET_SPECIALIZATION_USES_X = False
 
@@ -620,13 +627,17 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             old = conditional_scale.bind((x32, y64))
             signature = old._base_spec_key
             old_extractors = conditional_scale._specialize_extra[signature]  # type: ignore[attr-defined]
-            self.assertEqual(tuple(fn((x32, y64)) for fn in old_extractors), (64,))
+            old_results = tuple(fn((x32, y64)) for fn in old_extractors)
+            self.assertEqual(old_results[0], 64)
 
             conditional_scale.reset()
             _RESET_SPECIALIZATION_USES_X = True
             first = conditional_scale.bind((x32, y64))
             new_extractors = conditional_scale._specialize_extra[signature]  # type: ignore[attr-defined]
-            self.assertEqual(tuple(fn((x32, y64)) for fn in new_extractors), (32,))
+            self.assertEqual(
+                tuple(fn((x32, y64)) for fn in new_extractors),
+                (32, *old_results[1:]),
+            )
 
             second = conditional_scale.bind((x48, y64))
             self.assertEqual(first._base_spec_key, second._base_spec_key)
@@ -642,6 +653,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(scale(x, 2), x * 2)
         stale_bound = scale._prepared_call.bound  # type: ignore[attr-defined]
         signature = stale_bound._base_spec_key
+        original_results = tuple(fn((x, 2)) for fn in stale_bound._specialize_extra())
+        self.assertEqual(original_results[0], 2)
 
         scale.reset()
         cache_key = scale._create_bound_kernel_cache_key(  # type: ignore[attr-defined]
@@ -650,7 +663,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             signature,
         )
 
-        self.assertEqual(cache_key.extra_results, (2,))
+        self.assertEqual(cache_key.extra_results, original_results)
         self.assertFalse(scale._specialize_extra)  # type: ignore[attr-defined]
         self.assertFalse(scale._has_specialization_extras)  # type: ignore[attr-defined]
 
@@ -762,6 +775,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         prepared = scale._prepared_call
         assert prepared is not None
         bound = prepared.bound
+        original_results = tuple(fn((x, 2)) for fn in bound._specialize_extra())
+        self.assertEqual(original_results[0], 2)
         signature = bound._base_spec_key
         scale._extend_bound_kernel_specializations(
             bound,
@@ -779,7 +794,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         )
 
         self.assertEqual(tuple(scale._specialize_extra[signature]), schema)
-        self.assertEqual(cache_key.extra_results, (2, 64))
+        self.assertEqual(cache_key.extra_results, (*original_results, 64))
 
     def test_cache_key_generation_waits_for_specialization_extension(self) -> None:
         scale = _make_scale()
@@ -788,6 +803,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         prepared = scale._prepared_call
         assert prepared is not None
         bound = prepared.bound
+        original_results = tuple(fn((x, 2)) for fn in bound._specialize_extra())
+        self.assertEqual(original_results[0], 2)
         signature = bound._base_spec_key
         extension_entered = threading.Event()
         release_extension = threading.Event()
@@ -843,7 +860,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             assert cache_key is not None
             result = cache_key.result(timeout=5)
 
-        self.assertEqual(result.extra_results, (2, 64))
+        self.assertEqual(result.extra_results, (*original_results, 64))
 
     def test_cache_key_generation_retries_after_specialization_extension(self) -> None:
         scale = _make_scale()
@@ -852,6 +869,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         prepared = scale._prepared_call
         assert prepared is not None
         bound = prepared.bound
+        original_results = tuple(fn((x, 2)) for fn in bound._specialize_extra())
+        self.assertEqual(original_results[0], 2)
         signature = bound._base_spec_key
         key_entered = threading.Event()
         release_key = threading.Event()
@@ -866,7 +885,9 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 self.assertTrue(release_key.wait(5))
             return cast("int", values[1])
 
-        scale._specialize_extra[signature] = [blocking_value]
+        # Preserve the backend's cache-key-backed runtime facts.
+        original_schema = scale._specialize_extra[signature]
+        scale._specialize_extra[signature] = [blocking_value, *original_schema[1:]]
         with ThreadPoolExecutor(max_workers=2) as pool:
             cache_key = pool.submit(
                 scale._create_bound_kernel_cache_key,
@@ -890,7 +911,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
 
             result = cache_key.result(timeout=5)
 
-        self.assertEqual(result.extra_results, (2, 64))
+        self.assertEqual(result.extra_results, (*original_results, 64))
 
     def test_specialization_key_retries_after_specialization_extension(self) -> None:
         scale = _make_scale()
@@ -899,6 +920,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         prepared = scale._prepared_call
         assert prepared is not None
         bound = prepared.bound
+        original_results = tuple(fn((x, 2)) for fn in bound._specialize_extra())
+        self.assertEqual(original_results[0], 2)
         signature = bound._base_spec_key
         key_entered = threading.Event()
         release_key = threading.Event()
@@ -913,7 +936,9 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 self.assertTrue(release_key.wait(5))
             return cast("int", values[1])
 
-        scale._specialize_extra[signature] = [blocking_value]
+        # Preserve the backend's cache-key-backed runtime facts.
+        original_schema = scale._specialize_extra[signature]
+        scale._specialize_extra[signature] = [blocking_value, *original_schema[1:]]
         with ThreadPoolExecutor(max_workers=2) as pool:
             specialization_key = pool.submit(scale.specialization_key, (x, 2))
             try:
@@ -932,7 +957,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
 
             result = specialization_key.result(timeout=5)
 
-        self.assertEqual(result[-2:], (2, 64))
+        self.assertEqual(result[-len(original_results) - 1 :], (*original_results, 64))
 
     def test_cache_key_generation_does_not_wait_for_bind_lock(self) -> None:
         scale = _make_scale()
@@ -941,6 +966,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         prepared = scale._prepared_call
         assert prepared is not None
         bound = prepared.bound
+        original_results = tuple(fn((x, 2)) for fn in bound._specialize_extra())
+        self.assertEqual(original_results[0], 2)
         lock_held = threading.Event()
         release_lock = threading.Event()
 
@@ -964,7 +991,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 release_lock.set()
             holder.result(timeout=5)
 
-        self.assertEqual(result.extra_results, (2,))
+        self.assertEqual(result.extra_results, original_results)
 
     def test_stale_keyed_dispatch_generation_is_rebuilt(self) -> None:
         aot_scale = _make_aot_scale()
@@ -1145,17 +1172,57 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             static_shapes=True,
             config=helion.Config(block_sizes=[64]),
         )
-        def add_list(xs: list[torch.Tensor]) -> torch.Tensor:
-            out = torch.empty_like(xs[0])
-            for tile in hl.tile(xs[0].size(0)):
-                out[tile] = xs[0][tile] + xs[1][tile]
+        def add_container(xs: _TensorContainer, y: torch.Tensor) -> torch.Tensor:
+            x = xs.x
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
             return out
 
         x = torch.randn(64, device=DEVICE)
         y = torch.randn_like(x)
-        with patch.object(add_list, "_bind", wraps=add_list._bind) as bind:  # type: ignore[attr-defined]
-            out = add_list([x, y])
-        self.assertEqual(bind.call_count, 1)
+        args = (_TensorContainer(x), y)
+        self.assertIsNone(add_container._fast_dispatch_key_and_guards(args))
+        run_completed = False
+        run_count = 0
+        bind_after_run: list[bool] = []
+        original_bind = add_container._bind
+        original_ensure = kernel_module.BoundKernel.ensure_config_exists
+
+        def recorded_bind(values):
+            bind_after_run.append(run_completed)
+            return original_bind(values)
+
+        def observed_ensure(bound, values):
+            original_ensure(bound, values)
+            if bound.kernel is not add_container:
+                return
+            original_run = bound._run
+            assert original_run is not None
+
+            def observed_run(*run_args):
+                nonlocal run_completed, run_count
+                result = original_run(*run_args)
+                run_completed = True
+                run_count += 1
+                return result
+
+            bound._run = observed_run
+
+        with (
+            patch.object(add_container, "_bind", side_effect=recorded_bind),
+            patch.object(
+                kernel_module.BoundKernel,
+                "ensure_config_exists",
+                new=observed_ensure,
+            ),
+        ):
+            out = add_container(*args)
+        self.assertEqual(run_count, 1)
+        self.assertTrue(bind_after_run)
+        # Direct-call preparation catches exceptions after execution, so check
+        # the record here rather than asserting inside the patched binder.
+        self.assertFalse(any(bind_after_run))
         torch.testing.assert_close(out, x + y)
 
     def test_distributed_state_change_rechecks_dispatch(self) -> None:

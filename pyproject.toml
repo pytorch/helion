@@ -114,6 +114,9 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 # resolution -> runtime TypeError). It is imported by generated kernels at
 # runtime, not type-checked, so the forced future import (I002) is exempted.
 "helion/_compiler/cute/_flash_runtime.py" = ["I002"]
+"helion/_compiler/cute/_flash_row_mma_runtime.py" = ["I002"]
+"helion/_compiler/cute/_warp_mma_runtime.py" = ["I002"]
+"helion/_compiler/cute/_flash_alt_runtime.py" = ["I002"]
 # Same: the vendored @cute.jit gemm_ptx_partial here must NOT have its annotations
 # stringified by `from __future__ import annotations`. Imported by generated
 # kernels at runtime, not type-checked, so I002 is exempted. The remaining codes
@@ -165,6 +168,24 @@ allow-direct-references = true
 
 [tool.hatch.version]
 source = "vcs"
+
+[tool.pytest.ini_options]
+# artifacts/ holds gitignored benchmark and probe outputs, some of them named
+# test_*.py with import-time side effects; pytest must never collect them
+# (pytest's built-in defaults plus artifacts and the docs build).
+norecursedirs = [
+  "*.egg",
+  ".*",
+  "_darcs",
+  "build",
+  "CVS",
+  "dist",
+  "node_modules",
+  "venv",
+  "{arch}",
+  "artifacts",
+  "site",
+]
 
 [tool.pyrefly]
 project-includes = ["helion", "benchmarks", "docs", "examples"]

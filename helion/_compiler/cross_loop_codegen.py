@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -12,6 +13,7 @@ from torch.utils._sympy.functions import Max as SymbolicMax
 from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
+from .._dist_utils import _resolve_process_group
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -24,6 +26,7 @@ from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import nested_wait_placement
 from .device_function import TensorArg
+from .device_function import TensorDescriptorArg
 from .host_function import HostFunction
 from .program_id import _clone_ast_value
 from .program_id import _clone_stmt
@@ -40,6 +43,7 @@ from .tile_strategy import L2GroupingProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Mapping
 
     from .device_function import DeviceFunction
@@ -59,6 +63,10 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
+
+
+# One 128-byte line per uint64 peer_counter slot.
+_PEER_SLOT_WORDS = _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // torch.uint64.itemsize
 
 
 def _ast_fingerprint(nodes: list[ast.stmt]) -> tuple[str, ...]:
@@ -307,15 +315,16 @@ def _static_block_axis_geometry(
     device_function: DeviceFunction,
 ) -> tuple[int, int] | None:
     """Return ``(task_count, block_size)`` for one statically sized axis."""
-    env = CompileEnvironment.current()
+    info = CompileEnvironment.current().block_sizes[block_id]
+    # No static extent (data-dependent bounds, reused block sizes): no geometry.
+    if not isinstance(info.size, (int, torch.SymInt)):
+        return None
     try:
-        numel_expr = env.block_sizes[block_id].numel
+        numel_expr = info.numel
         if not numel_expr.is_number:
             return None
         numel = int(numel_expr)
-        block = int(
-            env.block_sizes[block_id].from_config_assert(device_function.config)
-        )
+        block = int(info.from_config_assert(device_function.config))
     except (KeyError, TypeError, ValueError):
         return None
     return (numel + block - 1) // block, block
@@ -391,6 +400,7 @@ def _wait_for_counter(
     counter: str,
     target: str,
     prefix: str,
+    load_fence: bool = True,
 ) -> list[ast.stmt]:
     value = device_function.new_var(prefix, dce=False)
     sync = device_function.new_var(f"{prefix}_sync", dce=False)
@@ -414,6 +424,7 @@ def _wait_for_counter(
             "constraints='=r,r', args=[tl.arange(0, 32)], "
             "dtype=tl.uint32, is_pure=False, pack=1)"
         ),
+        *(device_function.async_load_fence() if load_fence else []),
     ]
 
 
@@ -424,7 +435,7 @@ def _wait_for_dependencies(
     prefix: str,
 ) -> list[ast.stmt]:
     """Emit every acquire wait in one graph-derived dependency set."""
-    return [
+    waits = [
         statement
         for counter, target in dependencies
         for statement in _wait_for_counter(
@@ -432,8 +443,10 @@ def _wait_for_dependencies(
             counter=counter,
             target=target,
             prefix=prefix,
+            load_fence=False,
         )
     ]
+    return [*waits, *device_function.async_load_fence()] if waits else []
 
 
 def _emit_final_arrival_continuation(
@@ -469,26 +482,151 @@ def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
     )
 
 
+def _release_sync(device_function: DeviceFunction) -> list[ast.stmt]:
+    """CTA sync before a release publication, completing TMA stores first."""
+    return [
+        *device_function.async_store_drain(),
+        _publication_sync(device_function),
+    ]
+
+
 def _register_cross_loop_state(
     device_function: DeviceFunction,
     *,
     name_hint: str,
     numel: str,
     dtype: torch.dtype,
+    symmetric: bool = False,
 ) -> str:
-    """Register launch-persistent global state owned by the Triton launcher."""
+    """Register launch-persistent global state owned by the Triton launcher.
+
+    A symmetric state is followed by the table of every rank's state pointer.
+    """
     like = next(
-        argument
-        for argument in device_function.arguments
-        if isinstance(argument, TensorArg) and argument._host_str is not None
+        (
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorArg)
+            and not isinstance(argument, TensorDescriptorArg)
+            and argument._host_str is not None
+        ),
+        None,
     )
+    if like is None:
+        descriptor = next(
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorDescriptorArg)
+        )
+        like_host = (
+            HostFunction.current().tensor_to_origin[descriptor.fake_value].host_str()
+        )
+    else:
+        like_host = like.host_str()
     name = device_function.new_var(name_hint, dce=False)
-    device_function.wrapper_only_params.append(name)
-    device_function.triton_persistent_state_args.append(name)
+    names = [name]
+    if symmetric:
+        names.append(device_function.new_var(f"{name_hint}_ptrs", dce=False))
+    device_function.wrapper_only_params.extend(names)
+    device_function.triton_persistent_state_args.extend(names)
     device_function.triton_persistent_state_specs.append(
-        (like.host_str(), numel, str(dtype))
+        (like_host, numel, str(dtype), symmetric)
     )
     return name
+
+
+@dataclasses.dataclass(frozen=True)
+class PeerState:
+    """Symmetric uint64 state: inband mailboxes, peer counters, a done slot.
+
+    Laid out from the dependency graph alone, so body codegen and the
+    schedule agree on it whichever registers it first.
+    """
+
+    state: str
+    epoch: str
+    ptrs: str
+    rank: str
+    bases: tuple[str, ...]
+    # allocation id -> (first word, elements per slot)
+    mailboxes: dict[int, tuple[int, int]]
+    slots: dict[int, int]
+    done: int
+
+    def mailbox(self, allocation_id: int, source: object) -> str:
+        """Word offset of ``source``'s slot for this launch's parity."""
+        offset, numel = self.mailboxes[allocation_id]
+        return (
+            f"{offset} + tl.cast({self.epoch} & 1, tl.int64) * "
+            f"{len(self.bases) * numel} + {source} * {numel}"
+        )
+
+
+def peer_state(device_function: DeviceFunction) -> PeerState | None:
+    """Register the peer state once per kernel if any dependency crosses ranks."""
+    if device_function.peer_state is not None:
+        return device_function.peer_state
+    graph = HostFunction.current().device_ir.tile_dependency_graph
+    if graph is None or not graph.crosses_ranks():
+        return None
+    process_group_name = CompileEnvironment.current().process_group_name
+    assert process_group_name is not None
+    world_size = torch.distributed.get_world_size(
+        _resolve_process_group(process_group_name)
+    )
+    mailboxes: dict[int, tuple[int, int]] = {}
+    words = 0
+    for allocation_id in sorted(graph.inband_allocation_ids):
+        numel = graph.inband_numel(allocation_id)
+        mailboxes[allocation_id] = (words, numel)
+        words += 2 * world_size * numel
+    words = -(-words // _PEER_SLOT_WORDS) * _PEER_SLOT_WORDS
+    producers = sorted(
+        {
+            edge.producer_root
+            for edge in graph.edges
+            for dependency in edge.access_dependencies
+            if graph.transport(dependency) == "peer_counter"
+        }
+    )
+    slots = {root: words + i * _PEER_SLOT_WORDS for i, root in enumerate(producers)}
+    done = words + len(producers) * _PEER_SLOT_WORDS
+    state = _register_cross_loop_state(
+        device_function,
+        name_hint="tile_dependency_peer_state",
+        numel=str(done + 1),
+        dtype=torch.uint64,
+        symmetric=True,
+    )
+    ptrs = device_function.triton_persistent_state_args[-1]
+    rank = device_function.new_var("tile_dependency_peer_rank", dce=True)
+    bases = tuple(
+        device_function.new_var(f"tile_dependency_peer_base_{peer}", dce=True)
+        for peer in range(world_size)
+    )
+    # The launcher appends this rank to the table of per-rank state pointers.
+    device_function.preamble.extend(
+        [
+            statement_from_string(f"{rank} = tl.load({ptrs} + {world_size})"),
+            *(
+                statement_from_string(
+                    f"{base} = tl.load({ptrs} + {peer}).to(tl.pointer_type(tl.uint64))"
+                )
+                for peer, base in enumerate(bases)
+            ),
+        ]
+    )
+    device_function.peer_state = PeerState(
+        state=state,
+        epoch=device_function.new_var("tile_dependency_peer_epoch", dce=False),
+        ptrs=ptrs,
+        rank=rank,
+        bases=bases,
+        mailboxes=mailboxes,
+        slots=slots,
+        done=done,
+    )
+    return device_function.peer_state
 
 
 def _outline_cross_loop_region(
@@ -572,6 +710,13 @@ def emit_cross_loop_schedule(
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
     pipeline = device_function.config.cross_loop_pipeline
+    dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
+    assert dependency_graph is not None
+    # Only the dynamic pipeline emits peer transports; R5 offers no other choice.
+    if pipeline != "dynamic" and dependency_graph.crosses_ranks():
+        raise AssertionError(
+            "cross-rank tile dependencies require cross_loop_pipeline='dynamic'"
+        )
     if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
@@ -610,8 +755,6 @@ def emit_cross_loop_schedule(
         for root, body in enumerate(case_bodies)
         if _triton_root_requires_kernel_scope(body, target_device_capability)
     )
-    dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
-    assert dependency_graph is not None
     indexing = device_function.config.get("indexing", ())
 
     def uses_tensor_descriptor(memory_op_index: int) -> bool:
@@ -805,6 +948,61 @@ def emit_cross_loop_schedule(
     readiness_counter_arg = state_section(readiness_counter_state_offset)
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
+    # peer_counter: one uint64 slot per publishing root plus a done slot, on
+    # every rank. Targets use a uint64 epoch so they never wrap.
+    peer_edges = static_pipeline_plan.peer_edges
+    done_roots = static_pipeline_plan.done_roots
+    peer = peer_state(device_function)
+    world_size = len(peer.bases) if peer is not None else 1
+    # A lost node key would turn a poll into a plain load of racing peer data.
+    if any(
+        dependency_graph.is_inband(access)
+        and access.access_id not in device_function.inband_access_ids
+        for access in dependency_graph.accesses
+    ):
+        raise AssertionError("an inband access was not emitted as a push or poll")
+
+    def peer_target(roots: Iterable[int]) -> str:
+        assert peer is not None
+        tasks = sum(
+            static_pipeline_plan.execution_orders[root].task_count for root in roots
+        )
+        return f"{peer.epoch} * {int(tasks) * world_size}"
+
+    def peer_waits(root: int) -> list[ast.stmt]:
+        producers = sorted(
+            producer for producer, consumer in peer_edges if consumer == root
+        )
+        if not producers:
+            return []
+        assert peer is not None
+        return [
+            *(
+                statement_from_string(
+                    f"helion_dist_utils._wait_at_least({peer.state} + "
+                    f"{peer.slots[producer]}, {peer_target((producer,))})"
+                )
+                for producer in producers
+            ),
+            _publication_sync(device_function),
+            *device_function.async_load_fence(),
+        ]
+
+    def peer_publications(root: int) -> list[ast.stmt]:
+        if peer is None:
+            return []
+        slots = [peer.slots[root]] if root in peer.slots else []
+        if root in done_roots:
+            slots.append(peer.done)
+        lanes = 1 << (world_size - 1).bit_length()
+        return [
+            statement_from_string(
+                f"helion_dist_utils._add_on_every_rank({peer.ptrs}, {slot}, "
+                f"{world_size}, {lanes})"
+            )
+            for slot in slots
+        ]
+
     dispatch_ticket: str | None = None
     if not uses_packet_dispatch:
         assert state_arg is not None
@@ -835,6 +1033,13 @@ def emit_cross_loop_schedule(
                 f"{packet_count}, tl.uint64) + 1, tl.uint32)"
             ),
         ]
+        if peer is not None:
+            result.append(
+                statement_from_string(
+                    f"{peer.epoch} = {raw_dispatch_ticket} // "
+                    f"tl.cast({packet_count}, tl.uint64) + 1"
+                )
+            )
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
         consumer: tuple(
             sorted(
@@ -866,12 +1071,12 @@ def emit_cross_loop_schedule(
         producers = root_barrier_incoming.get(root, ())
         return tuple(root_barrier_dependency(producer) for producer in producers)
 
-    def root_barrier_publication(root: int) -> list[ast.stmt]:
+    def root_barrier_publication(root: int, *, synced: bool = False) -> list[ast.stmt]:
         if root not in root_barrier_indices:
             return []
         barrier_counter = root_barrier_counter(root)
         arrivals = static_pipeline_plan.root_barrier_arrival_count(root)
-        result = [_publication_sync(device_function)]
+        result = [] if synced else _release_sync(device_function)
         if arrivals == 1:
             result.append(
                 statement_from_string(
@@ -1526,11 +1731,15 @@ def emit_cross_loop_schedule(
                 )
             )
 
-        last_arrival_body = [consumer_call]
+        last_arrival_body = [*device_function.async_load_fence(), consumer_call]
         if consumer_publications:
-            last_arrival_body.append(_publication_sync(device_function))
+            last_arrival_body.extend(_release_sync(device_function))
             last_arrival_body.extend(consumer_publications)
-        last_arrival_body.extend(root_barrier_publication(continuation_root))
+        last_arrival_body.extend(
+            root_barrier_publication(
+                continuation_root, synced=bool(consumer_publications)
+            )
+        )
         expected_arrivals = plan.uniform_arrival_count()
         if expected_arrivals is None:
             raise AssertionError(
@@ -1657,12 +1866,7 @@ def emit_cross_loop_schedule(
                     )
 
             cloned = cast("ast.For", _clone_ast_value(loop))
-            cloned.body.extend(
-                [
-                    _publication_sync(device_function),
-                    *publications,
-                ]
-            )
+            cloned.body.extend([*_release_sync(device_function), *publications])
             emitted_site_ids.add(site_id)
             return [cloned]
 
@@ -1802,7 +2006,7 @@ def emit_cross_loop_schedule(
             )
         if producer_counters:
             has_task_scheduling = True
-            body.append(_publication_sync(device_function))
+            body.extend(_release_sync(device_function))
         for producer_counter_plan, readiness_producer in producer_counters:
             body.extend(
                 emit_readiness_arrivals_from_producer(
@@ -1836,16 +2040,21 @@ def emit_cross_loop_schedule(
         ]
 
     def static_root_body(root: int) -> list[ast.stmt]:
-        """Lower one resident root from its scalar W-padded ownership fold."""
+        """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
         active_worker_count = min(launch_worker_count, task_count_value)
-        segment_membership = (
-            f"({worker}) == 0"
-            if active_worker_count == 1
-            else f"(({worker}) >= 0 and ({worker}) < {active_worker_count})"
-        )
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
+        # A trailing root may begin mid-wave: rotate workers onto its lanes.
+        rotation = -segment_begin % launch_worker_count
+        lane = (
+            f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
+        )
+        segment_membership = (
+            f"({lane}) == 0"
+            if active_worker_count == 1
+            else f"(({lane}) >= 0 and ({lane}) < {active_worker_count})"
+        )
         task_dispatch: list[ast.stmt] = [
             create(
                 ast.For,
@@ -1855,7 +2064,7 @@ def emit_cross_loop_schedule(
                     ctx=ast.Store(),
                 ),
                 iter=expr_from_string(
-                    f"tl.range((({worker}) - 0) + ({segment_begin}), "
+                    f"tl.range((({lane}) - 0) + ({segment_begin}), "
                     f"({segment_end}), "
                     f"{launch_worker_count})"
                 ),
@@ -1912,6 +2121,7 @@ def emit_cross_loop_schedule(
                 dependencies=root_barrier_input_dependencies(root),
                 prefix="tile_dependency_root_barrier_wait",
             )
+            task_body.extend(peer_waits(root))
             task_body.extend(
                 scheduled_root_task_body(
                     root,
@@ -1920,7 +2130,11 @@ def emit_cross_loop_schedule(
                     (dispatch_ticket,),
                 )
             )
-            task_body.extend(root_barrier_publication(root))
+            publications = peer_publications(root)
+            if publications:
+                task_body.extend(_release_sync(device_function))
+            task_body.extend(root_barrier_publication(root, synced=bool(publications)))
+            task_body.extend(publications)
             packet_branches.append(
                 (
                     packet_begin,
@@ -1963,7 +2177,11 @@ def emit_cross_loop_schedule(
                 device_function,
                 name_hint="tile_dependency_packet_dispatch",
                 body=[branch for _begin, _requires_kernel_scope, branch in suffix],
-                extra_argument_names=(dispatch_ticket, epoch_var),
+                extra_argument_names=(
+                    dispatch_ticket,
+                    epoch_var,
+                    *([peer.epoch] if peer is not None else []),
+                ),
                 noinline=True,
             )
             result.append(
@@ -1977,6 +2195,23 @@ def emit_cross_loop_schedule(
         else:
             result.extend(
                 branch for _begin, _requires_kernel_scope, branch in packet_branches
+            )
+        if done_roots:
+            # The last ticket exits only after every rank's done roots finish,
+            # so the next launch cannot overwrite data a peer still reads.
+            assert peer is not None
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{dispatch_ticket} == {packet_count - 1}"),
+                    body=[
+                        statement_from_string(
+                            f"helion_dist_utils._wait_at_least({peer.state} + "
+                            f"{peer.done}, {peer_target(done_roots)})"
+                        )
+                    ],
+                    orelse=[],
+                )
             )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)

@@ -49,6 +49,12 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    def supports_block_ptr_indexing(self) -> bool:
+        from ..._compat import supports_block_ptr
+
+        # Triton >= 3.9 removed block pointers (triton-lang/triton#10833).
+        return supports_block_ptr()
+
     @property
     def name(self) -> str:
         return "triton"
@@ -68,16 +74,31 @@ class TritonBackend(Backend):
         tensor_host_args: list[str],
     ) -> str:
         from ..device_function import TensorArg
+        from ..device_function import TensorDescriptorArg
 
         # Bind fp4x2 storage as uint8; Triton has no pointer type for the shell dtype.
         if (
             isinstance(arg, TensorArg)
+            and not isinstance(arg, TensorDescriptorArg)
             and arg.fake_value.dtype is torch.float4_e2m1fn_x2
         ):
             return f"{host_str}.view(torch.uint8)"
         return host_str
 
+    def tensor_descriptor_host_base(
+        self, fake_value: torch.Tensor, host_str: str
+    ) -> str:
+        # Triton's host descriptor does not recognize PyTorch's packed FP4
+        # shell dtype, but its byte view has the same storage geometry.
+        if fake_value.dtype is torch.float4_e2m1fn_x2:
+            return f"{host_str}.view(torch.uint8)"
+        return host_str
+
     def supports_config_key(self, key: str) -> bool:
+        if key == "host_tensor_descriptors":
+            from ..._compat import supports_host_tensor_descriptor
+
+            return self.name == "triton" and supports_host_tensor_descriptor()
         if key == "cross_loop_pipeline":
             from ..._compat import is_hip
 
@@ -389,6 +410,7 @@ class TritonBackend(Backend):
             "triton_helpers": "from torch._inductor.runtime import triton_helpers",
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+            "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
@@ -537,6 +559,7 @@ class TritonBackend(Backend):
             out.append("_rng_seed_buffer")
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
+        from ..host_function import HostFunction
 
         device_fn = DeviceFunction.current()
         if device_fn.triton_remote_copy_signal_slots:
@@ -574,10 +597,25 @@ class TritonBackend(Backend):
             out.append(f"_remote_copy_scratch_specs=({specs},)")
         if device_fn.triton_persistent_state_specs:
             specs = ", ".join(
-                f"({tensor}, {numel}, {dtype})"
-                for tensor, numel, dtype in device_fn.triton_persistent_state_specs
+                f"({tensor}, {numel}, {dtype}, {symmetric})"
+                for tensor, numel, dtype, symmetric in (
+                    device_fn.triton_persistent_state_specs
+                )
             )
             out.append(f"_persistent_state_specs=({specs},)")
+            if any(spec[3] for spec in device_fn.triton_persistent_state_specs):
+                process_group_name = CompileEnvironment.current().process_group_name
+                if process_group_name is None:
+                    raise exc.BackendUnsupported(
+                        "triton", "symmetric launch state requires a process group"
+                    )
+                out.append(
+                    f"_persistent_state_process_group_name={process_group_name!r}"
+                )
+                # Ranks compare the digest when they first allocate the state.
+                graph = HostFunction.current().device_ir.tile_dependency_graph
+                assert graph is not None
+                out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="

@@ -201,7 +201,7 @@ class FusedLinearJSDFunction(torch.autograd.Function):
         num_chunks = (batch_size + chunk_size - 1) // chunk_size
 
         # Allocate outputs
-        total_loss = torch.tensor(0.0, device=student_input.device, dtype=torch.float)
+        total_loss = torch.zeros((), device=student_input.device, dtype=torch.float)
         grad_student_input = torch.zeros_like(student_input, dtype=torch.float)
         grad_student_weight = torch.zeros_like(student_weight, dtype=torch.float)
 

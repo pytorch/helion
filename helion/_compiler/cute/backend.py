@@ -33,6 +33,7 @@ from ..backend import _loop_contains_matmul
 from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .math_templates import SIGMOID_TEMPLATE
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
+    from ..aten_lowering import Lowering
     from ..device_function import Argument
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
@@ -54,6 +56,231 @@ if TYPE_CHECKING:
     from .attention_plan import AttentionScorePlan
 
     InductorOpOverrides = OpsHandler[Any]
+
+
+def _live_grid_thread_extents(
+    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
+) -> dict[int, int]:
+    """Recover grid launch requirements from surviving named assignments."""
+    live: dict[int, int] = {}
+    for statement in statements:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in extents:
+                    axis, extent = extents[target.id]
+                    live[axis] = max(live.get(axis, 1), extent)
+    return live
+
+
+def _live_grid_thread_dims(
+    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
+) -> list[int]:
+    live = _live_grid_thread_extents(statements, extents)
+    return [live.get(axis, 1) for axis in range(3)]
+
+
+# The ``cute.arch`` calls a thread makes on its own: its coordinates and the
+# launch's shape, per-thread memory operations, scalar math and the
+# programmatic-dependent-launch controls (atomics by their ``atomic_`` prefix).
+# Every other ``cute.arch`` call reaches other threads: shuffles, votes, warp
+# reductions, barriers, mbarriers, shared memory, warp and lane indices,
+# clusters, asynchronous copies.
+_CUTE_ARCH_PER_THREAD_CALLS = frozenset(
+    {
+        "thread_idx",
+        "block_idx",
+        "grid_dim",
+        "block_dim",
+        "load",
+        "store",
+        "prefetch",
+        "fmax",
+        "fmin",
+        "exp2",
+        "rcp_approx",
+        "cvt_f32_tf32",
+        "fma_packed_f32x2",
+        "mul_packed_f32x2",
+        "add_packed_f32x2",
+        "sub_packed_f32x2",
+        "calc_packed_f32x2_op",
+        "griddepcontrol_wait",
+        "griddepcontrol_launch_dependents",
+    }
+)
+# Helion's kernel-side helpers a thread calls on its own; the others
+# (``_cute_grouped_reduce_*``, ``_cute_resident_*``, the rank-1 and tcgen05
+# paths) combine or stage values across threads.
+_CUTE_PER_THREAD_HELPERS = frozenset(
+    {
+        "_cute_argreduce_index",
+        "_cute_atomic_max_float32",
+        "_cute_atomic_min_float32",
+        "_cute_fp8e4m3fn_to_float32",
+        "_cute_gelu_erf_exact_f32x2",
+        "_cute_sigmoid_approx_ftz_f32",
+    }
+)
+# The ``cute`` entry points through which a body partitions a tile across
+# threads: copies, MMA and their atoms; ``cutlass.utils`` (shared-memory and
+# TMEM allocators, schedulers) and ``cutlass.pipeline`` as a whole.
+_CUTE_CROSS_THREAD_ENTRY_POINTS = frozenset(
+    {
+        "copy",
+        "gemm",
+        "nvgpu",
+        "autovec_copy",
+        "local_partition",
+        "local_tile",
+        "make_copy_atom",
+        "make_mma_atom",
+        "make_tiled_mma",
+    }
+)
+_CUTE_CROSS_THREAD_ENTRY_PREFIXES = ("make_tiled_copy",)
+
+
+def _cross_thread_constructs(statements: Sequence[ast.AST]) -> list[str]:
+    """The constructs of a kernel body that reach other threads or hand a tile to a collective.
+
+    Each was emitted for the static launch shape: the lanes a warp reduction
+    spans, the stride of a shared-memory reduction's lane index, the
+    partition of a tiled copy or MMA.  A launch axis sized by a kernel
+    argument holds a one in that shape, so the construct is wrong once the
+    axis has more than one thread (a warp reduction over 32 column threads
+    beside eight row threads sums across rows).  Fail closed: every
+    ``cute.arch`` call outside ``_CUTE_ARCH_PER_THREAD_CALLS`` and every
+    ``_cute_`` helper outside ``_CUTE_PER_THREAD_HELPERS`` counts.
+    """
+    found: set[str] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name):
+                if (
+                    node.id.startswith("_cute_")
+                    and node.id not in _CUTE_PER_THREAD_HELPERS
+                ):
+                    found.add(node.id)
+                continue
+            if not isinstance(node, ast.Attribute):
+                continue
+            owner = node.value
+            if isinstance(owner, ast.Name):
+                if owner.id == "cute" and (
+                    node.attr in _CUTE_CROSS_THREAD_ENTRY_POINTS
+                    or node.attr.startswith(_CUTE_CROSS_THREAD_ENTRY_PREFIXES)
+                ):
+                    found.add(f"cute.{node.attr}")
+                elif owner.id == "cutlass" and node.attr in ("utils", "pipeline"):
+                    found.add(f"cutlass.{node.attr}")
+            elif (
+                isinstance(owner, ast.Attribute)
+                and isinstance(owner.value, ast.Name)
+                and owner.value.id == "cute"
+                and owner.attr == "arch"
+                and node.attr not in _CUTE_ARCH_PER_THREAD_CALLS
+                and not node.attr.startswith("atomic_")
+            ):
+                found.add(f"cute.arch.{node.attr}")
+    return sorted(found)
+
+
+def _symbolic_axes_text(axes: dict[int, str]) -> str:
+    return ", ".join(f"{axis} ({expr})" for axis, expr in sorted(axes.items()))
+
+
+def _thread_idx_axis(node: ast.AST) -> int | None:
+    """The axis of a ``cute.arch.thread_idx()[k]`` subscript, else ``None``."""
+    if not (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, int)
+    ):
+        return None
+    call = node.value
+    if not (
+        isinstance(call, ast.Call)
+        and not call.args
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "thread_idx"
+    ):
+        return None
+    owner = call.func.value
+    if (
+        isinstance(owner, ast.Attribute)
+        and owner.attr == "arch"
+        and isinstance(owner.value, ast.Name)
+        and owner.value.id == "cute"
+    ):
+        return node.slice.value
+    return None
+
+
+def _thread_axes_read_outside_leader_guards(statements: Sequence[ast.AST]) -> set[int]:
+    """The launch axes whose thread index the body reads, leader guards aside.
+
+    A leader guard compares the index with zero (``cute.arch.thread_idx()[k]
+    == 0``, see ``atomic_ops._cute_leader_predicate``); it is the one read of
+    an axis that holds for a single thread.
+    """
+    guards: set[int] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.Eq)
+                and isinstance(node.comparators[0], ast.Constant)
+                and node.comparators[0].value == 0
+                and _thread_idx_axis(node.left) is not None
+            ):
+                guards.add(id(node.left))
+    axes: set[int] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            axis = _thread_idx_axis(node)
+            if axis is not None and id(node) not in guards:
+                axes.add(axis)
+    return axes
+
+
+def _pointwise_grid_thread_dims(
+    live_extents: dict[int, int],
+    final_thread_axes: set[int],
+    referenced_dims: Sequence[int],
+    *,
+    has_pointwise_fact: bool,
+    has_nested_device_loops: bool,
+    has_synthetic_free_axes: bool,
+) -> tuple[int, int, int] | None:
+    if (
+        not has_pointwise_fact
+        or not live_extents
+        or not final_thread_axes.issubset(live_extents)
+        or has_nested_device_loops
+        or has_synthetic_free_axes
+    ):
+        return None
+    if any(referenced_dims[axis] > live_extents[axis] for axis in final_thread_axes):
+        # A larger reference is not evidence that every producer has a surplus
+        # mask. Do not add duplicate/out-of-tile writers to satisfy it.
+        raise exc.BackendUnsupported(
+            "cute", "pointwise grid reference exceeds its live producer extent"
+        )
+    dims = [
+        live_extents.get(axis, 1) if axis in final_thread_axes else 1
+        for axis in range(3)
+    ]
+    # CUDA's z dimension is capped independently of the total thread count.
+    # A numerically complete rectangular grid can otherwise request z=128
+    # while still fitting the 1024-thread product budget checked by the caller.
+    if any(size > limit for size, limit in zip(dims, (1024, 1024, 64), strict=True)):
+        raise exc.BackendUnsupported(
+            "cute", f"pointwise grid launch exceeds CUDA per-axis limits: {tuple(dims)}"
+        )
+    return dims[0], dims[1], dims[2]
 
 
 def _detect_mma_loop(
@@ -108,7 +335,7 @@ def _detect_mma_loop(
         if graph_info.block_ids != block_ids:
             continue
         for node in graph_info.graph.nodes:
-            candidate = analyze_cute_mma_node(node)
+            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
             if (
                 candidate is not None
                 and not candidate.requires_scalar_fallback
@@ -122,7 +349,13 @@ def _detect_mma_loop(
 
 def _specialized_mma_root_thread_layout(
     root_block_ids: Sequence[int], config: Config
-) -> tuple[int, int, int, int] | None:
+) -> tuple[int, int, int, int, bool, bool] | None:
+    """``(bm, bn, m_threads, n_threads, m_explicit, n_explicit)`` of the root.
+
+    An automatic thread count (``num_threads`` of 0) stands in as the block
+    size, trimmed to the 1024-thread CTA budget; the flags tell the MMA
+    support predicate whether the M / N counts were requested by the config.
+    """
     from ..compile_environment import CompileEnvironment
 
     if len(root_block_ids) != 2:
@@ -157,6 +390,8 @@ def _specialized_mma_root_thread_layout(
         root_block_sizes[1],
         root_thread_counts[0],
         root_thread_counts[1],
+        not root_thread_auto[0],
+        not root_thread_auto[1],
     )
 
 
@@ -167,15 +402,38 @@ def _specialized_mma_root_threads_support_impl(
     bn: int,
     root_m_threads: int,
     root_n_threads: int,
+    root_m_threads_explicit: bool,
+    root_n_threads_explicit: bool,
 ) -> bool:
     from .cute_mma import _mma_active_n_threads
     from .cute_mma import _tcgen05_root_m_threads
+    from .cute_mma import _tcgen05_root_n_threads
 
     if mma_impl == "tcgen05":
+        # The tcgen05 role launch is one physical warp per role row (see
+        # ``_tcgen05_root_m_threads``) and its y extent is the role warp
+        # count, clamped by the SIMT N axis (``_tcgen05_root_n_threads``):
+        # an explicit M or N thread count has to be exactly the width the
+        # launch planning resolves, so another request takes the generic
+        # SIMT path instead of launching warps the role predicates and the
+        # pipeline-init barrier do not count, or too few warps for the
+        # roles.  Automatic counts arrive here as the tile extents and are
+        # resolved by the launch planning.
+        physical_m_threads = _tcgen05_root_m_threads(bm, bn)
+        if root_m_threads_explicit:
+            m_threads_supported = root_m_threads == physical_m_threads
+        else:
+            m_threads_supported = physical_m_threads <= root_m_threads <= bm
+        if root_n_threads_explicit:
+            n_threads_supported = root_n_threads == _tcgen05_root_n_threads(bn)
+        else:
+            n_threads_supported = (
+                _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
+            )
         return (
-            _tcgen05_root_m_threads(bm, bn) <= root_m_threads <= bm
+            m_threads_supported
             and bm % root_m_threads == 0
-            and _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
+            and n_threads_supported
             and bn % root_n_threads == 0
             and root_m_threads * root_n_threads <= 1024
         )
@@ -237,7 +495,14 @@ def _detect_grouped_rank3_specialized_mma_loop(
     root_layout = _specialized_mma_root_thread_layout(mn_root_grid_ids, config)
     if root_layout is None:
         return False
-    bm, bn, root_m_threads, root_n_threads = root_layout
+    (
+        bm,
+        bn,
+        root_m_threads,
+        root_n_threads,
+        root_m_threads_explicit,
+        root_n_threads_explicit,
+    ) = root_layout
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
@@ -247,6 +512,8 @@ def _detect_grouped_rank3_specialized_mma_loop(
         bn=bn,
         root_m_threads=root_m_threads,
         root_n_threads=root_n_threads,
+        root_m_threads_explicit=root_m_threads_explicit,
+        root_n_threads_explicit=root_n_threads_explicit,
     ):
         return False
 
@@ -302,7 +569,7 @@ def _detect_specialized_mma_loop(
         if getattr(graph_info, "block_ids", None) != block_ids:
             continue
         for node in graph_info.graph.nodes:
-            candidate = analyze_cute_mma_node(node)
+            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
             if (
                 candidate is not None
                 and not candidate.requires_scalar_fallback
@@ -318,7 +585,14 @@ def _detect_specialized_mma_loop(
     root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
     if root_layout is None:
         return False
-    bm, bn, root_m_threads, root_n_threads = root_layout
+    (
+        bm,
+        bn,
+        root_m_threads,
+        root_n_threads,
+        root_m_threads_explicit,
+        root_n_threads_explicit,
+    ) = root_layout
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
@@ -348,6 +622,8 @@ def _detect_specialized_mma_loop(
                 bn=bn,
                 root_m_threads=root_m_threads,
                 root_n_threads=root_n_threads,
+                root_m_threads_explicit=root_m_threads_explicit,
+                root_n_threads_explicit=root_n_threads_explicit,
             ):
                 return True
             continue
@@ -357,6 +633,8 @@ def _detect_specialized_mma_loop(
             bn=bn,
             root_m_threads=root_m_threads,
             root_n_threads=root_n_threads,
+            root_m_threads_explicit=root_m_threads_explicit,
+            root_n_threads_explicit=root_n_threads_explicit,
         ):
             if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
@@ -550,7 +828,15 @@ def _detect_attention_mma_loop(
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
-        return False
+        # Softmax-free (gated) attention over jagged rows: same tcgen05 body
+        # family, selected by the same config envelope (128-row tiles).
+        from .cute_flash_gated import detect_gated_attention_loop
+
+        gated = detect_gated_attention_loop(fn, block_ids, config=config)
+        if gated is None:
+            return False
+        fn.cute_state.attention_flash_gated_match = gated
+        return True
     from ..host_function import HostFunction
 
     device_ir = HostFunction.current().device_ir
@@ -619,7 +905,7 @@ def _loop_may_use_mma(
         if not isinstance(graph, torch.fx.Graph):
             return False
         for node in graph.nodes:
-            candidate = analyze_cute_mma_node(node)
+            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
             if (
                 candidate is not None
                 and not candidate.requires_scalar_fallback
@@ -757,6 +1043,7 @@ def _graph_used_block_ids(
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
+    from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
     device_ir = HostFunction.current().device_ir
@@ -822,13 +1109,27 @@ def _graph_used_block_ids(
             and device_ir.grid_block_ids[phase_index] == block_ids
         )
 
-    for graph_info in fn.codegen.codegen_graphs:
-        if not graph_matches_loop(graph_info):
+    graph_by_id = {
+        graph_info.graph_id: graph_info for graph_info in fn.codegen.codegen_graphs
+    }
+    pending = [
+        graph_info
+        for graph_info in fn.codegen.codegen_graphs
+        if graph_matches_loop(graph_info)
+    ]
+    visited: set[int] = set()
+    while pending:
+        graph_info = pending.pop()
+        if graph_info.graph_id in visited:
             continue
+        visited.add(graph_info.graph_id)
         graph = getattr(graph_info, "graph", None)
         if graph is None:
             continue
         for node in graph.nodes:
+            # A root coordinate can first be read inside a captured device
+            # scope. Its thread distribution must remain live there as well.
+            pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
             value = node.meta.get("val")
             if is_tensor_like_value(value):
                 visit_value(value)
@@ -849,6 +1150,33 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
+
+    def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
+        from ..compile_environment import CompileEnvironment
+        from .grouped_row_union import physical_schedule
+        from .grouped_row_union import schedule_supported
+
+        env = CompileEnvironment.current()
+        spec = env.config_spec._cute_tcgen05_config
+        profile = physical_schedule(fn.config)
+        axes = spec.matmul_block_ids
+        return (
+            profile is not None
+            and spec.row_union_profile_supported(profile.name)
+            and axes is not None
+            and env.canonical_block_id(block_id)
+            in tuple(env.canonical_block_id(axis) for axis in axes[:2])
+            and schedule_supported(fn.config, profile.source_tile)
+            and tuple(fn.resolved_block_size(axis) for axis in axes)
+            == profile.source_tile
+        )
+
+    def codegen_config(self, config: Config) -> Config:
+        from ..compile_environment import CompileEnvironment
+
+        return CompileEnvironment.current().config_spec._cute_tcgen05_config.project_row_union_codegen(
+            config
+        )
 
     # Bump when config_value_priors() changes its candidate distribution.
     config_value_priors_version = 3
@@ -941,6 +1269,14 @@ class CuteBackend(Backend):
         }
         return priors
 
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .uniform_comparison import UniformComparisonLowering
+        from .uniform_comparison import match_uniform_float_gt
+
+        if match_uniform_float_gt(node) is not None:
+            return UniformComparisonLowering()
+        return None
+
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
         equivalent forms that compile to materially faster code.
@@ -955,6 +1291,25 @@ class CuteBackend(Backend):
         from .online_to_3pass import rewrite_online_to_3pass
 
         rewrite_online_to_3pass(hf)
+        from ..compile_environment import CompileEnvironment
+
+        plan = CompileEnvironment.current().cute_fission_plan
+        if plan is not None:
+            from .materialized_fission import apply_materialized_fission
+
+            apply_materialized_fission(hf, plan)
+
+        from .full_slice_matmul import stripmine_full_slice_matmuls
+
+        stripmine_full_slice_matmuls(hf)
+
+        from .segmented_matmul import normalize_segmented_matmuls
+
+        normalize_segmented_matmuls(hf)
+
+        from .flatten_nested_reductions import flatten_nested_reductions
+
+        flatten_nested_reductions(hf)
 
     def pre_codegen(
         self,
@@ -965,10 +1320,12 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..device_ir import RootGraphInfo
+        from .block_scaled_mma import plan_block_scaled
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
+        from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
@@ -1006,11 +1363,17 @@ class CuteBackend(Backend):
             return
 
         device_function.cute_state.direct_affine_candidates = ()
+        plan_block_scaled(graphs)
+        if DeviceFunction.current().cute_state.block_scaled_plan is not None:
+            return
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
         plan_chunk_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
+            return
+        plan_gdn_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.gdn_recurrence_plan is not None:
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
@@ -1028,22 +1391,103 @@ class CuteBackend(Backend):
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
+    def reference_override(
+        self, function: object, args: tuple[object, ...]
+    ) -> tuple[bool, object]:
+        from ..compile_environment import CompileEnvironment
+        from .philox_stream import reference_override
+
+        policy = CompileEnvironment.current().settings.cute_rng_stream
+        if policy in ("auto", "philox4"):
+            return reference_override(function, args, strict=policy == "philox4")
+        return False, None
+
+    def validate_implicit_rng_reference(self) -> None:
+        from ..compile_environment import CompileEnvironment
+
+        if CompileEnvironment.current().settings.cute_rng_stream == "philox4":
+            raise exc.BackendUnsupported(
+                "cute", "philox4 supports explicit uniform hl.rand only"
+            )
+
     def supports_config_key(self, key: str) -> bool:
         if (
             key == "num_threads"
             or key == "cute_vector_widths"
             or key == "cute_lane_layouts"
             or key == "cute_reduction_reloads"
+            or key
+            in {
+                "cute_reduction_schedule",
+                "cute_reduction_group_rows",
+                "cute_reduction_pipeline_depth",
+                "cute_reduction_local_tree",
+                "cute_reduction_row_schedule",
+                "cute_reduction_pack_output",
+                "cute_reduction_sequence",
+                "cute_host_paired_sum",
+                "cute_materialized_schedule",
+                "cute_materialized_operand_schedule",
+                "cute_pointwise_pid_type",
+            }
             or key == "cute_async_store_policy"
             or key == "cute_bf16x2_recurrence"
+            or key == "cute_register_chain"
+            or key == "cute_signed_bitfield_bf16"
+            or key == "cute_collective_mma"
+            or key == "cute_collective_static_layouts"
+            or key == "cute_collective_copy"
+            or key == "cute_collective_recipe"
+            or key == "cute_collective_operand_packets"
+            or key == "cute_collective_epilogue"
+            or key == "cute_collective_stages"
+            or key == "cute_collective_compute"
+            or key == "cute_collective_native_seeded"
+            or key == "cute_collective_tmem_seed"
+            or key == "cute_collective_tmem_a"
+            or key == "cute_gathered_mma_n"
+            or key == "cute_gathered_mma_stages"
             or key == "cute_proven_bounds"
+            or key == "cute_rng_packet"
+            or key == "cute_independent_reduction"
+            or key == "cute_replicated_reduction"
+            or key == "cute_vector_packet_unroll"
+            or key == "cute_packet_prefetch"
+            or key == "cute_vloop_sink"
+            or key == "cute_lane_unroll"
+            or key == "cute_pdl"
+            or key
+            in (
+                "cute_split_k_workspace",
+                "cute_split_k_stages",
+                "cute_split_k_schedule",
+                "cute_split_k_finalizer_warps",
+            )
+            or key
+            in (
+                "cute_grouped_rna_warps",
+                "cute_grouped_rna_block_k",
+                "cute_grouped_ab_stages",
+                "cute_grouped_ctas_per_sm",
+                "cute_grouped_prefix_scan",
+                "cute_grouped_descriptor_policy",
+                "cute_mma_f32_conversion",
+            )
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
+            or key == "cute_gdn_recurrence_stages"
+            or key == "cute_gdn_recurrence_epilogue_warps"
+            or key == "cute_gdn_recurrence_token_groups"
+            or key == "cute_gdn_recurrence_mma_m"
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
-            or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
+            or key == "cute_matmul_family"
+            or key == "cute_warp_mma_warps"
+            or key.startswith(
+                ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
+            )
         ):
             return True
         return super().supports_config_key(key)
@@ -1138,11 +1582,8 @@ class CuteBackend(Backend):
             compiled_fn = bound_kernel._compile_cache.get(full_config)
         if compiled_fn is None:
             return
-        cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
-            f"_helion_{bound_kernel.kernel.name}"
-        )
-        launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
-        if not launchers:
+        kernels = self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        if not kernels:
             return
         device_index = (
             bound_kernel.env.device.index
@@ -1152,43 +1593,75 @@ class CuteBackend(Backend):
         # The ephemeral context restored CUTE_DSL_CACHE_DIR on exit; this sets
         # the real per-device dir when the user did not provide one.
         self.setup_compile_cache_dir(device_index)
-        for launcher in launchers.values():
-            launcher.persist_compiled()
+        for cute_kernel in kernels:
+            launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", {})
+            for launcher in launchers.values():
+                launcher.persist_compiled()
+
+    @staticmethod
+    def _compiled_kernels(compiled_fn: object, kernel_name: str) -> tuple[object, ...]:
+        bundled = getattr(compiled_fn, "_helion_cute_kernels", None)
+        if isinstance(bundled, tuple):
+            return bundled
+        fn_globals = getattr(compiled_fn, "__globals__", None)
+        if not isinstance(fn_globals, dict):
+            return ()
+        kernel = fn_globals.get(f"_helion_{kernel_name}")
+        return () if kernel is None else (kernel,)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
     ) -> str | None:
-        cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
-            f"_helion_{bound_kernel.kernel.name}"
-        )
-        if cute_kernel is None:
+        keys = []
+        for cute_kernel in self._compiled_kernels(
+            compiled_fn, bound_kernel.kernel.name
+        ):
+            launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", {})
+            key = next(
+                (
+                    key
+                    for launcher in launchers.values()
+                    if (key := getattr(launcher, "_cache_key", None)) is not None
+                ),
+                None,
+            )
+            if key is None:
+                return None
+            keys.append(key)
+        if not keys:
             return None
-        launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
-        if not launchers:
-            return None
-        for launcher in launchers.values():
-            key = getattr(launcher, "_cache_key", None)
-            if key is not None:
-                return key
-        return None
+        if len(keys) == 1:
+            return keys[0]
+        return hashlib.sha256(repr(tuple(keys)).encode("utf-8")).hexdigest()
 
     def annotate_compiled_module(
         self, module: object, source: str, kernel_name: str
     ) -> None:
-        cute_kernel = getattr(module, f"_helion_{kernel_name}", None)
-        if cute_kernel is None:
-            return
-        with contextlib.suppress(AttributeError, TypeError):
-            cute_kernel._helion_cute_source_hash = hashlib.sha256(
-                source.encode("utf-8")
-            ).hexdigest()
+        compiled_fn = getattr(module, kernel_name, None)
+        kernels = self._compiled_kernels(compiled_fn, kernel_name)
+        source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        # Shared stage modules retain their own source hash. Two bundles may
+        # reuse the same stage while differing in another stage's configuration.
+        targets = (
+            (compiled_fn,)
+            if isinstance(getattr(compiled_fn, "_helion_cute_kernels", None), tuple)
+            else (compiled_fn, *kernels)
+        )
+        for target in targets:
+            with contextlib.suppress(AttributeError, TypeError):
+                target._helion_cute_source_hash = source_hash  # type: ignore[attr-defined]
 
     def generated_source_hash(self, compiled_fn: object) -> str | None:
-        fn_globals = getattr(compiled_fn, "__globals__", None)
+        source_hash = getattr(compiled_fn, "_helion_cute_source_hash", None)
+        if isinstance(source_hash, str):
+            return source_hash
         fn_name = getattr(compiled_fn, "__name__", None)
-        if not isinstance(fn_globals, dict) or not isinstance(fn_name, str):
+        if not isinstance(fn_name, str):
             return None
-        cute_kernel = fn_globals.get(f"_helion_{fn_name}")
+        kernels = self._compiled_kernels(compiled_fn, fn_name)
+        if len(kernels) != 1:
+            return None
+        cute_kernel = kernels[0]
         source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
         return source_hash if isinstance(source_hash, str) else None
 
@@ -1272,8 +1745,10 @@ class CuteBackend(Backend):
             "ir": "from cutlass._mlir import ir",
             "mlir_math": "from cutlass._mlir.dialects import math as mlir_math",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
+            "_cute_checked_block_dims": "from helion._compiler.cute.thread_budget import checked_thread_block_dims as _cute_checked_block_dims",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
                 "as _helion_tcgen05_pipeline"
@@ -1288,6 +1763,15 @@ class CuteBackend(Backend):
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_grouped_reduce_shared_two_stage_fragment": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_fragment",
+            "_cute_grouped_reduce_shared_columns": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_columns",
+            "_cute_resident_load_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_load_vector",
+            "_cute_resident_store_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_store_vector",
+            "_cute_resident_copy_async": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_copy_async",
+            "_cute_resident_sums": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_sums",
+            "_cute_resident_sums_disjoint": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_sums_disjoint",
+            "_cute_try_paired_sum_cast": "from helion.runtime.cute.paired_sum import try_paired_sum_cast as _cute_try_paired_sum_cast",
+            "_cute_try_single_sum_cast": "from helion.runtime.cute.single_sum import try_single_sum_cast as _cute_try_single_sum_cast",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
             "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
@@ -1301,8 +1785,10 @@ class CuteBackend(Backend):
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
+            "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
+            "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
@@ -1317,6 +1803,14 @@ class CuteBackend(Backend):
             "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
             "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
             "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_load_l1_l2_evict_first": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_first as _cute_load_l1_l2_evict_first",
+            "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",
+            "_cute_load_l1_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_last as _cute_load_l1_l2_evict_last",
+            "_cute_load_l1_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_8b",
+            "_cute_load_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l2_evict_last as _cute_load_l2_evict_last_8b",
+            "_cute_load_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l2_evict_last as _cute_load_l2_evict_last_4b",
+            "_cute_load_l1_l2_evict_first_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_4b",
+            "_cute_load_l1_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_4b",
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
@@ -1377,6 +1871,29 @@ class CuteBackend(Backend):
                 from ..compile_environment import CompileEnvironment
 
                 return CompileEnvironment.current().settings.fast_math
+
+            @staticmethod
+            def mul(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                from torch._inductor.virtualized import V
+
+                from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_EXPR
+                from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
+
+                node = V.current_node
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    not HelionCuteDSLOpOverrides._fastmath_on()
+                    and isinstance(node, torch.fx.Node)
+                    and node.meta.get(FP32_MULTIPLY_ROUNDING_META_KEY)
+                    and expected is not None
+                    and expected.dtype == torch.float32
+                ):
+                    # Moving a recipe to its own launch must not contract a
+                    # separately rounded multiply/add across a narrowing cast.
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, FP32_MULTIPLY_ROUNDING_EXPR
+                    )
+                return CuteDSLOpOverrides.mul(a, b)
 
             @staticmethod
             def _unary_math(x: CuteDSLArg, name: str) -> CuteDSLArg:
@@ -1474,9 +1991,7 @@ class CuteBackend(Backend):
                     x_fp32 = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
                 result = CuteDSLOpOverrides._apply_unary_op(
                     x_fp32,
-                    f"cute.math.rcp(1.0 + cute.math.exp2("
-                    f"-{{x}} * {CuteDSLOpOverrides.LOG2_E}, fastmath=True), "
-                    f"approx=True, ftz=True)",
+                    SIGMOID_TEMPLATE,
                 )
                 expected = CuteDSLOpOverrides._expected_tensor_val()
                 expected_dtype = expected.dtype if expected is not None else None
@@ -1797,6 +2312,11 @@ class CuteBackend(Backend):
                     strategy_bs_var = strategy.block_size_var(block_id)
                     if strategy_bs_var != block_size_var:
                         continue
+                    thread_extent = (
+                        strategy.fn.tile_strategy.thread_extent_for_block_id(block_id)
+                    )
+                    if thread_extent is not None and thread_extent > 0:
+                        return min(thread_extent, 32)
                     block_size = strategy.block_size
                     if isinstance(block_size, list) and idx < len(block_size):
                         block_size = block_size[idx]
@@ -1937,10 +2457,12 @@ class CuteBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
         from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
+        from ..compile_environment import CompileEnvironment
+        from ..device_function import ConstExprArg
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
-        from .thread_budget import check_thread_limit
+        from .thread_budget import check_thread_block_dims
 
         device_function = DeviceFunction.current()
         codegen = device_function.codegen
@@ -1958,6 +2480,23 @@ class CuteBackend(Backend):
         }
 
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
+            # A body whose shared cross-warp reductions were sized for a
+            # launch shape (``finalize_shared_reduce_groups``) must launch
+            # with exactly that shape: any other block would alias groups.
+            sized_for = device_function.cute_state.shared_reduce_launch_block
+            if sized_for is not None:
+                literal = re.fullmatch(r"block=\((\d+), (\d+), (\d+)\)", block_arg)
+                launched = (
+                    tuple(int(dim) for dim in literal.groups())
+                    if literal is not None
+                    else None
+                )
+                if launched != sized_for:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"shared reductions were sized for block={sized_for} "
+                        f"but the kernel launches with {block_arg}",
+                    )
             launcher_args = [block_arg]
             compile_options: list[str] = []
             recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
@@ -2018,8 +2557,18 @@ class CuteBackend(Backend):
         direct_affine_plan = device_function.cute_state.direct_affine_plan
         if direct_affine_plan is not None:
             x, y, z = direct_affine_plan.cta_shape
-            check_thread_limit(x * y * z, context=str(direct_affine_plan.cta_shape))
+            check_thread_block_dims(
+                (x, y, z), context=str(direct_affine_plan.cta_shape)
+            )
             return launcher_args_with_compile_options(f"block=({x}, {y}, {z})")
+
+        register_chain_block_dims = (
+            device_function.cute_state.collective_register_chain_block_dims
+        )
+        if register_chain_block_dims is not None:
+            return launcher_args_with_compile_options(
+                f"block={register_chain_block_dims}"
+            )
 
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses
@@ -2049,10 +2598,25 @@ class CuteBackend(Backend):
         # launch topology rather than the carrier's logical tile axes.
         if device_function.cute_state.chunk_prepare_plan is not None:
             return launcher_args_with_compile_options("block=(128, 1, 1)")
+        if device_function.cute_state.block_scaled_plan is not None:
+            return launcher_args_with_compile_options("block=(192, 1, 1)")
         recurrence_plan = device_function.cute_state.chunk_recurrence_plan
         if recurrence_plan is not None:
             return launcher_args_with_compile_options(
                 f"block=({recurrence_plan.threads}, 1, 1)"
+            )
+        gdn_plan = device_function.cute_state.gdn_recurrence_plan
+        if gdn_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({gdn_plan.threads}, 1, 1)"
+            )
+
+        # The register-MMA GEMM family owns the whole device body and runs
+        # one CTA of ``32 * warps`` threads per output tile.
+        warp_mma_plan = device_function.cute_state.warp_mma_gemm_plan
+        if warp_mma_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({warp_mma_plan.threads}, 1, 1)"
             )
 
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)
@@ -2074,6 +2638,16 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         }
+        # Block IDs include untuned grid axes and are not positions in the
+        # config's block_sizes list. Use the actual constexpr bindings, which
+        # also preserve names allocated for flattened or renamed tile axes.
+        block_size_values.update(
+            {
+                argument.name: int(argument.host_str())
+                for argument in device_function.arguments
+                if isinstance(argument, ConstExprArg) and argument.host_str().isdigit()
+            }
+        )
         # Accept both the historical ``offset_<n>`` prefix (non-CuTe backends)
         # and the post-rename ``tile_offset_<n>`` prefix (CuTe backend, see the
         # CuTe DSL preprocessor counter-collision note in
@@ -2088,7 +2662,16 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         )
-        offset_thread_dims = [1, 1, 1]
+        grid_thread_extents = device_function.cute_state.grid_thread_extents
+        live_grid_thread_extents = _live_grid_thread_extents(
+            [*device_function.preamble, *device_function.body], grid_thread_extents
+        )
+        exact_grid_thread_dims = [
+            live_grid_thread_extents.get(axis, 1) for axis in range(3)
+        ]
+        offset_thread_dims = list(exact_grid_thread_dims)
+        # Grid producers record exact extents independently of index spelling.
+        # Keep text recovery only for older/unregistered index producers.
         # When a lane loop is active for an axis the generated index expression
         # has the form
         #   ``indices_<n> = tile_offset_<n> + Int32(thread_idx()[<axis>]) * <epT> + Int32(lane_<n>)``
@@ -2125,37 +2708,42 @@ class CuteBackend(Backend):
         # without a signal. ``indices_line_assert_re`` below detects
         # the "wrapper-dropped" form so we can fail loudly instead.
         indices_line_re = re.compile(
-            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ "
-            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(\d+)\]\)"
-            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(\d+))?",
+            r"^\s*(?P<index>indices_\d+) = (?:tile_)?offset_(?P<offset>\d+) \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(?P<axis>\d+)\]\)"
+            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(?P<ept>\d+))?",
             flags=re.MULTILINE,
         )
         # Loose form: any ``indices_<n>`` line containing ``thread_idx``
         # under any wrapping. Used only for the wrapper-invariant
         # assertion below — never consulted for launch-dim values.
         indices_line_loose_re = re.compile(
-            r"^\s*indices_\d+ = (?:tile_)?offset_\d+ \+ "
+            r"^\s*(?P<index>indices_\d+) = (?:tile_)?offset_\d+ \+ "
             r"[^\n]*?cute\.arch\.thread_idx\(\)",
             flags=re.MULTILINE,
         )
         matched_lines = 0
         for line_match in indices_line_re.finditer(final_kernel_text):
+            if line_match.group("index") in grid_thread_extents:
+                continue
             matched_lines += 1
-            offset_id = line_match.group(1)
-            axis_text = line_match.group(2)
-            multiplier_text = line_match.group(3)
+            offset_id = line_match.group("offset")
+            axis_text = line_match.group("axis")
+            multiplier_text = line_match.group("ept")
             axis = int(axis_text)
             if not (0 <= axis < len(offset_thread_dims)):
                 continue
             block_name = offset_block_sizes.get(offset_id)
             block_size = block_size_values.get(block_name or "")
             if block_size is None and block_name is not None:
-                try:
-                    config_index = int(block_name.removeprefix("_BLOCK_SIZE_"))
-                except ValueError:
-                    config_index = -1
-                if 0 <= config_index < len(config.block_sizes):
-                    config_block_size = config.block_sizes[config_index]
+                # The generated suffix is a logical block ID, not an index
+                # into the tunable-only config list. Fixed leading axes and
+                # aliased blocks can make those indices differ. Resolve via
+                # BlockSizeInfo, as the grid producer does, so recovery cannot
+                # inflate an unmasked root using another root's tile width.
+                block_id = int(block_name.removeprefix("_BLOCK_SIZE_"))
+                block_sizes = CompileEnvironment.current().block_sizes
+                if 0 <= block_id < len(block_sizes):
+                    config_block_size = block_sizes[block_id].from_config(config)
                     if isinstance(config_block_size, int):
                         block_size = config_block_size
             if block_size is None:
@@ -2199,7 +2787,10 @@ class CuteBackend(Backend):
         # under-dimension every kernel that uses a thread axis.
         if (
             offset_block_sizes
-            and indices_line_loose_re.search(final_kernel_text)
+            and any(
+                match.group("index") not in grid_thread_extents
+                for match in indices_line_loose_re.finditer(final_kernel_text)
+            )
             and matched_lines == 0
         ):
             raise AssertionError(
@@ -2216,6 +2807,24 @@ class CuteBackend(Backend):
         referenced_dims = tuple(codegen.referenced_thread_block_dims)
         static_dims = tile_strategy.thread_block_dims()
         dim_exprs = tile_strategy.thread_block_dim_exprs()
+        # The axes whose thread extent is a kernel argument (``hl.tile(n,
+        # block_size=bsz)`` under ``static_shapes=False``): the static shapes
+        # below hold a one for them, and the launch takes their extent from
+        # the host constant at the end (``_symbolic_launch_block_arg``).
+        symbolic_axes = tile_strategy.symbolic_thread_axes()
+        if symbolic_axes and (
+            dim_exprs is None
+            or any(
+                axis >= len(dim_exprs) or dim_exprs[axis] != expr
+                for axis, expr in symbolic_axes.items()
+            )
+        ):
+            raise exc.BackendUnsupported(
+                self.name,
+                f"launch axis {_symbolic_axes_text(symbolic_axes)} is sized by a "
+                "kernel argument and the kernel's strategies share no single "
+                "launch shape",
+            )
         static_threads = functools.reduce(operator.mul, static_dims, 1)
         dynamic_threads = functools.reduce(operator.mul, dims, 1)
         has_nested_device_loops = any(
@@ -2225,11 +2834,15 @@ class CuteBackend(Backend):
         root_grid_dims = [1, 1, 1]
         device_ir = HostFunction.current().device_ir
         for block_ids in device_ir.grid_block_ids:
-            strategy = tile_strategy.block_id_to_strategy.get(tuple(block_ids))
-            if strategy is None:
-                continue
-            for axis, size in enumerate(strategy.thread_block_sizes()):
-                if axis < len(root_grid_dims):
+            for block_id in block_ids:
+                # Strategy widths use local axes. Reduction/free axes can
+                # precede the root in the actual CUDA layout, so use the same
+                # physical mapping as TileStrategyDispatch.thread_block_dims.
+                # Otherwise a dead root axis can inflate a different live
+                # axis whose memory accesses correctly omitted surplus masks.
+                axis = tile_strategy.thread_axis_for_block_id(block_id)
+                size = tile_strategy.thread_extent_for_block_id(block_id)
+                if axis is not None and size is not None and 0 <= axis < 3:
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
@@ -2329,10 +2942,9 @@ class CuteBackend(Backend):
                     for expr_dim, current_dim in zip(expr_dims, dims, strict=True)
                 ):
                     dims = expr_dims
-            elif dims == (1, 1, 1):
-                return launcher_args_with_compile_options(
-                    f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"
-                )
+            # Otherwise an axis is sized by a kernel argument (``symbolic_axes``):
+            # the static ``dims`` keep a one for it through the checks below,
+            # and the launch substitutes the host constant at the end.
         if offset_thread_dims != [1, 1, 1]:
             candidate_dims = tuple(
                 starmap(max, zip(dims, offset_thread_dims, strict=True))
@@ -2352,6 +2964,34 @@ class CuteBackend(Backend):
                 dims = dynamic_dims
             else:
                 dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        pointwise_dims = _pointwise_grid_thread_dims(
+            live_grid_thread_extents,
+            final_thread_axes,
+            referenced_dims,
+            has_pointwise_fact=bool(
+                CompileEnvironment.current().config_spec.pointwise_facts
+            ),
+            has_nested_device_loops=has_nested_device_loops,
+            has_synthetic_free_axes=bool(codegen.cute_synthetic_arange_axis_sizes),
+        )
+        if pointwise_dims is not None:
+            # Register broadcasts can create reduction strategies without an
+            # executable reduction. Their static axis reservation can differ
+            # from the root producer's physical mapping (especially when some
+            # reduction thread counts are one). For a proven pointwise body
+            # whose live axes all have grid producers, those emitted producers
+            # own the launch, with larger statement references rejected rather
+            # than inflating an unproved surplus mask. Keep reductions/MMA and independent
+            # nested/free-arange axes on their existing launch paths.
+            dims = pointwise_dims
+        if any(
+            required > actual
+            for required, actual in zip(exact_grid_thread_dims, dims, strict=True)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "grid thread extents cannot fit the launch thread budget",
+            )
         # Detect the silent-truncation case: codegen has already emitted
         # thread_idx[axis] references that assume a certain per-axis
         # extent (recorded in ``referenced_thread_block_dims``), but the
@@ -2384,7 +3024,7 @@ class CuteBackend(Backend):
         # so the strategy can intentionally launch fewer threads on a
         # reduction axis (e.g. K) than the codegen "references" through the
         # strategy's per-block thread count.
-        from .thread_budget import check_thread_limit
+        from .thread_budget import check_thread_block_dims
 
         def _emits_cute_gemm(stmt: ast.AST) -> bool:
             for sub in ast.walk(stmt):
@@ -2407,18 +3047,25 @@ class CuteBackend(Backend):
             and not specialized_root_tcgen05
             and not kernel_has_mma
         ):
-            referenced_threads = functools.reduce(
-                operator.mul, codegen.referenced_thread_block_dims, 1
+            # Root indices can live in the grid's outer prefix, outside the
+            # statement-reference recorder. Include those live axes when
+            # validating an inner loop's thread requirements: checking only
+            # the inner axes can hide a launch that dropped part of the tile.
+            required_dims = tuple(
+                max(ref_size, root_live_dims[axis])
+                if axis in final_thread_axes
+                else ref_size
+                for axis, ref_size in enumerate(codegen.referenced_thread_block_dims)
             )
+            referenced_threads = functools.reduce(operator.mul, required_dims, 1)
             if referenced_threads > MAX_THREADS_PER_BLOCK:
-                for axis, ref_size in enumerate(codegen.referenced_thread_block_dims):
+                for axis, ref_size in enumerate(required_dims):
                     if ref_size > 1 and axis < len(dims) and dims[axis] < ref_size:
                         raise exc.BackendUnsupported(
                             self.name,
                             (
                                 f"launch dims {tuple(dims)} under-dimension"
-                                f" referenced_thread_block_dims="
-                                f"{tuple(codegen.referenced_thread_block_dims)}"
+                                f" required_thread_block_dims={required_dims}"
                                 f" (axis {axis}: launched={dims[axis]} <"
                                 f" referenced={ref_size}). Codegen would access"
                                 f" nonexistent threads — joint requested"
@@ -2427,9 +3074,87 @@ class CuteBackend(Backend):
                             ),
                         )
 
-        check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
+        if tcgen05_compact_dims is not None and any(
+            launched < planned
+            for launched, planned in zip(dims, tcgen05_compact_dims, strict=True)
+        ):
+            # The role launch addresses every warp of the plan's block shape
+            # (MMA, TMA, scheduler and C-input warps by linear warp id, the
+            # pipeline-init barrier by their thread count); a launch narrower
+            # than the plan would never start some of them and deadlock on
+            # the first barrier.  The MMA detection declines the thread
+            # layouts that get here, so this is a last line.
+            raise exc.BackendUnsupported(
+                self.name,
+                f"tcgen05 role launch needs block={tuple(tcgen05_compact_dims)} "
+                f"but the thread layout launches block={tuple(dims)}: a role "
+                "warp would never start",
+            )
+        check_thread_block_dims(dims, context=str(tuple(dims)))
+        if symbolic_axes:
+            return launcher_args_with_compile_options(
+                self._symbolic_launch_block_arg(
+                    dims,
+                    symbolic_axes,
+                    [*device_function.preamble, *device_function.body],
+                )
+            )
         return launcher_args_with_compile_options(
             f"block=({dims[0]}, {dims[1]}, {dims[2]})"
+        )
+
+    def _symbolic_launch_block_arg(
+        self,
+        dims: tuple[int, ...],
+        symbolic_axes: dict[int, str],
+        statements: Sequence[ast.AST],
+    ) -> str:
+        """The ``block=`` argument of a launch with an argument-sized axis.
+
+        ``dims`` is the static launch shape, checked at codegen, with a one on
+        every axis of ``symbolic_axes``; the axis is launched with its host
+        constant instead (``_BLOCK_SIZE_n``, one thread per element) when the
+        body reads its thread index, and the tuple goes through
+        ``checked_thread_block_dims`` at launch, where the value is known.
+        An axis whose index the body never reads keeps the one: more threads
+        would only repeat the same work.  A leader guard
+        (``cute.arch.thread_idx()[axis] == 0`` around a tile-uniform atomic)
+        is not such a read: it holds for the one thread, and it is what keeps
+        the atomic to one thread when the axis is launched wide.
+
+        The body must not combine threads.  Every cross-thread construct was
+        emitted for the static shape (a warp reduction over 32 column threads
+        beside the symbolic row axis spans one warp only while the axis has
+        one thread), so a body with any is declined rather than launched
+        wrong; the reduction over the symbolic dim itself is declined by
+        ``BlockReductionStrategy.codegen_reduction``.
+        """
+        read_axes = _thread_axes_read_outside_leader_guards(statements)
+        live_axes = {
+            axis: expr for axis, expr in symbolic_axes.items() if axis in read_axes
+        }
+        if not live_axes:
+            return f"block=({dims[0]}, {dims[1]}, {dims[2]})"
+        for axis in live_axes:
+            if dims[axis] != 1:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"launch axis {axis} is sized by the kernel argument "
+                    f"{live_axes[axis]} but static tracking claims {dims[axis]} "
+                    "threads on it",
+                )
+        cross_thread = _cross_thread_constructs(statements)
+        if cross_thread:
+            raise exc.BackendUnsupported(
+                self.name,
+                f"launch axis {_symbolic_axes_text(live_axes)} is sized by a "
+                f"kernel argument and the body combines threads "
+                f"({', '.join(cross_thread)}), which was emitted for the static "
+                "launch shape",
+            )
+        launch = tuple(live_axes.get(axis, str(size)) for axis, size in enumerate(dims))
+        return (
+            f"block=_cute_checked_block_dims(({launch[0]}, {launch[1]}, {launch[2]}))"
         )
 
     def build_launcher_args(
@@ -2460,6 +3185,15 @@ class CuteBackend(Backend):
         from ..tile_strategy import PerThreadFlattenedTileStrategy
         from ..tile_strategy import PerThreadNDTileStrategy
 
+        if len(set(block_ids)) != len(block_ids):
+            # ``hl.tile([m, n], block_size=[bs, bs])`` with one registered
+            # block size hands both dimensions the same block: they would
+            # share one index and one mask, walking the diagonal.
+            raise exc.BackendUnsupported(
+                self.name,
+                "a tile whose dimensions share one block size symbol "
+                f"(block ids {block_ids}); register a block size per dimension",
+            )
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
         block_size_infos = [env.block_sizes[i] for i in block_ids]
@@ -2481,11 +3215,19 @@ class CuteBackend(Backend):
             int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
         ]
-        # Compute the total thread count across all block dimensions
-        # (grid + device loops) to check against the hardware limit.
-        # When it would exceed 1024, default device-loop (non-grid)
-        # dimensions to 1 thread to avoid budget overflow.
+        # Budget simultaneously active grid/device-loop axes. Sibling
+        # passes reuse axes; multiplying all their tile sizes would turn
+        # otherwise legal threaded reductions into serial lane loops.
         from .thread_budget import MAX_THREADS_PER_BLOCK
+        from .thread_budget import tile_loop_thread_count
+
+        inactive_grid_block_ids: set[int] = set()
+        if self.name == "cute":
+            from .loop_nesting import boundary_only_grid_blocks
+
+            inactive_grid_block_ids = boundary_only_grid_blocks(
+                env, device_ir, fn.codegen.codegen_graphs
+            )
 
         def _shrink_auto_thread_counts(
             nd_block_size: Sequence[object], thread_limit: int
@@ -2528,20 +3270,30 @@ class CuteBackend(Backend):
                 static_threads = functools.reduce(operator.mul, resolved_threads, 1)
             return static_threads
 
-        active_loop_block_ids = _active_loop_block_ids(fn)
-        all_block_infos = [env.block_sizes[i] for i in sorted(active_loop_block_ids)]
-        total_threads = 1
-        for info in all_block_infos:
-            if info.reduction:
-                continue
-            bs = info.from_config(config)
-            if isinstance(bs, int):
-                nt = int(
-                    env.config_spec.num_threads.config_get(
-                        config.num_threads, info.block_id, 0
+        if self.name == "cute":
+            total_threads = tile_loop_thread_count(
+                env,
+                device_ir,
+                fn.codegen.codegen_graphs,
+                config,
+                inactive_block_ids=inactive_grid_block_ids,
+            )
+        else:
+            # Metal shares this strategy constructor but retains its
+            # existing allocation policy.
+            total_threads = 1
+            for block_id in _active_loop_block_ids(fn):
+                info = env.block_sizes[block_id]
+                if info.reduction:
+                    continue
+                bs = info.from_config(config)
+                if isinstance(bs, int):
+                    nt = int(
+                        env.config_spec.num_threads.config_get(
+                            config.num_threads, block_id, 0
+                        )
                     )
-                )
-                total_threads *= nt if nt > 0 else bs
+                    total_threads *= nt if nt > 0 else bs
         if total_threads > MAX_THREADS_PER_BLOCK:
             for i, block_id in enumerate(block_ids):
                 if num_threads_config[i] == 0 and block_id not in grid_ids:
@@ -2551,6 +3303,7 @@ class CuteBackend(Backend):
             or has_dynamic_shape
             or len(device_ir.grid_block_ids) != 1
             or (len(block_ids) > 1 and not flattened)
+            or bool(inactive_grid_block_ids.intersection(block_ids))
         ):
             known_equal = getattr(env, "known_equal", None)
 
@@ -2572,7 +3325,7 @@ class CuteBackend(Backend):
                 grid_ids=grid_ids,
             )
             should_filter_inactive_block_ids = len(block_ids) > 1
-            inactive_block_ids: set[int] = set()
+            inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
             if should_filter_inactive_block_ids:
                 used_block_ids = _graph_used_block_ids(fn, block_ids)
                 if not used_block_ids:
@@ -2593,14 +3346,19 @@ class CuteBackend(Backend):
                             continue
                         if sizes_known_equal(block_size, other_size):
                             used_block_ids.add(other_block_id)
-                inactive_block_ids = set(block_ids) - used_block_ids
-                for i, block_id in enumerate(block_ids):
-                    if block_id in inactive_block_ids:
-                        num_threads_config[i] = 1
+                inactive_block_ids.update(set(block_ids) - used_block_ids)
+            for i, block_id in enumerate(block_ids):
+                if block_id in inactive_block_ids:
+                    num_threads_config[i] = 1
             is_device_loop = any(bid not in grid_ids for bid in block_ids)
+            active_block_ids = device_ir.codegen_active_block_ids
             reduction_axis_reserve = (
                 1
-                if any(info.reduction for info in env.block_sizes)
+                if any(
+                    info.reduction
+                    and (active_block_ids is None or info.block_id in active_block_ids)
+                    for info in env.block_sizes
+                )
                 and self.reduction_axis_first()
                 else 0
             )
@@ -2608,7 +3366,10 @@ class CuteBackend(Backend):
             def uses_thread_axis_for(
                 block_id: int, block_size: object, num_threads: int
             ) -> bool:
-                if block_id in inactive_block_ids:
+                if (
+                    block_id in inactive_block_ids
+                    or block_id in inactive_grid_block_ids
+                ):
                     return False
                 if num_threads > 0:
                     return num_threads > 1
@@ -2724,7 +3485,17 @@ class CuteBackend(Backend):
             mma_mode = False
             detect_mma = self.name == "cute"
             if is_device_loop and detect_mma:
-                if _detect_attention_mma_loop(
+                from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
+                from .cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
+                from .cute_warp_mma_gemm import detect_warp_mma_gemm
+
+                if config.get(WARP_MMA_FAMILY_KEY) == MATMUL_FAMILY_WARP_MMA:
+                    # The register-MMA GEMM family: the dedicated codegen
+                    # emits the whole device body (``32 * warps`` threads);
+                    # a kernel that is not the plain GEMM it lowers fails
+                    # closed with the reason instead of running tcgen05.
+                    mma_mode = detect_warp_mma_gemm(fn, block_ids, config=config)
+                elif _detect_attention_mma_loop(
                     fn,
                     block_ids,
                     config=config,
@@ -2762,21 +3533,31 @@ class CuteBackend(Backend):
                     and specialized_mma_plan.impl == "tcgen05"
                 ):
                     from .cute_mma import _tcgen05_root_m_threads
+                    from .cute_mma import _tcgen05_root_n_threads
 
                     m_axis = block_ids.index(specialized_mma_plan.m_block_id)
                     n_axis = block_ids.index(specialized_mma_plan.n_block_id)
                     m_block_size = nd_block_size[m_axis]
                     n_block_size = nd_block_size[n_axis]
+                    # The generic SIMT budget above can resolve an automatic
+                    # M axis before this specialized plan is known. Preserve
+                    # the original auto setting: that temporary width is not
+                    # an explicit request for multiple lanes per warp slot.
+                    # TCgen05's role launch multiplies this width by its warp
+                    # count, so retaining (for example) 64 would double it.
+                    requested_m_threads = env.config_spec.num_threads.config_get(
+                        config.num_threads, specialized_mma_plan.m_block_id, 0
+                    )
                     root_m_threads = (
                         _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
-                        if num_threads_config[m_axis] == 0
+                        if requested_m_threads == 0
                         and isinstance(m_block_size, int)
                         and isinstance(n_block_size, int)
                         else num_threads_config[m_axis]
                     )
                     root_n_threads = (
-                        min(int(n_block_size), 8)
-                        if num_threads_config[n_axis] == 0
+                        _tcgen05_root_n_threads(int(n_block_size))
+                        if original_num_threads_config[n_axis] == 0
                         and isinstance(n_block_size, int)
                         else num_threads_config[n_axis]
                     )

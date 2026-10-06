@@ -11,6 +11,11 @@ def pytest_configure() -> None:
     # gets their xdist worker killed. Clamp it to the floor (200ms) so the step
     # still runs (and stays covered) without dominating the test runtime.
     os.environ.setdefault("HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS", "200")
+    # The same pass re-times the top 8 configs (32 for cute); every timed
+    # iteration also zeroes the 256 MiB benchmark cache. Two finalists keep
+    # the pass covered while it stays cheap on runners that share one GPU
+    # between xdist workers. Tests of the default clear this key first.
+    os.environ.setdefault("HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K", "2")
 
     # The device-us re-rank needs the TPU profiler plane; under interpret
     # (CPU) it burns ~100 traced calls per candidate just to return inf.

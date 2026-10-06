@@ -14,6 +14,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # uv's default 30s per-request timeout is tight for multi-hundred-MB
+  # wheels (torch, cutlass) pulled from PyPI or NVIDIA's index on a slow
+  # link; the install steps below also retry on transport errors.
+  UV_HTTP_TIMEOUT: "300"
+
 jobs:
   load-matrix:
     runs-on: ubuntu-latest
@@ -116,17 +122,20 @@ jobs:
           set -eux
 
           source .venv/bin/activate
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
 
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
-            uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+            retry uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
             PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
             NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
-            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
+            retry env UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
             if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
               # Current NVSHMEM wheels no longer contain libnvshmem_device.bc, which
               # PyTorch's Triton API still requires. Keep Torch's ABI-matched host
@@ -150,11 +159,28 @@ jobs:
           source .venv/bin/activate
           echo "LD_LIBRARY_PATH=$VIRTUAL_ENV/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
+      - name: Cache Triton third-party downloads
+        if: matrix.triton-pin != ''
+        uses: actions/cache@v6
+        with:
+          # Triton's build_helpers.py streams a multi-hundred-MB LLVM tarball
+          # (plus the JSON and NVIDIA toolchain archives) from its blob store
+          # into these directories and reuses them whenever the recorded
+          # version.txt still matches the pinned URL.
+          path: |
+            ~/.triton/llvm
+            ~/.triton/json
+            ~/.triton/nvidia
+          key: triton-thirdparty-${{ matrix.alias }}-${{ matrix.backend }}-${{ matrix.triton-pin }}
+
       - name: Install Triton from source
         if: matrix.triton-pin != ''
         run: |
           set -x
           source .venv/bin/activate
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
           apt-get update
           apt-get install -y git clang-20 clang++-20 zlib1g-dev
           export CC=clang-20
@@ -167,8 +193,11 @@ jobs:
           git clone --recursive "$REPO" triton
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
-          uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+          retry uv pip install -r python/requirements.txt
+          # The LLVM download inside the build has a single 300s socket timeout
+          # and no retry of its own; an interrupted attempt leaves no
+          # version.txt, so the next one starts the download over.
+          retry env MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
@@ -186,14 +215,6 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
-      - name: Install FLA for linear-attention tests
-        if: (matrix.alias == 'h100' || matrix.alias == 'b200') && matrix.backend == 'triton'
-        run: |
-          source .venv/bin/activate
-          uv pip install einops transformers
-          uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
-          python -c "import fla; print('fla', fla.__name__)"
-
       - name: Build and install torch_tpu (Pallas)
         if: matrix.alias == 'tpu'
         uses: ./.github/actions/build-torch-tpu
@@ -208,7 +229,10 @@ jobs:
         if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          ./scripts/install_cute.sh
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
@@ -312,7 +336,9 @@ jobs:
           # A10G runners expose one 22 GiB GPU. Four xdist workers can collectively
           # exhaust VRAM with CUDA/Triton/Inductor state even when an individual test
           # only needs a small allocation.
-          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == *a10g* ]]; then
+          # The MI350X runner also exposes a single GPU. Four workers sharing it
+          # pushed the autotune and benchmark tests past their per-test timeout.
+          if [[ -n "$PARALLEL" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
             PARALLEL="-n2"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
@@ -330,6 +356,14 @@ jobs:
             # (~75s for the softmax autodiff backward), so the default 60s
             # per-test timeout false-positives on a cold Triton cache and the
             # worker gets killed mid-compile. Give it headroom.
+            TIMEOUT=180
+          elif [[ "${{ matrix.alias }}" == *mi350x* ]]; then
+            # The MI350X runner exposes a single GPU shared by its xdist
+            # workers. Autotuning and interleaved-benchmark tests (each timed
+            # iteration zeroes a 256 MiB cache buffer) legitimately run past
+            # 60s under that contention. pytest-timeout's thread method then
+            # calls os._exit(1), which xdist reports as a crashed worker with
+            # no traceback. Give it the same headroom as A10G.
             TIMEOUT=180
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
@@ -352,7 +386,7 @@ jobs:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
       options: --gpus all
 
-    runs-on: linux.g5.4xlarge.nvidia.gpu
+    runs-on: mt-l-x86aavx2-11-41-a10g
 
     defaults:
       run:

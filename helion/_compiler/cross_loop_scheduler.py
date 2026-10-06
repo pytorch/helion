@@ -988,6 +988,12 @@ class StaticPipelinePlan:
     readiness_counters: tuple[ReadinessCounterPlan, ...]
     root_barrier_edges: frozenset[tuple[int, int]]
     dispatch_mode: CrossLoopDispatchMode = "static"
+    # Cross-rank per-root counters: producer->consumer root pairs, and the
+    # roots whose tasks every rank waits for before a launch exits.
+    peer_edges: frozenset[tuple[int, int]] = frozenset()
+    done_roots: frozenset[int] = frozenset()
+    # Roots after every synchronized root: they neither wait nor publish.
+    trailing_roots: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if self.dispatch_mode not in ("static", "dynamic"):
@@ -1048,7 +1054,14 @@ class StaticPipelinePlan:
         )
 
     def static_base(self, root: int) -> int:
-        """Return one root's immutable W-aligned ownership base."""
+        """Return one root's immutable ownership base, W-aligned unless trailing."""
+        previous = [index for index in self.resident_roots if index < root]
+        if root in self.trailing_roots and previous:
+            # A trailing root needs no wave of its own; pack it behind.
+            return (
+                self.static_base(previous[-1])
+                + self.execution_orders[previous[-1]].task_count
+            )
         return sum(self._padded_task_count(index) for index in range(root))
 
     def _padded_task_count(self, root: int) -> int:
@@ -1130,7 +1143,7 @@ def _root_task_wave_relation(
     root: int,
     charge: Callable[[int], bool],
 ) -> CoordinateRelation | None:
-    if root in plan.continuation_roots:
+    if root in plan.continuation_roots or root in plan.trailing_roots:
         return None
     order = plan.execution_orders[root]
     ordinal_to_wave = CoordinateRelation.scalar_floor_div(
@@ -1405,7 +1418,7 @@ def _continuation_dominance_owner(
     virtual_execution = None if placement is None else placement.keys_by_item
     if virtual_execution is None or not virtual_execution.is_single_valued():
         return None
-    ignored = removed_roots | frozenset((consumer.consumer_root,))
+    ignored = removed_roots | plan.trailing_roots | {consumer.consumer_root}
     if any(
         root not in ignored
         and (
@@ -1758,6 +1771,11 @@ def _build_readiness_events(
     all_obligations_by_pair = {
         pair: set(obligations) for pair, obligations in obligations_by_root_pair
     }
+    producer_access_by_dependency_id = {
+        dependency.dependency_id: dependency.producer_access_id
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
 
     implied_obligations: dict[DependencyObligation, set[DependencyObligation]] = {}
     for preceding_dependency in exact_dependencies:
@@ -1784,9 +1802,6 @@ def _build_readiness_events(
                 or later_producers is None
                 or preceding_dependency.consumer_root != later_dependency.consumer_root
                 or preceding_dependency.producer_root != later_dependency.producer_root
-                or preceding_dependency.producer_site_id
-                != later_dependency.producer_site_id
-                or preceding_producers.target_domain != later_producers.target_domain
                 or not charge(
                     1 + len(preceding_producers.pieces) * len(later_producers.pieces)
                 )
@@ -1802,6 +1817,46 @@ def _build_readiness_events(
             acquired = (
                 None if preceding is None else preceding.then(preceding_producers)
             )
+            # A completion publication may also cover payload writes at an
+            # earlier producer site. Compose both sides' local program order
+            # before comparing the producer sets.
+            if acquired is not None and (
+                preceding_dependency.producer_site_id
+                != later_dependency.producer_site_id
+                or acquired.target_domain != later_producers.target_domain
+            ):
+                producer_site_id = preceding_dependency.producer_site_id
+                payload_site_id = later_dependency.producer_site_id
+                producer_access_id = producer_access_by_dependency_id.get(
+                    preceding_dependency.dependency_id
+                )
+                producer_site = (
+                    None if producer_site_id is None else site_by_id[producer_site_id]
+                )
+                producer_precedence = (
+                    None
+                    if producer_site_id is None
+                    or payload_site_id is None
+                    or producer_access_id is None
+                    # Only root-task completion has an unambiguous ordering
+                    # contract across sites: it occurs after every nested and
+                    # conditional access in that task.  A nested completion
+                    # could precede a later access in one of its ancestors.
+                    or producer_site is None
+                    or not producer_site.is_root
+                    else consumer_to_preceding_site_relation(
+                        dependency_graph,
+                        site_domains=site_domains,
+                        preceding_site_id=payload_site_id,
+                        consumer_site_id=producer_site_id,
+                        consumer_access_id=producer_access_id,
+                    )
+                )
+                acquired = (
+                    None
+                    if producer_precedence is None
+                    else acquired.then(producer_precedence)
+                )
             if acquired is not None and acquired.covers(later_producers):
                 implied_obligations.setdefault(preceding_obligation, set()).add(
                     (
@@ -1811,8 +1866,10 @@ def _build_readiness_events(
                     )
                 )
 
+    # Consumer keys carry a fallback flag: root-entry projections of nested
+    # consumers stay out of direct root events so a nested counter can drop them.
     exact_relations: dict[
-        tuple[int, int | None, CoordinateDomain],
+        tuple[int, int | None, CoordinateDomain, bool],
         dict[
             tuple[int, int | None, CoordinateDomain],
             list[tuple[Incidence, DependencyObligation]],
@@ -1827,9 +1884,10 @@ def _build_readiness_events(
         consumer_site_id: int | None,
         incidence: Incidence,
         covered_obligations: frozenset[DependencyObligation],
+        fallback: bool = False,
     ) -> None:
         relation = incidence.items_by_key
-        consumer = (consumer_root, consumer_site_id, relation.source_domain)
+        consumer = (consumer_root, consumer_site_id, relation.source_domain, fallback)
         producer = (producer_root, producer_site_id, relation.target_domain)
         exact_relations.setdefault(consumer, {}).setdefault(producer, []).extend(
             (incidence, obligation) for obligation in covered_obligations
@@ -1869,7 +1927,8 @@ def _build_readiness_events(
         consumer_site_is_usable = consumer_is_root or (
             consumer_site is not None and consumer_site.can_split_loop
         )
-        if producer_site_is_usable and consumer_site_is_usable:
+        nested_relation = producer_site_is_usable and consumer_site_is_usable
+        if nested_relation:
             add_exact_relation(
                 producer_root=dependency.producer_root,
                 producer_site_id=(
@@ -1907,6 +1966,7 @@ def _build_readiness_events(
             consumer_site_id=None,
             incidence=root_incidence,
             covered_obligations=exact_obligations,
+            fallback=nested_relation and not consumer_is_root,
         )
 
     pending_events: dict[
@@ -1972,9 +2032,10 @@ def _build_readiness_events(
         key=lambda item: (
             item[0][0],
             -1 if item[0][1] is None else item[0][1],
+            item[0][3],
         ),
     ):
-        consumer_root, consumer_site_id, consumer_domain = consumer
+        consumer_root, consumer_site_id, consumer_domain, _fallback = consumer
         merged_relations: list[
             tuple[
                 tuple[int, int | None, CoordinateDomain],
@@ -2249,7 +2310,7 @@ def _task_step_relations(
         for root in range(len(pipeline_plan.execution_orders))
     )
     if sum(relation is None for relation in result) != len(
-        pipeline_plan.continuation_roots
+        pipeline_plan.continuation_roots | pipeline_plan.trailing_roots
     ):
         return None
     return result
@@ -2307,9 +2368,10 @@ def _consumer_major_producer_order(
             if not root_candidates or any(item is None for item in root_candidates):
                 continue
             order = pipeline_plan.execution_orders[root]
+            # A root of at most one wave gains nothing from reordering; keep its order.
             if (
                 root in pipeline_plan.continuation_roots
-                or order.task_count < pipeline_plan.worker_count
+                or order.task_count <= pipeline_plan.worker_count
                 or order.task_count != readiness_graph.root_domains[root].size
             ):
                 continue
@@ -2744,6 +2806,7 @@ def _try_finalize_pipeline_proposal(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
     dispatch_mode: CrossLoopDispatchMode,
+    trailing_roots: frozenset[int],
     charge: Callable[[int], bool],
 ) -> StaticPipelinePlan | None:
     """Freeze one canonical placement, then lower its final counters."""
@@ -2795,6 +2858,7 @@ def _try_finalize_pipeline_proposal(
             readiness_counters=readiness_counters,
             root_barrier_edges=root_barrier_edges,
             dispatch_mode=dispatch_mode,
+            trailing_roots=trailing_roots,
         )
     except (ValueError, exc.CrossLoopSchedulingError):
         return None
@@ -2898,6 +2962,51 @@ def build_static_pipeline_plan(
     root_domains = tuple(
         order.tasks_by_ordinal.target_domain for order in root_task_orders
     )
+    # Local counters order same-rank dependencies only, each peer_counter
+    # dependency gets a direct peer edge, and inband data carries its readiness.
+    transports = {
+        (edge.producer_root, edge.consumer_root, dependency_graph.transport(dependency))
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
+    peer_edges = frozenset(
+        (producer, consumer)
+        for producer, consumer, transport in transports
+        if transport == "peer_counter"
+    )
+    cross_rank_roots = frozenset(
+        root
+        for producer, consumer, transport in transports
+        if transport != "counter"
+        for root in (producer, consumer)
+    ) | {
+        access.root
+        for access in dependency_graph.accesses
+        if access.owner_rank is not None
+    }
+    continuation_ineligible_roots |= cross_rank_roots
+    synchronized_roots = cross_rank_roots | {
+        root
+        for edge in dependency_graph.edges
+        for root in (edge.producer_root, edge.consumer_root)
+    }
+    trailing_roots = frozenset(
+        range(max(synchronized_roots, default=-1) + 1, len(root_task_orders))
+    )
+    dependency_graph = dataclasses.replace(
+        dependency_graph,
+        edges=tuple(
+            dataclasses.replace(edge, access_dependencies=local)
+            for edge in dependency_graph.edges
+            if (
+                local := tuple(
+                    dependency
+                    for dependency in edge.access_dependencies
+                    if dependency_graph.transport(dependency) == "counter"
+                )
+            )
+        ),
+    )
     readiness_graph = ReadinessGraph(
         root_domains,
         _build_readiness_events(
@@ -2924,6 +3033,7 @@ def build_static_pipeline_plan(
             readiness_counters=counters,
             root_barrier_edges=barriers,
             dispatch_mode=dispatch_mode,
+            trailing_roots=trailing_roots,
             charge=charge,
         )
 
@@ -3063,7 +3173,12 @@ def build_static_pipeline_plan(
                 "the requested dynamic cross-loop pipeline does not admit a "
                 "progress-safe cross-loop schedule"
             )
-    return proposal
+    return dataclasses.replace(
+        proposal,
+        peer_edges=peer_edges,
+        # Parity and credit already keep in-band roots from reusing live buffers.
+        done_roots=frozenset(root for edge in peer_edges for root in edge),
+    )
 
 
 def _select_root_barrier_edges(

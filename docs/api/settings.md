@@ -100,6 +100,20 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    - On Triton: ``"default"`` maps to ``"tf32"``, ``"high"`` maps to ``"tf32x3"``, and ``"highest"`` maps to ``"ieee"``.
    - On Pallas/TPU: all values currently emit JAX default precision. JAX ``"high"``/``"highest"`` fp32 dot precision is not used because it is less compatible with PyTorch eager references on the supported TPU stack.
 
+.. autoattribute:: Settings.cute_rng_stream
+
+   CuTe defaults to ``"auto"``. Explicit ``hl.rand`` uses all four Philox outputs:
+   logical offset ``i`` selects word ``i % 4`` from counter ``i // 4``. The stream
+   depends on the seed and logical offset, independently of tile size or packet
+   vectorization. This changes the sequence from the earlier CuTe default.
+
+   Set ``cute_rng_stream="word0"`` or ``HELION_CUTE_RNG_STREAM=word0`` to retain
+   the previous sequence. Other backends still default to ``"word0"``.
+   Under ``"auto"``, implicit Torch random operations, ``hl.randint`` and
+   ``hl.rand4x`` retain their existing behavior. Explicit ``"philox4"`` selects
+   the same uniform stream but rejects these other RNG operations. The policy
+   is serialized with settings and emitted reproduction decorators.
+
 .. autoattribute:: Settings.static_shapes
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
@@ -381,6 +395,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH`` | ``autotune_log_search_space_path`` | Optional path to save search space analysis JSON files. |
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
+| ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
@@ -400,7 +415,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
 | ``HELION_AUTOTUNE_CACHE`` | ``autotune_cache`` | Cache class to use (``"LocalAutotuneCache"`` (default), ``"StrictLocalAutotuneCache"``, ``"RemoteAutotuneCache"``, ``"StrictRemoteAutotuneCache"``, ``"AOTAutotuneCache"``). |
 | ``HELION_REMOTE_CACHE_BACKEND`` | (used by ``RemoteAutotuneCache`` and warm-start) | Fully-qualified class path to a ``RemoteCacheBackend`` subclass (e.g. ``mypackage.cache.RedisBackend``); enables remote read-through/write-through caching and, when the backend overrides ``list()``, remote warm-start lookups for ``from_best_available`` / ``helion.from_cache``. |
-| ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). |
+| ``HELION_BENCHMARK_CUDAGRAPH`` | (benchmarking) | Wrap ``run_example``'s timing loop in CUDA-graph capture/replay so launch overhead is amortized for both helion and the torch baseline. Defaults on inside ``run_example``, off elsewhere. Set ``0`` to opt out; ``1`` to enable globally. Capture silently falls back to non-CG if unavailable (HIP, no CUDA, nested capture). Note: ``=1`` globally also applies during autotune, which is counterproductive — each of thousands of configs triggers a fresh capture (warmup + sync per config, no reuse across configs since launch parameters differ), captured graphs accumulate memory pool allocations, and many configs raise on capture due to shape/stride differences across the search space. Prefer leaving unset (default off in autotune, on in ``run_example``). When it is on, kernels whose single replay takes under 64 us are timed as one captured graph holding several flushed calls minus a graph of the same flushes, because a lone replay carries the graph launch latency (4-6 us on B200, in ~2 us steps) and would read the same value for every short kernel. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
 | ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |
 | ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated Triton code; set to ``0`` to disable. |

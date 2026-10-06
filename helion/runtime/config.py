@@ -27,6 +27,7 @@ CuteAffineScanScheduleLiteral = Literal[
     "direct_m16n8_v1",
     "direct_m16n16_v1",
 ]
+CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
@@ -62,14 +63,26 @@ class Config(Mapping[str, object]):
         cute_async_load_cache: CuteAsyncLoadCacheLiteral | None = None,
         cute_async_store_policy: CuteAsyncStorePolicyLiteral | None = None,
         cute_bf16x2_recurrence: bool | None = None,
+        cute_signed_bitfield_bf16: bool | None = None,
         cute_proven_bounds: bool | None = None,
         cute_affine_scan_schedule: CuteAffineScanScheduleLiteral | None = None,
+        cute_rng_packet: bool | None = None,
+        cute_independent_reduction: bool | None = None,
+        cute_replicated_reduction: bool | None = None,
+        cute_vector_packet_unroll: bool | None = None,
+        cute_vloop_sink: bool | None = None,
+        cute_lane_unroll: int | None = None,
+        cute_pdl: bool | None = None,
+        cute_packet_prefetch: int | None = None,
+        cute_reduction_pipeline_depth: int | None = None,
+        cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral = None,
+        host_tensor_descriptors: bool | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
@@ -110,12 +123,51 @@ class Config(Mapping[str, object]):
                 16-byte state store ("default" or "l2_evict_last").
             cute_bf16x2_recurrence: Pack a structurally proven BF16 rank-one
                 recurrence into native BF16x2 operations.
+            cute_signed_bitfield_bf16: Convert proved signed byte fields to BF16
+                using the existing vector load/store packets. Disabled by default.
             cute_proven_bounds: Remove CuTe index guards only when exact launch
                 dimensions and cache-specialized tensor sizes prove them true.
             cute_affine_scan_schedule: Physical schedule for a compatible affine
                 scan. ``"ordinary"`` disables the direct lowering;
                 ``"direct_m16n8_v1"`` and ``"direct_m16n16_v1"`` select the
                 measured direct schedule profiles.
+            cute_independent_reduction: Sum each vector lane independently in
+                FP32 before combining lanes, preserving the element expression.
+                This changes summation order. Disabled by default.
+            cute_replicated_reduction: Replicate single-use whole-CTA sums in
+                each warp using one shared-memory barrier. Disabled by default.
+            cute_vector_packet_unroll: Fully unroll small straight-line vector
+                packet loops. Disabled by default to retain compact code.
+            cute_vloop_sink: Sink a grid constexpr vector loop into the serial
+                reduction nest it wraps (column sums): one vector load per row,
+                per-lane register accumulators, one grouped cross-thread combine
+                per row tile. Disabled by default. Kernels where nothing can be
+                sunk generate exactly the knob-off code.
+            cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for the row lane
+                loop of a sunk vector nest; every copy's vector loads issue
+                before any copy's accumulates. Only applies with cute_vloop_sink.
+            cute_pdl: Launch the kernel as a programmatic dependent of the
+                previous kernel in the stream: its launch and prologue overlap
+                that kernel's tail and it waits (``griddepcontrol.wait``) ahead
+                of its first global memory access. Off by default. Kernels that
+                already take part in dependent launch (native plans launched
+                with it, bodies with their own wait or release, the
+                materialized-fission producer) and pre-sm_90 targets generate
+                exactly the knob-off code.
+            cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
+                in a proved complete tile; 0 (the default) keeps the original order.
+                Requires cute_proven_bounds and storage-disjointness proof.
+            cute_reduction_pipeline_depth: Shared-memory ring depth (2 or 4) for
+                the proved CuTe pipelined resident-reduction schedule. Defaults
+                to 2. Depth 4 prefetches three row groups ahead and requires
+                enough shared memory for all four slots and reduction scratch.
+            cute_host_paired_sum: Fuse a proved host FP32 sum(0)/cast pair or
+                terminal sum/cast. ``"off"`` (the default) retains Torch calls;
+                ``"mapped"`` and ``"narrow"`` change independent-column
+                ownership while preserving the audited FP32 sum tree. Unknown
+                Torch implementations or unsupported bindings use the original
+                operations. Available only for typed, independent host pairs
+                or a terminal sum/cast with an effect-free return prefix.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -135,6 +187,9 @@ class Config(Mapping[str, object]):
                 Lower values allow higher occupancy but may hurt performance.
                 Used with persistent kernels to ensure multi-occupancy can be
                 achieved.
+            host_tensor_descriptors: Construct tensor descriptors once in the host
+                launcher instead of independently in every device program. This
+                only affects operations using tensor-descriptor indexing.
             indexing: Indexing strategy for load and store operations. Can be:
                 - A single strategy string (all loads/stores use this strategy):
                   indexing="block_ptr"  # backward compatible
@@ -142,6 +197,7 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+                ("block_ptr" needs Triton < 3.9; newer Triton lowers it as "pointer")
             atomic_indexing: Indexing strategy for atomic operations (e.g., hl.atomic_add).
                 Same format as ``indexing`` (a single string or a list per atomic op).
                 Defaults to "pointer" when omitted.
@@ -178,8 +234,19 @@ class Config(Mapping[str, object]):
             "cute_async_load_cache": cute_async_load_cache,
             "cute_async_store_policy": cute_async_store_policy,
             "cute_bf16x2_recurrence": cute_bf16x2_recurrence,
+            "cute_signed_bitfield_bf16": cute_signed_bitfield_bf16,
             "cute_proven_bounds": cute_proven_bounds,
             "cute_affine_scan_schedule": cute_affine_scan_schedule,
+            "cute_rng_packet": cute_rng_packet,
+            "cute_independent_reduction": cute_independent_reduction,
+            "cute_replicated_reduction": cute_replicated_reduction,
+            "cute_vector_packet_unroll": cute_vector_packet_unroll,
+            "cute_vloop_sink": cute_vloop_sink,
+            "cute_lane_unroll": cute_lane_unroll,
+            "cute_pdl": cute_pdl,
+            "cute_packet_prefetch": cute_packet_prefetch,
+            "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
+            "cute_host_paired_sum": cute_host_paired_sum,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -188,6 +255,7 @@ class Config(Mapping[str, object]):
             "cross_loop_pipeline": cross_loop_pipeline,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
+            "host_tensor_descriptors": host_tensor_descriptors,
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
@@ -359,6 +427,10 @@ class Config(Mapping[str, object]):
         return cast("int | None", self.config.get("maxnreg", DEFAULT_MAXNREG))
 
     @property
+    def host_tensor_descriptors(self) -> bool:
+        return cast("bool", self.config.get("host_tensor_descriptors", False))
+
+    @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
 
@@ -453,6 +525,14 @@ class Config(Mapping[str, object]):
             "CuteAffineScanScheduleLiteral",
             self.config.get("cute_affine_scan_schedule", "ordinary"),
         )
+
+    @property
+    def cute_packet_prefetch(self) -> int:
+        return cast("int", self.config.get("cute_packet_prefetch", 0))
+
+    @property
+    def cute_reduction_pipeline_depth(self) -> int:
+        return cast("int", self.config.get("cute_reduction_pipeline_depth", 2))
 
     @property
     def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:

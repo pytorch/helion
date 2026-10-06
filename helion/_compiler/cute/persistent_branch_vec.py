@@ -16,6 +16,9 @@ import re
 from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
+from .cache_policy_loads import cache_hinted_load_helper
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -123,13 +126,27 @@ def _mutated_value_roots(node: ast.AST) -> set[str]:
 def _freeze_definition(
     node: ast.expr,
     definitions: dict[str, ast.expr],
-) -> ast.expr:
+) -> ast.expr | None:
     """Inline known values so a definition keeps assignment-time semantics."""
+
+    class _TooLarge(Exception):
+        pass
 
     class _FreezeNames(ast.NodeTransformer):
         def __init__(self) -> None:
             super().__init__()
             self.expanding: set[str] = set()
+            self.remaining = 4096
+
+        def visit(self, node: ast.AST) -> ast.AST | list[ast.stmt] | None:
+            # Repeated scalar arithmetic can encode an exponentially large
+            # expression DAG. Callers must decline the entire proof when this
+            # budget is exceeded: omitting a definition could hide its lane
+            # dependence and make an aliased address appear injective.
+            self.remaining -= 1
+            if self.remaining < 0:
+                raise _TooLarge
+            return super().visit(node)
 
         def visit_Name(self, node: ast.Name) -> ast.AST:
             if not isinstance(node.ctx, ast.Load) or node.id in self.expanding:
@@ -140,18 +157,55 @@ def _freeze_definition(
             self.expanding.add(node.id)
             replacement = self.visit(_clone_expr(definition))
             self.expanding.remove(node.id)
+            assert isinstance(replacement, ast.expr)
             return ast.copy_location(replacement, node)
 
-    result = _FreezeNames().visit(_clone_expr(node))
+    try:
+        result = _FreezeNames().visit(_clone_expr(node))
+    except _TooLarge:
+        return None
     assert isinstance(result, ast.expr)
     return result
 
 
+def _needed_definition_names(
+    statements: list[ast.stmt], required_names: set[str]
+) -> set[str]:
+    """Close the requested names over all possible assignment dependencies."""
+    dependencies: dict[str, set[str]] = {}
+    needed = set(required_names)
+    for statement in statements:
+        # Retain aliases used by structured mutations even when the alias is
+        # absent from the requested expressions. Their referents are needed by
+        # the normal invalidation below, e.g. alias = source; alias[0] = value.
+        needed.update(_mutated_value_roots(statement))
+        for name, value in _single_name_definitions([statement]).items():
+            dependencies.setdefault(name, set()).update(
+                ReadWrites.from_ast(value).reads
+            )
+    pending = list(needed)
+    while pending:
+        for dependency in dependencies.get(pending.pop(), ()):
+            if dependency not in needed:
+                needed.add(dependency)
+                pending.append(dependency)
+    return needed
+
+
 def _definition_snapshots(
-    statements: list[ast.stmt],
-) -> list[dict[str, ast.expr]]:
-    """Return the definitions dominating each top-level statement."""
+    statements: list[ast.stmt], *, required_names: set[str] | None = None
+) -> list[dict[str, ast.expr]] | None:
+    """Return the definitions dominating each top-level statement.
+
+    A dependency-closed subset avoids expanding irrelevant scalar arithmetic.
+    Keep every write invalidation, including mutations through aliases, so the
+    selected definitions match the corresponding full snapshots. An oversized
+    definition in the selected dependency closure still declines the proof.
+    """
+    if required_names is not None:
+        required_names = _needed_definition_names(statements, required_names)
     definitions: dict[str, ast.expr] = {}
+    definition_reads: dict[str, set[str]] = {}
     result: list[dict[str, ast.expr]] = []
     for statement in statements:
         result.append(dict(definitions))
@@ -174,22 +228,23 @@ def _definition_snapshots(
         for name in _mutated_value_roots(statement):
             definition = definitions.get(name)
             if definition is not None:
-                invalidated.update(ReadWrites.from_ast(definition).reads)
+                invalidated.update(definition_reads[name])
         while invalidated:
             newly_invalidated: set[str] = set()
-            for name, value in tuple(definitions.items()):
-                if name in invalidated or (
-                    set(ReadWrites.from_ast(value).reads) & invalidated
-                ):
+            for name in tuple(definitions):
+                if name in invalidated or (definition_reads[name] & invalidated):
                     definitions.pop(name)
+                    definition_reads.pop(name)
                     newly_invalidated.add(name)
             invalidated = newly_invalidated
-        definitions.update(
-            {
-                name: _freeze_definition(value, definitions)
-                for name, value in exact_definitions.items()
-            }
-        )
+        for name, value in exact_definitions.items():
+            if required_names is not None and name not in required_names:
+                continue
+            frozen = _freeze_definition(value, definitions)
+            if frozen is None:
+                return None
+            definitions[name] = frozen
+            definition_reads[name] = set(ReadWrites.from_ast(frozen).reads)
     return result
 
 
@@ -225,6 +280,9 @@ class _CollectMemoryLoads(ast.NodeVisitor):
             self.calls.append(node)
             return
         if isinstance(node.func, ast.Attribute) and node.func.attr == "load":
+            self.calls.append(node)
+            return
+        if isinstance(node.func, ast.Name) and node.func.id in _VECTOR_LOAD_HELPERS:
             self.calls.append(node)
             return
         self.generic_visit(node)
@@ -352,6 +410,103 @@ def _plain_scalar_store_pointer(call: ast.Call) -> ast.expr | None:
     return None
 
 
+# Widest element count one 16-byte flush helper can write.
+_VECTOR_FLUSH_MAX_WIDTH = {
+    "_cute_store_u16_vec": 8,
+    "_cute_store_u32_vec": 4,
+    "_cute_store_u16x8_l2_evict_last": 8,
+    "_cute_store_u32x4_l2_evict_last": 4,
+}
+# The generated vector loads besides ``cute.arch.load``: the L2-policy helpers
+# (16- and 8-byte forms), called the same way
+# (``NAME(PTR, ir.VectorType.get([V], ...))``).
+_VECTOR_LOAD_HELPERS = _CUTE_CACHE_LOAD_HELPER_NAMES
+# Word carriers of byte-packed loads (several sub-word elements per word).  The
+# element count depends on the tensor dtype, which the call does not show.
+_PACKED_LOAD_CARRIERS = frozenset(
+    {"cutlass.Uint16", "cutlass.Uint32", "cutlass.Uint64"}
+)
+
+
+def _vector_type_width(node: ast.AST) -> int | None:
+    """Element count of a generated ``ir.VectorType.get([V], ...)`` type."""
+    if (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "ir.VectorType.get"
+        and node.args
+        and isinstance(node.args[0], ast.List)
+        and len(node.args[0].elts) == 1
+        and isinstance(node.args[0].elts[0], ast.Constant)
+        and isinstance(node.args[0].elts[0].value, int)
+    ):
+        return node.args[0].elts[0].value
+    return None
+
+
+def _generated_access_pointer(call: ast.Call) -> tuple[ast.expr, int] | None:
+    """Pointer and element width of a generated scalar or vector access.
+
+    Recognizes ``PTR.load()`` / ``PTR.store(value)`` (one element), the
+    hoisted ``cute.arch.load(PTR, ir.VectorType.get([V], ...))`` packet load
+    and its L2-policy helper forms (``V`` elements), a scalar-typed
+    ``cute.arch.load(PTR, cutlass.Float32, ...)`` (one element) and the
+    ``_cute_store_u16_vec`` / ``_cute_store_u32_vec`` flush of a V-loop's
+    values.  The flush's element count is not visible in the call, so it
+    reports the widest fragment its helper can write.  Anything else returns
+    ``None``: atomics, unknown helpers, and byte-packed loads through a word
+    carrier (``cute.arch.load(PTR, cutlass.Uint64)`` reads as many elements
+    as fit the word, a count the call does not show).
+    """
+    pointer = _plain_scalar_load_pointer(call)
+    if pointer is None:
+        pointer = _plain_scalar_store_pointer(call)
+    if pointer is not None:
+        return pointer, 1
+    func = call.func
+    name = ast.unparse(func) if isinstance(func, (ast.Attribute, ast.Name)) else ""
+    if name == "cute.arch.load" or name in _VECTOR_LOAD_HELPERS:
+        if len(call.args) < 2 or not isinstance(call.args[0], ast.expr):
+            return None
+        carrier = call.args[1]
+        width = _vector_type_width(carrier)
+        if width is not None:
+            return call.args[0], width
+        if name != "cute.arch.load" or ast.unparse(carrier) in _PACKED_LOAD_CARRIERS:
+            return None
+        return call.args[0], 1
+    if (
+        isinstance(func, ast.Name)
+        and func.id in _VECTOR_FLUSH_MAX_WIDTH
+        and len(call.args) == 2
+        and not call.keywords
+        and isinstance(call.args[0], ast.expr)
+    ):
+        return call.args[0], _VECTOR_FLUSH_MAX_WIDTH[func.id]
+    return None
+
+
+def _memory_address_definition_snapshots(
+    statements: list[ast.stmt],
+) -> list[dict[str, ast.expr]] | None:
+    """Snapshot canonical addresses used by the lane-independence proofs."""
+    required_names: set[str] = set()
+    for statement in statements:
+        for call in ast.walk(statement):
+            if not isinstance(call, ast.Call):
+                continue
+            if (load := _marker_call(call, _LOAD_MARKER, 6)) is not None:
+                pointer = load.args[4]
+            elif (store := _marker_call(call, _STORE_MARKER, 6)) is not None:
+                pointer = store.args[3]
+            else:
+                pointer = _plain_scalar_load_pointer(call)
+                if pointer is None:
+                    pointer = _plain_scalar_store_pointer(call)
+            if pointer is not None:
+                required_names.update(ReadWrites.from_ast(pointer).reads)
+    return _definition_snapshots(statements, required_names=required_names)
+
+
 def _single_tensor_iterator_root(node: ast.AST) -> str | None:
     roots = {
         child.value.id
@@ -451,13 +606,25 @@ def _scalar_pointer_is_known_affine(node: ast.AST, lane_var: str) -> bool:
     return depends and affine
 
 
+def _lane_step_separates(step: int, modulus: int, width: int) -> bool:
+    """Whether a lane offset of ``step`` (mod ``modulus``) cannot overlap a
+    ``width``-element access at the other lane."""
+    remainder = step % modulus
+    return min(remainder, modulus - remainder) >= width
+
+
 def _scalar_lane_mapping_is_injective(
     node: ast.AST,
     lane_var: str,
     lane_extent: int,
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    width: int = 1,
 ) -> bool:
-    """Prove distinct lanes produce distinct scalar pointer offsets."""
+    """Prove distinct lanes produce distinct scalar pointer offsets.
+
+    ``width`` > 1 additionally requires the lanes' ``width``-element
+    fragments not to overlap (hoisted vector packets and flushes).
+    """
 
     def visit(expr: ast.AST) -> tuple[bool, int | None]:
         if isinstance(expr, ast.Name):
@@ -515,7 +682,8 @@ def _scalar_lane_mapping_is_injective(
     # finite lane delta modulo 2**32 proves injectivity even when a known
     # coefficient itself wraps; it is conservative for wider arithmetic.
     return all(
-        (coefficient * delta) % (1 << 32) != 0 for delta in range(1, lane_extent)
+        _lane_step_separates(coefficient * delta, 1 << 32, width)
+        for delta in range(1, lane_extent)
     )
 
 
@@ -634,14 +802,16 @@ def _scalar_pointers_are_modularly_lane_disjoint(
     lane_extent: int,
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
     unstable_names: set[str],
+    width: int = 1,
 ) -> bool:
     """Prove cross-lane disjointness despite different row/checkpoint bases.
 
     If both pointers advance by the same nonzero lane step and every possible
     difference between their lane-independent bases is a multiple of ``M``, a
     cross-iteration dependence is impossible when ``step * delta`` is nonzero
-    modulo ``M`` for every live lane delta.  Including the Int32 modulus keeps
-    the proof sound under generated index narrowing.
+    modulo ``M`` for every live lane delta (at least ``width`` elements away
+    from zero for vector accesses).  Including the Int32 modulus keeps the
+    proof sound under generated index narrowing.
     """
     load_root = _single_tensor_iterator_root(load_pointer)
     store_root = _single_tensor_iterator_root(store_pointer)
@@ -682,7 +852,8 @@ def _scalar_pointers_are_modularly_lane_disjoint(
     for coefficient in base_coefficients.values():
         modulus = math.gcd(modulus, abs(coefficient))
     return modulus > 1 and all(
-        (lane_coefficient * delta) % modulus != 0 for delta in range(1, lane_extent)
+        _lane_step_separates(lane_coefficient * delta, modulus, width)
+        for delta in range(1, lane_extent)
     )
 
 
@@ -757,10 +928,15 @@ def _lane_accesses_are_iteration_independent(
     if (load_marker is None) != (store_marker is None):
         return False
     if load_marker is None:
-        load_pointer = _plain_scalar_load_pointer(load_call)
-        store_pointer = _plain_scalar_store_pointer(store_call)
-        if load_pointer is None or store_pointer is None:
+        load_access = _generated_access_pointer(load_call)
+        store_access = _generated_access_pointer(store_call)
+        if load_access is None or store_access is None:
             return False
+        load_pointer, load_width = load_access
+        store_pointer, store_width = store_access
+        # A hoisted packet or flush touches ``width`` consecutive elements
+        # from its pointer; the lanes' fragments must not overlap.
+        width = max(load_width, store_width)
         unstable_names = loop_carried_names or set()
         expanded_load = _lane_dependent_alias_expansion(
             load_pointer, load_definitions, lane_var
@@ -790,6 +966,7 @@ def _lane_accesses_are_iteration_independent(
             lane_var,
             lane_extent,
             proven_tensor_stride_values or {},
+            width,
         ):
             return True
         return _scalar_pointers_are_modularly_lane_disjoint(
@@ -799,6 +976,7 @@ def _lane_accesses_are_iteration_independent(
             lane_extent=lane_extent,
             proven_tensor_stride_values=proven_tensor_stride_values or {},
             unstable_names=unstable_names,
+            width=width,
         )
     assert store_marker is not None
     load_block = _literal(load_marker.args[0], int)
@@ -1268,6 +1446,8 @@ class _BranchLocalPersistentVectorizer:
         load_pointer = load_marker.args[4]
         load_roots = self._pointer_roots(load_pointer)
         definition_snapshots = _definition_snapshots(body)
+        if definition_snapshots is None:
+            return True
         for store_index, stmt in enumerate(body):
             for node in ast.walk(stmt):
                 if not isinstance(node, ast.Call):
@@ -1321,6 +1501,8 @@ class _BranchLocalPersistentVectorizer:
         """
         store_roots = self._pointer_roots(store_marker.args[3])
         definition_snapshots = _definition_snapshots(body)
+        if definition_snapshots is None:
+            return True
         for access_index, stmt in enumerate(body):
             for node in _memory_load_calls(stmt):
                 pointer = self._load_pointer(node)
@@ -1445,11 +1627,16 @@ class _BranchLocalPersistentVectorizer:
                         vector_type = (
                             f"ir.VectorType.get([{width}], {carrier}.mlir_type)"
                         )
-                        if eviction == "__l2_last__":
+                        if eviction in _CUTE_CACHE_LOAD_HELPERS:
+                            # An L2-policy marker is not a ``cute.arch.load``
+                            # kwarg: the 16-, 8- and 4-byte packets go
+                            # through the inline-PTX helper of their width.
+                            helper = cache_hinted_load_helper(
+                                eviction, width * itemsize
+                            )
                             load_source = (
-                                f"_cute_load_l2_evict_last({ast.unparse(base)}, "
-                                f"{vector_type})"
-                                if width * itemsize == 16
+                                f"{helper}({ast.unparse(base)}, {vector_type})"
+                                if helper is not None
                                 else f"cute.arch.load({ast.unparse(base)}, {vector_type})"
                             )
                         else:

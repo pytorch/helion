@@ -38,6 +38,47 @@ The rewrite then hoists the reciprocal computation:
 Multiple divisions sharing the same loop-invariant divisor share a
 single reciprocal computation.
 
+3. Share one reciprocal between ``n >= 2`` divisions by the same divisor
+   VALUE inside a single straight-line block, even when the divisor is
+   NOT loop-invariant (so the hoist above cannot fire).  ``swiglu_bwd``
+   computes, per element and inside the unrolled vector-lane loop::
+
+       v_9 = v_7 + v_8
+       v_10 = v_7 / v_9
+       v_12 = v_11 / v_9
+       v_13 = v_12 / v_9
+
+   and the scalar ``truediv`` lowering emits the full IEEE divide
+   sequence (~20 SASS instructions with a BSSY/BSYNC branch) for every
+   quotient.  The block-local pass rewrites this to one IEEE reciprocal
+   plus one FMUL per quotient::
+
+       v_9 = v_7 + v_8
+       _helion_inv_div_0 = 1.0 / v_9
+       v_10 = v_7 * _helion_inv_div_0
+       v_12 = v_11 * _helion_inv_div_0
+       v_13 = v_12 * _helion_inv_div_0
+
+   Divisions are grouped by (name, SSA version): every statement that
+   may rebind the divisor (including nested bodies, conservatively)
+   starts a new version, so ``a / d; d = d + 1; b / d`` is left alone.
+   A lone division is never rewritten (a reciprocal costs the same as
+   the division it would replace).
+
+Numerics of the two reciprocal rewrites (2 and 3) are identical: every
+quotient becomes ``fl(x * fl(1 / d))`` instead of the correctly rounded
+``fl(x / d)``.  With the fp32 unit roundoff ``u = 2**-24`` the relative
+error versus the exact quotient is at most ``2u + u**2`` (two roundings)
+instead of ``u``, i.e. below 1.5 ulp of the exact quotient, and the
+result is the correctly rounded quotient or one of its two fp32
+neighbours (at most 1 ulp away from the IEEE division result).  The bound
+assumes ``1 / d`` is a normal fp32 value (roughly ``2**-128 < |d| <=
+2**126``); outside that range the reciprocal can overflow or lose bits
+where the division would not, exactly as for the loop-invariant hoist.
+Both rewrites use only IEEE-rounded ``/`` and ``*`` -- no approximate or
+fast-math instructions are introduced -- and neither is an autotuner knob:
+the only gate is the ``HELION_DISABLE_HOIST_RECIP`` escape hatch.
+
 The alias-DCE pass inlines chains like ``mi_copy_1 = mi`` /
 ``mi_copy_1_0 = mi_copy_1`` so the deepest inner-loop use can read
 ``mi`` directly.  This removes the per-iter "copy" instruction the SSA
@@ -52,9 +93,11 @@ Measured impact on (4096, 12672) fp16 softmax_two_pass on B200:
 from __future__ import annotations
 
 import ast
+import operator
 
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import _names_read
+from .scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
 
 _HOIST_COUNTER: list[int] = [0]
 
@@ -141,10 +184,10 @@ def _collect_assigns_in_body(
                 if isinstance(target, ast.Name):
                     all_written.add(_canonical(target.id))
                     # AugAssign reads + writes the same name; never invariant.
-            # Recurse into nested for / if / with.
-            if isinstance(stmt, (ast.For, ast.If, ast.With)):
+            # Recurse into nested for / while / if / with.
+            if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With)):
                 _walk(stmt.body)
-            if isinstance(stmt, (ast.For, ast.If)):
+            if isinstance(stmt, (ast.For, ast.While, ast.If)):
                 _walk(stmt.orelse)
 
     _walk(body)
@@ -306,11 +349,15 @@ def _hoist_invariant_recips_in_for(
     for_node: ast.For,
     parent_body: list[ast.stmt],
     for_idx: int,
+    live_recips: dict[str, str] | None = None,
 ) -> int:
     """Try to hoist loop-invariant divisions in a single for-loop.
 
-    Returns the number of statements inserted before ``for_idx`` (so the
-    caller can adjust subsequent indices).
+    ``live_recips`` maps divisor names to reciprocals hoisted earlier in the
+    same body that are still valid (the divisor was not rebound since); a
+    later sibling loop dividing by the same name reuses them instead of
+    computing another reciprocal.  Returns the number of statements inserted
+    before ``for_idx`` (so the caller can adjust subsequent indices).
     """
     loop_target = for_node.target.id if isinstance(for_node.target, ast.Name) else None
     divisor_map = _find_invariant_div_binops(for_node.body, loop_target)
@@ -319,10 +366,14 @@ def _hoist_invariant_recips_in_for(
 
     inserted = 0
     for divisor_name, binop_list in divisor_map.items():
-        inv_name = _new_inv_name()
-        decl = statement_from_string(f"{inv_name} = 1.0 / {divisor_name}")
-        parent_body.insert(for_idx + inserted, decl)
-        inserted += 1
+        inv_name = live_recips.get(divisor_name) if live_recips is not None else None
+        if inv_name is None:
+            inv_name = _new_inv_name()
+            decl = statement_from_string(f"{inv_name} = 1.0 / {divisor_name}")
+            parent_body.insert(for_idx + inserted, decl)
+            inserted += 1
+            if live_recips is not None:
+                live_recips[divisor_name] = inv_name
         for binop in binop_list:
             _rewrite_div_to_mul(binop, inv_name)
     return inserted
@@ -343,23 +394,29 @@ def _hoist_in_body(body: list[ast.stmt]) -> list[ast.stmt]:
     # (possibly modified) child bodies.  By hoisting outermost first, the
     # nested bodies see ``... * _helion_inv_div_N`` (a Mult, not a Div)
     # and have nothing left to hoist — so they don't emit cascade aliases.
+    # Reciprocals hoisted at this level stay valid for later sibling loops
+    # until any statement (at this level or nested) binds their divisor again.
+    live_recips: dict[str, str] = {}
     i = 0
     while i < len(body):
         stmt = body[i]
         if isinstance(stmt, ast.For) and not stmt.orelse:
-            inserted = _hoist_invariant_recips_in_for(stmt, body, i)
+            inserted = _hoist_invariant_recips_in_for(stmt, body, i, live_recips)
             # Skip past the inserted decls and the for-loop itself.
             i += inserted + 1
         else:
             i += 1
+        for bound in _names_bound_by(stmt):
+            live_recips.pop(_canonical(bound), None)
+            live_recips.pop(bound, None)
 
     # Now recurse into nested bodies for any remaining hoists that are
     # only legal at deeper scopes (e.g., divisor defined inside the outer
     # loop but invariant w.r.t. an inner loop).
     for stmt in body:
-        if isinstance(stmt, (ast.For, ast.If, ast.With, ast.FunctionDef)):
+        if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)):
             stmt.body = _hoist_in_body(stmt.body)
-        if isinstance(stmt, (ast.For, ast.If)):
+        if isinstance(stmt, (ast.For, ast.While, ast.If)):
             stmt.orelse = _hoist_in_body(stmt.orelse)
     return body
 
@@ -644,11 +701,11 @@ def _inline_invariant_aliases(body: list[ast.stmt]) -> list[ast.stmt]:
         return body
     # Process this body first.
     _inline_invariant_aliases_in_body(body)
-    # Recurse into for/if/with bodies that remain after rewrite.
+    # Recurse into for/while/if/with bodies that remain after rewrite.
     for stmt in body:
-        if isinstance(stmt, (ast.For, ast.If, ast.With, ast.FunctionDef)):
+        if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)):
             _inline_invariant_aliases(stmt.body)
-        if isinstance(stmt, (ast.For, ast.If)):
+        if isinstance(stmt, (ast.For, ast.While, ast.If)):
             _inline_invariant_aliases(stmt.orelse)
     return body
 
@@ -783,9 +840,12 @@ def _find_invariant_scale_subs(
             # safely without re-evaluating its RHS multiple times.
             # Pattern A doesn't need this since the Sub stays in place.
             const_val = const_side.value
-            if not isinstance(const_val, (int, float)):
+            # This reassociation targets floating-point FMA expressions. Without
+            # a typed integer proof, retain integer arithmetic exactly: turning
+            # its scale into a float can round indices and add conversions.
+            if not isinstance(const_val, float):
                 continue
-            key = (root, float(const_val))
+            key = (root, const_val)
             found.setdefault(key, []).append((sub, sub_node, inv_side))
     return found
 
@@ -861,6 +921,7 @@ def _rewrite_scale_sub_to_fma(
     else:
         node.left = ast.Name(id=scaled_name, ctx=ast.Load())
         node.right = new_a_mult
+    setattr(node, SCALED_SUBTRACTION_ATTR, True)
     ast.fix_missing_locations(node)
 
 
@@ -910,10 +971,147 @@ def _hoist_scaled_subs_in_body(body: list[ast.stmt]) -> list[ast.stmt]:
             i += 1
 
     for stmt in body:
-        if isinstance(stmt, (ast.For, ast.If, ast.With, ast.FunctionDef)):
+        if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)):
             stmt.body = _hoist_scaled_subs_in_body(stmt.body)
-        if isinstance(stmt, (ast.For, ast.If)):
+        if isinstance(stmt, (ast.For, ast.While, ast.If)):
             stmt.orelse = _hoist_scaled_subs_in_body(stmt.orelse)
+    return body
+
+
+# Statements whose expressions are evaluated exactly once, in program
+# order, when the statement runs.  Divisions inside compound statements
+# (for/if/while headers) are left to the hoist above; their bodies are
+# visited as blocks of their own.
+_EAGER_STMT_TYPES = (
+    ast.Assign,
+    ast.AugAssign,
+    ast.AnnAssign,
+    ast.Expr,
+    ast.Return,
+    ast.Assert,
+)
+# Expressions whose body runs later (or repeatedly) in its own scope; a
+# reciprocal computed before the enclosing statement may be stale there.
+_DEFERRED_EXPR_TYPES = (
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
+def _eager_nodes(stmt: ast.stmt) -> list[ast.AST]:
+    """Breadth-first list of every node of ``stmt`` that is evaluated when
+    ``stmt`` runs, skipping ``_DEFERRED_EXPR_TYPES`` subtrees."""
+    nodes: list[ast.AST] = []
+    todo: list[ast.AST] = [stmt]
+    while todo:
+        node = todo.pop(0)
+        if isinstance(node, _DEFERRED_EXPR_TYPES):
+            continue
+        nodes.append(node)
+        todo.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
+def _names_bound_by(stmt: ast.stmt) -> set[str]:
+    """Every name ``stmt`` may (re)bind anywhere inside it: ``Store``/``Del``
+    ``Name`` contexts (assignment, for/with and walrus targets, ``del``)
+    plus nested ``def`` / ``class`` / ``import`` bindings.  Nested bodies
+    are included conservatively -- an ``if`` branch may or may not run,
+    so any name it binds has to be treated as changed after the ``if``.
+    """
+    bound: set[str] = set()
+    for node in ast.walk(stmt):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.alias):
+            bound.add((node.asname or node.name).split(".")[0])
+    return bound
+
+
+def _is_reciprocal_div(node: ast.BinOp) -> bool:
+    """``1.0 / d`` (or ``1 / d``) already IS a reciprocal -- e.g. a
+    declaration the loop-invariant hoist emitted.  Rewriting it to
+    ``1.0 * inv`` would only add a multiply."""
+    left = node.left
+    return (
+        isinstance(left, ast.Constant)
+        and isinstance(left.value, (int, float))
+        and left.value == 1
+    )
+
+
+def _share_repeated_recips_in_block(body: list[ast.stmt]) -> None:
+    """Sub-pass 3 for ONE straight-line block: divisions by the same
+    divisor value share a single ``inv = 1.0 / d`` reciprocal.
+
+    Divisions are grouped by ``(canonical divisor name, version)`` where
+    the version is bumped after every statement that may rebind the
+    divisor (``_names_bound_by``), so all members of a group observe the
+    same value of ``d``.  Names are canonicalized through the rename-group
+    map so a rebind through a to-be-renamed alias (``v_1_0`` -> ``mi``)
+    also starts a new version.  Groups with at least two members get the
+    reciprocal declared immediately before their first use (where ``d``
+    is known to be bound) and every member rewritten to ``x * inv``.
+
+    Mutates ``body`` in place.  Does NOT recurse into nested bodies --
+    ``_share_repeated_recips_in_body`` handles those as separate blocks.
+    """
+    version: dict[str, int] = {}
+    groups: dict[tuple[str, int], list[ast.BinOp]] = {}
+    first_use: dict[tuple[str, int], int] = {}
+    for idx, stmt in enumerate(body):
+        if isinstance(stmt, _EAGER_STMT_TYPES):
+            for node in _eager_nodes(stmt):
+                if (
+                    isinstance(node, ast.BinOp)
+                    and isinstance(node.op, ast.Div)
+                    and isinstance(node.right, ast.Name)
+                    and not _is_reciprocal_div(node)
+                ):
+                    canon = _canonical(node.right.id)
+                    key = (canon, version.get(canon, 0))
+                    groups.setdefault(key, []).append(node)
+                    first_use.setdefault(key, idx)
+        # Rebinds take effect AFTER the statement's reads.
+        for name in _names_bound_by(stmt):
+            canon = _canonical(name)
+            version[canon] = version.get(canon, 0) + 1
+
+    decls: list[tuple[int, int, ast.stmt]] = []
+    for key, binops in groups.items():
+        if len(binops) < 2:
+            continue
+        inv_name = _new_inv_name()
+        # Spell the divisor as the first member does: that name is read
+        # by the very statement the declaration is placed in front of.
+        divisor = binops[0].right
+        assert isinstance(divisor, ast.Name)
+        decl = statement_from_string(f"{inv_name} = 1.0 / {divisor.id}")
+        decls.append((first_use[key], len(decls), decl))
+        for binop in binops:
+            _rewrite_div_to_mul(binop, inv_name)
+    # Insert back-to-front so earlier indices stay valid; the descending
+    # group order for same-index declarations keeps them in program order.
+    for idx, _order, decl in sorted(decls, key=operator.itemgetter(0, 1), reverse=True):
+        body.insert(idx, decl)
+
+
+def _share_repeated_recips_in_body(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Apply ``_share_repeated_recips_in_block`` to ``body`` and, recursively,
+    to every nested block (each is an independent straight-line scope)."""
+    if _is_placeholder_body(body):
+        return body
+    _share_repeated_recips_in_block(body)
+    for stmt in body:
+        if isinstance(stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)):
+            stmt.body = _share_repeated_recips_in_body(stmt.body)
+        if isinstance(stmt, (ast.For, ast.While, ast.If)):
+            stmt.orelse = _share_repeated_recips_in_body(stmt.orelse)
     return body
 
 
@@ -1028,9 +1226,11 @@ def _dce_pure_assigns(body: list[ast.stmt]) -> list[ast.stmt]:
         # from enclosing scopes so a name assigned in an ``if`` branch is
         # preserved if it is read after the if/else.
         for stmt in stmts:
-            if isinstance(stmt, (ast.For, ast.If, ast.With, ast.FunctionDef)):
+            if isinstance(
+                stmt, (ast.For, ast.While, ast.If, ast.With, ast.FunctionDef)
+            ):
                 stmt.body = _walk(stmt.body, outer_reads)
-            if isinstance(stmt, (ast.For, ast.If)):
+            if isinstance(stmt, (ast.For, ast.While, ast.If)):
                 stmt.orelse = _walk(stmt.orelse, outer_reads)
 
         # Iterate to fixed point.
@@ -1063,14 +1263,20 @@ def hoist_loop_invariant_recips(
 ) -> list[ast.stmt]:
     """Apply the hoist passes to a list of kernel-body statements.
 
-    Runs three sub-passes:
+    Runs four sub-passes:
 
       1. Inline pure SSA alias chains (``mi_copy_1 = mi`` →
          direct use of ``mi``) so subsequent passes see clean root names.
       2. Hoist ``x / scalar`` divisions where the divisor is
          loop-invariant (transitively) into ``inv = 1.0 / scalar +
          x * inv``.
-      3. Hoist ``(A - INV) * CONST`` patterns where INV is
+      3. Share one ``inv = 1.0 / d`` between ``n >= 2`` divisions by the
+         same divisor value inside one straight-line block (the residual
+         divisions whose divisor is recomputed every iteration, e.g.
+         ``swiglu_bwd``'s three quotients by ``exp(x) + 1``).  Same
+         rounding as sub-pass 2 -- see the module docstring for the
+         <= 1 ulp argument.
+      4. Hoist ``(A - INV) * CONST`` patterns where INV is
          loop-invariant — emits ``INV_scaled = INV * CONST`` outside
          and rewrites the inner expression to ``A * CONST - INV_scaled``
          (an FMA-friendly form).
@@ -1119,9 +1325,14 @@ def hoist_loop_invariant_recips(
         #    to ``di``) is reassigned inside the loop.
         _USE_CANONICAL_INVARIANCE[0] = True
         body = _hoist_in_body(body)
-        # 3. Hoist scaled-sub patterns — same canonical-aware mode.
+        # 3. Share reciprocals between the divisions sub-pass 2 could not
+        #    hoist (divisor recomputed per iteration) — same
+        #    canonical-aware mode so a rebind through a to-be-renamed
+        #    alias ends the sharing group.
+        body = _share_repeated_recips_in_body(body)
+        # 4. Hoist scaled-sub patterns — same canonical-aware mode.
         body = _hoist_scaled_subs_in_body(body)
-        # 4. DCE dead pure assigns left behind by the rewrites
+        # 5. DCE dead pure assigns left behind by the rewrites
         #    (e.g. ``v_10 = v_9 - mi`` now unused because the Mult was
         #    rewritten to read ``v_9`` directly).
         body = _dce_pure_assigns(body)

@@ -101,8 +101,8 @@ def _(state: CodegenState) -> ast.AST:
         state.codegen.add_statement(
             statement_from_string(
                 f"pl.semaphore_signal({barrier}, inc=1, "
-                "device_id={device_id}, "
-                "device_id_type=pl.DeviceIdType.LOGICAL)",
+                "device_id={jax.sharding.get_abstract_mesh().axis_names: "
+                "jnp.asarray({device_id}, dtype=jnp.int32)})",
                 device_id=device_id,
             )
         )
@@ -118,8 +118,11 @@ def _(state: CodegenState) -> ast.AST:
             (
                 "    pl.semaphore_signal(",
                 "        second_barrier, inc=1,",
-                f"        device_id={{device_id_{index}}},",
-                "        device_id_type=pl.DeviceIdType.LOGICAL,",
+                (
+                    "        device_id={jax.sharding.get_abstract_mesh()"
+                    ".axis_names: jnp.asarray("
+                    f"{{device_id_{index}}}, dtype=jnp.int32)}},"
+                ),
                 "    )",
             )
         )
@@ -270,8 +273,8 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
             f"{op_name} = pltpu.make_async_remote_copy("
             "{src_ref}, {dst_ref}, "
             f"{send_sem}, {recv_sem}, "
-            "device_id={device_id}, "
-            "device_id_type=pl.DeviceIdType.LOGICAL)",
+            "device_id={jax.sharding.get_abstract_mesh().axis_names: "
+            "jnp.asarray({device_id}, dtype=jnp.int32)})",
             src_ref=src_ref,
             dst_ref=dst_ref,
             device_id=device_id,

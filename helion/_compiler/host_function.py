@@ -103,6 +103,46 @@ class CompilerState:
     )
     global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
     rng_seed_slot_count: int = 0
+    # SSA copies (_phi, _new_var) -> the tensors they copy.
+    ssa_inputs: dict[torch.UntypedStorage, tuple[torch.Tensor, ...]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    # Inputs of ambiguous joins: a loop body reads a carried value through them.
+    ambiguous_ssa_inputs: set[torch.UntypedStorage] = dataclasses.field(
+        default_factory=set
+    )
+    # get_remote_tensors views -> (local storage, owner rank), None if unmapped.
+    peer_views: dict[torch.UntypedStorage, tuple[torch.UntypedStorage, int] | None] = (
+        dataclasses.field(default_factory=dict)
+    )
+
+    def ssa_source(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """The tensor an SSA fake copies, or None if a join makes it ambiguous."""
+        storage = tensor.untyped_storage()
+        if storage in self.ambiguous_ssa_inputs:
+            return None
+        if storage not in self.ssa_inputs:
+            return tensor
+        sources = {id(s): s for s in map(self.ssa_source, self.ssa_inputs[storage])}
+        return next(iter(sources.values())) if len(sources) == 1 else None
+
+    def ssa_storages(self, tensor: torch.Tensor) -> set[torch.UntypedStorage]:
+        """A fake's storage and those of the tensors it transitively copies."""
+        storages: set[torch.UntypedStorage] = set()
+        pending = [tensor]
+        while pending:
+            if (storage := pending.pop().untyped_storage()) not in storages:
+                storages.add(storage)
+                pending.extend(self.ssa_inputs.get(storage, ()))
+        return storages
+
+    def record_ssa_copy(
+        self, copy: torch.Tensor, inputs: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Record the tensors a fresh SSA fake copies."""
+        self.ssa_inputs[copy.untyped_storage()] = inputs
+        if self.ssa_source(copy) is None:
+            self.ambiguous_ssa_inputs.update(t.untyped_storage() for t in inputs)
 
 
 class HostFunction:
@@ -254,7 +294,10 @@ class HostFunction:
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
         self.local_types = local_types
         for name, type_info in local_types.items():
-            type_info.populate_symbol_origins(NameOrigin(name, self))
+            # Locals leaked from an earlier root's device code are not host
+            # names; lifting their symbols would pass an undefined host arg.
+            if type_info.origin.is_host():
+                type_info.populate_symbol_origins(NameOrigin(name, self))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()

@@ -143,6 +143,33 @@ def _add_explicit_evict(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _cast_i16_to_bf16(w: torch.Tensor) -> torch.Tensor:
+    k, n = w.shape
+    out = torch.empty((k, n), dtype=torch.bfloat16, device=w.device)
+    for tk, tn in hl.tile((k, n)):
+        out[tk, tn] = w[tk, tn].to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cast_i32_to_f32(w: torch.Tensor) -> torch.Tensor:
+    k, n = w.shape
+    out = torch.empty((k, n), dtype=torch.float32, device=w.device)
+    for tk, tn in hl.tile((k, n)):
+        out[tk, tn] = w[tk, tn].to(torch.float32)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _double_bf16(w: torch.Tensor) -> torch.Tensor:
+    k, n = w.shape
+    out = torch.empty((k, n), dtype=torch.bfloat16, device=w.device)
+    for tk, tn in hl.tile((k, n)):
+        out[tk, tn] = w[tk, tn] * 2
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCutePointwiseVec(TestCase):
     def test_nd_grid_vec_bf16(self) -> None:
@@ -357,8 +384,62 @@ class TestCutePointwiseVec(TestCase):
             cute_vector_widths=[4],
             load_eviction_policies=["l2_last", "l2_last"],
         )
-        self.assertIn("_cute_load_l2_evict_last", code)
+        self.assertIn("_cute_load_l2_evict_last(", code)
         torch.testing.assert_close(out, x * y)
+
+    def test_l2_last_eviction_policy_narrow_packets(self) -> None:
+        """``l2_last`` reaches 8- and 4-byte packets through the helper of
+        their width (it used to be dropped below 16 bytes)."""
+        for dtype, width, suffix in (
+            (torch.float32, 2, "_8b"),
+            (torch.float16, 4, "_8b"),
+            (torch.float16, 2, "_4b"),
+            (torch.bfloat16, 2, "_4b"),
+        ):
+            with self.subTest(dtype=dtype, width=width):
+                x = torch.randn(2**14, device=DEVICE, dtype=dtype)
+                y = torch.randn_like(x)
+                code, out = code_and_output(
+                    _mul1d,
+                    (x, y),
+                    block_sizes=[1024],
+                    num_threads=[128],
+                    cute_vector_widths=[width],
+                    load_eviction_policies=["l2_last", "l2_last"],
+                )
+                self.assertIn(f"_cute_load_l2_evict_last{suffix}(", code)
+                torch.testing.assert_close(out, x * y, atol=0, rtol=0)
+
+    def test_two_level_eviction_policy(self) -> None:
+        """8/16-byte cache hints and scalar fallbacks preserve every element."""
+        for dtype, width in (
+            (torch.float32, 4),
+            (torch.float16, 8),
+            (torch.bfloat16, 8),
+        ):
+            for policy in ("l1_l2_first", "l1_l2_last"):
+                for selected_width in sorted({width, 4, 2, 1}, reverse=True):
+                    with self.subTest(dtype=dtype, policy=policy, width=selected_width):
+                        x = torch.randn(2**14, device=DEVICE, dtype=dtype)
+                        y = torch.randn_like(x)
+                        code, out = code_and_output(
+                            _mul1d,
+                            (x, y),
+                            block_sizes=[1024],
+                            num_threads=[128],
+                            cute_vector_widths=[selected_width],
+                            load_eviction_policies=[policy, policy],
+                        )
+                        helper = "_cute_load_l1_l2_evict_" + policy.rsplit("_", 1)[1]
+                        packet_bytes = selected_width * x.element_size()
+                        self.assertEqual(f"{helper}(" in code, packet_bytes == 16)
+                        self.assertEqual(f"{helper}_8b(" in code, packet_bytes == 8)
+                        # A width-1 site is a scalar load, not a packet.
+                        self.assertEqual(
+                            f"{helper}_4b(" in code,
+                            packet_bytes == 4 and selected_width > 1,
+                        )
+                        torch.testing.assert_close(out, x * y, atol=0, rtol=0)
 
     def test_epilogue_subtile_disables_vec(self) -> None:
         """Regression: epilogue_subtile stages stores through smem with a
@@ -472,6 +553,109 @@ class TestCutePointwiseVec(TestCase):
         )
         _, out32 = code_and_output(_sigmoid1d, (xs,), block_sizes=[8])
         torch.testing.assert_close(out32, torch.sigmoid(xs), equal_nan=True)
+
+    def test_int16_packet_cast_to_bf16_is_bitwise_exact(self) -> None:
+        """Every int16 value rides a V=8 Uint16 packet, is bitcast back to
+        Int16 per lane and takes the program's own bf16 cast: sign and
+        round-to-nearest-even match torch bit for bit."""
+        w = (
+            torch.arange(-32768, 32768, dtype=torch.int32, device=DEVICE)
+            .to(torch.int16)
+            .reshape(64, 1024)
+        )
+        code, out = code_and_output(
+            _cast_i16_to_bf16,
+            (w,),
+            block_sizes=[8, 1024],
+            num_threads=[8, 128],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        self.assertIn(".bitcast(cutlass.Int16)", code)
+        self.assertIn("_cute_store_u16_vec", code)
+        self.assertTrue(
+            torch.equal(out.view(torch.int16), w.to(torch.bfloat16).view(torch.int16))
+        )
+
+    def test_int32_packet_cast_to_fp32_is_bitwise_exact(self) -> None:
+        """int32 words ride a V=4 Uint32 packet; the fp32 cast rounds the
+        values above 2**24 (ties included) exactly as torch does."""
+        generator = torch.Generator().manual_seed(0)
+        w = torch.randint(
+            -(2**31), 2**31 - 1, (128, 512), generator=generator, dtype=torch.int64
+        ).to(torch.int32)
+        w[0, :16] = torch.tensor(
+            [
+                0,
+                1,
+                -1,
+                2**24 + 1,
+                -(2**24) - 1,
+                2**24 + 3,
+                2**31 - 1,
+                -(2**31),
+                2**25 + 2,
+                -(2**25) - 2,
+                33554433,
+                -33554433,
+                12345679,
+                -12345679,
+                100000001,
+                -100000001,
+            ],
+            dtype=torch.int32,
+        )
+        w = w.to(DEVICE)
+        code, out = code_and_output(
+            _cast_i32_to_f32,
+            (w,),
+            block_sizes=[8, 512],
+            num_threads=[8, 128],
+            cute_vector_widths=[1, 4],
+        )
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint32.mlir_type)", code)
+        self.assertIn("_cute_store_u32_vec", code)
+        self.assertTrue(
+            torch.equal(out.view(torch.int32), w.to(torch.float32).view(torch.int32))
+        )
+
+    def test_misaligned_views_take_scalar_loads(self) -> None:
+        """A packet needs an aligned base and row stride.  A 132-wide row
+        (264 bytes) or a view four elements into its storage stays on scalar
+        loads and still computes the exact result; the contiguous copy of the
+        same data keeps its packet."""
+        packet = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
+        for kernel, big in (
+            (
+                _cast_i16_to_bf16,
+                torch.randint(
+                    -32768, 32767, (64, 136), dtype=torch.int16, device=DEVICE
+                ),
+            ),
+            (_double_bf16, torch.randn(64, 136, dtype=torch.bfloat16, device=DEVICE)),
+        ):
+            row_stride = torch.empty((64, 132), dtype=big.dtype, device=DEVICE)
+            row_stride = row_stride[:, :128]
+            row_stride.copy_(big[:, :128])
+            views = {
+                "contiguous": big[:, :128].contiguous(),
+                "row_stride_132": row_stride,
+                "offset_4": big[:, 4:132],
+            }
+            for name, w in views.items():
+                with self.subTest(kernel=kernel.name, view=name):
+                    code, out = code_and_output(
+                        kernel,
+                        (w,),
+                        block_sizes=[8, 128],
+                        num_threads=[8, 16],
+                        cute_vector_widths=[1, 8],
+                    )
+                    self.assertEqual(packet in code, name == "contiguous")
+                    reference = (
+                        w.to(torch.bfloat16) if w.dtype is torch.int16 else w * 2
+                    )
+                    self.assertTrue(torch.equal(out, reference))
 
 
 if __name__ == "__main__":

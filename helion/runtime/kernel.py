@@ -9,7 +9,6 @@ import hashlib
 import inspect
 import itertools
 import logging
-import operator
 import os
 import re
 import sys
@@ -55,8 +54,10 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
+from .._compiler.autotuner_heuristics import register_compiler_coverage_groups
+from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
@@ -76,6 +77,11 @@ from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .cute_structural_config import DEFAULT_STRUCTURAL_POLICY
+from .cute_structural_config import CuteStructuralConfig
+from .cute_structural_config import StructuralPolicyError
+from .cute_structural_config import require_same_structural_policy
+from .cute_structural_config import select_structural_policy
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -88,11 +94,14 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+    from .cute_structural_config import CuteStructuralPolicyRequest
+    from .cute_structural_policy import CuteStructuralPolicy
 
-    ConfigLike = Config | dict[str, object]
+    ConfigLike = Config | dict[str, object] | CuteStructuralConfig
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -105,8 +114,13 @@ def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> boo
     return False
 
 
-def _td_layout_guard_active_for_config(
-    guard: TensorDescriptorLayoutGuard, config: Config
+class _TensorDescriptorOperationGuard(Protocol):
+    memory_op_indices: set[int]
+    atomic_op_indices: set[int]
+
+
+def _td_guard_active_for_config(
+    guard: _TensorDescriptorOperationGuard, config: Config
 ) -> bool:
     return any(
         _indexing_config_uses_tensor_descriptor(config.indexing, index)
@@ -850,6 +864,7 @@ class Kernel(Generic[_R]):
         configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
+        cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -867,7 +882,11 @@ class Kernel(Generic[_R]):
         # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
-        self.settings: Settings = settings or Settings()
+        self.settings, selected_configs, self._cute_structural_policy = (
+            select_structural_policy(
+                settings or Settings(), configs or [], cute_structural_policy
+            )
+        )
         self._key_fn: Callable[..., Hashable] | None = key
         # Whether the kernel declares distributed intent via an hl.ProcessGroupName
         # argument. Computed once so the per-call is_distributed check stays cheap
@@ -876,7 +895,7 @@ class Kernel(Generic[_R]):
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
             Config(**config) if isinstance(config, dict) else config
-            for config in configs or []
+            for config in selected_configs
         ]
         self._bind_lock = threading.RLock()
         self._specialize_extra_lock = threading.Lock()
@@ -955,6 +974,25 @@ class Kernel(Generic[_R]):
         grouping telemetry rows by kernel during analysis.
         """
         return inspect.getsource(self.fn)
+
+    def _validate_structural_policy(self) -> None:
+        # Legacy kernels retain their existing mutable Settings behavior. An
+        # explicitly policy-bound kernel cannot silently change its IR contract.
+        if self.cute_structural_policy is not None:
+            if self.settings.backend != "cute":
+                raise StructuralPolicyError(
+                    "A policy-bound Kernel requires backend='cute'"
+                )
+            require_same_structural_policy(
+                self.settings.get_cute_structural_policy(),
+                self.cute_structural_policy,
+                context="Kernel settings",
+            )
+
+    @property
+    def cute_structural_policy(self) -> CuteStructuralPolicy | None:
+        """The explicitly selected policy, or None for the unchanged legacy API."""
+        return self._cute_structural_policy
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
@@ -1446,6 +1484,7 @@ class Kernel(Generic[_R]):
 
     def _bind_isolated(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """Construct a canonical bound without reading or publishing shared caches."""
+        self._validate_structural_policy()
         args = self._validate_bind_args(args)
         args = self.normalize_args(*args)
         dist_initialized = dist.is_initialized()
@@ -1462,6 +1501,7 @@ class Kernel(Generic[_R]):
         )
 
     def _bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
+        self._validate_structural_policy()
         with measure("Kernel.bind"):
             args = self._validate_bind_args(args)
             dist_initialized = dist.is_initialized()
@@ -1537,6 +1577,10 @@ class Kernel(Generic[_R]):
         _specialize_extra lookups.
         """
         result: list[Hashable] = []
+        if self.cute_structural_policy is not None:
+            result.append(
+                ("cute_structural_policy", self.cute_structural_policy.identity())
+            )
         assert len(args) <= len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
@@ -1698,7 +1742,9 @@ class Kernel(Generic[_R]):
         Every argument set must bind normally to the same exact, current accelerator
         device. Distributed processes are not supported. A non-empty ``cache_tag`` is
         required for custom callbacks, dynamic-shape tuning, and runtime numeric
-        arguments; callers own tag invalidation in those cases.
+        arguments; callers own tag invalidation in those cases. Structural differences
+        in per-operation fields are allowed when a scalar override broadcasts across
+        every operation.
 
         Args:
             arg_sets: Non-empty sequence of representative kernel argument sequences.
@@ -1856,9 +1902,31 @@ class Kernel(Generic[_R]):
         anchor_backend = anchor.env.backend.name
         anchor_capability = target_device_capability(anchor.env.device)
         advanced_controls_files = self.settings.autotune_search_acf or None
-        anchor_fingerprint = anchor.config_spec.structural_fingerprint(
-            advanced_controls_files=advanced_controls_files
+        broadcastable_per_operation_fields = frozenset(
+            {
+                "indexing",
+                "atomic_indexing",
+                "load_eviction_policies",
+            }
         )
+        scalar_overridden_config_keys = frozenset(
+            key
+            for key, value in (self.settings.autotune_config_overrides or {}).items()
+            if key in broadcastable_per_operation_fields and isinstance(value, str)
+        )
+
+        def effective_fingerprint(
+            bound_kernel: BoundKernel[_R],
+        ) -> tuple[tuple[str | int, ...], ...]:
+            return tuple(
+                field
+                for field in bound_kernel.config_spec.structural_fingerprint(
+                    advanced_controls_files=advanced_controls_files
+                )
+                if field[0] not in scalar_overridden_config_keys
+            )
+
+        anchor_fingerprint = effective_fingerprint(anchor)
         for case_index, (bound_kernel, _) in enumerate(cases):
             if bound_kernel.env.process_group_name is not None:
                 raise exc.InvalidAPIUsage(
@@ -1878,9 +1946,7 @@ class Kernel(Generic[_R]):
                 raise exc.InvalidAPIUsage(
                     "autotune_multi requires every case to have the same device capability"
                 )
-            fingerprint = bound_kernel.config_spec.structural_fingerprint(
-                advanced_controls_files=advanced_controls_files
-            )
+            fingerprint = effective_fingerprint(bound_kernel)
             if fingerprint != anchor_fingerprint:
                 raise exc.InvalidAPIUsage(
                     "autotune_multi requires structurally compatible ConfigSpec "
@@ -1947,6 +2013,7 @@ class Kernel(Generic[_R]):
         Returns:
             _R: The result of the Kernel function call.
         """
+        self._validate_structural_policy()
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
         is_compiling = torch.compiler.is_compiling()
@@ -2139,7 +2206,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 specialization and bound caches.
         """
         super().__init__()
+        kernel._validate_structural_policy()
         self.kernel = kernel
+        self._structural_policy = (
+            kernel.settings.get_cute_structural_policy()
+            if kernel.settings.backend == "cute"
+            else None
+        )
         self._reset_generation = kernel._reset_generation
         # Extending this bound's schema evicts all of its dispatch mappings.
         self._dispatch_generation: int | None = None
@@ -2211,6 +2284,31 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.host_function = None  # type: ignore[assignment]
             return
 
+        if (
+            self.settings.cute_region_fission
+            or self.settings.cute_materialize_transformed_operands
+        ) and self.settings.backend == "cute":
+            from .._compiler.cute.materialize_operand import (
+                plan_operand_materialization,
+            )
+            from .._compiler.cute.materialized_fission import plan_materialized_fission
+
+            with (
+                _maybe_skip_dtype_check_in_meta_registrations(),
+                patch_inductor_lowerings(),
+            ):
+                if self.settings.cute_materialize_transformed_operands:
+                    self._env.cute_fission_plan = plan_operand_materialization(
+                        self.kernel, args, self._env
+                    )
+                if (
+                    self.settings.cute_region_fission
+                    and self._env.cute_fission_plan is None
+                ):
+                    self._env.cute_fission_plan = plan_materialized_fission(
+                        self.kernel, args, self._env
+                    )
+
         with self.env:
             self._env.process_group_name = _find_process_group_name(
                 kernel.fn, args, is_distributed
@@ -2264,6 +2362,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 runtime_args = dict(
                     zip(self.kernel.signature.parameters, args, strict=False)
                 )
+                self.env.snapshot_tensor_descriptor_alignments(runtime_args)
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                         self.env,
@@ -2332,6 +2431,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 from .._compiler.cute.aux_tensor import (
                     host_function_matmul_has_non_tcgen05_operand,
                 )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_tcgen05_rowvec_aux_facts,
+                )
 
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
                     host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
@@ -2344,6 +2446,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)
                 )
+                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
+                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
+                )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
@@ -2353,6 +2458,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             self.env.config_spec.compiler_seed_configs.append(
                                 seed_config
                             )
+                with self.env.use_runtime_arg_values(runtime_args):
+                    register_compiler_coverage_groups(
+                        self.env, self.host_function.device_ir
+                    )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -2398,6 +2507,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         return self.kernel.configs
 
     def _normalize_config(self, config: ConfigLike) -> Config:
+        self.kernel._validate_structural_policy()
+        if isinstance(config, CuteStructuralConfig):
+            require_same_structural_policy(
+                config.policy, self._structural_policy, context="Late config envelope"
+            )
+            return config.config
         if isinstance(config, Config):
             return config
         # pyrefly: ignore [bad-argument-type]
@@ -2406,14 +2521,39 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _normalized_config_copy(self, config: ConfigLike) -> Config:
         return self.env.config_spec.normalized_config(self._normalize_config(config))
 
-    def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
-        """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
+    def config_envelope(self, config: ConfigLike) -> CuteStructuralConfig:
+        """Snapshot a config and this bound's policy for a later pre-binding load."""
+        if self._structural_policy is None:
+            raise ValueError("Config policy envelopes require backend='cute'")
+        return CuteStructuralConfig(
+            self._normalize_config(config), self._structural_policy
+        )
+
+    def format_kernel_decorator(self, config: ConfigLike, settings: Settings) -> str:
+        """Return the @helion.kernel decorator capturing backend codegen settings."""
+        if self is not None and self.kernel.cute_structural_policy is not None:
+            config = self.config_envelope(config)
         parts = [
             f"config={config.__repr__()}",
             f"static_shapes={settings.static_shapes}",
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
+        if settings.backend == "cute":
+            # Structural settings determine the config's axis schema at binding.
+            # Record opt-outs too, independent of the replay process's environment.
+            parts.extend(
+                [
+                    "backend='cute'",
+                    f"cute_region_fission={settings.cute_region_fission}",
+                    f"cute_full_slice_matmul_tiling={settings.cute_full_slice_matmul_tiling}",
+                    f"cute_segmented_matmul_tiling={settings.cute_segmented_matmul_tiling}",
+                    f"cute_flatten_nested_reductions={settings.cute_flatten_nested_reductions}",
+                    f"cute_materialize_transformed_operands={settings.cute_materialize_transformed_operands}",
+                ]
+            )
+        if settings.backend == "cute" or settings.cute_rng_stream != "word0":
+            parts.append(f"cute_rng_stream={settings.cute_rng_stream!r}")
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(
@@ -2560,6 +2700,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 and self.env.backend.requires_shape_specialized_module
             ):
                 cache_extra = repr(self._base_spec_key)
+            if self.kernel.cute_structural_policy is not None:
+                cache_extra += self.extra_cache_key()
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code, extra=cache_extra)
             self.env.backend.annotate_compiled_module(
@@ -2603,7 +2745,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Returns ``""`` by default, leaving the cache key unchanged.
         """
-        return ""
+        policy = self.kernel.cute_structural_policy
+        return "" if policy is None else f"cute_structural_policy:{policy.identity()}"
 
     def supports_subprocess_benchmark(self) -> bool:
         return True
@@ -2864,11 +3007,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to set.
         """
+        requested_config = config
         config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
+        repro_config = (
+            requested_config
+            if isinstance(requested_config, CuteStructuralConfig)
+            else config
+        )
         counters["best_config_decorator"][
-            self.format_kernel_decorator(config, self.settings)
+            self.format_kernel_decorator(repro_config, self.settings)
         ] = 1
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
@@ -2879,10 +3028,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
+        tensor_descriptor_layout_guards = self.env.tensor_descriptor_layout_guards
+        tensor_descriptor_alignment_guards = getattr(
+            self.env, "tensor_descriptor_alignment_guards", {}
+        )
         if (
             not self.env.specialized_vars
             and not self.env.specialized_strides
-            and not self.env.tensor_descriptor_layout_guards
+            and not tensor_descriptor_layout_guards
+            and not tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
         ):
             return []
@@ -2945,7 +3099,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 return getitem_extractor
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
-                return operator.itemgetter(index)
+
+                def local_extractor(
+                    args: Sequence[object],
+                    _index: int = index,
+                ) -> Hashable:
+                    return cast("Hashable", args[_index])
+
+                return local_extractor
             raise exc.SpecializeArgType(v)
 
         arg_name_to_index: dict[str, int] = {
@@ -2971,14 +3132,78 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
-        implicit_config = self._fixed_config_for_td_layout_guards()
+        candidate_configs: tuple[Config, ...] | None
+        if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
+            implicit_config = self._fixed_config_for_td_layout_guards()
+            if implicit_config is not None:
+                candidate_configs = (implicit_config,)
+            elif not self.settings.force_autotune and len(self.kernel.configs) > 1:
+                normalized_configs = []
+                for config in self.kernel.configs:
+                    try:
+                        normalized_configs.append(self._normalized_config_copy(config))
+                    except exc.InvalidConfig:
+                        # Finite-search autotuning deliberately permits invalid
+                        # candidates and skips them at compile time. Descriptor
+                        # guard discovery must not make those failures eager.
+                        continue
+                candidate_configs = tuple(normalized_configs)
+            else:
+                candidate_configs = None
+        else:
+            candidate_configs = None
+
+        def guard_is_active(guard: _TensorDescriptorOperationGuard) -> bool:
+            return candidate_configs is None or any(
+                _td_guard_active_for_config(guard, config)
+                for config in candidate_configs
+            )
+
+        def descriptor_extent_cap(
+            guard: TensorDescriptorLayoutGuard,
+        ) -> int | None:
+            if guard.has_derived_block_extent:
+                return (
+                    CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if self.env.device.type == "cuda"
+                    else None
+                )
+            if candidate_configs is None:
+                return (
+                    CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if self.env.device.type == "cuda"
+                    else None
+                )
+            active_configs = tuple(
+                config
+                for config in candidate_configs
+                if _td_guard_active_for_config(guard, config)
+            )
+            with self.env:
+                resolved_block_sizes = (
+                    block_size.from_config(config)
+                    for config in active_configs
+                    for block_size in self.env.block_sizes
+                )
+                cap = max(
+                    (
+                        value
+                        for value in resolved_block_sizes
+                        if type(value) is int and value > 0 and value & (value - 1) == 0
+                    ),
+                    default=None,
+                )
+            if self.env.device.type != "cuda":
+                return cap
+            if cap is None:
+                return CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+            return min(cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE)
+
         for source, guard in sorted(
-            self.env.tensor_descriptor_layout_guards.items(),
+            tensor_descriptor_layout_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if implicit_config is not None and not _td_layout_guard_active_for_config(
-                guard, implicit_config
-            ):
+            if not guard_is_active(guard):
                 continue
             extract_tensor = make_extractor(source)
 
@@ -2989,18 +3214,58 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
+                _extent_cap: int | None = descriptor_extent_cap(guard),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
                     return ("ndim", tensor.ndim)
-                return tensor_descriptor_layout_signature_from_strides(
+                layout = tensor_descriptor_layout_signature_from_strides(
                     tensor.stride(),
                     _element_size,
+                )
+                # Extent classes guard Triton's descriptor block-shape and
+                # int32-coordinate legality. Other backends retain the legacy
+                # layout-only key; they neither consume host descriptors nor
+                # use Triton's descriptor legality checks.
+                if self.env.backend_name != "triton":
+                    return layout
+                return (
+                    layout,
+                    tuple(
+                        _tensor_descriptor_extent_class(int(size), _extent_cap)
+                        for size in tensor.size()
+                    ),
+                    all(int(size) < 2**31 for size in tensor.size()),
                 )
 
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
+
+        for source, guard in sorted(
+            tensor_descriptor_alignment_guards.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            if not guard_is_active(guard):
+                continue
+            extract_tensor = make_extractor(source)
+
+            def td_alignment_extractor(
+                args: Sequence[object],
+                _extract_tensor: Callable[
+                    [Sequence[object]], Hashable
+                ] = extract_tensor,
+                _requires_zero_storage_offset: bool = (
+                    guard.requires_zero_storage_offset
+                ),
+            ) -> Hashable:
+                tensor = cast("torch.Tensor", _extract_tensor(args))
+                return _concrete_tensor_satisfies_alignment_guard(
+                    tensor, _requires_zero_storage_offset
+                )
+
+            # Prepared metadata guards do not cover base pointers.
+            extractors.append(td_alignment_extractor)
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
@@ -3100,16 +3365,22 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
         if self._config is not None:
-            return self._config
-        if self.kernel.settings.autotune_effort == "none" and (
+            config = self._config
+        elif self.kernel.settings.autotune_effort == "none" and (
             len(self.kernel.configs) == 0 or self.settings.force_autotune
         ):
-            return self.config_spec.default_config()
-        if self.settings.force_autotune:
+            config = self.config_spec.default_config()
+        elif self.settings.force_autotune:
             return None
-        if len(self.kernel.configs) == 1:
-            return self.kernel.configs[0]
-        return None
+        elif len(self.kernel.configs) == 1:
+            config = self.kernel.configs[0]
+        else:
+            return None
+
+        # Decorator configs are intentionally allowed to omit inferred fields
+        # such as block_sizes.  Resolve the same effective config that codegen
+        # will see before asking BlockSizeSource to read those fields.
+        return self._normalized_config_copy(config)
 
     def _user_provided_config(self) -> Config | None:
         """Return a config if the user explicitly provided one, else None.
@@ -3431,6 +3702,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -3442,6 +3714,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -3452,6 +3725,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -3465,6 +3739,12 @@ def kernel(
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
         key: Optional callable returning a hashable that augments the specialization key.
+        cute_structural_policy: Select the CuTe config schema before binding.
+            Ordinary CuTe searches without recorded configs automatically enable
+            proved structural passes while honoring explicit settings. None
+            preserves legacy configs and cache identity; "auto" also permits
+            selection for a no-search invocation. A recorded policy selects its
+            exact schema. Existing unversioned declarations retain their axes.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
             directly. Refer to the ``helion.Settings`` class for available
@@ -3495,12 +3775,14 @@ def kernel(
             configs=configs,
             settings=settings_obj,
             key=key,
+            cute_structural_policy=cute_structural_policy,
         )
     return Kernel(
         fn,
         configs=configs,
         settings=settings_obj,
         key=key,
+        cute_structural_policy=cute_structural_policy,
     )
 
 
@@ -3517,6 +3799,12 @@ def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     # 0 or 1.  Keep 2 as the canonical "dynamic dimension" bucket that was
     # already used for all concrete sizes >= 2.
     return 2
+
+
+def _tensor_descriptor_extent_class(size: int, cap: int | None) -> int:
+    """Largest power-of-two descriptor block that can fit this dimension."""
+    result = 0 if size <= 0 else 1 << (size.bit_length() - 1)
+    return result if cap is None else min(result, cap)
 
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()

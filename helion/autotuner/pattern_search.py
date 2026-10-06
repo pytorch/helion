@@ -8,6 +8,7 @@ from .. import exc
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
+from .compiler_coverage import coverage_policy
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 
 if TYPE_CHECKING:
@@ -17,7 +18,9 @@ if TYPE_CHECKING:
     from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
     from ..runtime.settings import Settings
+    from . import ConfigSpec
     from .base_search import _AutotunableKernel
+    from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
 
 
@@ -29,6 +32,30 @@ class InitialPopulationStrategy(enum.Enum):
 
     FROM_BEST_AVAILABLE = "from_best_available"
     """Start from default config plus up to 20 best matching cached configs from previous runs."""
+
+
+def random_fallback_population_target(
+    strategy: InitialPopulationStrategy,
+    pad_random: bool,
+    config_spec: ConfigSpec,
+    population_size: int,
+) -> int | None:
+    """Population size to pad to when every seed/default/cache config fails.
+
+    Only a seed-only population (FROM_BEST_AVAILABLE without random padding)
+    needs the fallback. Random populations already prove the search space
+    broken when they fail entirely, and CuTe flash populations are
+    structurally designed rather than seeded; both keep the immediate
+    compile-error re-raise.
+    """
+    if (
+        strategy != InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        or pad_random
+        or config_spec.cute_flash_search_enabled
+        or population_size <= 0
+    ):
+        return None
+    return population_size
 
 
 class PatternSearch(PopulationBasedSearch):
@@ -68,7 +95,9 @@ class PatternSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
                 cached configs with random configs to reach initial_population size.
-                When False, use only the default and cached configs (no random padding).
+                When False, use only the default and cached configs; random configs
+                are added only as a fallback when every one of them fails to compile
+                or run (see PopulationBasedSearch.benchmark_initial_population).
             num_neighbors_cap: Maximum number of neighbors to explore per generation. -1 means no cap.
                 Set HELION_CAP_AUTOTUNE_NUM_NEIGHBORS=N to override.
             finishing_rounds: Number of finishing rounds to run after the main search.
@@ -83,13 +112,18 @@ class PatternSearch(PopulationBasedSearch):
         self.copies = copies
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
-        self.initial_population = initial_population
+        # A CuTe flash surface measures one parent row per structural leaf;
+        # a profile population below that count (``quick`` on the widest
+        # small-grid surface) is raised here rather than for every kernel.
+        self.initial_population = self.config_gen.flash_population_floor(
+            initial_population
+        )
         self.num_neighbors_cap = num_neighbors_cap
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
 
     def _algorithm_cache_policy(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             # 2: ListOf.pattern_neighbors also proposes uniform lists.
             "pattern_version": 2,
             "initial_population": self.initial_population,
@@ -103,6 +137,10 @@ class PatternSearch(PopulationBasedSearch):
             "compile_timeout_lower_bound": self.compile_timeout_lower_bound,
             "compile_timeout_quantile": self.compile_timeout_quantile,
         }
+        policy = coverage_policy(self.config_spec.compiler_coverage_groups)
+        if policy is not None:
+            result["compiler_coverage"] = policy
+        return result
 
     @classmethod
     def get_kwargs_from_profile(
@@ -127,37 +165,63 @@ class PatternSearch(PopulationBasedSearch):
         }
 
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
+        # Empty registries retain the exact old builder, cache lookup and draws.
+        if not self.config_gen.config_spec.compiler_coverage_groups:
+            return self._generate_initial_population_base()
+        generation = self.config_gen.initial_population_view()
+        population = self._generate_initial_population_base(generation=generation)
+        if (
+            self.initial_population <= 0
+            or not self.config_gen.compiler_coverage_enabled
+        ):
+            return population
+        # This is after every old return, including flash padding/truncation.
+        # There must be no later nominal-population slice.
+        return self._append_compiler_coverage(
+            population,
+            use_cache=self.initial_population_strategy
+            == InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+        )
+
+    def _generate_initial_population_base(
+        self, *, generation: ConfigGeneration | None = None
+    ) -> list[FlatConfig]:
         """
         Generate the initial population of flat configurations based on the strategy.
 
         Returns:
             A list of flat configurations for the initial population.
         """
+        config_gen = self.config_gen if generation is None else generation
         if (
             self.initial_population_strategy
             == InitialPopulationStrategy.FROM_BEST_AVAILABLE
         ):
-            pop = self._generate_best_available_population_flat()
-            if self.config_gen.config_spec.cute_flash_search_enabled:
-                design = self.config_gen.flash_deterministic_population_configs()
+            pop = (
+                self._generate_best_available_population_flat()
+                if generation is None
+                else self._generate_best_available_population_flat(
+                    generation=config_gen
+                )
+            )
+            if config_gen.config_spec.cute_flash_search_enabled:
+                design = config_gen.flash_deterministic_population_configs()
                 population_target = max(0, self.initial_population)
                 budget = min(
                     population_target,
-                    self.config_gen.flash_structural_population_budget(
-                        population_target
-                    ),
+                    config_gen.flash_structural_population_budget(population_target),
                     len(design),
                 )
                 qualification_count = min(
                     budget,
-                    self.config_gen.flash_structural_qualification_prefix_count(),
+                    config_gen.flash_structural_qualification_prefix_count(),
                 )
                 pinned: list[FlatConfig] = []
                 optional: list[FlatConfig] = []
                 pinned_configs = self._pinned_finalist_configs
                 for flat in pop:
                     try:
-                        canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+                        canonical_flat, config = config_gen.canonicalize_flat(flat)
                     except exc.InvalidConfig:
                         continue
                     (pinned if config in pinned_configs else optional).append(
@@ -170,32 +234,30 @@ class PatternSearch(PopulationBasedSearch):
                 # a nominal slot.
                 required = [
                     *(
-                        self.config_gen.flatten(config)
+                        config_gen.flatten(config)
                         for config in design[:qualification_count]
                     ),
                     *pinned,
                     *(
-                        self.config_gen.flatten(config)
+                        config_gen.flatten(config)
                         for config in design[qualification_count:budget]
                     ),
                 ]
                 exact_space = None
                 if population_target > 0:
-                    exact_space = (
-                        self.config_gen.flash_exact_effective_search_space_configs(
-                            population_target
-                        )
+                    exact_space = config_gen.flash_exact_effective_search_space_configs(
+                        population_target
                     )
                     if exact_space is not None:
                         required.extend(
-                            self.config_gen.flatten(config) for config in exact_space
+                            config_gen.flatten(config) for config in exact_space
                         )
                 ordered: list[FlatConfig] = []
                 seen: set[Config] = set()
 
                 def append_unique(flat: FlatConfig) -> None:
                     try:
-                        canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+                        canonical_flat, config = config_gen.canonicalize_flat(flat)
                     except exc.InvalidConfig:
                         return
                     if config in seen:
@@ -214,15 +276,19 @@ class PatternSearch(PopulationBasedSearch):
                             break
                         append_unique(flat)
                 if self.best_available_pad_random and exact_space is None:
+                    if generation is not None:
+                        return self._pad_initial_population_with_unique_random(
+                            ordered, population_target, generation=config_gen
+                        )
                     return self._pad_initial_population_with_unique_random(
                         ordered, population_target
                     )
                 return ordered
             if self.best_available_pad_random:
                 n_random = max(0, self.initial_population - len(pop))
-                pop.extend(self.config_gen.random_flat() for _ in range(n_random))
+                pop.extend(config_gen.random_flat() for _ in range(n_random))
             return pop
-        population = self.config_gen.random_population_flat(
+        population = config_gen.random_population_flat(
             self.initial_population,
             user_seed_configs=self._autotune_seed_configs(),
             log_func=self.log,
@@ -234,17 +300,25 @@ class PatternSearch(PopulationBasedSearch):
         pinned_seed_configs = [
             config
             for _flat, config in (
-                *self.config_gen.user_seed_flat_config_pairs(
-                    self._autotune_seed_configs()
-                ),
-                *self.config_gen.seed_flat_config_pairs(),
+                *config_gen.user_seed_flat_config_pairs(self._autotune_seed_configs()),
+                *config_gen.seed_flat_config_pairs(),
             )
         ]
-        pinned_seed_configs.append(
-            self.config_gen.unflatten(self.config_gen.default_flat())
-        )
+        pinned_seed_configs.append(config_gen.unflatten(config_gen.default_flat()))
         self.pin_finalist_configs(pinned_seed_configs)
-        return population
+        if self.config_gen.config_spec.cute_flash_search_enabled:
+            return population
+        return self._replace_backend_rejected_initial_configs(
+            population, self.initial_population
+        )
+
+    def _random_fallback_population_target(self) -> int | None:
+        return random_fallback_population_target(
+            self.initial_population_strategy,
+            self.best_available_pad_random,
+            self.config_spec,
+            self.initial_population,
+        )
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
@@ -258,7 +332,11 @@ class PatternSearch(PopulationBasedSearch):
             if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
-        self.benchmark_population(self.population, desc="Initial population")
+        self.benchmark_initial_population(
+            self.population,
+            random_fallback_target=self._random_fallback_population_target(),
+            visited=visited,
+        )
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(

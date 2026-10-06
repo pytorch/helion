@@ -252,7 +252,7 @@ def test_sm103_flash_target_policy() -> None:
             "descending",
         ),
         1024: (
-            3,
+            6,
             FlashCausalSeedTemplate.DEGREE2_V1,
             1,
             14,
@@ -265,7 +265,7 @@ def test_sm103_flash_target_policy() -> None:
             "descending",
         ),
         2048: (
-            3,
+            8,
             FlashCausalSeedTemplate.DEGREE2_V1,
             14,
             12,

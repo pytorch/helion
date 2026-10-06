@@ -9,6 +9,7 @@ import torch
 from torch.fx import Node
 
 from ...language.tile_ops import tile_begin
+from ...language.tile_ops import tile_index
 
 if TYPE_CHECKING:
     import ast
@@ -56,6 +57,7 @@ _CUTE_SHAPE_CHAIN_TARGETS = frozenset(
         torch.ops.aten.permute.default,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.squeeze.dim,
+        torch.ops.aten.clone.default,
     }
 )
 
@@ -115,6 +117,52 @@ def is_cute_unit_stride_iota_index(node: object) -> bool:
             or (is_scalar(lhs) and is_cute_unit_stride_iota_index(rhs))
         )
     return is_cute_unit_stride_iota_index(lhs) and is_scalar(rhs)
+
+
+def match_cute_shifted_tile_index(
+    node: object,
+) -> tuple[Node, tuple[int | torch.SymInt, ...]] | None:
+    """Match ``tile.index`` shifted by scalars: ``(tile_index node, shifts)``.
+
+    ``tile.index - c`` reaches indexing as ``sub(tile_index(block), c)``; its
+    lane coordinate is the block's own index shifted by the sum of the
+    returned terms (added scalars, negated subtracted scalars; empty for a
+    bare ``tile.index``).  ``None`` for anything else, including ``alpha != 1``
+    scaled adds and shifts by tensors.
+    """
+    terms: list[int | torch.SymInt] = []
+
+    def scalar(value: object) -> int | torch.SymInt | None:
+        if isinstance(value, Node):
+            value = value.meta.get("val")
+        return value if isinstance(value, (int, torch.SymInt)) else None
+
+    current = node
+    while True:
+        if not isinstance(current, Node) or current.op != "call_function":
+            return None
+        if current.target is tile_index:
+            return current, tuple(terms)
+        if current.kwargs.get("alpha", 1) != 1 or len(current.args) < 2:
+            return None
+        lhs, rhs = current.args[:2]
+        if current.target in (operator.sub, torch.ops.aten.sub.Tensor):
+            shift = scalar(rhs)
+            if shift is None:
+                return None
+            terms.append(-shift)
+            current = lhs
+        elif current.target in (operator.add, torch.ops.aten.add.Tensor):
+            if (shift := scalar(rhs)) is not None:
+                terms.append(shift)
+                current = lhs
+            elif (shift := scalar(lhs)) is not None:
+                terms.append(shift)
+                current = rhs
+            else:
+                return None
+        else:
+            return None
 
 
 def _match_constant_multiple(value: object) -> tuple[object, int]:
