@@ -1587,6 +1587,7 @@ class CuteBackend(Backend):
                 "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
+                "cute_fragment_register_producers",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
                 "cute_fragment_atomic_consumer_fusion",

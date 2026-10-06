@@ -1956,6 +1956,13 @@ class DeviceFunction:
                         {k: v[0] for k, v in self._variable_renames.items()},
                         self.new_var,
                     )
+            if self.config.get("cute_fragment_register_producers", False):
+                for request in self.cute_state.register_producer_requests:
+                    request.lower(
+                        definition.body,
+                        {k: v[0] for k, v in self._variable_renames.items()},
+                        self.new_var,
+                    )
             validate_thread_axis_accesses([*prefix, definition])
         result = [*prefix, definition]
         if (

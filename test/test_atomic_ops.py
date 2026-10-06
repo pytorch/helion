@@ -2320,7 +2320,14 @@ def _simulate_register_load_program(
         ),
         "cute": SimpleNamespace(
             make_rmem_tensor=lambda shape, dtype: Registers(shape[0], dtype),
-            math=SimpleNamespace(min=np.minimum, max=np.maximum),
+            math=SimpleNamespace(
+                min=lambda a, b, *, propagate_nan=True: (
+                    np.minimum(a, b) if propagate_nan else np.fmin(a, b)
+                ),
+                max=lambda a, b, *, propagate_nan=True: (
+                    np.maximum(a, b) if propagate_nan else np.fmax(a, b)
+                ),
+            ),
             make_layout=lambda shape: shape,
             arch=SimpleNamespace(
                 thread_idx=lambda: (state["lane"], 0, 0),
@@ -8627,6 +8634,9 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
             patch(
                 "helion._compiler.autotuner_heuristics.register_fragment_packet_loads_coverage"
             ),
+            patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_register_producers_coverage"
+            ),
         ):
             bound = _cpu_bind(kernel, args)
             default = bound.config_spec.default_config()
@@ -10340,3 +10350,608 @@ class TestFragmentSkipZeroAtomicsNative(TestCase):
             torch.testing.assert_close(
                 actual, torch.full_like(actual, value), rtol=0, atol=0
             )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_computed_register_producer(x):
+    out = torch.empty_like(x, dtype=torch.int32)
+    counts = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    other_counts = torch.empty_like(counts)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))
+        values = hl.load(x, [row, lane])
+        scaled = ((values + 3) * 2 - 1) / 3
+        bucket = ((torch.clamp(scaled, min=-8, max=8) + 8) * 3).to(torch.int32) % 17
+        first = hl.zeros([17], dtype=torch.int32)
+        second = hl.zeros([17], dtype=torch.int32)
+        hl.atomic_add(first, [bucket], 1)
+        hl.atomic_add(second, [bucket], 2)
+        counts[row, :] = first
+        other_counts[row, :] = second
+        hl.store(out, [row, lane], bucket)
+    return out, counts, other_counts
+
+
+class TestFragmentRegisterProducerCPU(unittest.TestCase):
+    def test_coordinate_guarded_first_use_and_later_domain(self):
+        import ast
+        from itertools import count
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        from helion._compiler.cute.register_producers import cache_register_producers
+
+        def program(first=33, second=33):
+            return f"""
+snapshot = cute.make_rmem_tensor((2,), cutlass.Float32)
+snapshot.fill(cutlass.Float32(float('nan')))
+for load_slot in cutlass.range_constexpr(2):
+    load_index = tid + load_slot * 32
+    if load_index < {max(first, second)}:
+        snapshot[load_slot] = cutlass.Float32(load_index)
+    else:
+        pass
+for first_slot in cutlass.range_constexpr(2):
+    first_index = tid + first_slot * 32
+    if first_index < 64:
+        first_domain = first_index // 1 % 64 < 64
+        first_lower = first_domain and 0 <= first_index // 1 % 64
+        first_active = first_lower and first_index // 1 % 64 < {first}
+        if first_active:
+            first = cutlass.Int64((((((snapshot[first_slot] + 1) * 3 - 2) * 5 + 7) - 4) * 2))
+            consumer(first_index, first)
+        else:
+            pass
+    else:
+        pass
+for second_slot in cutlass.range_constexpr(2):
+    second_index = tid + second_slot * 32
+    if second_index < 64:
+        second_domain = second_index // 1 % 64 < {second}
+        if second_domain:
+            second = cutlass.Int64((((((snapshot[second_slot] + 1) * 3 - 2) * 5 + 7) - 4) * 2))
+            consumer(second_index, second)
+        else:
+            pass
+    else:
+        pass
+"""
+
+        def lower(text):
+            body = ast.parse(text).body
+            names = count()
+            changed = cache_register_producers(
+                body, set(), {"snapshot": 64}, "tid", 32, lambda p: f"{p}_{next(names)}"
+            )
+            return changed, ast.unparse(
+                ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+            )
+
+        cases = [(program(a, b), a + b) for a, b in ((17, 17), (33, 33), (64, 33))]
+        # Cache the two narrower consumers while leaving the wider third use
+        # unchanged, including coordinates not initialized by the first use.
+        wider = program(17, 33)
+        statements = ast.parse(wider).body
+        middle = ast.parse(ast.unparse(statements[-2]).replace("first", "middle")).body[
+            0
+        ]
+        statements.insert(-1, middle)
+        cases.append((ast.unparse(ast.Module(body=statements, type_ignores=[])), 67))
+        for original, event_count in cases:
+            with self.subTest(source=original):
+                changed, cached = lower(original)
+                self.assertEqual(changed, 1)
+                observations = []
+                for text in (original, cached):
+                    events = []
+                    for tid in reversed(range(32)):
+                        scope = {
+                            "tid": tid,
+                            "consumer": lambda i, x, events=events: events.append(
+                                (i, type(x), x.tobytes())
+                            ),
+                            "cute": SimpleNamespace(
+                                make_rmem_tensor=lambda shape, dtype: np.empty(
+                                    shape, dtype=dtype
+                                )
+                            ),
+                            "cutlass": SimpleNamespace(
+                                Int64=np.int64,
+                                Float32=np.float32,
+                                range_constexpr=range,
+                            ),
+                        }
+                        exec(text, scope)
+                    observations.append(events)
+                self.assertEqual(*observations)
+                self.assertEqual(len(observations[0]), event_count)
+        original = program()
+        for text in (
+            program(17, 33),
+            original.replace("if first_active:", "if first_active and lane_mask:"),
+            original.replace("if first_active:", "if first_active or lane_mask:"),
+            original.replace("first_index // 1 % 64", "first_index // 1 % 32"),
+            original.replace(
+                "first_lower = first_domain", "first_lower = external_mask"
+            ),
+            original.replace("first_index // 1 % 64 < 33", "first_index // 1 % 64 < 0"),
+            original.replace(
+                "snapshot[second_slot]", "snapshot[(second_slot + 1) % 2]"
+            ),
+        ):
+            with self.subTest(source=text):
+                changed, output = lower(text)
+                self.assertEqual(changed, 0)
+                self.assertEqual(ast.dump(ast.parse(text)), ast.dump(ast.parse(output)))
+
+    def test_ordinary_histogram_consumers_tails_and_unchanged_effects(self):
+        import ast
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        for width, threads in ((17, 32), (65, 32), (129, 128)):
+            with self.subTest(width=width, threads=threads):
+                x = (torch.arange(2 * width).reshape(2, width).float() % 19) - 9
+                sources = []
+                with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                    bound = _cpu_bind(_fragment_computed_register_producer, (x,))
+                    for enabled in (False, True):
+                        config = bound.config_spec.default_config()
+                        config.config.update(
+                            cute_fragment_threads=threads,
+                            cute_fragment_register_snapshots=True,
+                            cute_fragment_register_producers=enabled,
+                        )
+                        sources.append(bound.to_code(config))
+                self.assertNotIn("fragment_register_producer =", sources[0])
+                self.assertIn("fragment_register_producer =", sources[1])
+                observations = []
+                for source in sources:
+                    out = torch.full_like(x, -99, dtype=torch.int32)
+                    counts = torch.zeros((2, 17), dtype=torch.int32)
+                    other = torch.zeros_like(counts)
+                    events = []
+                    _, barriers = _simulate_register_load_program(
+                        source,
+                        x,
+                        threads,
+                        host_tensors={
+                            "out": out,
+                            "counts": counts,
+                            "other_counts": other,
+                        },
+                        lane_order=list(reversed(range(threads))),
+                        atomic_events=events,
+                    )
+                    observations.append(
+                        (out.clone(), counts.clone(), other.clone(), events, barriers)
+                    )
+                for a, b in zip(observations[0][:3], observations[1][:3], strict=True):
+                    torch.testing.assert_close(a, b, rtol=0, atol=0)
+                self.assertEqual(observations[0][3:], observations[1][3:])
+                expected = (
+                    (torch.clamp(((x + 3) * 2 - 1) / 3, -8, 8) + 8) * 3
+                ).int() % 17
+                torch.testing.assert_close(observations[1][0], expected, rtol=0, atol=0)
+                expected_counts = torch.zeros((2, 17), dtype=torch.int32)
+                expected_counts.scatter_add_(
+                    1, expected.long(), torch.ones_like(expected)
+                )
+                torch.testing.assert_close(
+                    observations[1][1], expected_counts, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    observations[1][2], expected_counts * 2, rtol=0, atol=0
+                )
+                for source in sources:
+                    self.assertEqual(
+                        sum(
+                            isinstance(n, ast.Call)
+                            and isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "atomic_add"
+                            for n in ast.walk(ast.parse(source))
+                        ),
+                        2,
+                    )
+
+    def test_physical_epoch_owner_and_typed_storage_controls(self):
+        import ast
+        from itertools import count
+
+        from helion._compiler.cute.register_producers import cache_register_producers
+
+        def program(dtype="Int32", size=65):
+            slots = (size + 31) // 32
+            return f"""
+snapshot = cute.make_rmem_tensor(({slots},), cutlass.Float32)
+snapshot.fill(cutlass.Float32(0))
+for load_slot in cutlass.range_constexpr({slots}):
+    load_index = tid + load_slot * 32
+    if load_index < {size}:
+        snapshot[load_slot] = cutlass.Float32(load_index)
+    else:
+        pass
+for first_slot in cutlass.range_constexpr({slots}):
+    first_index = tid + first_slot * 32
+    if first_index < {size}:
+        first = cutlass.{dtype}(((((snapshot[first_slot] + 1) * 3 - 2) * 5 + 7) - 4) * 2)
+        consumer(first)
+    else:
+        pass
+unrelated_atomic(counter)
+for second_slot in cutlass.range_constexpr({slots}):
+    second_index = tid + second_slot * 32
+    if second_index < {size}:
+        second = cutlass.{dtype}(((((snapshot[second_slot] + 1) * 3 - 2) * 5 + 7) - 4) * 2)
+        consumer(second)
+    else:
+        pass
+"""
+
+        def transform(text, size=65):
+            body = ast.parse(text).body
+            names = count()
+            changed = cache_register_producers(
+                body,
+                set(),
+                {"snapshot": size},
+                "tid",
+                32,
+                lambda prefix: f"{prefix}_{next(names)}",
+            )
+            return changed, ast.unparse(
+                ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+            )
+
+        for dtype in ("Int32", "Int64", "Float32"):
+            changed, output = transform(program(dtype))
+            self.assertEqual(changed, 1)
+            self.assertIn(f"cute.make_rmem_tensor((3,), cutlass.{dtype})", output)
+            from types import SimpleNamespace
+
+            import numpy as np
+
+            # Execute both physical per-thread programs. In particular, the
+            # Int64 result must not inherit the Float32 input's storage type.
+            records = []
+            for text in (program(dtype), output):
+                values = []
+                for tid in reversed(range(32)):
+                    scope = {
+                        "tid": tid,
+                        "counter": object(),
+                        "consumer": lambda x, values=values: values.append(
+                            (type(x), x.tobytes())
+                        ),
+                        "unrelated_atomic": lambda counter: None,
+                        "cute": SimpleNamespace(
+                            make_rmem_tensor=lambda shape, dtype: np.empty(
+                                shape, dtype=dtype
+                            )
+                        ),
+                        "cutlass": SimpleNamespace(
+                            Int32=np.int32,
+                            Int64=np.int64,
+                            Float32=np.float32,
+                            range_constexpr=range,
+                        ),
+                    }
+                    exec(text, scope)
+                records.append(values)
+            self.assertEqual(*records)
+        original = program()
+        for text in (
+            original.replace(
+                "snapshot[second_slot]", "snapshot[(second_slot + 1) % 3]"
+            ),
+            original.replace(
+                "unrelated_atomic(counter)", "snapshot[0] = cutlass.Float32(3)"
+            ),
+            original.replace("unrelated_atomic(counter)", "alias = snapshot"),
+            original.replace(
+                "unrelated_atomic(counter)",
+                "snapshot = cute.make_rmem_tensor((3,), cutlass.Float32)",
+            ),
+            original.replace("unrelated_atomic(counter)", "unknown(snapshot)"),
+            original.replace("second_slot * 32", "second_slot * 64"),
+            program(size=1025),
+        ):
+            with self.subTest(source=text):
+                changed, output = transform(text, 1025 if "1025" in text else 65)
+                self.assertEqual(changed, 0)
+                self.assertEqual(ast.dump(ast.parse(text)), ast.dump(ast.parse(output)))
+
+    def test_first_use_dominance_and_physical_allocations(self):
+        import ast
+        from itertools import count
+
+        from helion._compiler.cute.register_producers import RegisterProducerRequest
+        from helion._compiler.cute.register_producers import cache_register_producers
+
+        prefix = ast.parse("""
+arena = cutlass.utils.SmemAllocator()
+left = arena.allocate_tensor(cutlass.Int32, cute.make_layout((1,)), byte_alignment=16)
+right = arena.allocate_tensor(cutlass.Int32, cute.make_layout((1,)), byte_alignment=16)
+""").body
+        self.assertTrue(
+            RegisterProducerRequest.independent_allocations(prefix, {"left", "right"})
+        )
+        original = ast.unparse(ast.Module(body=prefix, type_ignores=[]))
+        for text in (
+            original.replace(
+                "right = arena.allocate_tensor", "right = alias.allocate_tensor"
+            ),
+            original + "\nalias = arena",
+            original + "\narena.reset()",
+            original + "\nleft = right",
+            original.replace(
+                "right = arena.allocate_tensor(cutlass.Int32, cute.make_layout((1,)), byte_alignment=16)",
+                "right = cute.make_tensor(left.iterator, cute.make_layout((1,)))",
+            ),
+        ):
+            with self.subTest(source=text):
+                self.assertFalse(
+                    RegisterProducerRequest.independent_allocations(
+                        ast.parse(text).body, {"left", "right"}
+                    )
+                )
+
+        text = """
+snapshot = cute.make_rmem_tensor((1,), cutlass.Float32)
+snapshot.fill(cutlass.Float32(2))
+for first_slot in cutlass.range_constexpr(1):
+    first_index = tid + first_slot * 32
+    if first_index < 17:
+        first = cutlass.Int64((((((snapshot[first_slot] + 1) * 3 - 2) * 5 + 7) - 4) * 2))
+        consumer(first)
+    else:
+        pass
+for second_slot in cutlass.range_constexpr(1):
+    second_index = tid + second_slot * 32
+    if second_index < 17:
+        second = cutlass.Int64((((((snapshot[second_slot] + 1) * 3 - 2) * 5 + 7) - 4) * 2))
+        consumer(second)
+    else:
+        pass
+"""
+
+        def lower(body):
+            names = count()
+            return cache_register_producers(
+                body, set(), {"snapshot": 17}, "tid", 32, lambda p: f"{p}_{next(names)}"
+            )
+
+        body = ast.parse(text).body
+        self.assertEqual(lower(body), 1)
+        self.assertIn(
+            "cute.make_rmem_tensor((1,), cutlass.Int64)",
+            ast.unparse(ast.Module(body=body, type_ignores=[])),
+        )
+        # Conditional later consumers may use a dominated cache. Conditional
+        # first uses, lane-local first masks and hidden captures may not seed it.
+        body = ast.parse(text).body
+        body[-1:] = [
+            ast.If(
+                test=ast.Name(id="branch", ctx=ast.Load()), body=[body[-1]], orelse=[]
+            )
+        ]
+        self.assertEqual(lower(body), 1)
+        for mode in (
+            "first_branch",
+            "first_mask",
+            "capture",
+            "different_dtype",
+            "empty",
+        ):
+            body = ast.parse(text).body
+            if mode == "first_branch":
+                body[2:3] = [
+                    ast.If(
+                        test=ast.Name(id="branch", ctx=ast.Load()),
+                        body=[body[2]],
+                        orelse=[],
+                    )
+                ]
+            elif mode == "first_mask":
+                owner = body[2].body[1]
+                owner.body[:] = [
+                    ast.If(
+                        test=ast.Name(id="mask", ctx=ast.Load()),
+                        body=owner.body[:],
+                        orelse=[],
+                    )
+                ]
+            elif mode == "capture":
+                body += ast.parse("def escaped():\n    return snapshot[0]").body
+            elif mode == "different_dtype":
+                body = ast.parse(
+                    text.replace("second = cutlass.Int64", "second = cutlass.Int32")
+                ).body
+            else:
+                body = ast.parse(text.replace("< 17", "< 0")).body
+            before = ast.dump(ast.Module(body=body, type_ignores=[]))
+            self.assertEqual(lower(body), 0, mode)
+            self.assertEqual(ast.dump(ast.Module(body=body, type_ignores=[])), before)
+
+    def test_final_shared_epoch_and_unknown_alias_rejection(self):
+        import ast
+        from itertools import count
+
+        from helion._compiler.cute.register_producers import cache_register_producers
+
+        text = """
+snapshot = cute.make_rmem_tensor((2,), cutlass.Float32)
+snapshot.fill(cutlass.Float32(2))
+for writer in range(tid, 1, 32):
+    scale[0] = cutlass.Float32(3)
+cute.arch.sync_threads()
+for a in cutlass.range_constexpr(2):
+    i = tid + a * 32
+    if i < 65:
+        first = cutlass.Int64((((((snapshot[a] + scale[0]) * 3 - 2) * 5 + 7) - 4) * 2))
+        consumer(first)
+    else:
+        pass
+unrelated_atomic(counter)
+for b in cutlass.range_constexpr(2):
+    j = tid + b * 32
+    if j < 65:
+        second = cutlass.Int64((((((snapshot[b] + scale[0]) * 3 - 2) * 5 + 7) - 4) * 2))
+        consumer(second)
+    else:
+        pass
+""".replace("(2,)", "(3,)").replace("range_constexpr(2)", "range_constexpr(3)")
+
+        def lower(source):
+            body = ast.parse(source).body
+            names = count()
+            return cache_register_producers(
+                body,
+                {"scale"},
+                {"snapshot": 65},
+                "tid",
+                32,
+                lambda p: f"{p}_{next(names)}",
+            )
+
+        self.assertEqual(lower(text), 1)
+        for statement in (
+            "scale[0] = cutlass.Float32(9)",
+            "alias = scale",
+            "alias = cute.make_tensor(scale.iterator, cute.make_layout((1,)))",
+            "unknown(scale)",
+            "scale[1] = cutlass.Float32(9)",
+        ):
+            with self.subTest(statement=statement):
+                self.assertEqual(
+                    lower(text.replace("unrelated_atomic(counter)", statement)), 0
+                )
+        self.assertEqual(lower(text.replace("cute.arch.sync_threads()", "pass")), 0)
+
+    def test_default_strict_controls_and_ordered_population(self):
+        from copy import deepcopy
+        import random
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion._compiler import autotuner_heuristics
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        key = "cute_fragment_register_producers"
+        args = (torch.ones((2, 65)),)
+
+        def capture(enabled):
+            with patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_register_producers_coverage",
+                wraps=autotuner_heuristics.register_fragment_register_producers_coverage
+                if enabled
+                else None,
+            ) as hook:
+                if not enabled:
+                    hook.return_value = None
+                bound = _cpu_bind(
+                    helion.kernel(
+                        _fragment_computed_register_producer.fn,
+                        backend="cute",
+                        static_shapes=True,
+                        autotune_effort="full",
+                    ),
+                    args,
+                )
+                spec = bound.config_spec
+                default = spec.default_config()
+                self.assertNotIn(key, default)
+                self.assertTrue(all(key not in c for c in spec.compiler_seed_configs))
+                off = deepcopy(default)
+                off.config[key] = False
+                self.assertEqual(bound.to_code(default), bound.to_code(off))
+                for value in (1, "cache", None):
+                    invalid = deepcopy(default)
+                    invalid.config[key] = value
+                    with self.assertRaises(helion.exc.InvalidConfig):
+                        bound.to_code(invalid)
+                records = []
+                for seed in (0, 107):
+                    for strategy in (
+                        InitialPopulationStrategy.FROM_RANDOM,
+                        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                    ):
+                        random.seed(seed)
+                        with bound.env:
+                            search = PatternSearch(
+                                bound,
+                                args,
+                                initial_population=100,
+                                initial_population_strategy=strategy,
+                            )
+                            rows = [
+                                dict(search.config_gen.canonicalize_flat(row)[1])
+                                for row in checked_initial_population(search)
+                            ]
+                        records.append((rows, random.getstate()))
+                if enabled:
+                    group = spec.compiler_coverage_groups[-1]
+                    self.assertEqual(group.key, key)
+                    self.assertTrue(group.deferred)
+                    self.assertFalse(group.legacy)
+                    requested = group.witnesses[0].carrier
+                    requested.config[key] = True
+                    self.assertIn(
+                        "fragment_register_producer =", bound.to_code(requested)
+                    )
+                    for changes in (
+                        {"cute_fragment_register_snapshots": False},
+                        {"cute_fragment_threads": 1},
+                        {"cute_fragment_collective_mma": True},
+                    ):
+                        bad = deepcopy(requested)
+                        bad.config.update(changes)
+                        with self.assertRaises(helion.exc.InvalidConfig):
+                            bound.to_code(bad)
+                return records
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            before, after = capture(False), capture(True)
+        for (old_rows, old_rng), (new_rows, new_rng) in zip(before, after, strict=True):
+            self.assertEqual(old_rows, new_rows[: len(old_rows)])
+            self.assertEqual(old_rng, new_rng)
+            self.assertTrue(
+                any(row.get(key) is True for row in new_rows[len(old_rows) :])
+            )
+
+
+@onlyBackends("cute")
+class TestFragmentRegisterProducerNative(TestCase):
+    def test_independent_histograms_and_exact_indices(self):
+        for width, threads in ((17, 32), (65, 32), (129, 128)):
+            x = (
+                torch.arange(2 * width, device=DEVICE).reshape(2, width).float() % 19
+            ) - 9
+            expected = ((torch.clamp(((x + 3) * 2 - 1) / 3, -8, 8) + 8) * 3).int() % 17
+            counts = torch.zeros((2, 17), dtype=torch.int32, device=DEVICE)
+            counts.scatter_add_(1, expected.long(), torch.ones_like(expected))
+            before = x.clone()
+            for enabled in (False, True):
+                with self.subTest(width=width, threads=threads, enabled=enabled):
+                    _, actual = code_and_output(
+                        _fragment_computed_register_producer,
+                        (x,),
+                        cute_fragment_threads=threads,
+                        cute_fragment_register_snapshots=True,
+                        cute_fragment_register_producers=enabled,
+                    )
+                    for value, reference in zip(
+                        actual, (expected, counts, counts * 2), strict=True
+                    ):
+                        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
