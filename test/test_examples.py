@@ -2864,6 +2864,87 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
+    def _flex_attention_block_mask_cases(self):
+        """Run the example with multi-block causal and 2D-neighborhood BlockMasks.
+
+        Yields ``(out, lse, expected, expected_lse)`` per mask, the references
+        computed from the dense mask.
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+        from torch.nn.attention.flex_attention import create_mask
+
+        z, h, n_ctx, head_dim = 2, 2, 512, 64
+        q, k, v = [
+            torch.randn((z, h, n_ctx, head_dim), dtype=HALF_DTYPE, device=DEVICE)
+            for _ in range(3)
+        ]
+
+        def causal(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        def neighborhood(b, h, q_idx, kv_idx):
+            # 2D 32x16 canvas, 5x5 window: leaves fully masked rows in partial blocks
+            q_x, q_y = q_idx // 16, q_idx % 16
+            kv_x, kv_y = kv_idx // 16, kv_idx % 16
+            return ((q_x - kv_x).abs() <= 2) & ((q_y - kv_y).abs() <= 2)
+
+        mod = import_path(EXAMPLES_DIR / "flex_attention.py")
+        config = helion.Config(block_sizes=[64, 64])
+        original_configs = mod.helion_flex_attention_kernel.configs
+        self.addCleanup(
+            setattr, mod.helion_flex_attention_kernel, "configs", original_configs
+        )
+        mod.helion_flex_attention_kernel.configs = [config]
+        for mask_mod in (causal, neighborhood):
+            block_mask = create_block_mask(mask_mod, z, h, n_ctx, n_ctx, device=DEVICE)
+            visited = block_mask.kv_num_blocks + block_mask.full_kv_num_blocks
+            self.assertGreater(visited.max().item(), 1)
+            out, lse = mod.helion_flex_attention(
+                q, k, v, block_mask=block_mask, return_lse=True
+            )
+            dense = create_mask(mask_mod, z, h, n_ctx, n_ctx, device=DEVICE)
+            expected = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=dense
+            )
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(
+                head_dim
+            )
+            expected_lse = torch.logsumexp(
+                scores.masked_fill(~dense, float("-inf")), dim=-1
+            )
+            yield out, lse, expected, expected_lse
+
+    @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    def test_flex_attention_block_mask(self):
+        """Multi-block BlockMasks: kv_indices are block ids, masks broadcast over kv,
+        and partially masked rows must not produce NaN."""
+        for (
+            out,
+            _lse,
+            expected,
+            _expected_lse,
+        ) in self._flex_attention_block_mask_cases():
+            self.assertFalse(torch.isnan(out).any().item())
+            torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @xfailIfPallas(
+        "the (B, H, M) lse is stored one head per grid step, but H is the sublane "
+        "dim of its TPU block and a block of 1 head is not expressible, so the "
+        "Pallas backend keeps the whole H extent in the block and each step "
+        "leaves the other heads' rows undefined"
+    )
+    def test_flex_attention_block_mask_lse(self):
+        """The LSE matches torch.logsumexp over the dense mask (natural log; -inf for
+        rows with no visible key)."""
+        for (
+            _out,
+            lse,
+            _expected,
+            expected_lse,
+        ) in self._flex_attention_block_mask_cases():
+            torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
