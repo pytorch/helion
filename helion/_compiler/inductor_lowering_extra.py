@@ -7,9 +7,13 @@ from typing import Any
 from typing import Callable
 from typing import Generator
 
+import sympy
 import torch
+from torch._inductor import ir
 from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import to_dtype
+
+from .. import exc
 
 inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
 
@@ -175,6 +179,97 @@ def var_mean_helper_(
     output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
     # pyrefly: ignore [bad-return]
     return output[0] if not return_mean else output
+
+
+_JAGGED_MEAN_UNSUPPORTED = (
+    "a mean over the jagged tile dim is not supported: each row of the "
+    "parent tile holds its own number of elements, so there is no one "
+    "count to divide by; divide the sum by the row's length instead"
+)
+
+
+def _reduced_dim_extent(size: sympy.Expr) -> sympy.Expr:
+    """The elements a mean over a dim of ``size`` divides by.
+
+    A dim sized by the block of an ``hl.tile`` loop may hold fewer elements
+    than the block: a block wider than the dim, or the last tile of a dim
+    the block does not divide.  The masked elements are already out of the
+    sum, so the mean divides by the tile's extent (``tile.end -
+    tile.begin``, rendered as the block size where no mask is needed; see
+    :class:`~helion._compiler.variable_origin.TileExtentOrigin`) instead of
+    the block.  A reduction dim is its full size and is not changed here.
+    A jagged tile dim has a per-row extent (each row of the parent tile
+    holds its own number of elements) that no scalar divisor expresses, so
+    a mean over it is rejected rather than divided by the block, whether the
+    size is the block itself or derived from it (``torch.cat([v, v], dim=1)``
+    along the jagged dim sizes its dim ``2 * block``).  The tile cannot be
+    flattened into a sibling loop afterwards, as for ``tile.end``.
+    """
+    from ..language.tile_ops import _disable_flatten_get_tile
+    from .compile_environment import CompileEnvironment
+    from .host_function import HostFunction
+    from .host_function import SymbolOrigin
+    from .variable_origin import TileExtentOrigin
+
+    env = CompileEnvironment.current()
+    if not isinstance(size, sympy.Symbol):
+        if any(
+            (block_id := env.get_block_id(symbol)) is not None
+            and env.is_jagged_tile(block_id)
+            for symbol in size.free_symbols
+        ):
+            raise exc.InvalidJaggedTileUsage(_JAGGED_MEAN_UNSUPPORTED)
+        return size
+    block_id = env.get_block_id(size)
+    if block_id is None:
+        return size
+    info = env.block_sizes[block_id]
+    if info.reduction or info.var._sympy_() != size:  # pyrefly: ignore [missing-attribute]
+        return size
+    if env.is_jagged_tile(block_id):
+        raise exc.InvalidJaggedTileUsage(_JAGGED_MEAN_UNSUPPORTED)
+    extent = env.cached_create_unbacked_symint(("tile_extent", info.var))._sympy_()
+    assert isinstance(extent, sympy.Symbol)
+    HostFunction.current().expr_to_origin[extent] = SymbolOrigin(
+        TileExtentOrigin(block_id)
+    )
+    _disable_flatten_get_tile(info.var)
+    return extent
+
+
+@register_inductor_lowering(
+    # The overloads Helion traces, spelled out: a packet registers only
+    # itself when inductor's own table already lists its overloads.
+    [torch.ops.aten.mean.dim, torch.ops.aten.mean.default],
+    lowering_dict=inductor_lowering_dispatch,
+)
+def mean(
+    x: TensorBox,
+    axis: list[int] | int | None = None,
+    keepdim: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> TensorBox:
+    """Inductor's ``mean`` with the divisor of a tile dim being the tile's extent."""
+    from torch._inductor.lowering import _validate_reduction_axis
+    from torch._inductor.lowering import div
+    from torch._inductor.lowering import sum_
+
+    if dtype is not None:
+        x = to_dtype(x, dtype)
+    size = x.get_size()
+    axis = _validate_reduction_axis(x, axis)
+    # Computed in higher precision until the end of the lowering, as inductor does.
+    output_dtype = x.get_dtype()
+    if output_dtype in (torch.float16, torch.bfloat16):
+        x = to_dtype(x, torch.float)
+    sum_result = sum_(x, axis, keepdim)
+    denom = sympy.Mul(*[_reduced_dim_extent(size[i]) for i in axis])
+    device = x.get_device()
+    assert device is not None
+    denom_box = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=device)
+    expanded = ir.ExpandView.create(denom_box, list(sum_result.get_size()))
+    return to_dtype(div(sum_result, expanded), output_dtype)
 
 
 @register_inductor_lowering(

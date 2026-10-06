@@ -307,6 +307,40 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = x.float() - 1.0
         torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
 
+    @skipIfRefEager("block sizes are not applied in ref mode: no tile is padded")
+    def test_mean_over_a_padded_tile_divides_by_the_tiles_elements(self):
+        """A block wider than the dim, or the last tile of a dim the block does not divide, holds fewer elements than the block; the masked ones are out of the sum and must not count in the mean's divisor."""
+
+        def tile_means_summed(x: torch.Tensor) -> torch.Tensor:
+            b, m = x.size()
+            out = torch.empty([b], dtype=x.dtype, device=x.device)
+            for tile_b in hl.tile(b):
+                acc = hl.zeros([tile_b], dtype=x.dtype)
+                for tile_m in hl.tile(m):
+                    acc = acc + x[tile_b, tile_m].mean(dim=1)
+                out[tile_b] = acc
+            return out
+
+        x = torch.randn([4, 100], device=DEVICE)
+        for static_shapes in (True, False):
+            kernel = helion.kernel(
+                tile_means_summed, autotune_effort="none", static_shapes=static_shapes
+            )
+            _code, output = code_and_output(kernel, (x,), block_sizes=[1, 128])
+            torch.testing.assert_close(output, x.mean(dim=1), rtol=1e-4, atol=1e-4)
+            # A backend may widen the block (Pallas tiles the lane dim by 128):
+            # the expected per-tile means follow the block the kernel ran with.
+            config = kernel.bind((x,))._normalized_config_copy(
+                helion.Config(block_sizes=[1, 32])
+            )
+            width = config.block_sizes[1]
+            tile_means = sum(
+                x[:, start : start + width].mean(dim=1)
+                for start in range(0, 100, width)
+            )
+            _code, output = code_and_output(kernel, (x,), block_sizes=[1, 32])
+            torch.testing.assert_close(output, tile_means, rtol=1e-4, atol=1e-4)
+
     @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):
