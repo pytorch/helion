@@ -23,6 +23,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
@@ -1440,6 +1441,630 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = x.sum(1)
         _code, out = code_and_output(mid_axis_reduce, (x,))
         torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
+
+
+def _integer_loop_kernel():
+    @helion.kernel(backend="cute", autotune_effort="none")
+    def kernel(
+        x: torch.Tensor,
+        scratch: torch.Tensor,
+        minimum: hl.constexpr,
+        early: hl.constexpr,
+        carry_input: hl.constexpr,
+        side_effect: hl.constexpr,
+        identity: hl.constexpr,
+        begin: hl.constexpr,
+        extra_mask: hl.constexpr,
+        preserve_alias: hl.constexpr,
+    ):
+        rows, width = x.shape
+        out = torch.empty((rows,), dtype=x.dtype, device=x.device)
+        for row in hl.tile(rows):
+            best = hl.full([row], identity, dtype=x.dtype)
+            initial = best
+            for col in hl.tile(begin, width):
+                value = x[row, col]
+                if extra_mask:
+                    value = torch.where(col.index[None, :] % 3 == 1, identity, value)
+                if carry_input:
+                    value = torch.maximum(value, best[:, None])
+                if minimum:
+                    reduced = value.amin(-1)
+                    best = torch.minimum(best, reduced)
+                else:
+                    reduced = value.amax(-1)
+                    best = torch.maximum(best, reduced)
+                if early:
+                    scratch[row] = reduced
+                if side_effect:
+                    scratch[row] = best
+            out[row] = best
+            if preserve_alias:
+                scratch[row] = initial
+        return out
+
+    return kernel
+
+
+def _integer_loop_code(x, *, minimum=False, threads=128, enabled=True, **kw):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    kernel = _integer_loop_kernel()
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch("torch.cuda.current_device", return_value=0),
+        patch(
+            "torch.cuda.get_device_properties",
+            return_value=SimpleNamespace(
+                shared_memory_per_block_optin=232448, shared_memory_per_block=49152
+            ),
+        ),
+    ):
+        bound = _cpu_bind(
+            kernel,
+            (
+                x,
+                torch.zeros(x.shape[0], dtype=x.dtype),
+                minimum,
+                kw.get("early", False),
+                kw.get("carry_input", False),
+                kw.get("side_effect", False),
+                (torch.iinfo(x.dtype).max if minimum else torch.iinfo(x.dtype).min)
+                if not x.is_floating_point()
+                else (float("inf") if minimum else -float("inf")),
+                kw.get("begin", 0),
+                kw.get("extra_mask", False),
+                kw.get("preserve_alias", False),
+            ),
+        )
+        config = {"block_sizes": [1, threads], "num_threads": [1, threads]}
+        config.update(kw.get("config_override", {}))
+        if enabled:
+            config["cute_integer_loop_reduction"] = True
+        return bound, bound.to_code(helion.Config(**config))
+
+
+class TestIntegerLoopReductionCPU(unittest.TestCase):
+    def test_integer_loop_collective_placement(self):
+        import ast
+
+        for dtype in (torch.int32, torch.int64):
+            for minimum in (False, True):
+                with self.subTest(dtype=dtype, minimum=minimum):
+                    _, old = _integer_loop_code(
+                        torch.zeros((3, 513), dtype=dtype),
+                        minimum=minimum,
+                        enabled=False,
+                    )
+                    _, new = _integer_loop_code(
+                        torch.zeros((3, 513), dtype=dtype), minimum=minimum
+                    )
+                    self.assertNotEqual(old, new)
+
+                    def collective_depth(code):
+                        fn = next(
+                            n
+                            for n in ast.parse(code).body
+                            if isinstance(n, ast.FunctionDef)
+                            and n.name.startswith("_helion")
+                        )
+                        calls = []
+
+                        def visit(n, depth):
+                            if (
+                                isinstance(n, ast.Call)
+                                and isinstance(n.func, ast.Name)
+                                and n.func.id == "_cute_grouped_reduce_shared_two_stage"
+                            ):
+                                calls.append(depth)
+                            for c in ast.iter_child_nodes(n):
+                                visit(c, depth + isinstance(n, ast.For))
+
+                        visit(fn, 0)
+                        return calls
+
+                    self.assertEqual(collective_depth(old), [1])
+                    self.assertEqual(collective_depth(new), [0])
+
+
+def _integer_loop_model(source, x, *, return_scratch=False):
+    """Execute the generated scalar statements over one complete physical CTA.
+
+    Only the unchanged shared reducer helper is modeled as its exact typed
+    collective. Load masks, loop/carry/phi statements and output stores execute.
+    """
+    import ast
+    import operator
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    tree = ast.parse(source)
+    fn = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion")
+    )
+    threads = next(
+        k.value.elts[0].value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        for k in n.keywords
+        if k.arg == "block"
+    )
+
+    class Vectorize(ast.NodeTransformer):
+        def visit_IfExp(self, n):
+            self.generic_visit(n)
+            return ast.Call(
+                ast.Attribute(ast.Name("np", ast.Load()), "where", ast.Load()),
+                [n.test, n.body, n.orelse],
+                [],
+            )
+
+        def visit_BoolOp(self, n):
+            self.generic_visit(n)
+            result = n.values[0]
+            for other in n.values[1:]:
+                result = ast.Call(
+                    ast.Attribute(
+                        ast.Name("np", ast.Load()),
+                        "logical_and" if isinstance(n.op, ast.And) else "logical_or",
+                        ast.Load(),
+                    ),
+                    [result, other],
+                    [],
+                )
+            return result
+
+    class Pointer:
+        def __init__(self, array, index=0):
+            self.array = array
+            self.index = index
+
+        def __add__(self, index):
+            return Pointer(self.array, self.index + index)
+
+        def load(self):
+            index = np.asarray(self.index)
+            valid = (index >= 0) & (index < self.array.size)
+            return np.where(
+                valid, self.array.reshape(-1)[np.clip(index, 0, self.array.size - 1)], 0
+            )
+
+        def store(self, value):
+            indices, values = np.broadcast_arrays(self.index, value)
+            for index in np.unique(indices):
+                selected = values[indices == index]
+                assert np.all(selected == selected[0]), "divergent duplicate writers"
+                self.array.reshape(-1)[index] = selected[0]
+
+    def tensor(array):
+        return SimpleNamespace(
+            iterator=Pointer(array),
+            layout=SimpleNamespace(
+                stride=tuple(s // array.itemsize for s in array.strides)
+            ),
+        )
+
+    events = []
+    row = [0]
+
+    def collective(value, op, identity, *args, **kwargs):
+        assert kwargs == {"pre": 1, "group_span": threads, "group_count": 1}
+        assert args[0].shape == (threads,)
+        a = np.asarray(value)
+        v = a.max() if op == "max" else a.min()
+        events.append(op)
+        return np.full(threads, v, dtype=a.dtype)
+
+    ns = {
+        "np": np,
+        "operator": operator,
+        "cutlass": SimpleNamespace(Int32=np.int32, Int64=np.int64),
+        "cute": SimpleNamespace(
+            arch=SimpleNamespace(
+                thread_idx=lambda: (np.arange(threads, dtype=np.int32), 0, 0),
+                block_idx=lambda: (row[0], 0, 0),
+            ),
+            math=SimpleNamespace(
+                max=lambda a, b, **kw: np.maximum(a, b),
+                min=lambda a, b, **kw: np.minimum(a, b),
+            ),
+        ),
+        "_cute_grouped_reduce_shared_two_stage": collective,
+        "_cute_python_mod": operator.mod,
+    }
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and all(isinstance(t, ast.Name) for t in node.targets)
+            and isinstance(node.value, ast.Constant)
+        ):
+            for target in node.targets:
+                ns[target.id] = node.value.value
+    fn.decorator_list = []
+    fn.returns = None
+    for arg in fn.args.args:
+        arg.annotation = None
+    module = ast.fix_missing_locations(
+        Vectorize().visit(ast.Module(body=[fn], type_ignores=[]))
+    )
+    exec(compile(module, "<integer-loop-generated-model>", "exec"), ns)
+    array = x.numpy()
+    out = np.zeros(array.shape[0], dtype=array.dtype)
+    scratch = np.zeros_like(out)
+    arguments = {"x": tensor(array), "out": tensor(out), "scratch": tensor(scratch)}
+    for i in range(array.shape[0]):
+        row[0] = i
+        ns[fn.name](*[arguments[a.arg] for a in fn.args.args])
+    if return_scratch:
+        return torch.from_numpy(out), torch.from_numpy(scratch), events
+    return torch.from_numpy(out), events
+
+
+class TestIntegerLoopReductionValuesCPU(unittest.TestCase):
+    def test_exact_tails_extrema_and_duplicate_stores(self):
+        for dtype in (torch.int32, torch.int64):
+            limits = torch.iinfo(dtype)
+            for threads, width in ((64, 129), (128, 513), (512, 1025), (1024, 2049)):
+                x = torch.randint(-500, 500, (3, width), dtype=dtype)
+                x[0, -1] = limits.max
+                x[1, -1] = limits.min
+                x[2].fill_(limits.min)
+                for minimum in (False, True):
+                    with self.subTest(dtype=dtype, threads=threads, minimum=minimum):
+                        _, old = _integer_loop_code(
+                            x, threads=threads, minimum=minimum, enabled=False
+                        )
+                        _, new = _integer_loop_code(x, threads=threads, minimum=minimum)
+                        a, ae = _integer_loop_model(old, x)
+                        b, be = _integer_loop_model(new, x)
+                        expected = x.amin(-1) if minimum else x.amax(-1)
+                        torch.testing.assert_close(a, expected, atol=0, rtol=0)
+                        torch.testing.assert_close(b, expected, atol=0, rtol=0)
+                        self.assertEqual(
+                            len(ae), 3 * ((width + threads - 1) // threads)
+                        )
+                        self.assertEqual(len(be), 3)
+
+    def test_early_read_carry_input_and_mutation_reject(self):
+        from helion.exc import InvalidConfig
+
+        x = torch.zeros((3, 513), dtype=torch.int64)
+        for key in ("early", "carry_input", "side_effect"):
+            with self.subTest(key=key), self.assertRaises(InvalidConfig):
+                _integer_loop_code(x, **{key: True})
+
+    def test_single_trip_and_lane_loop_fallback(self):
+        for width, threads in ((17, 128), (128, 128)):
+            with self.subTest(width=width):
+                x = torch.zeros((3, width), dtype=torch.int64)
+                _, old = _integer_loop_code(x, threads=threads, enabled=False)
+                _, new = _integer_loop_code(x, threads=threads)
+                self.assertEqual(old, new)
+
+
+class TestIntegerLoopReductionProofCPU(unittest.TestCase):
+    def test_physical_subgroups_and_serial_lanes_keep_old_schedule(self):
+        x = torch.zeros((5, 1025), dtype=torch.int64)
+        for blocks, threads in (
+            ([4, 128], [4, 32]),
+            ([1, 256], [1, 128]),
+            ([1, 32], [1, 32]),
+        ):
+            with self.subTest(blocks=blocks, threads=threads):
+                config = {"block_sizes": blocks, "num_threads": threads}
+                _, old = _integer_loop_code(x, enabled=False, config_override=config)
+                _, new = _integer_loop_code(x, config_override=config)
+                self.assertEqual(old, new)
+
+    def test_begin_extra_mask_and_initial_alias(self):
+        for minimum in (False, True):
+            for begin in (3, 513):
+                with self.subTest(minimum=minimum, begin=begin):
+                    x = torch.arange(3 * 513, dtype=torch.int64).reshape(3, 513) - 400
+                    identity = (
+                        torch.iinfo(x.dtype).max
+                        if minimum
+                        else torch.iinfo(x.dtype).min
+                    )
+                    _, old = _integer_loop_code(
+                        x,
+                        minimum=minimum,
+                        begin=begin,
+                        extra_mask=True,
+                        preserve_alias=True,
+                        enabled=False,
+                    )
+                    _, new = _integer_loop_code(
+                        x,
+                        minimum=minimum,
+                        begin=begin,
+                        extra_mask=True,
+                        preserve_alias=True,
+                    )
+                    a, initial, _ = _integer_loop_model(old, x, return_scratch=True)
+                    b, other, events = _integer_loop_model(new, x, return_scratch=True)
+                    kept = x[:, begin:].clone()
+                    kept[:, torch.arange(begin, 513) % 3 == 1] = identity
+                    expected = (
+                        (kept.amin(-1) if minimum else kept.amax(-1))
+                        if kept.shape[1]
+                        else torch.full((3,), identity, dtype=x.dtype)
+                    )
+                    self.assertTrue(
+                        torch.equal(a, expected) and torch.equal(b, expected)
+                    )
+                    self.assertTrue(
+                        torch.equal(initial, torch.full((3,), identity, dtype=x.dtype))
+                    )
+                    self.assertTrue(torch.equal(initial, other))
+                    self.assertEqual(len(events), 3 if begin < 513 else 0)
+
+    def test_float_reduction_rejects(self):
+        with self.assertRaises(helion.exc.InvalidConfig):
+            _integer_loop_code(torch.zeros((3, 513), dtype=torch.float32))
+
+    def test_strict_boolean_and_deferred_population(self):
+        import random
+        from unittest.mock import patch
+
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        x = torch.zeros((3, 513), dtype=torch.int64)
+        bound, _ = _integer_loop_code(x)
+        args = (
+            x,
+            torch.zeros(3, dtype=x.dtype),
+            False,
+            False,
+            False,
+            False,
+            torch.iinfo(x.dtype).min,
+            0,
+            False,
+            False,
+        )
+        spec = bound.config_spec
+        key = "cute_integer_loop_reduction"
+        self.assertNotIn(key, spec.default_config().config)
+        self.assertTrue(spec.compiler_coverage_groups[-1].deferred)
+        self.assertEqual(spec.compiler_coverage_groups[-1].key, key)
+        with bound.env, _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            config = dict(spec.default_config().config)
+            for bad in (1, "true", None):
+                with self.subTest(bad=bad), self.assertRaises(helion.exc.InvalidConfig):
+                    spec.create_config_generation().strict_config_pair(
+                        helion.Config(**(config | {key: bad}))
+                    )
+            for seed in (0, 107):
+                for strategy in (
+                    InitialPopulationStrategy.FROM_RANDOM,
+                    InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                ):
+                    random.seed(seed)
+                    with (
+                        patch.object(
+                            spec, "cute_integer_loop_reduction_search_enabled", False
+                        ),
+                        patch.object(
+                            spec,
+                            "_compiler_coverage_groups",
+                            spec.compiler_coverage_groups[:-1],
+                        ),
+                    ):
+                        old = PatternSearch(
+                            bound,
+                            args,
+                            initial_population=100,
+                            initial_population_strategy=strategy,
+                        )
+                        a = [
+                            dict(old.config_gen.canonicalize_flat(row)[1])
+                            for row in checked_initial_population(old)
+                        ]
+                        rng = random.getstate()
+                    random.seed(seed)
+                    new = PatternSearch(
+                        bound,
+                        args,
+                        initial_population=100,
+                        initial_population_strategy=strategy,
+                    )
+                    b = [
+                        dict(new.config_gen.canonicalize_flat(row)[1])
+                        for row in checked_initial_population(new)
+                    ]
+                    self.assertEqual(a, b[: len(a)])
+                    self.assertEqual(rng, random.getstate())
+                    self.assertTrue(any(row.get(key) is True for row in b))
+        _, witness = _integer_loop_code(x, config_override=b[-1])
+        import ast
+
+        for loop in ast.walk(ast.parse(witness)):
+            if isinstance(loop, ast.For):
+                self.assertFalse(
+                    any(
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "_cute_grouped_reduce_shared_two_stage"
+                        for node in ast.walk(loop)
+                    )
+                )
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_sdk_integer_minmax(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import sys
+        import tempfile
+        from unittest.mock import patch
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        for dtype, typ in ((torch.int32, cutlass.Int32), (torch.int64, cutlass.Int64)):
+            for minimum in (False, True):
+                with self.subTest(dtype=dtype, minimum=minimum):
+                    _, code = _integer_loop_code(
+                        torch.zeros((3, 513), dtype=dtype), minimum=minimum
+                    )
+                    tree = ast.parse(code)
+                    fn = next(
+                        n
+                        for n in tree.body
+                        if isinstance(n, ast.FunctionDef)
+                        and n.name.startswith("_helion")
+                    )
+                    fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+                    tree.body = [
+                        n
+                        for n in tree.body
+                        if isinstance(n, (ast.Import, ast.ImportFrom))
+                        or isinstance(n, ast.Assign)
+                        and all(isinstance(t, ast.Name) for t in n.targets)
+                    ] + [fn]
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp) / "module.py"
+                        path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+                        spec = importlib.util.spec_from_file_location(
+                            "integer_loop_sdk", path
+                        )
+                        mod = importlib.util.module_from_spec(spec)
+                        sys.modules[spec.name] = mod
+                        with patch(
+                            "torch.cuda._lazy_init",
+                            side_effect=AssertionError("CPU only"),
+                        ):
+                            spec.loader.exec_module(mod)
+                            with ir.Context(), ir.Location.unknown():
+                                emitted = ir.Module.create()
+                                with ir.InsertionPoint(emitted.body):
+                                    entry = func.FuncOp("entry", ([], []))
+                                    with ir.InsertionPoint(entry.add_entry_block()):
+                                        args = [
+                                            cute.make_tensor(
+                                                cute.make_ptr(
+                                                    typ,
+                                                    0,
+                                                    cute.AddressSpace.gmem,
+                                                    assumed_align=16,
+                                                ),
+                                                cute.make_layout(
+                                                    (3, 513), stride=(513, 1)
+                                                )
+                                                if a.arg == "x"
+                                                else cute.make_layout(
+                                                    (3,), stride=(1,)
+                                                ),
+                                            )
+                                            for a in fn.args.args
+                                        ]
+                                        getattr(mod, fn.name)(*args)
+                                        func.ReturnOp([])
+                                self.assertTrue(emitted.operation.verify())
+                                self.assertIn("nvvm.barrier", str(emitted))
+
+
+@onlyBackends("cute")
+class TestIntegerLoopReductionNative(TestCase):
+    def test_integer_minmax_tails(self):
+        for dtype, threads in ((torch.int32, 64), (torch.int64, 1024)):
+            x = torch.arange(3 * 2051, device=DEVICE, dtype=dtype).reshape(3, 2051)
+            x[0, -1] = torch.iinfo(dtype).max
+            x[1, -1] = torch.iinfo(dtype).min
+            x[2].fill_(torch.iinfo(dtype).min)
+            original = x.clone()
+            for minimum in (False, True):
+                for enabled in (False, True):
+                    scratch = torch.zeros(3, device=DEVICE, dtype=dtype)
+                    identity = (
+                        torch.iinfo(dtype).max if minimum else torch.iinfo(dtype).min
+                    )
+                    args = (
+                        x,
+                        scratch,
+                        minimum,
+                        False,
+                        False,
+                        False,
+                        identity,
+                        0,
+                        False,
+                        False,
+                    )
+                    bound = _integer_loop_kernel().bind(args)
+                    out = bound.compile_config(
+                        helion.Config(
+                            block_sizes=[1, threads],
+                            num_threads=[1, threads],
+                            cute_integer_loop_reduction=enabled,
+                        )
+                    )(*args)
+                    expected = x.amin(-1) if minimum else x.amax(-1)
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(x, original, rtol=0, atol=0)
+                    self.assertEqual(scratch.count_nonzero().item(), 0)
+
+    def test_masked_and_empty_ranges_preserve_initial_alias(self):
+        x = (
+            torch.arange(3 * 513, device=DEVICE, dtype=torch.int64).reshape(3, 513)
+            - 800
+        )
+        original = x.clone()
+        identity = torch.iinfo(x.dtype).min
+        for begin in (0, 3, 513):
+            for enabled in (False, True):
+                scratch = torch.zeros(3, device=DEVICE, dtype=x.dtype)
+                args = (
+                    x,
+                    scratch,
+                    False,
+                    False,
+                    False,
+                    False,
+                    identity,
+                    begin,
+                    True,
+                    True,
+                )
+                bound = _integer_loop_kernel().bind(args)
+                out = bound.compile_config(
+                    helion.Config(
+                        block_sizes=[1, 128],
+                        num_threads=[1, 128],
+                        cute_integer_loop_reduction=enabled,
+                    )
+                )(*args)
+                kept = x[:, begin:].clone()
+                kept[:, torch.arange(begin, 513, device=DEVICE) % 3 == 1] = identity
+                expected = (
+                    kept.amax(-1) if begin < 513 else torch.full_like(scratch, identity)
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    scratch, torch.full_like(scratch, identity), rtol=0, atol=0
+                )
+                torch.testing.assert_close(x, original, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

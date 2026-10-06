@@ -939,10 +939,13 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_integer_loop_reduction",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1053,10 +1056,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_integer_loop_reduction",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1172,10 +1178,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
         "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_integer_loop_reduction",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1496,12 +1505,18 @@ class ConfigSpec:
         self.cute_fragment_warp_scan_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_scan_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_integer_atomic_epochs_search_enabled = False
         self.cute_fragment_atomic_aggregation_search_enabled = False
         self.cute_fragment_local_atomic_registers_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_local_atomic_registers_search_enabled = False
+        self.cute_fragment_atomic_consumer_fusion_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_atomic_consumer_fusion_search_enabled = False
         self.cute_fragment_local_atomic_register_min_threads = 0
         self.cute_fragment_register_snapshots_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_register_snapshots_search_enabled = False
+        self.cute_integer_loop_reduction_available = False
+        self.cute_integer_loop_reduction_search_enabled = False
         self.cute_fragment_register_snapshot_min_threads = 0
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
@@ -3445,6 +3460,50 @@ class ConfigSpec:
             f"{key}={value!r} requires proved CTA-private Int32 relaxed unused atomic updates"
         )
 
+    def _normalize_cute_fragment_atomic_consumer_fusion(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_atomic_consumer_fusion"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_atomic_consumer_fusion_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a proved same-coordinate local Int32 atomic consumer region"
+        )
+
+    def _normalize_cute_fragment_integer_atomic_epochs(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_integer_atomic_epochs"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_integer_atomic_epochs_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires proved CTA-private Int32 relaxed unused loop updates"
+        )
+
     def _normalize_cute_fragment_local_atomic_registers(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3467,6 +3526,23 @@ class ConfigSpec:
             return
         raise InvalidConfig(
             f"{key}={value!r} requires proved same-coordinate local Int32 atomic return consumers"
+        )
+
+    def _normalize_cute_integer_loop_reduction(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_integer_loop_reduction"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if value is True and self.cute_integer_loop_reduction_available:
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key} requires a pure single integer min/max loop recurrence"
         )
 
     def _normalize_cute_fragment_register_snapshots(
@@ -4489,10 +4565,19 @@ class ConfigSpec:
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_fragment_integer_atomic_epochs(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_fragment_local_atomic_registers(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_integer_loop_reduction(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_fragment_register_snapshots(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_atomic_consumer_fusion(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_register_loads(
@@ -5698,10 +5783,13 @@ class ConfigSpec:
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
                 "cute_fragment_atomic_aggregation",
+                "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
+                "cute_fragment_atomic_consumer_fusion",
+                "cute_integer_loop_reduction",
             ):
                 return True, False
             if key == "cute_fragment_threads":
@@ -5936,16 +6024,22 @@ class ConfigSpec:
                 fields["cute_fragment_warp_results"] = BooleanFragment()
             if self.cute_fragment_atomic_aggregation_search_enabled:
                 fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
+            if self.cute_fragment_integer_atomic_epochs_search_enabled:
+                fields["cute_fragment_integer_atomic_epochs"] = BooleanFragment()
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
+            if self.cute_integer_loop_reduction_search_enabled:
+                fields["cute_integer_loop_reduction"] = BooleanFragment()
             if self.cute_fragment_register_snapshots_search_enabled:
                 fields["cute_fragment_register_snapshots"] = BooleanFragment()
             if self.cute_fragment_published_scalars_search_enabled:
                 fields["cute_fragment_published_scalars"] = BooleanFragment()
             if self.cute_fragment_skip_zero_atomics_search_enabled:
                 fields["cute_fragment_skip_zero_atomics"] = BooleanFragment()
+            if self.cute_fragment_atomic_consumer_fusion_search_enabled:
+                fields["cute_fragment_atomic_consumer_fusion"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:
