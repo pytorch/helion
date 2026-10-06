@@ -197,6 +197,7 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
         bound.to_code(_config(bound, "cooperative"))
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -456,6 +457,7 @@ def test_fragment_reduction_explicit_phase_roots_share_capability():
     assert REDUCTION_KEY in bound.config_spec._flat_fields()
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -689,6 +691,7 @@ def _resource_bound_and_actual(bound, config):
     return source
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize("width", [4097, 8193])
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
@@ -796,6 +799,7 @@ def test_fragment_resource_carrier_builds_catalog_only_once():
     )
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize("rows", [65536, 131072])
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
@@ -1020,6 +1024,7 @@ def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
         bound.to_code(_thread_config(bound, 512))
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -1187,6 +1192,7 @@ def test_register_loads_strict_bool_roundtrip_and_neighbors():
     } == {False, True}
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -1326,6 +1332,23 @@ def _without_warp_scan_coverage():
         yield
 
 
+@pytest.fixture
+def _without_later_fragment_coverage():
+    """Keep historical prefix tests in their original registration universe.
+
+    Complete staging populations, including these additions, are compared
+    separately; these tests retain their original exact extension counts.
+    """
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for registration in ("register_fragment_register_snapshots_coverage",):
+            stack.enter_context(
+                patch("helion._compiler.autotuner_heuristics." + registration)
+            )
+        yield
+
+
 def _warp_scan_config(bound, value=True):
     return helion.Config.from_dict(
         dict(bound.config_spec.default_config()) | {WARP_SCAN_KEY: value}
@@ -1364,6 +1387,7 @@ def test_warp_scan_boolean_strict_admission_and_legacy_emitters():
     } == {False, True}
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -1480,6 +1504,7 @@ def test_warp_scan_zero_physical_capacity_rejects(reverse):
         bound.to_code(_warp_scan_config(bound))
 
 
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize("family", ["private", "producer", "scan"])
 @pytest.mark.parametrize(
     "strategy",

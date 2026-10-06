@@ -564,7 +564,8 @@ def test_composed_async_full_row_seed_survives_flatten() -> None:
     # The early grid-size check cannot look up the two fixed-size grid axes,
     # so xyz starts conservatively disabled for this otherwise-safe 3-D grid.
     assert "xyz" not in spec.allowed_pid_types
-    seeds = compiler_seed_configs(bound.env, host_function.device_ir)
+    with bound.env:
+        seeds = compiler_seed_configs(bound.env, host_function.device_ir)
     spec.compiler_seed_configs = seeds
     composed = [
         seed
