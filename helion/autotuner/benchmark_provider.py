@@ -251,6 +251,8 @@ def _clone_args(
     args: Sequence[object],
     process_group_name: str | None,
     idx_to_clone: Sequence[int] | None = None,
+    *,
+    preserve_storage: bool = False,
 ) -> Sequence[object]:
     """Clone selected tensor leaves while preserving their alias topology.
 
@@ -258,6 +260,8 @@ def _clone_args(
     clone that whole argument alias group.  This keeps view offsets, strides,
     mixed-dtype storage aliases, and duplicate references intact while still
     isolating the cloned group from both the caller and other candidates.
+    ``preserve_storage`` also retains the full storage and offset of a lone
+    contiguous view, as required when replaying a standalone kernel's layout.
     """
 
     clone_indices = None if idx_to_clone is None else set(idx_to_clone)
@@ -331,7 +335,7 @@ def _clone_args(
         storage_groups.setdefault(key, []).append(tensor)
 
     for tensors in storage_groups.values():
-        if len(tensors) == 1 and tensors[0].is_contiguous():
+        if not preserve_storage and len(tensors) == 1 and tensors[0].is_contiguous():
             # Retain the ordinary fast path (and its observable clone
             # semantics) when there is no cross-argument alias topology to
             # preserve.
