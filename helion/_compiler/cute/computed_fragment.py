@@ -55,6 +55,8 @@ from ..variable_origin import HostOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
+from .atomic_consumer_fusion import AtomicConsumerRegion
+from .atomic_consumer_fusion import atomic_consumer_regions
 from .captured_reduction import captured_reduction_coordinates
 from .captured_reduction import physical_capture_axes
 from .dead_zero_atomics import dead_zero_atomic_results
@@ -67,6 +69,7 @@ from .fragment_storage import metadata_guarded
 from .free_iota_reduction import free_iota_reductions
 from .free_iota_reduction import owned_iota_reduction_axes
 from .independent_reduction import independent_reduction_coordinates
+from .integer_atomic_epochs import can_defer_integer_epoch
 from .local_atomic import local_atomic_allocations
 from .local_atomic import local_buffer_conditional_inputs
 from .local_atomic import prove_local_atomics
@@ -973,7 +976,13 @@ class FragmentCompiler:
             )
         self.cg.add_statement(loop)
 
-    def atomic_add(self, node: Node, values: dict[Node, object]) -> Fragment | None:
+    def atomic_add(
+        self,
+        node: Node,
+        values: dict[Node, object],
+        deferred_updates: list[tuple[Callable[[tuple[str, ...]], None], bool]]
+        | None = None,
+    ) -> Fragment | None:
         """Each contribution is owned once; barriers are outside lane loops."""
         target, indices, value, sem = cast(
             "tuple[object, object, object, object]", _resolve(node.args, values)
@@ -1241,7 +1250,11 @@ class FragmentCompiler:
                     self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
                 self.emit(f"{result.read(coords)} = {previous}")
 
-        if aggregate_vars is None:
+        if deferred_updates is not None:
+            assert local and not warp_owned and local_registers is None
+            assert aggregate_vars is None and target_fake.dtype == torch.int32
+            deferred_updates.append((update, result is not None))
+        elif aggregate_vars is None:
             # Returned local values are immutable per-element snapshots. Finish
             # every worker's update/result write before a cross-lane consumer;
             # the target and result have distinct live allocations. Local
@@ -2263,6 +2276,7 @@ class FragmentCompiler:
                 )
             carries.append(carry)
         body: list[ast.AST] = []
+        deferred_barrier: ast.AST | None = None
         outer_offsets, outer_bounds = dict(self.offsets), dict(self.bounds)
         with self.cg.set_statements(body):
             for bid, _begin, end in zip(
@@ -2305,7 +2319,20 @@ class FragmentCompiler:
             self.held.pop()
             # The backedge can revisit the same atomic target. Finish this
             # iteration's epoch even when no loop carry was materialized.
+            pending = set(self.pending_local_atomics)
             self.synchronize_local_atomics()
+            if (
+                pending
+                and self.df.config.get("cute_fragment_integer_atomic_epochs", False)
+                and node not in self.private_scalar_loops
+                and can_defer_integer_epoch(
+                    body[:-1],
+                    {name: dtype for name, dtype, _count in self.buffers},
+                    pending,
+                )
+            ):
+                assert ast.unparse(body[-1]) == "cute.arch.sync_threads()"
+                deferred_barrier = body.pop()
         for index in reversed(range(len(graph.block_ids))):
             bid = graph.block_ids[index]
             begin = cast("list[object]", node.args[1])[index]
@@ -2337,6 +2364,10 @@ class FragmentCompiler:
             )
         for stmt in body:
             self.cg.add_statement(stmt)
+        if deferred_barrier is not None:
+            # Unconditional publication also covers zero-trip loops. Nothing
+            # can read or reuse target storage before this boundary.
+            self.cg.add_statement(deferred_barrier)
         self.held.pop()
         return carries
 
@@ -2740,6 +2771,59 @@ class FragmentCompiler:
             self.held.pop()
         return [*merged, *merged]
 
+    def can_fuse_atomics(
+        self, region: AtomicConsumerRegion, values: dict[Node, object]
+    ) -> bool:
+        if self.df.config.get("cute_fragment_atomic_aggregation", False):
+            return False
+        shapes = set()
+        storages = set()
+        for node in region.atomics:
+            fake = cast("torch.Tensor", node.meta["val"])
+            target = values.get(cast("Node", node.args[0]))
+            if (
+                node in self.local_register_nodes
+                or node in self.warp_result_nodes
+                or not isinstance(target, Fragment)
+                or target.storage is None
+                or len(target.shape) != 1
+                or id(target) not in self.local_logical_sizes
+                or target.storage in storages
+            ):
+                return False
+            storages.add(target.storage)
+            shapes.add(self.shape(fake.shape))
+        return len(shapes) == 1
+
+    def fused_atomic_updates(
+        self,
+        region: AtomicConsumerRegion,
+        updates: list[tuple[Callable[[tuple[str, ...]], None], bool]],
+    ) -> None:
+        assert len(updates) == len(region.atomics)
+        shape = self.shape(cast("torch.Tensor", region.atomics[0].meta["val"]).shape)
+
+        def body(coords: tuple[str, ...]) -> None:
+            previous = self.expression
+            # Only this proved immutable dependency closure survives the
+            # individual updates. Producer objects are current SSA recipes;
+            # their values include every original logical-dtype cast.
+            self.expression = FragmentExpression(self.cg)
+            try:
+                for update, _synchronize in updates:
+                    update(coords)
+            finally:
+                self.expression = previous
+
+        self.elements(shape, body, synchronize=False)
+        pending = self.pending_local_atomics.copy()
+        for _update, synchronize in updates:
+            if synchronize:
+                self.synchronize()
+        # Keep the original conservative post-region publication obligations.
+        # Removing these now-redundant boundaries is a separate optimization.
+        self.pending_local_atomics.update(pending)
+
     def graph(self, graph: torch.fx.Graph, values: dict[Node, object]) -> object:
         from .producer_cache import producer_cache_candidates
 
@@ -2750,15 +2834,47 @@ class FragmentCompiler:
             else frozenset()
         )
         uses = {node: len(node.users) for node in graph.nodes}
+        regions = (
+            atomic_consumer_regions(self.graphs, self.env)
+            if self.df.config.get("cute_fragment_atomic_consumer_fusion", False)
+            and not self.scopes
+            else {}
+        )
+        region: AtomicConsumerRegion | None = None
+        updates: list[tuple[Callable[[tuple[str, ...]], None], bool]] = []
+        held: list[object] = []
         self.scopes.append(values)
         try:
             for node in graph.nodes:
                 if node.op == "placeholder":
                     continue
                 if node.op == "output":
+                    assert region is None
                     return _resolve(node.args[0], values)
+                if (
+                    node in regions
+                    and not cache_nodes.intersection(regions[node].nodes)
+                    and self.can_fuse_atomics(regions[node], values)
+                ):
+                    assert region is None
+                    region = regions[node]
+                    updates, held = [], []
+                    self.held.append(held)
+                if region is not None:
+                    held.extend(
+                        (
+                            _resolve(node.args, values),
+                            [_resolve(value, values) for value in node.kwargs.values()],
+                        )
+                    )
                 with node.meta["location"], V.set_current_node(node):
-                    values[node] = self.node(node, values)
+                    values[node] = (
+                        self.node(node, values, updates)
+                        if region is not None and node in region.atomics
+                        else self.node(node, values)
+                    )
+                    if region is not None:
+                        held.append(values[node])
                     if node in cache_nodes:
                         value = values[node]
                         assert isinstance(value, Fragment)
@@ -2769,11 +2885,21 @@ class FragmentCompiler:
                         values.pop(source, None)
                 if uses[node] == 0:
                     values.pop(node, None)
+                if region is not None and node is region.nodes[-1]:
+                    self.fused_atomic_updates(region, updates)
+                    self.held.pop()
+                    region = None
         finally:
             self.scopes.pop()
         raise AssertionError("graph has no output")
 
-    def node(self, node: Node, values: dict[Node, object]) -> object:
+    def node(
+        self,
+        node: Node,
+        values: dict[Node, object],
+        deferred_updates: list[tuple[Callable[[tuple[str, ...]], None], bool]]
+        | None = None,
+    ) -> object:
         target = node.target
         args = cast("tuple[object, ...]", _resolve(node.args, values))
         fake = node.meta.get("val")
@@ -2831,6 +2957,8 @@ class FragmentCompiler:
         if _tracing_ops.is_for_loop_target(target):
             return self.loop(node, values)
         if target is atomic_ops.atomic_add:
+            if deferred_updates is not None:
+                return self.atomic_add(node, values, deferred_updates)
             return self.atomic_add(node, values)
         if target in (memory_ops.load, memory_ops.store):
             return self.memory(node, values, target is memory_ops.store)

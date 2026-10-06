@@ -1346,6 +1346,9 @@ def _without_later_fragment_coverage():
             "register_fragment_register_snapshots_coverage",
             "register_fragment_published_scalars_coverage",
             "register_fragment_skip_zero_atomics_coverage",
+            "register_fragment_atomic_consumer_fusion_coverage",
+            "register_integer_loop_reduction_coverage",
+            "register_fragment_integer_atomic_epochs_coverage",
         ):
             stack.enter_context(
                 patch("helion._compiler.autotuner_heuristics." + registration)
@@ -1662,8 +1665,12 @@ def test_atomic_aggregation_strict_scope_and_ordinary_mutation():
     ],
 )
 def test_atomic_aggregation_complete_prior_prefix_rng_seeds_and_overrides(strategy):
+    # Isolate the original aggregation extension from later deferred groups.
+    # The epoch tests separately retain the whole old population as a prefix.
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+    ), patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_integer_atomic_epochs_coverage"
     ):
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_atomic_aggregation_coverage"

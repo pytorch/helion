@@ -67,6 +67,18 @@ from .cute_fragment_atomic_aggregation import CuteFragmentAtomicAggregationHeuri
 from .cute_fragment_atomic_aggregation import (
     register_fragment_atomic_aggregation_coverage,
 )
+from .cute_fragment_atomic_consumer_fusion import (
+    CuteFragmentAtomicConsumerFusionHeuristic,
+)
+from .cute_fragment_atomic_consumer_fusion import (
+    register_fragment_atomic_consumer_fusion_coverage,
+)
+from .cute_fragment_integer_atomic_epochs import (
+    CuteFragmentIntegerAtomicEpochsHeuristic,
+)
+from .cute_fragment_integer_atomic_epochs import (
+    register_fragment_integer_atomic_epochs_coverage,
+)
 from .cute_fragment_local_atomic_registers import (
     CuteFragmentLocalAtomicRegistersHeuristic,
 )
@@ -110,6 +122,8 @@ from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
 from .cute_host_paired_sum import add_host_sum_seeds
+from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
+from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
@@ -212,6 +226,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentRegisterSnapshotsHeuristic,
         CuteFragmentPublishedScalarsHeuristic,
         CuteFragmentSkipZeroAtomicsHeuristic,
+        CuteFragmentAtomicConsumerFusionHeuristic,
+        CuteIntegerLoopReductionHeuristic,
+        CuteFragmentIntegerAtomicEpochsHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -672,5 +689,12 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_skip_zero_atomics_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_atomic_consumer_fusion_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_integer_loop_reduction_coverage(env, device_ir)
+    register_fragment_integer_atomic_epochs_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from ..language.memory_ops import CuteTileVecStoreSite
     from ..runtime.config import Config
+    from .cute.integer_loop_reduction import Hoist
     from .cute.lane_loop_distribution import LanePlacement
     from .cute.lane_loop_distribution import LaneScope
     from .cute.memory_ops import CuteLaneRelocation
@@ -5819,6 +5820,7 @@ class DeviceLoopOrGridState:
 
 @dataclasses.dataclass
 class DeviceLoopState(DeviceLoopOrGridState):
+    integer_reduction_hoist: Hoist | None = dataclasses.field(default=None, init=False)
     for_node: ast.For
     inner_statements: list[ast.AST]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
