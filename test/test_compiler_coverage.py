@@ -794,7 +794,7 @@ def test_actual_autotune_loop_delivers_all_added_witnesses_to_first_benchmark(
 
     delivered = []
 
-    def hold(members, *, desc):
+    def hold(members, *, desc, raise_if_no_viable_config=True):
         assert desc == "Initial population"
         delivered.extend(copy.deepcopy(member.config) for member in members)
         raise HeldBenchmark

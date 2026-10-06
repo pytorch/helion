@@ -188,6 +188,7 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+                ("block_ptr" needs Triton < 3.9; newer Triton lowers it as "pointer")
             atomic_indexing: Indexing strategy for atomic operations (e.g., hl.atomic_add).
                 Same format as ``indexing`` (a single string or a list per atomic op).
                 Defaults to "pointer" when omitted.

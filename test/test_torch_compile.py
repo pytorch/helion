@@ -26,6 +26,7 @@ from torch.utils._ordered_set import OrderedSet
 
 import helion
 from helion._compat import requires_torch_version
+from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import supports_torch_compile_fusion
 from helion._testing import DEVICE
@@ -4736,6 +4737,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         """Test: prologue/epilogue with different indexing strategies."""
         if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
             self.skipTest("Tensor descriptor support is required")
+        if indexing == "block_ptr" and not supports_block_ptr():
+            self.skipTest("Block pointer support is required")
 
         @helion.kernel(
             config=helion.Config(block_sizes=[64, 128], indexing=indexing),
