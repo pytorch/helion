@@ -957,7 +957,7 @@ def test_fragment_threads_strict_domain_and_roundtrip():
         assert generation.unflatten(flat) == config
         assert helion.Config.from_json(config.to_json()) == config
     assert generation.strict_config_pair(_thread_config(bound, 128))[1] == default
-    for value in (True, False, 0, 16, 96, 1024, "512", 128.0, None):
+    for value in (True, False, 0, 16, 96, 1023, 1056, 2048, "1024", 128.0, None):
         with pytest.raises(exc.InvalidConfig, match="computed fragment root"):
             spec.normalize(_thread_config(bound, value).config)
 
@@ -971,7 +971,7 @@ def test_fragment_threads_unsupported_root_rejected(kernel):
         bound.config_spec.normalize(_thread_config(bound, 512).config)
 
 
-@pytest.mark.parametrize("count", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("count", [32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("mode", ["serial", "cooperative"])
 def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
     import ast
@@ -1094,10 +1094,45 @@ def test_fragment_threads_both_ordered_phases_and_dynamic_rebind():
     for shape in ((3, 65), (5, 129)):
         bound = _cpu_bind(_barrier_scan, (torch.ones(shape),))
         assert len(bound.config_spec.cute_fragment_thread_root_ids) == 2
-        config = _thread_config(bound, 512)
-        config.config["pid_type"] = "flat"
-        code = bound.to_code(config)
-        assert code.count("block=(512, 1, 1)") == 2
+        for threads in (512, 1024):
+            config = _thread_config(bound, threads)
+            config.config["pid_type"] = "flat"
+            code = bound.to_code(config)
+            assert code.count(f"block=({threads}, 1, 1)") == 2
+
+
+def test_fragment_1024_threads_late_search_reachability():
+    bound = _bind()
+    generation = bound.config_spec.create_config_generation()
+    default = generation.default_flat()
+    projections = [
+        item
+        for item in generation.coordinate_neighbor_projections(default)
+        if item.key == THREAD_KEY and item.outcome == "candidate"
+    ]
+    candidate = next(item for item in projections if item.config[THREAD_KEY] == 1024)
+    _, canonical = generation.strict_config_pair(candidate.config)
+    assert canonical[THREAD_KEY] == 1024
+    assert "block=(1024, 1, 1)" in bound.to_code(canonical)
+
+    # The initial coverage view pins this entire coordinate to legacy128,
+    # then appends the same four old witnesses. Later neighbors can explore
+    # the appended enum value without changing that initial-population policy.
+    group = next(
+        g for g in bound.config_spec.compiler_coverage_groups if g.key == THREAD_KEY
+    )
+    assert [w.value for w in group.witnesses] == [32, 64, 256, 512]
+    current = generation.flatten(canonical)
+    previous = generation.flatten(_thread_config(bound, 512))
+    values = set()
+    for seed in (3, 11, 29, 41, 59, 71, 83, 97):
+        random.seed(seed)
+        mutated = generation.differential_mutation(
+            default, default, current, previous, crossover_rate=1.0
+        )
+        _, config = generation.canonicalize_flat(mutated)
+        values.add(config.get(THREAD_KEY, 128))
+    assert 1024 in values
 
 
 def test_fragment_threads_backend_specific():
