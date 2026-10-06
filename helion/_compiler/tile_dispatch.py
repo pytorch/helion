@@ -200,19 +200,17 @@ class TileStrategyDispatch:
         """Drop duplicate output-range reservations before physical allocation.
 
         Register broadcasting can allocate a reduction block whose variable is
-        exactly an existing tile variable. A pure pointwise root has no work to
-        execute on that duplicate range; the canonical tile already owns its
-        coordinates. Keep all strategies when nested or free-iota ownership is
-        present, and never elide executable reductions or matrix dimensions.
+        exactly an existing tile variable. The canonical tile already owns
+        those coordinates. Nested tile loops may reuse an outer root's tile,
+        but cannot establish ownership for sibling or child-only tile axes.
+        Never elide executable reductions, free-iota or matrix dimensions.
         """
         env = CompileEnvironment.current()
         spec = env.config_spec
         graphs = fn.codegen.codegen_graphs
         if (
             env.backend_name != "cute"
-            or not spec.pointwise_facts
             or spec.matmul_facts
-            or any(not isinstance(graph, RootGraphInfo) for graph in graphs)
             or any(
                 isinstance(node.target, torch._ops.OpOverload)
                 and node.target.overloadpacket is torch.ops.aten.arange
@@ -224,6 +222,26 @@ class TileStrategyDispatch:
         tile_blocks = {
             block_id for strategy in self.strategies for block_id in strategy.block_ids
         }
+        if not (
+            spec.pointwise_facts
+            and all(isinstance(graph, RootGraphInfo) for graph in graphs)
+        ):
+            # One root's grid tiles dominate its tiled child graphs. Restrict
+            # the extension to those outer coordinates: a child loop's tile
+            # may be inactive in a sibling, even with an identical extent.
+            grid_blocks = HostFunction.current().device_ir.grid_block_ids
+            if (
+                len(grid_blocks) != 1
+                or sum(isinstance(graph, RootGraphInfo) for graph in graphs) != 1
+                or not any(type(graph) is ForLoopGraphInfo for graph in graphs)
+                or any(
+                    not isinstance(graph, RootGraphInfo)
+                    and not (type(graph) is ForLoopGraphInfo and graph.block_ids)
+                    for graph in graphs
+                )
+            ):
+                return set()
+            tile_blocks &= set(grid_blocks[0])
         executable = set(spec.reduction_loops.valid_block_ids())
         if spec.reduction_kernel_fact is not None:
             executable.update(

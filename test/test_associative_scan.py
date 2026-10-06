@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
+import importlib
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -1237,6 +1240,429 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         expected = torch.cumsum(x.double(), dim=1).amax(1).float()
         _code, out = code_and_output(cumsum_mid_reduce, (x,))
         torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordinary_tiled_scan(x: torch.Tensor, kind: hl.constexpr, reverse: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        for column in hl.tile(x.size(1), block_size=8):
+            value = x[row, column]
+            if kind == "sum":
+                result = hl.cumsum(value, dim=-1, reverse=reverse)
+            elif kind == "prod":
+                result = hl.cumprod(value, dim=-1, reverse=reverse)
+            elif kind == "min":
+                result = hl.associative_scan(
+                    torch.minimum, value, dim=-1, reverse=reverse
+                )
+            else:
+                result = hl.associative_scan(
+                    torch.maximum, value, dim=-1, reverse=reverse
+                )
+            out[row, column] = result
+    return out
+
+
+def _execute_direct_scan_program(source, inputs):
+    """Interpret generated tensor subscripts using their actual storage strides."""
+    from test.test_indexing import _execute_pointwise_thread_program
+
+    tree = ast.parse(source)
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    tensor_args = {arg.arg for arg in kernel.args.args if arg.annotation is None}
+    modules = {
+        alias.asname: importlib.import_module(alias.name)
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.asname == "_source_module"
+    }
+
+    class TensorIndex(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            if isinstance(node.value, ast.Name) and node.value.id in modules:
+                value = vars(modules[node.value.id])[node.attr]
+                assert isinstance(value, int)
+                return ast.Constant(value=value)
+            return self.generic_visit(node)
+
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            if isinstance(node.value, ast.Name) and node.value.id in tensor_args:
+                indices = (
+                    node.slice.elts
+                    if isinstance(node.slice, ast.Tuple)
+                    else [node.slice]
+                )
+                tensor = node.value.id
+                offset = " + ".join(
+                    f"({ast.unparse(index)}) * {tensor}.layout.stride[{axis}]"
+                    for axis, index in enumerate(indices)
+                )
+                return ast.parse(
+                    f"({tensor}.iterator + ({offset})).load()", mode="eval"
+                ).body
+            return node
+
+    # The scalar interpreter replaces module imports with CPU stand-ins. Keep
+    # the real pure host launch-dimension guard for symbolic tile extents.
+    wrapper = next(
+        node for node in reversed(tree.body) if isinstance(node, ast.FunctionDef)
+    )
+    wrapper.body[:0] = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and any(alias.asname == "_cute_checked_block_dims" for alias in node.names)
+    ]
+    result, _ = _execute_pointwise_thread_program(
+        ast.unparse(ast.fix_missing_locations(TensorIndex().visit(tree))), inputs
+    )
+    return result
+
+
+def _ordinary_scan_expected(x, kind, reverse, chunk_size=8):
+    results = []
+    for chunk in x.split(chunk_size, dim=-1):
+        value = chunk.flip([-1]) if reverse else chunk
+        if kind == "sum":
+            value = value.cumsum(-1, dtype=x.dtype)
+        elif kind == "prod":
+            value = value.cumprod(-1, dtype=x.dtype)
+        elif kind == "min":
+            value = value.cummin(-1).values
+        else:
+            value = value.cummax(-1).values
+        results.append(value.flip([-1]) if reverse else value)
+    return torch.cat(results, -1)
+
+
+@pytest.fixture
+def _serial_scan_fallback(monkeypatch):
+    # These models execute scalar threads independently. Exercise the serial
+    # fallback explicitly; native tests retain the default parallel dispatcher.
+    from helion._compiler.backend_registry import repair_backend_codegen
+    from helion._compiler.cute import scan_ops
+
+    # Complete the upstream lazy reload before patching its actual emitter.
+    repair_backend_codegen("cute")
+    monkeypatch.setattr(scan_ops, "_cute_try_parallel_scan", lambda *args: None)
+
+
+@pytest.mark.parametrize("kind", ["sum", "prod", "min", "max"])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_ordinary_tiled_scan_generated_values(kind, reverse, dtype):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    backing = ((torch.arange(3 * 34).reshape(3, 34) % 3) + 1).to(dtype)
+    x = backing[:, ::2]
+    snapshot = backing.clone()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_ordinary_tiled_scan, (x, kind, reverse))
+        source = bound.to_code(bound.config_spec.default_config())
+    assert "fragment_smem" not in source
+    actual = _execute_direct_scan_program(source, (x, kind, reverse))
+    torch.testing.assert_close(
+        actual, _ordinary_scan_expected(x, kind, reverse), rtol=0, atol=0
+    )
+    torch.testing.assert_close(backing, snapshot, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_ordinary_scan_host_fixed_chunk_generated_values():
+    from unittest.mock import patch
+
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+    import test.test_cute_computed_fragment as fragment_tests
+    from test.test_cute_computed_fragment import _fragment_host_fixed_chunk_scan
+
+    x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_host_fixed_chunk_scan, (x,))
+        source = bound.to_code(bound.config_spec.default_config())
+    for chunk_size in (4, 8, 16):
+        with patch.object(fragment_tests, "_FRAGMENT_FIXED_CHUNK", chunk_size):
+            actual = _execute_direct_scan_program(source, (x,))
+        torch.testing.assert_close(
+            actual, _ordinary_scan_expected(x, "sum", False, chunk_size), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("kind", ["sum", "prod", "min", "max"])
+@pytest.mark.parametrize("reverse", [False, True])
+@onlyBackends(["cute"])
+def test_ordinary_tiled_scan_native(kind, reverse):
+    x = ((torch.arange(3 * 34, device=DEVICE).reshape(3, 34) % 3) + 1).float()[:, ::2]
+    before = x.clone()
+    torch.testing.assert_close(
+        _ordinary_tiled_scan(x, kind, reverse),
+        _ordinary_scan_expected(x, kind, reverse),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+def _scan_product_and_sum(left_product, left_sum, right_product, right_sum):
+    return left_product * right_product, left_sum + right_sum
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordinary_tiled_tuple_scan(x: torch.Tensor, reverse: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        for column in hl.tile(x.size(1), block_size=8):
+            values = x[row, column]
+            product, total = hl.associative_scan(
+                _scan_product_and_sum, (values, values), dim=-1, reverse=reverse
+            )
+            out[row, column] = product + total
+    return out
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_ordinary_tiled_tuple_scan_generated_values(reverse):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    x = ((torch.arange(3 * 17).reshape(3, 17) % 3) + 1).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_ordinary_tiled_tuple_scan, (x, reverse))
+        source = bound.to_code(bound.config_spec.default_config())
+    actual = _execute_direct_scan_program(source, (x, reverse))
+    expected = _ordinary_scan_expected(x, "prod", reverse) + _ordinary_scan_expected(
+        x, "sum", reverse
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordinary_bounded_scan(
+    x: torch.Tensor, begin: hl.constexpr, end: hl.constexpr, reverse: hl.constexpr
+):
+    out = torch.empty((x.size(0), end - begin), dtype=x.dtype, device=x.device)
+    for row in hl.tile(x.size(0), block_size=1):
+        for col in hl.tile(begin, end, block_size=8):
+            out[row, col.index - begin] = hl.cumprod(
+                x[row, col], dim=-1, reverse=reverse
+            )
+    return out
+
+
+@pytest.mark.parametrize(
+    "begin,end,width", [(3, 20, 25), (3, 19, 25), (0, 17, 25), (3, 20, 20)]
+)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_ordinary_bounded_scan_generated_values(begin, end, width, reverse):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    x = ((torch.arange(3 * width).reshape(3, width) % 3) + 1).float()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_ordinary_bounded_scan, (x, begin, end, reverse))
+        source = bound.to_code(bound.config_spec.default_config())
+    actual = _execute_direct_scan_program(source, (x, begin, end, reverse))
+    expected = _ordinary_scan_expected(x[:, begin:end], "prod", reverse)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@onlyBackends(["cute"])
+def test_ordinary_bounded_scan_native(reverse):
+    x = ((torch.arange(3 * 25, device=DEVICE).reshape(3, 25) % 3) + 1).float()
+    before = x.clone()
+    torch.testing.assert_close(
+        _ordinary_bounded_scan(x, 3, 20, reverse),
+        _ordinary_scan_expected(x[:, 3:20], "prod", reverse),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordinary_grid_bounded_scan(
+    x: torch.Tensor,
+    begin: int,
+    end: int,
+    reverse: hl.constexpr,
+):
+    out = torch.empty((x.size(0), end - begin), dtype=x.dtype, device=x.device)
+    for row, col in hl.tile([0, begin], [x.size(0), end], block_size=[2, 8]):
+        out[row, col.index - begin] = hl.cumprod(x[row, col], dim=-1, reverse=reverse)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordinary_first_axis_bounded_scan(
+    x: torch.Tensor,
+    begin: int,
+    end: int,
+    reverse: hl.constexpr,
+):
+    out = torch.empty((end - begin, x.size(1)), dtype=x.dtype, device=x.device)
+    for row in hl.tile(begin, end, block_size=8):
+        for col in hl.tile(x.size(1), block_size=2):
+            out[row.index - begin, col] = hl.cumprod(
+                x[row, col], dim=0, reverse=reverse
+            )
+    return out
+
+
+@pytest.mark.parametrize("first_axis", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_ordinary_grid_scan_generated_values(first_axis, reverse):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    x = ((torch.arange(3 * 25).reshape(3, 25) % 3) + 1).float()
+    if first_axis:
+        x = x.t().contiguous()
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        kernel = (
+            _ordinary_first_axis_bounded_scan
+            if first_axis
+            else _ordinary_grid_bounded_scan
+        )
+        bound = _cpu_bind(kernel, (x, 3, 20, reverse))
+        source = bound.to_code(bound.config_spec.default_config())
+    # Reuse the exact generated host wrapper with different runtime bounds.
+    for begin, end in [(3, 20), (1, 18), (2, 21)]:
+        actual = _execute_direct_scan_program(source, (x, begin, end, reverse))
+        selected = x[begin:end].t() if first_axis else x[:, begin:end]
+        expected = _ordinary_scan_expected(selected, "prod", reverse)
+        if first_axis:
+            expected = expected.t()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("first_axis", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@onlyBackends(["cute"])
+def test_ordinary_grid_scan_native(first_axis, reverse):
+    x = ((torch.arange(3 * 25, device=DEVICE).reshape(3, 25) % 3) + 1).float()
+    if first_axis:
+        x = x.t().contiguous()
+    before = x.clone()
+    for begin, end in [(3, 20), (1, 18), (2, 21)]:
+        kernel = (
+            _ordinary_first_axis_bounded_scan
+            if first_axis
+            else _ordinary_grid_bounded_scan
+        )
+        actual = kernel(x, begin, end, reverse)
+        selected = x[begin:end].t() if first_axis else x[:, begin:end]
+        expected = _ordinary_scan_expected(selected, "prod", reverse)
+        if first_axis:
+            expected = expected.t()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("missing", ["owner", "end"])
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    from helion._compiler.cute.cute_reshape import _resolve_dim_block_id
+    import helion._compiler.cute.scan_ops as scan_ops
+    from helion.language.memory_ops import _cute_remap_block_id
+
+    original = scan_ops._cute_codegen_serial_scan
+
+    def without_bound(state, helper, inputs, dim, reverse):
+        val = inputs[0].meta["val"]
+        block = _resolve_dim_block_id(state.codegen, val, dim % val.ndim)
+        assert block is not None
+        active = _cute_remap_block_id(state, block)
+        loops = state.codegen.active_device_loops.get(active)
+        owner = loops[-1] if loops else state.codegen.current_grid_state
+        assert owner is not None and active in owner.block_id_to_info
+        if missing == "owner":
+            owner.block_id_to_info.pop(active)
+        else:
+            owner.block_id_to_info[active].grid_end_expr = None
+        return original(state, helper, inputs, dim, reverse)
+
+    x = torch.ones(3, 25)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_ordinary_grid_bounded_scan, (x, 3, 20, True))
+        # Initialize lazy backend registration before replacing its emitter.
+        bound.to_code(bound.config_spec.default_config())
+        original = scan_ops._cute_codegen_serial_scan
+        monkeypatch.setattr(scan_ops, "_cute_codegen_serial_scan", without_bound)
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="logical tile " + missing
+        ):
+            bound.to_code(bound.config_spec.default_config())
+
+
+def test_ordinary_default_scan_keeps_parallel_dispatch(monkeypatch):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    from helion._compiler.backend_registry import repair_backend_codegen
+    from helion._compiler.cute import scan_ops
+
+    repair_backend_codegen("cute")
+    original = scan_ops._cute_try_parallel_scan
+    results = []
+
+    def observe(*args):
+        result = original(*args)
+        results.append(result is not None)
+        return result
+
+    monkeypatch.setattr(scan_ops, "_cute_try_parallel_scan", observe)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_ordinary_tiled_scan, (torch.ones(3, 17), "sum", False))
+        bound.to_code(bound.config_spec.default_config())
+    assert results and all(results)
+
+
+@pytest.mark.parametrize("extent", [17, "chunk_size"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_serial_scan_position_handles_symbolic_extent(extent, reverse):
+    from types import SimpleNamespace
+
+    from helion._compiler.cute.scan_ops import _cute_serial_scan_position
+
+    state = SimpleNamespace(device_function=SimpleNamespace(new_var=lambda name: name))
+    position, lines = _cute_serial_scan_position(state, "step", extent, reverse)
+    namespace = {"cutlass": SimpleNamespace(Int32=int), "chunk_size": 17}
+    actual = []
+    for step in range(17):
+        namespace["step"] = step
+        exec("\n".join(line.strip() for line in lines), namespace)
+        actual.append(namespace[position])
+    assert actual == list(range(16, -1, -1) if reverse else range(17))
 
 
 if __name__ == "__main__":

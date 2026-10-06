@@ -17,6 +17,7 @@ import torch
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
+from torch.utils._sympy.functions import FloorDiv
 
 from .. import exc
 from ..autotuner.config_fragment import ConfigSpecFragment
@@ -304,6 +305,33 @@ class TypeInfo:
         return self.contains_type((TensorType, TensorAttributeType))
 
 
+def _is_scaled_block_extent(expr: sympy.Basic) -> bool:
+    """A tile width scaled only by positive integer constants.
+
+    Preserve the relation needed by unpack/reshape/dot without exposing
+    partition counts (division by a block size) to singleton specialization.
+    The caller additionally requires a bounded slice and block-only symbols.
+    """
+    if isinstance(expr, sympy.Symbol):
+        return True
+    if isinstance(expr, sympy.Mul):
+        coefficient, extent = expr.as_coeff_Mul()
+        return (
+            coefficient.is_Integer is True
+            and coefficient > 0
+            and coefficient != 1
+            and _is_scaled_block_extent(extent)
+        )
+    if isinstance(expr, FloorDiv):
+        extent, divisor = expr.args
+        return (
+            divisor.is_Integer is True
+            and divisor > 0
+            and _is_scaled_block_extent(extent)
+        )
+    return False
+
+
 class TensorType(TypeInfo):
     fake_value: torch.Tensor
 
@@ -378,14 +406,26 @@ class TensorType(TypeInfo):
 
                 if self.origin.is_device():
                     output_sizes.append(output_size)
-                elif output_size != 1:
-                    # If all symbols in output_size are block size symbols, we reuse them
+                elif not env.is_singleton_size(output_size):
+                    # Explicit tile windows must retain their block-size
+                    # algebra (e.g. packed loads followed by reshape/dot).
+                    # Full/stepped allocation slices and partition counts keep
+                    # a reduction variable: their expression can have hint 1
+                    # while another config needs several elements, so exposing
+                    # it directly can specialize contiguity to a singleton.
                     if isinstance(output_size, torch.SymInt):
                         expr = output_size._sympy_()
                         if (
                             isinstance(expr, sympy.Expr)
                             and expr.free_symbols
                             and contains_only_block_size_symbols(expr)
+                            and (
+                                isinstance(expr, sympy.Symbol)
+                                or (
+                                    slice_obj.stop is not None
+                                    and _is_scaled_block_extent(expr)
+                                )
+                            )
                         ):
                             output_sizes.append(output_size)
                             continue

@@ -1647,7 +1647,7 @@ def _fragment_warp_reduction_config(bound, mode, tile):
     return config
 
 
-def _simulate_fragment_warp_reduction(source, inputs, outputs, blocks):
+def _simulate_fragment_warp_reduction(source, inputs, outputs, blocks, threads=128):
     """Execute emitted scalar programs with real 32-lane shuffle exchanges.
 
     Ordinary fragment element loops run each element once per phase. Cooperative
@@ -1755,18 +1755,21 @@ def _simulate_fragment_warp_reduction(source, inputs, outputs, blocks):
                 assert isinstance(start, ast.BinOp)
                 assert isinstance(start.left, ast.Name)
                 assert ast.literal_eval(start.right) == 32
-                assert ast.literal_eval(node.iter.args[2]) == 4
+                assert ast.literal_eval(node.iter.args[2]) == threads // 32
                 count = ast.literal_eval(node.iter.args[1])
                 ownership = [
-                    list(range(thread // 32, count, 4)) for thread in range(128)
+                    list(range(thread // 32, count, threads // 32))
+                    for thread in range(threads)
                 ]
-                for warp in range(4):
+                for warp in range(threads // 32):
                     assert all(
                         indices == ownership[warp * 32]
                         for indices in ownership[warp * 32 : (warp + 1) * 32]
                     )
                 assert Counter(
-                    index for thread in range(0, 128, 32) for index in ownership[thread]
+                    index
+                    for thread in range(0, threads, 32)
+                    for index in ownership[thread]
                 ) == Counter(range(count))
                 function = ast.parse("def _warp_element(_lane):\n    pass").body[0]
                 assert isinstance(function, ast.FunctionDef)
@@ -2377,13 +2380,14 @@ def _fragment_captured_conditional_missing(x: torch.Tensor, steps: int):
 
 
 @pytest.mark.parametrize("steps", [3, 4])
-def test_captured_conditional_missing_unchanged_output_rejects(steps):
+def test_captured_conditional_other_branch_supplies_unchanged_output(steps):
+    x = torch.ones(3, 17)
     with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
-            _fragment_captured_conditional_missing, (torch.ones(3, 17), steps)
-        )
-        with pytest.raises(exc.InvalidConfig, match="captured unchanged output"):
-            bound.to_code(_captured_reduction_config(bound, 1, 16))
+        bound = _cpu_bind(_fragment_captured_conditional_missing, (x, steps))
+        source = bound.to_code(_captured_reduction_config(bound, 1, 16))
+    actual = torch.full((3,), -1, dtype=torch.int32)
+    _simulate_independent_fragment(source, {"x": x, "steps": steps}, {"out": actual}, 3)
+    torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("steps", [1, 3])
@@ -2396,3 +2400,476 @@ def test_captured_conditional_explicit_outputs_keep_generated_values(steps):
     _simulate_independent_fragment(source, {"x": x, "steps": steps}, {"out": actual}, 3)
     expected = torch.full_like(actual, 2 if steps == 1 else 1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
+def test_fragment_threads_mixed_warp_reduction_cpu(threads, dtype):
+    x = _fragment_warp_reduction_inputs(3, 65, dtype, "max")
+    expected = _fragment_warp_reduction_reference(x, "max")
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_warp_reduction_mixed, (x, "max"))
+        config = _fragment_warp_reduction_config(bound, "warp", 16)
+        config.config["cute_fragment_threads"] = threads
+        source = bound.to_code(config)
+    assert f"block=({threads}, 1, 1)" in source
+    actual = tuple(torch.full_like(value, -9) for value in expected)
+    _simulate_fragment_warp_reduction(
+        source, {"x": x}, {"out": actual[0], "out_index": actual[1]}, 2, threads
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+def test_fragment_threads_native_mixed_reduction(threads):
+    x = _fragment_warp_reduction_inputs(3, 65, torch.int64, "max", "cuda")
+    bound = _fragment_warp_reduction_mixed.bind((x, "max"))
+    config = _fragment_warp_reduction_config(bound, "warp", 16)
+    config.config["cute_fragment_threads"] = threads
+    torch.testing.assert_close(
+        bound.compile_config(config)(x, "max"),
+        _fragment_warp_reduction_reference(x, "max"),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("kind", ["min", "max"])
+def test_fragment_threads_nan_order_cpu(threads, kind):
+    x = torch.full((3, 128), 0.5)
+    x[0, 0] = float("nan")
+    x[1, 33] = float("nan")
+    x[2, 127] = float("nan")
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_factored_tiled_reduction, (x, kind))
+        config = _fragment_warp_reduction_config(bound, "warp", 16)
+        config.config["cute_fragment_threads"] = threads
+        source = bound.to_code(config)
+    expected = _factored_tiled_reference(x, kind)
+    actual = torch.full_like(expected, -9)
+    _simulate_fragment_warp_reduction(source, {"x": x}, {"out": actual}, 2, threads)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("mode", ["serial", "cooperative"])
+def test_fragment_threads_native_scan(threads, mode):
+    from test.test_cute_fragment_scan_config import _computed_scan
+
+    x = torch.arange(3 * 5 * 65, device=DEVICE).reshape(3, 5, 65).to(torch.int64)
+    bound = _computed_scan.bind((x, 2, False))
+    config = bound.config_spec.default_config()
+    config.config.update(cute_fragment_threads=threads, cute_fragment_scan=mode)
+    actual, reused = bound.compile_config(config)(x, 2, False)
+    torch.testing.assert_close(actual, (x + 1).cumsum(2), rtol=0, atol=0)
+    torch.testing.assert_close(reused, (x + 1) * 2, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _physical_vector_capture(x: torch.Tensor, rows: int, steps: int):
+    out = torch.empty((rows,), dtype=torch.float32, device=x.device)
+    for row in hl.tile(rows):
+        vector = x[:]
+        total = hl.zeros([row], dtype=torch.float32)
+        for step in range(steps):
+            total += (vector + step).sum()
+        out[row] = total
+    return out
+
+
+@pytest.mark.parametrize(
+    "width,threads,native",
+    [(16, 16, True), (32, 32, True), (32, 16, False), (64, 64, False)],
+)
+def test_captured_vector_uses_complete_physical_lanes(width, threads, native):
+    x = torch.arange(width, dtype=torch.float32)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_physical_vector_capture, (x, 3, 3))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [1]
+        config.config["num_threads"] = [1, threads]
+        source = bound.to_code(config)
+    assert ("fragment_smem" not in source) == native
+    if native:
+        assert f"threads_in_group={width}" in source
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("width,threads", [(16, 16), (32, 32), (32, 16), (64, 64)])
+def test_captured_vector_physical_or_fragment_native(width, threads):
+    x = torch.arange(width, dtype=torch.float32, device=DEVICE)
+    expected = torch.full(
+        (3,), sum((x + step).sum().item() for step in range(3)), device=DEVICE
+    )
+    original = x.clone()
+    bound = _physical_vector_capture.bind((x, 3, 3))
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"] = [1]
+    config.config["num_threads"] = [1, threads]
+    actual = bound.compile_config(config)(x, 3, 3)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "options", [{"cute_fragment_reduction": "warp"}, {"cute_fragment_threads": 64}]
+)
+def test_physical_capture_preserves_explicit_fragment_modes(options):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_physical_vector_capture, (torch.ones(16), 3, 3))
+        config = bound.config_spec.default_config()
+        config.config.update(block_sizes=[1], num_threads=[1, 16], **options)
+        source = bound.to_code(config)
+    assert "fragment_smem" in source
+
+
+def test_physical_capture_vector_packets_keep_fragment_owner():
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_physical_vector_capture, (torch.ones(16), 3, 3))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            block_sizes=[1],
+            num_threads=[1, 16],
+            cute_vector_widths=[2] * len(bound.config_spec.cute_vector_widths),
+        )
+        source = bound.to_code(config)
+    assert "fragment_smem" in source
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_tensor_index_scan(x: torch.Tensor, mode: hl.constexpr):
+    out = torch.empty_like(x)
+    for _ in hl.grid(1):
+        row = hl.arange(x.size(0))
+        column = hl.arange(x.size(1))
+        if mode == "cartesian":
+            loaded = hl.load(x, [row, column])
+        elif mode == "masked":
+            loaded = hl.load(
+                x,
+                [row[:, None], column[None, :]],
+                extra_mask=(row[:, None] + column[None, :]) % 3 != 0,
+            )
+        else:
+            loaded = hl.load(x, [row[:, None], column[None, :]])
+        scanned = torch.cumsum(loaded + 1, dim=-1)
+        if mode == "reverse_store":
+            hl.store(out, [row[:, None], (x.size(1) - 1 - column)[None, :]], scanned)
+        else:
+            out[:, :] = scanned
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_nonconsecutive_tensor_index_scan(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for _ in hl.grid(1):
+        row = hl.arange(x.size(0))[:, None]
+        column = hl.arange(x.size(2))[None, :]
+        loaded = hl.load(x, [row, slice(None), column])
+        out[:, :, :] = torch.cumsum(loaded + 1, dim=-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_scalar_tensor_index_scan(x: torch.Tensor):
+    out = torch.empty((x.size(1), x.size(2)), device=x.device, dtype=x.dtype)
+    for _ in hl.grid(1):
+        row = hl.arange(x.size(1))[:, None]
+        column = hl.arange(x.size(2))[None, :]
+        loaded = hl.load(x, [1, row, column])
+        out[:, :] = torch.cumsum(loaded + 1, dim=-1)
+    return out
+
+
+def _tensor_index_source(kernel, args):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        return bound.to_code(bound.config_spec.default_config())
+
+
+@pytest.mark.parametrize("shape", [(3, 5), (17, 33), (1, 17), (17, 1)])
+@pytest.mark.parametrize("mode", ["broadcast", "cartesian", "masked", "reverse_store"])
+def test_fragment_tensor_index_generated_values(shape, mode):
+    x = (torch.arange(math.prod(shape)).reshape(shape) % 13).float()
+    before = x.clone()
+    source = _tensor_index_source(_fragment_tensor_index_scan, (x, mode))
+    actual = torch.full_like(x, -999)
+    values = x
+    if mode == "masked":
+        mask = (torch.arange(shape[0])[:, None] + torch.arange(shape[1])) % 3 != 0
+        values = torch.where(mask, values, 0)
+    expected = torch.cumsum(values + 1, -1)
+    if mode == "reverse_store":
+        expected = expected.flip(-1)
+    _simulate_independent_fragment(source, {"x": x}, {"out": actual}, 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+def test_fragment_nonconsecutive_and_scalar_tensor_indices(scalar):
+    x = (torch.arange(3 * 2 * 17).reshape(3, 2, 17) % 13).float()
+    kernel = (
+        _fragment_scalar_tensor_index_scan
+        if scalar
+        else _fragment_nonconsecutive_tensor_index_scan
+    )
+    expected = torch.cumsum((x[1] if scalar else x) + 1, -1)
+    actual = torch.full_like(expected, -999)
+    source = _tensor_index_source(kernel, (x,))
+    _simulate_independent_fragment(source, {"x": x}, {"out": actual}, 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("mode", ["broadcast", "cartesian", "masked", "reverse_store"])
+def test_fragment_tensor_index_native(mode):
+    x = (torch.arange(17 * 33, device=DEVICE).reshape(17, 33) % 13).float()
+    values = x
+    if mode == "masked":
+        mask = (
+            torch.arange(17, device=DEVICE)[:, None] + torch.arange(33, device=DEVICE)
+        ) % 3 != 0
+        values = torch.where(mask, x, 0)
+    expected = torch.cumsum(values + 1, -1)
+    if mode == "reverse_store":
+        expected = expected.flip(-1)
+    torch.testing.assert_close(
+        _fragment_tensor_index_scan(x, mode), expected, rtol=0, atol=0
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_loaded_tensor_index_scan(x, rows, columns):
+    out = torch.empty((rows.numel(), columns.numel()), device=x.device, dtype=x.dtype)
+    for _ in hl.grid(1):
+        row = rows[:][:, None]
+        column = columns[:][None, :]
+        loaded = hl.load(x, [row, column])
+        out[:, :] = torch.cumsum(loaded + 1, dim=-1)
+    return out
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_fragment_loaded_tensor_index_bounds_and_strides(transpose):
+    storage = (torch.arange(7 * 11).reshape(7, 11) % 13).float()
+    x = storage.t() if transpose else storage
+    rows = torch.tensor([x.size(0) - 1, 1, 0, 1, x.size(0)], dtype=torch.int64)
+    columns = torch.tensor([2, 0, x.size(1) - 1], dtype=torch.int64)
+    source = _tensor_index_source(
+        _fragment_loaded_tensor_index_scan, (x, rows, columns)
+    )
+    expected = torch.cat((x[rows[:-1]][:, columns], torch.zeros(1, columns.numel())))
+    expected = torch.cumsum(expected + 1, -1)
+    actual = torch.full_like(expected, -999)
+    # The generated pointer arithmetic sees underlying storage, with the actual
+    # strided input's compile-time strides retained in the generated code.
+    _simulate_independent_fragment(
+        source, {"x": storage, "rows": rows, "columns": columns}, {"out": actual}, 1
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+@skipUnlessBackends(["cute"])
+def test_fragment_tensor_index_native_rank3(scalar):
+    x = (torch.arange(3 * 2 * 17, device=DEVICE).reshape(3, 2, 17) % 13).float()
+    kernel = (
+        _fragment_scalar_tensor_index_scan
+        if scalar
+        else _fragment_nonconsecutive_tensor_index_scan
+    )
+    expected = torch.cumsum((x[1] if scalar else x) + 1, -1)
+    torch.testing.assert_close(kernel(x), expected, rtol=0, atol=0)
+
+
+def test_fragment_tensor_index_mapping_rejects_unowned_axes():
+    from helion._compiler.cute.fragment_indexing import memory_index_coordinates
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_tensor_index_scan, (torch.ones(3, 5), "broadcast"))
+        with bound.env:
+            index = torch.ones(2, 3, dtype=torch.int64)
+            for shape in ((4,), (1, 2)):
+                with pytest.raises(
+                    exc.BackendUnsupported, match="fragment tensor index"
+                ):
+                    memory_index_coordinates(bound.env, [index], {0: (2, 3)}, shape)
+            singleton = torch.ones(1, dtype=torch.int64)
+            with pytest.raises(exc.BackendUnsupported, match="fragment tensor index"):
+                memory_index_coordinates(bound.env, [singleton], {0: (1,)}, ())
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_conditional_cross_branch_capture(x: torch.Tensor, flag: int):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        values = torch.cumsum(x[row, :] + 1, dim=-1)
+        if flag > 0:
+            branch_temporary = values * 2
+            values = values + branch_temporary
+        out[row, :] = values
+    return out
+
+
+@pytest.mark.parametrize("flag", [-1, 1])
+def test_fragment_conditional_cross_branch_capture_preserves_branch_effects(flag):
+    x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
+    source = _tensor_index_source(_fragment_conditional_cross_branch_capture, (x, flag))
+    actual = torch.full_like(x, -999)
+    _simulate_independent_fragment(source, {"x": x, "flag": flag}, {"out": actual}, 3)
+    expected = torch.cumsum(x + 1, -1) * (3 if flag > 0 else 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_conditional_capture_effects(x: torch.Tensor, flag: int):
+    out = torch.empty_like(x)
+    effect = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        left = torch.cumsum(x[row, :] + 1, dim=-1)
+        right = left + 1
+        if flag > 0:
+            left = left + right
+            effect[row, :] = left * 2
+        else:
+            right = right - left
+            effect[row, :] = right * 3
+        out[row, :] = left + right
+    return out, effect
+
+
+@pytest.mark.parametrize("flag", [-1, 1])
+def test_fragment_conditional_capture_preserves_all_effects(flag):
+    x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
+    source = _tensor_index_source(_fragment_conditional_capture_effects, (x, flag))
+    outputs = {name: torch.full_like(x, -999) for name in ("out", "effect")}
+    _simulate_independent_fragment(source, {"x": x, "flag": flag}, outputs, 3)
+    left = torch.cumsum(x + 1, -1)
+    right = left + 1
+    if flag > 0:
+        left = left + right
+        effect = left * 2
+    else:
+        right = right - left
+        effect = right * 3
+    torch.testing.assert_close(outputs["out"], left + right, rtol=0, atol=0)
+    torch.testing.assert_close(outputs["effect"], effect, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["missing", "conflicting"])
+def test_fragment_conditional_outer_capture_proof_rejects_invalid_ir(kind):
+    original = FragmentCompiler.conditional
+
+    def corrupt_capture(compiler, node, values):
+        info = compiler.graphs[node.args[1]]
+        saved_outputs, saved_names, saved_args = (
+            info.branches_outputs,
+            info.else_arg_names,
+            node.args,
+        )
+        if kind == "missing":
+            info.branches_outputs = [(0, "unbound_outer_value")]
+        else:
+            info.else_arg_names = list(info.if_arg_names)
+            # A different outer node under the same lexical name is ambiguous.
+            conflicting = next(n for n in node.graph.nodes if n not in node.args[3])
+            node.args = (*node.args[:4], [conflicting])
+        try:
+            return original(compiler, node, values)
+        finally:
+            info.branches_outputs, info.else_arg_names, node.args = (
+                saved_outputs,
+                saved_names,
+                saved_args,
+            )
+
+    with (
+        patch.object(FragmentCompiler, "conditional", corrupt_capture),
+        pytest.raises(
+            exc.InvalidConfig,
+            match="captured unchanged output|conflicting outer captures",
+        ),
+    ):
+        _tensor_index_source(
+            _fragment_conditional_cross_branch_capture, (torch.ones(3, 17), 1)
+        )
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("flag", [-1, 1])
+def test_fragment_conditional_cross_branch_capture_native(flag):
+    x = (torch.arange(3 * 17, device=DEVICE).reshape(3, 17) % 7).float()
+    expected = torch.cumsum(x + 1, -1) * (3 if flag > 0 else 1)
+    torch.testing.assert_close(
+        _fragment_conditional_cross_branch_capture(x, flag), expected, rtol=0, atol=0
+    )
+
+
+_FRAGMENT_FIXED_CHUNK = 8
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_host_fixed_chunk_scan(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        for column in hl.tile(x.size(1), block_size=_FRAGMENT_FIXED_CHUNK):
+            out[row, column] = torch.cumsum(x[row, column], dim=-1)
+    return out
+
+
+def test_fragment_unresolved_fixed_extent_preserves_ordinary_owner():
+    from helion._compiler import generate_ast as generate_module
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_host_fixed_chunk_scan, (torch.ones(3, 17),))
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+        with patch.object(
+            generate_module.GenerateAST,
+            "_try_codegen_computed_fragment_root",
+            return_value=False,
+        ):
+            ordinary = bound.to_code(config)
+    assert "fragment_smem" not in source
+    assert ast.dump(ast.parse(source), include_attributes=False) == ast.dump(
+        ast.parse(ordinary), include_attributes=False
+    )
+
+
+@pytest.mark.parametrize("option", ["cute_fragment_scan", "cute_fragment_threads"])
+def test_fragment_unresolved_fixed_extent_rejects_explicit_owner(option):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_host_fixed_computed_scan, (torch.ones(3, 17),))
+        config = bound.config_spec.default_config()
+        config.config[option] = "cooperative" if option == "cute_fragment_scan" else 32
+        with pytest.raises(exc.InvalidConfig, match="computed fragment root"):
+            bound.to_code(config)
+
+
+@skipUnlessBackends(["cute"])
+def test_fragment_host_fixed_chunk_native():
+    x = (torch.arange(3 * 17, device=DEVICE).reshape(3, 17) % 7).float()
+    expected = torch.cat(
+        [
+            torch.cumsum(x[:, start : start + _FRAGMENT_FIXED_CHUNK], -1)
+            for start in range(0, 17, _FRAGMENT_FIXED_CHUNK)
+        ],
+        -1,
+    )
+    torch.testing.assert_close(
+        _fragment_host_fixed_chunk_scan(x), expected, rtol=0, atol=0
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_host_fixed_computed_scan(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        for column in hl.tile(x.size(1), block_size=_FRAGMENT_FIXED_CHUNK):
+            out[row, column] = torch.cumsum(x[row, column] + 1, dim=-1)
+    return out

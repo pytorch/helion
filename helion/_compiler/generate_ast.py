@@ -1647,6 +1647,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         captured_fragment
                         or (
                             self.device_function.config.get(
+                                "cute_fragment_register_loads", False
+                            )
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_register_load_root_ids
+                        )
+                        or (
+                            self.device_function.config.get(
+                                "cute_fragment_threads", 128
+                            )
+                            != 128
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_thread_root_ids
+                        )
+                        or (
+                            self.device_function.config.get(
                                 "cute_fragment_scan", "serial"
                             )
                             == "cooperative"
@@ -1710,16 +1725,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_suffix
                                 )
                             else:
-                                # The index and mask definitions a strategy
-                                # hoists ahead of its lane loops are the
-                                # body's whether or not it has any: a tile
-                                # widened to a sibling loop's launch keeps one
-                                # element per thread and parks them there.
+                                # A shared launch can require coordinate and
+                                # surplus-mask setup even with no lane loops.
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_prefix
                                 )
-                                grid_state.add_body_barriers(wrapped_body)
-                                self.statements_stack[-1].extend(wrapped_body)
+                                self.statements_stack[-1].extend(
+                                    grid_state.wrap_body(wrapped_body)
+                                )
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_suffix
                                 )
@@ -1900,6 +1913,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     resolve_pruned_lane_owners(
                         list(self.device_function.body),
                         self.device_function.cute_state.reshape_lane_fallbacks,
+                        physical_fallbacks=self.device_function.cute_state.reshape_physical_fallbacks,
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
                     )
                     self.device_function.body = normalize_nested_lane_reductions(
                         list(self.device_function.body),
