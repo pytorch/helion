@@ -12,6 +12,7 @@ from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..inductor_lowering import ReductionLowering
+from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -47,8 +48,6 @@ def fragment_warp_reduction_supported(node: Node) -> bool:
 
 
 def fragment_reduction_roots(env: CompileEnvironment, ir: DeviceIR) -> frozenset[int]:
-    from ..cute.computed_fragment import computed_fragment_supported
-
     return frozenset(
         root
         for root, graphs in fragment_root_regions(ir)
@@ -57,7 +56,7 @@ def fragment_reduction_roots(env: CompileEnvironment, ir: DeviceIR) -> frozenset
             for info in graphs
             for node in info.graph.nodes
         )
-        and computed_fragment_supported(env, graphs)
+        and computed_fragment_discovery_supported(env, graphs)
     )
 
 

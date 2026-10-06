@@ -91,6 +91,7 @@ from .register_snapshots import SnapshotOwner
 from .register_snapshots import snapshot_capture_slots
 from .register_snapshots import snapshot_chains
 from .register_snapshots import snapshot_logical_shape
+from .scan_helper import additive_scan_helper
 from .tcgen05_config import CuteTcgen05Config
 from .warp_results import warp_result_chain
 
@@ -374,6 +375,7 @@ def _selection_logical_shape(
         if target in (
             _tracing_ops._mask_to,
             _tracing_ops._new_var,
+            scan_ops._associative_scan,
             torch.ops.aten.alias.default,
             torch.ops.aten.clone.default,
             torch.ops.aten.view.dtype,
@@ -1851,6 +1853,26 @@ class FragmentCompiler:
                 extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
         return extent
 
+    def scan_axis_extent(self, node: Node, source: Fragment, dim: int) -> str:
+        """Intersect physical/tile bounds with the scan producer's proved domain."""
+        from .gather_domains import loop_domain_facts
+
+        fake = cast("torch.Tensor", node.meta["val"])
+        capacity = source.shape[dim]
+        extent = self.logical_axis_extent(fake, dim, capacity)
+        logical = _selection_logical_shape(
+            self.env,
+            cast("Node", node.args[1]),
+            scalar_indexed_loads=True,
+            tensor_indexed_loads=True,
+            proven_domains=loop_domain_facts(self.env, self.graphs).shapes,
+        )
+        if logical is not None and len(logical) == len(source.shape):
+            bound = logical[dim]
+            if not self.env.known_nonnegative(sympy.Add(bound, -capacity)):
+                extent = f"min({extent}, {self.sym(bound)})"
+        return extent
+
     def topk(self, node: Node, values: dict[Node, object]) -> tuple[Fragment, Fragment]:
         """Complete last-axis selection inside an existing uniform fragment owner.
 
@@ -2717,6 +2739,10 @@ class FragmentCompiler:
         from .resident_while import resident_while_plan
 
         plan = resident_while_plan(node, self.graphs)
+        if plan.composed and self.df.config.get(
+            "cute_fragment_register_snapshots", False
+        ):
+            raise exc.InvalidConfig("fresh control epochs retain shared captures")
         if node not in loop_domain_facts(self.env, self.graphs).resident_whiles:
             raise exc.InvalidConfig(
                 "resident while lacks complete logical/readonly proof"
@@ -2775,9 +2801,16 @@ class FragmentCompiler:
                 and not value.dependencies
                 and slot in snapshot_capture_slots(node, self.graphs, binding.source)
             )
-            captures.append(
-                value if keep_snapshot else self.materialize(value, copy=True)
-            )
+            captured = value if keep_snapshot else self.materialize(value, copy=True)
+            if plan.composed and id(value) in self.local_logical_sizes:
+                # The frame proof permits only completed readonly local captures.
+                # Preserve declared extent on the held shared copy, never its
+                # padded capacity; vector carries remain forbidden by the plan.
+                self.local_logical_sizes[id(captured)] = self.local_logical_sizes[
+                    id(value)
+                ]
+                self.local_storage.append(captured)
+            captures.append(captured)
         carries = [captures[slot] for _index, slot in plan.body.carry_map]
         predicate = self.allocate(Fragment((), torch.bool, lambda _: "False"))
         self.held.append(predicate)
@@ -2838,8 +2871,7 @@ class FragmentCompiler:
         result = self.allocate(source)
         dim = cast("int", node.args[2]) % len(source.shape)
         reverse = bool(node.args[3])
-        fake = cast("torch.Tensor", node.meta["val"])
-        extent = self.logical_axis_extent(fake, dim, source.shape[dim])
+        extent = self.scan_axis_extent(node, source, dim)
 
         def line(coords: tuple[str, ...]) -> None:
             total = self.df.new_var("fragment_scan")
@@ -2910,8 +2942,7 @@ class FragmentCompiler:
             )
         assert self.threads % 32 == 0
         reverse = bool(node.args[3])
-        fake = cast("torch.Tensor", node.meta["val"])
-        extent = self.logical_axis_extent(fake, dim, capacity)
+        extent = self.scan_axis_extent(node, source, dim)
         return self.warp_scan_fragment(
             source, dim, extent, reverse, export=node in self.scan_plans
         )
@@ -3210,8 +3241,7 @@ class FragmentCompiler:
         self.held.append(other)
         dim = cast("int", node.args[2]) % len(source.shape)
         reverse = bool(node.args[3])
-        fake = cast("torch.Tensor", node.meta["val"])
-        extent = self.logical_axis_extent(fake, dim, source.shape[dim])
+        extent = self.scan_axis_extent(node, source, dim)
 
         def initialize(coords: tuple[str, ...]) -> None:
             self.emit(
@@ -3283,11 +3313,40 @@ class FragmentCompiler:
                     )
 
     def conditional(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
-        local_inputs = (
-            uniform_local_branch_inputs(node, self.graphs)
-            if self.local_allocations
-            else None
-        )
+        composed_tree = None
+        try:
+            local_inputs = (
+                uniform_local_branch_inputs(node, self.graphs)
+                if self.local_allocations
+                else None
+            )
+        except exc.InvalidConfig:
+            local_inputs = None
+        if local_inputs is None and self.local_allocations:
+            from .uniform_region_tree import uniform_local_regions
+
+            try:
+                composed_tree = uniform_local_regions(self.graphs)
+            except exc.InvalidConfig:
+                pass
+            else:
+                members = [n for f in composed_tree.frames for n in f.graph.graph.nodes]
+                local_inputs = (
+                    frozenset(
+                        n
+                        for n in members
+                        if isinstance(n.meta.get("lowering"), ReductionLowering)
+                    ),
+                    frozenset(
+                        n for n in members if n.target is _tracing_ops._get_symnode
+                    ),
+                    frozenset(
+                        n
+                        for n in members
+                        if n.target is memory_ops.load
+                        and n not in {read.node for read in composed_tree.indexed_reads}
+                    ),
+                )
         if local_inputs is not None:
             reductions, symbols, loads = local_inputs
             if any(
@@ -3373,8 +3432,17 @@ class FragmentCompiler:
             for allocation in self.local_allocations
             for graph_id in node.args[1:3]
         )
+        if composed_tree is not None:
+            if self.df.config.get("cute_fragment_register_snapshots", False):
+                raise exc.InvalidConfig("composed control retains shared captures")
+            # Descendant fresh epochs require the same per-arm retirement even
+            # when an immediate arm owns no allocation itself.
+            branch_local = True
+        incoming_pending = self.pending_local_atomics.copy()
         branches: list[list[ast.AST]] = []
         for side in range(2):
+            if composed_tree is not None:
+                self.pending_local_atomics = incoming_pending.copy()
             branch = self.graphs[cast("int", node.args[1 + side])]
             captures = [
                 values[source] for source in cast("list[Node]", node.args[3 + side])
@@ -4012,7 +4080,7 @@ def computed_fragment_supported(
         from .resident_while import resident_while_plan
 
         try:
-            mutable_while = len(while_calls) == 1 and bool(
+            mutable_while = bool(
                 resident_while_plan(next(iter(while_calls)), graphs).local_allocations
             )
             if mutable_while:
@@ -4445,19 +4513,7 @@ def computed_fragment_supported(
                     return False
                 helper = graph_by_id[cast("int", node.args[0])]
                 assert isinstance(helper, HelperFunctionGraphInfo)
-                nodes = list(helper.graph.nodes)
-                if len(nodes) != 4:
-                    return False
-                lhs, rhs, add, output = nodes
-                if (
-                    lhs.op != "placeholder"
-                    or rhs.op != "placeholder"
-                    or add.target is not torch.ops.aten.add.Tensor
-                    or add.args not in ((lhs, rhs), (rhs, lhs))
-                    or add.kwargs.get("alpha", 1) != 1
-                    or output.op != "output"
-                    or output.args != (add,)
-                ):
+                if not additive_scan_helper(helper):
                     return False
             lowering = node.meta.get("lowering")
             if isinstance(
