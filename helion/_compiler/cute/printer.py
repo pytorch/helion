@@ -39,7 +39,13 @@ class HelionCutePrinter(HelionTritonPrinter):
 
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
-        return f"(({self._print_basic_expr(lhs)}) % ({self._print_basic_expr(rhs)}))"
+        left, right = self._print_basic_expr(lhs), self._print_basic_expr(rhs)
+        if (
+            lhs.is_nonnegative is True  # pyrefly: ignore[missing-attribute]
+            and rhs.is_positive is True  # pyrefly: ignore[missing-attribute]
+        ):
+            return f"(({left}) % ({right}))"
+        return f"_cute_python_mod({left}, {right})"
 
     def _print_PowByNatural(self, expr: sympy.Expr) -> str:
         raise exc.BackendUnsupported("cute", "unproved scalar integer power")

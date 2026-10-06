@@ -1325,6 +1325,32 @@ class GenerateASTFromInductor(DefaultHandler):
             # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
             return self.reciprocal(self.sqrt(x))
 
+    def _integer_shift(self, name: str, x: object, y: object) -> str:
+        dtype = self._expected_tensor_dtype()
+        if (
+            dtype is None
+            or CompileEnvironment.current().backend_name != "cute"
+            or dtype
+            not in (
+                torch.int8,
+                torch.uint8,
+                torch.int16,
+                torch.uint16,
+            )
+        ):
+            return self._default(name, (x, y), {})
+        # CuTe promotes a narrow integer combined with a Python shift count
+        # to Int32. Torch truncates each tensor operation to its result dtype,
+        # before any subsequent shift or conversion.
+        result = _unpack_opsvalue(getattr(self.parent_handler, name)(x, y))
+        return self._lift(self._create_cast_expr(expr_from_string(result), dtype))
+
+    def bitwise_left_shift(self, x0: object, x1: object) -> str:
+        return self._integer_shift("bitwise_left_shift", x0, x1)
+
+    def bitwise_right_shift(self, x0: object, x1: object) -> str:
+        return self._integer_shift("bitwise_right_shift", x0, x1)
+
     def neg(self, x: object) -> str:  # type: ignore[override]
         if CompileEnvironment.current().backend_name != "cute":
             return self._default("neg", (x,), {})

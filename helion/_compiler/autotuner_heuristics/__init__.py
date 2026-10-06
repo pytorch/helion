@@ -71,6 +71,8 @@ from .cute_fragment_scan import CuteFragmentScanHeuristic
 from .cute_fragment_scan import register_fragment_scan_coverage
 from .cute_fragment_threads import CuteFragmentThreadsHeuristic
 from .cute_fragment_threads import register_fragment_threads_coverage
+from .cute_fragment_warp_results import CuteFragmentWarpResultsHeuristic
+from .cute_fragment_warp_results import register_fragment_warp_results_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -164,6 +166,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentReductionHeuristic,
         CuteFragmentThreadsHeuristic,
         CuteFragmentRegisterLoadsHeuristic,
+        CuteFragmentWarpResultsHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -592,5 +595,8 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_register_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_warp_results_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )

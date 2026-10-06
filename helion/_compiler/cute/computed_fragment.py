@@ -49,22 +49,29 @@ from ..inductor_lowering import install_inductor_kernel_handlers
 from ..matmul_utils import _compute_out_dtype
 from ..matmul_utils import _needs_f32_accumulator
 from ..variable_origin import GridOrigin
+from ..variable_origin import HostOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
 from .captured_reduction import captured_reduction_coordinates
 from .captured_reduction import physical_capture_axes
+from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .fragment_expression import FragmentExpression
 from .fragment_indexing import memory_index_coordinates
 from .fragment_storage import aligned_shared_bytes
 from .fragment_storage import configured_fragment_expr
 from .fragment_storage import metadata_guarded
+from .free_iota_reduction import free_iota_reductions
+from .free_iota_reduction import owned_iota_reduction_axes
 from .independent_reduction import independent_reduction_coordinates
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
+from .local_atomic import terminal_finalizer_inputs
+from .local_atomic import terminal_loop_symbols
 from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
 from .tcgen05_config import CuteTcgen05Config
+from .warp_results import warp_result_chain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -219,7 +226,16 @@ class FragmentCompiler:
         self.local_allocations: frozenset[Node] = frozenset()
         self.local_logical_sizes: dict[int, int] = {}
         self.local_storage: list[Fragment] = []
+        self.pending_local_atomics: set[str] = set()
+        self.scalar_ordered_tickets: dict[Node, Fragment] = {}
         self.graphs = cg.codegen_graphs if graphs is None else graphs
+        self.warp_result_nodes: dict[Node, int] = {}
+        if self.df.config.get("cute_fragment_warp_results", False):
+            for graph in self.graphs:
+                for node in graph.graph.nodes:
+                    self.warp_result_nodes.update(
+                        warp_result_chain(node, self.env, self.threads)
+                    )
 
     def begin(self) -> None:
         self.allocator = self.df.new_var("fragment_smem")
@@ -302,8 +318,62 @@ class FragmentCompiler:
             return value.read(tuple("0" for _ in value.shape))
         return self.sym(value)
 
+    def host_stride(self, tensor: HostTensor, dim: int) -> str:
+        # Fresh wrapper allocations have configured symbolic strides, which
+        # need the fragment block-size resolver. Other host layouts must use
+        # the ordinary metadata argument/specialization proof: fake stride
+        # factors alone need not have a recoverable host symbol origin.
+        if self.env.tensor_layout_is_symbolically_exact(tensor.value) and all(
+            tensor.value.untyped_storage() != source.untyped_storage()
+            for source in self.env.input_sources
+        ):
+            return self.sym(tensor.value.stride(dim))
+        return self.df.tensor_stride(tensor.value, dim).name
+
     def emit(self, source: str) -> None:
         self.cg.add_statement(statement_from_string(source))
+
+    def synchronize(self) -> None:
+        self.emit("cute.arch.sync_threads()")
+        self.pending_local_atomics.clear()
+
+    def synchronize_local_atomics(self) -> None:
+        if self.pending_local_atomics:
+            self.synchronize()
+
+    def predicate(self, masks: list[str] | tuple[str, ...]) -> str:
+        """Bound SDK short-circuit AST expansion without changing mask order.
+
+        The CuTe preprocessor repeats the accumulated left operand in each
+        short-circuit check. A flat N-way conjunction therefore expands
+        exponentially even when its DAG is small. Name successive prefixes in
+        this exact lexical body; each binary conjunction keeps Python/DSL
+        short-circuit behavior, and no value is cached across a later mutation.
+        """
+        source = " and ".join(masks) or "True"
+        expression = expr_from_string(source)
+        if not isinstance(expression, ast.BoolOp):
+            return source
+        operands: list[ast.expr] = []
+
+        def flatten(value: ast.expr) -> None:
+            if isinstance(value, ast.BoolOp) and type(value.op) is type(expression.op):
+                for child in value.values:
+                    flatten(child)
+            else:
+                operands.append(value)
+
+        flatten(expression)
+        if len(operands) <= 3:
+            return source
+        operation = "and" if isinstance(expression.op, ast.And) else "or"
+        current = self.df.new_var("fragment_predicate")
+        self.emit(f"{current} = {ast.unparse(operands[0])}")
+        for operand in operands[1:]:
+            previous = current
+            current = self.df.new_var("fragment_predicate")
+            self.emit(f"{current} = {previous} {operation} ({ast.unparse(operand)})")
+        return current
 
     def dtype(self, dtype: torch.dtype) -> str:
         return self.env.backend.dtype_str(dtype)
@@ -392,6 +462,10 @@ class FragmentCompiler:
             self.smem_bytes += aligned_shared_bytes(count, value.dtype)
         else:
             capacity, name, index = selected
+            # A dead allocation can be recycled even when its last user was
+            # an unused atomic. Finish that lifetime before ordinary writes.
+            if name in self.pending_local_atomics:
+                self.synchronize_local_atomics()
             if capacity >= count:
                 count = capacity
             else:
@@ -435,7 +509,12 @@ class FragmentCompiler:
         body: Callable[[tuple[str, ...]], None],
         *,
         threads_per_element: int = 1,
+        warp_owned: bool = False,
+        synchronize: bool = True,
     ) -> None:
+        if warp_owned:
+            assert threads_per_element == 1
+            threads_per_element = 32
         assert threads_per_element in (1, 32)
         assert self.threads % threads_per_element == 0
         index = self.df.new_var("fragment_index")
@@ -450,9 +529,20 @@ class FragmentCompiler:
         assert isinstance(loop, ast.For)
         loop.body.clear()
         with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
-            body(self.coordinates(index, shape))
+            if warp_owned:
+                branch = cast(
+                    "ast.If",
+                    statement_from_string(f"if {self.thread} % 32 == 0:\n    pass"),
+                )
+                branch.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    body(self.coordinates(index, shape))
+                self.cg.add_statement(branch)
+            else:
+                body(self.coordinates(index, shape))
         self.cg.add_statement(loop)
-        self.emit("cute.arch.sync_threads()")
+        if synchronize:
+            self.synchronize()
 
     def copy(
         self, source: Fragment, target: Fragment, *, threads_per_element: int = 1
@@ -485,13 +575,11 @@ class FragmentCompiler:
         self.held.pop()
         return result
 
-    def atomic_add(self, node: Node, values: dict[Node, object]) -> None:
+    def atomic_add(self, node: Node, values: dict[Node, object]) -> Fragment | None:
         """Each contribution is owned once; barriers are outside lane loops."""
         target, indices, value, sem = cast(
             "tuple[object, object, object, object]", _resolve(node.args, values)
         )
-        if node.users or sem != "relaxed":
-            raise exc.InvalidConfig("fragment atomics require unused relaxed results")
         assert isinstance(target, (Fragment, HostTensor))
         assert isinstance(indices, (tuple, list))
         fake = cast("torch.Tensor", node.meta["val"])
@@ -504,12 +592,30 @@ class FragmentCompiler:
                 "fragment atomics require scalar/tensor indices for every axis"
             )
         local = isinstance(target, Fragment)
-        if local and (target.storage is None or len(target.shape) != 1):
+        if sem != "relaxed" and (local or target_fake.dtype != torch.int32):
+            raise exc.InvalidConfig(
+                "ordered fragment atomics require a global int32 target"
+            )
+        if node.users and (local or target_fake.dtype != torch.int32):
+            raise exc.InvalidConfig(
+                "fragment atomic results require a global int32 target"
+            )
+        if isinstance(target, Fragment) and (
+            target.storage is None or len(target.shape) != 1
+        ):
             raise exc.InvalidConfig("CTA-local atomics require direct resident storage")
         if target_fake.dtype not in (torch.float32, torch.int32):
             raise exc.InvalidConfig("fragment atomic add supports float32/int32")
 
-        def update(coords: tuple[str, ...]) -> None:
+        if sem in ("release", "acq_rel"):
+            # Each worker publishes its preceding global writes before any
+            # elected scalar/vector owner performs the release operation.
+            # A fence in only the owner would not publish other workers' writes.
+            # Both operations are collective, outside contribution masks/loops.
+            self.emit("cute.arch.fence_acq_rel_gpu()")
+            self.synchronize()
+
+        def logical_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
             masks = [
                 f"({coord}) < ({self.logical_axis_extent(fake, dim, shape[dim])})"
                 for dim, coord in enumerate(coords)
@@ -535,6 +641,42 @@ class FragmentCompiler:
                     for mask in index.broadcast_domain(coords):
                         if mask not in masks:
                             masks.append(mask)
+            return tuple(masks)
+
+        # The side effect is emitted once below, never embedded in a lazy
+        # element recipe. Repeated consumers read this immutable snapshot.
+        warp_groups = self.warp_result_nodes.get(node)
+        warp_owned = warp_groups is not None and math.prod(shape) == warp_groups
+        register = (
+            self.df.new_var("fragment_warp_atomic")
+            if node.users and warp_owned
+            else None
+        )
+        if register is not None:
+            self.emit(f"{register} = {self.cast('0', target_fake.dtype)}")
+        result = (
+            Fragment(
+                shape,
+                target_fake.dtype,
+                lambda _coords: cast("str", register),
+                True,
+                logical_domain=logical_domain,
+            )
+            if register is not None
+            else self.allocate(
+                Fragment(
+                    shape,
+                    target_fake.dtype,
+                    lambda coords: "0",
+                    logical_domain=logical_domain,
+                )
+            )
+            if node.users
+            else None
+        )
+
+        def update(coords: tuple[str, ...]) -> None:
+            masks = list(logical_domain(coords))
             positions = []
             for dim, index in enumerate(indices):
                 position = (
@@ -578,7 +720,7 @@ class FragmentCompiler:
                 scope = "cta"
             else:
                 offset = " + ".join(
-                    f"cutlass.Int64({position}) * cutlass.Int64({self.sym(target.value.stride()[dim])})"
+                    f"cutlass.Int64({position}) * cutlass.Int64({self.host_stride(target, dim)})"
                     for dim, position in enumerate(positions)
                 )
                 pointer = f"({target.name}.iterator + ({offset})).llvm_ptr"
@@ -588,12 +730,33 @@ class FragmentCompiler:
                 if isinstance(value, Fragment)
                 else self.scalar(value)
             )
-            self.emit(
-                f"if {' and '.join(masks) or 'True'}:\n"
-                f"    cute.arch.atomic_add({pointer}, {self.cast(contribution, target_fake.dtype)}, sem='relaxed', scope={scope!r})"
+            atomic = (
+                f"cute.arch.atomic_add({pointer}, "
+                f"{self.cast(contribution, target_fake.dtype)}, "
+                f"sem={sem!r}, scope={scope!r})"
             )
+            if result is None:
+                self.emit(f"if {self.predicate(masks)}:\n    {atomic}")
+            else:
+                previous = self.df.new_var("fragment_atomic_previous")
+                self.emit(f"{previous} = {self.cast('0', target_fake.dtype)}")
+                self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
+                self.emit(f"{result.read(coords)} = {previous}")
 
-        self.elements(shape, update)
+        self.elements(shape, update, warp_owned=warp_owned, synchronize=not local)
+        if local:
+            assert isinstance(target, Fragment) and target.storage is not None
+            self.pending_local_atomics.add(target.storage)
+        if register is not None:
+            # Preserve the existing atomic ordering barrier, including unrelated
+            # alias loads. Only the return-value exchange becomes warp-local.
+            self.emit(
+                f"if {self.thread} // 32 < {warp_groups}:\n"
+                f"    {register} = cute.arch.shuffle_sync({register}, 0, mask=0xffffffff, mask_and_clamp=31)"
+            )
+        if result is not None and not shape and sem in ("acquire", "acq_rel"):
+            self.scalar_ordered_tickets[node] = result
+        return result
 
     def memory(self, node: Node, values: dict[Node, object], store: bool) -> object:
         tensor = values[cast("Node", node.args[0])]
@@ -707,7 +870,7 @@ class FragmentCompiler:
                         expression = self.df.new_var("fragment_tensor_index")
                         self.emit(f"{expression} = {self.cast('0', value.dtype)}")
                         branch = statement_from_string(
-                            f"if {' and '.join(domain) or 'True'}:\n    pass"
+                            f"if {self.predicate(domain)}:\n    pass"
                         )
                         assert isinstance(branch, ast.If)
                         branch.body.clear()
@@ -726,17 +889,14 @@ class FragmentCompiler:
                 masks.append(mask_value.broadcast(coords))
             elif mask_value is not None:
                 masks.append(self.scalar(mask_value))
-            stride = tensor.value.stride()
             offset = (
                 " + ".join(
-                    f"cutlass.Int64({index}) * cutlass.Int64({self.sym(stride[dim])})"
+                    f"cutlass.Int64({index}) * cutlass.Int64({self.host_stride(tensor, dim)})"
                     for dim, index in enumerate(tensor_indices)
                 )
                 or "0"
             )
-            return f"({tensor.name}.iterator + ({offset}))", " and ".join(
-                masks
-            ) or "True"
+            return f"({tensor.name}.iterator + ({offset}))", self.predicate(masks)
 
         if store:
             value = _resolve(node.args[2], values)
@@ -755,7 +915,11 @@ class FragmentCompiler:
                     f"if {mask}:\n    {pointer}.store({self.cast(stored, tensor.value.dtype)})"
                 )
 
-            self.elements(shape, write)
+            self.elements(
+                shape,
+                write,
+                warp_owned=self.warp_result_nodes.get(node) == math.prod(shape),
+            )
             return None
 
         def load(coords: tuple[str, ...]) -> str:
@@ -1070,6 +1234,43 @@ class FragmentCompiler:
                         self.emit(f"{total} = {combine(total, peer)}")
                 return selected if indexed else self.cast(total, fake.dtype)
 
+            if node in self.warp_result_nodes:
+                groups = self.warp_result_nodes[node]
+                name = self.df.new_var("fragment_warp_reduction")
+                self.emit(f"{name} = {self.cast('0', fake.dtype)}")
+                branch = cast(
+                    "ast.If",
+                    statement_from_string(
+                        f"if {self.thread} // 32 < {groups}:\n    pass"
+                    ),
+                )
+                branch.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    coords = self.coordinates(
+                        f"{self.thread} // 32", self.shape(fake.shape)
+                    )
+                    if warp:
+                        self.emit(f"{name} = {reduce(coords)}")
+                    else:
+                        leader = cast(
+                            "ast.If",
+                            statement_from_string(
+                                f"if {self.thread} % 32 == 0:\n    pass"
+                            ),
+                        )
+                        leader.body.clear()
+                        with self.cg.set_statements(cast("list[ast.AST]", leader.body)):
+                            self.emit(f"{name} = {reduce(coords)}")
+                        self.cg.add_statement(leader)
+                        self.emit(
+                            f"{name} = cute.arch.shuffle_sync({name}, 0, mask=0xffffffff, mask_and_clamp=31)"
+                        )
+                self.cg.add_statement(branch)
+                # Keep the existing lifetime/mutation ordering boundary.
+                self.synchronize()
+                return Fragment(
+                    self.shape(fake.shape), fake.dtype, lambda _coords: name, True
+                )
             return self.materialize(
                 Fragment(
                     self.shape(fake.shape),
@@ -1116,6 +1317,18 @@ class FragmentCompiler:
             self.df.resolved_block_size(bid) != 1 for bid in graph.block_ids
         ):
             raise exc.InvalidConfig("CTA-local atomics require uniform scalar loops")
+        loop_index_type = "Int32"
+        if self.local_allocations:
+            parent, _slot = control_flow_parent_entries(self.graphs)[graph_id]
+            owner = next(info for info in self.graphs if info.graph is parent.graph)
+            if isinstance(owner, IfGraphInfo):
+                self.uniform_finalizer_symbols(
+                    terminal_loop_symbols(node, self.graphs), set(graph.block_ids)
+                )
+                # A proved scalar finalizer loop accepts runtime host integers.
+                # Keep their signed 64-bit range through its induction variable;
+                # narrowing to tile-index Int32 changes bounds and body indices.
+                loop_index_type = "Int64"
         args = [values[x] for x in cast("list[Node]", node.args[3])]
         placeholders = list(graph.graph.find_nodes(op="placeholder"))
         output_node = graph.graph.find_nodes(op="output")[0]
@@ -1183,6 +1396,9 @@ class FragmentCompiler:
                     self.copy(source, target)
             self.held.pop()
             self.held.pop()
+            # The backedge can revisit the same atomic target. Finish this
+            # iteration's epoch even when no loop carry was materialized.
+            self.synchronize_local_atomics()
         for index in reversed(range(len(graph.block_ids))):
             bid = graph.block_ids[index]
             begin = cast("list[object]", node.args[1])[index]
@@ -1195,7 +1411,7 @@ class FragmentCompiler:
                         values[explicit] if isinstance(explicit, Node) else explicit
                     )
             loop = statement_from_string(
-                f"for {self.offsets[bid]} in range(cutlass.Int32({start}), cutlass.Int32({self.bounds[bid]}), {step}):\n    pass"
+                f"for {self.offsets[bid]} in range(cutlass.{loop_index_type}({start}), cutlass.{loop_index_type}({self.bounds[bid]}), {step}):\n    pass"
             )
             assert isinstance(loop, ast.For)
             loop.body = cast("list[ast.stmt]", body)
@@ -1311,7 +1527,47 @@ class FragmentCompiler:
         self.held.pop()
         return current
 
+    def uniform_finalizer_symbols(
+        self, nodes: frozenset[Node], loop_blocks: set[int] | None = None
+    ) -> None:
+        for node in nodes:
+            value = node.meta["val"]
+            expression = value._sympy_() if isinstance(value, torch.SymInt) else value
+            for symbol in sympy.sympify(expression).free_symbols:
+                entry = HostFunction.current().expr_to_origin.get(symbol)
+                origin = entry.origin if entry is not None else None
+                if not isinstance(origin, HostOrigin) and not (
+                    type(origin) is GridOrigin
+                    and (
+                        origin.block_id in self.offsets
+                        or loop_blocks is not None
+                        and origin.block_id in loop_blocks
+                    )
+                    and self.df.resolved_block_size(origin.block_id) == 1
+                ):
+                    raise exc.InvalidConfig(
+                        "local finalizer requires proved uniform scalar origins"
+                    )
+
     def conditional(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
+        if self.local_allocations:
+            tickets, symbols = terminal_finalizer_inputs(node, self.graphs)
+            predicate_value = values[cast("Node", node.args[0])]
+            predicate_buffers = self.referenced_buffers([predicate_value])
+            for ticket in tickets:
+                result = self.scalar_ordered_tickets.get(ticket)
+                if (
+                    result is None
+                    or result.shape != ()
+                    or not result.resident
+                    or result.storage is None
+                    or result.storage not in predicate_buffers
+                    or ticket in self.warp_result_nodes
+                ):
+                    raise exc.InvalidConfig(
+                        "local finalizer requires one shared scalar ticket and CTA broadcast"
+                    )
+            self.uniform_finalizer_symbols(symbols)
         info = self.graphs[cast("int", node.args[1])]
         assert isinstance(info, IfGraphInfo)
         assert info.branches_outputs is not None
@@ -1434,6 +1690,39 @@ class FragmentCompiler:
             sequence, index = args
             assert isinstance(sequence, (list, tuple)) and isinstance(index, int)
             return sequence[index]
+        # CTA-local targets have a proved initialize/update/final-read lifetime.
+        # Coalesce only updates to disjoint targets. Repeated updates to one
+        # target retain their collective epoch boundary, including floating
+        # association across threads. Finish pending writes before a read,
+        # storage reuse, or conservative effect boundary.
+        # Alias-only nodes above do not access memory. Check physical storage,
+        # including lazy dependencies, so consumers cannot hide an alias.
+        local_update = (
+            target is atomic_ops.atomic_add
+            and isinstance(args[0], Fragment)
+            and id(args[0]) in self.local_logical_sizes
+            and not node.users
+        )
+        read_args = args[1:] if local_update else args
+        if (
+            target is _tracing_ops._if
+            or _tracing_ops.is_for_loop_target(target)
+            or (target is atomic_ops.atomic_add and not local_update)
+            or (
+                local_update
+                and cast("Fragment", args[0]).storage in self.pending_local_atomics
+            )
+            or self.pending_local_atomics
+            & self.referenced_buffers(
+                [
+                    *read_args,
+                    *(_resolve(value, values) for value in node.kwargs.values()),
+                ]
+            )
+        ):
+            # A loop can execute zero times. Never let a barrier generated only
+            # in its body discharge a write from before that loop.
+            self.synchronize_local_atomics()
         if target is _tracing_ops._if:
             return self.conditional(node, values)
         if _tracing_ops.is_for_loop_target(target):
@@ -1560,7 +1849,10 @@ class FragmentCompiler:
             source_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
 
             def masked(coords: tuple[str, ...]) -> str:
-                masks = []
+                # A local allocation can have padded physical capacity while
+                # retaining its declared logical domain. Its initialized pad
+                # values are not necessarily neutral for this reduction.
+                masks = list(source.domain(coords)) if source.logical_domain else []
                 for coord, size in zip(coords, source_fake.shape, strict=True):
                     bid = self.env.resolve_block_id(size)
                     if bid is None:
@@ -1573,7 +1865,7 @@ class FragmentCompiler:
                         masks.append(
                             f"(({coord}) < ({self.sym(self.env.block_sizes[bid].numel)}))"
                         )
-                mask = " and ".join(masks) or "True"
+                mask = self.predicate(masks)
                 return f"({self.cast(source.read(coords), fake.dtype)} if {mask} else {self.cast(self.scalar(args[1]), fake.dtype)})"
 
             return Fragment(
@@ -1697,6 +1989,7 @@ def computed_fragment_supported(
     graphs: list[GraphInfo],
     *,
     physical_axes: frozenset[int] = frozenset(),
+    owned_iota_axes: frozenset[int] = frozenset(),
 ) -> bool:
     """Structural root ownership shared by search discovery and code generation.
 
@@ -1714,6 +2007,11 @@ def computed_fragment_supported(
         return False
     graph_by_id = {info.graph_id: info for info in graphs}
     independent_reductions = independent_reduction_coordinates(env, graphs)
+    free_reductions = {
+        node
+        for node in free_iota_reductions(env, graphs)
+        if node.meta["lowering"].block_index not in owned_iota_axes
+    }
     captured_reductions = captured_reduction_coordinates(
         env, graphs, physical_axes=physical_axes
     )
@@ -1806,6 +2104,7 @@ def computed_fragment_supported(
             node in local_allocations
             or node in independent_reductions
             or node in captured_reductions
+            or node in free_reductions
         ):
             return True
         if node.target is _tracing_ops._host_tensor:
@@ -2069,11 +2368,29 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_register_loads", False)
         and root.graph_id in env.config_spec.cute_fragment_register_load_root_ids
     )
+    warp_results_required = (
+        cg.device_function.config.get("cute_fragment_warp_results", False)
+        and root.graph_id in env.config_spec.cute_fragment_warp_result_root_ids
+    )
     local_required = bool(local_atomic_allocations(cg.host_function.device_ir.graphs))
+    owned_iota_axes = (
+        frozenset()
+        if threads_required
+        or register_loads_required
+        or cg.device_function.config.get("cute_fragment_reduction", "serial")
+        != "serial"
+        else owned_iota_reduction_axes(cg)
+    )
+    free_required = any(
+        node.graph is cg.host_function.device_ir.graphs[root.graph_id].graph
+        and node.meta["lowering"].block_index not in owned_iota_axes
+        for node in free_iota_reductions(env, cg.host_function.device_ir.graphs)
+    )
     physical_axes = (
         frozenset()
         if threads_required
         or register_loads_required
+        or warp_results_required
         or cg.device_function.config.get("cute_fragment_scan", "serial") != "serial"
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
         != "serial"
@@ -2087,25 +2404,95 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             physical_axes=physical_axes,
         )
     )
+    fragment_schedule_required = (
+        threads_required
+        or register_loads_required
+        or warp_results_required
+        or (
+            cg.device_function.config.get("cute_fragment_scan", "serial")
+            == "cooperative"
+            and root.graph_id in env.config_spec.cute_fragment_scan_root_ids
+        )
+        or (
+            cg.device_function.config.get("cute_fragment_reduction", "serial") == "warp"
+            and root.graph_id in env.config_spec.cute_fragment_reduction_root_ids
+        )
+    )
+    state = cg.device_function.cute_state
+    if any(
+        plan is not None
+        for plan in (
+            state.block_scaled_plan,
+            state.chunk_prepare_plan,
+            state.chunk_recurrence_plan,
+            state.single_token_rank1_plan,
+            state.split_single_token_rank1_plan,
+            state.fixed_token_rank1_plan,
+            state.attention_flash_block_ids,
+            state.attention_flash_bwd_block_ids,
+        )
+    ):
+        # Pre-codegen selected a complete root owner. It must execute its
+        # late layout/alias checks; an implicit coordinate requirement must
+        # not bypass those checks by replacing its producer with fragments.
+        if local_required or fragment_schedule_required:
+            raise exc.InvalidConfig(
+                "a planned root cannot share a computed fragment schedule"
+            )
+        return False
+    if free_required:
+        # A new complete owner changes the placement of global stores relative
+        # to vector reductions. Separate destinations need a disjointness
+        # proof; declining into the unowned scalar iota path would lose the
+        # complete reduction. Repeated stores through one tensor retain their
+        # existing ordered semantics.
+        destinations = {
+            cg.device_function.tensor_arg(target.meta["val"]).name
+            for info in cg.host_function.device_ir.graphs
+            for node in info.graph.nodes
+            if node.target is memory_ops.store
+            and isinstance(target := node.args[0], Node)
+            and isinstance(target.meta.get("val"), torch.Tensor)
+            and target.meta["val"] in HostFunction.current().tensor_to_origin
+        }
+        disjoint = cg.device_function.proven_disjoint_tensor_pairs()
+        if any(
+            frozenset((left, right)) not in disjoint
+            for left in destinations
+            for right in destinations
+            if left < right
+        ):
+            if local_required or fragment_schedule_required:
+                raise exc.InvalidConfig(
+                    "fragment store destinations require disjoint storage"
+                )
+            raise exc.BackendUnsupported(
+                "cute", "fragment store destinations require disjoint storage"
+            )
+    if (
+        cg.device_function.config.get(
+            "cute_affine_scan_schedule", DIRECT_AFFINE_ORDINARY_SCHEDULE
+        )
+        != DIRECT_AFFINE_ORDINARY_SCHEDULE
+    ):
+        # The direct affine schedule must first emit its ordinary producer,
+        # then prove and replace that entire region. Implicit free-iota and
+        # capture ownership must not erase the producer before that proof.
+        if (
+            local_required
+            or fragment_schedule_required
+            or cg.device_function.config.get("cute_reduction_schedule", "scalar")
+            != "scalar"
+        ):
+            raise exc.InvalidConfig(
+                "direct affine schedules cannot share a computed fragment root"
+            )
+        return False
     if cg.device_function.config.get("cute_reduction_schedule", "scalar") != "scalar":
         # An explicit resident schedule owns its rectangular carries and
         # performs its own complete proof during materialization. Replacing
         # its scalar producer here erases the structure that proof consumes.
-        if (
-            local_required
-            or threads_required
-            or register_loads_required
-            or (
-                cg.device_function.config.get("cute_fragment_scan", "serial")
-                == "cooperative"
-                and root.graph_id in env.config_spec.cute_fragment_scan_root_ids
-            )
-            or (
-                cg.device_function.config.get("cute_fragment_reduction", "serial")
-                == "warp"
-                and root.graph_id in env.config_spec.cute_fragment_reduction_root_ids
-            )
-        ):
+        if local_required or free_required or fragment_schedule_required:
             raise exc.InvalidConfig(
                 "resident reduction schedules cannot share a computed fragment root"
             )
@@ -2119,7 +2506,16 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             raise exc.InvalidConfig(
                 "CTA-local atomics require a complete fragment root"
             )
-        if captured_required or threads_required or register_loads_required:
+        if free_required:
+            raise exc.InvalidConfig(
+                "free iota reductions require a complete fragment root"
+            )
+        if (
+            captured_required
+            or threads_required
+            or register_loads_required
+            or warp_results_required
+        ):
             raise exc.InvalidConfig(
                 "captured full reductions require a computed fragment root"
                 if captured_required
@@ -2130,7 +2526,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
-        if captured_required or local_required
+        if captured_required or local_required or free_required
         else cg.codegen_graphs
     )
 
@@ -2146,6 +2542,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
 
     def decline() -> bool:
+        if free_required:
+            raise exc.InvalidConfig(
+                "free iota reductions require a supported complete fragment root"
+            )
         if local_required:
             raise exc.InvalidConfig(
                 "CTA-local atomics require a supported complete fragment root"
@@ -2156,6 +2556,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or reduction_required
             or threads_required
             or register_loads_required
+            or warp_results_required
         ):
             raise exc.InvalidConfig(
                 "captured full reductions require a computed fragment root"
@@ -2181,18 +2582,24 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     ):
         return decline()
     if not computed_fragment_supported(
-        CompileEnvironment.current(), graphs, physical_axes=physical_axes
+        CompileEnvironment.current(),
+        graphs,
+        physical_axes=physical_axes,
+        owned_iota_axes=owned_iota_axes,
     ):
         return decline()
     # This owner implements configured reduction tiling directly. Keep the
     # logical producer graph, including every other codegen transformation,
     # rather than applying scalar graph rolling before fragment ownership.
-    if not captured_required and not local_required:
+    if not captured_required and not local_required and not free_required:
         graphs = cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
     if not computed_fragment_supported(
-        CompileEnvironment.current(), graphs, physical_axes=physical_axes
+        CompileEnvironment.current(),
+        graphs,
+        physical_axes=physical_axes,
+        owned_iota_axes=owned_iota_axes,
     ):
         return decline()
     root = graphs[root.graph_id]
@@ -2265,6 +2672,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     with cg.set_statements(body):
         compiler.emit(f"{compiler.thread} = cutlass.Int32(cute.arch.thread_idx()[0])")
         compiler.graph(root.graph, {})
+        # Root lifetime can be nested in an outer generated grid loop.
+        compiler.synchronize_local_atomics()
     capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(compiler.env.device)
     if local_required and not capacity:
         raise exc.InvalidConfig(
