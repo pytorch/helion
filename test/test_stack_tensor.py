@@ -273,5 +273,76 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
             assert tensor.eq(i).all().item()
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _stack_memory_proof_kernel(x, dev_ptrs, write: hl.constexpr):
+    count = hl.specialize(dev_ptrs.size(0))
+    out = torch.empty((count, x.size(0)), dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0), block_size=4):
+        tensors = hl.stacktensor_like(x, dev_ptrs[:])
+        if write:
+            tensors[tile] = x[tile][None, :]
+            out[:, tile] = x[tile][None, :]
+        else:
+            out[:, tile] = tensors[tile]
+    return out
+
+
+class TestStackTensorOwnershipCPU(TestCase):
+    def test_indirect_memory_keeps_load_ownership_conservative(self):
+        from unittest.mock import patch
+
+        from torch.fx import Node
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.local_atomic import _reachable_graphs
+        from helion._compiler.cute.register_loads import host_load_is_readonly
+        from helion._compiler.cute.register_loads import lane_private_load
+        from helion.language import memory_ops
+
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        ):
+            for width in (5, 16):
+                for write in (False, True):
+                    with self.subTest(width=width, write=write):
+                        x = torch.arange(width).float()
+                        pointers = torch.zeros(3, dtype=torch.uint64)
+                        bound = _cpu_bind(
+                            _stack_memory_proof_kernel, (x, pointers, write)
+                        )
+                        code = bound.to_code(bound.config_spec.default_config())
+                        self.assertTrue(code)
+                        host = bound.host_function
+                        graphs = _reachable_graphs(host.device_ir.graphs)
+                        loads = [
+                            node
+                            for graph in graphs
+                            for node in graph.graph.nodes
+                            if node.target is memory_ops.load
+                        ]
+                        checked = 0
+                        with bound.env, host:
+                            for load in loads:
+                                if write or not isinstance(load.args[0], Node):
+                                    # A disjoint pointer array says nothing about
+                                    # its pointees. Indirect writes can alias x.
+                                    self.assertFalse(
+                                        host_load_is_readonly(load, bound.env, graphs)
+                                    )
+                                    if not isinstance(load.args[0], Node):
+                                        self.assertFalse(
+                                            lane_private_load(load, bound.env)
+                                        )
+                                    checked += 1
+                        self.assertGreater(checked, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

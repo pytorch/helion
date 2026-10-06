@@ -99,6 +99,7 @@ def _without_later_fragment_coverage():
             "register_integer_loop_reduction_coverage",
             "register_fragment_integer_atomic_epochs_coverage",
             "register_fragment_packet_loads_coverage",
+            "register_fragment_register_producers_coverage",
         ):
             stack.enter_context(
                 patch("helion._compiler.autotuner_heuristics." + registration)
@@ -310,6 +311,7 @@ def test_scan_search_full_neighbors_and_random_mutation_reach_both_modes():
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_scan_coverage_honors_explicit_legacy_override_and_disabled_heuristics(
     disabled,
 ):
@@ -521,6 +523,7 @@ def test_fragment_reduction_coverage_preserves_original_population_and_rng(strat
 
 
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_neighbors_random_mutation_and_overrides():
     bound = _bind_reduction()
     generation = bound.config_spec.create_config_generation()
@@ -579,6 +582,7 @@ def _scan_and_fragment_reduction(x: torch.Tensor):
 
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
@@ -797,6 +801,7 @@ def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents(
 
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_resource_carrier_builds_catalog_only_once():
     from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,

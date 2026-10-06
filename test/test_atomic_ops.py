@@ -685,7 +685,8 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             # is tile-dependent and therefore has no supported local owner.
             error = helion.exc.InvalidConfig
             message = (
-                "CTA-local atomics require a constant one-dimensional root allocation"
+                "CTA-local atomics require a constant one-dimensional root/arm "
+                "allocation of int32/float32"
             )
         with self.assertRaisesRegex(error, message):
             kernel(x)
