@@ -961,6 +961,7 @@ class _FakeCuteReductionCodegen(GenerateAST):
         }
         self.current_grid_state = None
         self.max_thread_block_dims = [3, 16, 1]
+        self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
         self.statements: list[object] = []
 
     def add_statement(self, stmt: object) -> None:
@@ -24552,6 +24553,49 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
             backend.reduction_index_expr("bs", "cutlass.Int32", 0, axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.thread_linear_index_expr({0: 4, 3: 4})
+
+
+@onlyBackends(["cute"])
+class TestCuteMultiAxisKContraction(unittest.TestCase):
+    """The shared-memory K sum of the scalar matmul fallback groups partials by
+    every launch axis, not only the x lane."""
+
+    def test_multi_axis_k64_contraction_matches_reference(self) -> None:
+        """M=8 rows and N=16 cols on free ``hl.arange`` thread axes next to a
+        64-thread K axis launch a (64, 8, 2) block.  The shared-memory K sum
+        must group partials per (y, z) row, not per x lane only.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[]),
+            static_shapes=True,
+        )
+        def dot_m8_n16(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = q.size(0)
+            C = hl.specialize(q.size(1))
+            out = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
+            for tile_bhn in hl.tile(BHN, block_size=1):
+                rows = hl.arange(8)
+                cols = hl.arange(16)
+                a = hl.dot(
+                    q[tile_bhn, rows, :].float() * 2.0,
+                    (k[tile_bhn, cols, :].float() * 0.5).transpose(-2, -1),
+                )
+                out[tile_bhn, rows, cols] = a
+            return out
+
+        q = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        code = dot_m8_n16.bind((q, k)).to_code(helion.Config(block_sizes=[]))
+        self.assertIn("block=(64, 8, 2)", code)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+        out = dot_m8_n16(q, k)
+        ref = torch.zeros(4, 64, 64, device=DEVICE)
+        ref[:, :8, :16] = torch.bmm(
+            q[:, :8].float() * 2.0, (k[:, :16].float() * 0.5).transpose(-2, -1)
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

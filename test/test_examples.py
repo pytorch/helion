@@ -391,7 +391,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfFn(
         lambda: _get_backend() == "cute",
-        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
+        "CuTe lane reduction over a dynamic-shape full-slice N (400) is nested in "
+        "a different lane owner (BackendUnsupported); static shapes are covered",
     )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
@@ -2259,6 +2260,41 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             fn_name="jagged_layer_norm_kernel",
             block_sizes=[4, 8, 8, 8, 8, 8, 8],
+        )
+
+    @skipIfFn(
+        lambda: _get_backend() != "cute",
+        "CuTe lane-reduction coverage for the example's default shape",
+    )
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_layer_norm_lane_split(self):
+        # M=32 features over 16-wide tiles gives a 16-lane / 1-thread lane
+        # loop whose per-lane row sums are updated by the inner jagged loop
+        # under an SSA alias before the lane reduction feeds the carried mean.
+        num_rows, max_cols, M = 16, 32, 32
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        eps = 1e-6
+        args = (x_data, x_offsets, eps)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
+        expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
+
+        check_example(
+            "jagged_layer_norm",
+            args,
+            expected,
+            fn_name="jagged_layer_norm_kernel",
+            block_sizes=[16] * 7,
+            atol=1e-3,
+            rtol=1e-3,
         )
 
     def test_exp_fwd(self):
