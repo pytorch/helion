@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .handoff import HandoffMeasurement
+    from .handoff import HandoffPoint
     from .metrics import KernelMetadata
 
 else:
@@ -235,6 +237,52 @@ class AutotuningLogger:
             )
 
     @_logging_errors()
+    def record_handoff(self, point: HandoffPoint) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "handoff",
+                self._trace_algorithm,
+                reason=point.reason,
+                config_id=canonical_config_id(point.config),
+                config=point.config.config,
+                source_hash=point.finalists[0].source_hash,
+                objective_unit=point.objective_unit,
+                objective=point.finalists[0].perf,
+                perf_ms=point.finalists[0].perf
+                if point.objective_unit == "ms"
+                else None,
+                trials=point.progress.trials,
+                unique_sources=point.progress.unique_sources,
+                samples=point.finalists[0].samples,
+            )
+
+    @_logging_errors()
+    def record_handoff_measurement(
+        self,
+        measurement: HandoffMeasurement,
+        objective_unit: str,
+        *,
+        completed_at: float | None = None,
+    ) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "handoff_confirmation",
+                measurement.algorithm,
+                completed_at=completed_at,
+                config_id=canonical_config_id(measurement.config),
+                config=measurement.config.config,
+                source_hash=measurement.source_hash,
+                status=measurement.status,
+                objective=measurement.perf,
+                objective_unit=objective_unit,
+                per_shape_ms=[
+                    value if math.isfinite(value) else None
+                    for value in measurement.per_shape
+                ],
+                per_shape_statuses=measurement.per_shape_statuses,
+            )
+
+    @_logging_errors()
     def record_llm_request(self, **fields: object) -> _LLMTraceRequest | None:
         trace = self._trace_sink
         if trace is None:
@@ -260,6 +308,8 @@ class AutotuningLogger:
     @contextlib.contextmanager
     def autotune_tracing(self, algorithm: str) -> Iterator[None]:
         """Trace an entire search, sharing the clock across nested search stages."""
+        from .handoff import _HandoffStop
+
         filename = self._settings.autotune_log
         if (
             not self._settings.autotune_log_details
@@ -295,6 +345,9 @@ class AutotuningLogger:
             try:
                 yield
                 status = "ok"
+            except _HandoffStop:
+                status = "handoff"
+                raise
             finally:
                 if active is not None:
                     with _logging_errors():

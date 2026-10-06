@@ -441,6 +441,9 @@ class BenchmarkResult(NamedTuple):
     # Monotonic completion time, captured before later trials in the batch.
     # Optional for compatibility with custom benchmark providers.
     completed_at: float | None = None
+    # Per-result evidence survives later measurements of normalized aliases.
+    per_shape: tuple[float, ...] = ()
+    per_shape_statuses: tuple[str, ...] = ()
 
 
 class IsolatedBenchmarkFailure(NamedTuple):
@@ -2635,6 +2638,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                     if all(result.completed_at is not None for result in row)
                     else time.perf_counter()
                 ),
+                per_shape=timing_tuple,
+                per_shape_statuses=statuses,
             )
             results[config_index] = result
             if self._collect_effective_source_repairs and not math.isfinite(perf):
@@ -2706,6 +2711,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                         status="deduplicated",
                         compile_time=None,
                         completed_at=repair.completed_at,
+                        per_shape=tuple(repaired_timings),
+                        per_shape_statuses=tuple(repaired_statuses),
                     )
                 self._original_configs_by_materialized_key.pop(key, None)
                 self._anchor_fns_by_materialized_key.pop(key, None)
@@ -2812,7 +2819,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 generation=self._autotune_metrics.num_generations,
                 status=result.status,
                 perf_ms=(
-                    self.raw_latency(result.config)
+                    _aggregate_values(result.per_shape, self.args.aggregation)
                     if math.isfinite(result.perf)
                     else None
                 ),

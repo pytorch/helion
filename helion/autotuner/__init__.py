@@ -25,6 +25,12 @@ from .external import autotune as autotune
 from .finite_search import CachedFiniteSearch as CachedFiniteSearch
 from .finite_search import FiniteSearch as FiniteSearch
 from .finite_search import from_cache as from_cache
+from .handoff import HandoffCandidate as HandoffCandidate
+from .handoff import HandoffMeasurement as HandoffMeasurement
+from .handoff import HandoffPoint as HandoffPoint
+from .handoff import HandoffPolicy as HandoffPolicy
+from .handoff import HandoffProgress as HandoffProgress
+from .handoff import find_handoff as find_handoff
 from .llm_search import LLMGuidedSearch as LLMGuidedSearch
 from .llm_seeded_lfbo import LLMSeededLFBOTreeSearch as LLMSeededLFBOTreeSearch
 from .llm_seeded_lfbo import LLMSeededSearch as LLMSeededSearch
