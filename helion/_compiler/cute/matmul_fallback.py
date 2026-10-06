@@ -11,9 +11,13 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
+from ..generate_ast import GenerateAST
 from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
+from .matmul_utils import CuteAtomicLaneRoute
+from .matmul_utils import cute_atomic_consumer_lane_route
+from .matmul_utils import cute_per_lane_atomic_consumer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -774,6 +778,38 @@ def _emit_cute_matmul_n_collapse(
     return result
 
 
+def _cute_k_lane_loop_is_innermost(cg: GenerateAST, loop_state: object) -> bool:
+    """Whether the K block's loop body is the innermost open statement scope.
+
+    The per-thread ``dot_acc`` running sum is zeroed one statement list up,
+    outside the K loop body and the lane loop that wraps it, and then
+    accumulates on every iteration below that point.  That equals the K
+    contraction only when nothing but the K loop and its lane loop sit between
+    the zero-init and the accumulate.  A free-axis device loop or lane loop
+    nested inside the K loop (``for lane_K: ... for tile_M: for lane_M:
+    dot_acc += ...``) would be summed as well, so such matmuls take the owned
+    product-sum marker route whose lane scheduler proves or rejects a lowering.
+
+    A device loop's body is its ``inner_statements``; the grid body is the
+    list pushed directly below the grid's ``hoist_parent_statements``.
+    """
+    from ..tile_strategy import DeviceGridState
+    from ..tile_strategy import DeviceLoopState
+
+    statements_stack = cg.statements_stack
+    if isinstance(loop_state, DeviceLoopState):
+        return statements_stack[-1] is loop_state.inner_statements
+    if isinstance(loop_state, DeviceGridState):
+        # Every grid lane loop sits between the hoist parent and the body, so
+        # a second (free-axis) lane loop would also be folded into the sum.
+        return (
+            len(statements_stack) >= 2
+            and statements_stack[-2] is loop_state.hoist_parent_statements
+            and len(loop_state.lane_loops) == 1
+        )
+    return False
+
+
 def _cute_product_uses_owned_lane_reduction(
     cg: CodegenInterface, product: ast.AST, owner_lane: str
 ) -> bool:
@@ -836,8 +872,15 @@ def _emit_cute_matmul(
     lhs_node: object = None,
     rhs_node: object = None,
     acc_node: object = None,
+    fx_node: torch.fx.Node | None = None,
 ) -> ast.AST:
-    """Build a CuTe matmul fallback using a cross-thread reduction over K."""
+    """Build a CuTe matmul fallback using a cross-thread reduction over K.
+
+    ``fx_node`` is the matmul's own device IR node.  When its K axis turns out
+    to be split across a serial lane loop, the node's consumers decide whether
+    an ``hl.atomic_*`` user may see per-lane partial sums instead of the
+    per-thread running sum (``cute_atomic_consumer_lane_route``).
+    """
     if hasattr(cg, "cute_uses_matmul"):
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
     reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
@@ -902,18 +945,43 @@ def _emit_cute_matmul(
         lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
         if not accumulate_in_lane_loop:
             lane_var = None
+        assert isinstance(cg, GenerateAST)
+        if lane_var is not None:
+            # K really is split across this lane loop, so an atomic consumer
+            # of the running sum would add every prefix of the contraction.
+            atomic_route = cute_atomic_consumer_lane_route(
+                fx_node, is_acc_none=acc is None, get_graph=cg.get_graph
+            )
+            if atomic_route is CuteAtomicLaneRoute.PER_LANE:
+                # Every K lane adds its own partial, so the atomic varies
+                # along this lane loop although its index does not cover the
+                # K block; the atomic lowering must not record it as uniform
+                # along the loop (and have the lane placement pin it to the
+                # first lane).
+                assert fx_node is not None
+                cg.device_function.cute_state.per_lane_atomic_lane_vars.setdefault(
+                    cute_per_lane_atomic_consumer(fx_node), set()
+                ).add(lane_var)
+                lane_var = None
+            elif atomic_route is CuteAtomicLaneRoute.OWNED:
+                product_lane = lane_var
+                lane_var = None
         # Keep the running sum when its inputs are independent of the owned
         # lane reductions. A reduction-fed rescale or product needs an explicit
-        # product marker and a complete staged reduction schedule.
-        if (
-            lane_var is not None
-            and acc is not None
-            and (
-                (
-                    _cute_acc_is_rescaled_loop_carried(acc_node)
-                    and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+        # product marker and a complete staged reduction schedule.  So does a K
+        # lane loop that is not the innermost open scope: the running sum would
+        # also fold the free-axis iterations nested inside it.
+        if lane_var is not None and (
+            not _cute_k_lane_loop_is_innermost(cg, loop_state)
+            or (
+                acc is not None
+                and (
+                    (
+                        _cute_acc_is_rescaled_loop_carried(acc_node)
+                        and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+                    )
+                    or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
                 )
-                or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
             )
         ):
             # Complete dependent reductions before the product sum and consume

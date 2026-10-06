@@ -221,8 +221,7 @@ def _(state: CodegenState) -> object:
         lhs_ast,
         rhs_ast,
         accumulate_in_lane_loop=not cute_outer_accumulates_result(
-            state.fx_node,
-            is_acc_none=is_acc_none,
+            state.fx_node, is_acc_none=is_acc_none
         ),
         k_block_id=k_block_id,
         static_k_extent=static_k_extent,
@@ -234,4 +233,5 @@ def _(state: CodegenState) -> object:
         lhs_node=dot_lhs_node,
         rhs_node=dot_rhs_node,
         acc_node=None if is_acc_none else dot_acc_node,
+        fx_node=state.fx_node,
     )
