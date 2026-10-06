@@ -706,6 +706,7 @@ def emit_row_epilogue(
     aux_prefetch: int | None = None,
     split: bool = False,
     packed: bool | None = None,
+    reduce_across: Callable[[str, str], str] | None = None,
 ) -> tuple[str, str]:
     """Emit the program's passes as kernel-body source.
 
@@ -722,7 +723,12 @@ def emit_row_epilogue(
     and the chunk loop steps two elements at a time.  ``packed`` (default) lowers
     the pair arithmetic to the ``f32x2`` instructions; otherwise the same pairs
     use scalar instructions with identical per-lane rounding, see
-    ``row_epilogue_packed_enabled``.
+    ``row_epilogue_packed_enabled``.  When several threads share one row
+    (each holding ``chunks * chunk_width`` of its columns), ``reduce_across``
+    renders the cross-thread completion of a reduction from its kind
+    (``"sum"`` / ``"amax"`` / ``"amin"``) and the thread's partial value; it
+    is applied once per reduction, after the thread's accumulators are folded
+    and before any row value reads the result.
     """
     assert len(aux_loads) == len(program.aux_names) == len(aux_elems) == len(aux_allocs)
     assert len(scalar_names) == len(program.scalar_exprs)
@@ -1012,6 +1018,8 @@ def emit_row_epilogue(
                     else:
                         total = f"{fn}({total}, {part}, propagate_nan=True)"
                 add(f"{var(op.name)} = {total}")
+                if reduce_across is not None:
+                    add(f"{var(op.name)} = {reduce_across(reduce_kind, var(op.name))}")
             for op in _row_ops_available_at(program, pass_index + 1):
                 add(f"{var(op.name)} = {render_op(op, atom)}")
 

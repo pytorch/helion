@@ -95,6 +95,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "_compiler/cute/_flash_gemm_ptx.py",
             "gathered_mma_tma",
         ),
+        (
+            "helion_flash_row_mma",
+            "_compiler/cute/_flash_row_mma_runtime.py",
+            "helion_flash",
+        ),
     ],
 )
 def test_transitive_helper_changes_only_its_family(

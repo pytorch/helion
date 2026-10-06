@@ -58,6 +58,18 @@ from .causal_range import CausalRangeProof
 from .causal_range import IntegerInterval
 from .causal_range import TileLayout
 from .causal_range import prove_descending_causal_prefix_unmasked
+from .cute_flash_row_mma import ROW_MMA_DEFAULT_TILE_M
+from .cute_flash_row_mma import ROW_MMA_DEFAULT_WARPS
+from .cute_flash_row_mma import ROW_MMA_FAMILY
+from .cute_flash_row_mma import ROW_MMA_PLAN_KIND
+from .cute_flash_row_mma import ROW_MMA_TILE_M_CHOICES
+from .cute_flash_row_mma import ROW_MMA_WARP_CHOICES
+from .cute_flash_row_mma import emit_flash_row_mma_device_body
+from .cute_flash_row_mma import emit_flash_row_mma_module_statements
+from .cute_flash_row_mma import row_mma_aux_smem_bytes
+from .cute_flash_row_mma import row_mma_search_grid
+from .cute_flash_row_mma import row_mma_shape_supported
+from .cute_flash_row_mma import row_mma_supported
 from .flash_policy import get_flash_target_policy
 from .flash_row_epilogue import FLASH_OUTPUT_EPILOGUE_ROW_PROGRAM
 from .flash_row_epilogue import FlashRowEpilogueProgram
@@ -76,6 +88,7 @@ from .flash_tuning import FlashSoftmaxLowering
 _T = TypeVar("_T")
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
@@ -1769,6 +1782,10 @@ class FlashPipelineFamilyFlags(NamedTuple):
 FLASH_PIPELINE_FAMILY_FLAGS: dict[str, FlashPipelineFamilyFlags] = {
     "ws_overlap": FlashPipelineFamilyFlags("ws_overlap"),
     "fa4": FlashPipelineFamilyFlags("fa4"),
+    # Register-MMA row programs (mma.sync, cp.async, no TMA/TMEM): 8- or
+    # 16-row query tiles whose warps split the keys; the latency-bound
+    # structure for grids too small to fill the device.
+    ROW_MMA_FAMILY: FlashPipelineFamilyFlags(ROW_MMA_FAMILY),
     "fa4_deep_1cta": FlashPipelineFamilyFlags("fa4", separate_kv_rings=True),
     "fa4_2cta_causal": FlashPipelineFamilyFlags(
         "fa4", causal_two_cta=True, use_2cta_instrs=True
@@ -1821,6 +1838,8 @@ def _flash_pipeline_family_from_flags(
     local_tma_partition: bool,
     tensor_4d_tma: bool,
 ) -> str:
+    if topology == ROW_MMA_FAMILY:
+        return ROW_MMA_FAMILY
     if topology != "fa4":
         return "ws_overlap"
     if separate_kv_rings:
@@ -2102,6 +2121,12 @@ class FlashAttentionConfig:
     # rescale between them), instead of two online-softmax rounds with their
     # handshakes.
     ws_one_pass: bool = False
+    # ``row_mma`` family: warps per CTA (each owns an equal share of the keys)
+    # and query rows per CTA (8 or 16: one or two octets sharing the warps'
+    # K/V shared-memory slices).  Pinned to the defaults for every other
+    # family so configs that differ only here stay one autotune identity.
+    row_warps: int = ROW_MMA_DEFAULT_WARPS
+    row_tile_m: int = ROW_MMA_DEFAULT_TILE_M
 
 
 # TMEM is 512 columns. The FA4 score pipeline holds ``s_stage`` score buffers of
@@ -2607,6 +2632,9 @@ def resolve_flash_config(
     prefer_packed_reduce: bool = False,
     plain_row_body: bool = True,
     has_row_epilogue: bool = False,
+    has_score_modifiers: bool = False,
+    row_mma_aligned: bool = True,
+    row_mma_aux_dtypes: Sequence[str] = (),
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
 
@@ -2621,6 +2649,15 @@ def resolve_flash_config(
     epilogue; those rows exist only in the 128-row body, so the 64-row query
     tile is canonicalized away instead of aliasing it. *has_row_epilogue*
     keeps fused row epilogues on the chunked FA4 softmax body.
+    *has_score_modifiers* is True when the score plan carries a modifier
+    (mask, bias, softcap, ...); ``plain_row_body`` alone cannot tell that
+    apart from a fused row epilogue, which the ``row_mma`` row programs do
+    run. *row_mma_aligned* is False when a q/k/v/o/lse (or aux) base is not
+    proven 16-byte aligned; the ``row_mma`` row programs move 16-byte packets
+    from those bases, so such a request resolves to the tcgen05 default
+    instead. *row_mma_aux_dtypes* names the fused row epilogue's aux rows
+    (known at codegen only); a request whose aux staging does not fit the
+    row programs' shared-memory budget resolves to the tcgen05 default too.
     """
 
     packet_config = config
@@ -2699,8 +2736,42 @@ def resolve_flash_config(
         topology_cfg = _cfg(FLASH_TOPOLOGY_KEY)
         if topology_cfg is not None:
             topology = str(topology_cfg)
-    if topology not in ("ws_overlap", "fa4"):
+    if topology not in ("ws_overlap", "fa4", ROW_MMA_FAMILY):
         topology = "ws_overlap"
+    if topology == ROW_MMA_FAMILY:
+        if row_mma_aligned and row_mma_supported(
+            head_dim=head_dim,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            plain_row_body=plain_row_body,
+            has_row_epilogue=has_row_epilogue,
+            has_score_modifiers=has_score_modifiers,
+        ):
+            row_mma_config = _resolve_row_mma_config(
+                head_dim,
+                num_kv,
+                _cfg,
+                dtype=dtype,
+                num_bh=num_bh,
+                is_causal=is_causal,
+                has_kv_tile_pruning=has_kv_tile_pruning,
+                requires_ws_overlap=requires_ws_overlap,
+                small_biased_candidate=small_biased_candidate,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+                supports_tensor_4d_tma=supports_tensor_4d_tma,
+                prefer_packed_reduce=prefer_packed_reduce,
+                plain_row_body=plain_row_body,
+                has_row_epilogue=has_row_epilogue,
+                has_score_modifiers=has_score_modifiers,
+                aux_dtypes=row_mma_aux_dtypes,
+            )
+            if row_mma_config is not None:
+                return row_mma_config
+        topology = topology_default
     if topology == "fa4" and num_kv % 2 != 0:
         topology = "ws_overlap"
     dense_hd64_fa4 = topology == "fa4" and not is_causal and head_dim == 64
@@ -3911,6 +3982,96 @@ def resolve_flash_config(
     )
 
 
+def _resolve_row_mma_config(
+    head_dim: int,
+    num_kv: int,
+    cfg: Callable[[str], object | None],
+    *,
+    dtype: torch.dtype,
+    num_bh: int | None,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    supports_tensor_4d_tma: bool,
+    prefer_packed_reduce: bool,
+    plain_row_body: bool,
+    has_row_epilogue: bool,
+    has_score_modifiers: bool,
+    aux_dtypes: Sequence[str] = (),
+) -> FlashAttentionConfig | None:
+    """Resolve the ``row_mma`` family: its two knobs over a fixed base.
+
+    Every tcgen05 knob is dead for the row programs, so they take the values
+    of the plain ``ws_overlap`` resolution of the same problem (independent of
+    the requested config), which makes every row_mma config that differs only
+    in dead knobs the same autotune identity.  The sequence is ``128 * num_kv``
+    (the flash plan requires ``seq % 128 == 0``); a warp count the key range
+    cannot be split over, or whose staging of the fused row epilogue's aux
+    rows (``aux_dtypes``, known at codegen only) does not fit next to the K/V
+    stages, falls back to the default knobs.  None declines the family when
+    even those cannot be planned.
+    """
+    base = resolve_flash_config(
+        head_dim,
+        num_kv,
+        {FLASH_TOPOLOGY_KEY: "ws_overlap"},
+        dtype=dtype,
+        num_bh=num_bh,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        prefer_packed_reduce=prefer_packed_reduce,
+        plain_row_body=plain_row_body,
+        has_row_epilogue=has_row_epilogue,
+        has_score_modifiers=has_score_modifiers,
+    )
+    seq = 128 * num_kv
+
+    def plannable(row_warps: int, row_tile_m: int) -> bool:
+        return row_mma_shape_supported(
+            seq=seq,
+            head_dim=head_dim,
+            row_warps=row_warps,
+            row_tile_m=row_tile_m,
+            aux_bytes=row_mma_aux_smem_bytes(
+                head_dim=head_dim,
+                row_tile_m=row_tile_m,
+                row_warps=row_warps,
+                aux_dtypes=aux_dtypes,
+            ),
+        )
+
+    row_warps = ROW_MMA_DEFAULT_WARPS
+    row_warps_cfg = cfg(FLASH_ROW_WARPS_KEY)
+    if row_warps_cfg is not None and int(row_warps_cfg) in ROW_MMA_WARP_CHOICES:  # type: ignore[call-overload]
+        row_warps = int(row_warps_cfg)  # type: ignore[call-overload]
+    row_tile_m = ROW_MMA_DEFAULT_TILE_M
+    row_tile_m_cfg = cfg(FLASH_ROW_TILE_M_KEY)
+    if row_tile_m_cfg is not None and int(row_tile_m_cfg) in ROW_MMA_TILE_M_CHOICES:  # type: ignore[call-overload]
+        row_tile_m = int(row_tile_m_cfg)  # type: ignore[call-overload]
+    if not plannable(row_warps, row_tile_m):
+        row_warps = ROW_MMA_DEFAULT_WARPS
+        row_tile_m = ROW_MMA_DEFAULT_TILE_M
+        if not plannable(row_warps, row_tile_m):
+            return None
+    return dataclasses.replace(
+        base,
+        topology=ROW_MMA_FAMILY,
+        pipeline_family=ROW_MMA_FAMILY,
+        # One CTA per row tile, never a persistent grid.
+        persistent=False,
+        row_warps=row_warps,
+        row_tile_m=row_tile_m,
+    )
+
+
 def _flash_ws_one_pass_supported(*, q_tile_m: int, num_kv: int, kv_stage: int) -> bool:
     """Whether the one-pass softmax is legal: the 64-row body (flat, staged,
     dense, plain rows) over exactly two KV tiles, both issued by the prologue
@@ -4033,6 +4194,8 @@ FLASH_SOFTMAX_SETUP_KEY = "cute_flash_softmax_setup"
 FLASH_KV_TILE_N_KEY = "cute_flash_kv_tile_n"
 FLASH_Q_TILE_M_KEY = "cute_flash_q_tile_m"
 FLASH_WS_ONE_PASS_KEY = "cute_flash_ws_one_pass"
+FLASH_ROW_WARPS_KEY = "cute_flash_row_warps"
+FLASH_ROW_TILE_M_KEY = "cute_flash_row_tile_m"
 FLASH_EPI_TMA_SETUP_KEY = "cute_flash_epi_tma_setup"
 
 
@@ -4077,6 +4240,28 @@ FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS: tuple[tuple[str, ...], ...] = (
         FLASH_EPI_STG_GMEM_KEY,
     ),
 )
+
+# Active values whose legality needs other knobs set at the same time.  The
+# structural coverage design adds one witness context per entry (the
+# dependencies plus the value) so the value is reachable by construction
+# instead of by a lucky combination of covering rows: the 64-row query tile
+# and its one-pass softmax exist only on the flat, staged, two-stage
+# ``ws_overlap`` body.
+FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] = {
+    (FLASH_Q_TILE_M_KEY, 64): {
+        FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_EPI_STG_KEY: True,
+        FLASH_KV_STAGE_KEY: 2,
+    },
+    (FLASH_WS_ONE_PASS_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_EPI_STG_KEY: True,
+        FLASH_KV_STAGE_KEY: 2,
+        FLASH_Q_TILE_M_KEY: 64,
+    },
+}
 
 FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_S_STAGE_KEY,
@@ -4130,6 +4315,8 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_KV_TILE_N_KEY,
     FLASH_Q_TILE_M_KEY,
     FLASH_WS_ONE_PASS_KEY,
+    FLASH_ROW_WARPS_KEY,
+    FLASH_ROW_TILE_M_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -4215,6 +4402,8 @@ def flash_effective_config_values(
         FLASH_KV_TILE_N_KEY: config.kv_tile_n,
         FLASH_Q_TILE_M_KEY: config.q_tile_m,
         FLASH_WS_ONE_PASS_KEY: config.ws_one_pass,
+        FLASH_ROW_WARPS_KEY: config.row_warps,
+        FLASH_ROW_TILE_M_KEY: config.row_tile_m,
     }
 
 
@@ -4337,6 +4526,7 @@ def _flash_seed_values(
     supports_tensor_4d_tma: bool,
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
     pipeline_family_override: str | None = None,
 ) -> dict[str, object]:
     fragments = flash_autotune_fragments(
@@ -4354,6 +4544,7 @@ def _flash_seed_values(
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
         pipeline_family_override=pipeline_family_override,
     )
     return {key: fragment.default() for key, fragment in fragments.items()}
@@ -4628,6 +4819,7 @@ def _flash_validated_target_seed(
     expected: Mapping[str, object],
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
 ) -> Config:
     """Build a target seed and reject policies normalized by config resolution.
 
@@ -4650,6 +4842,7 @@ def _flash_validated_target_seed(
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         plain_row_body=plain_row_body,
         has_row_epilogue=has_row_epilogue,
+        has_score_modifiers=has_score_modifiers,
     )
     actual = flash_effective_config_values(resolved)
     mismatches = {
@@ -4690,6 +4883,7 @@ def _flash_target_seed_config(
     block_size_targets: Sequence[int],
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
 ) -> Config | None:
     target_policy = get_flash_target_policy(target_device_capability)
     tuning_policy = target_policy.tuning_for_torch(
@@ -4727,6 +4921,7 @@ def _flash_target_seed_config(
             supports_tensor_4d_tma=supports_tensor_4d_tma,
             has_row_epilogue=has_row_epilogue,
             plain_row_body=plain_row_body,
+            has_score_modifiers=has_score_modifiers,
             pipeline_family_override=pipeline_family,
         )
         values = {key: fragment.default() for key, fragment in fragments.items()}
@@ -4749,6 +4944,7 @@ def _flash_target_seed_config(
             expected=expected,
             has_row_epilogue=has_row_epilogue,
             plain_row_body=plain_row_body,
+            has_score_modifiers=has_score_modifiers,
         )
 
     dense_policy = tuning_policy.dense_policy(num_kv)
@@ -4772,6 +4968,7 @@ def _flash_target_seed_config(
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
         pipeline_family_override=dense_policy.pipeline_family,
     )
     values = {key: fragment.default() for key, fragment in fragments.items()}
@@ -4795,6 +4992,7 @@ def _flash_target_seed_config(
         expected=expected,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
     )
 
 
@@ -4815,6 +5013,7 @@ def flash_attention_seed_config(
     supports_tensor_4d_tma: bool = True,
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     seed_kind: str = "default",
 ) -> Config | None:
@@ -4845,6 +5044,7 @@ def flash_attention_seed_config(
             block_size_targets=block_size_targets,
             has_row_epilogue=has_row_epilogue,
             plain_row_body=plain_row_body,
+            has_score_modifiers=has_score_modifiers,
         )
         if target_seed is not None:
             return target_seed
@@ -4866,6 +5066,7 @@ def flash_attention_seed_config(
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
     )
     if seed_kind == "default":
         return _flash_config_with_values(block_sizes, values)
@@ -4910,6 +5111,7 @@ def flash_attention_seed_configs(
     supports_tensor_4d_tma: bool = True,
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     device_sm_count: int = 0,
 ) -> tuple[Config, ...]:
@@ -4942,6 +5144,7 @@ def flash_attention_seed_configs(
         "supports_tensor_4d_tma": supports_tensor_4d_tma,
         "has_row_epilogue": has_row_epilogue,
         "plain_row_body": plain_row_body,
+        "has_score_modifiers": has_score_modifiers,
     }
     fragments = flash_autotune_fragments(head_dim, num_kv, **common)
     base_values = {key: fragment.default() for key, fragment in fragments.items()}
@@ -5109,6 +5312,7 @@ def _flash_legal_autotune_pipeline_families(
     requested_family: str | None,
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
 ) -> tuple[str, ...]:
     """Enumerate families whose requested structure survives normalization."""
     candidates = (
@@ -5130,6 +5334,16 @@ def _flash_legal_autotune_pipeline_families(
             "ws_overlap",
         ):
             continue
+        if (
+            family == ROW_MMA_FAMILY
+            and requested_family is None
+            and not row_mma_search_grid(num_bh=num_bh, num_kv=num_kv)
+        ):
+            # The row programs stream every key once per 8-row tile, so
+            # they win only where the 128-row tiles cannot fill the
+            # device. Unattended searches skip them on larger grids (no
+            # seed, coverage row or fragment); explicit configs stay legal.
+            continue
         requested: dict[str, object] = {FLASH_PIPELINE_FAMILY_KEY: family}
         if output_requires_tma:
             requested[FLASH_EPI_TMA_KEY] = True
@@ -5148,6 +5362,7 @@ def _flash_legal_autotune_pipeline_families(
             supports_tensor_4d_tma=supports_tensor_4d_tma,
             plain_row_body=plain_row_body,
             has_row_epilogue=has_row_epilogue,
+            has_score_modifiers=has_score_modifiers,
         )
         if effective.pipeline_family != family:
             continue
@@ -5175,6 +5390,7 @@ def flash_autotune_fragments(
     supports_tensor_4d_tma: bool = True,
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
     topology_override: str | None = None,
     pipeline_family_override: str | None = None,
 ) -> dict[str, ConfigSpecFragment]:
@@ -5220,6 +5436,7 @@ def flash_autotune_fragments(
         prefer_packed_reduce=has_kv_tile_pruning or requires_ws_overlap,
         plain_row_body=plain_row_body,
         has_row_epilogue=has_row_epilogue,
+        has_score_modifiers=has_score_modifiers,
     )
     paired = num_kv >= 2 and num_kv % 2 == 0
     cluster_aligned = num_kv >= 4 and num_kv % 4 == 0
@@ -5561,6 +5778,7 @@ def flash_autotune_fragments(
         requested_family=valid_family,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
     )
     if valid_family is None and valid_topology is not None:
         active_families = tuple(
@@ -5772,6 +5990,7 @@ def flash_autotune_fragments(
                 supports_tensor_4d_tma=supports_tensor_4d_tma,
                 has_row_epilogue=has_row_epilogue,
                 plain_row_body=plain_row_body,
+                has_score_modifiers=has_score_modifiers,
             ).exp2_packet
             == packet
         ]
@@ -5899,6 +6118,23 @@ def flash_autotune_fragments(
         (False, True),
         (False, True) if ws_one_pass_searchable else (defaults.ws_one_pass,),
     )
+    # The row-program knobs are searched only when the family itself is in
+    # play (its structure is independent of the sequence length, so the
+    # surface stays length-invariant); otherwise they stay at their defaults.
+    row_mma_searchable = ROW_MMA_FAMILY in active_families and valid_family in (
+        None,
+        ROW_MMA_FAMILY,
+    )
+    row_warps = enum(
+        defaults.row_warps,
+        ROW_MMA_WARP_CHOICES,
+        ROW_MMA_WARP_CHOICES if row_mma_searchable else (defaults.row_warps,),
+    )
+    row_tile_m = enum(
+        defaults.row_tile_m,
+        ROW_MMA_TILE_M_CHOICES,
+        ROW_MMA_TILE_M_CHOICES if row_mma_searchable else (defaults.row_tile_m,),
+    )
 
     fragments: dict[str, ConfigSpecFragment] = {
         FLASH_KV_TILE_N_KEY: kv_tile_n,
@@ -5952,7 +6188,21 @@ def flash_autotune_fragments(
         FLASH_EPI_TMA_SETUP_KEY: epi_tma_setup,
         FLASH_Q_TILE_M_KEY: q_tile_m,
         FLASH_WS_ONE_PASS_KEY: ws_one_pass,
+        FLASH_ROW_WARPS_KEY: row_warps,
+        FLASH_ROW_TILE_M_KEY: row_tile_m,
     }
+    if valid_family == ROW_MMA_FAMILY:
+        # Every other knob is dead for the row programs: pin its search to the
+        # default so the family's surface is exactly its two knobs.
+        for key, fragment in list(fragments.items()):
+            if key in (
+                FLASH_PIPELINE_FAMILY_KEY,
+                FLASH_ROW_WARPS_KEY,
+                FLASH_ROW_TILE_M_KEY,
+            ):
+                continue
+            assert isinstance(fragment, EnumFragment)
+            fragments[key] = EnumFragment(fragment.choices, (fragment.default(),))
     target_tuning_policy = get_flash_target_policy(
         target_device_capability
     ).tuning_for_torch(head_dim, str(dtype).removeprefix("torch."))
@@ -6000,6 +6250,7 @@ def flash_config_from_config(
     supports_tensor_4d_tma: bool = True,
     plain_row_body: bool = True,
     has_row_epilogue: bool = False,
+    has_score_modifiers: bool = False,
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -6022,6 +6273,7 @@ def flash_config_from_config(
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         plain_row_body=plain_row_body,
         has_row_epilogue=has_row_epilogue,
+        has_score_modifiers=has_score_modifiers,
     )
 
 
@@ -12969,6 +13221,21 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     flash_config: Mapping[str, object] | None = df.config
     if score_plan.requires_ws_overlap:
         flash_config = {**df.config, FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+    # The row programs address q/k/v/o/lse with 16-byte cp.async and
+    # st.global.v4 packets from the tensor bases. The bound kernel is keyed
+    # on each input's pointer residue, so a base proven only 8-byte aligned
+    # (a contiguous view four bf16 elements into a buffer, say) resolves to
+    # the tcgen05 families for that binding alone.
+    from ..compile_environment import CompileEnvironment
+    from .memory_ops import cute_tensor_base_is_aligned
+
+    env = CompileEnvironment.current()
+    row_mma_aligned = all(
+        cute_tensor_base_is_aligned(env, arg.fake_value, 16)
+        for arg in (q_arg, k_arg, v_arg, o_arg, lse_arg, *plan.epi_aux_args)
+        if arg is not None
+    )
+    row_mma_aux_dtypes = () if row_emit is None else row_emit.aux_dtypes
     cfg = resolve_flash_config(
         head_dim,
         num_kv,
@@ -12999,6 +13266,9 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         prefer_packed_reduce=bool(score_plan.modifiers),
         plain_row_body=row_emit is None and not score_plan.modifiers,
         has_row_epilogue=row_emit is not None,
+        has_score_modifiers=bool(score_plan.modifiers),
+        row_mma_aligned=row_mma_aligned,
+        row_mma_aux_dtypes=row_mma_aux_dtypes,
     )
     if _flash_output_requires_tma(batch, seq, head_dim) and not cfg.epi_tma:
         return False
@@ -13059,6 +13329,87 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             seq=seq,
             head_dim=head_dim,
             io_dtype=io_dtype_str,
+        )
+        df.preamble = []
+        return True
+
+    if cfg.topology == ROW_MMA_FAMILY:
+        # A fused row epilogue addresses its aux rows as plain kernel tensor
+        # parameters (the same (B, S, D) geometry as O) and stages them through
+        # shared memory, which the staging plan must leave room for.
+        row_mma_epilogue: FlashRowEpilogueEmit | None = None
+        if row_emit is not None:
+            row_mma_epilogue = FlashRowEpilogueEmit(
+                row_emit.program,
+                tuple(aux_arg.name for aux_arg in plan.epi_aux_args),
+                row_emit.aux_dtypes,
+                row_emit.scalar_names,
+            )
+        row_mma_aux_bytes = row_mma_aux_smem_bytes(
+            head_dim=head_dim,
+            row_tile_m=cfg.row_tile_m,
+            row_warps=cfg.row_warps,
+            aux_dtypes=row_mma_aux_dtypes,
+        )
+        if not row_mma_shape_supported(
+            seq=seq,
+            head_dim=head_dim,
+            row_warps=cfg.row_warps,
+            row_tile_m=cfg.row_tile_m,
+            aux_bytes=row_mma_aux_bytes,
+        ):
+            return False
+        emit_flash_row_mma_module_statements(cg)
+        cg.cute_wrapper_plans.append(
+            {
+                "kind": ROW_MMA_PLAN_KIND,
+                "batch": batch,
+                "seq": seq,
+                "head_dim": head_dim,
+                "row_warps": cfg.row_warps,
+                "row_tile_m": cfg.row_tile_m,
+                "total_tiles": batch * (seq // cfg.row_tile_m),
+                # Resolved to launcher argument positions so the wrapper
+                # can refuse a base its schema proves under-aligned.
+                "q_name": q_arg.name,
+                "k_name": k_arg.name,
+                "v_name": v_arg.name,
+                "o_name": o_arg.name,
+                **({} if lse_arg is None else {"lse_name": lse_arg.name}),
+                **(
+                    {
+                        "epi_aux_count": len(plan.epi_aux_args),
+                        **{
+                            f"epi_aux{index}_name": aux_arg.name
+                            for index, aux_arg in enumerate(plan.epi_aux_args)
+                        },
+                    }
+                    if plan.epi_aux_args
+                    else {}
+                ),
+            }
+        )
+        df.placeholder_args.update((q_arg.name, k_arg.name, v_arg.name, o_arg.name))
+        if lse_arg is not None:
+            df.placeholder_args.add(lse_arg.name)
+        df.placeholder_args.update(aux_arg.name for aux_arg in plan.epi_aux_args)
+        df.cute_state.attention_flash_threads = 32 * cfg.row_warps
+        df.body = emit_flash_row_mma_device_body(
+            q_name=q_arg.name,
+            k_name=k_arg.name,
+            v_name=v_arg.name,
+            o_name=o_arg.name,
+            lse_name=None if lse_arg is None else lse_arg.name,
+            num_bh=batch,
+            seq=seq,
+            head_dim=head_dim,
+            io_dtype=io_dtype_str,
+            scale_log2=scale_log2,
+            lse_scale=score_plan.lse_scale,
+            row_warps=cfg.row_warps,
+            row_tile_m=cfg.row_tile_m,
+            relu_output=_flash_output_relu_enabled(output_epilogue),
+            row_epilogue=row_mma_epilogue,
         )
         df.preamble = []
         return True
