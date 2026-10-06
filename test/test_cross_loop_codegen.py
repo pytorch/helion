@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import itertools
 from types import SimpleNamespace
 from typing import Any
 from typing import cast

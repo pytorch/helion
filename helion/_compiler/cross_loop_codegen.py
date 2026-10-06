@@ -1100,6 +1100,24 @@ def _stored_names(nodes: Iterable[ast.AST]) -> set[str]:
     }
 
 
+def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
+    return {
+        node.id
+        for root in nodes
+        for node in ast.walk(root)
+        if isinstance(node, ast.Name)
+    }
+
+
+def _renamed(statements: list[ast.stmt], mapping: Mapping[str, str]) -> list[ast.stmt]:
+    cloned = [_clone_stmt(statement) for statement in statements]
+    for statement in cloned:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and node.id in mapping:
+                node.id = mapping[node.id]
+    return cloned
+
+
 def _is_prefetch(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Expr)
