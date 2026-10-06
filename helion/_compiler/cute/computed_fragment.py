@@ -41,6 +41,7 @@ from ..compile_environment import CompileEnvironment
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import HelperFunctionGraphInfo
 from ..device_ir import IfGraphInfo
+from ..device_ir import RootGraphInfo
 from ..device_ir import control_flow_parent_entries
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
@@ -1241,8 +1242,8 @@ class FragmentCompiler:
             else None
         )
 
-        def update(coords: tuple[str, ...]) -> None:
-            masks = list(logical_domain(coords))
+        def update_in_domain(coords: tuple[str, ...], previous: str | None) -> None:
+            masks = []
             positions = []
             for dim, index in enumerate(indices):
                 position = (
@@ -1322,10 +1323,7 @@ class FragmentCompiler:
             elif result is None:
                 self.emit(f"if {self.predicate(masks)}:\n    {atomic}")
             else:
-                previous = iteration_ticket or self.df.new_var(
-                    "fragment_atomic_previous"
-                )
-                self.emit(f"{previous} = {self.cast('0', target_fake.dtype)}")
+                assert previous is not None
                 if skip_zero:
                     update_value = self.df.new_var("fragment_atomic_nonzero_value")
                     self.emit(
@@ -1337,9 +1335,38 @@ class FragmentCompiler:
                     )
                 else:
                     self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
+
+        def update(coords: tuple[str, ...]) -> None:
+            previous = None
+            if result is not None:
+                previous = iteration_ticket or self.df.new_var(
+                    "fragment_atomic_previous"
+                )
+                self.emit(f"{previous} = {self.cast('0', target_fake.dtype)}")
+
+            # Evaluating a lazy index can read a captured tensor whose declared
+            # extent is smaller than the padded atomic iteration domain. Check
+            # the contribution domain before evaluating that index, rather than
+            # masking only the final atomic after the index has already read it.
+            masks = logical_domain(coords)
+            if masks:
+                branch = cast(
+                    "ast.If",
+                    statement_from_string(f"if {self.predicate(masks)}:\n    pass"),
+                )
+                branch.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    update_in_domain(coords, previous)
+                self.cg.add_statement(branch)
+            else:
+                update_in_domain(coords, previous)
+
+            if result is not None:
                 if iteration_ticket is not None:
                     self.iteration_defined.add(node)
                 else:
+                    # Invalid contributions still produce the existing zero
+                    # result, including padded lanes of shared snapshots.
                     self.emit(f"{result.read(coords)} = {previous}")
 
         if deferred_updates is not None:
@@ -3795,6 +3822,33 @@ def computed_fragment_supported(
             )
         ):
             return False
+    # If-only frames also require the complete bound output proof: they need
+    # not have a host load or a while-domain check to trigger readonly validation.
+    if any(
+        node.target is memory_ops.store
+        for info in graphs
+        if not isinstance(info, RootGraphInfo)
+        for node in info.graph.nodes
+    ):
+        from .uniform_region_tree import uniform_local_regions
+        from .uniform_region_tree import uniform_output_stores_are_writeonly
+
+        if any(
+            len(node.args) != 4 or node.kwargs
+            for info in graphs
+            for node in info.graph.nodes
+            if node.target is memory_ops.store
+        ):
+            return False
+        try:
+            tree = uniform_local_regions(graphs)
+        except exc.InvalidConfig:
+            pass  # Preserve the independently proved legacy terminal path.
+        else:
+            if not uniform_output_stores_are_writeonly(
+                env, graphs, tree, allow_unbound=allow_unbound
+            ):
+                return False
     graph_by_id = {info.graph_id: info for info in graphs}
     independent_reductions = independent_reduction_coordinates(env, graphs)
     free_reductions = {
