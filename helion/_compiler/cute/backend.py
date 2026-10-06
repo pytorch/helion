@@ -3316,8 +3316,13 @@ class CuteBackend(Backend):
         device_ir = HostFunction.current().device_ir
         block_size_infos = [env.block_sizes[i] for i in block_ids]
         flattened = block_size_infos[0].is_flattened(config)
-        loop_order = env.config_spec.loop_orders.config_get(
-            config.loop_orders, block_ids[0]
+        # A registered tile can also appear in a multidimensional loop.
+        # Its permutation applies only there; a one-dimensional loop has
+        # no order to configure.
+        loop_order = (
+            env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
+            if len(block_ids) > 1
+            else None
         ) or [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1

@@ -212,12 +212,7 @@ def codegen_view_cute(ctx: LoweringContext, node: Node) -> object:
 
 @view_dtype_lowering.register_codegen("cute")
 def codegen_view_dtype_cute(ctx: LoweringContext, node: Node) -> object:
-    """Per-element bitcast through shared memory ``cute.recast_tensor``.
-
-    CuTe DSL operates on per-thread scalars, so a dtype reinterpret has to
-    round-trip a value through shared memory: write as the source dtype, then
-    read the same memory through a recast view typed as the target dtype.
-    """
+    """Reinterpret equal-width numeric values within their owning thread."""
     from .cute_reshape import _flat_index_from_coords
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _get_tile_shape
@@ -239,12 +234,22 @@ def codegen_view_dtype_cute(ctx: LoweringContext, node: Node) -> object:
             f"{target_dtype} ({target_dtype.itemsize} bytes)",
         )
 
+    env = CompileEnvironment.current()
+    src_dtype_str = env.backend.dtype_str(input_val.dtype)
+    tgt_dtype_str = env.backend.dtype_str(target_dtype)
+    if input_val.dtype != torch.bool and target_dtype != torch.bool:
+        # Lowerings can keep low-precision arithmetic in FP32 registers. Round
+        # to the tensor's declared dtype before reinterpreting its bits.
+        # Each thread retains ownership, including replicated physical axes.
+        return expr_from_string(
+            f"{src_dtype_str}({{_inp}}).bitcast({tgt_dtype_str})", _inp=tensor
+        )
+
     from ..generate_ast import GenerateAST
 
     cg = ctx.cg
     assert isinstance(cg, GenerateAST)
     df = cg.device_function
-    env = CompileEnvironment.current()
     config = df.config
 
     shape = _get_tile_shape(input_val, env, config)
@@ -253,9 +258,6 @@ def codegen_view_dtype_cute(ctx: LoweringContext, node: Node) -> object:
     numel = 1
     for s in shape:
         numel *= s
-
-    src_dtype_str = env.backend.dtype_str(input_val.dtype)
-    tgt_dtype_str = env.backend.dtype_str(target_dtype)
 
     smem_ptr = df.new_var("view_dtype_smem_ptr")
     smem = df.new_var("view_dtype_smem")

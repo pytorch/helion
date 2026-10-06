@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import operator
 import unittest
 
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
+from helion._compiler.cute.canonicalize_reductions import _independent_combines
+from helion._compiler.cute.canonicalize_reductions import canonicalize_reductions
+from helion._compiler.device_ir import DeviceIR
+from helion._compiler.device_ir import HelperFunctionGraphInfo
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -12,6 +18,8 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.language._tracing_ops import _mask_to
+from helion.language.reduce_ops import _reduce
 
 
 def add_combine_fn(x, y):
@@ -632,6 +640,106 @@ class TestReduce(RefEagerTestBase, TestCase):
         # Verify against PyTorch argmax
         pytorch_result = torch.argmax(values, dim=1)
         torch.testing.assert_close(result, pytorch_result)
+
+
+@onlyBackends(["cute"])
+class TestCuteBuiltinReduce(RefEagerTestBase, TestCase):
+    def test_nonidentity_padding_is_not_canonicalized(self) -> None:
+        combine = make_fx(operator.add)(torch.ones(1), torch.ones(1)).graph
+        for other in (0.0, 1.0):
+            with self.subTest(other=other):
+                ir = DeviceIR()
+                combine_id = ir.add_graph(
+                    combine,
+                    HelperFunctionGraphInfo,
+                    node_args=[],
+                    original_function_name="add",
+                )
+                graph = torch.fx.Graph()
+                x = graph.placeholder("x")
+                masked = graph.call_function(_mask_to, (x, other))
+                masked.meta["val"] = torch.empty(1, 65)
+                reduction = graph.call_function(
+                    _reduce, (combine_id, masked, -1, False, False)
+                )
+                reduction.meta["val"] = torch.empty(1)
+                graph.output(reduction)
+                ir.add_root_graph(graph)
+                canonicalize_reductions(ir)
+                output = graph.find_nodes(op="output")[0]
+                self.assertIs(
+                    output.args[0].target,
+                    torch.ops.aten.sum.dim_IntList if other == 0 else _reduce,
+                )
+
+    def test_builtin_combine_requires_exact_operands(self) -> None:
+        x, y = torch.ones(1), torch.ones(1)
+        for combine, recognized in (
+            (operator.add, True),
+            (lambda a, b: b * a, True),
+            (lambda a, b: a + b + 1, False),
+            (lambda a, b: a + a, False),
+            (lambda a, b: torch.add(a, b, alpha=2), False),
+        ):
+            with self.subTest(combine=combine):
+                graph = make_fx(combine)(x, y).graph
+                self.assertEqual(
+                    _independent_combines(graph, 1) is not None, recognized
+                )
+
+    def test_builtin_combines_span_multiple_lane_groups(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def combined(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            sums = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+            products = torch.empty_like(sums)
+            maxima = torch.empty_like(sums)
+            minima = torch.empty_like(sums)
+            for row in hl.tile(x.size(0)):
+                value = x[row, :]
+                sums[row] = hl.reduce(add_combine_fn, value, dim=-1)
+                products[row] = hl.reduce(mul_combine_fn, value, dim=-1, other=1.0)
+                maxima[row] = hl.reduce(
+                    max_combine_fn, value, dim=-1, other=-float("inf")
+                )
+                minima[row] = hl.reduce(
+                    min_combine_fn, value, dim=-1, other=float("inf")
+                )
+            return sums, products, maxima, minima
+
+        for columns in (65, 513):
+            with self.subTest(columns=columns):
+                x = torch.randn((17, columns), device=DEVICE) * 0.01 + 1.0
+                _, output = code_and_output(combined, (x,))
+                expected = (x.sum(-1), x.prod(-1), x.amax(-1), x.amin(-1))
+                for actual, reference in zip(output, expected, strict=True):
+                    torch.testing.assert_close(actual, reference)
+
+    def test_independent_tuple_combines_preserve_dtypes(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def combined(
+            x: torch.Tensor, indices: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            values = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+            counts = torch.empty((x.size(0),), dtype=indices.dtype, device=x.device)
+            for row in hl.tile(x.size(0)):
+                total, count = hl.reduce(
+                    tuple_add_combine_fn, (x[row, :], indices[row, :]), dim=-1
+                )
+                values[row] = total
+                counts[row] = count
+            return values, counts
+
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.full((17, 65), 0.5, dtype=dtype, device=DEVICE)
+                indices = torch.full(
+                    (17, 65), 100000000, dtype=torch.int32, device=DEVICE
+                )
+                _, (values, counts) = code_and_output(combined, (x, indices))
+                torch.testing.assert_close(values, x.sum(-1))
+                torch.testing.assert_close(counts, indices.sum(-1, dtype=torch.int32))
 
 
 if __name__ == "__main__":

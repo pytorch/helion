@@ -105,6 +105,88 @@ def jit_add_combine_fn(x, y):
 
 @onlyBackends(["triton", "cute"])
 class TestAssociativeScan(RefEagerTestBase, TestCase):
+    def test_computed_cumsum_axes_and_source_reuse(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def kernel(
+            x: torch.Tensor, axis: hl.constexpr, reverse: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            output = torch.empty_like(x)
+            reused = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :, :] * 2
+                output[row, :, :] = hl.cumsum(values, dim=axis, reverse=reverse)
+                reused[row, :, :] = values + 3
+            return output, reused
+
+        x = torch.arange(3 * 5 * 65, device=DEVICE, dtype=torch.int32).reshape(3, 5, 65)
+        for axis in (1, 2):
+            for reverse in (False, True):
+                with self.subTest(axis=axis, reverse=reverse):
+                    _, (actual, reused) = code_and_output(
+                        kernel, (x, axis, reverse), block_sizes=[1]
+                    )
+                    values = x * 2
+                    expected = values.flip([axis]) if reverse else values
+                    expected = expected.cumsum(axis, dtype=x.dtype)
+                    if reverse:
+                        expected = expected.flip([axis])
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(reused, values + 3, rtol=0, atol=0)
+
+    def test_computed_cumsum_bitcast_partial_tiles(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def kernel(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+            output = torch.empty(x.shape, dtype=torch.int32, device=x.device)
+            for row, col in hl.tile(x.shape, block_size=[2, 32]):
+                flags = (x[row, col].view(torch.int32) < 0).to(torch.int32)
+                output[row, col] = hl.cumsum(flags, dim=-1, reverse=reverse)
+            return output
+
+        x = torch.randn(5, 65, device=DEVICE)
+        x[:, ::4] = -0.0
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                _, actual = code_and_output(kernel, (x, reverse))
+                flags = (x.view(torch.int32) < 0).to(torch.int32)
+                chunks = []
+                for values in flags.split(32, dim=-1):
+                    if reverse:
+                        values = values.flip([-1])
+                    values = values.cumsum(-1, dtype=torch.int32)
+                    chunks.append(values.flip([-1]) if reverse else values)
+                torch.testing.assert_close(
+                    actual, torch.cat(chunks, -1), rtol=0, atol=0
+                )
+
+    def test_computed_fragment_indexed_scalar_fill(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def kernel(x: torch.Tensor, destination: torch.Tensor) -> torch.Tensor:
+            scans = torch.empty_like(x)
+            for row, col in hl.tile(x.shape, block_size=[2, 32]):
+                destination[row, col] = -7
+                values = x[row, col] + 1
+                scans[row, col] = hl.cumsum(values, dim=-1)
+                hl.store(destination, [row, col], 3, extra_mask=values > 0)
+            return scans
+
+        for dtype in (torch.int32, torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                x = (torch.arange(325, device=DEVICE).reshape(5, 65) % 5 - 2).to(dtype)
+                backing = torch.full((7, 132), -99, dtype=dtype, device=DEVICE)
+                destination = backing[1:6, 1:131:2]
+                _, actual = code_and_output(kernel, (x, destination))
+                expected_backing = torch.full_like(backing, -99)
+                expected_backing[1:6, 1:131:2] = torch.where(x + 1 > 0, 3, -7).to(dtype)
+                expected_scans = torch.cat(
+                    [
+                        values.cumsum(-1, dtype=dtype)
+                        for values in (x + 1).split(32, -1)
+                    ],
+                    -1,
+                )
+                torch.testing.assert_close(backing, expected_backing, rtol=0, atol=0)
+                torch.testing.assert_close(actual, expected_scans, rtol=0, atol=0)
+
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 
