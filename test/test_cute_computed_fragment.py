@@ -5148,6 +5148,8 @@ def test_resident_while_plan_current_captures_not_node_args():
 def test_resident_while_plan_rejects_actual_ambiguous_swap():
     from helion._compiler.cute.resident_while import resident_while_plan
 
+    _bound, call, graphs = _resident_while_bound()
+    assert resident_while_plan(call, graphs).nested_fors
     _bound, call, graphs = _resident_while_bound(swap=True)
     with pytest.raises(exc.InvalidConfig, match="explicit initialized phi"):
         resident_while_plan(call, graphs)

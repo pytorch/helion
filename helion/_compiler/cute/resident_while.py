@@ -30,12 +30,17 @@ from ..device_ir import WhileConditionGraphInfo
 from ..device_ir import WhileLoopGraphInfo
 from ..inductor_lowering import SympyExprLowering
 from .bounded_gather import inline_asm_shape
+from .uniform_control import _carry_map
+from .uniform_control import _outputs
+from .uniform_control import _require
+from .uniform_control import _signature
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..compile_environment import CompileEnvironment
     from .gather_domains import GatherDomainFacts
+    from .uniform_region_tree import UniformRegionFrame
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,7 @@ class ResidentWhilePlan:
     nested_fors: tuple[ResidentCallContext, ...]
     invariant_slots: tuple[int, ...]
     local_allocations: frozenset[Node] = frozenset()
+    composed: bool = False
     requirements: tuple[str, ...] = (
         "whole_cta_entry_and_shared_predicate_publication",
         "predicate_reader_barrier_before_overwrite",
@@ -69,90 +75,9 @@ class ResidentWhilePlan:
     )
 
 
-def _require(condition: bool, reason: str) -> None:
-    if not condition:
-        raise exc.InvalidConfig(f"resident while plan: {reason}")
-
-
-def _signature(value: Node) -> tuple[torch.dtype, tuple[int, ...]]:
-    fake = value.meta.get("val")
-    _require(isinstance(fake, torch.Tensor), "tensor metadata required")
-    fake = cast("torch.Tensor", fake)
-    _require(
-        all(type(size) is int and size > 0 for size in fake.shape),
-        "positive static physical shape required",
-    )
-    return fake.dtype, cast("tuple[int, ...]", tuple(fake.shape))
-
-
-def _outputs(info: GraphInfo) -> tuple[Node, ...]:
-    nodes = list(info.graph.find_nodes(op="output"))
-    _require(len(nodes) == 1, "one graph output required")
-    values = nodes[0].args[0]
-    _require(
-        isinstance(values, (list, tuple))
-        and all(isinstance(value, Node) for value in values),
-        "tensor output list required",
-    )
-    return tuple(cast("Sequence[Node]", values))
-
-
-def _carry_map(
-    call: Node, captures: tuple[Node, ...], outputs: tuple[Node, ...]
-) -> tuple[tuple[int, int], ...]:
-    slots: dict[int, int] = {}
-    order = {node: index for index, node in enumerate(call.graph.nodes)}
-    _require(call in order, "loop call is absent from caller graph")
-    for item in call.users:
-        _require(
-            item.op == "call_function"
-            and item.graph is call.graph
-            and item in order
-            and order[item] > order[call]
-            and item.target is operator.getitem
-            and len(item.args) == 2
-            and not item.kwargs
-            and item.args[0] is call
-            and type(item.args[1]) is int
-            and 0 <= item.args[1] < len(outputs),
-            "invalid loop output projection",
-        )
-        index = cast("int", item.args[1])
-        for phi in item.users:
-            _require(
-                phi.op == "call_function"
-                and phi.graph is call.graph
-                and phi in order
-                and order[phi] > order[item]
-                and phi.target is _tracing_ops._phi
-                and len(phi.args) == 2
-                and not phi.kwargs
-                and phi.args[1] is item,
-                "output must have an explicit initialized phi",
-            )
-            matches = [i for i, value in enumerate(captures) if value is phi.args[0]]
-            _require(len(matches) == 1, "ambiguous phi entry capture")
-            slot = matches[0]
-            _require(index not in slots or slots[index] == slot, "conflicting phi")
-            _require(
-                _signature(outputs[index]) == _signature(captures[slot]),
-                "carry physical shape or dtype changed",
-            )
-            _require(
-                _signature(item) == _signature(outputs[index]),
-                "projection physical shape or dtype changed",
-            )
-            _require(
-                _signature(phi) == _signature(captures[slot]),
-                "phi physical shape or dtype changed",
-            )
-            slots[index] = slot
-    _require(set(slots) == set(range(len(outputs))), "uninitialized loop output")
-    _require(len(set(slots.values())) == len(slots), "duplicate carry destination")
-    return tuple(sorted(slots.items()))
-
-
-def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
+def _legacy_resident_while_plan(
+    call: Node, graphs: Sequence[GraphInfo]
+) -> ResidentWhilePlan:
     """Inspect one immediate root while and its static-for child call contexts.
 
     Every returned requirement must be discharged by a future emitter/admission
@@ -476,6 +401,49 @@ def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhil
     )
 
 
+def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
+    try:
+        return _legacy_resident_while_plan(call, graphs)
+    except exc.InvalidConfig as legacy_error:
+        from .uniform_region_tree import uniform_local_regions
+
+        try:
+            tree = uniform_local_regions(graphs)
+        except exc.InvalidConfig:
+            # A second, narrower proof must not replace the failed legacy
+            # obligation with an unrelated unsupported-topology diagnostic.
+            raise legacy_error from None
+        frames = {f.graph.graph_id: f for f in tree.frames}
+        _require(call.target is _tracing_ops._while_loop, "while call required")
+        condition = frames[cast("int", call.args[0])]
+        body = frames[cast("int", call.args[1])]
+        _require(condition.call is call and body.call is call, "actual while frame")
+
+        def context(frame: UniformRegionFrame) -> ResidentCallContext:
+            return ResidentCallContext(
+                call,
+                frame.graph,
+                frame.captures,
+                frame.placeholders,
+                frame.outputs,
+                frame.carry_map,
+                frames[cast("int", frame.parent_graph_id)].call,
+            )
+
+        destinations = {slot for _index, slot in body.carry_map}
+        return ResidentWhilePlan(
+            cast(
+                "RootGraphInfo", next(f.graph for f in tree.frames if f.role == "root")
+            ),
+            context(condition),
+            context(body),
+            (),
+            tuple(i for i in range(len(body.captures)) if i not in destinations),
+            frozenset(a for f in tree.frames for a in f.local_targets),
+            composed=True,
+        )
+
+
 def resident_while_domain_facts(
     env: CompileEnvironment,
     graphs: Sequence[GraphInfo],
@@ -505,7 +473,7 @@ def resident_while_domain_facts(
     if len(calls) != 1:
         return incoming
     try:
-        plan = resident_while_plan(calls[0], graphs)
+        plan = _legacy_resident_while_plan(calls[0], graphs)
     except exc.InvalidConfig:
         return incoming
     for context in (plan.condition, plan.body, *plan.nested_fors):
