@@ -2289,6 +2289,12 @@ class WalkDeviceAST(NodeVisitor):
             return
         self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
+    def visit_IfExp(self, node: ast.IfExp) -> object:
+        test_proxy = self.visit(node.test)
+        if isinstance(test_proxy, _tracing_ops._symbolic_types):
+            raise exc.StatementNotSupported("dynamic conditional expression")
+        return self.visit(node.body if test_proxy else node.orelse)
+
     def _create_if_subgraph(
         self,
         test_proxy: object,
