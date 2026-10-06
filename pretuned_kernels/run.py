@@ -43,6 +43,11 @@ KERNELS = [
     "rms_norm",
     "layer_norm",
     "softmax",
+    "categorical_sampling",
+    "min_p_sampling",
+    "chain_speculative_sampling",
+    "varlen_topk",
+    "top_p_renorm",
     "scaled_mm",
     "scale_mm_cute",
     "nvfp4_gemv",
@@ -99,15 +104,28 @@ def _supported_hardware(name: str) -> set[str]:
     """Hardware a kernel is pretuned for, inferred from its checked-in heuristics.
 
     Each ``_helion_aot_<name>_cuda_sm<NN>.py`` file declares a compute capability
-    the kernel ships a config for; map those to hardware aliases. This is the
-    single source of truth -- no per-kernel declaration to keep in sync.
+    the kernel ships a config for; map those to hardware aliases. Composite
+    recipes without a same-name kernel require a heuristic for every stage
+    on that hardware.
     """
+    directory = _kernel_directory(name)
     hardware = set()
-    for path in _kernel_directory(name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
+    for path in directory.glob(f"_helion_aot_{name}_cuda_sm*.py"):
         match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
         if match:
             hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
-    return hardware
+    if hardware:
+        return hardware
+
+    stages: dict[str, set[str]] = {}
+    for path in directory.glob("_helion_aot_*_cuda_sm*.py"):
+        match = re.fullmatch(r"_helion_aot_(.+)_cuda_(sm\d+)\.py", path.name)
+        if match:
+            kernel, compute = match.groups()
+            stages.setdefault(kernel, set()).add(
+                _HARDWARE_BY_COMPUTE.get(compute, compute)
+            )
+    return set.intersection(*stages.values()) if stages else set()
 
 
 def _import_kernel_module(name: str) -> ModuleType:

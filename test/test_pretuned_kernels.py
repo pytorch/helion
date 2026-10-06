@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
+from pretuned_kernels import run as pretuned_run
 import pytest
 import torch
 from torch._environment import is_fbcode
@@ -35,6 +36,7 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessCuteAvailable
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -95,6 +97,24 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     return sys.modules[module_name]
+
+
+def test_composite_pretuned_hardware_requires_all_stages(tmp_path: Path) -> None:
+    from pretuned_kernels import run
+
+    directory = tmp_path / "pipeline"
+    directory.mkdir()
+    for filename in (
+        "_helion_aot_produce_cuda_sm100.py",
+        "_helion_aot_produce_cuda_sm103.py",
+        "_helion_aot_consume_cuda_sm103.py",
+    ):
+        (directory / filename).touch()
+    with patch.object(run, "PRETUNED_KERNELS_DIR", tmp_path):
+        assert run._supported_hardware("pipeline") == {"gb300"}
+        assert run._supported_hardware("missing") == set()
+        (directory / "_helion_aot_consume_cuda_sm100.py").touch()
+        assert run._supported_hardware("pipeline") == {"b200", "gb300"}
 
 
 @pytest.mark.parametrize(
@@ -1636,6 +1656,40 @@ class TestPretunedKernelsPerformance(TestCase):
         if not module.has_vllm():
             self.skipTest("deepseek_v3_moe_nvfp4 performance requires vLLM.")
         self._run_pretuned_kernel_perf("deepseek_v3_moe_nvfp4")
+
+
+_PRETUNED_SAMPLING_CASES = [("categorical_sampling", index) for index in range(7)] + [
+    (name, 0)
+    for name in (
+        "min_p_sampling",
+        "chain_speculative_sampling",
+        "varlen_topk",
+        "top_p_renorm",
+    )
+]
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("name,index", _PRETUNED_SAMPLING_CASES)
+def test_pretuned_sampling_aot_correctness(
+    name: str, index: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("sampling AOT configs are pretuned for GB300")
+    from helion.autotuner.base_cache import AutotuneCacheBase
+
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    assert name in pretuned_run.KERNELS
+    assert pretuned_run._supported_hardware(name) == {"gb300"}
+    module = pretuned_run._import_kernel_module(name)
+    with patch.object(
+        AutotuneCacheBase,
+        "_run_autotune_trials",
+        side_effect=AssertionError("pretuned recipes must not launch autotuning"),
+    ):
+        module.check_case(module.SHAPES[index])
 
 
 if __name__ == "__main__":
