@@ -1023,6 +1023,8 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
 
     import numpy as np
 
+    packets = {"vector": 0, "scalar": 0}
+
     class Pointer:
         def __init__(self, tensor, offset=0):
             self.tensor = tensor
@@ -1038,7 +1040,14 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
                 storage_offset=0,
             )
 
+        def align(self, alignment):
+            assert (
+                self.tensor.data_ptr() + self.offset * self.tensor.element_size()
+            ) % alignment == 0
+            return self
+
         def load(self):
+            packets["scalar"] += 1
             storage = self.storage()
             offset = self.tensor.storage_offset() + self.offset
             assert 0 <= offset < storage.numel()
@@ -1067,11 +1076,21 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
         def allocate_tensor(self, dtype, layout, byte_alignment):
             return Shared(dtype, layout)
 
+    def copy_packet(atom, source, destination):
+        assert atom == 128
+        assert destination.values.size == 4
+        assert (
+            source.iterator.tensor.data_ptr() + source.iterator.offset * 4
+        ) % 16 == 0
+        packets["vector"] += 1
+        for lane in range(4):
+            destination[lane] = (source.iterator + lane).load()
+
     class SerialElements(ast.NodeTransformer):
         def visit_For(self, node):
             node = self.generic_visit(node)
             if isinstance(node.target, ast.Name) and node.target.id.startswith(
-                "fragment_index"
+                ("fragment_index", "fragment_packet_index")
             ):
                 assert isinstance(node.iter, ast.Call) and len(node.iter.args) == 3
                 node.iter.args[0] = ast.Constant(0)
@@ -1104,6 +1123,13 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
             "cute": SimpleNamespace(
                 math=SimpleNamespace(min=np.minimum, max=np.maximum, tanh=np.tanh),
                 make_layout=lambda shape: shape,
+                make_rmem_tensor=lambda layout, dtype: Shared(dtype, layout),
+                make_tensor=lambda iterator, layout: SimpleNamespace(
+                    iterator=iterator, layout=layout
+                ),
+                make_copy_atom=lambda op, dtype, num_bits_per_copy: num_bits_per_copy,
+                nvgpu=SimpleNamespace(CopyUniversalOp=lambda: None),
+                copy=copy_packet,
                 arch=SimpleNamespace(
                     thread_idx=lambda: (0, 0, 0),
                     block_idx=lambda block=block: (block, 0, 0),
@@ -1132,6 +1158,7 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
         environment[function.name](
             *(environment[arg.arg] for arg in function.args.args)
         )
+    return packets
 
 
 @pytest.mark.parametrize("widths", [(17, 65), (31, 19), (17, 17)])
@@ -3413,6 +3440,9 @@ def test_fragment_producer_cache_preserves_prefix_and_rng(strategy_name):
         patch(
             "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
         ),
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_packet_loads_coverage"
+        ),
     ):
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_producer_cache_coverage"
@@ -4395,3 +4425,246 @@ def test_snapshot_native_typed_loads(dtype):
     torch.testing.assert_close(out, x + 2, rtol=0, atol=0)
     torch.testing.assert_close(reduced, (x.to(torch.int64) + 1).sum(-1), rtol=0, atol=0)
     torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_packet_masked_scan(x: torch.Tensor, modulus: hl.constexpr):
+    raw = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        index = hl.arange(x.size(1))
+        value = hl.load(x, [row, index], extra_mask=index % modulus != 0)
+        raw[row, :] = value
+        out[row, :] = hl.cumsum(value + 1, dim=-1) + value.sum(-1)[:, None]
+    return raw, out
+
+
+@pytest.mark.parametrize("width", [4, 17, 65, 128])
+@pytest.mark.parametrize("layout", ["dense", "stride", "offset", "transpose"])
+def test_fragment_packet_loads_generated_masks_layouts(width, layout):
+    base = torch.arange(3 * width * 2, dtype=torch.float32).reshape(3, width * 2)
+    if layout == "dense":
+        x = base[:, :width].contiguous()
+    elif layout == "stride":
+        x = base[:, ::2]
+    elif layout == "offset":
+        x = base[:, 1 : width + 1]
+    else:
+        x = torch.arange(3 * width, dtype=torch.float32).reshape(width, 3).T
+    before = x.clone()
+    codes = []
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_packet_masked_scan, (x, 13))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [2]
+        for enabled in (False, True):
+            config.config["cute_fragment_packet_loads"] = enabled
+            codes.append(bound.to_code(config))
+    assert codes[0].count("sync_threads") == codes[1].count("sync_threads")
+    if layout == "offset":
+        assert "num_bits_per_copy=128" not in codes[1]
+    else:
+        assert "num_bits_per_copy=128" in codes[1]
+    outputs = []
+    for code in codes:
+        raw, out = torch.empty_like(x), torch.empty_like(x)
+        stats = _simulate_independent_fragment(
+            code, {"x": x}, {"raw": raw, "out": out}, 2
+        )
+        outputs.append((raw, out, stats))
+    expected = torch.where(torch.arange(width) % 13 != 0, x, 0)
+    for raw, out, _stats in outputs:
+        torch.testing.assert_close(raw, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            out, (expected + 1).cumsum(-1) + expected.sum(-1)[:, None], rtol=0, atol=0
+        )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+    if layout == "dense" and width >= 17:
+        assert outputs[1][2]["vector"] > 0
+    if layout in ("stride", "transpose", "offset"):
+        assert outputs[1][2]["vector"] == 0
+
+
+@pytest.mark.parametrize("strategy_name", ["FROM_RANDOM", "FROM_BEST_AVAILABLE"])
+def test_fragment_packet_loads_preserves_old_population_rng(strategy_name):
+    import random
+
+    from test.test_compiler_coverage import make_search
+
+    from helion.autotuner.pattern_search import InitialPopulationStrategy
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_packet_loads_coverage"
+        ):
+            old = _cpu_bind(
+                helion.kernel(
+                    _fragment_uncached_cheap.fn, backend="cute", static_shapes=True
+                ),
+                (torch.ones(3, 65),),
+            )
+        new = _cpu_bind(
+            helion.kernel(
+                _fragment_uncached_cheap.fn, backend="cute", static_shapes=True
+            ),
+            (torch.ones(3, 65),),
+        )
+        assert old.config_spec.default_config() == new.config_spec.default_config()
+        assert (
+            old.config_spec.compiler_seed_configs
+            == new.config_spec.compiler_seed_configs
+        )
+        old_code = old.to_code(old.config_spec.default_config())
+        assert new.to_code(new.config_spec.default_config()) == old_code
+    strategy = InitialPopulationStrategy[strategy_name]
+    for seed in (31, 987, 2026):
+        prior = make_search(old.config_spec, count=100, strategy=strategy)
+        current = make_search(new.config_spec, count=100, strategy=strategy)
+        random.seed(seed)
+        expected = [
+            prior.config_gen.unflatten(row)
+            for row in prior._generate_initial_population_flat()
+        ]
+        state = random.getstate()
+        random.seed(seed)
+        actual = [
+            current.config_gen.unflatten(row)
+            for row in current._generate_initial_population_flat()
+        ]
+        assert random.getstate() == state
+        assert actual[: len(expected)] == expected
+        assert len(actual) == len(expected) + 1
+        assert actual[-1]["cute_fragment_packet_loads"] is True
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64, torch.int32])
+def test_fragment_packet_loads_unsupported_dtype_default_parity(dtype):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
+        assert not bound.config_spec.cute_fragment_packet_load_root_ids
+        config = bound.config_spec.default_config()
+        before = bound.to_code(config)
+        config.config["cute_fragment_packet_loads"] = False
+        assert bound.to_code(config) == before
+        config.config["cute_fragment_packet_loads"] = True
+        with pytest.raises(exc.InvalidConfig, match="readonly Float32"):
+            bound.to_code(config)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "value = (x.iterator + shared[index]).load()",
+        "value = (indices.iterator + offset).load()",
+        "offset = unknown(index)\nvalue = (x.iterator + offset).load()",
+        "if flag:\n    x[index] = value\nvalue = (x.iterator + index).load()",
+        "value = (x.iterator + index).load()\ncute.arch.sync_threads()",
+    ],
+)
+def test_fragment_packet_loads_rejects_effectful_coordinate_recipes(bad):
+    from helion._compiler.cute.packet_loads import _load_assignment
+
+    assert _load_assignment(ast.parse(bad).body, "x") is None
+
+
+@pytest.mark.parametrize(
+    "layout,width", [("dense", 17), ("dense", 128), ("stride", 65), ("offset", 17)]
+)
+@skipUnlessBackends(["cute"])
+def test_fragment_packet_loads_native(layout, width):
+    base = torch.arange(3 * width * 2, device=DEVICE, dtype=torch.float32).reshape(
+        3, width * 2
+    )
+    x = (
+        base[:, ::2]
+        if layout == "stride"
+        else base[:, 1 : width + 1]
+        if layout == "offset"
+        else base[:, :width].contiguous()
+    )
+    before = x.clone()
+    bound = _fragment_packet_masked_scan.bind((x, 13))
+    config = bound.config_spec.default_config()
+    config.config.update(block_sizes=[2], cute_fragment_packet_loads=True)
+    actual = bound.compile_config(config)(x, 13)
+    expected = torch.where(torch.arange(width, device=DEVICE) % 13 != 0, x, 0)
+    torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual[1], (expected + 1).cumsum(-1) + expected.sum(-1)[:, None], rtol=0, atol=0
+    )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+def test_fragment_packet_loads_preserves_special_bits():
+    import numpy as np
+
+    bits = torch.tensor(
+        [
+            0,
+            -2147483648,
+            1,
+            -2147483647,
+            1065353216,
+            -1082130432,
+            2139095040,
+            -8388608,
+            2143289635,
+            8388607,
+            8388608,
+            -2139095040,
+            0,
+            -2147483648,
+            1065353216,
+            1,
+        ],
+        dtype=torch.int32,
+    )
+    x = bits.view(torch.float32).repeat(3, 1)
+    codes = []
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_packet_masked_scan, (x, 1000))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [2]
+        for enabled in (False, True):
+            config.config["cute_fragment_packet_loads"] = enabled
+            codes.append(bound.to_code(config))
+    snapshots = []
+    with np.errstate(invalid="ignore"):
+        for code in codes:
+            raw, out = torch.empty_like(x), torch.empty_like(x)
+            _simulate_independent_fragment(code, {"x": x}, {"raw": raw, "out": out}, 2)
+            snapshots.append((raw, out))
+    expected = x.clone()
+    expected[:, 0] = 0
+    assert torch.equal(snapshots[0][0].view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(snapshots[1][0].view(torch.int32), expected.view(torch.int32))
+    torch.testing.assert_close(
+        snapshots[0][1], snapshots[1][1], rtol=0, atol=0, equal_nan=True
+    )
+
+
+def test_fragment_packet_loads_declines_aliasing_host_mutation():
+    x = torch.arange(3 * 17, dtype=torch.float32).reshape(3, 17)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_dynamic_host_strides, (x, x))
+        assert not bound.config_spec.cute_fragment_packet_load_root_ids
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_packet_loads"] = True
+        with pytest.raises(exc.InvalidConfig, match="readonly Float32"):
+            bound.to_code(config)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
+    x = torch.empty((3, 0), dtype=dtype)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_uncached_cheap, (x,))
+        config = bound.config_spec.default_config()
+        before = bound.to_code(config)
+        assert "num_bits_per_copy=128" not in before
+        config.config["cute_fragment_packet_loads"] = True
+        if dtype == torch.float32:
+            assert bound.to_code(config) == before
+        else:
+            with pytest.raises(exc.InvalidConfig, match="readonly Float32"):
+                bound.to_code(config)
