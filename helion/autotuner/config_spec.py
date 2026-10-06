@@ -940,6 +940,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_warp_scan",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1051,6 +1052,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_warp_scan",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1167,6 +1169,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_warp_scan",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1491,6 +1494,9 @@ class ConfigSpec:
         self.cute_fragment_local_atomic_registers_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_local_atomic_registers_search_enabled = False
         self.cute_fragment_local_atomic_register_min_threads = 0
+        self.cute_fragment_register_snapshots_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_register_snapshots_search_enabled = False
+        self.cute_fragment_register_snapshot_min_threads = 0
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
@@ -3400,6 +3406,30 @@ class ConfigSpec:
             f"{key}={value!r} requires proved same-coordinate local Int32 atomic return consumers"
         )
 
+    def _normalize_cute_fragment_register_snapshots(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_register_snapshots"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_register_snapshots_root_ids
+            and cast("int", config.get("cute_fragment_threads", 128))
+            >= self.cute_fragment_register_snapshot_min_threads
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires proved bounded readonly rank-one snapshots with exact integer reductions"
+        )
+
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4397,6 +4427,9 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_local_atomic_registers(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_register_snapshots(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_register_loads(
@@ -5590,6 +5623,7 @@ class ConfigSpec:
                 "cute_fragment_warp_scan",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_local_atomic_registers",
+                "cute_fragment_register_snapshots",
             ):
                 return True, False
             if key == "cute_fragment_threads":
@@ -5828,6 +5862,8 @@ class ConfigSpec:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
+            if self.cute_fragment_register_snapshots_search_enabled:
+                fields["cute_fragment_register_snapshots"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:
