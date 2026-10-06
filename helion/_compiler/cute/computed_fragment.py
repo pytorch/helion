@@ -89,6 +89,7 @@ from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
 from .register_snapshots import SnapshotBinding
 from .register_snapshots import SnapshotOwner
+from .register_snapshots import frame_snapshot_recipes
 from .register_snapshots import snapshot_capture_slots
 from .register_snapshots import snapshot_chains
 from .register_snapshots import snapshot_logical_shape
@@ -1802,6 +1803,7 @@ class FragmentCompiler:
                             ]
                         )
                     ),
+                    self.shape(snapshot_logical_shape(node)),
                 ),
             )
         if self.df.config.get(
@@ -2461,15 +2463,84 @@ class FragmentCompiler:
         self.held.pop()
         return carries
 
+    def derived_snapshot(
+        self, value: Fragment, sources: frozenset[Node]
+    ) -> Fragment | None:
+        """Initialize a distinct typed slot; retain the recipe's domain lifetime."""
+        bindings: dict[Node, SnapshotBinding] = {}
+        seen: set[int] = set()
+
+        def collect(fragment: Fragment) -> None:
+            if id(fragment) in seen:
+                return
+            seen.add(id(fragment))
+            if fragment.snapshot is not None:
+                bindings[fragment.snapshot.source] = fragment.snapshot
+            for dependency in fragment.dependencies:
+                collect(dependency)
+
+        collect(value)
+        if (
+            not sources
+            or set(bindings) != sources
+            or any(
+                binding.source not in self.snapshot_loads
+                or binding.threads != self.threads
+                or binding.shape != value.shape
+                or binding.domain_storage
+                or binding.logical_shape
+                != self.shape(snapshot_logical_shape(binding.source))
+                for binding in bindings.values()
+            )
+        ):
+            return None
+        shape = value.shape
+        if len(shape) != 1:
+            return None
+        size = shape[0]
+        owner_sizes = {
+            size,
+            *(binding.logical_shape[0] for binding in bindings.values()),
+        }
+        slots = (size + self.threads - 1) // self.threads
+        name = self.df.new_var("fragment_derived_snapshot")
+        self.register_snapshot_buffers[name] = size
+        self.emit(
+            f"{name} = cute.make_rmem_tensor(({slots},), {self.dtype(value.dtype)})"
+        )
+        self.emit(f"{name}.fill({self.cast('0', value.dtype)})")
+
+        def read(coords: tuple[str, ...]) -> str:
+            owner = self.snapshot_owner
+            if owner is None or len(coords) != 1 or owner.size not in owner_sizes:
+                raise exc.InvalidConfig(
+                    "derived snapshot lacks its active coordinate owner"
+                )
+            owner.prove(coords[0])
+            return f"{name}[{owner.slot}]"
+
+        def fill(coords: tuple[str, ...]) -> None:
+            self.emit(f"{read(coords)} = {self.cast(value.read(coords), value.dtype)}")
+
+        self.held.append(value)
+        self.elements(shape, fill)
+        self.held.pop()
+        # This is not a SnapshotBinding for the original load. Preserve the
+        # result dtype and all domain dependencies; no lifetime is discarded.
+        return Fragment(
+            shape,
+            value.dtype,
+            read,
+            True,
+            dependencies=(value,),
+            logical_domain=value.logical_domain,
+        )
+
     def resident_while(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
         from .gather_domains import loop_domain_facts
         from .resident_while import resident_while_plan
 
         plan = resident_while_plan(node, self.graphs)
-        if plan.composed and self.df.config.get(
-            "cute_fragment_register_snapshots", False
-        ):
-            raise exc.InvalidConfig("fresh control epochs retain shared captures")
         if node not in loop_domain_facts(self.env, self.graphs).resident_whiles:
             raise exc.InvalidConfig(
                 "resident while lacks complete logical/readonly proof"
@@ -2512,6 +2583,13 @@ class FragmentCompiler:
         # carries and other recipes retain the original held shared copies.
         captures: list[Fragment] = []
         self.held.append(captures)
+        recipes = (
+            frame_snapshot_recipes(node, self.graphs, self.env).get(
+                plan.body.graph.graph_id, {}
+            )
+            if self.df.config.get("cute_fragment_register_snapshots", False)
+            else {}
+        )
         for slot, entry in enumerate(plan.body.captures):
             value = cast("Fragment", values[entry])
             binding = value.snapshot
@@ -2522,13 +2600,26 @@ class FragmentCompiler:
                 and binding.threads == self.threads
                 and binding.shape == value.shape
                 and binding.dtype == value.dtype
+                and binding.logical_shape
+                == self.shape(snapshot_logical_shape(binding.source))
                 and not binding.domain_storage
                 and value.resident
                 and value.storage is None
                 and not value.dependencies
                 and slot in snapshot_capture_slots(node, self.graphs, binding.source)
             )
-            captured = value if keep_snapshot else self.materialize(value, copy=True)
+            derived = (
+                self.derived_snapshot(value, recipes[slot])
+                if not keep_snapshot and slot in recipes
+                else None
+            )
+            captured = (
+                value
+                if keep_snapshot
+                else derived
+                if derived is not None
+                else self.materialize(value, copy=True)
+            )
             if plan.composed and id(value) in self.local_logical_sizes:
                 # The frame proof permits only completed readonly local captures.
                 # Preserve declared extent on the held shared copy, never its
@@ -3160,8 +3251,6 @@ class FragmentCompiler:
             for graph_id in node.args[1:3]
         )
         if composed_tree is not None:
-            if self.df.config.get("cute_fragment_register_snapshots", False):
-                raise exc.InvalidConfig("composed control retains shared captures")
             # Descendant fresh epochs require the same per-arm retirement even
             # when an immediate arm owns no allocation itself.
             branch_local = True
@@ -3798,16 +3887,16 @@ def computed_fragment_supported(
         from .resident_while import resident_while_plan
 
         try:
-            mutable_while = bool(
-                resident_while_plan(next(iter(while_calls)), graphs).local_allocations
-            )
+            plans = [resident_while_plan(call, graphs) for call in while_calls]
+            mutable_while = any(plan.local_allocations for plan in plans)
+            needs_bounded_gather = any(not plan.local_allocations for plan in plans)
             if mutable_while:
                 prove_local_atomics(graphs)
         except exc.InvalidConfig:
             return False
 
         if (
-            (not bounded_gather_owned and not mutable_while)
+            (not bounded_gather_owned and needs_bounded_gather)
             or loop_domain_facts(
                 env, graphs, allow_unbound=allow_unbound
             ).resident_whiles
