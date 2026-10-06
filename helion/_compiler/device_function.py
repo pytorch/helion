@@ -1964,6 +1964,11 @@ class DeviceFunction:
                         self.new_var,
                     )
             validate_thread_axis_accesses([*prefix, definition])
+            from .cute.scalar_policy_loads import lower_scalar_policy_loads
+
+            # Keep ordinary load/effect recognition intact through all memory
+            # scheduling, including the late published/register-producer cuts.
+            definition.body = lower_scalar_policy_loads(definition.body)
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"
