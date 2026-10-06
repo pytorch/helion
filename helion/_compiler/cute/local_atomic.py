@@ -205,6 +205,144 @@ def terminal_finalizer_inputs(
     return frozenset(tickets), frozenset(symbols)
 
 
+def local_buffer_conditional_inputs(
+    node: Node, graphs: list[GraphInfo]
+) -> tuple[frozenset[Node], frozenset[Node]] | None:
+    """Admit a terminal uniform branch controlled by completed local reductions.
+
+    This is separate from ordered global-ticket finalizers. Only direct, complete
+    local allocations may cross this branch as read-only captures. Fresh mutable
+    targets must stay wholly in one immediate arm; no allocation alias escapes.
+    Scalar shape is necessary but not sufficient: the emitter snapshots the final
+    predicate into one shared slot before any branch code can reuse its storage.
+    """
+    allocations = local_atomic_allocations(graphs)
+
+    def dependencies(value: object) -> set[Node]:
+        pending = [value] if isinstance(value, Node) else []
+        seen: set[Node] = set()
+        while pending:
+            source = pending.pop()
+            if source not in seen:
+                seen.add(source)
+                pending.extend(source.all_input_nodes)
+        return seen
+
+    if not dependencies(node.args[0]) & allocations:
+        return None
+
+    def reject() -> NoReturn:
+        raise exc.InvalidConfig(
+            "local-buffer conditionals require terminal uniform branches, "
+            "complete allocation captures and uniform scalar local reductions"
+        )
+
+    by_id = {info.graph_id: info for info in _reachable_graphs(graphs)}
+    root = next(info for info in by_id.values() if info.graph is node.graph)
+    following = list(node.graph.nodes)
+    if (
+        not isinstance(root, RootGraphInfo)
+        or node.users
+        or any(n.op != "output" for n in following[following.index(node) + 1 :])
+    ):
+        reject()
+    info = by_id[cast("int", node.args[1])]
+    if not isinstance(info, IfGraphInfo) or info.branches_outputs:
+        reject()
+    targets = atomic_target_origins(graphs)
+    for graph_id in node.args[1:3]:
+        branch = by_id[cast("int", graph_id)]
+        for child in branch.graph.nodes:
+            if child.target is _tracing_ops._if or _tracing_ops.is_for_loop_target(
+                child.target
+            ):
+                reject()
+            if child.target is atomic_ops.atomic_add:
+                target = targets[child]
+                # Ordered/global operations and mutation through parent captures
+                # remain outside this proof. Each target has one lexical arm.
+                if (
+                    target.graph is not branch.graph
+                    or target.target is not creation_ops.full
+                ):
+                    reject()
+
+    def direct(value: Node) -> Node:
+        while value.target is _tracing_ops._new_var:
+            value = cast("Node", value.args[0])
+        return value
+
+    reductions: set[Node] = set()
+    symbols: set[Node] = set()
+    proved: set[Node] = set()
+
+    def uniform(value: object) -> None:
+        if isinstance(value, (int, bool)):
+            return
+        if not isinstance(value, Node) or value.graph is not node.graph:
+            reject()
+        if value in proved:
+            return
+        fake = value.meta.get("val")
+        if value.target in (_tracing_ops._get_symnode, torch.ops.aten.sym_size.int):
+            if not isinstance(fake, (int, torch.SymInt)):
+                reject()
+            symbols.add(value)
+            proved.add(value)
+            return
+        if (
+            not isinstance(fake, torch.Tensor)
+            or fake.ndim != 0
+            or fake.dtype not in (torch.bool, torch.int32, torch.int64)
+        ):
+            reject()
+        if value.target in (
+            torch.ops.aten.sum.default,
+            torch.ops.aten.sum.dim_IntList,
+            torch.ops.aten.amax.default,
+            torch.ops.aten.amin.default,
+        ):
+            source = value.args[0]
+            # Reduction neutralization reads the same complete allocation. It
+            # changes invalid padding values, never its coordinates or lifetime.
+            if (
+                isinstance(source, Node)
+                and source.target is _tracing_ops._mask_to
+                and isinstance(source.args[1], int)
+            ):
+                source = source.args[0]
+            if (
+                not isinstance(source, Node)
+                or direct(source) not in allocations
+                or direct(source).graph is not node.graph
+                or cast("torch.Tensor", source.meta["val"]).dtype != torch.int32
+            ):
+                reject()
+            reductions.add(value)
+        else:
+            if value.target is not _tracing_ops._new_var and not (
+                isinstance(value.target, torch._ops.OpOverload)
+                and torch.Tag.pointwise in value.target.tags
+                and torch.Tag.nondeterministic_seeded not in value.target.tags
+                and not value.target._schema.is_mutable
+            ):
+                reject()
+            for source in value.all_input_nodes:
+                uniform(source)
+        proved.add(value)
+
+    uniform(node.args[0])
+    if not reductions:
+        reject()
+    for values in node.args[3:5]:
+        for source in cast("list[Node]", values):
+            if dependencies(source) & allocations and direct(source) not in allocations:
+                # A scalar already proved uniform is safe to read, but a lazy
+                # tensor view/pointwise capture is deliberately outside this scope.
+                uniform(source)
+    return frozenset(reductions), frozenset(symbols)
+
+
 def terminal_loop_symbols(node: Node, graphs: list[GraphInfo]) -> frozenset[Node]:
     """Prove initialized scalar carries and a read-only, straight-line body.
 
@@ -311,10 +449,11 @@ def terminal_loop_symbols(node: Node, graphs: list[GraphInfo]) -> frozenset[Node
 def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
     """Allow direct allocations, uniform captures, and final read-only consumers.
 
-    View aliases, conditional mutation, returned local atomic values and reads
-    before later mutation are excluded. Each allocation lives in its root and
-    is captured unchanged through scalar loops. A terminal uniform finalizer may
-    consume fresh global data without capturing any local allocation.
+    View aliases, captured conditional mutation and reads before later mutation
+    are excluded. Int32 atomic returns are independent materialized snapshots.
+    Each allocation lives in its root or one immediate uniform branch arm.
+    Root allocations are captured unchanged through scalar loops. A terminal
+    uniform finalizer may consume fresh global data without local captures.
     The emitter additionally proves scalar grid/loop geometry and capacity.
     """
     graphs = _reachable_graphs(graphs)
@@ -328,6 +467,7 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
     parents = control_flow_parent_entries(graphs)
     by_graph = {info.graph: info for info in graphs}
     captures: dict[Node, Node] = {}
+    local_branches: set[Node] = set()
     for info in graphs:
         if info.graph_id in parents:
             call, slot = parents[info.graph_id]
@@ -340,7 +480,16 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
             )
         for node in info.graph.nodes:
             if node.target is _tracing_ops._if:
-                terminal_finalizer_inputs(node, graphs)
+                if local_buffer_conditional_inputs(node, graphs) is not None:
+                    local_branches.add(node)
+                else:
+                    terminal_finalizer_inputs(node, graphs)
+
+    local_regions = {
+        cast("int", graph_id)
+        for branch in local_branches
+        for graph_id in branch.args[1:3]
+    }
 
     def origin(node: Node) -> Node:
         while True:
@@ -373,9 +522,12 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
             or not isinstance(cast("list[object]", dimensions)[0], int)
             or cast("list[int]", dimensions)[0] <= 0
             or not isinstance(initial, (int, float))
-            or by_graph[allocation.graph].graph_id in parents
+            or (
+                by_graph[allocation.graph].graph_id in parents
+                and by_graph[allocation.graph].graph_id not in local_regions
+            )
         ):
-            reject("a constant one-dimensional root allocation of int32/float32")
+            reject("a constant one-dimensional root/arm allocation of int32/float32")
         positions = {node: i for i, node in enumerate(allocation.graph.nodes)}
         updates: list[int] = []
         reads: list[int] = []
@@ -391,6 +543,10 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
                             reject("loop outputs that retain the same allocation")
                         continue
                     if user.op == "output" and info.graph_id in parents:
+                        # Branch outputs can contain dead lexical locals. For
+                        # local_regions the parent proof has no users or merged
+                        # outputs, so none escapes. Loop identities are checked
+                        # separately by the existing phi/capture rules.
                         continue
                     if _tracing_ops.is_for_loop_target(user.target):
                         if (
@@ -404,11 +560,18 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
                         ):
                             reject("an unchanged allocation capture, not a loop bound")
                         continue
+                    if user in local_branches:
+                        if alias not in (*user.args[3], *user.args[4]):
+                            reject("an unchanged read-only conditional capture")
+                        reads.append(positions[user])
+                        continue
                     if user.target is atomic_ops.atomic_add and user.args[0] is alias:
                         if user.args[2] is alias or alias in user.args[1]:
                             reject("updates that do not read their mutable target")
-                        if user.users or user.args[3] != "relaxed":
-                            reject("unused relaxed atomic results")
+                        if user.args[3] != "relaxed":
+                            reject("relaxed local atomics")
+                        if user.users and dtype != torch.int32:
+                            reject("int32 returned local atomic values")
                         parent = user
                         while parent.graph is not allocation.graph:
                             entry = parents.get(by_graph[parent.graph].graph_id)
@@ -417,16 +580,38 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
                             parent = entry[0]
                         updates.append(positions[parent])
                         continue
+                    read_entry = parents.get(info.graph_id)
+                    read_position = (
+                        positions[user]
+                        if user.graph is allocation.graph
+                        else positions[read_entry[0]]
+                        if read_entry is not None
+                        and read_entry[0] in local_branches
+                        and read_entry[0].graph is allocation.graph
+                        else None
+                    )
                     if (
-                        user.graph is allocation.graph
+                        read_position is not None
+                        and info.graph_id in local_regions
+                        and user.target is atomic_ops.atomic_add
+                        and user.args[0] is not alias
+                        and (user.args[2] is alias or alias in user.args[1])
+                    ):
+                        # The branch proof already restricts the destination to
+                        # a fresh target in this arm. Captured/other completed
+                        # buffers are read-only index/contribution sources.
+                        reads.append(read_position)
+                        continue
+                    if (
+                        read_position is not None
                         and user.target in (memory_ops.store, atomic_ops.atomic_add)
                         and user.args[2] is alias
                         and cast("Node", user.args[0]).target
                         is _tracing_ops._host_tensor
                     ):
-                        reads.append(positions[user])
+                        reads.append(read_position)
                         continue
-                    if user.graph is allocation.graph and (
+                    if read_position is not None and (
                         user.target
                         in (scan_ops._associative_scan, _tracing_ops._mask_to)
                         or (
@@ -444,7 +629,7 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
                         # The fragment emitter completes pending updates before
                         # reads. Dependencies keep the allocation live through
                         # every derived read, including lazy tensor recipes.
-                        reads.append(positions[user])
+                        reads.append(read_position)
                         continue
                     reject("only read-only root consumers after local updates")
         if not updates or any(position <= max(updates) for position in reads):

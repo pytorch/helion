@@ -887,7 +887,8 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             # is tile-dependent and therefore has no supported local owner.
             error = helion.exc.InvalidConfig
             message = (
-                "CTA-local atomics require a constant one-dimensional root allocation"
+                "CTA-local atomics require a constant one-dimensional root/arm "
+                "allocation of int32/float32"
             )
         with self.assertRaisesRegex(error, message):
             kernel(x)
@@ -2163,6 +2164,11 @@ def _simulate_register_load_program(
             (self.iterator + index).store(value)
             self.initialized.add(int(index))
 
+    class Registers(Shared):
+        def fill(self, value):
+            for index in range(self.values.numel()):
+                self[index] = value
+
     class Allocator:
         def __init__(self):
             self.ordinal = 0
@@ -2297,8 +2303,10 @@ def _simulate_register_load_program(
             BFloat16=lambda value: torch.tensor(float(value)).bfloat16().item(),
             Boolean=bool,
             utils=SimpleNamespace(SmemAllocator=Allocator),
+            range_constexpr=range,
         ),
         "cute": SimpleNamespace(
+            make_rmem_tensor=lambda shape, dtype: Registers(shape[0], dtype),
             math=SimpleNamespace(min=np.minimum, max=np.maximum),
             make_layout=lambda shape: shape,
             arch=SimpleNamespace(
@@ -6397,6 +6405,2349 @@ class TestFragmentAtomicAggregationNative(TestCase):
         torch.testing.assert_close(
             actual, _aggregation_reference(x.int(), indices, 17, 0, 1), rtol=0, atol=0
         )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_fetch_add(
+    x, tickets, reused, reversed_tickets, mode: hl.constexpr, initial: hl.constexpr
+):
+    out = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.full([17], initial, dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        indices = lane % 17
+        if mode == "negative":
+            indices = indices - 17
+        elif mode == "masked":
+            indices = torch.where(lane + 1 < x.size(1), indices, 17)
+        elif mode == "bounds":
+            indices = lane - 18
+        if mode == "epochs":
+            hl.atomic_add(local, [indices], x[row, :])
+        for iteration in range(2):
+            previous = hl.atomic_add(local, [indices], x[row, :])
+            if mode == "snapshot":
+                hl.atomic_add(local, [indices], x[row, :])
+            # The first consumer deliberately crosses physical lane/warp owners.
+            reversed_tickets[row, iteration, :] = torch.flip(previous, [0])
+            tickets[row, iteration, :] = previous
+            reused[row, iteration, :] = previous ^ 85
+        out[row, :] = local
+    return out
+
+
+def _local_fetch_args(width, mode, initial=3, value=1, device="cpu"):
+    x = torch.full((2, width), value, dtype=torch.float32, device=device)
+    outputs = [
+        torch.full((2, 2, width), -99, dtype=torch.int32, device=device)
+        for _ in range(3)
+    ]
+    return (x, *outputs, mode, initial)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_scalar_fetch(x, tickets):
+    out = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.full([17], 5, dtype=torch.int32)
+        for iteration in range(2):
+            previous = hl.atomic_add(local, [-1], 1)
+            tickets[row, iteration, :] = previous + hl.arange(x.size(1)) * 0
+        out[row, :] = local
+    return out
+
+
+def _check_local_fetch(args, actual):
+    x, tickets, reused, reversed_tickets, mode, initial = args
+    lane = torch.arange(x.size(1), device=x.device)
+    indices = lane % 17
+    if mode == "negative":
+        indices -= 17
+    elif mode == "masked":
+        indices = torch.where(lane + 1 < x.size(1), indices, 17)
+    elif mode == "bounds":
+        indices = lane - 18
+    indices = torch.where(indices < 0, indices + 17, indices)
+    valid = (indices >= 0) & (indices < 17)
+    expected = torch.full_like(actual, initial, dtype=torch.int64)
+    step = int(x[0, 0].to(torch.int32))
+    for bin_index in range(17):
+        selected = valid & (indices == bin_index)
+        count = int(selected.sum())
+        start = initial + (step * count if mode == "epochs" else 0)
+        epochs = 4 if mode == "snapshot" else (3 if mode == "epochs" else 2)
+        expected[:, bin_index] += epochs * step * count
+        for iteration in range(2):
+            values = (
+                start
+                + step
+                * (
+                    iteration * count * (2 if mode == "snapshot" else 1)
+                    + torch.arange(count, device=x.device)
+                )
+            ).to(torch.int32)
+            torch.testing.assert_close(
+                tickets[:, iteration, selected].sort(-1).values,
+                values.sort().values.expand(x.size(0), -1),
+                rtol=0,
+                atol=0,
+            )
+    torch.testing.assert_close(actual, expected.int(), rtol=0, atol=0)
+    assert bool((tickets[:, :, ~valid] == 0).all())
+    torch.testing.assert_close(reused, tickets ^ 85, rtol=0, atol=0)
+    torch.testing.assert_close(reversed_tickets, tickets.flip(-1), rtol=0, atol=0)
+    return int(valid.sum()) * x.size(0) * epochs
+
+
+class TestFragmentLocalFetchAddCPU(unittest.TestCase):
+    def test_scalar_result_is_one_arrival_broadcast_to_all_consumers(self):
+        for threads in (32, 128, 512):
+            with self.subTest(threads=threads):
+                x = torch.ones((2, 65))
+                tickets = torch.full((2, 2, 65), -99, dtype=torch.int32)
+                actual = torch.empty((2, 17), dtype=torch.int32)
+                source = _aggregation_codegen(
+                    _fragment_local_scalar_fetch, (x, tickets), False, threads
+                )
+                workers = []
+                _simulate_register_load_program(
+                    source,
+                    x,
+                    threads,
+                    host_tensors={"tickets": tickets, "out": actual},
+                    atomic_workers=workers,
+                )
+                self.assertEqual(workers, [("cta", 0)] * 4)
+                expected = torch.full_like(actual, 5)
+                expected[:, -1] = 7
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    tickets,
+                    torch.tensor([5, 6]).view(1, 2, 1).expand_as(tickets).int(),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_duplicate_bins_snapshots_wrapping_tails_and_loop_reuse(self):
+        for width, threads in ((17, 32), (65, 128), (129, 128), (65, 512)):
+            for mode in ("plain", "negative", "masked", "bounds", "epochs", "snapshot"):
+                with self.subTest(width=width, threads=threads, mode=mode):
+                    args = _local_fetch_args(width, mode)
+                    source = _aggregation_codegen(
+                        _fragment_local_fetch_add, args, False, threads
+                    )
+                    for reverse in (False, True):
+                        actual = torch.empty((2, 17), dtype=torch.int32)
+                        events = []
+                        _simulate_register_load_program(
+                            source,
+                            args[0],
+                            threads,
+                            host_tensors={
+                                "out": actual,
+                                "tickets": args[1],
+                                "reused": args[2],
+                                "reversed_tickets": args[3],
+                            },
+                            lane_order=(
+                                list(reversed(range(threads))) if reverse else None
+                            ),
+                            atomic_events=events,
+                        )
+                        expected_calls = _check_local_fetch(args, actual)
+                        self.assertEqual(len(events), expected_calls)
+                        self.assertTrue(all(event[0] == "cta" for event in events))
+                    self.assertNotIn("fragment_warp_atomic", source)
+
+    def test_returned_updates_never_aggregate_or_elide_zero(self):
+        for initial, value in (
+            ((1 << 24) + 5, 0.75),
+            ((1 << 24) + 5, 1.75),
+            ((1 << 24) + 5, -1.75),
+            ((1 << 31) - 2, 1.75),
+        ):
+            with self.subTest(initial=initial, value=value):
+                args = _local_fetch_args(65, "plain", initial, value)
+                before = _aggregation_codegen(_fragment_local_fetch_add, args, False)
+                with self.assertRaisesRegex(helion.exc.InvalidConfig, "unused"):
+                    _aggregation_codegen(_fragment_local_fetch_add, args, True)
+                self.assertNotIn("match_sync", before)
+                actual = torch.empty((2, 17), dtype=torch.int32)
+                events = []
+                _simulate_register_load_program(
+                    before,
+                    args[0],
+                    128,
+                    host_tensors={
+                        "out": actual,
+                        "tickets": args[1],
+                        "reused": args[2],
+                        "reversed_tickets": args[3],
+                    },
+                    atomic_events=events,
+                )
+                self.assertEqual(len(events), _check_local_fetch(args, actual))
+
+    def test_unused_aggregation_composes_with_ungrouped_local_returns(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                args = _local_fetch_args(65, "epochs")
+                source = _aggregation_codegen(_fragment_local_fetch_add, args, enabled)
+                actual = torch.empty((2, 17), dtype=torch.int32)
+                _simulate_register_load_program(
+                    source,
+                    args[0],
+                    128,
+                    host_tensors={
+                        "out": actual,
+                        "tickets": args[1],
+                        "reused": args[2],
+                        "reversed_tickets": args[3],
+                    },
+                )
+                _check_local_fetch(args, actual)
+                self.assertEqual("match_sync" in source, enabled)
+
+    def test_missing_result_exchange_barrier_is_observable(self):
+        import ast
+
+        args = _local_fetch_args(128, "plain")
+        source = _aggregation_codegen(_fragment_local_fetch_add, args, False)
+        tree = ast.parse(source)
+        removed = []
+
+        class RemoveExchange(ast.NodeTransformer):
+            def visit_For(self, node):
+                self.generic_visit(node)
+                for index, statement in enumerate(node.body[:-1]):
+                    if (
+                        isinstance(statement, ast.For)
+                        and "fragment_atomic_previous" in ast.unparse(statement)
+                        and ast.unparse(node.body[index + 1])
+                        == "cute.arch.sync_threads()"
+                    ):
+                        removed.append(node.body.pop(index + 1))
+                        break
+                return node
+
+        changed = ast.unparse(ast.fix_missing_locations(RemoveExchange().visit(tree)))
+        self.assertEqual(len(removed), 1)
+        with self.assertRaisesRegex(AssertionError, "shared.*before initialization"):
+            _simulate_register_load_program(
+                changed,
+                args[0],
+                128,
+                host_tensors={
+                    "tickets": args[1],
+                    "reused": args[2],
+                    "reversed_tickets": args[3],
+                },
+            )
+
+    def test_local_return_rejects_float_ordering_aliases_and_early_reads(self):
+        for dtype, mode in (
+            (torch.float32, "result"),
+            (torch.int32, "release"),
+            (torch.int32, "alias"),
+            (torch.int32, "early_read"),
+            (torch.int32, "divergent"),
+        ):
+            with (
+                self.subTest(dtype=dtype, mode=mode),
+                self.assertRaises(helion.exc.InvalidConfig),
+            ):
+                _aggregation_codegen(
+                    _local_atomic_histogram,
+                    (torch.ones((2, 17), dtype=dtype), 17, 2, mode),
+                    False,
+                )
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_sdk_shared_int32_return_is_used_and_has_cta_scope(self):
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        with ir.Context(), ir.Location.unknown():
+            module = ir.Module.create()
+            with ir.InsertionPoint(module.body):
+                fn = func.FuncOp(
+                    "local_fetch_add",
+                    (
+                        [ir.Type.parse("!llvm.ptr<3>"), cutlass.Int32.mlir_type],
+                        [cutlass.Int32.mlir_type],
+                    ),
+                )
+                block = fn.add_entry_block()
+                with ir.InsertionPoint(block):
+                    previous = cute.arch.atomic_add(
+                        block.arguments[0],
+                        cutlass.Int32(block.arguments[1]),
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    cute.arch.sync_threads()
+                    func.ReturnOp([previous.ir_value()])
+            self.assertTrue(module.operation.verify())
+            atomic = next(
+                op for op in block.operations if op.operation.name == "nvvm.atomicrmw"
+            )
+            self.assertEqual(str(atomic.memOrder), "#nvvm.mem_order<relaxed>")
+            self.assertEqual(str(atomic.syncscope), "#nvvm.mem_scope<cta>")
+            self.assertIn("!llvm.ptr<3>", str(module))
+            self.assertIn("return", str(module))
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_generated_local_fetch_stages_through_sdk(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        source = _aggregation_codegen(
+            _fragment_local_fetch_add, _local_fetch_args(65, "masked"), False
+        )
+        tree = ast.parse(source)
+        fn = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        )
+        fn.name = "staged_local_fetch"
+        fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+        tree.body = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign))
+        ] + [fn]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "staged_local_fetch.py"
+            path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+            spec = importlib.util.spec_from_file_location("staged_local_fetch", path)
+            sdk = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sdk)
+            with ir.Context(), ir.Location.unknown():
+                emitted = ir.Module.create()
+                with ir.InsertionPoint(emitted.body):
+                    entry = func.FuncOp("entry", ([], []))
+                    block = entry.add_entry_block()
+                    with ir.InsertionPoint(block):
+                        tensors = [
+                            cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.Float32
+                                    if arg.arg == "x"
+                                    else cutlass.Int32,
+                                    0,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((260,)),
+                            )
+                            for arg in fn.args.args
+                        ]
+                        sdk.staged_local_fetch(*tensors)
+                        func.ReturnOp([])
+                self.assertTrue(emitted.operation.verify())
+                text = str(emitted)
+                self.assertIn("nvvm.atomicrmw", text)
+                self.assertIn("#nvvm.mem_scope<cta>", text)
+                self.assertIn("nvvm.barrier", text)
+                self.assertNotIn("nvvm.match.sync", text)
+
+
+@onlyBackends("cute")
+class TestFragmentLocalFetchAddNative(TestCase):
+    def test_scalar_arrival_and_full_cta_broadcast(self):
+        for threads in (32, 128, 512):
+            with self.subTest(threads=threads):
+                x = torch.ones((2, 65), device=DEVICE)
+                tickets = torch.full((2, 2, 65), -99, dtype=torch.int32, device=DEVICE)
+                _, actual = code_and_output(
+                    _fragment_local_scalar_fetch,
+                    (x, tickets),
+                    cute_fragment_threads=threads,
+                )
+                expected = torch.full_like(actual, 5)
+                expected[:, -1] = 7
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    tickets,
+                    torch.tensor([5, 6], device=DEVICE)
+                    .view(1, 2, 1)
+                    .expand_as(tickets)
+                    .int(),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_local_tickets_masks_cross_lane_consumers_and_reuse(self):
+        for width, threads in ((17, 32), (65, 128), (129, 128), (65, 512)):
+            for mode in ("plain", "negative", "masked", "bounds", "epochs", "snapshot"):
+                with self.subTest(width=width, threads=threads, mode=mode):
+                    args = _local_fetch_args(width, mode, device=DEVICE)
+                    before = args[0].clone()
+                    _, actual = code_and_output(
+                        _fragment_local_fetch_add, args, cute_fragment_threads=threads
+                    )
+                    _check_local_fetch(args, actual)
+                    torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+    def test_local_integer_payload_zero_and_signed_wrap(self):
+        for initial, value in (
+            ((1 << 24) + 5, 0.75),
+            ((1 << 24) + 5, -1.75),
+            ((1 << 31) - 2, 1.75),
+        ):
+            with self.subTest(initial=initial, value=value):
+                args = _local_fetch_args(65, "plain", initial, value, DEVICE)
+                _, actual = code_and_output(_fragment_local_fetch_add, args)
+                _check_local_fetch(args, actual)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_fetch_shapes(x, direct, reverse, shifted, vector: hl.constexpr):
+    out = torch.empty((x.size(0), 2, 17), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.full([17], 3, dtype=torch.int32)
+        routed = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        if vector:
+            previous = hl.atomic_add(local, [lane % 17], x[row, :])
+        else:
+            previous = hl.atomic_add(local, [lane % 17], 1)
+        direct[row, :] = previous
+        reverse[row, :] = torch.flip(previous, [0])
+        shifted[row, :] = (
+            previous.reshape([x.size(1), 1]) + lane.unsqueeze(1)
+        ).reshape([x.size(1)])
+        hl.atomic_add(routed, [previous % 17], 1)
+        out[row, 0, :] = local
+        out[row, 1, :] = routed
+    return out
+
+
+def _check_local_fetch_shapes(x, direct, reverse, shifted, actual):
+    width = x.size(1)
+    columns = torch.arange(width, device=x.device)
+    expected = 3 + torch.bincount(columns % 17, minlength=17).int()
+    torch.testing.assert_close(
+        actual[:, 0], expected.expand_as(actual[:, 0]), rtol=0, atol=0
+    )
+    for bucket in range(17):
+        tickets = direct[:, columns % 17 == bucket]
+        expected_tickets = torch.arange(3, 3 + tickets.size(1), device=x.device).int()
+        torch.testing.assert_close(
+            tickets.sort(-1).values, expected_tickets.expand_as(tickets), rtol=0, atol=0
+        )
+    torch.testing.assert_close(reverse, direct.flip(-1), rtol=0, atol=0)
+    torch.testing.assert_close(
+        shifted, direct + columns, rtol=0, atol=0, check_dtype=False
+    )
+    for row in range(x.size(0)):
+        torch.testing.assert_close(
+            actual[row, 1],
+            torch.bincount(direct[row].long() % 17, minlength=17).int(),
+            rtol=0,
+            atol=0,
+        )
+
+
+class TestFragmentLocalFetchShapeCPU(unittest.TestCase):
+    def test_scalar_and_vector_returns_keep_logical_views_and_index_domains(self):
+        for width, threads in ((17, 32), (65, 128), (129, 512)):
+            for vector in (False, True):
+                with self.subTest(width=width, threads=threads, vector=vector):
+                    x = torch.ones((2, width))
+                    direct = torch.full((2, width), -99, dtype=torch.int32)
+                    reverse = torch.full_like(direct, -99)
+                    shifted = torch.full_like(direct, -99)
+                    source = _aggregation_codegen(
+                        _fragment_local_fetch_shapes,
+                        (x, direct, reverse, shifted, vector),
+                        False,
+                        threads,
+                    )
+                    for descending in (False, True):
+                        actual = torch.empty((2, 2, 17), dtype=torch.int32)
+                        events = []
+                        _simulate_register_load_program(
+                            source,
+                            x,
+                            threads,
+                            host_tensors={
+                                "direct": direct,
+                                "reverse": reverse,
+                                "shifted": shifted,
+                                "out": actual,
+                            },
+                            lane_order=list(reversed(range(threads)))
+                            if descending
+                            else None,
+                            atomic_events=events,
+                        )
+                        self.assertEqual(len(events), 4 * width)
+                        _check_local_fetch_shapes(x, direct, reverse, shifted, actual)
+                        torch.testing.assert_close(
+                            x, torch.ones_like(x), rtol=0, atol=0
+                        )
+
+
+@onlyBackends("cute")
+class TestFragmentLocalFetchShapeNative(TestCase):
+    def test_mixed_global_and_unused_local_controls(self):
+        for sem in ("relaxed", "acq_rel"):
+            for unused in (False, True):
+                with self.subTest(sem=sem, unused=unused):
+                    x = torch.ones((2, 17), dtype=torch.int32, device=DEVICE)
+                    counter = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+                    tickets = torch.full_like(x, -99)
+                    _, actual = code_and_output(
+                        _fragment_ordered_vector, (x, counter, tickets, sem, unused)
+                    )
+                    torch.testing.assert_close(actual, x, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        counter, torch.full_like(counter, 17), rtol=0, atol=0
+                    )
+                    expected = (
+                        torch.full_like(tickets, -99)
+                        if unused
+                        else torch.arange(17, dtype=torch.int32, device=DEVICE)
+                        .view(1, 17)
+                        .expand_as(tickets)
+                    )
+                    torch.testing.assert_close(
+                        tickets.sort(-1).values, expected, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(x, torch.ones_like(x), rtol=0, atol=0)
+
+    def test_scalar_and_vector_returns_keep_logical_views_and_index_domains(self):
+        for width, threads in ((17, 32), (65, 128), (129, 512)):
+            for vector in (False, True):
+                with self.subTest(width=width, threads=threads, vector=vector):
+                    x = torch.ones((2, width), device=DEVICE)
+                    direct = torch.full(
+                        (2, width), -99, dtype=torch.int32, device=DEVICE
+                    )
+                    reverse = torch.full_like(direct, -99)
+                    shifted = torch.full_like(direct, -99)
+                    _, actual = code_and_output(
+                        _fragment_local_fetch_shapes,
+                        (x, direct, reverse, shifted, vector),
+                        cute_fragment_threads=threads,
+                    )
+                    _check_local_fetch_shapes(x, direct, reverse, shifted, actual)
+                    torch.testing.assert_close(x, torch.ones_like(x), rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_registers(x, tickets, reused, scalar: hl.constexpr):
+    out = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(helion.next_power_of_2(x.size(1)))
+        index = torch.where(lane < x.size(1), lane % 19 - 1, 17)
+        if scalar:
+            value = 1
+        else:
+            value = hl.load(x, [row, lane])
+        previous = hl.atomic_add(local, [index], value)
+        hl.store(tickets, [row, lane], previous)
+        hl.store(reused, [row, lane], previous * 3 + 2)
+        out[row, :] = local
+    return out
+
+
+def _local_register_codegen(kernel, args, enabled, threads=128):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_local_atomic_registers=enabled, cute_fragment_threads=threads
+        )
+        _, config = bound.config_spec.create_config_generation().strict_config_pair(
+            config
+        )
+        return bound.to_code(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_register_escape(x, tickets, counter, mode: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(helion.next_power_of_2(x.size(1)))
+        ticket = hl.atomic_add(local, [lane % 17], 1)
+        if mode == "flip":
+            result = torch.flip(ticket, [0])
+        elif mode == "scan":
+            result = hl.cumsum(ticket, 0)
+        elif mode == "reduce":
+            result = ticket + ticket.sum()
+        elif mode == "carry":
+            result = ticket
+            for step in range(2):
+                result = result + step
+        else:
+            hl.atomic_add(counter, [row + lane * 0], ticket)
+            result = ticket
+        hl.store(tickets, [row, lane], result)
+    return tickets
+
+
+class TestFragmentLocalRegistersCPU(unittest.TestCase):
+    def test_tails_wrapped_indices_values_reuse_and_epoch_parity(self):
+        for width, threads in (
+            (17, 32),
+            (65, 32),
+            (129, 128),
+            (1025, 512),
+            (1023, 1024),
+            (1025, 1024),
+        ):
+            for scalar in (False, True):
+                with self.subTest(width=width, threads=threads, scalar=scalar):
+                    x = ((torch.arange(2 * width).reshape(2, width) % 7) - 3).int()
+                    ticket = torch.full_like(x, -99)
+                    reused = torch.full_like(x, -99)
+                    args = (x, ticket, reused, scalar)
+                    sources = [
+                        _local_register_codegen(
+                            _fragment_local_registers, args, flag, threads
+                        )
+                        for flag in (False, True)
+                    ]
+                    self.assertNotIn("fragment_local_tickets", sources[0])
+                    self.assertIn("cute.make_rmem_tensor", sources[1])
+                    for order in (list(range(threads)), list(reversed(range(threads)))):
+                        observed = []
+                        for source in sources:
+                            ticket.fill_(-99)
+                            reused.fill_(-99)
+                            events = []
+                            output = torch.full((2, 17), -99, dtype=torch.int32)
+                            actual, barriers = _simulate_register_load_program(
+                                source,
+                                x,
+                                threads,
+                                host_tensors={
+                                    "tickets": ticket,
+                                    "reused": reused,
+                                    "out": output,
+                                },
+                                lane_order=order,
+                                atomic_events=events,
+                            )
+                            observed.append(
+                                (
+                                    output.clone(),
+                                    ticket.clone(),
+                                    reused.clone(),
+                                    barriers,
+                                    events,
+                                )
+                            )
+                        for a, b in zip(observed[0][:3], observed[1][:3], strict=True):
+                            torch.testing.assert_close(a, b, rtol=0, atol=0)
+                        self.assertEqual(observed[0][3:], observed[1][3:])
+                        indices = torch.arange(width) % 19 - 1
+                        indices = torch.where(indices < 0, indices + 17, indices)
+                        active = indices < 17
+                        expected = torch.zeros((2, 17), dtype=torch.int32)
+                        expected.scatter_add_(
+                            1,
+                            indices[active].expand(2, -1),
+                            torch.ones_like(x[:, active]) if scalar else x[:, active],
+                        )
+                        torch.testing.assert_close(
+                            observed[1][0], expected, rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            observed[1][2], observed[1][1] * 3 + 2, rtol=0, atol=0
+                        )
+
+    def test_cross_lane_views_decline_and_slot_budget_is_explicit(self):
+        from helion import exc
+
+        x = torch.ones((2, 17))
+        out = torch.zeros_like(x, dtype=torch.int32)
+        with self.assertRaises(exc.InvalidConfig):
+            _local_register_codegen(
+                _fragment_local_fetch_shapes,
+                (x, out, out.clone(), out.clone(), False),
+                True,
+                32,
+            )
+        x = torch.ones((2, 1025), dtype=torch.int32)
+        out = torch.zeros_like(x)
+        with self.assertRaises(exc.InvalidConfig):
+            _local_register_codegen(
+                _fragment_local_registers, (x, out, out.clone(), False), True, 32
+            )
+        source = _local_register_codegen(
+            _fragment_local_registers, (x, out, out.clone(), False), True, 64
+        )
+        self.assertIn("cute.make_rmem_tensor", source)
+
+    def test_masked_nan_and_fractional_contributions_stay_guarded(self):
+        x = (torch.arange(130).reshape(2, 65).float() % 5) - 2.5
+        x[:, torch.arange(65) % 19 == 18] = float("nan")
+        tickets = torch.zeros_like(x, dtype=torch.int32)
+        reused = torch.zeros_like(tickets)
+        records = []
+        for flag in (False, True):
+            source = _local_register_codegen(
+                _fragment_local_registers, (x, tickets, reused, False), flag, 32
+            )
+            events = []
+            out, barriers = _simulate_register_load_program(
+                source,
+                x,
+                32,
+                host_tensors={"tickets": tickets, "reused": reused},
+                atomic_events=events,
+            )
+            records.append(
+                (out.clone(), tickets.clone(), reused.clone(), events, barriers)
+            )
+        for a, b in zip(records[0][:3], records[1][:3], strict=True):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        self.assertEqual(records[0][3:], records[1][3:])
+
+    def test_default_and_complete_previous_coverage_prefix(self):
+        from copy import deepcopy
+        import random
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        key = "cute_fragment_local_atomic_registers"
+        x = torch.ones((2, 65), dtype=torch.int32)
+        args = (x, x.clone(), x.clone(), False)
+        kernel = helion.kernel(
+            _fragment_local_registers.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="full",
+        )
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(kernel, args)
+            spec = bound.config_spec
+            default = spec.default_config()
+            self.assertNotIn(key, default)
+            self.assertTrue(all(key not in seed for seed in spec.compiler_seed_configs))
+            off = deepcopy(default)
+            off.config[key] = False
+            self.assertEqual(bound.to_code(default), bound.to_code(off))
+            for invalid in (1, "registers", None):
+                bad = deepcopy(default)
+                bad.config[key] = invalid
+                with self.assertRaises(helion.exc.InvalidConfig):
+                    bound.to_code(bad)
+            groups = spec.compiler_coverage_groups
+            self.assertEqual(groups[-1].key, key)
+            self.assertTrue(groups[-1].deferred)
+            self.assertFalse(groups[-1].legacy)
+
+            def population():
+                with bound.env:
+                    search = PatternSearch(
+                        bound,
+                        args,
+                        initial_population=8,
+                        initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+                    )
+                    rows = checked_initial_population(search)
+                    return [
+                        dict(search.config_gen.canonicalize_flat(row)[1])
+                        for row in rows
+                    ], random.getstate()
+
+            random.seed(20261003)
+            new, state = population()
+            with patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_local_atomic_registers_coverage"
+            ):
+                bound = _cpu_bind(kernel, args)
+            random.seed(20261003)
+            old, old_state = population()
+            self.assertEqual(new[: len(old)], old)
+            self.assertEqual(state, old_state)
+            self.assertTrue(any(row.get(key) is True for row in new))
+
+    def test_nonlocal_consumers_keep_the_existing_shared_path(self):
+        x = torch.ones((2, 65), dtype=torch.int32)
+        for mode in ("flip", "scan", "reduce", "carry", "global"):
+            with self.subTest(mode=mode):
+                args = (x, torch.zeros_like(x), torch.zeros(2, dtype=torch.int32), mode)
+                baseline = _local_register_codegen(
+                    _fragment_local_register_escape, args, False
+                )
+                self.assertNotIn("fragment_local_tickets", baseline)
+                with self.assertRaises(helion.exc.InvalidConfig):
+                    _local_register_codegen(_fragment_local_register_escape, args, True)
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_sdk_compiles_register_slot_producer_and_consumers(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        for width, threads in ((129, 32), (1025, 1024)):
+            with self.subTest(width=width, threads=threads):
+                x = torch.ones((2, width), dtype=torch.int32)
+                code = _local_register_codegen(
+                    _fragment_local_registers,
+                    (x, x.clone(), x.clone(), False),
+                    True,
+                    threads,
+                )
+                tree = ast.parse(code)
+                fn = next(
+                    n
+                    for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+                )
+                fn.name = "staged"
+                fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+                tree.body = [
+                    n
+                    for n in tree.body
+                    if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign))
+                ] + [fn]
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "register_slots.py"
+                    path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+                    spec = importlib.util.spec_from_file_location(
+                        "register_slots", path
+                    )
+                    sdk = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(sdk)
+                    with ir.Context(), ir.Location.unknown():
+                        module = ir.Module.create()
+                        with ir.InsertionPoint(module.body):
+                            entry = func.FuncOp("entry", ([], []))
+                            with ir.InsertionPoint(entry.add_entry_block()):
+                                tensors = [
+                                    cute.make_tensor(
+                                        cute.make_ptr(
+                                            cutlass.Int32,
+                                            0,
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=16,
+                                        ),
+                                        cute.make_layout((2 * width,)),
+                                    )
+                                    for _arg in fn.args.args
+                                ]
+                                sdk.staged(*tensors)
+                                func.ReturnOp([])
+                        self.assertTrue(module.operation.verify())
+                        self.assertIn("nvvm.atomicrmw", str(module))
+                        self.assertIn("#nvvm.mem_scope<cta>", str(module))
+                        self.assertIn("nvvm.barrier", str(module))
+
+    def test_1024_threads_shared_float_subnormals_and_capacity_guard(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        tiny = torch.finfo(torch.float32).tiny
+        x = torch.full((2, 2), tiny / 2)
+        source = _fragment_ordered_codegen(_local_atomic_subnormal, (x,), 1024)
+        self.assertIn("block=(1024, 1, 1)", source)
+        for order in (list(range(1024)), list(reversed(range(1024)))):
+            actual = torch.full((2, 1), -999.0)
+            _simulate_register_load_program(
+                source, x, 1024, lane_order=order, host_tensors={"out": actual}
+            )
+            torch.testing.assert_close(actual, torch.full((2, 1), tiny), rtol=0, atol=0)
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(
+                _local_atomic_histogram,
+                (torch.ones((1, 17)), 17, 2, "plain"),
+            )
+            config = bound.config_spec.default_config()
+            config.config["cute_fragment_threads"] = 1024
+            with (
+                patch(
+                    "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
+                    return_value=16,
+                ),
+                self.assertRaisesRegex(helion.exc.InvalidConfig, "shared bytes"),
+            ):
+                bound.to_code(config)
+
+
+@onlyBackends("cute")
+class TestFragmentLocalRegistersNative(TestCase):
+    def test_register_ticket_slots_tails_and_repeated_consumers(self):
+        for width, threads in ((17, 32), (129, 128), (8192, 512), (1025, 1024)):
+            for scalar in (False, True):
+                with self.subTest(width=width, threads=threads, scalar=scalar):
+                    x = torch.ones((2, width), dtype=torch.int32, device=DEVICE)
+                    tickets = torch.full_like(x, -99)
+                    reused = torch.full_like(x, -99)
+                    source, out = code_and_output(
+                        _fragment_local_registers,
+                        (x, tickets, reused, scalar),
+                        cute_fragment_local_atomic_registers=True,
+                        cute_fragment_threads=threads,
+                    )
+                    self.assertIn("fragment_local_tickets", source)
+                    indices = torch.arange(width, device=DEVICE) % 19 - 1
+                    indices = torch.where(indices < 0, indices + 17, indices)
+                    expected = torch.zeros((2, 17), dtype=torch.int32, device=DEVICE)
+                    for bucket in range(17):
+                        active = indices == bucket
+                        count = int(active.sum())
+                        expected[:, bucket] = count
+                        for row in range(2):
+                            torch.testing.assert_close(
+                                tickets[row, active].sort().values,
+                                torch.arange(count, dtype=torch.int32, device=DEVICE),
+                                rtol=0,
+                                atol=0,
+                            )
+                    self.assertTrue(torch.all(tickets[:, indices >= 17] == 0))
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(reused, tickets * 3 + 2, rtol=0, atol=0)
+                    torch.testing.assert_close(x, torch.ones_like(x), rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_buffer_capacity(
+    x, out, totals, capacity: hl.constexpr, mode: hl.constexpr
+):
+    for row in hl.grid(x.size(0)):
+        count = hl.zeros([1], dtype=torch.int32)
+        histogram = hl.zeros([17], dtype=torch.int32)
+        compacted = hl.zeros([capacity], dtype=x.dtype)
+        column = hl.arange(helion.next_power_of_2(x.size(1)))
+        value = hl.load(x, [row, column], extra_mask=column < x.size(1))
+        active = (column < x.size(1)) & (value > 0)
+        ticket = hl.atomic_add(
+            count, [torch.zeros_like(column)], active.to(torch.int32)
+        )
+        hl.atomic_add(histogram, [column % 17], active.to(torch.int32))
+        safe_ticket = torch.where(
+            ticket < 0, 0, torch.where(ticket >= capacity, capacity - 1, ticket)
+        )
+        hl.atomic_add(
+            compacted,
+            [safe_ticket],
+            torch.where(active & (ticket < capacity), value, 0),
+        )
+        if mode == "scalar":
+            total = count.sum()
+        else:
+            total = histogram.sum()
+        totals[row] = total
+        if total <= capacity:
+            if mode == "pressure":
+                prefix = torch.cumsum(compacted, 0)
+                out[row, :] = prefix + prefix.sum().to(torch.int32)
+            else:
+                out[row, :] = compacted
+        else:
+            # A failed capacity attempt must overwrite the entire output. This
+            # fixture deliberately starts with nonzero/stale output contents.
+            out[row, :] = -1
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_buffer_rejected(x, out, mode: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(local, [lane % 17], x[row, :])
+        total = local.sum()
+        if mode == "view":
+            captured = torch.flip(local, [0])
+        elif mode == "lazy":
+            captured = local + 1
+        else:
+            captured = local
+        if mode == "vector":
+            condition = local > 0
+        elif mode == "singleton":
+            condition = local.sum(0, keepdim=True) > 0
+        elif mode == "loaded":
+            condition = (total > 0) & (x[row, 0] > 0)
+        else:
+            condition = total > 0
+        if mode == "early":
+            hl.atomic_add(local, [lane % 17], x[row, :])
+        if condition:
+            if mode == "atomic":
+                hl.atomic_add(local, [lane % 17], x[row, :])
+            elif mode == "loop":
+                for iteration in range(2):
+                    out[row, :] = local + iteration
+            elif mode == "nested":
+                if total > 1:
+                    out[row, :] = local
+            elif mode == "phi":
+                captured = local * 2
+            else:
+                out[row, :] = captured
+        else:
+            out[row, :] = -1
+        if mode == "later":
+            hl.atomic_add(local, [lane % 17], x[row, :])
+        elif mode == "phi":
+            out[row, :] = captured
+        elif mode == "nonterminal":
+            out[row, :] = local
+    return out
+
+
+def _local_buffer_capacity_args(width, capacity, mode, device="cpu", dtype=torch.int32):
+    # Empty, exact-capacity and overflowing populations share one compiled CTA
+    # program. A zero at every inactive coordinate checks initialized padding.
+    x = torch.zeros((4, width), dtype=dtype, device=device)
+    for row, count in enumerate(
+        (0, min(width, capacity), min(width, capacity + 1), width)
+    ):
+        x[row, :count] = torch.arange(1, count + 1, dtype=torch.int32, device=device)
+    return (
+        x,
+        torch.full((4, capacity), -777, dtype=dtype, device=device),
+        torch.full((4,), -999, dtype=torch.int32, device=device),
+        capacity,
+        mode,
+    )
+
+
+def _check_local_buffer_capacity(args):
+    x, out, totals, capacity, mode = args
+    expected_count = (x > 0).sum(-1).to(torch.int32)
+    torch.testing.assert_close(totals, expected_count, rtol=0, atol=0)
+    for row in range(x.size(0)):
+        if expected_count[row] > capacity:
+            torch.testing.assert_close(
+                out[row], torch.full_like(out[row], -1), rtol=0, atol=0
+            )
+        elif mode == "pressure":
+            # Prefix order can follow either valid atomic schedule. Recover the
+            # compacted values; its multiset is the independent invariant.
+            count = int(expected_count[row])
+            prefix = out[row] - out[row].sum().div(capacity + 1, rounding_mode="trunc")
+            recovered = torch.diff(prefix, prepend=prefix.new_zeros(1))
+            expected = torch.zeros_like(recovered)
+            expected[:count] = x[row][x[row] > 0]
+            torch.testing.assert_close(
+                recovered.sort().values, expected.sort().values, rtol=0, atol=0
+            )
+        else:
+            expected = torch.zeros_like(out[row])
+            selected = x[row][x[row] > 0]
+            expected[: selected.numel()] = selected
+            torch.testing.assert_close(
+                out[row].sort().values, expected.sort().values, rtol=0, atol=0
+            )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_local_buffer_extrema(x, out, limit: int, minimum: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.int32)
+        hl.atomic_add(local, [hl.arange(17)], x[row, :])
+        if minimum:
+            extreme = torch.amin(local)
+        else:
+            extreme = torch.amax(local)
+        if extreme >= limit:
+            out[row, :] = local * 2
+        else:
+            out[row, :] = local - 1
+    return out
+
+
+def _local_buffer_extrema_args(minimum, device="cpu"):
+    x = torch.arange(3 * 17, dtype=torch.int32, device=device).reshape(3, 17) - 17
+    return x, torch.full_like(x, -999), 0, minimum
+
+
+def _check_local_buffer_extrema(args):
+    x, out, limit, minimum = args
+    extreme = x.amin(1) if minimum else x.amax(1)
+    expected = torch.where((extreme >= limit)[:, None], x * 2, x - 1)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+class TestFragmentLocalBufferConditionalsCPU(unittest.TestCase):
+    def test_float_buffer_and_extrema_uniform_host_bound(self):
+        args = _local_buffer_capacity_args(65, 17, "pressure", dtype=torch.float32)
+        source = _fragment_ordered_codegen(_fragment_local_buffer_capacity, args)
+        _simulate_register_load_program(
+            source, args[0], 128, host_tensors={"out": args[1], "totals": args[2]}
+        )
+        _check_local_buffer_capacity(args)
+        for minimum in (False, True):
+            args = _local_buffer_extrema_args(minimum)
+            source = _fragment_ordered_codegen(_fragment_local_buffer_extrema, args)
+            for limit in (-19, 0, 18, 100):
+                with self.subTest(minimum=minimum, limit=limit):
+                    values = (*args[:2], limit, minimum)
+                    _simulate_register_load_program(
+                        source,
+                        args[0],
+                        128,
+                        host_tensors={"out": args[1]},
+                        scalar_args={"limit": limit},
+                    )
+                    _check_local_buffer_extrema(values)
+
+    def test_compaction_capacity_tails_and_complete_fallback(self):
+        for width, capacity, threads in ((17, 8, 32), (65, 17, 128), (129, 65, 512)):
+            for mode in ("scalar", "histogram", "pressure"):
+                with self.subTest(
+                    width=width, capacity=capacity, threads=threads, mode=mode
+                ):
+                    args = _local_buffer_capacity_args(width, capacity, mode)
+                    source = _fragment_ordered_codegen(
+                        _fragment_local_buffer_capacity, args, threads
+                    )
+                    for order in (list(range(threads)), list(reversed(range(threads)))):
+                        args[1].fill_(314159)
+                        events = []
+                        before = args[0].clone()
+                        _simulate_register_load_program(
+                            source,
+                            args[0],
+                            threads,
+                            host_tensors={"out": args[1], "totals": args[2]},
+                            lane_order=order,
+                            memory_events=events,
+                        )
+                        _check_local_buffer_capacity(args)
+                        torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+                        self.assertEqual(
+                            sum(event[0] == "atomic" for event in events),
+                            4 * 3 * helion.next_power_of_2(width),
+                        )
+                    # Same generated program takes the other branch per row.
+                    args[0].copy_(args[0].flip(0))
+                    _simulate_register_load_program(
+                        source,
+                        args[0],
+                        threads,
+                        host_tensors={"out": args[1], "totals": args[2]},
+                    )
+                    _check_local_buffer_capacity(args)
+
+    def test_predicate_and_local_captures_stay_live_during_branch_allocation(self):
+        from unittest.mock import patch
+
+        from helion._compiler.cute.computed_fragment import FragmentCompiler
+
+        original = FragmentCompiler.allocate
+        checks = []
+
+        def allocate(compiler, value):
+            held = compiler.referenced_buffers(compiler.held)
+            result = original(compiler, value)
+            if held:
+                self.assertNotIn(result.storage, held)
+                checks.append(result.storage)
+            return result
+
+        args = _local_buffer_capacity_args(65, 17, "pressure")
+        with patch.object(FragmentCompiler, "allocate", allocate):
+            source = _fragment_ordered_codegen(_fragment_local_buffer_capacity, args)
+        self.assertTrue(checks)
+        _simulate_register_load_program(
+            source, args[0], 128, host_tensors={"out": args[1], "totals": args[2]}
+        )
+        _check_local_buffer_capacity(args)
+
+    def test_unsupported_predicates_aliases_mutation_and_reconvergence_reject(self):
+        for mode in (
+            "vector",
+            "singleton",
+            "loaded",
+            "view",
+            "lazy",
+            "atomic",
+            "loop",
+            "nested",
+            "early",
+            "later",
+            "phi",
+            "nonterminal",
+        ):
+            with self.subTest(mode=mode), self.assertRaises(helion.exc.InvalidConfig):
+                _fragment_ordered_codegen(
+                    _fragment_local_buffer_rejected,
+                    (
+                        torch.ones((2, 17), dtype=torch.int32),
+                        torch.empty((2, 17), dtype=torch.int32),
+                        mode,
+                    ),
+                )
+
+    def test_warp_private_reduction_cannot_control_cta_branch(self):
+        from unittest.mock import patch
+
+        from helion._compiler.cute.computed_fragment import FragmentCompiler
+        from helion._compiler.cute.local_atomic import local_buffer_conditional_inputs
+
+        original = FragmentCompiler.conditional
+
+        def conditional(compiler, node, values):
+            reductions, _symbols = local_buffer_conditional_inputs(
+                node, compiler.graphs
+            )
+            compiler.warp_result_nodes.update(dict.fromkeys(reductions, 1))
+            return original(compiler, node, values)
+
+        with (
+            patch.object(FragmentCompiler, "conditional", conditional),
+            self.assertRaisesRegex(helion.exc.InvalidConfig, "CTA-shared"),
+        ):
+            _fragment_ordered_codegen(
+                _fragment_local_buffer_capacity,
+                _local_buffer_capacity_args(17, 8, "histogram"),
+            )
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_sdk_stages_shared_predicate_and_both_collective_branches(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        for mode in ("scalar", "pressure"):
+            source = _fragment_ordered_codegen(
+                _fragment_local_buffer_capacity,
+                _local_buffer_capacity_args(65, 17, mode),
+            )
+            tree = ast.parse(source)
+            fn = next(
+                n
+                for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+            )
+            fn.name = "staged_local_branch"
+            fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+            tree.body = [
+                n
+                for n in tree.body
+                if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign))
+            ] + [fn]
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "staged.py"
+                path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+                spec = importlib.util.spec_from_file_location(
+                    "staged_local_branch", path
+                )
+                sdk = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(sdk)
+                with ir.Context(), ir.Location.unknown():
+                    emitted = ir.Module.create()
+                    with ir.InsertionPoint(emitted.body):
+                        entry = func.FuncOp("entry", ([], []))
+                        block = entry.add_entry_block()
+                        with ir.InsertionPoint(block):
+                            tensors = [
+                                cute.make_tensor(
+                                    cute.make_ptr(
+                                        cutlass.Int32,
+                                        0,
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16,
+                                    ),
+                                    cute.make_layout((260,)),
+                                )
+                                for _arg in fn.args.args
+                            ]
+                            sdk.staged_local_branch(*tensors)
+                            func.ReturnOp([])
+                    self.assertTrue(emitted.operation.verify())
+                    text = str(emitted)
+                    self.assertIn("scf.if", text)
+                    self.assertIn("nvvm.barrier", text)
+                    self.assertIn("nvvm.atomicrmw", text)
+
+
+@onlyBackends("cute")
+class TestFragmentLocalBufferConditionalsNative(TestCase):
+    def test_float_buffer_and_uniform_extrema(self):
+        args = _local_buffer_capacity_args(65, 17, "pressure", DEVICE, torch.float32)
+        code_and_output(_fragment_local_buffer_capacity, args)
+        _check_local_buffer_capacity(args)
+        for minimum in (False, True):
+            with self.subTest(minimum=minimum):
+                args = _local_buffer_extrema_args(minimum, DEVICE)
+                code_and_output(_fragment_local_buffer_extrema, args)
+                _check_local_buffer_extrema(args)
+
+    def test_complete_compaction_and_overflow_branches(self):
+        for width, capacity, threads in ((17, 8, 32), (65, 17, 128), (129, 65, 512)):
+            for mode in ("scalar", "histogram", "pressure"):
+                with self.subTest(
+                    width=width, capacity=capacity, threads=threads, mode=mode
+                ):
+                    args = _local_buffer_capacity_args(width, capacity, mode, DEVICE)
+                    before = args[0].clone()
+                    code_and_output(
+                        _fragment_local_buffer_capacity,
+                        args,
+                        cute_fragment_threads=threads,
+                    )
+                    _check_local_buffer_capacity(args)
+                    torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_refinement(
+    x, lengths, out, counts, capacity: hl.constexpr, k: hl.constexpr
+):
+    for row in hl.grid(x.size(0)):
+        count = hl.zeros([1], torch.int32)
+        compact_keys = hl.zeros([capacity], torch.int32)
+        compact_ids = hl.zeros([capacity], torch.int32)
+        col = hl.arange(helion.next_power_of_2(x.size(1)))
+        valid = (col < x.size(1)) & (col < lengths[row])
+        value = hl.load(x, [row, col], extra_mask=valid)
+        active = valid & (value >= 0)
+        ticket = hl.atomic_add(count, [torch.zeros_like(col)], active.to(torch.int32))
+        address = torch.where(ticket < capacity, ticket, capacity - 1)
+        hl.atomic_add(
+            compact_keys,
+            [address],
+            torch.where(active & (ticket < capacity), value + 8, 0),
+        )
+        hl.atomic_add(
+            compact_ids,
+            [address],
+            torch.where(active & (ticket < capacity), col + 1, 0),
+        )
+        population = count.sum()
+        counts[row] = population
+        out[row, :] = -1
+        if (population >= k) & (population <= capacity):
+            small_hist = hl.zeros([16], torch.int32)
+            small_col = hl.arange(helion.next_power_of_2(capacity))
+            small_valid = (small_col < population) & (small_col < capacity)
+            hl.atomic_add(small_hist, [compact_keys], small_valid.to(torch.int32))
+            small_cdf = torch.cumsum(small_hist, 0)
+            small_cut = (small_cdf < population - k + 1).to(torch.int32).sum()
+            small_above = small_valid & (compact_keys > small_cut)
+            small_tie = small_valid & (compact_keys == small_cut)
+            small_need = k - small_above.to(torch.int32).sum()
+            small_slots = hl.zeros([2], torch.int32)
+            small_ticket = hl.atomic_add(
+                small_slots,
+                [small_tie.to(torch.int32)],
+                (small_above | small_tie).to(torch.int32),
+            )
+            small_dest = torch.where(
+                small_above, small_ticket, k - small_need + small_ticket
+            )
+            hl.store(
+                out,
+                [row, small_dest],
+                compact_ids - 1,
+                extra_mask=small_above | (small_tie & (small_ticket < small_need)),
+            )
+        else:
+            full_hist = hl.zeros([16], torch.int32)
+            full_col = hl.arange(helion.next_power_of_2(x.size(1)))
+            full_valid = (full_col < x.size(1)) & (full_col < lengths[row])
+            full_value = hl.load(x, [row, full_col], extra_mask=full_valid)
+            full_key = full_value + 8
+            hl.atomic_add(full_hist, [full_key], full_valid.to(torch.int32))
+            full_cdf = torch.cumsum(full_hist, 0)
+            full_count = full_valid.to(torch.int32).sum()
+            full_cut = (full_cdf < full_count - k + 1).to(torch.int32).sum()
+            full_above = full_valid & (full_key > full_cut)
+            full_tie = full_valid & (full_key == full_cut)
+            full_need = k - full_above.to(torch.int32).sum()
+            full_slots = hl.zeros([2], torch.int32)
+            full_ticket = hl.atomic_add(
+                full_slots,
+                [full_tie.to(torch.int32)],
+                (full_above | full_tie).to(torch.int32),
+            )
+            full_dest = torch.where(
+                full_above, full_ticket, k - full_need + full_ticket
+            )
+            hl.store(
+                out,
+                [row, full_dest],
+                full_col,
+                extra_mask=full_above | (full_tie & (full_ticket < full_need)),
+            )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_atomic_epochs(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        total = parent.sum()
+        if total > 0:
+            first = hl.zeros([17], dtype=torch.int32)
+            second = hl.full([33], 3, dtype=torch.float32)
+            hl.atomic_add(first, [lane % 17 - 17], x[row, :])
+            out[row, :] = first + parent
+            # These final unused epochs must complete in the selected arm.
+            hl.atomic_add(second, [lane % 33], x[row, :])
+        else:
+            other = hl.zeros([17], dtype=torch.int32)
+            spare = hl.full([65], 5, dtype=torch.float32)
+            hl.atomic_add(other, [lane % 17], x[row, :])
+            out[row, :] = other + parent
+            hl.atomic_add(spare, [lane % 65], x[row, :])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_captured(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        total = parent.sum()
+        if total > 0:
+            fresh = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(fresh, [lane % 17], x[row, :])
+            hl.atomic_add(parent, [lane % 17], x[row, :])
+            out[row, :] = fresh
+        else:
+            out[row, :] = parent
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_nested(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        total = parent.sum()
+        if total > 0:
+            fresh = hl.zeros([17], dtype=torch.int32)
+            if total > 1:
+                hl.atomic_add(fresh, [lane % 17], x[row, :])
+            out[row, :] = fresh
+        else:
+            out[row, :] = parent
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_loop(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        total = parent.sum()
+        if total > 0:
+            fresh = hl.zeros([17], dtype=torch.int32)
+            for iteration in range(2):
+                hl.atomic_add(fresh, [lane % 17], x[row, :] + iteration)
+            out[row, :] = fresh
+        else:
+            out[row, :] = parent
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_alias(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        total = parent.sum()
+        if total > 0:
+            fresh = hl.zeros([17], dtype=torch.int32)
+            viewed = fresh[:, None]
+            hl.atomic_add(viewed, [lane % 17, 0], x[row, :])
+            out[row, :] = fresh
+        else:
+            out[row, :] = parent
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_early(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        total = parent.sum()
+        if total > 0:
+            fresh = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(fresh, [lane % 17], x[row, :])
+            early = fresh + 1
+            hl.atomic_add(fresh, [lane % 17], x[row, :])
+            out[row, :] = early
+        else:
+            out[row, :] = parent
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_branch_escape(x, out):
+    for row in hl.grid(x.size(0)):
+        parent = hl.zeros([17], dtype=torch.int32)
+        lane = hl.arange(x.size(1))
+        hl.atomic_add(parent, [lane % 17], x[row, :])
+        carried = parent
+        if parent.sum() > 0:
+            fresh = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(fresh, [lane % 17], x[row, :])
+            carried = fresh
+        out[row, :] = carried
+    return out
+
+
+def _branch_refinement_args(width, capacity, device="cpu"):
+    k = 4
+    x = (torch.arange(8 * width, device=device).reshape(8, width) % 8 - 8).to(
+        torch.int32
+    )
+    for row, population in (
+        (1, k),
+        (2, capacity),
+        (3, capacity + 1),
+        (4, width),
+        (5, k),
+    ):
+        x[row, :population] = (
+            torch.arange(population, dtype=torch.int32, device=device) % 8
+        )
+    x[4].fill_(7)
+    lengths = torch.tensor(
+        [width] * 5 + [width - 3, 0, 2], dtype=torch.int32, device=device
+    )
+    x[7, :2] = torch.tensor([-8, 7], dtype=torch.int32, device=device)
+    for row in range(8):
+        x[row, lengths[row] :] = 999
+    return (
+        x,
+        lengths,
+        torch.full((8, k), -777, dtype=torch.int32, device=device),
+        torch.full((8,), -99, dtype=torch.int32, device=device),
+        capacity,
+        k,
+    )
+
+
+def _check_branch_refinement(args):
+    x, lengths, out, counts, _capacity, k = args
+    for row in range(x.size(0)):
+        length = int(lengths[row])
+        self_count = int((x[row, :length] >= 0).sum())
+        assert int(counts[row]) == self_count
+        selected = out[row][out[row] >= 0].long()
+        assert selected.numel() == min(k, length)
+        assert selected.unique().numel() == selected.numel()
+        assert bool(torch.all(selected < length))
+        assert int((out[row] == -1).sum()) == k - selected.numel()
+        reference = x[row, :length].sort(descending=True).values[:k]
+        torch.testing.assert_close(
+            x[row, selected].sort(descending=True).values, reference, rtol=0, atol=0
+        )
+
+
+class TestFragmentBranchLocalAtomicsCPU(unittest.TestCase):
+    def test_exact_compact_refinement_and_full_row_fallback(self):
+        for width, capacity, threads in ((17, 8, 32), (65, 17, 128), (129, 33, 512)):
+            for scan in ("serial", "cooperative"):
+                with self.subTest(
+                    width=width, capacity=capacity, threads=threads, scan=scan
+                ):
+                    args = _branch_refinement_args(width, capacity)
+                    source = _local_histogram_consumer_codegen(
+                        _fragment_branch_refinement, args, scan, threads
+                    )
+                    for reverse in (False, True):
+                        args[2].fill_(-777)
+                        before = [value.clone() for value in args[:2]]
+                        _simulate_register_load_program(
+                            source,
+                            args[0],
+                            threads,
+                            host_tensors={
+                                "lengths": args[1],
+                                "out": args[2],
+                                "counts": args[3],
+                            },
+                            lane_order=list(reversed(range(threads)))
+                            if reverse
+                            else None,
+                        )
+                        _check_branch_refinement(args)
+                        for actual, expected in zip(args[:2], before, strict=True):
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    args[0].copy_(args[0].flip(0))
+                    args[1].copy_(args[1].flip(0))
+                    _simulate_register_load_program(
+                        source,
+                        args[0],
+                        threads,
+                        host_tensors={
+                            "lengths": args[1],
+                            "out": args[2],
+                            "counts": args[3],
+                        },
+                    )
+                    _check_branch_refinement(args)
+
+    def test_unused_epochs_finish_inside_each_arm_and_join(self):
+        import ast
+        from unittest.mock import patch
+
+        from helion._compiler.cute.computed_fragment import FragmentCompiler
+        from helion._compiler.device_ir import ElseGraphInfo
+        from helion._compiler.device_ir import IfGraphInfo
+
+        original = FragmentCompiler.graph
+        entries, exits = [], []
+
+        def graph(compiler, graph, values):
+            info = next(info for info in compiler.graphs if info.graph is graph)
+            branch = isinstance(info, (IfGraphInfo, ElseGraphInfo))
+            if branch:
+                entries.append(set(compiler.pending_local_atomics))
+                self.assertFalse(compiler.pending_local_atomics)
+            result = original(compiler, graph, values)
+            if branch:
+                exits.append(set(compiler.pending_local_atomics))
+            return result
+
+        x = torch.stack((torch.ones(65), -torch.ones(65), torch.zeros(65))).to(
+            torch.int32
+        )
+        out = torch.full((3, 17), -99, dtype=torch.int32)
+        with patch.object(FragmentCompiler, "graph", graph):
+            source = _fragment_ordered_codegen(
+                _fragment_branch_atomic_epochs, (x, out), 128
+            )
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(all(exits))
+        tree = ast.parse(source)
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+        )
+        branch = next(
+            n
+            for n in fn.body
+            if isinstance(n, ast.If) and isinstance(n.test, ast.Subscript)
+        )
+        self.assertEqual(ast.unparse(branch.body[-1]), "cute.arch.sync_threads()")
+        self.assertEqual(ast.unparse(branch.orelse[-1]), "cute.arch.sync_threads()")
+        self.assertEqual(
+            ast.unparse(fn.body[fn.body.index(branch) + 1]), "cute.arch.sync_threads()"
+        )
+        for order in (list(range(128)), list(reversed(range(128)))):
+            events = []
+            _simulate_register_load_program(
+                source,
+                x,
+                128,
+                host_tensors={"out": out},
+                lane_order=order,
+                memory_events=events,
+            )
+            expected = torch.zeros((3, 17), dtype=torch.int32)
+            expected.scatter_add_(1, (torch.arange(65) % 17).expand(3, -1), x)
+            torch.testing.assert_close(out, expected * 2, rtol=0, atol=0)
+            self.assertTrue(
+                all(event[-1] == "cta" for event in events if event[0] == "atomic")
+            )
+
+    def test_captured_mutation_nested_control_alias_and_escape_reject(self):
+        for kernel, reason in (
+            (_fragment_branch_captured, "terminal uniform"),
+            (_fragment_branch_nested, "terminal uniform"),
+            (_fragment_branch_loop, "terminal uniform"),
+            (_fragment_branch_alias, "terminal uniform"),
+            (_fragment_branch_early, "initialization, then updates, then final reads"),
+        ):
+            with (
+                self.subTest(kernel=kernel.fn.__name__),
+                self.assertRaisesRegex(helion.exc.InvalidConfig, reason),
+            ):
+                _fragment_ordered_codegen(
+                    kernel,
+                    (
+                        torch.ones((3, 17), dtype=torch.int32),
+                        torch.empty((3, 17), dtype=torch.int32),
+                    ),
+                )
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "terminal uniform"):
+            _fragment_ordered_codegen(
+                _fragment_branch_escape,
+                (
+                    torch.ones((3, 17), dtype=torch.int32),
+                    torch.empty((3, 17), dtype=torch.int32),
+                ),
+            )
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_sdk_compact_and_fallback_fresh_histograms(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        for kernel, args, scan in (
+            (_fragment_branch_refinement, _branch_refinement_args(17, 8), "serial"),
+            (
+                _fragment_branch_refinement,
+                _branch_refinement_args(17, 8),
+                "cooperative",
+            ),
+            (
+                _fragment_branch_atomic_epochs,
+                (
+                    torch.ones((3, 17), dtype=torch.int32),
+                    torch.empty((3, 17), dtype=torch.int32),
+                ),
+                "serial",
+            ),
+        ):
+            source = _local_histogram_consumer_codegen(kernel, args, scan, 128)
+            tree = ast.parse(source)
+            fn = next(
+                n
+                for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+            )
+            fn.name = "staged_branch"
+            fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+            tree.body = [
+                n
+                for n in tree.body
+                if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign))
+            ] + [fn]
+            with (
+                self.subTest(kernel=kernel.fn.__name__, scan=scan),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "staged.py"
+                path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+                spec = importlib.util.spec_from_file_location("staged_branch", path)
+                sdk = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(sdk)
+                with ir.Context(), ir.Location.unknown():
+                    emitted = ir.Module.create()
+                    with ir.InsertionPoint(emitted.body):
+                        entry = func.FuncOp("entry", ([], []))
+                        block = entry.add_entry_block()
+                        with ir.InsertionPoint(block):
+                            tensors = [
+                                cute.make_tensor(
+                                    cute.make_ptr(
+                                        cutlass.Int32,
+                                        0,
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16,
+                                    ),
+                                    cute.make_layout((512,)),
+                                )
+                                for _arg in fn.args.args
+                            ]
+                            sdk.staged_branch(*tensors)
+                            func.ReturnOp([])
+                    self.assertTrue(emitted.operation.verify())
+                    text = str(emitted)
+                    self.assertIn("scf.if", text)
+                    self.assertIn("nvvm.atomicrmw", text)
+                    self.assertIn("nvvm.barrier", text)
+
+
+@onlyBackends("cute")
+class TestFragmentBranchLocalAtomicsNative(TestCase):
+    def test_compact_refinement_and_overflow_fallback(self):
+        for width, capacity, threads in ((17, 8, 32), (65, 17, 128), (129, 33, 512)):
+            for scan in ("serial", "cooperative"):
+                with self.subTest(
+                    width=width, capacity=capacity, threads=threads, scan=scan
+                ):
+                    args = _branch_refinement_args(width, capacity, DEVICE)
+                    before = [value.clone() for value in args[:2]]
+                    code_and_output(
+                        _fragment_branch_refinement,
+                        args,
+                        cute_fragment_threads=threads,
+                        cute_fragment_scan=scan,
+                    )
+                    _check_branch_refinement(args)
+                    for actual, expected in zip(args[:2], before, strict=True):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_unused_branch_epochs(self):
+        x = torch.stack(
+            (
+                torch.ones(65, device=DEVICE),
+                -torch.ones(65, device=DEVICE),
+                torch.zeros(65, device=DEVICE),
+            )
+        ).to(torch.int32)
+        out = torch.full((3, 17), -99, dtype=torch.int32, device=DEVICE)
+        code_and_output(_fragment_branch_atomic_epochs, (x, out))
+        expected = torch.zeros_like(out)
+        expected.scatter_add_(
+            1, (torch.arange(65, device=DEVICE) % 17).expand(3, -1), x
+        )
+        torch.testing.assert_close(out, expected * 2, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_register_atomic_consumers(x, out, capacity: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(helion.next_power_of_2(x.size(1)))
+        value = hl.load(x, [row, lane], extra_mask=lane < x.size(1))
+        active = value > 0
+        counter = hl.zeros([1], dtype=torch.int32)
+        payload = hl.zeros([capacity], dtype=torch.int32)
+        identifiers = hl.zeros([capacity], dtype=torch.int32)
+        tickets = hl.atomic_add(
+            counter, [torch.zeros_like(lane)], active.to(torch.int32)
+        )
+        fits = active & (tickets < capacity)
+        index = torch.where(
+            fits,
+            torch.where(lane % 2 == 0, tickets - capacity, tickets),
+            torch.where(lane % 2 == 0, -capacity - 1, capacity),
+        )
+        # Invalid lanes deliberately contain an unsafe integer conversion.
+        contribution = torch.where(fits, value, float("nan"))
+        hl.atomic_add(payload, [index], contribution)
+        hl.atomic_add(identifiers, [index], lane.to(torch.int32) + 1)
+        # The same immutable ticket is consumed again as a contribution.
+        hl.atomic_add(payload, [index], tickets)
+        out[row, 0] = counter.sum()
+        hl.store(out, [row, hl.arange(capacity) + 1], payload)
+        hl.store(out, [row, hl.arange(capacity) + capacity + 1], identifiers)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_register_atomic_branches(x, out, capacity: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(helion.next_power_of_2(x.size(1)))
+        value = hl.load(x, [row, lane], extra_mask=lane < x.size(1))
+        population = hl.zeros([1], dtype=torch.int32)
+        hl.atomic_add(population, [torch.zeros_like(lane)], (value > 0).to(torch.int32))
+        if population.sum() <= capacity:
+            counter = hl.zeros([1], dtype=torch.int32)
+            payload = hl.zeros([capacity], dtype=torch.int32)
+            identifiers = hl.zeros([capacity], dtype=torch.int32)
+            active = value > 0
+            tickets = hl.atomic_add(
+                counter, [torch.zeros_like(lane)], active.to(torch.int32)
+            )
+            index = torch.where(active, tickets, capacity)
+            hl.atomic_add(payload, [index], value)
+            hl.atomic_add(identifiers, [index], lane.to(torch.int32) + 1)
+            hl.atomic_add(payload, [index], tickets)
+            out[row, 0] = counter.sum()
+            hl.store(out, [row, hl.arange(capacity) + 1], payload)
+            hl.store(out, [row, hl.arange(capacity) + capacity + 1], identifiers)
+        else:
+            counter_fallback = hl.zeros([1], dtype=torch.int32)
+            payload_fallback = hl.zeros([capacity], dtype=torch.int32)
+            identifiers_fallback = hl.zeros([capacity], dtype=torch.int32)
+            # A complete deterministic fallback set, independent of the sample.
+            active_fallback = lane < capacity
+            tickets_fallback = hl.atomic_add(
+                counter_fallback,
+                [torch.zeros_like(lane)],
+                active_fallback.to(torch.int32),
+            )
+            index_fallback = torch.where(active_fallback, tickets_fallback, capacity)
+            hl.atomic_add(payload_fallback, [index_fallback], value)
+            hl.atomic_add(
+                identifiers_fallback, [index_fallback], lane.to(torch.int32) + 1
+            )
+            hl.atomic_add(payload_fallback, [index_fallback], tickets_fallback)
+            out[row, 0] = counter_fallback.sum()
+            hl.store(out, [row, hl.arange(capacity) + 1], payload_fallback)
+            hl.store(
+                out, [row, hl.arange(capacity) + capacity + 1], identifiers_fallback
+            )
+    return out
+
+
+def _register_consumer_codegen(kernel, args, enabled, aggregate, threads):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_local_atomic_registers=enabled,
+            cute_fragment_atomic_aggregation=aggregate,
+            cute_fragment_threads=threads,
+        )
+        _, config = bound.config_spec.create_config_generation().strict_config_pair(
+            config
+        )
+        return bound.to_code(config)
+
+
+def _register_consumer_args(width, capacity, device="cpu"):
+    x = torch.ones((4, width), device=device, dtype=torch.float32) * 2.75
+    x[0].zero_()
+    x[1, capacity - 1 :] = -1.25
+    x[2, capacity:] = -1.25
+    out = torch.full((4, 2 * capacity + 1), -99, dtype=torch.int32, device=device)
+    return x, out, capacity
+
+
+def _check_register_consumers(kernel, args):
+    x, out, capacity = args
+    branch = kernel is _fragment_register_atomic_branches
+    for row in range(x.size(0)):
+        selected = torch.nonzero(x[row] > 0).flatten()
+        expected_count = selected.numel()
+        if branch and expected_count > capacity:
+            selected = torch.arange(capacity, device=x.device)
+            expected_count = capacity
+        assert int(out[row, 0]) == expected_count
+        count = min(expected_count, capacity)
+        ids = out[row, capacity + 1 : capacity + 1 + count].to(torch.int64) - 1
+        assert torch.unique(ids).numel() == count
+        assert bool(torch.isin(ids, selected).all())
+        torch.testing.assert_close(
+            out[row, 1 : 1 + count],
+            x[row, ids].to(torch.int32)
+            + torch.arange(count, device=x.device, dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+        assert bool((out[row, 1 + count : capacity + 1] == 0).all())
+        assert bool((out[row, capacity + 1 + count :] == 0).all())
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_register_atomic_rejected(x, out, mode: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(helion.next_power_of_2(x.size(1)))
+        counter = hl.zeros([1], dtype=torch.int32)
+        ticket = hl.atomic_add(counter, [torch.zeros_like(lane)], 1)
+        if mode == "float":
+            target = hl.zeros([17], dtype=torch.float32)
+            hl.atomic_add(target, [ticket % 17], 1.0)
+            out[row, :] = target.to(torch.int32)
+        elif mode == "ordered":
+            target = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(target, [ticket % 17], 1, sem="acq_rel")
+            out[row, :] = target
+        elif mode == "global":
+            hl.atomic_add(out, [row, ticket % 17], 1)
+        elif mode == "flip":
+            target = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(target, [torch.flip(ticket, [0]) % 17], 1)
+            out[row, :] = target
+        else:
+            target = hl.zeros([17], dtype=torch.int32)
+            result = torch.stack((ticket, ticket))
+            hl.atomic_add(target, [result % 17], 1)
+            out[row, :] = target
+    return out
+
+
+class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
+    def test_root_and_branch_compaction_events_masks_and_epochs(self):
+        for kernel in (
+            _fragment_register_atomic_consumers,
+            _fragment_register_atomic_branches,
+        ):
+            for width, capacity, threads in ((17, 8, 32), (65, 17, 32), (129, 33, 128)):
+                for aggregate in (False, True):
+                    with self.subTest(
+                        kernel=kernel.fn.__name__, width=width, aggregate=aggregate
+                    ):
+                        args = _register_consumer_args(width, capacity)
+                        before = args[0].clone()
+                        codes = [
+                            _register_consumer_codegen(
+                                kernel, args, flag, aggregate, threads
+                            )
+                            for flag in (False, True)
+                        ]
+                        self.assertNotIn("fragment_local_tickets", codes[0])
+                        # One real returned atomic in each lexical arm; terminal
+                        # unused consumers must not acquire return snapshots.
+                        self.assertEqual(
+                            codes[1].count("= cute.make_rmem_tensor"),
+                            2 if kernel is _fragment_register_atomic_branches else 1,
+                        )
+                        for order in (
+                            list(range(threads)),
+                            list(reversed(range(threads))),
+                        ):
+                            observed = []
+                            for code in codes:
+                                args[1].fill_(-99)
+                                events = []
+                                result, barriers = _simulate_register_load_program(
+                                    code,
+                                    args[0],
+                                    threads,
+                                    host_tensors={"out": args[1]},
+                                    lane_order=order,
+                                    atomic_events=events,
+                                )
+                                _check_register_consumers(kernel, args)
+                                observed.append((result.clone(), barriers, events))
+                            torch.testing.assert_close(
+                                observed[0][0], observed[1][0], rtol=0, atol=0
+                            )
+                            self.assertEqual(observed[0][1:], observed[1][1:])
+                        torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+    def test_atomic_consumers_decline_changes_of_scope_dtype_or_coordinate(self):
+        args = (
+            torch.ones((2, 65), dtype=torch.int32),
+            torch.zeros((2, 17), dtype=torch.int32),
+        )
+        for mode in ("float", "ordered", "global", "flip", "stack"):
+            with self.subTest(mode=mode), self.assertRaises(helion.exc.InvalidConfig):
+                _register_consumer_codegen(
+                    _fragment_register_atomic_rejected, (*args, mode), True, False, 128
+                )
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_sdk_register_consumers_and_uniform_aggregate_branches(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        for kernel in (
+            _fragment_register_atomic_consumers,
+            _fragment_register_atomic_branches,
+        ):
+            for aggregate in (False, True):
+                with self.subTest(kernel=kernel.fn.__name__, aggregate=aggregate):
+                    source = _register_consumer_codegen(
+                        kernel, _register_consumer_args(65, 17), True, aggregate, 32
+                    )
+                    tree = ast.parse(source)
+                    fn = next(
+                        n
+                        for n in tree.body
+                        if isinstance(n, ast.FunctionDef)
+                        and n.name.startswith("_helion_")
+                    )
+                    fn.name = "staged"
+                    fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+                    tree.body = [
+                        n
+                        for n in tree.body
+                        if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign))
+                    ] + [fn]
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory) / "staged.py"
+                        path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+                        spec = importlib.util.spec_from_file_location(
+                            "register_atomic_staged", path
+                        )
+                        sdk = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(sdk)
+                        with ir.Context(), ir.Location.unknown():
+                            emitted = ir.Module.create()
+                            with ir.InsertionPoint(emitted.body):
+                                entry = func.FuncOp("entry", ([], []))
+                                with ir.InsertionPoint(entry.add_entry_block()):
+                                    tensors = [
+                                        cute.make_tensor(
+                                            cute.make_ptr(
+                                                cutlass.Float32
+                                                if arg.arg == "x"
+                                                else cutlass.Int32,
+                                                0,
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=16,
+                                            ),
+                                            cute.make_layout((512,)),
+                                        )
+                                        for arg in fn.args.args
+                                    ]
+                                    sdk.staged(*tensors)
+                                    func.ReturnOp([])
+                            self.assertTrue(emitted.operation.verify())
+                            text = str(emitted)
+                            self.assertIn("nvvm.atomicrmw", text)
+                            self.assertIn("#nvvm.mem_scope<cta>", text)
+                            self.assertIn("nvvm.barrier", text)
+                            self.assertEqual("nvvm.match.sync" in text, aggregate)
+                            self.assertEqual("nvvm.redux.sync" in text, aggregate)
+
+
+@onlyBackends("cute")
+class TestFragmentRegisterAtomicConsumersNative(TestCase):
+    def test_root_and_branch_compaction_return_registers(self):
+        for kernel in (
+            _fragment_register_atomic_consumers,
+            _fragment_register_atomic_branches,
+        ):
+            for width, capacity, threads in (
+                (17, 8, 32),
+                (65, 17, 128),
+                (8192, 1024, 512),
+            ):
+                for aggregate in (False, True):
+                    with self.subTest(
+                        kernel=kernel.fn.__name__, width=width, aggregate=aggregate
+                    ):
+                        args = _register_consumer_args(width, capacity, DEVICE)
+                        before = args[0].clone()
+                        code_and_output(
+                            kernel,
+                            args,
+                            cute_fragment_threads=threads,
+                            cute_fragment_local_atomic_registers=True,
+                            cute_fragment_atomic_aggregation=aggregate,
+                        )
+                        _check_register_consumers(kernel, args)
+                        torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+
+class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
+    def test_previous_population_and_rng_with_dependent_witnesses(self):
+        from contextlib import ExitStack
+        import random
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion._compiler.autotuner_heuristics import (
+            cute_fragment_local_atomic_registers,
+        )
+        from helion._compiler.autotuner_heuristics import cute_fragment_threads
+        from helion._compiler.autotuner_heuristics import cute_fragment_warp_results
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        x = torch.ones((1, 8193), dtype=torch.int32)
+        fixtures = (
+            (
+                _fragment_warp_reservations,
+                (*_warp_reservation_args(4), False),
+                "cute_fragment_warp_results",
+            ),
+            (
+                _register_load_histogram,
+                (torch.ones(2, 65), 3, 128),
+                "cute_fragment_register_loads",
+            ),
+            (
+                _fragment_local_registers,
+                (x, x.clone(), x.clone(), False),
+                "cute_fragment_local_atomic_registers",
+            ),
+        )
+
+        def capture(kernel, args, key, legacy):
+            with ExitStack() as stack:
+                if legacy:
+                    for module in (
+                        cute_fragment_threads,
+                        cute_fragment_warp_results,
+                        cute_fragment_local_atomic_registers,
+                    ):
+                        stack.enter_context(
+                            patch.object(
+                                module,
+                                "THREADS",
+                                cute_fragment_threads.LEGACY_COVERAGE_THREADS,
+                            )
+                        )
+                bound = _cpu_bind(
+                    helion.kernel(
+                        kernel.fn,
+                        backend="cute",
+                        static_shapes=True,
+                        autotune_effort="full",
+                    ),
+                    args,
+                )
+                spec = bound.config_spec
+                group = next(g for g in spec.compiler_coverage_groups if g.key == key)
+                self.assertEqual(
+                    [(d.key, d.value) for d in group.dependencies],
+                    [("cute_fragment_threads", 512)],
+                )
+                inventory = [
+                    (
+                        g.key,
+                        [(d.key, d.value) for d in g.dependencies],
+                        [(dict(w.carrier), w.value) for w in g.witnesses],
+                    )
+                    for g in spec.compiler_coverage_groups
+                ]
+                records = []
+                for seed in (0, 107):
+                    for strategy in (
+                        InitialPopulationStrategy.FROM_RANDOM,
+                        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                    ):
+                        random.seed(seed)
+                        with bound.env:
+                            search = PatternSearch(
+                                bound,
+                                args,
+                                initial_population=100,
+                                initial_population_strategy=strategy,
+                            )
+                            flat = checked_initial_population(search)
+                            rows = [
+                                dict(search.config_gen.canonicalize_flat(row)[1])
+                                for row in flat
+                            ]
+                        self.assertTrue(any(row.get(key) is True for row in rows))
+                        self.assertTrue(
+                            all(
+                                row.get("cute_fragment_threads", 128) != 1024
+                                for row in rows
+                            )
+                        )
+                        records.append((rows, random.getstate()))
+                return (
+                    dict(spec.default_config()),
+                    [dict(c) for c in spec.compiler_seed_configs],
+                    inventory,
+                    records,
+                )
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            for kernel, args, key in fixtures:
+                with self.subTest(key=key):
+                    self.assertEqual(
+                        capture(kernel, args, key, True),
+                        capture(kernel, args, key, False),
+                    )
+
+    def test_new_only_eligibility_can_require_1024_witness(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        x = torch.ones((1, 16385), dtype=torch.int32)
+        fixtures = (
+            (
+                _fragment_warp_reservations,
+                (*_warp_reservation_args(32), False),
+                "cute_fragment_warp_results",
+            ),
+            (
+                _fragment_local_registers,
+                (x, x.clone(), x.clone(), False),
+                "cute_fragment_local_atomic_registers",
+            ),
+        )
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            for kernel, args, key in fixtures:
+                with self.subTest(key=key):
+                    bound = _cpu_bind(
+                        helion.kernel(
+                            kernel.fn,
+                            backend="cute",
+                            static_shapes=True,
+                            autotune_effort="full",
+                        ),
+                        args,
+                    )
+                    spec = bound.config_spec
+                    group = next(
+                        g for g in spec.compiler_coverage_groups if g.key == key
+                    )
+                    self.assertEqual(
+                        [(d.key, d.value) for d in group.dependencies],
+                        [("cute_fragment_threads", 1024)],
+                    )
+                    config = spec.default_config()
+                    config.config.update({key: True, "cute_fragment_threads": 512})
+                    with self.assertRaises(helion.exc.InvalidConfig):
+                        bound.to_code(config)
+                    config.config["cute_fragment_threads"] = 1024
+                    self.assertIn("block=(1024, 1, 1)", bound.to_code(config))
+                    with bound.env:
+                        search = PatternSearch(
+                            bound,
+                            args,
+                            initial_population=100,
+                            initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+                        )
+                        rows = [
+                            dict(search.config_gen.canonicalize_flat(row)[1])
+                            for row in checked_initial_population(search)
+                        ]
+                    self.assertTrue(
+                        any(
+                            row.get(key) is True
+                            and row.get("cute_fragment_threads") == 1024
+                            for row in rows
+                        )
+                    )
 
 
 if __name__ == "__main__":
