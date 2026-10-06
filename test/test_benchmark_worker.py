@@ -1806,7 +1806,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         )
 
     def test_confirm_suspicious_rebenchmark_timings(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def __init__(self) -> None:
                 self.confirm_fns: list[object] | None = None
                 self.confirm_warmup: int | None = None
@@ -1855,7 +1855,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(timings, [0.92, 0.95])
 
     def test_confirm_suspicious_rebenchmark_keeps_unconfirmed_timings(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def benchmark_isolated(
                 self,
                 fns: list[object],
@@ -1892,7 +1892,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(timings, [0.92, 0.80])
 
     def test_cute_flash_suspicious_confirmation_timeout_invalidates(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def __init__(self) -> None:
                 self.mutated_arg_indices: list[int] = []
                 self.invalidated_sources: list[str] = []
@@ -1968,7 +1968,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(healthy.perfs, [1.0, 0.95])
 
     def test_rebenchmark_uses_isolated_provider(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def __init__(self) -> None:
                 self.mutated_arg_indices: list[int] = []
                 self.fns: list[object] | None = None
@@ -2022,7 +2022,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(search.best_perf_so_far, 0.50)
 
     def test_cute_flash_isolated_timeout_invalidates_source_aliases(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def __init__(self) -> None:
                 self.mutated_arg_indices: list[int] = []
                 self.invalidated_sources: list[str] = []
@@ -2116,6 +2116,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
     ) -> None:
         search = object.__new__(PopulationBasedSearch)
         search.log = Mock(trace_enabled=False)
+        search.benchmark_provider = SimpleNamespace()
         search.config_spec = SimpleNamespace(
             backend_name="cute",
             cute_flash_search_enabled=True,
@@ -2156,7 +2157,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         )
 
     def test_non_cute_isolated_timeout_keeps_prior_timing(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def __init__(self) -> None:
                 self.mutated_arg_indices: list[int] = []
 
@@ -2203,7 +2204,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(measured.perfs, [0.8, 0.75])
 
     def test_non_cute_isolated_runtime_error_keeps_existing_inf_behavior(self) -> None:
-        class FakeProvider:
+        class FakeProvider(SimpleNamespace):
             def __init__(self) -> None:
                 self.mutated_arg_indices: list[int] = []
 

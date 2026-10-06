@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from .base_search import _AutotunableKernel
     from .logger import AutotuningLogger
     from .metrics import AutotuneMetrics
+    from .pipeline_proposals import _Objective
 
 
 # True while the autotuner compiles configs to measure them (a search's
@@ -680,6 +681,72 @@ class BenchmarkProvider(abc.ABC):
     def cleanup(self) -> None:
         """Release resources (tmpdir, subprocesses, etc.)."""
         ...
+
+
+def _not_an_isolated_stage(*args: object, **kwargs: object) -> object:
+    raise RuntimeError("Pipeline proposals cannot execute an isolated stage")
+
+
+class PipelineBenchmarkProvider(BenchmarkProvider):
+    """No compile or timer here: the callback owns realization and measurement."""
+
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        settings: Settings,
+        config_spec: ConfigSpec,
+        args: Sequence[object],
+        log: AutotuningLogger,
+        autotune_metrics: AutotuneMetrics,
+        *,
+        objective: _Objective,
+        search_name: str = "coordinate",
+    ) -> None:
+        self.objective = objective
+        self.log = log
+        self.metrics = autotune_metrics
+        self.search_name = search_name
+        self.mutated_arg_indices = ()
+
+    def setup(self) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        pass
+
+    def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
+        # The shared objective checks the callback budget. Avoid retaining a
+        # bound search method when this provider does not use its timer hook.
+        pass
+
+    def benchmark(
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
+    ) -> list[BenchmarkResult]:
+        results = []
+        for config in configs:
+            perf = self.objective.measure(config, phase=f"{self.search_name}:{desc}")
+            status: Literal["ok", "error"] = "ok" if math.isfinite(perf) else "error"
+            self.metrics.num_configs_tested += 1
+            if status == "ok":
+                self.metrics.num_successful_candidate_measurements += 1
+            self.log.record_autotune_entry(
+                AutotuneLogEntry(
+                    self.metrics.num_generations,
+                    status,
+                    perf if status == "ok" else None,
+                    None,
+                    f"pipeline-{self.objective.evaluations}",
+                    config,
+                )
+            )
+            results.append(
+                BenchmarkResult(config, _not_an_isolated_stage, perf, status, None)
+            )
+        return results
 
 
 class LocalBenchmarkProvider(BenchmarkProvider):
