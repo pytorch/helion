@@ -179,6 +179,7 @@ def test_enabled_handoff_preserves_wrapper_and_returns_config(case, cached, skip
     assert case.find.call_args.kwargs == {"skip_cache": skip_cache}
     policy = case.find.call_args.args[1]
     assert policy.after_seconds == 30
+    assert not policy.automatic
     assert case.build.call_args.args[:2] == (autotuner, case.point)
     case.bundle.run_agent_rounds.assert_called_once_with(
         budget_seconds=90, log=case.search.log
@@ -189,11 +190,12 @@ def test_enabled_handoff_preserves_wrapper_and_returns_config(case, cached, skip
     case.search.kernel.compile_config.assert_not_called()
 
 
-def test_no_search_time_limit_waits_for_completion(case):
+def test_no_search_time_limit_uses_automatic_handoff(case):
     case.settings.autotune_budget_seconds = None
     pipeline.autotune_with_handoff(case.search)
     policy = case.find.call_args.args[1]
     assert policy.after_seconds is None
+    assert policy.automatic
 
 
 def test_each_handoff_has_a_new_directory_under_log_path(case):
