@@ -166,6 +166,9 @@ def _initial_population_with_legacy_prefix(
         patch(
             "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
         ),
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
+        ),
     ):
         old_bound = _cpu_bind(bound.kernel, args)
     _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
