@@ -119,6 +119,8 @@ from .cute_fragment_register_snapshots import (
 from .cute_fragment_resources import fragment_resource_carrier
 from .cute_fragment_scan import CuteFragmentScanHeuristic
 from .cute_fragment_scan import register_fragment_scan_coverage
+from .cute_fragment_scan_exports import CuteFragmentScanExportsHeuristic
+from .cute_fragment_scan_exports import register_fragment_scan_exports_coverage
 from .cute_fragment_skip_zero_atomics import CuteFragmentSkipZeroAtomicsHeuristic
 from .cute_fragment_skip_zero_atomics import (
     register_fragment_skip_zero_atomics_coverage,
@@ -239,6 +241,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentIntegerAtomicEpochsHeuristic,
         CuteFragmentPacketLoadsHeuristic,
         CuteFragmentRegisterProducersHeuristic,
+        CuteFragmentScanExportsHeuristic,
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
     ),
@@ -689,9 +692,10 @@ def register_compiler_coverage_groups(
     register_fragment_local_atomic_registers_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
-    register_fragment_register_snapshots_coverage(
-        env, device_ir, resource_carrier=resource_carrier
-    )
+    if not env.config_spec.cute_fragment_register_snapshot_while_root_ids:
+        register_fragment_register_snapshots_coverage(
+            env, device_ir, resource_carrier=resource_carrier
+        )
     register_fragment_published_scalars_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
@@ -714,6 +718,12 @@ def register_compiler_coverage_groups(
     register_fragment_bounded_gather_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
+    if env.config_spec.cute_fragment_register_snapshot_while_root_ids:
+        # This new capture case depends on the existing uniform-while owner.
+        # Preserve the registration order of all pre-existing snapshot roots.
+        register_fragment_register_snapshots_coverage(
+            env, device_ir, resource_carrier=resource_carrier
+        )
     register_gather_warp_scan_coverage(env, device_ir)
     register_fragment_atomic_consumer_fusion_coverage(
         env, device_ir, resource_carrier=resource_carrier, extended_only=True
@@ -721,3 +731,4 @@ def register_compiler_coverage_groups(
     register_fragment_pure_producer_regions_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
+    register_fragment_scan_exports_coverage(env, device_ir)

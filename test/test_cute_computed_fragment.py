@@ -6602,3 +6602,476 @@ def test_fragment_where_explicit_padding_min_cpu():
             actual = torch.full_like(expected, -999)
             _simulate_fragment_warp_reduction(code, {"x": x}, {"out": actual}, 3)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
+def _fragment_completed_scan_exports(x, threshold, kind: hl.constexpr):
+    width = hl.specialize(x.size(1))
+    selected = torch.empty((x.size(0),), device=x.device, dtype=torch.int64)
+    last = torch.empty_like(selected)
+    for row in hl.tile(x.size(0), block_size=1):
+        values = x[row, :] * 1
+        row_threshold = threshold[row, None]
+        cdf = hl.cumsum(values, dim=-1, reverse=kind == "reverse")
+        index = hl.arange(width).to(torch.int64)[None, :]
+        if kind == "opaque":
+            cdf = hl.inline_asm_elementwise(
+                "mov.b32 $0, $1;",
+                "=f,f",
+                [cdf],
+                dtype=torch.float32,
+                is_pure=True,
+                pack=1,
+            )
+        if kind == "store":
+            x[row, :] = cdf
+        if kind == "float":
+            first = cdf.amax(-1).to(torch.int64)
+        else:
+            first = torch.where(cdf > row_threshold, index, width).amin(-1)
+        final = torch.where(values > 0, index, -1).amax(-1)
+        selected[row] = first
+        last[row] = final
+    return selected, last
+
+
+def _completed_scan_source(x, threshold, kind="paired", threads=128, enabled=True):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_completed_scan_exports, (x, threshold, kind))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=threads, cute_fragment_warp_scan=True
+        )
+        if enabled:
+            config.config["cute_fragment_scan_exports"] = True
+        return bound.to_code(config)
+
+
+def _completed_scan_model_source(source):
+    """Lift only full-mask shuffle-up into the existing lane scheduler."""
+
+    class UpToIndex(ast.NodeTransformer):
+        def visit_Call(self, node):
+            node = self.generic_visit(node)
+            if ast.unparse(node.func) != "cute.arch.shuffle_sync_up":
+                return node
+            keys = {k.arg: k.value for k in node.keywords}
+            assert ast.literal_eval(keys["mask"]) == 0xFFFFFFFF
+            assert ast.literal_eval(keys["mask_and_clamp"]) == 0
+            distance = ast.literal_eval(keys["offset"])
+            assert distance in (1, 2, 4, 8, 16)
+            lane = "(cute.arch.thread_idx()[0] % 32)"
+            return ast.parse(
+                f"cute.arch.shuffle_sync({ast.unparse(node.args[0])}, {lane} - {distance} if {lane} >= {distance} else {lane}, mask=0xffffffff, mask_and_clamp=31)",
+                mode="eval",
+            ).body
+
+    return ast.unparse(ast.fix_missing_locations(UpToIndex().visit(ast.parse(source))))
+
+
+@pytest.mark.parametrize(
+    "threads,width", [(32, 33), (128, 17), (128, 513), (256, 1024), (512, 65)]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+def test_completed_scan_exports_cpu_emitted(threads, width, dtype):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = (torch.arange(3 * width).reshape(3, width) % 11 - 5).to(dtype)
+    if dtype.is_floating_point:
+        x[0] = -0.0
+        x[1, 0] = 16777216
+        x[1, min(31, width - 1)] = -16777216
+        x[2, width // 2] = float("nan")
+    else:
+        x[1, width // 2] = torch.iinfo(dtype).max
+    threshold = torch.tensor([0, 3, -2], dtype=dtype)
+    cdf = _warp_scan_tree_reference(x, False)
+    index = torch.arange(width).expand_as(x).to(torch.int64)
+    expected = (
+        torch.where(cdf > threshold[:, None], index, width).amin(-1),
+        torch.where(x > 0, index, -1).amax(-1),
+    )
+    for enabled in (False, True):
+        source = _completed_scan_source(x, threshold, threads=threads, enabled=enabled)
+        assert ("fragment_scan_export" in source) == enabled
+        for reverse in (False, True):
+            outputs = {
+                "selected": torch.full((3,), -99, dtype=torch.int64),
+                "last": torch.full((3,), -99, dtype=torch.int64),
+            }
+            _simulate_register_load_program(
+                _completed_scan_model_source(source),
+                x,
+                threads,
+                host_tensors=outputs | {"threshold": threshold},
+                lane_order=list(range(threads))[:: -1 if reverse else 1],
+            )
+            torch.testing.assert_close(
+                (outputs["selected"], outputs["last"]), expected, rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize(
+    "kind,width",
+    [("float", 33), ("reverse", 33), ("paired", 2048), ("opaque", 33), ("store", 33)],
+)
+def test_completed_scan_exports_declines(kind, width):
+    with pytest.raises(exc.InvalidConfig, match="scan|export"):
+        _completed_scan_source(torch.ones((2, width)), torch.zeros(2), kind)
+
+
+def test_completed_scan_exports_off_and_request_controls():
+    x, threshold = torch.ones((2, 33)), torch.zeros(2)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_completed_scan_exports, (x, threshold, "paired"))
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_warp_scan"] = True
+        original = bound.to_code(config)
+        config.config["cute_fragment_scan_exports"] = False
+        assert bound.to_code(config) == original
+        for change in (
+            {"cute_fragment_scan_exports": 1},
+            {"cute_fragment_scan_exports": True, "cute_fragment_warp_scan": False},
+            {"cute_fragment_scan_exports": True, "cute_fragment_register_loads": True},
+        ):
+            request = helion.Config.from_dict(dict(config) | change)
+            with pytest.raises(exc.InvalidConfig):
+                bound.config_spec.normalize(request, _fix_invalid=False)
+
+
+def test_completed_scan_exports_partial_carry_mutant():
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x, threshold = torch.ones((1, 65)), torch.tensor([33.0])
+    source = _completed_scan_source(x, threshold, threads=32)
+    tree = ast.parse(source)
+    mutations = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Subscript)
+            and ast.unparse(node.targets[0].value).startswith("fragment_scan_export")
+            and isinstance(node.value, ast.Call)
+            and node.value.args
+            and isinstance(node.value.args[0], ast.BinOp)
+        ):
+            node.value = node.targets[0]
+            node.value.ctx = ast.Load()
+            mutations += 1
+    assert mutations == 1
+    mutated = ast.unparse(ast.fix_missing_locations(tree))
+    out = {
+        "selected": torch.full((1,), -99, dtype=torch.int64),
+        "last": torch.full((1,), -99, dtype=torch.int64),
+    }
+    _simulate_register_load_program(
+        _completed_scan_model_source(mutated),
+        x,
+        32,
+        host_tensors=out | {"threshold": threshold},
+    )
+    assert out["selected"].item() != 33
+
+
+@pytest.mark.parametrize("threads,width", [(128, 65), (256, 1024)])
+def test_completed_scan_exports_subnormal_and_infinity(threads, width):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = torch.zeros((3, width))
+    x[0] = torch.nextafter(torch.tensor(0.0), torch.tensor(1.0))
+    x[1, 0] = float("inf")
+    x[1, -1] = -float("inf")
+    x[2] = -0.0
+    threshold = torch.tensor([0.0, 1.0, -0.0])
+    cdf = _warp_scan_tree_reference(x, False)
+    index = torch.arange(width).expand_as(x).long()
+    expected = (
+        torch.where(cdf > threshold[:, None], index, width).amin(-1),
+        torch.where(x > 0, index, -1).amax(-1),
+    )
+    source = _completed_scan_source(x, threshold, threads=threads)
+    out = {
+        "selected": torch.empty(3, dtype=torch.int64),
+        "last": torch.empty(3, dtype=torch.int64),
+    }
+    _simulate_register_load_program(
+        _completed_scan_model_source(source),
+        x,
+        threads,
+        host_tensors=out | {"threshold": threshold},
+    )
+    torch.testing.assert_close((out["selected"], out["last"]), expected, rtol=0, atol=0)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("threads,width", [(32, 33), (128, 513), (256, 1024)])
+def test_completed_scan_exports_native(threads, width):
+    torch.manual_seed(17)
+    x = torch.randint(-4, 5, (3, width), device=DEVICE).float()
+    threshold = torch.tensor([0.0, 3.0, -2.0], device=DEVICE)
+    cdf = _warp_scan_tree_reference(x.cpu(), False).to(x.device)
+    index = torch.arange(width, device=x.device).expand_as(x).long()
+    expected = (
+        torch.where(cdf > threshold[:, None], index, width).amin(-1),
+        torch.where(x > 0, index, -1).amax(-1),
+    )
+    bound = _fragment_completed_scan_exports.bind((x, threshold, "paired"))
+    for enabled in (False, True):
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=threads,
+            cute_fragment_warp_scan=True,
+            cute_fragment_scan_exports=enabled,
+        )
+        actual = bound.compile_config(config)(x, threshold, "paired")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _immutable_while_snapshot(x, limits, capacity: hl.constexpr):
+    out = torch.empty((x.size(0),), device=x.device, dtype=torch.int32)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(capacity)
+        snapshot = hl.load(x, [row, lane], extra_mask=lane < x.size(1))
+        iteration = hl.full([], 0, dtype=torch.int32)
+        total = hl.full([], 0, dtype=torch.int32)
+        limit = limits[row]
+        threshold = lane % 3
+        while iteration < limit:
+            total = total + torch.sum(
+                torch.where(
+                    lane < x.size(1), (snapshot > threshold).to(torch.int32), 0
+                ),
+                dtype=torch.int32,
+            )
+            threshold = torch.gather(threshold, 0, ((lane + 1) % capacity).long())
+            iteration = iteration + 1
+        out[row] = total
+    return out
+
+
+def _immutable_while_snapshot_codegen(
+    x, limits, threads, snapshots, kernel=_immutable_while_snapshot
+):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, (x, limits, 1 << (x.size(1) - 1).bit_length()))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_bounded_gather=True,
+            cute_fragment_threads=threads,
+            cute_fragment_register_snapshots=snapshots,
+        )
+        return bound, config, bound.to_code(config)
+
+
+@pytest.mark.parametrize("width,threads", [(17, 128), (257, 128)])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.float32])
+def test_immutable_while_snapshot_emitted(width, threads, dtype):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = (torch.arange(3 * width).reshape(3, width) % 9 - 3).to(dtype)
+    limits = torch.tensor([0, 1, 4], dtype=torch.int32)
+    capacity = 1 << (width - 1).bit_length()
+    expected_values = []
+    for row, limit in zip(x, limits, strict=True):
+        threshold = torch.arange(capacity) % 3
+        total = 0
+        for _ in range(int(limit)):
+            total += int((row > threshold[:width]).sum())
+            threshold = torch.roll(threshold, -1)
+        expected_values.append(total)
+    expected = torch.tensor(expected_values, dtype=torch.int32)
+    if dtype == torch.float32:
+        x[1, :4] = torch.tensor([float("nan"), float("inf"), -0.0, float("-inf")])
+        # Recompute the affected row under the public comparison semantics.
+        expected[1] = (x[1] > (torch.arange(capacity) % 3)[:width]).sum()
+    before = x.clone(), limits.clone()
+    for enabled in (False, True):
+        bound, config, code = _immutable_while_snapshot_codegen(
+            x, limits, threads, enabled
+        )
+        assert ("fragment_snapshot = cute.make_rmem_tensor" in code) == enabled
+        for order in (list(range(threads)), list(reversed(range(threads)))):
+            out = torch.full_like(limits, -99)
+            _simulate_register_load_program(
+                code,
+                x,
+                threads,
+                host_tensors={"limits": limits, "out": out},
+                lane_order=order,
+            )
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(x, before[0], rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(limits, before[1])
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _immutable_while_snapshot_decline(
+    x, limits, capacity: hl.constexpr, mode: hl.constexpr
+):
+    out = torch.empty((x.size(0),), device=x.device, dtype=torch.int32)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(capacity)
+        address = lane
+        if mode == "index":
+            address = (lane + 1) % x.size(1)
+        snapshot = hl.load(x, [row, address], extra_mask=lane < x.size(1))
+        if mode == "derived":
+            snapshot = snapshot + 1
+        if mode == "join":
+            if limits[row] > 1:
+                snapshot = snapshot + 1
+            else:
+                snapshot = snapshot - 1
+        iteration = hl.full([], 0, dtype=torch.int32)
+        total = hl.full([], 0, dtype=torch.int32)
+        threshold = lane % 3
+        while iteration < limits[row]:
+            if mode == "remap":
+                selected = torch.gather(snapshot, 0, ((lane + 1) % capacity).long())
+            elif mode == "body_load":
+                selected = hl.load(x, [row, (lane + iteration) % x.size(1)])
+            else:
+                selected = snapshot
+            total = total + torch.sum(
+                torch.where(
+                    lane < x.size(1), (selected > threshold).to(torch.int32), 0
+                ),
+                dtype=torch.int32,
+            )
+            threshold = torch.gather(threshold, 0, ((lane + 1) % capacity).long())
+            if mode == "mutable":
+                snapshot = snapshot + 1
+            iteration = iteration + 1
+        if mode == "alias":
+            hl.store(x, [row, lane], snapshot, extra_mask=lane < x.size(1))
+        out[row] = total
+    return out
+
+
+@pytest.mark.parametrize(
+    "mode", ["derived", "join", "remap", "body_load", "mutable", "alias", "index"]
+)
+def test_immutable_while_snapshot_declines(mode):
+    from helion._compiler.cute.register_snapshots import snapshot_chains
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        x = torch.ones(3, 17, dtype=torch.int32)
+        limits = torch.tensor([0, 1, 4], dtype=torch.int32)
+        bound = _cpu_bind(_immutable_while_snapshot_decline, (x, limits, 32, mode))
+        with bound.env, bound.host_function:
+            chains = snapshot_chains(bound.host_function.device_ir.graphs, bound.env)
+        assert not chains
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_bounded_gather=True, cute_fragment_register_snapshots=True
+        )
+        with pytest.raises(exc.InvalidConfig):
+            bound.to_code(config)
+
+
+def test_immutable_while_snapshot_coverage_dependency():
+    x = torch.ones(3, 17, dtype=torch.int32)
+    limits = torch.tensor([0, 1, 4], dtype=torch.int32)
+    bound, config, _ = _immutable_while_snapshot_codegen(x, limits, 128, True)
+    spec = bound.config_spec
+    assert spec.cute_fragment_register_snapshot_while_root_ids
+    assert spec.default_config().get("cute_fragment_register_snapshots", False) is False
+    missing = helion.Config.from_dict(
+        dict(config.config) | {"cute_fragment_bounded_gather": False}
+    )
+    with pytest.raises(exc.InvalidConfig):
+        spec.normalized_config(missing)
+    group = next(
+        g
+        for g in spec.compiler_coverage_groups
+        if g.key == "cute_fragment_register_snapshots"
+    )
+    assert any(
+        d.key == "cute_fragment_bounded_gather" and d.value is True
+        for d in group.dependencies
+    )
+    assert group.witnesses[0].carrier.get("cute_fragment_bounded_gather") is True
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _immutable_while_snapshot_early(x, limits, capacity: hl.constexpr):
+    out = torch.empty((x.size(0),), device=x.device, dtype=torch.int32)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(capacity)
+        snapshot = hl.load(x, [row, lane], extra_mask=lane < x.size(1))
+        iteration = hl.full([], 0, dtype=torch.int32)
+        threshold = lane % 3
+        total = hl.full([], 0, dtype=torch.int32)
+        while (iteration < limits[row]) & (
+            torch.sum(
+                torch.where(
+                    lane < x.size(1), (snapshot > threshold).to(torch.int32), 0
+                ),
+                dtype=torch.int32,
+            )
+            > 0
+        ):
+            total = total + torch.sum(
+                torch.where(
+                    lane < x.size(1), (snapshot > threshold).to(torch.int32), 0
+                ),
+                dtype=torch.int32,
+            )
+            threshold = torch.gather(threshold + 1, 0, ((lane + 1) % capacity).long())
+            iteration = iteration + 1
+        out[row] = total
+    return out
+
+
+def test_immutable_while_snapshot_early_and_reentry():
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = torch.arange(51, dtype=torch.int32).reshape(3, 17) % 7 - 4
+    limits = torch.tensor([0, 1, 4], dtype=torch.int32)
+    _, _, code = _immutable_while_snapshot_codegen(
+        x, limits, 128, True, _immutable_while_snapshot_early
+    )
+    for bump, trip_limits in [(0, [0, 1, 4]), (4, [4, 3, 0])]:
+        values = x + bump
+        trips = torch.tensor(trip_limits, dtype=torch.int32)
+        expected = []
+        for row, limit in zip(values, trips, strict=True):
+            threshold = torch.arange(32) % 3
+            total = 0
+            for _ in range(int(limit)):
+                count = int((row > threshold[:17]).sum())
+                if count == 0:
+                    break
+                total += count
+                threshold = torch.roll(threshold + 1, -1)
+            expected.append(total)
+        for order in (list(range(128)), list(reversed(range(128)))):
+            out = torch.full_like(trips, -99)
+            _simulate_register_load_program(
+                code,
+                values,
+                128,
+                host_tensors={"limits": trips, "out": out},
+                lane_order=order,
+            )
+            torch.testing.assert_close(
+                out, torch.tensor(expected, dtype=torch.int32), rtol=0, atol=0
+            )
+    # Both initial/next predicates retain publication and read-WAR boundaries.
+    device = next(n for n in ast.parse(code).body if isinstance(n, ast.FunctionDef))
+    sites = 0
+    for node in ast.walk(device):
+        for _, statements in ast.iter_fields(node):
+            if not isinstance(statements, list):
+                continue
+            for i, statement in enumerate(statements):
+                if isinstance(statement, ast.Assign) and any(
+                    isinstance(target, ast.Name)
+                    and target.id.startswith("fragment_while_take")
+                    for target in statement.targets
+                ):
+                    assert ast.unparse(statements[i - 1]) == "cute.arch.sync_threads()"
+                    assert ast.unparse(statements[i + 1]) == "cute.arch.sync_threads()"
+                    sites += 1
+    assert sites == 2

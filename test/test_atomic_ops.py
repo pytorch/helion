@@ -11243,3 +11243,319 @@ class TestFragmentIterationLocalReturnsNative(TestCase):
                             out[:, :16].sum(1), total + 48, rtol=0, atol=0
                         )
                         torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_completed_local_read(x, indices, mask, out):
+    width = x.size(1)
+    for row in hl.grid(x.size(0)):
+        local = hl.full([width], 2, dtype=x.dtype)
+        col = hl.arange(width)
+        hl.atomic_add(local, [col], x[row, :])
+        hl.atomic_add(local, [col], x[row, :] * 2)
+        selected = hl.load(local, [indices[row, :]], extra_mask=mask[row, :])
+        scalar = hl.load(local, [3])
+        scratch = hl.full([width], 9, dtype=x.dtype)
+        hl.atomic_add(scratch, [col], torch.ones_like(x[row, :]))
+        out[row, :] = selected + scalar + scratch.sum()
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_completed_local_rejected(x, out, mode: hl.constexpr):
+    for row in hl.grid(x.size(0)):
+        col = hl.arange(x.size(1))
+        local = hl.zeros([x.size(1)], dtype=torch.int32)
+        hl.atomic_add(local, [col], x[row, :])
+        if mode == "alias":
+            selected = hl.load(local.view([x.size(1)]), [col])
+        elif mode == "dtype":
+            selected = hl.load(local, [col.to(torch.float32)])
+        elif mode == "cache":
+            selected = hl.load(local, [col], eviction_policy="evict_last")
+        elif mode == "loop":
+            for j in range(2):
+                selected = hl.load(local, [col + j])
+                out[row, :] = selected
+        else:
+            selected = hl.load(local, [col])
+            alias = local
+            hl.atomic_add(alias, [col], x[row, :])
+        if mode != "loop":
+            out[row, :] = selected
+    return out
+
+
+def _completed_local_args(width, queries, dtype=torch.int32, device="cpu"):
+    x = (torch.arange(2 * width, device=device).reshape(2, width) - width).to(dtype)
+    if dtype == torch.float32:
+        x = x * 0.25
+    indices = (
+        torch.arange(queries, device=device)
+        .flip(0)
+        .remainder(width)
+        .expand(2, queries)
+        .clone()
+        .to(torch.int64)
+    )
+    indices[:, :6] = torch.tensor(
+        [-(1 << 63), (1 << 63) - 1, -1, width, 0, 0],
+        device=device,
+        dtype=torch.int64,
+    )
+    mask = torch.ones_like(indices, dtype=torch.bool)
+    mask[0, 6::3] = False
+    mask[1, 7::4] = False
+    return x, indices, mask, torch.empty((2, queries), device=device, dtype=dtype)
+
+
+def _check_completed_local(args):
+    x, indices, mask, out = args
+    valid = (indices >= 0) & (indices < x.size(1)) & mask
+    expected = torch.where(
+        valid, (x * 3 + 2).gather(1, indices.clamp(0, x.size(1) - 1)), 0
+    )
+    expected += (x[:, 3] * 3 + 2)[:, None] + 10 * x.size(1)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+class TestCompletedLocalIndexedReadCPU(unittest.TestCase):
+    def test_cross_lane_duplicates_bounds_masks_tails_and_storage_reuse(self):
+        for width, queries, threads in ((17, 35, 32), (65, 33, 128), (129, 131, 512)):
+            for dtype in (torch.int32, torch.float32):
+                with self.subTest(width=width, queries=queries, dtype=dtype):
+                    args = _completed_local_args(width, queries, dtype)
+                    source = _fragment_ordered_codegen(
+                        _fragment_completed_local_read, args, threads
+                    )
+                    before = args[0].clone()
+                    for order in (None, list(reversed(range(threads)))):
+                        _simulate_register_load_program(
+                            source,
+                            args[0],
+                            threads,
+                            host_tensors={
+                                "indices": args[1],
+                                "mask": args[2],
+                                "out": args[3],
+                            },
+                            lane_order=order,
+                        )
+                        _check_completed_local(args)
+                    torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+    def test_early_read_transformed_alias_and_nested_owner_decline(self):
+        x = torch.arange(34, dtype=torch.int32).reshape(2, 17)
+        for mode in ("early", "alias", "dtype", "cache", "loop"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaises((helion.exc.BaseError, RuntimeError)),
+            ):
+                _fragment_ordered_codegen(
+                    _fragment_completed_local_rejected,
+                    (x, torch.empty_like(x), mode),
+                )
+
+    def test_removing_final_update_publication_changes_results(self):
+        import ast
+
+        args = _completed_local_args(65, 65)
+        source = _fragment_ordered_codegen(_fragment_completed_local_read, args)
+        tree = ast.parse(source)
+        kernel = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+        )
+        first_read = next(
+            i
+            for i, statement in enumerate(kernel.body)
+            if isinstance(statement, ast.For)
+            and "fragment_local_load" in ast.unparse(statement)
+        )
+        last_update = max(
+            i
+            for i, statement in enumerate(kernel.body[:first_read])
+            if "cute.arch.atomic_add(" in ast.unparse(statement)
+        )
+        removed = [
+            i
+            for i in range(last_update + 1, first_read)
+            if ast.unparse(kernel.body[i]) == "cute.arch.sync_threads()"
+        ]
+        self.assertTrue(removed)
+        for i in reversed(removed):
+            kernel.body.pop(i)
+        with self.assertRaises(AssertionError):
+            _simulate_register_load_program(
+                ast.unparse(tree),
+                args[0],
+                128,
+                host_tensors={"indices": args[1], "mask": args[2], "out": args[3]},
+            )
+            _check_completed_local(args)
+
+
+@onlyBackends("cute")
+class TestCompletedLocalIndexedReadNative(TestCase):
+    def test_completed_reads_integer_and_float_masks(self):
+        for dtype in (torch.int32, torch.float32):
+            args = _completed_local_args(65, 33, dtype, DEVICE)
+            _, actual = code_and_output(
+                _fragment_completed_local_read, args, cute_fragment_threads=128
+            )
+            self.assertIs(actual, args[3])
+            _check_completed_local(args)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_completed_local_dependent(x, out):
+    width = x.size(1)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([width], dtype=torch.int32)
+        hl.atomic_add(local, [hl.arange(width)], x[row, :])
+        indices = (local + 3) % width
+        selected = hl.load(local, [indices], extra_mask=(local % 2) == 0)
+        out[row, :] = selected + selected.sum()
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_completed_local_tiled_owner(x, out):
+    for row in hl.tile(x.size(0)):
+        local = hl.zeros([x.size(1)], dtype=torch.int32)
+        col = hl.arange(x.size(1))
+        hl.atomic_add(local, [col], x[row, :])
+        out[row, :] = hl.load(local, [col], extra_mask=col >= 0)[
+            None, :
+        ] + torch.zeros_like(x[row, :])
+    return out
+
+
+class TestCompletedLocalIndexedReadLifetimeCPU(unittest.TestCase):
+    def test_index_and_mask_read_source_before_result_allocation(self):
+        for width in (17, 65):
+            x = torch.arange(2 * width, dtype=torch.int32).reshape(2, width) % width
+            out = torch.empty_like(x)
+            code = _fragment_ordered_codegen(
+                _fragment_completed_local_dependent, (x, out)
+            )
+            expected = torch.where(x % 2 == 0, x.gather(1, ((x + 3) % width).long()), 0)
+            expected += expected.sum(1, keepdim=True)
+            for order in (None, list(reversed(range(128)))):
+                _simulate_register_load_program(
+                    code, x, 128, host_tensors={"out": out}, lane_order=order
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_more_than_one_row_owner_is_rejected(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        x = torch.ones((2, 17), dtype=torch.int32)
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(
+                _fragment_completed_local_tiled_owner, (x, torch.empty_like(x))
+            )
+            config = bound.config_spec.default_config()
+            config.config.update(block_sizes=[2], cute_fragment_threads=128)
+            with self.assertRaisesRegex(helion.exc.InvalidConfig, "scalar grid"):
+                bound.to_code(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_completed_local_index_semantics(x, indices, out, mode: hl.constexpr):
+    width = x.size(1)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([width], dtype=x.dtype)
+        hl.atomic_add(local, [hl.arange(width)], x[row, :])
+        negative = (hl.arange(width) % width) - width
+        if mode == "unmasked":
+            value = hl.load(local, [negative])
+        elif mode == "masked":
+            value = hl.load(local, [negative], extra_mask=negative < 0)
+        elif mode == "scalar":
+            value = hl.load(local, [-1]) + hl.load(local, [-width])
+        elif mode == "scalar_masked":
+            value = hl.load(local, [-1], extra_mask=hl.full([], True, torch.bool))
+        elif mode == "tensor_scalar_masked":
+            index = hl.full([], -1, torch.int32)
+            value = hl.load(local, [index], extra_mask=hl.full([], True, torch.bool))
+        elif mode == "invalid":
+            value = hl.load(local, [width])
+        elif mode == "invalid_negative":
+            value = hl.load(local, [-width - 1])
+        else:
+            value = hl.load(local, [indices[row, :]])
+        out[row, :] = value + torch.zeros_like(x[row, :])
+    return out
+
+
+class TestCompletedLocalIndexedReadSemanticsCPU(unittest.TestCase):
+    def test_negative_tensor_scalar_and_mask_semantics_match_load_reference(self):
+        for dtype in (torch.int32, torch.float32):
+            x = torch.arange(34).reshape(2, 17).to(dtype) + 3
+            indices = torch.zeros_like(x, dtype=torch.int64)
+            for mode in (
+                "unmasked",
+                "masked",
+                "scalar",
+                "scalar_masked",
+                "tensor_scalar_masked",
+            ):
+                with self.subTest(dtype=dtype, mode=mode):
+                    out = torch.empty_like(x)
+                    code = _fragment_ordered_codegen(
+                        _fragment_completed_local_index_semantics,
+                        (x, indices, out, mode),
+                    )
+                    expected = torch.empty_like(out)
+                    for row in range(x.size(0)):
+                        index = torch.arange(17) - 17
+                        if mode == "unmasked":
+                            value = hl.load._ref_fn(x[row], [index])
+                        elif mode == "masked":
+                            value = hl.load._ref_fn(x[row], [index], index < 0)
+                        elif mode == "scalar":
+                            value = hl.load._ref_fn(x[row], [-1]) + hl.load._ref_fn(
+                                x[row], [-17]
+                            )
+                        elif mode == "scalar_masked":
+                            value = hl.load._ref_fn(x[row], [-1], torch.tensor(True))
+                        else:
+                            value = hl.load._ref_fn(
+                                x[row],
+                                [torch.tensor(-1, dtype=torch.int32)],
+                                torch.tensor(True),
+                            )
+                        expected[row] = value
+                    for order in (None, list(reversed(range(128)))):
+                        _simulate_register_load_program(
+                            code,
+                            x,
+                            128,
+                            host_tensors={"indices": indices, "out": out},
+                            lane_order=order,
+                        )
+                        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_unmasked_unknown_or_out_of_range_is_not_zero_filled(self):
+        x = torch.ones((2, 17), dtype=torch.int32)
+        for mode in ("invalid", "invalid_negative", "unknown"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    helion.exc.InvalidConfig, "proved logical index range"
+                ),
+            ):
+                _fragment_ordered_codegen(
+                    _fragment_completed_local_index_semantics,
+                    (
+                        x,
+                        torch.zeros_like(x, dtype=torch.int64),
+                        torch.empty_like(x),
+                        mode,
+                    ),
+                )
