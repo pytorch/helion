@@ -10,6 +10,7 @@ from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...language import scan_ops
 from ...runtime.config import Config
+from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -24,8 +25,6 @@ MODES = ("serial", "cooperative")
 
 def fragment_scan_roots(env: CompileEnvironment, ir: DeviceIR) -> frozenset[int]:
     """Project the same roots used by explicit ordered phase code generation."""
-    from ..cute.computed_fragment import computed_fragment_supported
-
     return frozenset(
         root
         for root, graphs in fragment_root_regions(ir)
@@ -34,7 +33,7 @@ def fragment_scan_roots(env: CompileEnvironment, ir: DeviceIR) -> frozenset[int]
             for info in graphs
             for node in info.graph.nodes
         )
-        and computed_fragment_supported(env, graphs)
+        and computed_fragment_discovery_supported(env, graphs)
     )
 
 
