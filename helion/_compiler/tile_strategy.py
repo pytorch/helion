@@ -5048,6 +5048,7 @@ def _plain_assignment_name(stmt: ast.AST) -> str | None:
 
 _PURE_RELOCATABLE_NAMES = frozenset(
     {
+        "_cute_python_mod",
         "abs",
         "bool",
         "float",

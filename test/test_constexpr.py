@@ -199,7 +199,12 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         device_code, host_code = code[: match.start()], code[match.start() :]
         if _get_backend() == "cute":
             self.assertIn("_default_cute_launcher", host_code)
-            # The host binds constexpr values independently of CTA shape.
+            # Output rows may be distributed through the persistent grid or
+            # physical threads, depending on the target's minimum dot tile.
+            # Validate the complete result rather than a particular CTA shape.
+            actual = matmul_int4_block_expr(A, B_packed)
+            expected = (A.float() @ B_unpacked.float()).to(torch.bfloat16)
+            torch.testing.assert_close(actual, expected)
             self.assertNotIn("_BLOCK_SIZE_", host_code)
         else:
             self.assertIn("_BLOCK_SIZE_0 = 1", host_code)

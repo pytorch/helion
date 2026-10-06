@@ -1571,6 +1571,7 @@ class CuteBackend(Backend):
                 "cute_fragment_reduction",
                 "cute_fragment_threads",
                 "cute_fragment_register_loads",
+                "cute_fragment_warp_results",
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
@@ -1922,6 +1923,7 @@ class CuteBackend(Backend):
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
+            "_cute_python_mod": "from helion._compiler.cute.integer_helpers import python_mod as _cute_python_mod",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
@@ -2175,6 +2177,20 @@ class CuteBackend(Backend):
 
             @staticmethod
             def remainder(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    expected is not None
+                    and not expected.dtype.is_floating_point
+                    and expected.dtype != torch.bool
+                ):
+                    # TensorIterator first converts wrapped scalar operands to
+                    # the logical promoted tensor dtype. Keep this distinct
+                    # from scalar PythonMod's ordinary Python/SDK promotion.
+                    left = CuteDSLOpOverrides._cast_expr("{a}", expected.dtype)
+                    right = CuteDSLOpOverrides._cast_expr("{b}", expected.dtype)
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, f"_cute_python_mod({left}, {right})"
+                    )
                 return HelionCuteDSLOpOverrides.mod(a, b)
 
             @staticmethod
@@ -2430,6 +2446,17 @@ class CuteBackend(Backend):
         val = self.cast_expr(val, self.dtype_str(dtype))
         if reduction_type == "sum":
             return f"({acc} + {val})"
+        if reduction_type in ("min", "max") and dtype == torch.int32:
+            # Preserve signed ordering through unsigned keys. The CUDA compiler
+            # can lose a source negation when combining a signed Int32 extrema
+            # chain into VIMNMX3. Flipping the sign bit is an exact order
+            # isomorphism and avoids that invalid signed fusion.
+            sign_bit = "cutlass.Uint32(2147483648)"
+            lhs = f"(cutlass.Uint32({acc}) ^ {sign_bit})"
+            rhs = f"(cutlass.Uint32({val}) ^ {sign_bit})"
+            return (
+                f"cutlass.Int32(cute.math.{reduction_type}({lhs}, {rhs}) ^ {sign_bit})"
+            )
         if reduction_type == "max":
             return f"({acc}) if ({acc}) > ({val}) else ({val})"
         if reduction_type == "min":

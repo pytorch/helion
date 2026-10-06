@@ -95,6 +95,23 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     dim = cast("int", state.proxy_arg(2))
     reverse = bool(state.proxy_arg(3))
     is_tuple_input = bool(state.proxy_arg(4))
+    input_value = state.proxy_arg(1)
+    inputs = input_value if is_tuple_input else (input_value,)
+    assert isinstance(inputs, (tuple, list))
+    if all(
+        CompileEnvironment.current().known_equal(
+            cast("torch.Tensor", value).size(dim), 1
+        )
+        for value in inputs
+    ):
+        # A singleton inclusive scan seeds from its only element and never
+        # invokes the combine. Preserve the already-lowered value, including
+        # its source masks, dtype and payload; no scan coordinate is needed.
+        if is_tuple_input:
+            expressions = state.ast_args[1]
+            assert isinstance(expressions, (tuple, list))
+            return [cast("ast.AST", expression) for expression in expressions]
+        return state.ast_arg(1)
 
     helper_graph_info = state.get_graph(combine_graph_id)
     assert isinstance(helper_graph_info, HelperFunctionGraphInfo)

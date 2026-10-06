@@ -1029,13 +1029,24 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
         def __add__(self, offset):
             return Pointer(self.tensor, self.offset + int(offset))
 
+        def storage(self):
+            return self.tensor.as_strided(
+                (self.tensor.untyped_storage().nbytes() // self.tensor.element_size(),),
+                (1,),
+                storage_offset=0,
+            )
+
         def load(self):
-            assert 0 <= self.offset < self.tensor.numel()
-            return self.tensor.reshape(-1)[self.offset].item()
+            storage = self.storage()
+            offset = self.tensor.storage_offset() + self.offset
+            assert 0 <= offset < storage.numel()
+            return storage[offset].item()
 
         def store(self, value):
-            assert 0 <= self.offset < self.tensor.numel()
-            self.tensor.reshape(-1)[self.offset] = float(value)
+            storage = self.storage()
+            offset = self.tensor.storage_offset() + self.offset
+            assert 0 <= offset < storage.numel()
+            storage[offset] = value.item() if isinstance(value, np.generic) else value
 
     class Shared:
         def __init__(self, dtype, shape):
@@ -1077,6 +1088,7 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
     for block in range(blocks):
         environment = {
             "operator": operator,
+            "_cute_python_mod": operator.mod,
             "cutlass": SimpleNamespace(
                 Float32=np.float32,
                 Float64=np.float64,
@@ -1088,6 +1100,7 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
             "cute": SimpleNamespace(
+                math=SimpleNamespace(min=np.minimum, max=np.maximum),
                 make_layout=lambda shape: shape,
                 arch=SimpleNamespace(
                     thread_idx=lambda: (0, 0, 0),
@@ -1420,6 +1433,7 @@ def test_fragment_singleton_view_logical_coordinates(
     value = physical.permute(tuple(reversed(range(len(shape))))) if shape else physical
     expected = target(value, *arguments)
     compiler = object.__new__(FragmentCompiler)
+    compiler.pending_local_atomics = set()
     compiler.shape = lambda sizes: tuple(sizes)
     compiler.coordinate_locals = lambda coordinates: coordinates
     graph = torch.fx.Graph()
@@ -1828,6 +1842,7 @@ def _simulate_fragment_warp_reduction(source, inputs, outputs, blocks, threads=1
     for block in range(blocks):
         environment: dict[str, Any] = {
             "operator": operator,
+            "_cute_python_mod": operator.mod,
             "_run_warp": run_warp,
             "cutlass": SimpleNamespace(
                 Float16=np.float16,
@@ -1842,6 +1857,7 @@ def _simulate_fragment_warp_reduction(source, inputs, outputs, blocks, threads=1
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
             "cute": SimpleNamespace(
+                math=SimpleNamespace(min=np.minimum, max=np.maximum),
                 make_layout=lambda shape: shape,
                 arch=SimpleNamespace(
                     thread_idx=lambda: (0, 0, 0),
@@ -2873,3 +2889,357 @@ def _fragment_host_fixed_computed_scan(x: torch.Tensor):
         for column in hl.tile(x.size(1), block_size=_FRAGMENT_FIXED_CHUNK):
             out[row, column] = torch.cumsum(x[row, column] + 1, dim=-1)
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _free_iota_vector_reduction(x, chunk: hl.constexpr, kind: hl.constexpr):
+    parts = (x.size(1) + chunk - 1) // chunk
+    out = torch.empty((x.size(0), parts), dtype=torch.int32, device=x.device)
+    for row, part in hl.grid((x.size(0), parts)):
+        columns = part * chunk + hl.arange(chunk)
+        valid = (columns < x.size(1)) & (columns % 5 != row % 5)
+        value = hl.load(x, [row, columns], extra_mask=valid)
+        if kind == "count":
+            reduced = ((value > 3) & valid).to(torch.int32).sum(dtype=torch.int32)
+        elif kind == "sum":
+            reduced = torch.where(valid, value + 2, 0).sum(dtype=torch.int32)
+        else:
+            reduced = torch.where(valid, value + 2, -1000).amax()
+        out[row, part] = reduced
+    return out
+
+
+def _free_iota_reference(x, chunk, kind):
+    result = torch.empty(
+        (x.size(0), (x.size(1) + chunk - 1) // chunk),
+        dtype=torch.int32,
+        device=x.device,
+    )
+    for row in range(x.size(0)):
+        for part, start in enumerate(range(0, x.size(1), chunk)):
+            columns = torch.arange(
+                start, min(start + chunk, x.size(1)), device=x.device
+            )
+            values = x[row, columns][columns % 5 != row % 5]
+            result[row, part] = (
+                (values > 3).sum()
+                if kind == "count"
+                else (values + 2).sum()
+                if kind == "sum"
+                else (values + 2).amax()
+                if values.numel()
+                else -1000
+            )
+    return result
+
+
+def _free_iota_config(bound, reduction):
+    config = bound.config_spec.default_config()
+    config.config["reduction_loops"] = [reduction]
+    return config
+
+
+@pytest.mark.parametrize("chunk,reduction", [(16, 8), (64, 16), (128, 32)])
+@pytest.mark.parametrize("kind", ["count", "sum", "max"])
+def test_free_iota_reduction_complete_producer_values(chunk, reduction, kind):
+    # Strided source, independent row/partition coordinates, masked tails and a
+    # nonzero pointwise offset distinguish full-vector semantics from repeating
+    # one masked scalar. The original looped lowering did precisely the latter.
+    x = (torch.arange(3 * (4 * chunk + 6), dtype=torch.int32) % 13).reshape(3, -1)[
+        :, ::2
+    ]
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_free_iota_vector_reduction, (x, chunk, kind))
+        source = bound.to_code(_free_iota_config(bound, reduction))
+    assert "arange_lane" not in source
+    assert "fragment_reduce_tile" in source
+    expected = _free_iota_reference(x, chunk, kind)
+    actual = torch.full_like(expected, -999)
+    before = x.clone()
+    _simulate_independent_fragment(source, {"x": x}, {"out": actual}, actual.numel())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+    coverage = _generated_output_address_coverage(source, "out", actual.numel(), 128)
+    assert coverage == dict.fromkeys(range(actual.numel()), 1)
+
+
+def test_free_iota_large_default_reduction_values():
+    x = (torch.arange(2 * 8195).reshape(2, 8195) % 7).int()
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(_free_iota_vector_reduction, (x, 8192, "count"))
+        source = bound.to_code(bound.config_spec.default_config())
+    expected = _free_iota_reference(x, 8192, "count")
+    actual = torch.full_like(expected, -999)
+    _simulate_independent_fragment(source, {"x": x}, {"out": actual}, actual.numel())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert "arange_lane" not in source
+
+
+def test_free_iota_existing_complete_axis_keeps_native_program():
+    # The persistent 64-element axis already owns the ordinary iota coordinate.
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(
+            _free_iota_vector_reduction, (torch.ones(3, 129).int(), 64, "sum")
+        )
+        config = _free_iota_config(bound, None)
+        actual = bound.to_code(config)
+        with patch(
+            "helion._compiler.cute.computed_fragment.free_iota_reductions",
+            return_value={},
+        ):
+            original = bound.to_code(config)
+    assert "fragment_smem" not in actual
+    assert actual == original
+
+
+def test_free_iota_declines_incompatible_collective_config():
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(
+            _free_iota_vector_reduction, (torch.ones(3, 129).int(), 64, "count")
+        )
+        config = _free_iota_config(bound, 16)
+        config.config["cute_collective_mma"] = True
+        with pytest.raises(exc.InvalidConfig):
+            bound.to_code(config)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "chunk,reduction,kind",
+    [(16, 8, "count"), (64, 16, "sum"), (128, 32, "max"), (8192, 4096, "count")],
+)
+def test_free_iota_complete_vector_native(chunk, reduction, kind):
+    x = (torch.arange(3 * (2 * chunk + 3), device=DEVICE).reshape(3, -1) % 13).int()
+    before = x.clone()
+    bound = _free_iota_vector_reduction.bind((x, chunk, kind))
+    actual = bound.compile_config(_free_iota_config(bound, reduction))(x, chunk, kind)
+    torch.testing.assert_close(
+        actual, _free_iota_reference(x, chunk, kind), rtol=0, atol=0
+    )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_int32_negated_extrema(x: torch.Tensor):
+    low = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+    high = torch.empty_like(low)
+    for row in hl.tile(x.size(0), block_size=1):
+        # The scan establishes a complete-fragment producer. Integer overflow is
+        # intentional: reductions must preserve the logical Int32 value bits.
+        values = -hl.cumsum(x[row, :] + 1, dim=-1)
+        low[row] = values.amin(-1)
+        high[row] = values.amax(-1)
+    return low, high
+
+
+def _fragment_int32_extrema_inputs(columns, device="cpu"):
+    bounds = torch.iinfo(torch.int32)
+    prefix = torch.tensor(
+        [bounds.min, bounds.max, -1, 0, 1, bounds.min + 1, bounds.max - 1],
+        dtype=torch.int32,
+        device=device,
+    )
+    prefix = prefix.repeat((columns + 6) // 7)[:columns]
+    positive = (torch.arange(columns, device=device) % 13 + 1).int()
+    prefix = torch.stack((prefix, positive, -positive))
+    x = prefix.clone()
+    x[:, 1:] = prefix[:, 1:] - prefix[:, :-1]
+    return x - 1
+
+
+def _fragment_int32_extrema_reference(x):
+    values = -(x + 1).cumsum(-1, dtype=torch.int32)
+    return values.amin(-1), values.amax(-1)
+
+
+@pytest.mark.parametrize("mode", ["serial", "warp"])
+@pytest.mark.parametrize("columns", [17, 65])
+def test_fragment_int32_negated_extrema_generated_boundaries(mode, columns):
+    x = _fragment_int32_extrema_inputs(columns)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_int32_negated_extrema, (x,))
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_reduction"] = mode
+        code = bound.to_code(config)
+    expected = _fragment_int32_extrema_reference(x)
+    actual = tuple(torch.full_like(value, -99) for value in expected)
+    _simulate_fragment_warp_reduction(
+        code, {"x": x}, {"low": actual[0], "high": actual[1]}, 3
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["min", "max"])
+def test_int32_extrema_signed_order_boundary_equivalence(kind):
+    import numpy as np
+
+    from helion._compiler.cute.backend import CuteBackend
+
+    limits = torch.iinfo(torch.int32)
+    values = [
+        limits.min,
+        limits.min + 1,
+        -65537,
+        -1,
+        0,
+        1,
+        65537,
+        limits.max - 1,
+        limits.max,
+    ]
+    # Include negation overflow, where -INT_MIN is still INT_MIN.
+    values.extend(int(value) for value in -torch.tensor(values, dtype=torch.int32))
+    expression = CuteBackend().reduction_combine_expr(kind, "a", "b", torch.int32)
+    scope = {
+        "cutlass": SimpleNamespace(Int32=np.int32, Uint32=np.uint32),
+        "cute": SimpleNamespace(math=SimpleNamespace(min=np.minimum, max=np.maximum)),
+    }
+    reference = min if kind == "min" else max
+    for left, right in itertools.product(values, repeat=2):
+        scope.update(a=np.int32(left), b=np.int32(right))
+        assert int(eval(expression, scope)) == reference(left, right)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("mode", ["serial", "warp"])
+@pytest.mark.parametrize("columns", [17, 65])
+def test_fragment_int32_negated_extrema_native(mode, columns):
+    x = _fragment_int32_extrema_inputs(columns, "cuda")
+    before = x.clone()
+    bound = _fragment_int32_negated_extrema.bind((x,))
+    config = bound.config_spec.default_config()
+    config.config["cute_fragment_reduction"] = mode
+    actual = bound.compile_config(config)(x)
+    torch.testing.assert_close(
+        actual, _fragment_int32_extrema_reference(x), rtol=0, atol=0
+    )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _fragment_dynamic_host_strides(x, out):
+    hl.specialize(x.size(1))
+    for row in hl.tile(x.size(0), block_size=1):
+        out[row, :] = torch.cumsum(x[row, :] + 1, dim=-1)
+    return out
+
+
+def test_fragment_host_stride_arguments_preserve_views_and_rebinds():
+    inputs = torch.arange(3 * 18).reshape(3, 18).float()[:, 1::2]
+    outputs = torch.full((3, 27), -999.0)[:, 2::3]
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_dynamic_host_strides, (inputs, outputs))
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+    tree = ast.parse(source)
+    device = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    parameters = {arg.arg for arg in device.args.args}
+    assert {"x_stride_0", "x_stride_1", "out_stride_0", "out_stride_1"} <= parameters
+    for input_step, output_step in ((2, 3), (3, 5)):
+        storage = torch.arange(3 * (9 * input_step + 1)).reshape(3, -1).float()
+        x = storage[:, 1::input_step]
+        target = torch.full((3, 9 * output_step + 2), -999.0)
+        out = target[:, 2::output_step]
+        kwargs = {"x": x, "out": out}
+        for name, tensor in (("x", x), ("out", out)):
+            for dim in range(2):
+                kwargs[f"{name}_stride_{dim}"] = tensor.stride(dim)
+                kwargs[f"{name}_size_{dim}"] = tensor.size(dim)
+        _simulate_independent_fragment(source, kwargs, {}, 3)
+        torch.testing.assert_close(out, (x + 1).cumsum(-1), rtol=0, atol=0)
+        untouched = target.clone()
+        untouched[:, 2::output_step] = -999
+        assert torch.all(untouched == -999)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _free_iota_two_destinations(
+    x, left, right, chunk: hl.constexpr, same_target: hl.constexpr
+):
+    for row, part in hl.grid([x.size(0), left.size(1)]):
+        index = part * chunk + hl.arange(chunk)
+        loaded = hl.load(x, [row, index], extra_mask=index < x.size(1))
+        total = (loaded + 1).sum()
+        left[row, part] = total
+        if same_target:
+            left[row, part] = total + 7
+        else:
+            right[row, part] = total + 7
+    return left, right
+
+
+@pytest.mark.parametrize("mode", ["disjoint", "same_target", "overlapping_views"])
+def test_free_iota_store_ownership_keeps_alias_guards(mode):
+    x = torch.arange(2 * 129).reshape(2, 129).float()
+    storage = torch.full((2, 4), -999.0)
+    left = storage[:, :3]
+    right = (
+        torch.full((2, 3), -999.0)
+        if mode == "disjoint"
+        else left
+        if mode == "same_target"
+        else storage[:, 1:]
+    )
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(
+            _free_iota_two_destinations,
+            (x, left, right, 64, mode == "same_target"),
+        )
+        config = _free_iota_config(bound, 16)
+        if mode == "overlapping_views":
+            with pytest.raises(exc.BackendUnsupported, match="disjoint storage"):
+                bound.to_code(config)
+            return
+        source = bound.to_code(config)
+    assert "fragment_reduce_tile" in source
+    _simulate_independent_fragment(
+        source, {"x": x, "left": left, "right": right}, {}, 6
+    )
+    expected = torch.stack(
+        [
+            torch.stack(
+                [x[row, start : start + 64].sum() + 64 for start in (0, 64, 128)]
+            )
+            for row in range(2)
+        ]
+    )
+    torch.testing.assert_close(right, expected + 7, rtol=0, atol=0)
+    torch.testing.assert_close(
+        left, expected + (7 if mode == "same_target" else 0), rtol=0, atol=0
+    )
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("width", [9, 17])
+def test_fragment_host_stride_native_rebind(width):
+    compiled = None
+    for input_step, output_step in ((2, 3), (3, 5)):
+        storage = torch.arange(
+            3 * (width * input_step + 1), device=DEVICE, dtype=torch.float32
+        ).reshape(3, -1)
+        x = storage[:, 1::input_step]
+        target = torch.full((3, width * output_step + 2), -999.0, device=DEVICE)
+        out = target[:, 2::output_step]
+        before = x.clone()
+        if compiled is None:
+            bound = _fragment_dynamic_host_strides.bind((x, out))
+            compiled = bound.compile_config(bound.config_spec.default_config())
+        actual = compiled(x, out)
+        assert actual is out
+        torch.testing.assert_close(actual, (x + 1).cumsum(-1), rtol=0, atol=0)
+        torch.testing.assert_close(x, before, rtol=0, atol=0)
+        untouched = target.clone()
+        untouched[:, 2::output_step] = -999
+        assert torch.all(untouched == -999)

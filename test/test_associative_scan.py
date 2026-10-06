@@ -1665,5 +1665,239 @@ def test_serial_scan_position_handles_symbolic_extent(extent, reverse):
     assert actual == list(range(16, -1, -1) if reverse else range(17))
 
 
+@helion.kernel(backend="cute", autotune_effort="none")
+def _singleton_inclusive_scan(
+    x,
+    y,
+    dim: hl.constexpr,
+    reverse: hl.constexpr,
+    tuple_input: hl.constexpr,
+    masked: hl.constexpr,
+    scan: hl.constexpr,
+):
+    out_x = torch.empty_like(x)
+    out_y = torch.empty_like(y)
+    axis = 1 if dim == 0 else 0
+    for tile in hl.tile(x.size(axis), block_size=8):
+        if dim == 0:
+            if masked:
+                first = hl.load(x, [slice(None), tile], extra_mask=y[:, tile] % 4 == 0)
+                second = hl.load(y, [slice(None), tile], extra_mask=y[:, tile] % 4 == 0)
+            else:
+                first = x[:, tile]
+                second = y[:, tile]
+        else:
+            if masked:
+                first = hl.load(x, [tile, slice(None)], extra_mask=y[tile, :] % 4 == 0)
+                second = hl.load(y, [tile, slice(None)], extra_mask=y[tile, :] % 4 == 0)
+            else:
+                first = x[tile, :]
+                second = y[tile, :]
+        if scan:
+            if tuple_input:
+                first, second = hl.associative_scan(
+                    _scan_product_and_sum, (first, second), dim=dim, reverse=reverse
+                )
+            else:
+                first = hl.associative_scan(
+                    torch.minimum, first, dim=dim, reverse=reverse
+                )
+        if dim == 0:
+            out_x[:, tile] = first
+            out_y[:, tile] = second
+        else:
+            out_x[tile, :] = first
+            out_y[tile, :] = second
+    return out_x, out_y
+
+
+def _execute_singleton_scan_program(source, inputs):
+    # Reuse the existing generated-thread address/unique-write model for a
+    # multi-output wrapper, retaining the original tensor storage and dtypes.
+    tree = ast.parse(source)
+    wrapper = next(
+        node for node in reversed(tree.body) if isinstance(node, ast.FunctionDef)
+    )
+    result = next(node for node in wrapper.body if isinstance(node, ast.Return))
+    result.value = ast.Call(
+        func=ast.Name(id="_ScanOutputs", ctx=ast.Load()),
+        args=[result.value],
+        keywords=[],
+    )
+    tree.body.insert(
+        0,
+        ast.parse(
+            "class _ScanOutputs(tuple):\n    def numel(self):\n        return sum(value.numel() for value in self)\n"
+        ).body[0],
+    )
+    return _execute_direct_scan_program(
+        ast.unparse(ast.fix_missing_locations(tree)), inputs
+    )
+
+
+def _singleton_scan_data(dim, device="cpu"):
+    # Strides, signed zero, quiet NaN payloads and exact wide integers survive
+    # the singleton identity; no arithmetic on these values is required.
+    bits = torch.tensor(
+        [
+            -2147483648,
+            0,
+            1,
+            0x7FC12345,
+            0x7F800000,
+            -8388608,
+            0x3F800000,
+            0x00800000,
+            0x3EAAAAAB,
+            0x40000000,
+            0x40400000,
+            0x40800000,
+            0x40A00000,
+            0x40C00000,
+            0x40E00000,
+            0x41000000,
+            0x41100000,
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    backing = torch.empty((17, 2), dtype=torch.float32, device=device)
+    backing[:, 0] = bits.view(torch.float32)
+    backing[:, 1] = 123
+    x = backing[:, :1]
+    y = (torch.arange(34, device=device, dtype=torch.int64) + (1 << 60)).reshape(17, 2)[
+        :, :1
+    ]
+    if dim == 0:
+        x, y = x.t(), y.t()
+    return x, y
+
+
+@pytest.mark.parametrize("dim", [0, -1])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("tuple_input", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_singleton_scan_generated_identity(dim, reverse, tuple_input, masked):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    x, y = _singleton_scan_data(dim)
+    before = (x.contiguous().view(torch.int32).clone(), y.clone())
+    args = (x, y, dim, reverse, tuple_input, masked, True)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_singleton_inclusive_scan, args)
+        source = bound.to_code(bound.config_spec.default_config())
+    actual = _execute_singleton_scan_program(source, args)
+    expected_x, expected_y = x.clone(), y.clone()
+    if masked:
+        expected_x.reshape(-1)[1::2] = 0
+        expected_y.reshape(-1)[1::2] = 0
+    torch.testing.assert_close(
+        actual[0].contiguous().view(torch.int32),
+        expected_x.contiguous().view(torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(actual[1], expected_y, rtol=0, atol=0)
+    torch.testing.assert_close(
+        x.contiguous().view(torch.int32), before[0], rtol=0, atol=0
+    )
+    torch.testing.assert_close(y, before[1], rtol=0, atol=0)
+    assert "scan_acc" not in source
+    assert "scan_initialized" not in source
+
+
+@pytest.mark.parametrize(
+    "dim,reverse,tuple_input,masked",
+    [(0, True, True, False), (-1, False, False, True), (-1, True, True, False)],
+)
+@onlyBackends(["cute"])
+def test_singleton_scan_native_identity(dim, reverse, tuple_input, masked):
+    x, y = _singleton_scan_data(dim, DEVICE)
+    x_before, y_before = x.contiguous().view(torch.int32).clone(), y.clone()
+    _code, actual = code_and_output(
+        _singleton_inclusive_scan, (x, y, dim, reverse, tuple_input, masked, True)
+    )
+    expected_x, expected_y = x.clone(), y.clone()
+    if masked:
+        expected_x.reshape(-1)[1::2] = 0
+        expected_y.reshape(-1)[1::2] = 0
+    torch.testing.assert_close(
+        actual[0].contiguous().view(torch.int32),
+        expected_x.contiguous().view(torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(actual[1], expected_y, rtol=0, atol=0)
+    torch.testing.assert_close(
+        x.contiguous().view(torch.int32), x_before, rtol=0, atol=0
+    )
+    torch.testing.assert_close(y, y_before, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_singleton_scan_rebind_does_not_specialize_shape_hints():
+    from unittest.mock import patch
+
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    kernel = helion.kernel(
+        _singleton_inclusive_scan.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+    )
+    storage = torch.arange(17 * 16).reshape(17, 16).float()
+    integer = (torch.arange(17 * 16, dtype=torch.int64) + (1 << 60)).reshape(17, 16)
+    bindings = {}
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        for width in (1, 4, 1):
+            x, y = storage[:, :width], integer[:, :width]
+            args = (x, y, -1, False, False, False, True)
+            bound = kernel.bind(args)
+            if width in bindings:
+                assert bound is bindings[width]
+            bindings[width] = bound
+            source = bound.to_code(bound.config_spec.default_config())
+            actual = _execute_singleton_scan_program(source, args)
+            torch.testing.assert_close(actual[0], x.cummin(-1).values, rtol=0, atol=0)
+            torch.testing.assert_close(actual[1], y, rtol=0, atol=0)
+            assert ("scan_acc" in source) == (width != 1)
+    assert bindings[1] is not bindings[4]
+
+
+@onlyBackends(["cute"])
+def test_singleton_scan_native_dtype_payloads():
+    for dtype in (torch.float16, torch.bfloat16, torch.float64):
+        x = torch.tensor(
+            [-0.0, float("inf"), float("-inf"), float("nan"), 1 + 2**-40],
+            dtype=dtype,
+            device=DEVICE,
+        )[:, None]
+        y = (torch.arange(5, device=DEVICE, dtype=torch.int64) + (1 << 60))[:, None]
+        bits_dtype = torch.int64 if dtype == torch.float64 else torch.int16
+        before = x.contiguous().view(bits_dtype).clone()
+        _code, actual = code_and_output(
+            _singleton_inclusive_scan, (x, y, -1, True, True, False, True)
+        )
+        assert actual[0].dtype == dtype
+        torch.testing.assert_close(
+            actual[0].contiguous().view(bits_dtype), before, rtol=0, atol=0
+        )
+        torch.testing.assert_close(actual[1], y, rtol=0, atol=0)
+        torch.testing.assert_close(
+            x.contiguous().view(bits_dtype), before, rtol=0, atol=0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
