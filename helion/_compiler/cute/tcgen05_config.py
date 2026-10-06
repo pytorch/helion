@@ -16,6 +16,22 @@ from ...autotuner.config_fragment import IntegerFragment
 from ...autotuner.config_fragment import ListOf
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .cute_warp_mma_gemm import MATMUL_FAMILIES
+from .cute_warp_mma_gemm import MATMUL_FAMILY_TCGEN05
+from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
+from .cute_warp_mma_gemm import WARP_MMA_DEFAULT_WARPS
+from .cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
+from .cute_warp_mma_gemm import WARP_MMA_MAX_BM
+from .cute_warp_mma_gemm import WARP_MMA_MAX_BN
+from .cute_warp_mma_gemm import WARP_MMA_MIN_BM
+from .cute_warp_mma_gemm import WARP_MMA_MIN_BN
+from .cute_warp_mma_gemm import WARP_MMA_SEED_TILES
+from .cute_warp_mma_gemm import WARP_MMA_WARP_CHOICES
+from .cute_warp_mma_gemm import WARP_MMA_WARPS_KEY
+from .cute_warp_mma_gemm import warp_mma_k_step
+from .cute_warp_mma_gemm import warp_mma_max_legal_warps
+from .cute_warp_mma_gemm import warp_mma_tile_reason
+from .cute_warp_mma_gemm import warp_mma_warp_layout
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
 from .epilogue_fanout import schedule_supported as fanout_schedule_supported
@@ -405,6 +421,8 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_num_epi_warps",
     TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
     TCGEN05_BATCH_RASTER_CONFIG_KEY,
+    WARP_MMA_FAMILY_KEY,
+    WARP_MMA_WARPS_KEY,
 )
 CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -534,6 +552,16 @@ class CuteTcgen05Config:
         # SM count of the bound device (0 when unknown); small-grid seeds use
         # it to decide whether the standard tiling can fill the machine.
         self.device_sm_count: int = 0
+        # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``):
+        # admitted by the search plan (static latency-bound problem, one
+        # matmul, supported layouts); its 16x8 tiles widen the M / N block
+        # floors, which ``_normalize_warp_mma_family`` clamps back to the
+        # recorded tcgen05 floors for tcgen05-family configs.
+        self.warp_mma_admitted: bool = False
+        self.tcgen05_min_search_m: int = 64
+        self.tcgen05_min_search_n: int = 8
+        # Block id of the leading passthrough (batch) axis, when any.
+        self.matmul_leading_block_id: int | None = None
 
     @property
     def allowed_pid_types(self) -> tuple[PidTypeLiteral, ...]:
@@ -1016,6 +1044,272 @@ class CuteTcgen05Config:
                     )
                     seeds.append(Config(**direct_seed_config))
         return seeds
+
+    def _warp_mma_problem(
+        self,
+    ) -> tuple[int, int, int, torch.dtype] | None:
+        """``(m, n, k, dtype)`` of the admitted register-MMA GEMM, or None."""
+        extents = self.matmul_compile_time_static_extents
+        dtype = self.matmul_input_dtype
+        if (
+            not self.search_enabled
+            or not self.warp_mma_admitted
+            or extents is None
+            or dtype is None
+            or any(value is None or value <= 0 for value in extents)
+        ):
+            return None
+        m, n, k = cast("tuple[int, int, int]", extents)
+        return m, n, k, dtype
+
+    def _warp_mma_seed_bk(self, k: int, dtype: torch.dtype) -> int | None:
+        """The widest K chunk the K fragment admits that divides K."""
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bk_fragment = fragments[2]
+        k_step = warp_mma_k_step(dtype)
+        bk = bk_fragment.high
+        while bk > k_step and (k % bk or bk % k_step):
+            bk //= 2
+        if k % bk or bk % k_step or bk < bk_fragment.low or bk > k:
+            return None
+        return bk
+
+    def _warp_mma_seed_configs(self) -> list[Config]:
+        """Register-MMA tiles for the admitted latency-bound GEMMs.
+
+        One-warp 16x8 tiles (the Helion-Triton fp8 256^3 winner's structure:
+        2.24 us vs cuBLAS 2.62) and the four-warp 64x8 / 32x32 and two-warp
+        32x16 tiles that won the fp16 256^3 + bias and (4, 64, 128, 128)
+        probes (2.64 vs 2.88, 2.19 vs 2.66); the timer decides against the
+        tcgen05 small-grid seeds.
+        """
+        problem = self._warp_mma_problem()
+        fragments = self._matmul_block_fragments()
+        if problem is None or fragments is None:
+            return []
+        m, n, k, dtype = problem
+        bk = self._warp_mma_seed_bk(k, dtype)
+        if bk is None:
+            return []
+        bm_fragment, bn_fragment, _bk_fragment = fragments
+        leading_index = self._config_block_index(self.matmul_leading_block_id)
+        seeds: list[Config] = []
+        for bm, bn, warps in WARP_MMA_SEED_TILES:
+            if not (
+                bm_fragment.low <= bm <= bm_fragment.high
+                and bn_fragment.low <= bn <= bn_fragment.high
+            ):
+                continue
+            if (
+                warp_mma_tile_reason(
+                    m=m, n=n, k=k, bm=bm, bn=bn, bk=bk, warps=warps, dtype=dtype
+                )
+                is not None
+            ):
+                continue
+            block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+            assert block_sizes is not None
+            if leading_index is not None:
+                block_sizes[leading_index] = 1
+            seed_config: dict[str, Any] = {
+                "block_sizes": block_sizes,
+                WARP_MMA_FAMILY_KEY: MATMUL_FAMILY_WARP_MMA,
+                WARP_MMA_WARPS_KEY: warps,
+            }
+            seeds.append(Config(**seed_config))
+        return seeds
+
+    def _pin_warp_mma_inert_knobs(self, config: dict[str, object]) -> None:
+        """Pin every knob the register-MMA body ignores to its default so equal
+        kernels share one autotune identity: the tcgen05 pipeline knobs, the
+        rasterization knobs of the (replaced) Helion grid, the per-block thread /
+        vector / lane-layout knobs, the indexing choice and the occupancy hint."""
+        for key, fragment in self.optional_fragments(for_search=True).items():
+            if key in (WARP_MMA_FAMILY_KEY, WARP_MMA_WARPS_KEY):
+                continue
+            if key in config:
+                config[key] = fragment.default()
+        spec = self.config_spec
+        if "l2_groupings" in config:
+            config["l2_groupings"] = [1 for _ in spec.l2_groupings]
+        if "loop_orders" in config:
+            config["loop_orders"] = [item._fill_missing() for item in spec.loop_orders]
+        for key, default in (
+            ("num_threads", 0),
+            ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
+            ("indexing", "pointer"),
+        ):
+            value = config.get(key)
+            if isinstance(value, list):
+                config[key] = [default for _ in value]
+        if "cute_min_blocks_per_mp" in config:
+            config["cute_min_blocks_per_mp"] = 0
+
+    @staticmethod
+    def _warp_mma_largest_divisor(
+        extent: int, requested: int, *, low: int, high: int
+    ) -> int | None:
+        """The largest power of two in ``[low, min(requested, high)]`` dividing ``extent``."""
+        value = 1 << (max(min(requested, high), 1).bit_length() - 1)
+        while value >= low:
+            if extent % value == 0:
+                return value
+            value //= 2
+        return None
+
+    def _normalize_warp_mma_family(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Keep the register-MMA family and the tcgen05 tiles mutually legal.
+
+        ``cute_matmul_family="warp_mma"`` needs the admitted problem, a tile
+        the family can run (16..64 rows, 8..64 columns, a K chunk of whole
+        mma steps dividing K, a warp count tiling the block) and a unit batch
+        block; its tcgen05-only knobs are inert and pinned to their defaults
+        so equal kernels share one identity.  The tcgen05 family keeps its
+        own block floors, which the admitted family's search widened.
+        """
+        if not self.search_enabled:
+            return
+        family = config.get(WARP_MMA_FAMILY_KEY)
+        if family is not None and family not in MATMUL_FAMILIES:
+            if fix_invalid:
+                config[WARP_MMA_FAMILY_KEY] = MATMUL_FAMILY_TCGEN05
+                family = MATMUL_FAMILY_TCGEN05
+            else:
+                raise InvalidConfig(
+                    f"{WARP_MMA_FAMILY_KEY} must be one of {list(MATMUL_FAMILIES)!r}, "
+                    f"got {family!r}"
+                )
+        view = self._matmul_config_view(config)
+        if family == MATMUL_FAMILY_WARP_MMA:
+            problem = self._warp_mma_problem()
+            if problem is None or view is None:
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{WARP_MMA_FAMILY_KEY}={family!r} is not admitted for this "
+                        "kernel (the register-MMA family needs one static, "
+                        "latency-bound dense GEMM with K-contiguous A)"
+                    )
+                config[WARP_MMA_FAMILY_KEY] = MATMUL_FAMILY_TCGEN05
+                family = MATMUL_FAMILY_TCGEN05
+            else:
+                m, n, k, dtype = problem
+                block_sizes, m_index, n_index, k_index = view
+                bm, bn, bk = (
+                    block_sizes[m_index],
+                    block_sizes[n_index],
+                    block_sizes[k_index],
+                )
+                warps = config.get(WARP_MMA_WARPS_KEY, WARP_MMA_DEFAULT_WARPS)
+                values_are_ints = all(
+                    type(value) is int for value in (bm, bn, bk, warps)
+                )
+                reason = (
+                    warp_mma_tile_reason(
+                        m=m,
+                        n=n,
+                        k=k,
+                        bm=cast("int", bm),
+                        bn=cast("int", bn),
+                        bk=cast("int", bk),
+                        warps=cast("int", warps),
+                        dtype=dtype,
+                    )
+                    if values_are_ints
+                    else "tile sizes and the warp count must be integers"
+                )
+                if reason is not None:
+                    if not fix_invalid:
+                        raise InvalidConfig(
+                            f"{WARP_MMA_FAMILY_KEY}={family!r}: {reason}"
+                        )
+                    k_step = warp_mma_k_step(dtype)
+                    new_bm = self._warp_mma_largest_divisor(
+                        m,
+                        bm if type(bm) is int else WARP_MMA_MAX_BM,
+                        low=WARP_MMA_MIN_BM,
+                        high=WARP_MMA_MAX_BM,
+                    )
+                    new_bn = self._warp_mma_largest_divisor(
+                        n,
+                        bn if type(bn) is int else WARP_MMA_MAX_BN,
+                        low=WARP_MMA_MIN_BN,
+                        high=WARP_MMA_MAX_BN,
+                    )
+                    new_bk = self._warp_mma_largest_divisor(
+                        k, bk if type(bk) is int else k, low=k_step, high=k
+                    )
+                    if new_bk is not None and new_bk % k_step:
+                        new_bk = None
+                    if new_bm is None or new_bn is None or new_bk is None:
+                        config[WARP_MMA_FAMILY_KEY] = MATMUL_FAMILY_TCGEN05
+                        family = MATMUL_FAMILY_TCGEN05
+                    else:
+                        block_sizes[m_index] = new_bm
+                        block_sizes[n_index] = new_bn
+                        block_sizes[k_index] = new_bk
+                        requested = (
+                            warps if type(warps) is int else WARP_MMA_DEFAULT_WARPS
+                        )
+                        legal = [
+                            choice
+                            for choice in WARP_MMA_WARP_CHOICES
+                            if choice <= requested
+                            and warp_mma_warp_layout(new_bm, new_bn, choice) is not None
+                        ]
+                        config[WARP_MMA_WARPS_KEY] = (
+                            max(legal)
+                            if legal
+                            else warp_mma_max_legal_warps(new_bm, new_bn)
+                        )
+                if family == MATMUL_FAMILY_WARP_MMA:
+                    leading_index = self._config_block_index(
+                        self.matmul_leading_block_id
+                    )
+                    if leading_index is not None and block_sizes[leading_index] != 1:
+                        if not fix_invalid:
+                            raise InvalidConfig(
+                                f"{WARP_MMA_FAMILY_KEY}={family!r} requires a batch block of 1"
+                            )
+                        block_sizes[leading_index] = 1
+                    # One CTA per output tile on the flat grid: the persistent
+                    # program-id strategies wrap the device body in a
+                    # ``virtual_pid`` loop (shared memory allocated inside a
+                    # dynamic loop, a ``_NUM_SM`` parameter the body ignores).
+                    if "flat" not in self.allowed_pid_types:
+                        if not fix_invalid:
+                            raise InvalidConfig(
+                                f"{WARP_MMA_FAMILY_KEY}={family!r} requires the flat "
+                                "program-id grid, which this kernel disallows"
+                            )
+                        config[WARP_MMA_FAMILY_KEY] = MATMUL_FAMILY_TCGEN05
+                        family = MATMUL_FAMILY_TCGEN05
+                    else:
+                        config["pid_type"] = "flat"
+                        self._pin_warp_mma_inert_knobs(config)
+                        return
+        # tcgen05 family (explicit or implied): the admitted register-MMA
+        # search widened the M / N floors; clamp them back the way the block
+        # floors always clamped an under-sized request (``BlockSizeSpec``
+        # raises a value below ``min_size`` silently, so a pinned
+        # ``block_sizes=[16, 16, 32]`` on a tcgen05 kernel keeps running the
+        # 64-row tile it always ran).
+        if view is None or not self.warp_mma_admitted:
+            return
+        block_sizes, m_index, n_index, _k_index = view
+        for index, floor in (
+            (m_index, self.tcgen05_min_search_m),
+            (n_index, self.tcgen05_min_search_n),
+        ):
+            value = block_sizes[index]
+            if type(value) is int and value < floor:
+                block_sizes[index] = floor
+        if fix_invalid and WARP_MMA_WARPS_KEY in config:
+            config[WARP_MMA_WARPS_KEY] = WARP_MMA_DEFAULT_WARPS
 
     def _one_wave_two_cta_tile_is_valid(self, bm: object, bn: object) -> bool:
         """Whole 256 x {128, 64} CtaGroup.TWO tiles of the static problem."""
@@ -2318,6 +2612,7 @@ class CuteTcgen05Config:
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
         seeds.extend(self._small_grid_seed_configs())
+        seeds.extend(self._warp_mma_seed_configs())
         seeds.extend(self._one_wave_seed_configs())
         seeds.extend(self._batched_multi_tile_seed_configs())
         plain_clc_seed = self._plain_clc_seed_config()
@@ -3094,6 +3389,7 @@ class CuteTcgen05Config:
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        self._normalize_warp_mma_family(config, fix_invalid=fix_invalid)
         self._normalize_batch_raster(config, fix_invalid=fix_invalid)
         # An explicit physical schedule owns its projection.  Validate the
         # requested carrier before generic block normalization can repair it.
@@ -5252,6 +5548,13 @@ class CuteTcgen05Config:
             if for_search and direct_store_inert
             else None,
         )
+        # The register-MMA GEMM family and its warp count are searched only
+        # where the plan admitted the family (``warp_mma_admitted``); every
+        # tcgen05-enabled kernel validates the keys so an explicit request on
+        # a non-admitted problem is refused with the reason.
+        if not for_search or self.warp_mma_admitted:
+            fragments[WARP_MMA_FAMILY_KEY] = EnumFragment(MATMUL_FAMILIES)
+            fragments[WARP_MMA_WARPS_KEY] = EnumFragment(WARP_MMA_WARP_CHOICES)
         if len(self.materialized_matmul_block_ids) >= 2:
             fragments["tcgen05_region_ab_stages"] = ListOf(
                 IntegerFragment(0, 16, 0), len(self.materialized_matmul_block_ids)

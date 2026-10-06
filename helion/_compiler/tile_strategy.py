@@ -7646,7 +7646,13 @@ class BlockSizeTileStrategy(TileStrategy):
         if backend_name != "cute" or not pid_type.startswith("persistent"):
             return False
         from .backend import _kernel_specialized_mma_impl
+        from .cute.cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
+        from .cute.cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
 
+        # The register-MMA family owns the whole body (one CTA per tile); the
+        # tcgen05 persistent scheduler would need a tcgen05 plan it never gets.
+        if self.fn.config.get(WARP_MMA_FAMILY_KEY) == MATMUL_FAMILY_WARP_MMA:
+            return False
         return _kernel_specialized_mma_impl(self.fn, config=self.fn.config) == "tcgen05"
 
 

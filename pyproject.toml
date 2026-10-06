@@ -115,6 +115,7 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 # runtime, not type-checked, so the forced future import (I002) is exempted.
 "helion/_compiler/cute/_flash_runtime.py" = ["I002"]
 "helion/_compiler/cute/_flash_row_mma_runtime.py" = ["I002"]
+"helion/_compiler/cute/_warp_mma_runtime.py" = ["I002"]
 "helion/_compiler/cute/_flash_alt_runtime.py" = ["I002"]
 # Same: the vendored @cute.jit gemm_ptx_partial here must NOT have its annotations
 # stringified by `from __future__ import annotations`. Imported by generated

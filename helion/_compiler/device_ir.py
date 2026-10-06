@@ -3524,6 +3524,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             candidate.operands.rhs.rhs_segment_group is not None
                             or candidate.operands.rhs.rhs_packed_group is not None
                         ),
+                        lhs_source=candidate.operands.lhs.source_fake,
+                        rhs_source=candidate.operands.rhs.source_fake,
+                        operands_permuted=(
+                            candidate.operands.lhs.source_to_logical_order is not None
+                            or candidate.operands.rhs.source_to_logical_order
+                            is not None
+                        ),
                     )
                     planning_results.append(planning_result)
                     search_plan = planning_result.plan
@@ -3569,6 +3576,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             item.explicit_epi_tile_compatible
                             for item, _lhs, _plan in search_candidates
                         ),
+                        leading_block_id=(
+                            candidate.operands.leading_passthrough_block_id
+                        ),
+                        # The register-MMA family replaces the whole device
+                        # body of ONE GEMM (its root tile loop around its K
+                        # loop); kernels with several matmuls keep tcgen05.
+                        warp_mma_plain_kernel=len(mma_candidates) == 1,
                     )
                     if len(mma_candidates) == 1 and not (
                         config_spec.reduction_block_ids
