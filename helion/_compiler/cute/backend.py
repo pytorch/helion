@@ -1805,6 +1805,10 @@ class CuteBackend(Backend):
             "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",
             "_cute_load_l1_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_last as _cute_load_l1_l2_evict_last",
             "_cute_load_l1_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_8b",
+            "_cute_load_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l2_evict_last as _cute_load_l2_evict_last_8b",
+            "_cute_load_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l2_evict_last as _cute_load_l2_evict_last_4b",
+            "_cute_load_l1_l2_evict_first_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_4b",
+            "_cute_load_l1_l2_evict_last_4b": "from helion._compiler.cute.l2_policy import load_v4b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_4b",
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
@@ -2474,6 +2478,23 @@ class CuteBackend(Backend):
         }
 
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
+            # A body whose shared cross-warp reductions were sized for a
+            # launch shape (``finalize_shared_reduce_groups``) must launch
+            # with exactly that shape: any other block would alias groups.
+            sized_for = device_function.cute_state.shared_reduce_launch_block
+            if sized_for is not None:
+                literal = re.fullmatch(r"block=\((\d+), (\d+), (\d+)\)", block_arg)
+                launched = (
+                    tuple(int(dim) for dim in literal.groups())
+                    if literal is not None
+                    else None
+                )
+                if launched != sized_for:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"shared reductions were sized for block={sized_for} "
+                        f"but the kernel launches with {block_arg}",
+                    )
             launcher_args = [block_arg]
             compile_options: list[str] = []
             recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)

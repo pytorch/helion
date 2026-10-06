@@ -21,8 +21,8 @@ from .._compiler.compile_environment import _symint_expr
 from .._compiler.cute.access_regions import access_address
 from .._compiler.cute.access_regions import block_size_symbol
 from .._compiler.cute.access_regions import tile_begin_symbol
-from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_8B_HELPERS
 from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
+from .._compiler.cute.cache_policy_loads import cache_hinted_load_helper
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
@@ -1158,24 +1158,19 @@ def _cute_unroll_vec_load_expr(
 
     The L2-policy eviction "suffixes" (``_CUTE_CACHE_LOAD_HELPERS``) are not
     ``cute.arch.load`` kwargs (it has no L2 policy support) but markers that a
-    16-byte (or, except for ``l2_last``, 8-byte) hoist load goes through the
-    inline-PTX ``createpolicy.fractional`` helper; other sites silently drop
-    the hint.
+    16-, 8- or 4-byte hoist load goes through the inline-PTX
+    ``createpolicy.fractional`` helper of its width; byte-packed dtypes and
+    2-byte scalars silently drop the hint.
     """
     if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
-        if not _cute_is_byte_packed(dtype) and vec_width * dtype.itemsize == 16:
+        helper = (
+            None
+            if _cute_is_byte_packed(dtype)
+            else cache_hinted_load_helper(eviction_suffix, vec_width * dtype.itemsize)
+        )
+        if helper is not None:
             return (
-                f"{_CUTE_CACHE_LOAD_HELPERS[eviction_suffix]}({ptr_expr}, "
-                f"ir.VectorType.get([{vec_width}], "
-                f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
-            )
-        if (
-            eviction_suffix in _CUTE_CACHE_LOAD_8B_HELPERS
-            and not _cute_is_byte_packed(dtype)
-            and vec_width * dtype.itemsize == 8
-        ):
-            return (
-                f"{_CUTE_CACHE_LOAD_8B_HELPERS[eviction_suffix]}({ptr_expr}, "
+                f"{helper}({ptr_expr}, "
                 f"ir.VectorType.get([{vec_width}], "
                 f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
             )

@@ -384,8 +384,31 @@ class TestCutePointwiseVec(TestCase):
             cute_vector_widths=[4],
             load_eviction_policies=["l2_last", "l2_last"],
         )
-        self.assertIn("_cute_load_l2_evict_last", code)
+        self.assertIn("_cute_load_l2_evict_last(", code)
         torch.testing.assert_close(out, x * y)
+
+    def test_l2_last_eviction_policy_narrow_packets(self) -> None:
+        """``l2_last`` reaches 8- and 4-byte packets through the helper of
+        their width (it used to be dropped below 16 bytes)."""
+        for dtype, width, suffix in (
+            (torch.float32, 2, "_8b"),
+            (torch.float16, 4, "_8b"),
+            (torch.float16, 2, "_4b"),
+            (torch.bfloat16, 2, "_4b"),
+        ):
+            with self.subTest(dtype=dtype, width=width):
+                x = torch.randn(2**14, device=DEVICE, dtype=dtype)
+                y = torch.randn_like(x)
+                code, out = code_and_output(
+                    _mul1d,
+                    (x, y),
+                    block_sizes=[1024],
+                    num_threads=[128],
+                    cute_vector_widths=[width],
+                    load_eviction_policies=["l2_last", "l2_last"],
+                )
+                self.assertIn(f"_cute_load_l2_evict_last{suffix}(", code)
+                torch.testing.assert_close(out, x * y, atol=0, rtol=0)
 
     def test_two_level_eviction_policy(self) -> None:
         """8/16-byte cache hints and scalar fallbacks preserve every element."""
@@ -411,6 +434,11 @@ class TestCutePointwiseVec(TestCase):
                         packet_bytes = selected_width * x.element_size()
                         self.assertEqual(f"{helper}(" in code, packet_bytes == 16)
                         self.assertEqual(f"{helper}_8b(" in code, packet_bytes == 8)
+                        # A width-1 site is a scalar load, not a packet.
+                        self.assertEqual(
+                            f"{helper}_4b(" in code,
+                            packet_bytes == 4 and selected_width > 1,
+                        )
                         torch.testing.assert_close(out, x * y, atol=0, rtol=0)
 
     def test_epilogue_subtile_disables_vec(self) -> None:

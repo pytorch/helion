@@ -53,7 +53,6 @@ from helion._compiler.cute.register_tile_admission import (
     _CUTE_REGISTER_TILE_CONTROL_FLOW,
 )
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
-from helion._compiler.cute.thread_budget import MAX_THREADS_PER_BLOCK
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -479,15 +478,15 @@ def test_single_vector_thread_uses_the_warp_column_path() -> None:
     )
     assert "for synthetic_lane_1 in cutlass.range_constexpr(2):" in code
     assert code.count(COLUMN_REDUCE) == 1
-    # The shared-memory exchange is keyed on the full runtime thread id (a
-    # redundant thread axis may still be mapped later in codegen), so its
-    # group count covers the largest launch block.
-    assert (
-        "sum_1_lane_acc_lane = cutlass.Int32(cute.arch.thread_idx()[0]) "
-        "+ cutlass.Int32(cute.arch.thread_idx()[1]) "
-        "* cutlass.Int32(cute.arch.block_dim()[0])"
-    ) in code
-    assert f"pre=1, group_span=64, group_count={MAX_THREADS_PER_BLOCK // 64})" in code
+    # The shared-memory exchange is emitted keyed on the full runtime thread
+    # id with a group count covering the largest launch block (a redundant
+    # thread axis may still be mapped later in codegen); once the launch
+    # shape is final, ``finalize_shared_reduce_groups`` sizes it for the one
+    # 64-thread group that launches and keys it on ``thread_idx()[0]``.
+    assert "block=(64, 1, 1)" in code
+    assert "sum_1_lane_acc_lane = cutlass.Int32(cute.arch.thread_idx()[0])\n" in code
+    assert "block_dim()" not in code
+    assert "pre=1, group_span=64, group_count=1)" in code
 
 
 def _rolled_code(bound: Any, config: helion.Config) -> str:
