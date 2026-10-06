@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
+from pretuned_kernels import run as pretuned_run
 import pytest
 import torch
 from torch._environment import is_fbcode
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._hardware import HardwareInfo
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
@@ -35,6 +37,9 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner import aot_cache
+from helion.autotuner.aot_structural_policy import policy_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -95,6 +100,78 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     return sys.modules[module_name]
+
+
+@pytest.mark.parametrize("policy_suffix", ["", "__policy_" + "a" * 64])
+def test_composite_pretuned_hardware_requires_all_stages(
+    tmp_path: Path, policy_suffix: str
+) -> None:
+    from pretuned_kernels import run
+
+    directory = tmp_path / "pipeline"
+    directory.mkdir()
+    for filename in (
+        "_helion_aot_produce_cuda_sm100.py",
+        f"_helion_aot_produce_cuda_sm103{policy_suffix}.py",
+        f"_helion_aot_consume_cuda_sm103{policy_suffix}.py",
+    ):
+        (directory / filename).touch()
+    with patch.object(run, "PRETUNED_KERNELS_DIR", tmp_path):
+        assert run._supported_hardware("pipeline") == {"sm103"}
+        assert run._supported_hardware("missing") == set()
+        (directory / "_helion_aot_consume_cuda_sm100.py").touch()
+        assert run._supported_hardware("pipeline") == {"b200", "sm103"}
+
+
+def test_pretuned_hardware_accepts_policy_suffix(tmp_path: Path) -> None:
+    directory = tmp_path / "sample"
+    directory.mkdir()
+    (directory / "_helion_aot_sample_cuda_sm100.py").touch()
+    (directory / f"_helion_aot_sample_cuda_sm103__policy_{'a' * 64}.py").touch()
+    (directory / "_helion_aot_sample_cuda_sm90__policy_invalid.py").touch()
+    with patch.object(pretuned_run, "PRETUNED_KERNELS_DIR", tmp_path):
+        assert pretuned_run._supported_hardware("sample") == {"b200", "sm103"}
+
+
+@pytest.mark.parametrize(
+    "recipe,source,structural_rewrites",
+    [
+        ("categorical_sampling", "categorical_sampling", True),
+        ("chain_speculative_sampling", "chain_speculative_sampling", True),
+        ("min_p_sampling", "min_p_sampling", True),
+        ("varlen_topk", "varlen_topk", True),
+        ("topk", "topk", True),
+        ("moe_softmax_routing", "moe_softmax_routing", True),
+        ("top_p_renorm", "stages", False),
+    ],
+)
+def test_shipped_policy_heuristics_use_upstream_discovery(
+    recipe: str,
+    source: str,
+    structural_rewrites: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = helion.CuteStructuralPolicy(
+        cute_region_fission=structural_rewrites,
+        cute_full_slice_matmul_tiling=structural_rewrites,
+        cute_segmented_matmul_tiling=structural_rewrites,
+        cute_flatten_nested_reductions=structural_rewrites,
+        cute_materialize_transformed_operands=structural_rewrites,
+    )
+    directory = _pretuned_kernel_directory(recipe)
+    expected = policy_path(directory / f"_helion_aot_{source}_cuda_sm103.py", policy)
+    assert expected.is_file()
+    monkeypatch.delenv("HELION_HEURISTIC_DIR", raising=False)
+    monkeypatch.setattr(aot_cache, "_heuristic_file_cache", {})
+    monkeypatch.setattr(
+        aot_cache,
+        "get_hardware_info",
+        lambda: HardwareInfo("cuda", "NVIDIA GB300", "12.8", "sm103"),
+    )
+    assert (
+        aot_cache.find_heuristic_file(directory / f"{source}.py", source, policy=policy)
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -1636,6 +1713,40 @@ class TestPretunedKernelsPerformance(TestCase):
         if not module.has_vllm():
             self.skipTest("deepseek_v3_moe_nvfp4 performance requires vLLM.")
         self._run_pretuned_kernel_perf("deepseek_v3_moe_nvfp4")
+
+
+_PRETUNED_SAMPLING_CASES = [("categorical_sampling", index) for index in range(7)] + [
+    (name, 0)
+    for name in (
+        "min_p_sampling",
+        "chain_speculative_sampling",
+        "varlen_topk",
+        "top_p_renorm",
+    )
+]
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("name,index", _PRETUNED_SAMPLING_CASES)
+def test_pretuned_sampling_aot_correctness(
+    name: str, index: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("sampling AOT configs are pretuned for GB300")
+    from helion.autotuner.base_cache import AutotuneCacheBase
+
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    assert name in pretuned_run.KERNELS
+    assert pretuned_run._supported_hardware(name) == {"sm103"}
+    module = pretuned_run._import_kernel_module(name)
+    with patch.object(
+        AutotuneCacheBase,
+        "_run_autotune_trials",
+        side_effect=AssertionError("pretuned recipes must not launch autotuning"),
+    ):
+        module.check_case(module.SHAPES[index])
 
 
 if __name__ == "__main__":
