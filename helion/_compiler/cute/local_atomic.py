@@ -103,6 +103,39 @@ def local_atomic_allocations(graphs: list[GraphInfo]) -> frozenset[Node]:
     )
 
 
+def local_indexed_load(node: Node) -> bool:
+    """The narrow indexed-read ABI for a completed rank-one local target.
+
+    Completion, direct allocation identity and root ownership are checked by
+    prove_local_atomics. This predicate does not authorize an alias or a new
+    mutation epoch. Cache eviction hints do not apply to shared storage.
+    """
+    if (
+        node.target is not memory_ops.load
+        or len(node.args) != 4
+        or node.kwargs
+        or node.args[3] is not None
+        or not isinstance(node.args[1], (list, tuple))
+        or len(node.args[1]) != 1
+    ):
+        return False
+    index = node.args[1][0]
+    value = index.meta.get("val") if isinstance(index, Node) else index
+    if isinstance(value, torch.Tensor):
+        if value.dtype not in (torch.int32, torch.int64) or value.ndim > 1:
+            return False
+    elif not isinstance(value, (int, torch.SymInt)) or isinstance(value, bool):
+        return False
+    mask = node.args[2]
+    if mask is not None:
+        if not isinstance(mask, Node):
+            return False
+        fake = mask.meta.get("val")
+        if not isinstance(fake, torch.Tensor) or fake.dtype != torch.bool:
+            return False
+    return True
+
+
 def terminal_finalizer_inputs(
     node: Node, graphs: list[GraphInfo]
 ) -> tuple[frozenset[Node], frozenset[Node]]:
@@ -634,6 +667,14 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
                         # reads. Dependencies keep the allocation live through
                         # every derived read, including lazy tensor recipes.
                         reads.append(read_position)
+                        continue
+                    if (
+                        user.graph is allocation.graph
+                        and isinstance(by_graph[allocation.graph], RootGraphInfo)
+                        and local_indexed_load(user)
+                        and user.args[0] is alias
+                    ):
+                        reads.append(positions[user])
                         continue
                     reject("only read-only root consumers after local updates")
         if not updates or any(position <= max(updates) for position in reads):
