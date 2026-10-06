@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import cast
 
+from ... import exc
 from ..triton.printer import HelionTritonPrinter
 
 if TYPE_CHECKING:
@@ -39,6 +40,12 @@ class HelionCutePrinter(HelionTritonPrinter):
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
         return f"(({self._print_basic_expr(lhs)}) % ({self._print_basic_expr(rhs)}))"
+
+    def _print_PowByNatural(self, expr: sympy.Expr) -> str:
+        raise exc.BackendUnsupported("cute", "unproved scalar integer power")
+
+    def _print_IntegerPowerOfTwo(self, expr: sympy.Expr) -> str:
+        return f"(cutlass.Int64(1) << ({self._print_basic_expr(expr.args[0])}))"
 
 
 def cute_texpr(expr: sympy.Expr) -> str:

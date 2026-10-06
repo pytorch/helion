@@ -58,6 +58,38 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
+    """Reject live invalid CUDA coordinates after owned-root scaffolding DCE."""
+    nodes = [node for statement in statements for node in ast.walk(statement)]
+
+    def thread_tuple(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "cute.arch.thread_idx"
+        ) or (isinstance(node, ast.Name) and node.id in aliases)
+
+    aliases: set[str] = set()
+    while True:
+        previous = len(aliases)
+        for node in nodes:
+            if isinstance(node, ast.Assign) and thread_tuple(node.value):
+                aliases.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+        if len(aliases) == previous:
+            break
+    for node in nodes:
+        if not isinstance(node, ast.Subscript) or not thread_tuple(node.value):
+            continue
+        axis = node.slice
+        if not (
+            isinstance(axis, ast.Constant)
+            and type(axis.value) is int
+            and 0 <= axis.value < 3
+        ):
+            raise exc.BackendUnsupported("cute", f"thread axis {ast.unparse(axis)}")
+
+
 def _live_grid_thread_extents(
     statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
 ) -> dict[int, int]:
@@ -1270,9 +1302,15 @@ class CuteBackend(Backend):
         return priors
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from ..aten_lowering import squeeze_lowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
+            # These overloads have the same logical-view semantics as squeeze.dim.
+            # Register them before Inductor turns them into a ReinterpretView;
+            # the CuTe handler uses the traced output shape, not a scalar dim.
+            return squeeze_lowering
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -1428,6 +1466,8 @@ class CuteBackend(Backend):
                 "cute_host_paired_sum",
                 "cute_materialized_schedule",
                 "cute_materialized_operand_schedule",
+                "cute_fragment_scan",
+                "cute_fragment_reduction",
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
@@ -2132,10 +2172,10 @@ class CuteBackend(Backend):
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
-        if axis >= 3 and block_size_var != "1":
-            raise exc.BackendUnsupported(self.name, f"thread axis {axis}")
         if block_size_var == "1":
             return offset_var
+        # Root emitters may replace the entire scalar schedule, making this
+        # index dead. Validate surviving coordinates after final codegen/DCE.
         return f"{offset_var} + {dtype}(cute.arch.thread_idx()[{axis}])"
 
     def loop_index_expr(
