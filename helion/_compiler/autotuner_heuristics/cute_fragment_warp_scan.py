@@ -126,7 +126,9 @@ class CuteFragmentWarpScanHeuristic(AutotunerHeuristic):
                     else:
                         dependent.add(root)
         if dependent:
-            dependent.intersection_update(bounded_gather_roots(env, device_ir))
+            dependent.intersection_update(
+                bounded_gather_roots(env, device_ir, allow_unbound=True)
+            )
         env.config_spec.cute_fragment_warp_scan_root_ids = frozenset(roots)
         env.config_spec.cute_fragment_warp_scan_requirements = tuple(
             FragmentRootRequirement(root, frozenset({"cute_fragment_bounded_gather"}))
