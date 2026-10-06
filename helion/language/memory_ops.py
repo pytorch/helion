@@ -1049,7 +1049,16 @@ def _cute_scalar_load_expr(
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             f"{dtype_str}{eviction_suffix})"
         )
-    return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+    loaded = f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+    if dtype in (torch.uint8, torch.uint32):
+        # CuTe pointer offsets reconstruct signless MLIR integers as signed
+        # Numeric types. Restore the logical unsigned dtype before a masked
+        # zero joins the load or a later conversion extends its high bit.
+        from .._compiler.compile_environment import CompileEnvironment
+
+        dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+        return f"{dtype_str}({loaded})"
+    return loaded
 
 
 # Maximum bytes per vector load/store transaction (LDG.128/STG.128).

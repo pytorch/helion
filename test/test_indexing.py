@@ -3786,6 +3786,7 @@ def _execute_pointwise_thread_program(source, inputs):
     namespace = {
         "torch": torch,
         "operator": operator,
+        "_cute_python_mod": operator.mod,
         "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float, Boolean=bool),
         "cute": SimpleNamespace(
             arch=SimpleNamespace(
@@ -4343,6 +4344,487 @@ def test_cute_nested_broadcast_alias_native(flat, reverse):
         actual, (values[..., None, None] * table[column]).sum(2), rtol=0, atol=0
     )
     torch.testing.assert_close(inputs[:3], before, rtol=0, atol=0)
+
+
+def _integer_modulo_ir_program(
+    dtype, *, raw=False, right_dtype=None, constant=None, operand_dtype=None
+):
+    """Capture real SDK scalar operations; no native compilation or device."""
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import func
+
+    from helion._compiler.cute.integer_helpers import python_mod
+
+    right_dtype = dtype if right_dtype is None else right_dtype
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp(
+                "integer_modulo", ([dtype.mlir_type, right_dtype.mlir_type], [])
+            )
+            block = function.add_entry_block()
+            with ir.InsertionPoint(block):
+                left = dtype(block.arguments[0])
+                right = (
+                    right_dtype(block.arguments[1]) if constant is None else constant
+                )
+                if operand_dtype is not None:
+                    left, right = operand_dtype(left), operand_dtype(right)
+                result = left % right if raw else python_mod(left, right)
+                func.ReturnOp([])
+        identifiers = {value: index for index, value in enumerate(block.arguments)}
+        program = []
+        for operation in block.operations:
+            op = operation.operation
+            if op.name == "func.return":
+                continue
+            assert len(op.results) == 1
+            value = op.results[0]
+            identifiers[value] = len(identifiers)
+            attributes = {
+                name: int(op.attributes[name].value)
+                for name in ("value", "predicate")
+                if name in op.attributes
+            }
+            program.append(
+                (
+                    identifiers[value],
+                    op.name,
+                    [identifiers[argument] for argument in op.operands],
+                    ir.IntegerType(value.type).width,
+                    attributes,
+                )
+            )
+        return program, identifiers[result.ir_value()], str(module)
+
+
+def _execute_integer_modulo_ir(
+    program, output, width, signed, left, right, right_width=None
+):
+    """Interpret emitted integer IR, checking poison rather than hiding it."""
+    values = {0: left, 1: right}
+    widths = {0: width, 1: width if right_width is None else right_width}
+
+    def signed_value(value, bits):
+        value = int(value) & ((1 << bits) - 1)
+        return value - (1 << bits) if value & (1 << (bits - 1)) else value
+
+    for destination, operation, arguments, bits, attributes in program:
+        operands = [values[index] for index in arguments]
+        if operation == "arith.constant":
+            value = attributes["value"]
+        elif operation == "arith.addi":
+            value = sum(operands)
+        elif operation == "arith.remsi":
+            dividend, divisor = (signed_value(value, bits) for value in operands)
+            assert divisor != 0 and not (
+                dividend == -(1 << (bits - 1)) and divisor == -1
+            ), "undefined raw signed remainder"
+            value = (abs(dividend) % abs(divisor)) * (-1 if dividend < 0 else 1)
+        elif operation == "arith.remui":
+            value = (operands[0] & ((1 << bits) - 1)) % (
+                operands[1] & ((1 << bits) - 1)
+            )
+        elif operation == "arith.andi":
+            value = operands[0] & operands[1]
+        elif operation == "arith.select":
+            value = operands[1] if operands[0] else operands[2]
+        elif operation == "arith.cmpi":
+            predicate = attributes["predicate"]
+            operand_bits = widths[arguments[0]]
+            first, second = operands
+            if predicate in (2, 3, 4, 5):
+                first, second = (
+                    signed_value(value, operand_bits) for value in operands
+                )
+            else:
+                first, second = (
+                    value & ((1 << operand_bits) - 1) for value in operands
+                )
+            value = (
+                first == second,
+                first != second,
+                first < second,
+                first <= second,
+                first > second,
+                first >= second,
+                first < second,
+                first <= second,
+                first > second,
+                first >= second,
+            )[predicate]
+        elif operation in ("arith.bitcast", "arith.trunci", "arith.extui"):
+            value = operands[0]
+        elif operation == "arith.extsi":
+            value = signed_value(operands[0], widths[arguments[0]])
+        else:
+            raise AssertionError(operation)
+        values[destination] = int(value) & ((1 << bits) - 1)
+        widths[destination] = bits
+    return signed_value(values[output], widths[output]) if signed else values[output]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cute_integer_remainders(left, right, c_style: hl.constexpr):
+    result = torch.empty_like(left)
+    for tile in hl.tile(left.size(0)):
+        if c_style:
+            result[tile] = torch.fmod(left[tile], right[tile])
+        else:
+            result[tile] = torch.remainder(left[tile], right[tile])
+    return result
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cute_integer_modulo_offsets(values):
+    result = torch.zeros_like(values)
+    for row in hl.grid(values.size(0)):
+        offset = (-row * 5) % values.size(1)
+        for columns in hl.tile(values.size(1)):
+            positions = (columns.index + offset) % values.size(1)
+            mask = ((-columns.index) % 3) != 0
+            result[row, columns] = hl.load(values, [row, positions], extra_mask=mask)
+    return result
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cute_wrapped_remainder(left, divisor: hl.constexpr):
+    result = torch.empty_like(left)
+    for tile in hl.tile(left.size(0)):
+        result[tile] = torch.remainder(left[tile], divisor)
+    return result
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cute_promoted_remainder(left, right, output_dtype: hl.constexpr):
+    result = torch.empty(left.shape, dtype=output_dtype, device=left.device)
+    for rows, columns in hl.tile(left.shape):
+        if right.ndim == 0:
+            value = right[()]
+        else:
+            value = right[columns]
+        result[rows, columns] = torch.remainder(left[rows, columns], value)
+    return result
+
+
+class TestCuteIntegerModuloCPU(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+
+        if importlib.util.find_spec("cutlass") is None:
+            self.skipTest("requires CuTe scalar IR, not a GPU")
+
+    def test_actual_integer_ir_matches_python_and_avoids_poison(self):
+        import itertools
+
+        import cutlass
+
+        for dtype in (
+            cutlass.Int8,
+            cutlass.Int16,
+            cutlass.Int32,
+            cutlass.Int64,
+            cutlass.Uint8,
+            cutlass.Uint32,
+            cutlass.Uint64,
+        ):
+            with self.subTest(dtype=dtype):
+                program, output, _source = _integer_modulo_ir_program(dtype)
+                width, signed = dtype.width, dtype.signed
+                low = -(1 << (width - 1)) if signed else 0
+                high = (1 << (width - int(signed))) - 1
+                cases = (
+                    range(low, high + 1)
+                    if width == 8
+                    else sorted(
+                        {
+                            low,
+                            low + 1,
+                            low + 2,
+                            high - 2,
+                            high - 1,
+                            high,
+                            *(value for value in range(-9, 10) if low <= value <= high),
+                        }
+                    )
+                )
+                for left, right in itertools.product(cases, repeat=2):
+                    if right:
+                        self.assertEqual(
+                            _execute_integer_modulo_ir(
+                                program, output, width, signed, left, right
+                            ),
+                            left % right,
+                        )
+                if signed:
+                    raw, raw_output, _source = _integer_modulo_ir_program(
+                        dtype, raw=True
+                    )
+                    self.assertEqual(
+                        _execute_integer_modulo_ir(raw, raw_output, width, True, -7, 3),
+                        -1,
+                    )
+                    with self.assertRaisesRegex(AssertionError, "undefined raw"):
+                        _execute_integer_modulo_ir(
+                            raw, raw_output, width, True, low, -1
+                        )
+
+    def test_promoted_widths_and_python_constants(self):
+        import cutlass
+
+        for left_dtype, right_dtype in (
+            (cutlass.Int8, cutlass.Int32),
+            (cutlass.Int16, cutlass.Int64),
+            (cutlass.Int64, cutlass.Int8),
+        ):
+            program, output, _source = _integer_modulo_ir_program(
+                left_dtype, right_dtype=right_dtype
+            )
+            for left, right in ((-7, 3), (7, -3), (-7, -3), (0, -1)):
+                self.assertEqual(
+                    _execute_integer_modulo_ir(
+                        program,
+                        output,
+                        left_dtype.width,
+                        True,
+                        left,
+                        right,
+                        right_dtype.width,
+                    ),
+                    left % right,
+                )
+        for dtype in (cutlass.Int8, cutlass.Int32, cutlass.Int64):
+            for constant in (3, -3, 1 << 40, -(1 << 40)):
+                program, output, _source = _integer_modulo_ir_program(
+                    dtype, constant=constant
+                )
+                for left in (-7, 0, 7):
+                    self.assertEqual(
+                        _execute_integer_modulo_ir(
+                            program, output, dtype.width, True, left, 0
+                        ),
+                        left % constant,
+                    )
+
+    def test_proved_positive_printer_path_is_unchanged(self):
+        import sympy
+        from torch.utils._sympy.functions import PythonMod
+
+        from helion._compiler.cute.printer import cute_texpr
+
+        nonnegative = sympy.Symbol("position", integer=True, nonnegative=True)
+        positive = sympy.Symbol("extent", integer=True, positive=True)
+        unknown = sympy.Symbol("offset", integer=True)
+        self.assertEqual(
+            cute_texpr(PythonMod(nonnegative, positive)), "((position) % (extent))"
+        )
+        self.assertEqual(
+            cute_texpr(PythonMod(unknown, positive)), "_cute_python_mod(offset, extent)"
+        )
+        self.assertEqual(
+            cute_texpr(PythonMod(nonnegative, -positive)),
+            "_cute_python_mod(position, (-1)*extent)",
+        )
+
+    def test_tensor_wrapped_scalars_and_promoted_operands(self):
+        import ast
+
+        import cutlass
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        for torch_dtype, sdk_dtype in (
+            (torch.int8, cutlass.Int8),
+            (torch.int16, cutlass.Int16),
+            (torch.int32, cutlass.Int32),
+        ):
+            values = torch.tensor([-7, 7], dtype=torch_dtype)
+            for scalar in (
+                torch.iinfo(torch_dtype).max + 2,
+                -(torch.iinfo(torch_dtype).max + 2),
+            ):
+                with self.subTest(dtype=torch_dtype, scalar=scalar):
+                    program, output, _ir = _integer_modulo_ir_program(
+                        sdk_dtype, constant=scalar, operand_dtype=sdk_dtype
+                    )
+                    actual = [
+                        _execute_integer_modulo_ir(
+                            program, output, sdk_dtype.width, True, int(value), 0
+                        )
+                        for value in values
+                    ]
+                    self.assertEqual(actual, torch.remainder(values, scalar).tolist())
+                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                        bound = _cpu_bind(_cute_wrapped_remainder, (values, scalar))
+                        source = bound.to_code(bound.config_spec.default_config())
+                    calls = [
+                        n
+                        for n in ast.walk(ast.parse(source))
+                        if isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Name)
+                        and n.func.id == "_cute_python_mod"
+                    ]
+                    self.assertTrue(calls)
+                    for call in calls:
+                        self.assertEqual(
+                            [ast.unparse(arg.func) for arg in call.args],
+                            [f"cutlass.{sdk_dtype.__name__}"] * 2,
+                        )
+        left = torch.tensor([[-7, 7], [-9, 9]], dtype=torch.int8)
+        for right in (
+            torch.tensor(129, dtype=torch.int64),
+            torch.tensor([129, -129], dtype=torch.int32),
+        ):
+            expected = torch.remainder(left, right)
+            sdk_dtype = cutlass.Int8 if expected.dtype == torch.int8 else cutlass.Int32
+            with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                bound = _cpu_bind(
+                    _cute_promoted_remainder, (left, right, expected.dtype)
+                )
+                source = bound.to_code(bound.config_spec.default_config())
+            calls = [
+                n
+                for n in ast.walk(ast.parse(source))
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "_cute_python_mod"
+            ]
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(
+                    [ast.unparse(arg.func) for arg in call.args],
+                    [f"cutlass.{sdk_dtype.__name__}"] * 2,
+                )
+            right_sdk = cutlass.Int64 if right.ndim == 0 else cutlass.Int32
+            program, output, _ir = _integer_modulo_ir_program(
+                cutlass.Int8, right_dtype=right_sdk, operand_dtype=sdk_dtype
+            )
+            actual = [
+                _execute_integer_modulo_ir(
+                    program, output, 8, True, int(a), int(b), right_sdk.width
+                )
+                for a, b in zip(
+                    left.flatten(), right.expand_as(left).flatten(), strict=True
+                )
+            ]
+            self.assertEqual(actual, expected.flatten().tolist())
+
+    def test_codegen_distinguishes_python_remainder_and_c_style_mod(self):
+        import ast
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            for dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                for c_style in (False, True):
+                    with self.subTest(dtype=dtype, c_style=c_style):
+                        left = torch.tensor([-7, -1, 0, 1, 7], dtype=dtype)
+                        right = torch.tensor([3, -3, 3, -3, 3], dtype=dtype)
+                        bound = _cpu_bind(
+                            _cute_integer_remainders, (left, right, c_style)
+                        )
+                        source = bound.to_code(bound.config_spec.default_config())
+                        calls = [
+                            node
+                            for node in ast.walk(ast.parse(source))
+                            if isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name)
+                            and node.func.id == "_cute_python_mod"
+                        ]
+                        self.assertEqual(len(calls), int(not c_style))
+            values = torch.arange(3 * 17, dtype=torch.int32).reshape(3, 17)
+            bound = _cpu_bind(_cute_integer_modulo_offsets, (values,))
+            config = bound.config_spec.default_config()
+            config.config["block_sizes"] = [16]
+            source = bound.to_code(config)
+            self.assertIn("_cute_python_mod", source)
+
+
+@onlyBackends("cute")
+class TestCuteIntegerModuloNative(TestCase):
+    def test_signed_remainder_and_fmod_values(self):
+        for dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+            for c_style in (False, True):
+                with self.subTest(dtype=dtype, c_style=c_style):
+                    low, high = torch.iinfo(dtype).min, torch.iinfo(dtype).max
+                    pairs = [
+                        (-7, 3),
+                        (7, -3),
+                        (-7, -3),
+                        (7, 3),
+                        (0, -3),
+                        (low, 3),
+                        (high, -3),
+                        (1, low),
+                        (-1, low),
+                    ]
+                    if not c_style:
+                        pairs.append((low, -1))
+                    left = torch.tensor(
+                        [a for a, _b in pairs], dtype=dtype, device=DEVICE
+                    )
+                    right = torch.tensor(
+                        [b for _a, b in pairs], dtype=dtype, device=DEVICE
+                    )
+                    expected = torch.tensor(
+                        [
+                            (abs(a) % abs(b)) * (-1 if a < 0 else 1)
+                            if c_style
+                            else a % b
+                            for a, b in pairs
+                        ],
+                        dtype=dtype,
+                        device=DEVICE,
+                    )
+                    _source, actual = code_and_output(
+                        _cute_integer_remainders,
+                        (left, right, c_style),
+                        block_sizes=[16],
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_signed_modulo_scalar_offsets_and_tensor_masks(self):
+        for width in (17, 65, 2051):
+            with self.subTest(width=width):
+                values = torch.arange(
+                    3 * width, dtype=torch.int32, device=DEVICE
+                ).reshape(3, width)
+                expected = torch.zeros_like(values)
+                for row in range(3):
+                    positions = (
+                        torch.arange(width, device=DEVICE) + (-row * 5) % width
+                    ) % width
+                    mask = (-torch.arange(width, device=DEVICE)) % 3 != 0
+                    expected[row] = torch.where(mask, values[row, positions], 0)
+                _source, actual = code_and_output(
+                    _cute_integer_modulo_offsets, (values,), block_sizes=[16]
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_wrapped_scalars_and_tensor_promotion(self):
+        for dtype in (torch.int8, torch.int16, torch.int32):
+            values = torch.tensor([-7, 7], dtype=dtype, device=DEVICE)
+            for scalar in (torch.iinfo(dtype).max + 2, -(torch.iinfo(dtype).max + 2)):
+                with self.subTest(dtype=dtype, scalar=scalar):
+                    _source, actual = code_and_output(
+                        _cute_wrapped_remainder, (values, scalar), block_sizes=[16]
+                    )
+                    torch.testing.assert_close(
+                        actual, torch.remainder(values, scalar), rtol=0, atol=0
+                    )
+        left = torch.tensor([[-7, 7], [-9, 9]], dtype=torch.int8, device=DEVICE)
+        right = torch.tensor([129, -129], dtype=torch.int32, device=DEVICE)
+        expected = torch.remainder(left, right)
+        _source, actual = code_and_output(
+            _cute_promoted_remainder, (left, right, expected.dtype)
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

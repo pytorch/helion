@@ -126,7 +126,11 @@ _OPERATOR_CALLS = frozenset(
 )
 _BUILTINS = frozenset({"abs", "bool", "float", "int", "max", "min", "round"})
 _HELPERS = frozenset(
-    {"_cute_float4_e2m1fn_x2_to_float32", "_cute_fp8e4m3fn_to_float32"}
+    {
+        "_cute_float4_e2m1fn_x2_to_float32",
+        "_cute_fp8e4m3fn_to_float32",
+        "_cute_python_mod",
+    }
 )
 _GLOBALS = _BUILTINS | _HELPERS | {"cutlass", "cute", "math", "operator"}
 _METADATA = frozenset({"iterator", "layout", "shape", "stride", "element_type"})
