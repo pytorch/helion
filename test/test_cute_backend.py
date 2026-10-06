@@ -5957,7 +5957,7 @@ class TestCuteBackend(TestCase):
         self.assertEqual(
             set(family.search_choices or ()),
             set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES)
-            - {"fa4_2cta_causal", "row_mma"},
+            - {"fa4_2cta_causal", "row_mma", "fa4_alt"},
         )
         self.assertEqual(epi_tma.search_choices, (False, True))
 
@@ -6080,6 +6080,8 @@ class TestCuteBackend(TestCase):
                 True,
                 True,
             ),
+            # the alternating-warpgroup family is a head_dim-128 body
+            "fa4_alt": ("fa4", False, False, False, False, False, False, False),
         }
         self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
 
@@ -6087,7 +6089,7 @@ class TestCuteBackend(TestCase):
             for family_name, expected in expected_flags.items():
                 with self.subTest(family=family_name):
                     cfg = resolve_flash_config(
-                        64,
+                        128 if family_name == "fa4_alt" else 64,
                         512,
                         {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
                         dtype=torch.float16,

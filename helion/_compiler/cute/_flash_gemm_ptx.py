@@ -724,6 +724,22 @@ def gemm_ptx_precomputed_qk_static(
     )
 
 
+def _ptx_parity_wait(
+    tag: str, ptr_operand: int, phase_operand: int, wait_hint: int
+) -> str:
+    """A try_wait.parity spin loop on inline-asm operand ``ptr_operand`` with
+    labels/predicate suffixed by ``tag`` (several waits share one asm block)."""
+    return (
+        f".reg .pred P{tag}; \n\t"
+        f"LAB_WAIT{tag}: \n\t"
+        f"mbarrier.try_wait.parity.shared::cta.b64 P{tag}, [${ptr_operand}], "
+        f"${phase_operand}, {wait_hint}; \n\t"
+        f"@P{tag} bra DONE{tag}; \n\t"
+        f"bra     LAB_WAIT{tag}; \n\t"
+        f"DONE{tag}: \n\t"
+    )
+
+
 @cute.jit
 def gemm_ptx_precomputed_pv_ts(
     acc_tmem_addr: Int32,
@@ -739,7 +755,17 @@ def gemm_ptx_precomputed_pv_ts(
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
     wait_hint: int = 10_000_000,
     a_offsets: tuple[int, ...] | None = None,
+    mbar_mid_ptrs: tuple[cutlass.Pointer, cutlass.Pointer] | None = None,
 ) -> None:
+    """Issue the PV MMA K-chunks as one inline-asm stream.
+
+    ``mbar_ptr``/``mbar_phase`` fold the staged-P wait into the stream: the first
+    three quarters of the K-chunks issue, then the stream waits on ``mbar_ptr``
+    before the last quarter. ``mbar_mid_ptrs`` refines that split to one wait per
+    quarter: the second and third quarters wait on their own barriers (softmax
+    arrives once per 32-column P chunk) and the last quarter still waits on
+    ``mbar_ptr``; all waits share ``mbar_phase``.
+    """
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     tCrA_layout = cute.recast_layout(32, 16, tCrA_layout)
     num_k_tile = cute.size(tCrA_layout.shape[2])
@@ -779,7 +805,35 @@ def gemm_ptx_precomputed_pv_ts(
             "DONE: \n\t"
         )
     else:
+        assert mbar_mid_ptrs is None, "mbar_mid_ptrs needs the final-quarter mbar_ptr"
         mbar_wait_str = ""
+    if const_expr(mbar_mid_ptrs is not None):
+        # One wait per quarter of the K-chunks: operands $6/$7 are the second and
+        # third quarters' barriers, $4 the last quarter's; $5 the shared parity.
+        assert num_k_tile % 4 == 0, "the per-chunk P release needs 4 K-chunk groups"
+        quarter = num_k_tile // 4
+        input_args.append(mbar_mid_ptrs[0].toint().ir_value())
+        input_args.append(mbar_mid_ptrs[1].toint().ir_value())
+        wait_operands = {
+            quarter: ("A", 6),
+            2 * quarter: ("B", 7),
+            3 * quarter: ("C", 4),
+        }
+        chunked_stream = "".join(
+            (
+                _ptx_parity_wait(*wait_operands[k], 5, wait_hint)
+                if k in wait_operands
+                else ""
+            )
+            + f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+            + "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
+            + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+            f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
+            f"smem_desc_b, {idesc_var_name}, 1;\n\t"
+            for k in range(1, num_k_tile)
+        )
+    else:
+        chunked_stream = ""
     llvm.inline_asm(
         None,
         input_args,
@@ -801,37 +855,45 @@ def gemm_ptx_precomputed_pv_ts(
         "setp.ne.b32 p, $2, 0;\n\t"
         f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
         f"[tmem_acc], [tmem_a], smem_desc_b, {idesc_var_name}, {pred_str};\n\t"
-        + "".join(
-            (
-                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
-                f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
-                f"smem_desc_b, {idesc_var_name}, 1;\n\t"
-            )
-            for k in range(
-                1,
-                num_k_tile if const_expr(mbar_ptr is None) else num_k_tile // 4 * 3,
-            )
-        )
-        + mbar_wait_str
         + (
-            "".join(
+            chunked_stream
+            if const_expr(mbar_mid_ptrs is not None)
+            else "".join(
                 (
-                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo, "
-                    f"{hex(offset_b_diff[k - 1])};\n\t"
+                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
                     f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
                     f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
                     f"smem_desc_b, {idesc_var_name}, 1;\n\t"
                 )
-                for k in range(num_k_tile // 4 * 3, num_k_tile)
+                for k in range(
+                    1,
+                    num_k_tile if const_expr(mbar_ptr is None) else num_k_tile // 4 * 3,
+                )
             )
-            if const_expr(mbar_ptr is not None)
-            else ""
+            + mbar_wait_str
+            + (
+                "".join(
+                    (
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo, "
+                        f"{hex(offset_b_diff[k - 1])};\n\t"
+                        "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
+                        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+                        f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
+                        f"smem_desc_b, {idesc_var_name}, 1;\n\t"
+                    )
+                    for k in range(num_k_tile // 4 * 3, num_k_tile)
+                )
+                if const_expr(mbar_ptr is not None)
+                else ""
+            )
         )
         + "}\n",
-        "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+        "r,r,r,r"
+        if const_expr(mbar_ptr is None)
+        else "r,r,r,r,r,r,r,r"
+        if const_expr(mbar_mid_ptrs is not None)
+        else "r,r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

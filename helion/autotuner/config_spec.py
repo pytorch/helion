@@ -2073,6 +2073,12 @@ class ConfigSpec:
         config.update(flash_effective_config_values(effective))
         if effective_topology == "fa4":
             config.update(explicit_e2e_offsets)
+            if effective.alternating_warpgroups:
+                # Both softmax warpgroups of the alternating family process
+                # the same rows: one emulation phase. Keep the resolver's pin
+                # in the search identity so offsets differing only in the
+                # second phase do not name the same program twice.
+                config[FLASH_E2E_OFFSET0_KEY] = config[FLASH_E2E_OFFSET_KEY]
         e2e_schedule_default = _flash_e2e_schedule_default(
             effective_topology, self._cute_flash_head_dim
         )

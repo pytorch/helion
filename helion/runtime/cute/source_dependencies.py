@@ -22,9 +22,10 @@ _COMMON_DEPENDENCIES = (
 )
 
 # The flash families (dense, gated, backward) share one generated preamble that
-# imports these runtime modules.
+# imports these runtime modules; the alternating-warpgroup body adds its own.
 _FLASH_DEPENDENCIES = (
     "_compiler/cute/_flash_runtime.py",
+    "_compiler/cute/_flash_alt_runtime.py",
     "_compiler/cute/_flash_gemm_ptx.py",
     "_compiler/cute/_mlir_compat.py",
     "_compiler/cute/epilogue_helpers.py",

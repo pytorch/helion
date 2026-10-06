@@ -58,6 +58,8 @@ from .causal_range import CausalRangeProof
 from .causal_range import IntegerInterval
 from .causal_range import TileLayout
 from .causal_range import prove_descending_causal_prefix_unmasked
+from .cute_flash_alt import emit_flash_fa4_alt_device_body
+from .cute_flash_alt import fa4_alt_supported
 from .cute_flash_row_mma import ROW_MMA_DEFAULT_TILE_M
 from .cute_flash_row_mma import ROW_MMA_DEFAULT_WARPS
 from .cute_flash_row_mma import ROW_MMA_FAMILY
@@ -1777,6 +1779,9 @@ class FlashPipelineFamilyFlags(NamedTuple):
     use_clc_scheduler: bool = False
     local_tma_partition: bool = False
     tensor_4d_tma: bool = False
+    # One query tile per work item, two softmax warpgroups on alternating KV
+    # steps, separate QK/PV issue warps (see ``cute_flash_alt``).
+    alternating_warpgroups: bool = False
 
 
 FLASH_PIPELINE_FAMILY_FLAGS: dict[str, FlashPipelineFamilyFlags] = {
@@ -1816,6 +1821,9 @@ FLASH_PIPELINE_FAMILY_FLAGS: dict[str, FlashPipelineFamilyFlags] = {
         local_tma_partition=True,
         tensor_4d_tma=True,
     ),
+    # New families go last: autotune seeds and coverage rows index the family
+    # list by position.
+    "fa4_alt": FlashPipelineFamilyFlags("fa4", alternating_warpgroups=True),
 }
 FLASH_PIPELINE_FAMILIES = tuple(FLASH_PIPELINE_FAMILY_FLAGS)
 FLASH_AUTOTUNE_PIPELINE_FAMILIES = FLASH_PIPELINE_FAMILIES
@@ -1837,11 +1845,14 @@ def _flash_pipeline_family_from_flags(
     use_clc_scheduler: bool,
     local_tma_partition: bool,
     tensor_4d_tma: bool,
+    alternating_warpgroups: bool = False,
 ) -> str:
     if topology == ROW_MMA_FAMILY:
         return ROW_MMA_FAMILY
     if topology != "fa4":
         return "ws_overlap"
+    if alternating_warpgroups:
+        return "fa4_alt"
     if separate_kv_rings:
         base = "fa4_deep_1cta"
         local_tma_partition = False
@@ -1958,6 +1969,14 @@ class FlashAttentionConfig:
     # this for dense non-causal hd64, where the extra split barrier lost to the
     # simpler full-P release.
     split_p_arrive: bool = True
+    # Per-chunk staged-P release on top of ``split_p_arrive`` (dense fa4 bodies
+    # with the chunked softmax, Rep16 P stores and the PTX MMA stream): softmax
+    # arrives once per 32-column P chunk (pfor, pforc0, pforc1, pfor2) and the PV
+    # issue stream waits before each K-chunk quarter, so the first three quarters
+    # of PV run under the exp pass and QK(i+1) follows the last chunk by one
+    # quarter of PV instead of the 3/4-split's late start. Same stores, same MMA
+    # order: bitwise identical to the split release.
+    p_chunk_arrive: bool = False
     # TMEM P-store repetition for the FA4 softmax P path. Upstream FA4 exposes
     # this as a useful hd64 lever: 16 preserves the original 4-way staged-P
     # chunks, while 32 halves the r2t chunk count and is searched on dense hd64.
@@ -2100,6 +2119,11 @@ class FlashAttentionConfig:
     # ``(s, d, h, z)`` / ``(d, s, h, z)`` when the original contiguous 4D input
     # shape is recoverable. This matches FA4's dense MHA tensor-map rank.
     tensor_4d_tma: bool = False
+    # ``fa4_alt``: one 128-row query tile per persistent work item, softmax
+    # warpgroups A/B on alternating KV steps with their own score/probability
+    # buffers, a QK-issue warp and a PV-issue warp, the output staged through
+    # the finished item's dead Q stage. Dense hd128 plain rows only.
+    alternating_warpgroups: bool = False
     # Causal descending KV can run the short masked diagonal prefix separately
     # from the hot unmasked suffix, removing a per-KV branch from most tiles.
     causal_loop_split: bool = False
@@ -2727,6 +2751,10 @@ def resolve_flash_config(
         if legacy_structural_config
         else _flash_pipeline_family_flags(pipeline_family_env)
     )
+    alt_requested = bool(
+        requested_family_flags is not None
+        and requested_family_flags.alternating_warpgroups
+    )
     if requested_family_flags is not None:
         topology = requested_family_flags.topology
     else:
@@ -3029,6 +3057,22 @@ def resolve_flash_config(
         or p_store_repetition != 16
     ):
         s_load_repetition = 32
+    p_chunk_arrive = _flash_bool_env("HELION_CUTE_FLASH_P_CHUNK_ARRIVE", False)
+    p_chunk_arrive_cfg = _cfg(FLASH_P_CHUNK_ARRIVE_KEY)
+    if p_chunk_arrive_cfg is not None:
+        p_chunk_arrive = bool(p_chunk_arrive_cfg)
+    if (
+        topology != "fa4"
+        or is_causal
+        or not mma_ptx
+        or not softmax_disc
+        or not split_p_arrive
+        or p_store_repetition != 16
+        or s_load_repetition != 32
+    ):
+        # The per-chunk release is written for the dense chunked pass with Rep16
+        # P stores and the PTX PV stream (the waits live inside that stream).
+        p_chunk_arrive = False
     precompute_qk_desc_default = False
     precompute_qk_desc = _flash_bool_env(
         "HELION_CUTE_FLASH_PRECOMPUTE_QK_DESC", precompute_qk_desc_default
@@ -3762,6 +3806,9 @@ def resolve_flash_config(
         softmax_disc=softmax_disc,
     ):
         kv_tile_n = 128
+    if kv_tile_n != 128:
+        # Four 32-column P chunks per KV tile: one arrival each.
+        p_chunk_arrive = False
     # 64-row query tiles: only the flat, staged, dense two-warpgroup ws_overlap
     # body has the two-rows-per-thread softmax/epilogue math, and only for
     # plain rows (score modifiers and fused row epilogues index rows by
@@ -3897,6 +3944,74 @@ def resolve_flash_config(
     if epi_tma_setup not in ("shared", "role_local") or not epi_tma_setup_eligible:
         epi_tma_setup = "shared"
 
+    # The alternating-warpgroup family (``fa4_alt``) owns its structure: the
+    # fa4 body's structural knobs below have no meaning there and are pinned so
+    # that configs differing only in them normalize to one effective config.
+    # Its only output path is the TMA store through the finished item's Q
+    # stage, so a request without the TMA epilogue is not this family.
+    alternating_warpgroups = (
+        alt_requested
+        and topology == "fa4"
+        and epi_tma
+        and _flash_supported_io_dtype(dtype)
+        and not has_kv_tile_pruning
+        and not small_biased_candidate
+        and not use_2cta_instrs
+        and not use_cga2_local_cta
+        and not use_clc_scheduler
+        and not local_tma_partition
+        and not tensor_4d_tma
+        and not separate_kv_rings
+        and fa4_alt_supported(
+            head_dim=head_dim,
+            num_kv=num_kv,
+            is_causal=is_causal,
+            plain_row_body=plain_row_body,
+            has_row_epilogue=has_row_epilogue,
+            kv_tile_n=kv_tile_n,
+        )
+    )
+    if alternating_warpgroups:
+        pipeline_family = "fa4_alt"
+        persistent = True
+        persistent_ctas_per_sm = 1
+        persistent_loop = "while"
+        recompute_tile_coords = False
+        q_tile_count = 1
+        q_tile_m = 128
+        # K ring depth (the V ring is two deep); 3 fills shared memory exactly.
+        kv_stage = min(max(kv_stage, 2), 3)
+        epi_stg = False
+        epi_stg_store = "slice"
+        epi_stg_gmem = "stage"
+        epi_tma_setup = "shared"
+        softmax_setup = "shared"
+        sp_row_sum = "fragment"
+        softmax_disc = True
+        disc_pipe_depth = 1
+        split_p_arrive = True
+        p_chunk_arrive = False
+        p_store_repetition = 16
+        s_load_repetition = 32
+        precompute_qk_desc = False
+        first_load_order = 0
+        kv_order = "ascending"
+        stat_transport = "ring2"
+        skip_rescale_stats = False
+        mma_interleave = True
+        mma_ptx = True
+        role_map = "helion"
+        role_chain = False
+        masked_e2e_schedule = "inherit"
+        masked_e2e_freq = e2e_freq
+        masked_e2e_res = e2e_res
+        # both warpgroups process the same rows: one emulation phase
+        e2e_offset0 = e2e_offset
+        # 2 * 192 + 64 + 64 fills the register file; the four single warps
+        # spill below 64 and the softmax row does not fit above 192.
+        softmax_regs = 192
+        corr_regs = 64
+        other_regs = 64
     if exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS and (
         pipeline_family != "fa4" or not causal_loop_split
     ):
@@ -3941,6 +4056,7 @@ def resolve_flash_config(
         softmax_disc=softmax_disc,
         disc_pipe_depth=disc_pipe_depth,
         split_p_arrive=split_p_arrive,
+        p_chunk_arrive=p_chunk_arrive,
         p_store_repetition=p_store_repetition,
         s_load_repetition=s_load_repetition,
         precompute_qk_desc=precompute_qk_desc,
@@ -3979,6 +4095,7 @@ def resolve_flash_config(
         kv_tile_n=kv_tile_n,
         q_tile_m=q_tile_m,
         ws_one_pass=ws_one_pass,
+        alternating_warpgroups=alternating_warpgroups,
     )
 
 
@@ -4147,6 +4264,7 @@ FLASH_TOPOLOGY_KEY = "cute_flash_topology"
 FLASH_SOFTMAX_DISC_KEY = "cute_flash_softmax_disc"
 FLASH_DISC_PIPE_KEY = "cute_flash_disc_pipe"
 FLASH_SPLIT_P_ARRIVE_KEY = "cute_flash_split_p_arrive"
+FLASH_P_CHUNK_ARRIVE_KEY = "cute_flash_p_chunk_arrive"
 FLASH_P_STORE_REP_KEY = "cute_flash_p_store_rep"
 FLASH_S_LOAD_REP_KEY = "cute_flash_s_load_rep"
 FLASH_PRECOMPUTE_QK_DESC_KEY = "cute_flash_precompute_qk_desc"
@@ -4317,6 +4435,10 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_WS_ONE_PASS_KEY,
     FLASH_ROW_WARPS_KEY,
     FLASH_ROW_TILE_M_KEY,
+    # New axes go last: the structural coverage design derives its row pattern
+    # from the axis positions, and an inserted axis would reshuffle every later
+    # axis's rows (the 64-row query tile's witness depends on them).
+    FLASH_P_CHUNK_ARRIVE_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -4368,6 +4490,7 @@ def flash_effective_config_values(
         FLASH_SOFTMAX_DISC_KEY: config.softmax_disc,
         FLASH_DISC_PIPE_KEY: config.disc_pipe_depth,
         FLASH_SPLIT_P_ARRIVE_KEY: config.split_p_arrive,
+        FLASH_P_CHUNK_ARRIVE_KEY: config.p_chunk_arrive,
         FLASH_P_STORE_REP_KEY: config.p_store_repetition,
         FLASH_S_LOAD_REP_KEY: config.s_load_repetition,
         FLASH_PRECOMPUTE_QK_DESC_KEY: config.precompute_qk_desc,
@@ -5631,6 +5754,11 @@ def flash_autotune_fragments(
     if fa4_search_eligible:
         disc_pipe = enum(defaults.disc_pipe_depth, (1, 2, 3, 4), (1, 2, 3, 4))
         split_p = enum(defaults.split_p_arrive, (False, True), (False, True))
+        p_chunk = enum(
+            defaults.p_chunk_arrive,
+            (False, True),
+            (False,) if is_causal else (False, True),
+        )
         p_store = enum(defaults.p_store_repetition, (16, 32), (16, 32))
         s_load = enum(defaults.s_load_repetition, (16, 32), (16, 32))
         precompute = enum(defaults.precompute_qk_desc, (False, True), (False, True))
@@ -5652,6 +5780,9 @@ def flash_autotune_fragments(
         )
         split_p = enum(
             defaults.split_p_arrive, (False, True), (defaults.split_p_arrive,)
+        )
+        p_chunk = enum(
+            defaults.p_chunk_arrive, (False, True), (defaults.p_chunk_arrive,)
         )
         p_store = enum(
             defaults.p_store_repetition, (16, 32), (defaults.p_store_repetition,)
@@ -6190,6 +6321,7 @@ def flash_autotune_fragments(
         FLASH_WS_ONE_PASS_KEY: ws_one_pass,
         FLASH_ROW_WARPS_KEY: row_warps,
         FLASH_ROW_TILE_M_KEY: row_tile_m,
+        FLASH_P_CHUNK_ARRIVE_KEY: p_chunk,
     }
     if valid_family == ROW_MMA_FAMILY:
         # Every other knob is dead for the row programs: pin its search to the
@@ -6303,6 +6435,12 @@ import helion._compiler.cute._flash_gemm_ptx as _helion_flash_ptx
 _helion_flash_runtime_abi = {_FLASH_RUNTIME_ABI}
 """
 
+# Only modules with an alternating-warpgroup body import its runtime, so every
+# other flash render (and its disk-cache key) is unchanged by the family.
+_FLASH_ALT_PREAMBLE_IMPORTS = """\
+import helion._compiler.cute._flash_alt_runtime as _helion_flash_alt_rt
+"""
+
 
 def emit_flash_module_statements(cg: GenerateAST) -> None:
     """Emit the once-per-module flash imports."""
@@ -6310,6 +6448,15 @@ def emit_flash_module_statements(cg: GenerateAST) -> None:
         return
     cg._helion_flash_module_emitted = True  # type: ignore[attr-defined]
     for line_stmt in ast.parse(_FLASH_PREAMBLE_IMPORTS).body:
+        cg.module_statements.append(line_stmt)
+
+
+def emit_flash_alt_module_statements(cg: GenerateAST) -> None:
+    """Emit the once-per-module import of the alternating family's runtime."""
+    if getattr(cg, "_helion_flash_alt_module_emitted", False):
+        return
+    cg._helion_flash_alt_module_emitted = True  # type: ignore[attr-defined]
+    for line_stmt in ast.parse(_FLASH_ALT_PREAMBLE_IMPORTS).body:
         cg.module_statements.append(line_stmt)
 
 
@@ -9212,6 +9359,7 @@ def emit_flash_fa4_device_body(
                     kv_iterations=num_kv if persistent else None,
                     stage_output=cfg.epi_tma or cfg.epi_stg,
                     split_p_arrive=cfg.split_p_arrive,
+                    p_chunk_arrive=cfg.p_chunk_arrive,
                     stat_depth=1 if fa4_stat_handoff else 2,
                     pipelined_stat_handoff=acknowledged_stat_pipeline,
                     final_only_stat_handoff=final_only_stat_pipeline,
@@ -9237,6 +9385,7 @@ def emit_flash_fa4_device_body(
                     kv_iterations=num_kv if persistent else None,
                     stage_output=cfg.epi_tma or cfg.epi_stg,
                     split_p_arrive=cfg.split_p_arrive,
+                    p_chunk_arrive=cfg.p_chunk_arrive,
                     stat_depth=1 if fa4_stat_handoff else 2,
                     pipelined_stat_handoff=acknowledged_stat_pipeline,
                     final_only_stat_handoff=final_only_stat_pipeline,
@@ -9258,6 +9407,7 @@ def emit_flash_fa4_device_body(
                     persistent=False,
                     stage_output=cfg.epi_tma or cfg.epi_stg,
                     split_p_arrive=cfg.split_p_arrive,
+                    p_chunk_arrive=cfg.p_chunk_arrive,
                     stat_depth=1,
                     pipelined_stat_handoff=True,
                     stat_release_mapping=stat_release_mapping,
@@ -9743,6 +9893,18 @@ flash_v_prod, flash_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(
         if staged_first_load_setup
         else ""
     )
+    # Per-chunk staged-P release: the middle chunks' barriers (two per Q slot).
+    pforc_ptr_setup = (
+        "\nflash_pforc_ptr = storage.pforc_mbar.data_ptr()"
+        if cfg.p_chunk_arrive
+        else ""
+    )
+    pforc_init = (
+        f"\n        cute.arch.mbarrier_init(flash_pforc_ptr + 2 * flash_st, {pfor2_count})"
+        f"\n        cute.arch.mbarrier_init(flash_pforc_ptr + 2 * flash_st + 1, {pfor2_count})"
+        if cfg.p_chunk_arrive
+        else ""
+    )
     setup = f"""
 tidx, _, _ = cute.arch.thread_idx()
 warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -9760,7 +9922,7 @@ flash_scale_t = storage.sScale.get_tensor({scale_layout})
 # Raw mbarrier init -> fence -> CTA sync, before the pipelines.
 flash_s_full_ptr = storage.s_full_mbar.data_ptr()
 flash_pfor_ptr = storage.pfor_mbar.data_ptr()
-flash_pfor2_ptr = storage.pfor2_mbar.data_ptr()
+flash_pfor2_ptr = storage.pfor2_mbar.data_ptr(){pforc_ptr_setup}
 flash_o_full_ptr = storage.o_full_mbar.data_ptr()
 flash_corr_epi_full_ptr = storage.corr_epi_mbar_ptr.data_ptr()
 flash_corr_epi_empty_ptr = flash_corr_epi_full_ptr + 2
@@ -9774,7 +9936,7 @@ if tidx == 0:{prologue_init}
         cute.arch.mbarrier_init(flash_s_full_ptr + flash_st, 1)
         cute.arch.mbarrier_init(flash_o_full_ptr + flash_st, 1)
         cute.arch.mbarrier_init(flash_pfor_ptr + flash_st, {pfor_count})
-        cute.arch.mbarrier_init(flash_pfor2_ptr + flash_st, {pfor2_count})
+        cute.arch.mbarrier_init(flash_pfor2_ptr + flash_st, {pfor2_count}){pforc_init}
         cute.arch.mbarrier_init(flash_corr_epi_full_ptr + flash_st, 128)
         cute.arch.mbarrier_init(flash_corr_epi_empty_ptr + flash_st, 1)
 {aux_full_init}    for flash_st in cutlass.range_constexpr({s_corr_stage}):
@@ -10564,6 +10726,11 @@ if warp_idx == 15:
             if split_p_arrive
             else ""
         )
+        if cfg.p_chunk_arrive:
+            # One wait per K-chunk quarter: the middle quarters on this slot's
+            # pforc pair, the last quarter on pfor2 (pfor gates the first, above).
+            pv0_split_wait_arg += "\n                mbar_mid_ptrs=(flash_pforc_ptr + 0, flash_pforc_ptr + 1),"
+            pv1_split_wait_arg += "\n                mbar_mid_ptrs=(flash_pforc_ptr + 2, flash_pforc_ptr + 3),"
         pv_wait_hint_arg = f", wait_hint={cfg.wait_hint}"
 
         # STEADY-loop body (in-place P): PV(i) issued BEFORE QK(i+1) -- the PV-before-QK
@@ -11219,6 +11386,9 @@ if warp_idx == 15:
                 args.append("degree1=True")
             elif disc_exp2_codegen.degree2:
                 args.append("degree2=True")
+            if cfg.p_chunk_arrive and not causal:
+                assert split_p_arrive and not mixed_p_store
+                args.append(f"pforc_ptr_stage=flash_pforc_ptr + {2 * int(stage)}")
             return f"_helion_flash_rt.{name}(" + ", ".join(args) + ")"
 
         pass2_call = _format_disc_pass2(_disc_pass2_name, causal=False)
@@ -13453,7 +13623,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         "topology": cfg.topology,
         # The fa4 topology stages 2 Q-tiles per CTA -> the Q smem layout must
         # be 2-deep (ws_overlap stages a single Q-tile -> 1).
-        "q_stage": cfg.q_tile_count,
+        "q_stage": 2 if cfg.alternating_warpgroups else cfg.q_tile_count,
         "q_tile_m": cfg.q_tile_m,
         "ws_one_pass": cfg.ws_one_pass,
         # Lever A: build the O TMA-store atom host-side and pass it to the corr
@@ -13568,6 +13738,30 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                     row_epilogue=row_emit,
                 )
             )
+    elif cfg.topology == "fa4" and cfg.alternating_warpgroups:
+        emit_flash_alt_module_statements(cg)
+        df.cute_state.attention_flash_threads = 512
+        alt_exp2 = _flash_disc_exp2_codegen_params(
+            cfg.exp2_packet, cfg.e2e_freq, cfg.e2e_res
+        )
+        df.body = list(
+            emit_flash_fa4_alt_device_body(
+                head_dim=head_dim,
+                num_kv=num_kv,
+                sequence_extent=seq,
+                total_tiles=total_tiles,
+                cfg=cfg,
+                has_lse=lse_arg is not None,
+                io_dtype=io_dtype_str,
+                lse_scale=score_plan.lse_scale,
+                exp2_pair_batch=alt_exp2.pair_batch,
+                exp2_emu_batch=alt_exp2.emu_batch,
+                exp2_degree2=alt_exp2.degree2,
+                exp2_degree1=alt_exp2.degree1_unmasked,
+                e2e_freq=alt_exp2.e2e_freq,
+                e2e_res=alt_exp2.e2e_res,
+            )
+        )
     elif cfg.topology == "fa4":
         from ..compile_environment import CompileEnvironment
 
