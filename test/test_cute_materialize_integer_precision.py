@@ -168,9 +168,23 @@ def _direct_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return output
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _derived_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    output = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        accumulator = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            operand = (b[inner, column] + 1).to(a.dtype)
+            accumulator = torch.addmm(accumulator, a[row, inner], operand)
+        output[row, column] = accumulator.to(a.dtype)
+    return output
+
+
 @pytest.mark.parametrize("destination", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize(
-    "source,expected",
+    "source,derived_expected",
     (
         (torch.int8, True),
         (torch.uint8, True),
@@ -178,10 +192,15 @@ def _direct_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         (torch.int32, False),
     ),
 )
+@pytest.mark.parametrize("derived", (False, True))
 @skipUnlessBackends(["cute"])
 def test_actual_recipe_admission_uses_integer_precision(
-    source: torch.dtype, destination: torch.dtype, expected: bool
+    source: torch.dtype, destination: torch.dtype, derived_expected: bool, derived: bool
 ) -> None:
+    # A bare cast of the loaded tile is rounded to the half format by the
+    # original program too, so it is admitted at every integer width; derived
+    # integer arithmetic still needs the proved-range check.
+    expected = derived_expected if derived else True
     with (
         _cpu_target(),
         patch.object(
@@ -189,7 +208,7 @@ def test_actual_recipe_admission_uses_integer_precision(
         ),
     ):
         kernel = helion.kernel(
-            _direct_cast_rhs.fn,
+            (_derived_cast_rhs if derived else _direct_cast_rhs).fn,
             backend="cute",
             static_shapes=True,
             autotune_effort="none",

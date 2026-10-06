@@ -639,7 +639,11 @@ class LFBOPatternSearch(PatternSearch):
                 self.population.append(member)
         initial_population = list(self.population)
         self.set_generation(0)
-        self.benchmark_population(self.population, desc="Initial population")
+        self.benchmark_initial_population(
+            self.population,
+            random_fallback_target=self._random_fallback_population_target(),
+            visited=visited,
+        )
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(

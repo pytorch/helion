@@ -18,6 +18,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -274,6 +275,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
     @skipIfNotTriton("block_ptr is triton-only")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_matmul_block_ptr(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),

@@ -20,6 +20,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .resident_reductions import _pointer_parts
 from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import _NUMERIC_TYPES
@@ -40,16 +41,7 @@ if TYPE_CHECKING:
 
 SEQUENCE_KEY = "cute_reduction_sequence"
 _MARKER = "_helion_sequence_reduce"
-_VECTOR_LOADS = frozenset(
-    {
-        "cute.arch.load",
-        "_cute_load_l2_evict_last",
-        "_cute_load_l1_l2_evict_first",
-        "_cute_load_l1_l2_evict_last",
-        "_cute_load_l1_l2_evict_first_8b",
-        "_cute_load_l1_l2_evict_last_8b",
-    }
-)
+_VECTOR_LOADS = frozenset({"cute.arch.load", *_CUTE_CACHE_LOAD_HELPER_NAMES})
 _GLOBALS = frozenset(
     {
         "cutlass",
@@ -59,11 +51,7 @@ _GLOBALS = frozenset(
         "range",
         "float",
         "int",
-        "_cute_load_l2_evict_last",
-        "_cute_load_l1_l2_evict_first",
-        "_cute_load_l1_l2_evict_last",
-        "_cute_load_l1_l2_evict_first_8b",
-        "_cute_load_l1_l2_evict_last_8b",
+        *_CUTE_CACHE_LOAD_HELPER_NAMES,
         _MARKER,
     }
 )

@@ -79,6 +79,46 @@ def _computed_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _int16_bare_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        acc = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = hl.dot(a[row, inner], b[inner, column].to(a.dtype), acc=acc)
+        out[row, column] = acc.to(a.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _int16_bare_cast_lhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty((m, n), dtype=b.dtype, device=b.device)
+    for row, column in hl.tile((m, n)):
+        acc = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = hl.dot(a[row, inner].to(b.dtype), b[inner, column], acc=acc)
+        out[row, column] = acc.to(b.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _int16_derived_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, column in hl.tile((m, n)):
+        acc = hl.zeros([row, column], dtype=torch.float32)
+        for inner in hl.tile(k):
+            transformed = (b[inner, column] + 1).to(a.dtype)
+            acc = hl.dot(a[row, inner], transformed, acc=acc)
+        out[row, column] = acc.to(a.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
 def _interleaved_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     n = b.shape[1]
@@ -416,6 +456,51 @@ def test_unsupported_memory_and_tile_semantics_keep_original_path(
     assert len(bound.host_function.device_ir.root_ids) == 1
 
 
+def test_bare_integer_cast_of_loaded_tile_is_materialized() -> None:
+    """``b[k, n].to(bf16)`` on an int16 input rounds every loaded value exactly as
+    the program does, so the range proof required for derived integer recipes
+    does not apply; the derived ``(b + 1).to(bf16)`` recipe still needs it."""
+    m, k, n = 128, 256, 128
+    args = (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((k, n), dtype=torch.int16),
+    )
+    bound = _bind(_int16_bare_cast_rhs, args)
+    plan = bound.env.cute_fission_plan
+    assert plan is not None and plan.region_count == 2
+    assert bound.config_spec.cute_tcgen05_search_enabled
+    derived = _bind(_int16_derived_cast_rhs, args)
+    assert derived.env.cute_fission_plan is None
+
+
+def test_bare_integer_cast_on_the_lhs_is_materialized() -> None:
+    """An ``[M, K]`` recipe on the LHS is reused across the output columns:
+    the producer tiles ``[M, K]`` and the consumer contracts
+    ``matrix[m, k] @ b[k, n]`` with the direct RHS input."""
+    m, k, n = 128, 256, 128
+    args = (
+        torch.empty((m, k), dtype=torch.int16),
+        torch.empty((k, n), dtype=torch.bfloat16),
+    )
+    bound = _bind(_int16_bare_cast_lhs, args)
+    plan = bound.env.cute_fission_plan
+    assert plan is not None and plan.region_count == 2
+    assert plan.operand_interleave_factor == 1
+    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert plan.replacement_body is not None
+    producer = ast.unparse(plan.replacement_body[-3])
+    assert "_helion_materialize_m, _helion_materialize_k" in producer
+    assert (
+        "_helion_materialized_operand[_helion_materialize_m, _helion_materialize_k]"
+        in producer
+    )
+    consumer = ast.unparse(plan.replacement_body[-2])
+    assert (
+        "_helion_materialized_operand[row, _helion_materialize_logical_k]" in consumer
+    )
+    assert "b[_helion_materialize_logical_k, column]" in consumer
+
+
 def test_input_output_aliases_are_not_materialized() -> None:
     args = _args(shape=(16, 32, 32))
     bound = _bind(_aliased_output, (*args, args[0]))
@@ -598,7 +683,13 @@ def test_flat_materialization_seed_preserves_the_native_consumer(
             if seed.config.get("cute_pointwise_pid_type") == "flat"
             and seed.config.get("tcgen05_cta_group") == "two"
         )
-        assert flat.block_sizes[0] == spec.block_sizes[0].min_size == 1
+        # The producer seed owns one 16-byte packet per thread in a 128-thread
+        # CTA; the flat variant keeps that geometry and only changes the grid.
+        threads = cast("list[int]", flat.config["num_threads"])
+        row_threads = spec.num_threads.config_get(threads, 0)
+        column_threads = spec.num_threads.config_get(threads, 1)
+        assert flat.block_sizes[0] == row_threads >= 1
+        assert row_threads * column_threads == 128
         assert generation.unflatten(generation.flatten(flat)) == flat
         assert any(
             generation.unflatten(config).config.get("cute_pointwise_pid_type") == "flat"
@@ -635,3 +726,175 @@ def test_pointwise_pid_override_requires_a_proved_region(value: object) -> None:
             bound.config_spec.normalized_config(config)
         bound.config_spec.normalize(config, _fix_invalid=True)
         assert "cute_pointwise_pid_type" not in config.config
+
+
+def _int16_args(
+    shape: tuple[int, int, int], *, lhs: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k, n = shape
+    if lhs:
+        return (
+            torch.empty((m, k), dtype=torch.int16),
+            torch.empty((k, n), dtype=torch.bfloat16),
+        )
+    return (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((k, n), dtype=torch.int16),
+    )
+
+
+def _producer_seed(bound: BoundKernel[Any], **wanted: object) -> helion.Config:
+    spec = bound.config_spec
+    for seed in spec.compiler_seed_configs:
+        values = seed.config
+        widths = cast("list[int]", values.get("cute_vector_widths", []))
+        if spec.cute_vector_widths.config_get(widths, 1) != 8:
+            continue
+        if all(values.get(key) == value for key, value in wanted.items()):
+            return bound._normalized_config_copy(
+                helion.Config.from_dict(spec.default_config().config | values)
+            )
+    raise AssertionError(f"no producer seed matches {wanted}")
+
+
+@pytest.mark.parametrize("lhs", [False, True], ids=["rhs_int16", "lhs_int16"])
+def test_int16_cast_producer_loads_vector_packets(lhs: bool) -> None:
+    kernel = _int16_bare_cast_lhs if lhs else _int16_bare_cast_rhs
+    bound = _bind(kernel, _int16_args((128, 256, 128), lhs=lhs))
+    assert bound.env.cute_fission_plan is not None
+    # Both recipes prove the producer/consumer edge, so their seeds carry PDL.
+    assert bound.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+    with bound.env:
+        config = _producer_seed(
+            bound, tcgen05_cta_group="two", tcgen05_materialized_pdl=True
+        )
+    producer, consumer = _stage_sources(bound.to_code(config))
+    assert "cute.arch.griddepcontrol_launch_dependents()" in producer
+    assert "cute.arch.griddepcontrol_wait()" in consumer
+    # One 16-byte packet of int16 words per thread, each lane bitcast back to
+    # Int16 before the program's own bf16 cast; the store keeps its u16 packet.
+    assert "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in producer
+    assert ".bitcast(cutlass.Int16)" in producer
+    assert "cutlass.BFloat16(" in producer
+    assert "_cute_store_u16_vec(" in producer
+    assert ".load()" not in producer
+    assert "CtaGroup.TWO" in consumer
+
+
+def test_producer_seed_geometry_is_one_packet_per_thread_in_a_warp_quartet() -> None:
+    bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    spec = bound.config_spec
+    with bound.env:
+        seeds = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if spec.cute_vector_widths.config_get(
+                cast("list[int]", seed.config.get("cute_vector_widths", [])), 1
+            )
+            == 8
+        ]
+        assert seeds
+        for seed in seeds:
+            threads = cast("list[int]", seed.config["num_threads"])
+            row_threads = spec.num_threads.config_get(threads, 0)
+            column_threads = spec.num_threads.config_get(threads, 1)
+            # 128 columns hold 16 packets, so eight rows stack across threads.
+            assert (row_threads, column_threads) == (8, 16)
+            assert seed.block_sizes[:2] == [8, 128]
+            # Every paired seed asks for the programmatic dependent launch.
+            assert seed.config.get("tcgen05_materialized_pdl") is True
+        assert {seed.config.get("cute_pointwise_pid_type") for seed in seeds} == {
+            None,
+            "flat",
+        }
+
+
+def test_small_grid_seeds_add_one_cta_tiles_with_pdl() -> None:
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    spec = bound.config_spec
+    state = spec._cute_tcgen05_config
+    assert state.device_sm_count == 148
+    with bound.env:
+        one_cta = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("tcgen05_cta_group") == "auto"
+        ]
+        # A 128x128 output is one standard tile: 64-row tiles with 16/32/64
+        # columns spread the operand re-reads over 16/8/4 CTAs.
+        assert sorted({tuple(seed.block_sizes[2:]) for seed in one_cta}) == [
+            (64, 16, 128),
+            (64, 32, 128),
+            (64, 64, 128),
+        ]
+        for seed in one_cta:
+            assert seed.config["pid_type"] == "persistent_interleaved"
+            assert seed.config["tcgen05_cluster_m"] == 1
+            assert seed.config["tcgen05_ab_stages"] == 2
+        # The producer-layout carriers of those seeds ask for the programmatic
+        # dependent launch; the bare native seeds keep the search default.
+        assert all(
+            seed.config.get("tcgen05_materialized_pdl") is True
+            for seed in one_cta
+            if spec.cute_vector_widths.config_get(
+                cast("list[int]", seed.config.get("cute_vector_widths", [])), 1
+            )
+            == 8
+        )
+        config = _producer_seed(bound, tcgen05_cta_group="auto")
+        assert config.block_sizes[2:] == [64, 16, 128]
+        assert config.config["tcgen05_materialized_pdl"] is True
+        # The seed is representable in the search schema (the optional matmul
+        # min-blocks coordinate has no public default key, so compare flat).
+        generation = ConfigGeneration(spec)
+        flat = generation.flatten(config)
+        assert generation.flatten(generation.unflatten(flat)) == flat
+    producer, consumer = _stage_sources(bound.to_code(config))
+    assert "cute.arch.griddepcontrol_launch_dependents()" in producer
+    assert "CtaGroup.ONE" in consumer
+    assert "'use_pdl': True" in consumer
+    # The one-CTA consumer issues the ordinary input's initial TMA loads before
+    # the dependency wait; only the materialized operand's loads follow it.
+    wait = "cute.arch.griddepcontrol_wait()"
+    assert consumer.count(wait) == 1
+    assert consumer.index("cute.copy(tma_atom_a") < consumer.index(wait)
+    assert consumer.index(wait) < consumer.index("cute.copy(tma_atom_b")
+    assert "tcgen05_pdl_producer_state = tcgen05_ab_producer_state.clone()" in consumer
+
+
+def test_small_grid_seeds_absent_when_standard_tiles_fill_the_device() -> None:
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _bind(_int16_bare_cast_rhs, _int16_args((2048, 1024, 2048)))
+    spec = bound.config_spec
+    with bound.env:
+        assert spec._cute_tcgen05_config.device_sm_count == 148
+        # 256 standard tiles already fill 148 SMs: no small one-CTA tiles.
+        assert not any(
+            seed.config.get("tcgen05_cta_group") == "auto" and seed.block_sizes[2] == 64
+            for seed in spec.compiler_seed_configs
+        )
+        assert any(
+            seed.config.get("tcgen05_cta_group") == "two"
+            for seed in spec.compiler_seed_configs
+        )
+
+
+def test_one_cta_pdl_requires_the_persistent_role_local_schedule() -> None:
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    spec = bound.config_spec
+    with bound.env:
+        config = _producer_seed(bound, tcgen05_cta_group="auto")
+        flat = helion.Config.from_dict(
+            config.config
+            | {
+                "pid_type": "flat",
+                "tcgen05_persistence_model": "non_persistent",
+                "tcgen05_materialized_pdl": True,
+            }
+        )
+        with pytest.raises(InvalidConfig, match="dependency-wait schedule"):
+            spec.normalized_config(flat)
+        spec.normalize(flat, _fix_invalid=True)
+        assert "tcgen05_materialized_pdl" not in flat.config

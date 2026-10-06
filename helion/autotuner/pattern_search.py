@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
     from ..runtime.settings import Settings
+    from . import ConfigSpec
     from .base_search import _AutotunableKernel
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
@@ -31,6 +32,30 @@ class InitialPopulationStrategy(enum.Enum):
 
     FROM_BEST_AVAILABLE = "from_best_available"
     """Start from default config plus up to 20 best matching cached configs from previous runs."""
+
+
+def random_fallback_population_target(
+    strategy: InitialPopulationStrategy,
+    pad_random: bool,
+    config_spec: ConfigSpec,
+    population_size: int,
+) -> int | None:
+    """Population size to pad to when every seed/default/cache config fails.
+
+    Only a seed-only population (FROM_BEST_AVAILABLE without random padding)
+    needs the fallback. Random populations already prove the search space
+    broken when they fail entirely, and CuTe flash populations are
+    structurally designed rather than seeded; both keep the immediate
+    compile-error re-raise.
+    """
+    if (
+        strategy != InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        or pad_random
+        or config_spec.cute_flash_search_enabled
+        or population_size <= 0
+    ):
+        return None
+    return population_size
 
 
 class PatternSearch(PopulationBasedSearch):
@@ -70,7 +95,9 @@ class PatternSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
                 cached configs with random configs to reach initial_population size.
-                When False, use only the default and cached configs (no random padding).
+                When False, use only the default and cached configs; random configs
+                are added only as a fallback when every one of them fails to compile
+                or run (see PopulationBasedSearch.benchmark_initial_population).
             num_neighbors_cap: Maximum number of neighbors to explore per generation. -1 means no cap.
                 Set HELION_CAP_AUTOTUNE_NUM_NEIGHBORS=N to override.
             finishing_rounds: Number of finishing rounds to run after the main search.
@@ -280,6 +307,14 @@ class PatternSearch(PopulationBasedSearch):
             population, self.initial_population
         )
 
+    def _random_fallback_population_target(self) -> int | None:
+        return random_fallback_population_target(
+            self.initial_population_strategy,
+            self.best_available_pad_random,
+            self.config_spec,
+            self.initial_population,
+        )
+
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
         self.log(
@@ -292,7 +327,11 @@ class PatternSearch(PopulationBasedSearch):
             if member is not None and member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
-        self.benchmark_population(self.population, desc="Initial population")
+        self.benchmark_initial_population(
+            self.population,
+            random_fallback_target=self._random_fallback_population_target(),
+            visited=visited,
+        )
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(

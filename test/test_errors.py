@@ -83,7 +83,9 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         search = DifferentialEvolutionSearch(fake_kernel, args=())
 
         def fake_parallel(
-            self: PopulationBasedSearch, to_check: list[list[object]]
+            self: PopulationBasedSearch,
+            to_check: list[list[object]],
+            random_fallback_target: int | None = None,
         ) -> list[PopulationMember]:
             members = []
             for flat_values in to_check:

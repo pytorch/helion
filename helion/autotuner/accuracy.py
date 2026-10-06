@@ -27,7 +27,7 @@ def assert_close(
     *,
     scale_atol_by_expected_rms: bool = False,
 ) -> None:
-    """Like torch.testing.assert_close, with fp8 and large tensor handling.
+    """Like torch.testing.assert_close, with packed floats and large tensor handling.
 
     With ``scale_atol_by_expected_rms`` (used when the caller did not specify
     an explicit atol), the absolute-tolerance floor for each tensor leaf is
@@ -139,6 +139,18 @@ def _chunked_assert_close(
             f"Tensor shape mismatch during autotuner accuracy check: "
             f"{tuple(actual.shape)} != {tuple(expected.shape)}"
         )
+    if torch.float4_e2m1fn_x2 in (actual.dtype, expected.dtype):
+        if actual.dtype != expected.dtype:
+            raise AssertionError(
+                "Tensor dtype mismatch during autotuner accuracy check: "
+                f"{actual.dtype} != {expected.dtype}"
+            )
+        # Packed FP4 has no numeric cast to the RMS accumulator dtype. Check
+        # the storage exactly; byte-distance tolerances do not measure FP4
+        # numeric error, and input mutation checks must preserve both nibbles.
+        actual = actual.view(torch.uint8)
+        expected = expected.view(torch.uint8)
+        atol = rtol = 0.0
     if scale_atol_by_expected_rms and expected.dtype.is_floating_point:
         rms = _chunked_rms(expected, chunk_size)
         # A non-finite RMS (inf in the baseline output) must not disable the

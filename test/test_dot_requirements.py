@@ -1256,17 +1256,19 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound.set_config(config)
 
         code = bound.to_triton_code(config)
-        # ``indices_2`` corresponds to the inactive outer-K block_id. It
-        # must be plain ``tile_offset_2`` — no ``thread_idx`` term —
-        # otherwise the launch dim is shared with the inner block_id and
-        # the inner indices line addresses past the tile.
+        # ``indices_2`` corresponds to the inactive outer-K block_id. The
+        # kernel reads the K coordinate only as ``tile_offset_2`` (the inner
+        # loop's bounds), so the index is dead: the atomic add on
+        # ``[tile_m, tile_n]`` carries no mask of that axis and dead-code
+        # elimination drops the definition. If it is emitted, it must be
+        # plain ``tile_offset_2`` — no ``thread_idx`` term — otherwise the
+        # launch dim is shared with the inner block_id and the inner indices
+        # line addresses past the tile.
+        self.assertIn("tile_offset_2", code)
         for ln in code.splitlines():
             if ln.strip().startswith("indices_2 = "):
                 self.assertNotIn("thread_idx", ln, msg=ln)
                 self.assertIn("tile_offset_2", ln, msg=ln)
-                break
-        else:
-            self.fail("could not locate indices_2 = ... in generated code")
 
         # Crash-survival regression check: the kernel must run without a
         # CUDA illegal memory access so the GPU context survives. This

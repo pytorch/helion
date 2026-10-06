@@ -17,11 +17,13 @@ from torch._prims_common import compute_required_storage_length
 from .. import exc
 from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
+from .._compat import supports_block_ptr
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
 from .compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_expr
+from .compile_environment import warning
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 from .host_function import HostFunction
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+_warned_block_ptr_fallback = False
 
 
 class TileWithOffsetInfo(NamedTuple):
@@ -556,6 +559,14 @@ class IndexingStrategy:
         if indexing_literal == "tensor_descriptor":
             return TensorDescriptorIndexingStrategy()
         if indexing_literal == "block_ptr":
+            if not supports_block_ptr():
+                # Triton >= 3.9 removed block pointers; keep configs that
+                # name them working by lowering them as pointer indexing.
+                global _warned_block_ptr_fallback
+                if not _warned_block_ptr_fallback:
+                    _warned_block_ptr_fallback = True
+                    warning(exc.BlockPtrIndexingUnavailable)
+                return PointerIndexingStrategy()
             return BlockPtrIndexingStrategy()
         raise RuntimeError(
             f"Invalid indexing strategy: {indexing_literal!r}, "

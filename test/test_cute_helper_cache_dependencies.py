@@ -75,6 +75,26 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "_compiler/cute/kda_device_primitives.py",
             "chunk_recurrence_sm100",
         ),
+        (
+            "gdn_recurrence_sm100",
+            "_compiler/cute/gdn_recurrence_sm100.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
+            "gdn_recurrence_sm100",
+            "_compiler/cute/gdn_recurrence_geometry.py",
+            "chunk_recurrence_warp_dv4",
+        ),
+        (
+            "helion_flash",
+            "_compiler/cute/_flash_runtime.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
+            "helion_flash_gated",
+            "_compiler/cute/_flash_gemm_ptx.py",
+            "gathered_mma_tma",
+        ),
     ],
 )
 def test_transitive_helper_changes_only_its_family(

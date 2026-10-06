@@ -670,7 +670,11 @@ class _FakeLocalBenchmarkProvider:
         return repairs
 
     def benchmark(
-        self, configs: list[Config], *, desc: str = "Benchmarking"
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         self.benchmark_calls.append((configs, desc))
         if self.kernel.error is not None:

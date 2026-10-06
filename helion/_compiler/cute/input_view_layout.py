@@ -62,7 +62,7 @@ def _pointer_preserving_views() -> dict[torch.Tensor, torch.Tensor] | None:
     for statement in HostFunction.current().body:
         if isinstance(statement, ast.For):
             break
-        if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr)):
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Assert)):
             return None
         targets = (
             statement.targets

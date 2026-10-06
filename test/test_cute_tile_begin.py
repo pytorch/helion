@@ -338,3 +338,69 @@ def test_causal_flash_host_has_no_undefined_block_size(topology: str) -> None:
         and node.id.startswith("_BLOCK_SIZE_")
     }
     assert not read - assigned
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flat_begin_scalar(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    n = x.size(0)
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        c = w[tile_n.begin]
+        out[tile_n] = x[tile_n] * c + tile_n.id + (tile_n.end - tile_n.begin)
+    return out
+
+
+@pytest.mark.parametrize("threads,vector", [(4, 1), (4, 4), (16, 1), (8, 2)])
+def test_flattened_tile_begin_is_the_tile_base(threads: int, vector: int) -> None:
+    # On the flattened per-thread strategy ``offset_var`` is the per-element
+    # index; ``tile.begin`` / ``tile.end`` / ``tile.id`` must render from the
+    # uniform tile base or ``w[tile.begin]`` broadcasts per element.
+    torch.manual_seed(0)
+    n, block = 1000, 16
+    x = torch.randn(n, device=DEVICE)
+    w = torch.randn(n, device=DEVICE)
+    config = helion.Config(
+        block_sizes=[block], num_threads=[threads], cute_vector_widths=[vector]
+    )
+    bound = _flat_begin_scalar.bind((x, w))
+    code = bound.to_code(config)
+    scalar_load = next(line for line in code.splitlines() if "w.iterator" in line)
+    # A uniform scalar: never the per-element index or a per-lane vector load.
+    for per_element in ("offsets_0", "indices_0", "lane_base", "cute.arch.load"):
+        assert per_element not in scalar_load, scalar_load
+    out = bound.compile_config(config)(x, w)
+    expected = torch.empty_like(x)
+    for begin in range(0, n, block):
+        end = min(begin + block, n)
+        expected[begin:end] = x[begin:end] * w[begin] + begin // block + (end - begin)
+    torch.testing.assert_close(out, expected)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flat_tile_ids(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x, dtype=torch.int32)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = tile.id * 1000 + tile.begin + (tile.end - tile.begin)
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("block", [1, 2])
+def test_flattened_begin_without_a_recorded_tile_base(block: int) -> None:
+    """A flattened per-thread grid without a lane loop still lowers tile.begin.
+
+    Block size 1 claims no thread axis and records no ``pid * BLOCK`` base, so
+    ``tile.begin`` / ``tile.id`` / ``tile.end`` derive the tile start from the
+    per-element index instead of failing closed.
+    """
+    n = 37
+    config = helion.Config(block_sizes=[block], num_threads=[block])
+    code = _code(_flat_tile_ids, (torch.zeros(n, dtype=torch.float32),), config)
+    assert "tile_id" in code
+    x = torch.zeros(n, device=DEVICE, dtype=torch.float32)
+    result = _flat_tile_ids._bind_isolated((x,)).compile_config(config)(x)
+    index = torch.arange(n, device=DEVICE, dtype=torch.int32)
+    tile_id = index // block
+    begin = tile_id * block
+    extent = torch.minimum(begin + block, torch.full_like(begin, n)) - begin
+    torch.testing.assert_close(result, tile_id * 1000 + begin + extent)

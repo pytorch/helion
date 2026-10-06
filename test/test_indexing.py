@@ -13,6 +13,7 @@ import helion
 from helion import _compat
 from helion import exc
 from helion._compat import get_tensor_descriptor_fn_name
+from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
@@ -29,6 +30,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
@@ -684,9 +686,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
         x = torch.randn(8, 4, 16, device=DEVICE)
         block_size = [4, 4, 8]
 
-        backends = ["block_ptr"]
+        backends = []
+        if supports_block_ptr():
+            backends.append("block_ptr")
         if supports_tensor_descriptor():
             backends.append("tensor_descriptor")
+        if not backends:
+            self.skipTest("needs block_ptr or tensor_descriptor indexing")
 
         mask_shapes = [
             (8, 4, 16),  # full size, no broadcast
@@ -756,9 +762,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         x = torch.randn([200], device=DEVICE)
 
-        backends = ["block_ptr"]
+        backends = []
+        if supports_block_ptr():
+            backends.append("block_ptr")
         if supports_tensor_descriptor():
             backends.append("tensor_descriptor")
+        if not backends:
+            self.skipTest("needs block_ptr or tensor_descriptor indexing")
 
         for indexing in backends:
             with self.subTest(indexing=indexing):
@@ -2409,6 +2419,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_per_load_indexing(self):
         @helion.kernel
         def multi_load_kernel(
@@ -2488,6 +2499,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("needs debugging")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_per_load_and_store_indexing(self):
         """Test that both loads and stores can have independent indexing strategies."""
 

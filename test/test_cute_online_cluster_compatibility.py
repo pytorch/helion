@@ -123,9 +123,12 @@ def test_non_nd_begin_retains_coordinate_subtraction(thread_axis: int | None) ->
     axes = {} if thread_axis is None else {7: thread_axis}
     codegen = SimpleNamespace(
         active_device_loops={},
-        current_grid_state=SimpleNamespace(strategy=object(), block_thread_axes=axes),
+        current_grid_state=SimpleNamespace(
+            strategy=SimpleNamespace(tile_begin_var=lambda _: "fallback_offset"),
+            block_thread_axes=axes,
+        ),
         index_var=lambda _: "global_index",
-        offset_var=lambda _: "fallback_offset",
+        offset_var=lambda _: "per_element_offset",
         lift=Mock(side_effect=lambda value, **kwargs: value),
     )
     state = cast(

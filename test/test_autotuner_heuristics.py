@@ -7735,7 +7735,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             FLASH_PERSISTENT_KEY,
             FLASH_DISC_PIPE_KEY,
             FLASH_EPI_TMA_KEY,
-            FLASH_EPI_STG_KEY,
             FLASH_RESCALE_CHUNK_COLS_KEY,
             FLASH_SOFTMAX_REGS_KEY,
             FLASH_CORR_REGS_KEY,
@@ -7752,10 +7751,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 assert isinstance(fragment, EnumFragment)
                 self.assertEqual(fragment.search_choices, (fragment.default(),))
 
+        # The ws_overlap warpgroup body measures both O epilogues (staged
+        # coalesced store vs direct per-thread STG) on its two-stage S ring.
         for key in (
             FLASH_S_STAGE_KEY,
             FLASH_KV_STAGE_KEY,
             FLASH_PACKED_REDUCE_KEY,
+            FLASH_EPI_STG_KEY,
         ):
             with self.subTest(active_key=key):
                 fragment = fragments[key]

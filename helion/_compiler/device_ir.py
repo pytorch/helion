@@ -20,6 +20,7 @@ from typing import Protocol
 from typing import cast
 from unittest.mock import patch
 
+import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
@@ -57,6 +58,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .cute.register_tile_admission import register_tile_body_admitted
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -229,6 +231,15 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 )
                 proxy.node.meta["val"] = obj
                 proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._get_symnode)
+                # Epilogue classification also runs outside HostFunction's
+                # context. Preserve the proof that a scalar can be lifted as
+                # a uniform runtime argument, rather than a device coordinate.
+                if isinstance(obj, (torch.SymInt, torch.SymFloat)):
+                    origins = HostFunction.current().expr_to_origin
+                    proxy.node.meta["helion_host_scalar"] = all(
+                        symbol in origins and origins[symbol].origin.is_host()
+                        for symbol in obj.node.expr.free_symbols
+                    )
                 # pyrefly: ignore [missing-attribute]
                 proxy.force = lambda: proxy
             return transform(tracker[obj])
@@ -1160,6 +1171,9 @@ class DeviceIR:
                     reload_blocks.add(rdim.block_id)
 
         graphs_with_rolled_rdim: set[int] = set()
+        register_tile_body = env.backend_name == "cute" and register_tile_body_admitted(
+            self.graphs
+        )
         for rdim, allow_loop, used_graphs in rdim_results:
             if not allow_loop:
                 continue
@@ -1175,6 +1189,21 @@ class DeviceIR:
                 env.backend.register_reduction_loop_config_slots(
                     env, rdim.block_id, rdim.size_hint()
                 )
+            if register_tile_body:
+                # A persistent reduction lane may nest outside one-vector tile
+                # wrappers as a register tile only over a static, unmasked
+                # extent (the lane count is a trace-time constant) and a body
+                # the two-pass schedule can lower.  A CuTe-only decision: no
+                # other backend reads the extent here.
+                numel = rdim.numel
+                if (
+                    isinstance(numel, (int, sympy.Integer))
+                    and int(numel) > 0
+                    and env.backend.static_rdim_size(int(numel)) == int(numel)
+                ):
+                    env.config_spec.cute_register_tile_reduction_blocks.add(
+                        rdim.block_id
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed
@@ -3367,6 +3396,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             detect_flash_bwd_search_surface(device_ir)
             flash_shape = detect_flash_search_surface(device_ir)
             if flash_shape is not None:
+                from ..language.matmul_ops import _cuda_num_sms_or_zero
+
                 config_spec.enable_cute_flash_search(
                     head_dim=flash_shape.head_dim,
                     num_kv=flash_shape.num_kv,
@@ -3382,6 +3413,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     standard_causal_output=flash_shape.standard_causal_output,
                     output_requires_tma=flash_shape.output_requires_tma,
                     supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
+                    has_row_epilogue=flash_shape.has_row_epilogue,
+                    plain_row_body=flash_shape.plain_row_body,
+                    device_sm_count=_cuda_num_sms_or_zero(
+                        CompileEnvironment.current().device
+                    ),
                 )
             else:
                 from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate
@@ -3709,6 +3745,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # so both matmul front ends read one description of the workload (axis roles, knob
         # competition, per-dot placement/work, peak liveness).
         device_ir.build_kernel_matmul_fact(analysis)
+        if env.backend_name == "cute" and (
+            config_spec.kernel_matmul_fact is not None
+            or analysis.writes_input_storage(env)
+        ):
+            from .cute.memory_ops import register_cute_tensor_alias_specializations
+
+            # Vectorized writes to inputs and collective matmuls need the same
+            # guarded disjoint-input facts as reductions. Fresh grid outputs
+            # cannot alias inputs and must not add storage-dependent cache keys.
+            register_cute_tensor_alias_specializations(env)
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()

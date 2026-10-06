@@ -260,10 +260,11 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
             cute_flash.FLASH_S_STAGE_KEY: 1,
         }
-    elif route == "ws_two_warpgroup":
+    elif route.startswith("ws_two_warpgroup"):
         config_values = {
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
             cute_flash.FLASH_S_STAGE_KEY: 2,
+            cute_flash.FLASH_EPI_STG_KEY: not route.endswith("_direct"),
         }
     else:
         use_2cta = "2cta" in route
@@ -303,7 +304,7 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
                 cast("DeviceFunction", None),
                 **common,
             )
-        elif route == "ws_two_warpgroup":
+        elif route.startswith("ws_two_warpgroup"):
             body = cute_flash.emit_flash_ws_device_body(
                 cast("DeviceFunction", None),
                 **common,
@@ -325,9 +326,10 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
     (
         ("identity", True),
         ("relu", True),
-        ("relu_to_fp16", False),
-        ("relu_after_bf16", False),
-        ("abs", False),
+        # Row-local programs (casts, abs) lower through the fused row epilogue.
+        ("relu_to_fp16", True),
+        ("relu_after_bf16", True),
+        ("abs", True),
     ),
 )
 def test_bfloat16_output_epilogue_flash_matcher(
@@ -429,7 +431,11 @@ def test_relu_output_epilogue_rejects_auxiliary_attention(auxiliary: str) -> Non
     ("route", "staged_helper"),
     (
         ("ws_legacy", None),
-        ("ws_two_warpgroup", None),
+        # The two-warpgroup ws_overlap body stages O through smem by default
+        # (coalesced drain); ``cute_flash_epi_stg=False`` keeps the direct
+        # per-thread store.
+        ("ws_two_warpgroup", "fa4_correction_epilogue_to_smem_scoped"),
+        ("ws_two_warpgroup_direct", None),
         ("fa4_direct", None),
         ("fa4_tma", "fa4_correction_epilogue_to_smem_scoped"),
         ("fa4_stg", "fa4_correction_epilogue_to_smem_scoped"),

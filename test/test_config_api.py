@@ -3075,3 +3075,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_every_cute_only_config_key_is_backend_specific() -> None:
+    """The base backend accepts every key outside BACKEND_SPECIFIC_KEYS, so a
+    CuTe-only knob missing from the set reaches Triton configs unrejected."""
+    from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+    from helion.autotuner.config_spec import VALID_KEYS
+
+    cute_only = {key for key in VALID_KEYS if key.startswith(("cute_", "tcgen05_"))}
+    assert cute_only
+    assert sorted(cute_only - BACKEND_SPECIFIC_KEYS) == []

@@ -278,10 +278,34 @@ def test_branch_sites_remain_inside_the_branch() -> None:
     assert "_tile_store_vals_" not in code
 
 
-def test_body_defined_index_is_not_hoisted() -> None:
+def test_body_defined_uniform_index_is_hoisted_after_its_definition() -> None:
     code = _code((torch.empty((2, 2048), dtype=torch.bfloat16),), _local_index_tile)
+    # The computed row selector is uniform across the vector lanes, so the
+    # gathered row is loaded as one vector (commit 3df5c429); the load must
+    # follow the selector's definition inside the lane body.
+    assert "_tile_unroll_vec_" in code
+    selector = code.index(" % ")
+    assert code.index("_tile_unroll_vec_") > selector
+    assert "_tile_store_vals_" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _lane_dependent_index_tile(x: torch.Tensor) -> torch.Tensor:
+    rows, columns = x.shape
+    out = torch.empty_like(x)
+    for row, col in hl.tile([rows, columns], block_size=[1, None]):
+        selected = (col.index * 7 + row.begin) % columns
+        out[row.begin, col] = x[row.begin, selected]
+    return out
+
+
+def test_lane_dependent_index_is_not_hoisted() -> None:
+    code = _code(
+        (torch.empty((2, 2048), dtype=torch.bfloat16),), _lane_dependent_index_tile
+    )
+    # The column selector varies with the vectorized lane, so no single vector
+    # load covers the gathered elements.
     assert "_tile_unroll_vec_" not in code
-    # The output address is independent of the computed input selector.
     assert "_tile_store_vals_" in code
 
 

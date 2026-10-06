@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import importlib
+import inspect
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -229,6 +230,26 @@ if triton_is_available():
         )
 
     @functools.cache
+    def _supports_block_ptr() -> bool:
+        """Whether this Triton still lowers ``tl.make_block_ptr``.
+
+        triton-lang/triton#10833 ("Remove block pointer support") drops
+        ``tl.advance`` and keeps ``tl.make_block_ptr`` as a stub whose body is
+        ``raise NotImplementedError(...)``, so presence alone proves nothing:
+        look at the builtin's body.  Without source (frozen or compiled
+        installs) only the 3.7 line is known to have block pointers; main
+        reported 3.8.0 for two months after the removal.
+        """
+        make_block_ptr = getattr(tl, "make_block_ptr", None)
+        if make_block_ptr is None or getattr(tl, "advance", None) is None:
+            return False
+        try:
+            source = inspect.getsource(make_block_ptr)
+        except (OSError, TypeError):
+            return get_triton_version() < version.parse("3.8")
+        return "NotImplementedError" not in source
+
+    @functools.cache
     def _supports_host_tensor_descriptor() -> bool:
         """Whether this Triton install provides the host descriptor API."""
         if torch.version.hip is not None or not (
@@ -340,6 +361,9 @@ else:
     def _supports_host_tensor_descriptor() -> bool:  # type: ignore[misc]
         return False
 
+    def _supports_block_ptr() -> bool:  # type: ignore[misc]
+        return False
+
     def get_tensor_descriptor_fn_name() -> str:  # type: ignore[misc]
         return "tl.make_tensor_descriptor"
 
@@ -375,6 +399,12 @@ def supports_tensor_descriptor() -> bool:
 def supports_host_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_host_tensor_descriptor()
+
+
+def supports_block_ptr() -> bool:
+    """Whether ``indexing="block_ptr"`` can be lowered by the installed Triton."""
+    # call private func we can patch in testing
+    return _supports_block_ptr()
 
 
 def target_device_capability(

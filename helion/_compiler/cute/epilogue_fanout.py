@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
+    from .cute_epilogue import _AuxiliaryTensorExprStep
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
     from .device_state import CuteTcgen05StoreValue
 
@@ -273,12 +274,7 @@ class PairedFanoutPlan:
     pre_wait_aux_safe: bool = False
 
 
-def shared_prefix(
-    first: Tcgen05UnaryEpilogueChain,
-    second: Tcgen05UnaryEpilogueChain,
-    dtype: torch.dtype,
-) -> tuple[int, bool] | None:
-    """Compare complete typed expression nodes, including rounding templates."""
+def _output_rounding_step(dtype: torch.dtype) -> _AuxiliaryTensorExprStep:
     from .cute_epilogue import _FLOAT_CAST_TYPES
     from .cute_epilogue import _AuxiliaryTensorExprStep
     from .cute_epilogue import _CurrentTensorExpr
@@ -286,6 +282,24 @@ def shared_prefix(
     from .cute_epilogue import _UnaryOp
     from .cute_epilogue import _UnaryTensorExpr
 
+    assert dtype in _FLOAT_CAST_TYPES
+    cast_template = (
+        "{inner}.to(cutlass.Float32)"
+        if dtype is torch.float32
+        else _round_epilogue_expression("{inner}", dtype)
+    )
+    return _AuxiliaryTensorExprStep(
+        _UnaryTensorExpr(_UnaryOp(f"to_{dtype}", cast_template), _CurrentTensorExpr())
+    )
+
+
+def shared_prefix(
+    first: Tcgen05UnaryEpilogueChain,
+    second: Tcgen05UnaryEpilogueChain,
+    dtype: torch.dtype,
+    prefix_dtype: torch.dtype | None,
+) -> tuple[int, bool] | None:
+    """Compare complete typed expression nodes, including rounding templates."""
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
     count = len(first.steps)
@@ -293,16 +307,12 @@ def shared_prefix(
         return None
     if len(second.steps) == count:
         return count, False
-    cast_template = (
-        "{inner}.to(cutlass.Float32)"
-        if dtype is torch.float32
-        else _round_epilogue_expression("{inner}", dtype)
-    )
-    cast_step = _AuxiliaryTensorExprStep(
-        _UnaryTensorExpr(_UnaryOp(f"to_{dtype}", cast_template), _CurrentTensorExpr())
-    )
-    assert dtype in _FLOAT_CAST_TYPES
-    if second.steps[count] != cast_step:
+    # A low-precision operation already rounds its result. Its consumer need
+    # not contain a redundant explicit cast to the first output's dtype.
+    if (
+        second.steps[count] != _output_rounding_step(dtype)
+        and prefix_dtype is not dtype
+    ):
         return None
     return count, True
 
@@ -317,6 +327,7 @@ def prove_paired_fanout(
     from ...language import _tracing_ops
     from ...language import memory_ops
     from ..indexing_strategy import exact_tile_block_ids
+    from .cute_epilogue import _node_tensor_dtype
     from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
     from .cute_fx_walk import build_inner_outputs_index_from_graphs
     from .promote_output_axis import _access_tensor
@@ -385,7 +396,16 @@ def prove_paired_fanout(
         or first.untyped_storage()._cdata == second.untyped_storage()._cdata
     ):
         return None
-    common = shared_prefix(chains[0], chains[1], first.dtype)
+    prefix_value = ordered[0].args[2]
+    assert isinstance(prefix_value, torch.fx.Node)
+    # Chain analysis omits the terminal store conversion. Inspect its input,
+    # since the omitted conversion cannot prove that the shared prefix rounds.
+    if prefix_value.target is torch.ops.prims.convert_element_type.default:
+        prefix_value = prefix_value.args[0]
+    assert isinstance(prefix_value, torch.fx.Node)
+    common = shared_prefix(
+        chains[0], chains[1], first.dtype, _node_tensor_dtype(prefix_value)
+    )
     if common is None:
         return None
     output_storage = {tensor.untyped_storage()._cdata for tensor in tensors}
@@ -559,11 +579,14 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
     from .cute_epilogue import _AuxiliaryTensorLoadExpr
     from .cute_epilogue import _BinaryTensorExpr
     from .cute_epilogue import _CurrentTensorExpr
+    from .cute_epilogue import _RuntimeScalarExpr
     from .cute_epilogue import _UnaryTensorExpr
 
     def key(expr: object) -> object:
         if isinstance(expr, _CurrentTensorExpr):
             return ("current",)
+        if isinstance(expr, _RuntimeScalarExpr):
+            return ("runtime_scalar", expr.expr)
         if isinstance(expr, _AuxiliaryTensorLoadExpr):
             return ("aux", expr.load_node, expr.broadcast_axis, expr.template)
         if isinstance(expr, _UnaryTensorExpr):
@@ -598,10 +621,13 @@ def render_shared_suffix(
     from .cute_epilogue import _UnaryTensorExpr
 
     source: list[str] = []
-    carrier = first_value
+    has_cast = rendered.chain.steps[plan.prefix_steps] == _output_rounding_step(
+        plan.output_dtype
+    )
+    carrier = first_value if has_cast else f"{first_value}.to(cutlass.Float32)"
     for index in range(plan.prefix_steps, len(rendered.chain.steps)):
         step = rendered.chain.steps[index]
-        if index == plan.prefix_steps:
+        if index == plan.prefix_steps and has_cast:
             step = _AuxiliaryTensorExprStep(
                 _UnaryTensorExpr(
                     _UnaryOp("promote_rounded_output", "{inner}.to(cutlass.Float32)"),

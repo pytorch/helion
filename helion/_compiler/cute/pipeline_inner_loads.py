@@ -220,6 +220,15 @@ def _is_vec_load_call(node: ast.expr) -> bool:
     return isinstance(node.args[1], ast.Call)
 
 
+def _has_memory_access(node: ast.AST) -> bool:
+    """True if ``node`` contains a gmem access (``.load()``/``.store()``,
+    or any ``cute.arch`` intrinsic)."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in ("load", "store", "arch"):
+            return True
+    return False
+
+
 class _NameRenamer(ast.NodeTransformer):
     """Replace ``ast.Name`` references with a fresh name expression.
 
@@ -327,11 +336,39 @@ def _has_loop_carried_scalar_write(
     return False
 
 
+def _dynamic_trip_hint(
+    tile_var: str, dynamic_trip_counts: dict[str, tuple[int, str]] | None
+) -> int | None:
+    """Size-hint trip count of a rolled reduction over a symbolic extent."""
+    entry = dynamic_trip_counts.get(tile_var) if dynamic_trip_counts else None
+    return None if entry is None else entry[0]
+
+
+def _vec_load_is_self_guarded(load_rhs: ast.expr, lane_base_name: str) -> bool:
+    """Whether the packet pointer is a select whose condition reads the lane base.
+
+    Such a load already falls through to a safe in-bounds anchor whenever its
+    chunk is out of range, and rebasing the lane base for the prefetch rebases
+    that condition with it, so the speculative prefetch of the final iteration
+    needs no clamp.  A select that does not read the lane base (an outer row
+    mask on its own) says nothing about the swept extent, and a lane-dependent
+    anchor could itself run past it; both keep the clamp.
+    """
+    assert isinstance(load_rhs, ast.Call)
+    pointer = load_rhs.args[0]
+    return (
+        isinstance(pointer, ast.IfExp)
+        and lane_base_name in _names_read(pointer.test)
+        and lane_base_name not in _names_read(pointer.orelse)
+    )
+
+
 def _try_pipeline_one_outer_loop(
     loop: ast.For,
     constexpr_values: dict[str, int] | None,
     outer_scope_names: set[str] | None = None,
     rename_groups: dict[str, str] | None = None,
+    dynamic_trip_counts: dict[str, tuple[int, str]] | None = None,
 ) -> list[ast.stmt] | None:
     """Try to software-pipeline a single qualifying outer loop.
 
@@ -355,9 +392,15 @@ def _try_pipeline_one_outer_loop(
         return None
     end_val = _const_int_value(end_expr, constexpr_values)
     if end_val is None:
-        return None
+        # A rolled reduction over a symbolic extent: decide from the bound
+        # size hint.  The final iteration's speculative prefetch stays in
+        # bounds whatever the runtime trip count is, through the packet's
+        # own guard or the clamp against the symbolic end (see below).
+        trip_hint = _dynamic_trip_hint(tile_var, dynamic_trip_counts)
+        if trip_hint is None or trip_hint < 2:
+            return None
     # Need at least 2 iterations for pipelining to do anything.
-    if (end_val - start_val) // step_val < 2:
+    elif (end_val - start_val) // step_val < 2:
         return None
 
     body = outer_loop.body
@@ -392,16 +435,43 @@ def _try_pipeline_one_outer_loop(
     if tile_var not in _names_read(lane_base_rhs):
         return None
 
-    # Second inner statement: ``LOAD_VAR = cute.arch.load(<addr using LANE_BASE>, VEC_TY)``.
-    load_stmt = inner_body[1]
+    # Next: ``LOAD_VAR = cute.arch.load(<addr using LANE_BASE>, VEC_TY)``.  A
+    # masked lattice defines its chunk-level predicates (``mask_N =
+    # LANE_BASE < n``) between the lane base and the packet; such pure
+    # scalar assignments only read the (snapshotted) lane base and are kept
+    # in place after the prefetch.
+    load_idx = 1
+    while load_idx < len(inner_body):
+        candidate = inner_body[load_idx]
+        candidate_rhs = candidate.value if isinstance(candidate, ast.Assign) else None
+        if candidate_rhs is not None and _is_vec_load_call(candidate_rhs):
+            break
+        if (
+            _assignment_lhs_name(candidate) is None
+            or candidate_rhs is None
+            or _has_memory_access(candidate_rhs)
+            or lane_base_name in _names_assigned(candidate)
+        ):
+            return None
+        load_idx += 1
+    if load_idx >= len(inner_body):
+        return None
+    load_stmt = inner_body[load_idx]
     load_var_name = _assignment_lhs_name(load_stmt)
     if load_var_name is None:
         return None
     assert isinstance(load_stmt, ast.Assign)
     load_rhs = load_stmt.value
-    if not _is_vec_load_call(load_rhs):
-        return None
     if lane_base_name not in _names_read(load_rhs):
+        return None
+    predicate_stmts = inner_body[1:load_idx]
+    predicate_writes: set[str] = set()
+    for stmt in predicate_stmts:
+        predicate_writes |= _names_assigned(stmt)
+    if predicate_writes & (_names_read(load_rhs) | _names_read(lane_base_rhs)):
+        # The prefetch is issued before the predicates are re-evaluated for
+        # the snapshotted lane base, so neither it nor the lane base may read
+        # what they define.
         return None
 
     # We further require that the outer-loop body is JUST the single
@@ -492,14 +562,13 @@ def _try_pipeline_one_outer_loop(
     snapshot_lane_base = statement_from_string(f"{lane_base_name} = {pipe_lane_base}")
     snapshot_load = statement_from_string(f"{load_var_name} = {pipe_load}")
     # The last iteration's speculative prefetch would read one STEP past
-    # the end of the swept region.  Masked loads (an ``IfExp`` inside the
-    # load expression) already fall through to a safe in-bounds address;
-    # for UNMASKED loads (extent known to divide the chunk, so codegen
-    # elides the mask) clamp the prefetch base back to the current
-    # (in-bounds) lane base — the prefetched value is never consumed on
-    # the final iteration, it just must not fault.
-    load_has_guard = any(isinstance(sub, ast.IfExp) for sub in ast.walk(load_rhs))
-    if load_has_guard:
+    # the end of the swept region.  A self-guarded packet (its pointer
+    # select reads the lane base) already falls through to a safe in-bounds
+    # address once rebased; any other load clamps the prefetch base back to
+    # the current (in-bounds) lane base, comparing against the range end,
+    # which may be symbolic — the prefetched value is never consumed on the
+    # final iteration, it just must not fault.
+    if _vec_load_is_self_guarded(load_rhs, lane_base_name):
         prefetch_lane_base = statement_from_string(
             f"{pipe_lane_base} = {ast.unparse(next_lane_base_rhs)}"
         )
@@ -516,9 +585,11 @@ def _try_pipeline_one_outer_loop(
         snapshot_load,
         prefetch_lane_base,
         prefetch_load,
-        # Append the rest of the original inner body (after the 2
-        # statements we replaced with snapshots).
-        *inner_body[2:],
+        # Chunk predicates read the snapshotted lane base, then the rest of
+        # the original inner body (after the statements replaced by
+        # snapshots).
+        *predicate_stmts,
+        *inner_body[load_idx + 1 :],
     ]
 
     inner_loop.body = new_inner_body
@@ -531,6 +602,7 @@ def _walk_and_pipeline(
     constexpr_values: dict[str, int] | None,
     outer_scope_names: set[str] | None = None,
     rename_groups: dict[str, str] | None = None,
+    dynamic_trip_counts: dict[str, tuple[int, str]] | None = None,
 ) -> list[ast.stmt]:
     """Walk ``body`` recursively, attempting the pipeline transform on
     each top-level qualifying outer loop.  Returns a new body list.
@@ -560,7 +632,10 @@ def _walk_and_pipeline(
         if isinstance(stmt, ast.FunctionDef):
             # A new function scope; do not propagate enclosing names.
             stmt.body = _walk_and_pipeline(
-                stmt.body, constexpr_values, rename_groups=rename_groups
+                stmt.body,
+                constexpr_values,
+                rename_groups=rename_groups,
+                dynamic_trip_counts=dynamic_trip_counts,
             )
             new_body.append(stmt)
             continue
@@ -568,15 +643,27 @@ def _walk_and_pipeline(
             # Recurse into the body first, passing through the current
             # visible set so nested loops can see outer-scope writes.
             stmt.body = _walk_and_pipeline(
-                stmt.body, constexpr_values, local_visible, rename_groups
+                stmt.body,
+                constexpr_values,
+                local_visible,
+                rename_groups,
+                dynamic_trip_counts,
             )
             if isinstance(stmt, (ast.For, ast.If)):
                 stmt.orelse = _walk_and_pipeline(
-                    stmt.orelse, constexpr_values, local_visible, rename_groups
+                    stmt.orelse,
+                    constexpr_values,
+                    local_visible,
+                    rename_groups,
+                    dynamic_trip_counts,
                 )
         if isinstance(stmt, ast.For):
             pipelined = _try_pipeline_one_outer_loop(
-                stmt, constexpr_values, local_visible, rename_groups
+                stmt,
+                constexpr_values,
+                local_visible,
+                rename_groups,
+                dynamic_trip_counts,
             )
             if pipelined is not None:
                 new_body.extend(pipelined)
@@ -608,12 +695,19 @@ def pipeline_inner_loads(
     body: list[ast.stmt],
     constexpr_values: dict[str, int] | None = None,
     rename_groups: dict[str, str] | None = None,
+    *,
+    dynamic_trip_counts: dict[str, tuple[int, str]] | None = None,
 ) -> list[ast.stmt]:
     """Apply the inner-load pipelining peephole to a kernel body.
 
     ``constexpr_values`` maps module-level constexpr names (e.g.
     ``_BLOCK_SIZE_1``) to their static int value so the range trip
     count can be resolved.
+
+    ``dynamic_trip_counts`` maps the offset variable (loop target) of a
+    rolled reduction over a symbolic extent to ``(size_hint_trips,
+    constexpr_name)``; the hint stands in for the static trip count of
+    ``range(0, extent, step)``.
 
     ``rename_groups`` (optional) maps pre-rename SSA names to their
     post-rename canonical names (e.g. ``{"v_1_0": "mi"}``).  The pass
@@ -637,4 +731,9 @@ def pipeline_inner_loads(
     if os.environ.get("HELION_DISABLE_LOAD_PIPELINE"):
         return body
     _PIPE_COUNTER[0] = 0
-    return _walk_and_pipeline(body, constexpr_values, rename_groups=rename_groups)
+    return _walk_and_pipeline(
+        body,
+        constexpr_values,
+        rename_groups=rename_groups,
+        dynamic_trip_counts=dynamic_trip_counts,
+    )

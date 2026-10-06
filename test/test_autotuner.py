@@ -77,6 +77,7 @@ from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 from helion.autotuner.benchmarking import MirroredBenchmarkTrace
 from helion.autotuner.benchmarking import _mirrored_bench_call_layout
 from helion.autotuner.config_fragment import BlockSizeFragment
@@ -106,6 +107,7 @@ from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.pattern_search import random_fallback_population_target
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.autotuner.surrogate_pattern_search import (
@@ -798,6 +800,20 @@ class TestAutotuneIgnoreErrors(TestCase):
                     self.assertRaisesRegex(error_type, message),
                 ):
                     search.benchmark_batch([config], desc="initial")
+
+    def test_initial_compile_failures_skipped_when_fallback_available(self) -> None:
+        search = self._make_compile_failure_search()
+        with patch.object(
+            search.kernel,
+            "compile_config",
+            side_effect=exc.BackendUnsupported("cute", "seed config unsupported"),
+        ):
+            results = search.benchmark_batch(
+                ["seed"], desc="initial", raise_if_no_viable_config=False
+            )
+        self.assertEqual([result.perf for result in results], [float("inf")])
+        self.assertEqual([result.status for result in results], ["error"])
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
     def test_late_compile_failures_are_skipped(self) -> None:
         cases = (
@@ -8135,6 +8151,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 1
         search.max_generations = 0
@@ -8187,6 +8205,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generated = [member(0, 2.0), member(1, 1.0)]
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 1
         search.max_generations = 0
@@ -8253,6 +8273,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         constraints = LFBOPatternSearch._flash_leaf_constraints(constrained_leaf)
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 2
         search.max_generations = 0
@@ -8316,6 +8338,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+        search.best_available_pad_random = True
+        search.initial_population = 1
         search.log = Mock()
         search.copies = 1
         search.max_generations = 20
@@ -10265,6 +10289,101 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ):
             self.assertIs(search.final_rebenchmark_best(noisy), stable)
 
+    def test_finalize_keeps_measured_best_when_worker_is_unkillable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        best = PopulationMember(
+            lambda: None, [9.0], (), helion.Config(num_warps=4), status="ok"
+        )
+        other = PopulationMember(
+            lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
+        )
+        search.population = [other, best]
+        search._unkillable_configs = set()
+
+        with patch.object(
+            search,
+            "final_rebenchmark_best",
+            side_effect=BenchmarkWorkerUnkillable("worker remained alive"),
+        ):
+            self.assertEqual(search._finalize(), best.config)
+        self.assertIs(search.best, best)
+
+    def test_finalize_drops_the_candidate_whose_worker_could_not_be_reaped(
+        self,
+    ) -> None:
+        """The config under verification when the worker hung may be the one
+        that hung it: the fallback skips it, and raises when nothing is left."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        best = PopulationMember(
+            lambda: None, [9.0], (), helion.Config(num_warps=4), status="ok"
+        )
+        other = PopulationMember(
+            lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
+        )
+        search.population = [other, best]
+        search._unkillable_configs = set()
+        error = BenchmarkWorkerUnkillable("worker remained alive")
+        error.fn_index = 1
+        search._record_unkillable([other, best], error)
+        self.assertEqual(search._unkillable_configs, {best.config})
+
+        with patch.object(search, "final_rebenchmark_best", side_effect=error):
+            self.assertEqual(search._finalize(), other.config)
+        self.assertIs(search.best, other)
+
+        search._record_unkillable([other, best], BenchmarkWorkerUnkillable("x"))
+        self.assertEqual(search._unkillable_configs, {best.config})
+        search._unkillable_configs.add(other.config)
+        with (
+            patch.object(search, "final_rebenchmark_best", side_effect=error),
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            search._finalize()
+
+    def test_autotune_keeps_selected_config_when_worker_cleanup_is_unkillable(
+        self,
+    ) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.kernel = Mock()
+        search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
+        search.kernel.get_cached_path.return_value = None
+        search.args = ()
+        search._autotune_metrics = AutotuneMetrics()
+        search._search_space_tracker = None
+        search.benchmark_provider = Mock()
+        search.benchmark_provider.cleanup.side_effect = BenchmarkWorkerUnkillable(
+            "worker remained alive"
+        )
+        search._unkillable_configs = set()
+        selected = helion.Config(num_warps=4)
+
+        with (
+            patch.object(search, "_prepare"),
+            patch.object(search, "_autotune", return_value=selected),
+            patch.object(search, "_finalize_autotune_metrics"),
+        ):
+            self.assertEqual(search.autotune(), selected)
+        search.benchmark_provider.cleanup.assert_called_once()
+
+        # ... unless the selected config is the one whose worker hung
+        search._unkillable_configs = {selected}
+        with (
+            patch.object(search, "_prepare"),
+            patch.object(search, "_autotune", return_value=selected),
+            patch.object(search, "_finalize_autotune_metrics"),
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            search.autotune()
+
     def test_final_rebenchmark_rejects_all_failed_finalists(self) -> None:
         settings = Settings(
             autotune_log_level=logging.CRITICAL,
@@ -10844,6 +10963,52 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(observed_pointers["a"], [original.data_ptr()])
         self.assertNotEqual(observed_pointers["b"], [original.data_ptr()])
         self.assertTrue(torch.equal(original, torch.zeros_like(original)))
+
+    def test_benchmark_isolated_names_the_candidate_whose_worker_hung(self) -> None:
+        """A worker that cannot be reaped names the batch position of the
+        candidate it ran, whether it refused to die under that candidate or at
+        the fresh-process shutdown before the next one."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = settings
+        provider.log = Mock()
+        provider.mutated_arg_indices = []
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._subprocess_wrapper_unloadable = False
+        provider._subprocess_benchmark_enabled = lambda: True
+        provider._benchmark_worker = None
+        runs: list[object] = []
+
+        def hang_on_the_second(fn: object, *, warmup: int, rep: int) -> float:
+            runs.append(fn)
+            if len(runs) == 2:
+                raise BenchmarkWorkerUnkillable("worker remained alive")
+            return 1.0
+
+        provider._run_subprocess_benchmark_job = hang_on_the_second
+        fns = [object(), object(), object()]
+        with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+            provider.benchmark_isolated(fns, warmup=1, rep=1)
+        self.assertEqual(caught.exception.fn_index, 1)
+        self.assertEqual(runs, fns[:2])
+
+        # fresh processes: the worker that ran candidate 0 refuses to die when
+        # it is shut down ahead of candidate 1
+        runs.clear()
+        worker = Mock()
+        worker.shutdown.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
+
+        def run_and_leave_a_worker(fn: object, *, warmup: int, rep: int) -> float:
+            runs.append(fn)
+            provider._benchmark_worker = worker
+            return 1.0
+
+        provider._run_subprocess_benchmark_job = run_and_leave_a_worker
+        with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+            provider.benchmark_isolated(fns, warmup=1, rep=1, fresh_process=True)
+        self.assertEqual(caught.exception.fn_index, 0)
+        self.assertEqual(runs, fns[:1])
+        self.assertIsNone(provider._benchmark_worker)
 
     def test_rebenchmark_falls_back_when_isolated_wrapper_is_unloadable(self) -> None:
         settings = Settings(autotune_log_level=logging.CRITICAL)
@@ -11806,6 +11971,8 @@ class TestCuteAutotuner(TestCase):
                 "cute_independent_reduction",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",
+                "cute_vloop_sink",
+                "cute_lane_unroll",
                 "load_eviction_policies",
             },
         )
@@ -11835,6 +12002,8 @@ class TestCuteAutotuner(TestCase):
                     "cute_independent_reduction",
                     "cute_replicated_reduction",
                     "cute_vector_packet_unroll",
+                    "cute_vloop_sink",
+                    "cute_lane_unroll",
                     "load_eviction_policies",
                 },
             )
@@ -12574,9 +12743,12 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(set(cute_flash.FLASH_CONFIG_KEYS).isdisjoint(mm_keys))
 
     def test_cute_flash_two_cta_uses_general_softmax_register_search(self) -> None:
+        from helion._compiler.cute.cute_flash import _FLASH_SOFTMAX_REGS_VALUES
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
 
+        general = set(_FLASH_SOFTMAX_REGS_VALUES)
+        self.assertLessEqual({176, 184, 192, 200}, general)
         for num_kv in (512, 1536, 2048):
             with self.subTest(num_kv=num_kv):
                 fragment = flash_autotune_fragments(
@@ -12587,10 +12759,8 @@ class TestCuteAutotuner(TestCase):
                     standard_dense_output=True,
                     pipeline_family_override="fa4_2cta",
                 )[FLASH_SOFTMAX_REGS_KEY]
-                self.assertEqual(
-                    set(fragment.search_choices or ()), {176, 184, 192, 200}
-                )
-                self.assertLessEqual({176, 184, 192, 200}, set(fragment.choices))
+                self.assertEqual(set(fragment.search_choices or ()), general)
+                self.assertLessEqual(general, set(fragment.choices))
 
 
 @onlyBackends(["triton"])
@@ -14032,6 +14202,322 @@ class TestAutotuneSeedConfigs(TestCase):
         self.assertIn(
             "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
         )
+
+
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@onlyBackends(["triton", "cute"])
+class TestSeedPopulationFallback(TestCase):
+    """A seed-only initial population recovers when every seed fails to compile.
+
+    Compiles and timings are stubbed: a no-op callable stands in for every
+    compiled config and every surviving config ties at 1.0 ms, so each search
+    runs end to end in a fraction of a second and only the fallback mechanics
+    are under test.
+    """
+
+    # initial_population (PatternSearch, LFBOTreeSearch) and 2x population_size
+    # (DifferentialEvolutionSearch) in _seed_only_searches.
+    FALLBACK_TARGET = 8
+
+    def _make_bound(self) -> tuple[object, tuple[torch.Tensor, torch.Tensor]]:
+        # The baseline must not depend on the stubbed compile_config.
+        @helion.kernel(
+            autotune_log_level=0,
+            autotune_precompile=None,
+            autotune_benchmark_subprocess=False,
+            autotune_baseline_fn=operator.add,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add.bind(args), args
+
+    def _seed_configs(self, search: PopulationBasedSearch) -> set[helion.Config]:
+        return {
+            search.config_gen.canonicalize_flat(flat)[1]
+            for flat in search._generate_initial_population_flat()
+        }
+
+    def _random_configs(
+        self, search: PopulationBasedSearch, count: int
+    ) -> list[helion.Config]:
+        return [
+            search.config_gen.unflatten(flat)
+            for flat in search._pad_initial_population_with_unique_random([], count)
+        ]
+
+    @staticmethod
+    def _stub_compile(
+        should_fail: Callable[[helion.Config], bool],
+    ) -> tuple[Callable[..., object], list[helion.Config]]:
+        # Replaces bound.compile_config; nothing is really compiled.
+        compiled: list[helion.Config] = []
+
+        def compile_config(config: helion.Config, *, allow_print: bool = True):
+            compiled.append(config)
+            if should_fail(config):
+                raise exc.BackendUnsupported("test", "seed config unsupported")
+            return lambda *args, **kwargs: None
+
+        return compile_config, compiled
+
+    def _run(
+        self,
+        search: PopulationBasedSearch,
+        bound: object,
+        should_fail: Callable[[set[helion.Config], helion.Config], bool],
+        batches: Mock | None = None,
+        *,
+        cached_seeds: int = 0,
+    ) -> tuple[helion.Config, set[helion.Config], list[helion.Config], Mock, Mock]:
+        # ``batches`` records benchmark_batch calls; callers expecting a raise
+        # pass their own so it outlives the patch context.  ``cached_seeds``
+        # stands in for best-config cache hits, which also join the seed set.
+        if batches is None:
+            batches = Mock(wraps=search.benchmark_batch)
+        log = Mock(wraps=search.log)
+        search._prepare()
+        with patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]):
+            if cached_seeds:
+                search.set_best_available_seed_configs(
+                    self._random_configs(search, cached_seeds)
+                )
+            seeds = self._seed_configs(search)
+            compile_config, compiled = self._stub_compile(
+                functools.partial(should_fail, seeds)
+            )
+            with (
+                patch.object(bound, "compile_config", side_effect=compile_config),
+                patch.object(
+                    search.benchmark_provider, "_benchmark_function", return_value=1.0
+                ),
+                patch.object(search, "benchmark_batch", batches),
+                patch.object(search, "log", log),
+            ):
+                best = search.autotune()
+        return best, seeds, compiled, batches, log
+
+    def _seed_only_searches(
+        self, bound: object, args: tuple[torch.Tensor, torch.Tensor]
+    ) -> list[PopulationBasedSearch]:
+        # Mirrors the quick effort profile: FROM_BEST_AVAILABLE without random
+        # padding, so the initial population is only seed/default configs.
+        kwargs = {
+            "initial_population_strategy": InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+            "best_available_pad_random": False,
+        }
+        return [
+            PatternSearch(
+                bound,
+                args,
+                initial_population=self.FALLBACK_TARGET,
+                copies=1,
+                max_generations=1,
+                **kwargs,
+            ),
+            LFBOTreeSearch(
+                bound,
+                args,
+                initial_population=self.FALLBACK_TARGET,
+                copies=1,
+                max_generations=1,
+                **kwargs,
+            ),
+            DifferentialEvolutionSearch(
+                bound,
+                args,
+                population_size=self.FALLBACK_TARGET // 2,
+                max_generations=2,
+                **kwargs,
+            ),
+        ]
+
+    def _assert_fell_back_to_random(
+        self,
+        best: helion.Config,
+        seeds: set[helion.Config],
+        compiled: list[helion.Config],
+        batches: Mock,
+        log: Mock,
+    ) -> None:
+        target = self.FALLBACK_TARGET
+        self.assertNotIn(best, seeds)
+        self.assertTrue(set(compiled) >= seeds)
+        self.assertGreaterEqual(batches.call_count, 2)
+        initial_call, fallback_call = batches.call_args_list[:2]
+        self.assertFalse(initial_call.kwargs["raise_if_no_viable_config"])
+        self.assertEqual(fallback_call.kwargs["desc"], "Random fallback population")
+        # The fallback holds exactly ``target`` new configs beyond the seeds,
+        # however many seeds there were.
+        fallback_configs = fallback_call.args[0]
+        self.assertEqual(len(fallback_configs), target)
+        self.assertEqual(len(set(fallback_configs)), target)
+        self.assertTrue(seeds.isdisjoint(fallback_configs))
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        self.assertTrue(
+            any(
+                message.startswith(
+                    f"None of the {len(seeds)} seed/default/cache configs "
+                    "compiled or ran"
+                )
+                and message.endswith(f"continuing with {target} random configs.")
+                for message in warnings
+            ),
+            warnings,
+        )
+
+    def test_quick_profile_pads_seed_only_population(self) -> None:
+        profile = get_effort_profile("quick")
+        for search_config in (
+            profile.pattern_search,
+            profile.lfbo_pattern_search,
+            profile.differential_evolution,
+        ):
+            assert search_config is not None
+            self.assertEqual(
+                search_config.initial_population_strategy, "from_best_available"
+            )
+            self.assertFalse(search_config.best_available_pad_random)
+        spec = SimpleNamespace(cute_flash_search_enabled=False)
+        flash_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        best_available = InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        self.assertEqual(
+            random_fallback_population_target(best_available, False, spec, 30), 30
+        )
+        # Random padding, random populations, designed CuTe flash populations,
+        # and empty targets keep the immediate compile-error re-raise.
+        self.assertIsNone(
+            random_fallback_population_target(best_available, True, spec, 30)
+        )
+        self.assertIsNone(
+            random_fallback_population_target(
+                InitialPopulationStrategy.FROM_RANDOM, False, spec, 30
+            )
+        )
+        self.assertIsNone(
+            random_fallback_population_target(best_available, False, flash_spec, 30)
+        )
+        self.assertIsNone(
+            random_fallback_population_target(best_available, False, spec, 0)
+        )
+
+    def test_unsupported_seeds_fall_back_to_random_population(self) -> None:
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                best, seeds, compiled, batches, log = self._run(
+                    search, bound, operator.contains
+                )
+                self.assertGreater(len(set(compiled)), len(seeds))
+                self._assert_fell_back_to_random(best, seeds, compiled, batches, log)
+
+    def test_fallback_pads_past_cached_seeds(self) -> None:
+        # With at least FALLBACK_TARGET seeds (default plus cache hits) the
+        # fallback must still add FALLBACK_TARGET new random configs instead of
+        # padding only up to the target, which left nothing to benchmark.
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                best, seeds, compiled, batches, log = self._run(
+                    search,
+                    bound,
+                    operator.contains,
+                    cached_seeds=self.FALLBACK_TARGET + 2,
+                )
+                self.assertGreaterEqual(len(seeds), self.FALLBACK_TARGET)
+                self._assert_fell_back_to_random(best, seeds, compiled, batches, log)
+
+    def test_empty_fallback_reraises_compile_error(self) -> None:
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                batches = Mock(wraps=search.benchmark_batch)
+                # Every random draw is the default config, already a seed, so
+                # no fallback config survives deduplication.
+                with (
+                    patch.object(
+                        search.config_gen,
+                        "random_flat",
+                        return_value=search.config_gen.default_flat(),
+                    ),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported, "seed config unsupported"
+                    ),
+                ):
+                    self._run(search, bound, lambda seeds, config: True, batches)
+                # Only the seed batch ran: its deferred compile error surfaced
+                # instead of an empty fallback batch followed by NoConfigFound.
+                self.assertEqual(batches.call_count, 1)
+                self.assertFalse(
+                    batches.call_args_list[0].kwargs["raise_if_no_viable_config"]
+                )
+
+    def test_fallback_population_failing_too_still_raises(self) -> None:
+        bound, args = self._make_bound()
+        for search in self._seed_only_searches(bound, args):
+            with self.subTest(search=type(search).__name__):
+                batches = Mock(wraps=search.benchmark_batch)
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported, "seed config unsupported"
+                ):
+                    self._run(search, bound, lambda seeds, config: True, batches)
+                # The fallback batch was attempted before giving up.
+                self.assertEqual(batches.call_count, 2)
+                self.assertEqual(
+                    batches.call_args_list[1].kwargs["desc"],
+                    "Random fallback population",
+                )
+
+    def test_random_populations_keep_raising_without_fallback(self) -> None:
+        bound, args = self._make_bound()
+        # Full effort: FROM_RANDOM, plus FROM_BEST_AVAILABLE with random padding.
+        searches = [
+            PatternSearch(
+                bound,
+                args,
+                initial_population=4,
+                copies=1,
+                max_generations=1,
+                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+            ),
+            PatternSearch(
+                bound,
+                args,
+                initial_population=4,
+                copies=1,
+                max_generations=1,
+                initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                best_available_pad_random=True,
+            ),
+            DifferentialEvolutionSearch(
+                bound,
+                args,
+                population_size=2,
+                max_generations=2,
+                initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+            ),
+        ]
+        for search in searches:
+            with self.subTest(
+                search=type(search).__name__,
+                strategy=search.initial_population_strategy.name,  # pyrefly: ignore[missing-attribute]
+            ):
+                batches = Mock(wraps=search.benchmark_batch)
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported, "seed config unsupported"
+                ):
+                    self._run(search, bound, lambda seeds, config: True, batches)
+                self.assertEqual(batches.call_count, 1)
+                self.assertTrue(
+                    batches.call_args_list[0].kwargs["raise_if_no_viable_config"]
+                )
 
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")

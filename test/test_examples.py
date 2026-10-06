@@ -441,7 +441,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 128, 128, 256],
         )
 
-    @onlyBackends(["triton", "pallas"])
+    @onlyBackends(["triton", "pallas", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -762,41 +762,21 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         m, k, n = 2048, 1024, 1280
 
-        # The CuTe scalar matmul fallback accumulates each bf16xbf16 product in
-        # full fp32 (it never rounds the per-element products back to bf16), so
-        # it is *more* accurate than torch's bf16 tensor-core reference. The cute
-        # output bit-matches a full-precision (IEEE fp32) products matmul cast to
-        # bf16, so use that as the reference. ``setUpModule`` flips the default
-        # matmul fp32 precision to TF32, which would make ``torch.matmul`` itself
-        # lossy, so force IEEE fp32 for the reference computation.
-        is_cute = _get_backend() == "cute"
-
-        def expected(
-            xt: torch.Tensor, wt: torch.Tensor, transpose: bool
-        ) -> torch.Tensor:
-            if not is_cute:
-                return reference_bf16xint16_pytorch(xt, wt, transpose)
-            if transpose:
-                x_f32 = xt.to(torch.bfloat16).float()
-                w_f32 = wt.float()
-            else:
-                x_f32 = xt.float()
-                w_f32 = wt.to(torch.bfloat16).float()
-            with float32_matmul_precision("highest"):
-                out = torch.matmul(x_f32, w_f32)
-            return out.to(torch.bfloat16)
-
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
-        # Pallas tiles the K reduction, so a tiny fraction of outputs can land
-        # on the other side of a bf16 rounding boundary vs PyTorch's full-K dot.
-        max_mismatch_pct = 1e-4 if _get_backend() == "pallas" else None
-        max_mismatched_abs_diff = 0.5 if max_mismatch_pct is not None else None
+        # Pallas tiles the K reduction and the CuTe backend runs the cast
+        # operand through its tensor-core GEMM (materialized or converted in the
+        # TMA pipeline), so the fp32 accumulation order differs from PyTorch's
+        # full-K dot; with int16-magnitude operands a tiny fraction of the
+        # nearly-cancelling outputs lands on the other side of a bf16 rounding
+        # boundary.
+        max_mismatch_pct = 1e-4 if _get_backend() in ("pallas", "cute") else None
+        max_mismatched_abs_diff = 0.5 if _get_backend() == "pallas" else None
 
         check_example(
             "bf16xint16_gemm",
             (x, w),
-            expected(x, w, False),
+            reference_bf16xint16_pytorch(x, w, False),
             fn_name="_bf16xint16_gemm",
             max_mismatch_pct=max_mismatch_pct,
             max_mismatched_abs_diff=max_mismatched_abs_diff,
@@ -810,7 +790,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "bf16xint16_gemm",
             (x_int16, w_bf16),
-            expected(x_int16, w_bf16, True),
+            reference_bf16xint16_pytorch(x_int16, w_bf16, True),
             fn_name="_int16xbf16_gemm",
             max_mismatch_pct=max_mismatch_pct,
             max_mismatched_abs_diff=max_mismatched_abs_diff,
@@ -2400,7 +2380,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="squeeze_and_excitation_net_bwd_dx",
-            block_sizes=[16, 16, 16],
+            block_sizes=[16] * 8,
+            pid_type="persistent_blocked",
             num_warps=4,
             num_stages=2,
             atol=0.3,
@@ -2444,7 +2425,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="squeeze_and_excitation_net_bwd_da",
-            block_sizes=[16, 16, 16],
+            block_sizes=[16] * 8,
+            pid_type="persistent_blocked",
             num_warps=4,
             num_stages=2,
             atol=0.3,

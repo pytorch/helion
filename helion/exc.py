@@ -459,6 +459,13 @@ class BaseWarning(_FixedMessage):
         return f"WARNING[{type(self).__name__}]: {self!s}"
 
 
+class BlockPtrIndexingUnavailable(BaseWarning):
+    message = (
+        "indexing='block_ptr' was requested, but this Triton build has no block "
+        "pointers (removed in Triton 3.9); using pointer indexing instead."
+    )
+
+
 class TensorOperationInWrapper(BaseWarning):
     message = (
         "A tensor operation outside of the `hl.tile` or `hl.grid` loop will not be fused "
