@@ -1424,6 +1424,8 @@ def _cute_stack_tensor_mask_expr(
     dev_ptrs: torch.Tensor,
     subscript: list[object],
     extra_mask: ast.AST | None,
+    *,
+    for_store: bool = False,
 ) -> str | None:
     terms = []
     tensor_mask = _cute_combined_mask(
@@ -1432,6 +1434,7 @@ def _cute_stack_tensor_mask_expr(
         extra_mask,
         tensor=tensor_like,
         include_tensor_index_masks=False,
+        for_store=for_store,
     )
     if tensor_mask is not None:
         terms.append(tensor_mask)
@@ -1559,7 +1562,9 @@ def _codegen_cute_store_stack_load(
             target_indices,
             f"({stack_ptr_expr}).load()",
         )
-        mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+        mask_expr = _cute_combined_mask(
+            state, [*subscript], extra_mask, tensor=tensor, for_store=True
+        )
         if mask_expr is None:
             body = f"    {store_expr}"
         else:
@@ -1622,7 +1627,9 @@ def _codegen_cute_store_stack_load(
         _cute_scalar_store_expr(tensor_name, rewritten_index_exprs, "{value}"),
         value=value,
     )
-    mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+    mask_expr = _cute_combined_mask(
+        state, [*subscript], extra_mask, tensor=tensor, for_store=True
+    )
     if mask_expr is None:
         return store_expr
     mask_ast = expr_from_string(mask_expr)
@@ -2176,6 +2183,7 @@ def _codegen_cute_store_loaded_index_trailing_slices(
         prefix_subscript,
         extra_mask,
         tensor=tensor,
+        for_store=True,
     )
     masks = [mask for mask in (source_mask, target_mask) if mask is not None]
     mask_expr = " and ".join(f"({mask})" for mask in masks) if masks else None
@@ -2505,7 +2513,9 @@ def _codegen_cute_store_expand_broadcast_tile(
         slice(None) if pos == broadcast_dim else idx
         for pos, idx in enumerate(subscript)
     ]
-    mask_expr = _cute_combined_mask(state, base_subscript, extra_mask, tensor=tensor)
+    mask_expr = _cute_combined_mask(
+        state, base_subscript, extra_mask, tensor=tensor, for_store=True
+    )
     dim_size = _cute_tensor_dim_size_expr(state, tensor, broadcast_dim)
     lane_bound = f"({broadcast_coord}) < {dim_size}"
     mask_expr = lane_bound if mask_expr is None else f"({mask_expr}) and {lane_bound}"
@@ -2933,6 +2943,7 @@ def _(state: CodegenState) -> ast.AST:
             dev_ptrs,
             [*subscript],
             extra_mask,
+            for_store=True,
         )
         if mask_expr is None:
             return store_expr
@@ -3080,7 +3091,9 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
         index_exprs[-1] = topk_lane_expr
     store_uses_pointer = "None" not in index_exprs
-    mask_expr = _cute_combined_mask(state, mask_subscript, extra_mask, tensor=tensor)
+    mask_expr = _cute_combined_mask(
+        state, mask_subscript, extra_mask, tensor=tensor, for_store=True
+    )
     branch_vec_store_candidate: tuple[int, int] | None = None
 
     # Vectorized store: when this store's stride-1 axis is a vec-partitioned
