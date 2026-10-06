@@ -45,6 +45,7 @@ from .._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
 from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
+from .._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
 from .._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
 from .._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
@@ -904,6 +905,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_pipeline",
+        "cute_flash_gate_warpgroups",
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
@@ -1070,6 +1072,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
         SPLIT_K_FINALIZER_KEY,
@@ -1451,6 +1454,21 @@ class ConfigSpec:
         # flash detector fires (see ``lower_to_device_ir``). The shape needed to
         # build the fragments (head_dim / num_kv) is captured at the same time.
         self.cute_flash_search_enabled: bool = False
+        # Gated (softmax-free) attention surface: pins the 128x128 tile shape
+        # and exposes only the K/V TMA ring depth. See ``cute_flash_gated``.
+        self.cute_flash_gated_search_enabled: bool = False
+        self._cute_flash_gated_block_size_targets: dict[int, int] = {}
+        self._cute_flash_gated_kv_block_id: int | None = None
+        self._cute_flash_gated_q_block_id: int | None = None
+        self._cute_flash_gated_q_tile_choices: tuple[int, ...] = (128,)
+        self._cute_flash_gated_kv_tile_choices: tuple[int, ...] = ()
+        self._cute_flash_gated_kv_stage_choices: tuple[int, ...] = ()
+        self._cute_flash_gated_kv_stage_default: int = 2
+        self._cute_flash_gated_gate_warpgroup_choices: tuple[int, ...] = (1,)
+        self._cute_flash_gated_gate_warpgroup_default: int = 1
+        self._cute_flash_gated_kv_stage_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
         self._cute_flash_num_bh: int | None = None
@@ -2258,6 +2276,213 @@ class ConfigSpec:
             spec.autotuner_min = target
             spec.max_size = target
 
+    def enable_cute_flash_gated_search(
+        self,
+        *,
+        block_size_targets: Mapping[int, int],
+        kv_block_id: int,
+        kv_tile_choices: Sequence[int],
+        kv_stage_choices: Sequence[int],
+        kv_stage_default: int,
+        gate_warpgroup_choices: Sequence[int] = (1,),
+        gate_warpgroup_default: int = 1,
+        kv_stage_choices_by_tile: Mapping[tuple[int, int], Sequence[int]] | None = None,
+        q_block_id: int | None = None,
+        q_tile_choices: Sequence[int] = (128,),
+    ) -> None:
+        """Enable the gated (softmax-free) fused attention surface.
+
+        Restricts the query block size to the fused body's row tiles (128, or
+        also 64) and the KV block size to its tile widths (the detector fires
+        only there) and exposes the K/V TMA ring depth and the number of gate
+        warpgroups.
+        """
+        self.cute_flash_gated_search_enabled = True
+        self._cute_flash_gated_block_size_targets = dict(block_size_targets)
+        self._cute_flash_gated_kv_block_id = kv_block_id
+        self._cute_flash_gated_q_block_id = q_block_id
+        self._cute_flash_gated_q_tile_choices = tuple(sorted(q_tile_choices))
+        self._cute_flash_gated_kv_tile_choices = tuple(sorted(kv_tile_choices))
+        self._cute_flash_gated_kv_stage_choices = tuple(kv_stage_choices)
+        self._cute_flash_gated_kv_stage_default = kv_stage_default
+        self._cute_flash_gated_gate_warpgroup_choices = tuple(gate_warpgroup_choices)
+        self._cute_flash_gated_gate_warpgroup_default = gate_warpgroup_default
+        self._cute_flash_gated_kv_stage_choices_by_tile = {
+            tile: tuple(stages)
+            for tile, stages in (kv_stage_choices_by_tile or {}).items()
+        }
+        for block_id, target in block_size_targets.items():
+            spec = self.block_sizes.block_id_lookup(block_id)
+            if block_id == kv_block_id:
+                spec.autotuner_min = min(self._cute_flash_gated_kv_tile_choices)
+                spec.max_size = max(self._cute_flash_gated_kv_tile_choices)
+                if min(self._cute_flash_gated_q_tile_choices) < spec.max_size:
+                    # The frontend caps a KV loop bounded by the query tile
+                    # (``hl.tile(0, tile_q.end)``) at the query block size.  The
+                    # fused body walks each work item's KV range independently
+                    # of the tile height, so a 128-column KV tile over a 64-row
+                    # query tile is legal (and the efficient shape).
+                    spec.bounded_by_block_id = None
+            elif block_id == q_block_id:
+                spec.autotuner_min = min(self._cute_flash_gated_q_tile_choices)
+                spec.max_size = max(self._cute_flash_gated_q_tile_choices)
+                # The 128-row tile stays the default; 64 rows is a search choice.
+                spec.default_size = target
+            else:
+                spec.autotuner_min = target
+                spec.max_size = target
+
+    def _cute_flash_gated_tiles(self) -> list[tuple[int, int]]:
+        """Every fused (query rows, KV tile) shape with a ring depth that fits
+        shared memory: tallest query tile and widest KV tile first."""
+        by_tile = self._cute_flash_gated_kv_stage_choices_by_tile
+        return [
+            (q_tile, kv_tile)
+            for q_tile in sorted(self._cute_flash_gated_q_tile_choices, reverse=True)
+            for kv_tile in sorted(self._cute_flash_gated_kv_tile_choices, reverse=True)
+            if not by_tile or by_tile.get((q_tile, kv_tile))
+        ]
+
+    def _cute_flash_gated_block_size_lists(self) -> list[list[int]]:
+        """The block sizes of every fused tile shape (``_cute_flash_gated_tiles`` order)."""
+        base = self._cute_flash_gated_block_size_target_list()
+        kv_block_id = self._cute_flash_gated_kv_block_id
+        assert kv_block_id is not None
+        kv_index = self.block_sizes.block_id_to_index(kv_block_id)
+        q_block_id = self._cute_flash_gated_q_block_id
+        q_index = (
+            self.block_sizes.block_id_to_index(q_block_id)
+            if q_block_id is not None
+            else None
+        )
+        result: list[list[int]] = []
+        for q_tile, kv_tile in self._cute_flash_gated_tiles():
+            block_sizes = list(base)
+            block_sizes[kv_index] = kv_tile
+            if q_index is not None:
+                block_sizes[q_index] = q_tile
+            result.append(block_sizes)
+        return result
+
+    def _cute_flash_gated_block_size_target_list(self) -> list[int]:
+        targets: list[int | None] = [None] * len(self.block_sizes)
+        for block_id, target in self._cute_flash_gated_block_size_targets.items():
+            targets[self.block_sizes.block_id_to_index(block_id)] = target
+        if any(target is None for target in targets):
+            raise InvalidConfig(
+                "CuTe gated attention search has incomplete block sizes"
+            )
+        return [target for target in targets if target is not None]
+
+    def cute_flash_gated_seed_configs(self) -> list[helion.Config]:
+        if not self.cute_flash_gated_search_enabled:
+            return []
+        from .._compiler.cute.cute_flash_gated import gated_seed_configs
+
+        return gated_seed_configs(
+            self._cute_flash_gated_block_size_lists(),
+            self._cute_flash_gated_kv_stage_choices,
+            self._cute_flash_gated_kv_stage_default,
+            tiles=self._cute_flash_gated_tiles(),
+            kv_stage_choices_by_tile=self._cute_flash_gated_kv_stage_choices_by_tile,
+        )
+
+    def _cute_flash_gated_kv_tile(self, config: dict[str, object]) -> int:
+        """The KV tile width of a config on the gated surface."""
+        kv_block_id = self._cute_flash_gated_kv_block_id
+        assert kv_block_id is not None
+        value = config.get("block_sizes")
+        assert isinstance(value, (list, tuple))
+        kv_tile = value[self.block_sizes.block_id_to_index(kv_block_id)]
+        assert isinstance(kv_tile, int)
+        return kv_tile
+
+    def _cute_flash_gated_q_tile(self, config: dict[str, object]) -> int:
+        """The query tile height of a config on the gated surface."""
+        q_block_id = self._cute_flash_gated_q_block_id
+        if q_block_id is None:
+            return max(self._cute_flash_gated_q_tile_choices)
+        value = config.get("block_sizes")
+        assert isinstance(value, (list, tuple))
+        q_tile = value[self.block_sizes.block_id_to_index(q_block_id)]
+        assert isinstance(q_tile, int)
+        return q_tile
+
+    def _normalize_cute_flash_gated(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Normalize the gated attention surface (see ``_normalize_cute_flash``)."""
+        if not self.cute_flash_gated_search_enabled:
+            return
+        block_size_lists = self._cute_flash_gated_block_size_lists()
+        block_size_targets = block_size_lists[0]
+        if fix_invalid:
+            if config.get("block_sizes") not in block_size_lists:
+                config["block_sizes"] = list(block_size_targets)
+            config["pid_type"] = "flat"
+            self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
+            self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
+            self._normalize_cute_flash_default_sequence(config, "cute_vector_widths", 1)
+            self._normalize_cute_flash_default_sequence(
+                config, "cute_lane_layouts", "blocked"
+            )
+            self._normalize_cute_flash_default_loop_orders(config)
+            config.pop("epilogue_subtile", None)
+        elif not any(
+            self._is_cute_flash_config_envelope(config, block_sizes)
+            for block_sizes in block_size_lists
+        ):
+            return
+        from .._compiler.cute.cute_flash_gated import gated_kv_stage_default
+
+        # The legal ring depths depend on the tile shape (shared memory), so
+        # validate against the config's own tile.
+        kv_tile = self._cute_flash_gated_kv_tile(config)
+        choices = self._cute_flash_gated_kv_stage_choices_by_tile.get(
+            (self._cute_flash_gated_q_tile(config), kv_tile),
+            self._cute_flash_gated_kv_stage_choices,
+        )
+        stage_default = (
+            self._cute_flash_gated_kv_stage_default
+            if self._cute_flash_gated_kv_stage_default in choices
+            else gated_kv_stage_default(choices)
+        )
+        value = config.get(FLASH_KV_STAGE_KEY)
+        if value is None:
+            config[FLASH_KV_STAGE_KEY] = stage_default
+        elif value not in choices:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FLASH_KV_STAGE_KEY} must be one of {list(choices)!r} "
+                    f"for block_sizes {config.get('block_sizes')!r}, got {value!r}"
+                )
+            config[FLASH_KV_STAGE_KEY] = stage_default
+        from .._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
+        from .._compiler.cute.cute_flash_gated import gated_gate_warpgroup_choices
+        from .._compiler.cute.cute_flash_gated import gated_gate_warpgroup_default
+
+        # The legal warpgroup counts depend on the tile (its chunks must split
+        # evenly among the warpgroups), so validate against the config's own.
+        wg_choices = tuple(
+            g
+            for g in gated_gate_warpgroup_choices(
+                self._cute_flash_gated_q_tile(config),
+                self._cute_flash_gated_kv_tile(config),
+            )
+            if g in self._cute_flash_gated_gate_warpgroup_choices
+        ) or (1,)
+        wg_default = gated_gate_warpgroup_default(wg_choices)
+        wgs = config.get(FLASH_GATE_WARPGROUPS_KEY)
+        if wgs is None:
+            config[FLASH_GATE_WARPGROUPS_KEY] = wg_default
+        elif wgs not in wg_choices:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FLASH_GATE_WARPGROUPS_KEY} must be one of {list(wg_choices)!r} "
+                    f"for block_sizes {config.get('block_sizes')!r}, got {wgs!r}"
+                )
+            config[FLASH_GATE_WARPGROUPS_KEY] = wg_default
+
     def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
         """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
 
@@ -2475,9 +2700,16 @@ class ConfigSpec:
         )
 
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
-        if not self.cute_flash_search_enabled or "block_sizes" not in config:
+        if "block_sizes" not in config:
             return
-        block_size_targets = self._cute_flash_block_size_target_list()
+        if self.cute_flash_search_enabled:
+            block_size_targets = self._cute_flash_block_size_target_list()
+        elif self.cute_flash_gated_search_enabled:
+            if config["block_sizes"] in self._cute_flash_gated_block_size_lists():
+                return
+            block_size_targets = self._cute_flash_gated_block_size_target_list()
+        else:
+            return
         value = config["block_sizes"]
         raw_block_sizes = [*value] if isinstance(value, (list, tuple)) else [value]
         if raw_block_sizes == block_size_targets:
@@ -2707,6 +2939,8 @@ class ConfigSpec:
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)
             seeds.extend(flash_seeds)
+        if self.backend_name == "cute" and self.cute_flash_gated_search_enabled:
+            seeds.extend(self.cute_flash_gated_seed_configs())
         return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
@@ -3730,6 +3964,27 @@ class ConfigSpec:
                     "matched BT16 chunk-prepare kernels"
                 )
 
+        if (
+            FLASH_KV_STAGE_KEY in config
+            and not self.cute_flash_search_enabled
+            and not self.cute_flash_gated_search_enabled
+            and self.supports_config_key(FLASH_KV_STAGE_KEY)
+        ):
+            # The KV ring depth has no consumer on the scalar path. A config
+            # pinned from a flash autotune must still run when the surface is
+            # off (another sequence length, ``HELION_CUTE_FLASH=0``, a GPU
+            # without tcgen05), so the key is dropped rather than rejected;
+            # the flash surfaces validate their own values.
+            config.pop(FLASH_KV_STAGE_KEY)
+        from .._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
+
+        if (
+            FLASH_GATE_WARPGROUPS_KEY in config
+            and not self.cute_flash_gated_search_enabled
+        ):
+            # Same rule for the gate warpgroup count: only the gated body reads it.
+            config.pop(FLASH_GATE_WARPGROUPS_KEY)
+
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
             # from common keys (e.g. num_warps, num_stages, indexing).
@@ -4618,6 +4873,7 @@ class ConfigSpec:
                 fix_invalid=_fix_invalid,
             )
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_flash_gated(config, fix_invalid=_fix_invalid)
 
         if self.supports_config_key("num_sm_multiplier"):
             # The default autotuning domain remains powers of two, while an
@@ -5190,6 +5446,31 @@ class ConfigSpec:
                 fields.update(
                     self._cute_flash_autotune_fragments(
                         pipeline_family_override=_flash_pipeline_family_override,
+                    )
+                )
+            elif self.cute_flash_gated_search_enabled:
+                from .._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
+
+                default = self._cute_flash_gated_kv_stage_default
+                fields[FLASH_KV_STAGE_KEY] = EnumFragment(
+                    choices=(
+                        default,
+                        *(
+                            choice
+                            for choice in self._cute_flash_gated_kv_stage_choices
+                            if choice != default
+                        ),
+                    )
+                )
+                wg_default = self._cute_flash_gated_gate_warpgroup_default
+                fields[FLASH_GATE_WARPGROUPS_KEY] = EnumFragment(
+                    choices=(
+                        wg_default,
+                        *(
+                            choice
+                            for choice in self._cute_flash_gated_gate_warpgroup_choices
+                            if choice != wg_default
+                        ),
                     )
                 )
             elif self.cute_flash_bwd_search_enabled:
@@ -6005,6 +6286,9 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
         self.max_size: int = self.dim_max_size
+        # A search surface may pin the default (non-autotuned) block size while
+        # widening the autotuner's range (see ``_fragment``).
+        self.default_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -6084,6 +6368,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # Needed for matmul dims smaller than the heuristic default (e.g. M<16),
         # where the default would otherwise overshoot to a masked tile.
         default = min(default, self.dim_max_size)
+        if self.default_size is not None:
+            default = self.default_size
         if any(
             self.block_id in group for group in base.cute_pointwise_region_grid_groups
         ):

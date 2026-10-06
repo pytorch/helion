@@ -2059,6 +2059,15 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        grid_multiplier = self.cute_state.launch_grid_multiplier
+        if grid_multiplier != 1:
+            # A fused body running one CTA per (grid index, lane).
+            assert (
+                isinstance(call_grid_expr, ast.Tuple) and len(call_grid_expr.elts) == 1
+            )
+            call_grid_expr = expr_from_string(
+                f"(({{grid}}[0]) * {grid_multiplier},)", grid=call_grid_expr
+            )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:
             # The cluster splits each row across ``cluster_n`` CTAs on a new

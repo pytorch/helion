@@ -84,6 +84,42 @@ def flash_shared_storage(
 
 
 @functools.cache
+def flash_gated_shared_storage(
+    head_dim: int,
+    kv_tile: int,
+    kv_stage: int,
+    dtype: object = cutlass.Float16,
+    q_rows: int = 128,
+) -> type:
+    """SharedStorage for the gated (softmax-free) warp-specialized flash body.
+
+    Same barrier graph as ``flash_shared_storage`` at ``s_stage == 2`` (double
+    buffered S, one O accumulator, a p_ready handoff) but with ``kv_tile``-row
+    K/V ring slots so a 64-column KV tile does not reserve 128-row stages, and
+    a ``q_rows``-row Q tile (128, or 64 for the M=64 tcgen05 tile).
+    """
+
+    @cute.struct
+    class SharedStorage:
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * kv_stage]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * kv_stage]
+        mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        p_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        tmem_holding_buf: cutlass.Int32
+        sQ: cute.struct.Align[cute.struct.MemRange[dtype, q_rows * head_dim], 1024]
+        sK: cute.struct.Align[
+            cute.struct.MemRange[dtype, kv_tile * head_dim * kv_stage], 1024
+        ]
+        sV: cute.struct.Align[
+            cute.struct.MemRange[dtype, kv_tile * head_dim * kv_stage], 1024
+        ]
+
+    return SharedStorage
+
+
+@functools.cache
 def flash_fa4_shared_storage(
     head_dim: int,
     kv_stage: int,
@@ -2798,6 +2834,251 @@ def fa4_store_o_smem_to_gmem_whole(
             out[None, rest_m, None],
             tOgO_epi[None, rest_m, None],
         )
+
+
+@dsl_user_op
+def _cvt_rn_bf16_hi(
+    x: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """``cvt.rn.bf16x2.f32`` of ``(x, 0.0)``: the bf16 rounding of ``x`` lands
+    in the high half of a word whose low half is zero, which *is* the fp32
+    pattern of ``x`` rounded to bf16 -- one instruction, no unpack."""
+    word = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(x).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+            Float32(0.0).ir_value(loc=loc, ip=ip),
+        ],
+        "cvt.rn.bf16x2.f32 $0, $1, $2;",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(llvm.bitcast(T.f32(), word, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _prmt(
+    a: object,
+    b: object,
+    selector: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """``prmt.b32``: pick the four bytes of the result from the eight bytes of
+    ``(a, b)`` (byte ``i`` of the result is byte ``selector[4i:4i+4]`` of the
+    pair, ``a`` bytes 0-3, ``b`` bytes 4-7)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Int32(a).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+                cutlass.Int32(b).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+                cutlass.Int32(selector).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+            ],
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def gated_round_vec(x: cute.TensorSSA, dtype: type[Numeric]) -> cute.TensorSSA:
+    """Round an fp32 vector to ``dtype`` (bf16/fp16) and back to fp32.
+
+    ``x.to(dtype).to(Float32)`` lowers to a scalar ``cvt.rn.bf16.f32`` per
+    element plus an unpack; converting pairs through a packed word costs a
+    ``cvt.rn.bf16x2.f32`` per pair and two unpacks.  For bf16 the round trip
+    is instead one ``cvt.rn.bf16x2.f32`` per element with 0.0 as the partner
+    (``_cvt_rn_bf16_hi``): the rounded pattern already sits in the high half
+    of the word.  Bit-identical to the plain conversion (same
+    round-to-nearest-even).
+    """
+    n = cute.size(x.shape)
+    if dtype is not cutlass.BFloat16:
+        return x.to(dtype).to(cutlass.Float32)
+    src = cute.make_rmem_tensor((n,), cutlass.Float32)
+    dst = cute.make_rmem_tensor((n,), cutlass.Float32)
+    src.store(x)
+    for k in range(n):
+        dst[k] = _cvt_rn_bf16_hi(src[k])
+    return dst.load()
+
+
+def tcgen05_fence_before_thread_sync() -> None:
+    """``tcgen05.fence::before_thread_sync``: order this thread's prior tcgen05
+    operations (the allocation's TMEM-address write to shared memory, TMEM
+    loads and stores) before a following barrier, so the threads released by
+    it observe them (``tcgen05_fence_after_thread_sync`` on their side)."""
+    llvm.inline_asm(
+        None,
+        [],
+        "tcgen05.fence::before_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def tcgen05_fence_after_thread_sync() -> None:
+    """``tcgen05.fence::after_thread_sync``: order this thread's following
+    tcgen05 operations (and the read of the published TMEM address) after the
+    barrier it just passed."""
+    llvm.inline_asm(
+        None,
+        [],
+        "tcgen05.fence::after_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# Byte selectors of ``prmt.b32 d, a, b, sel`` (``a`` = bytes 0-3, ``b`` =
+# bytes 4-7; nibble ``i`` of ``sel`` names the source byte of result byte ``i``).
+_PRMT_LO_LO = 0x5410  # {a.lo16, b.lo16}
+_PRMT_HI_HI = 0x7632  # {a.hi16, b.hi16}
+_PRMT_LO_HI = 0x7610  # {a.lo16, b.hi16}
+_PRMT_BLO_AHI = 0x3254  # {b.lo16, a.hi16}
+_PRMT_BHI_AHI = 0x3276  # {b.hi16, a.hi16}
+_PRMT_BLO_ALO = 0x1054  # {b.lo16, a.lo16}
+
+
+def _gated_shuffle_words_xor2(words: cute.TensorSSA) -> cute.TensorSSA:
+    """Exchange every 32-bit word with lane ``^ 2``: at the 64-row tcgen05 tile
+    the ``16x64b`` TMEM shapes hand the two column parities of a row to lanes
+    ``t`` and ``t ^ 2`` of the same warp."""
+    n = cute.size(words.shape)
+    src = cute.make_rmem_tensor((n,), cutlass.Int32)
+    dst = cute.make_rmem_tensor((n,), cutlass.Int32)
+    src.store(words)
+    for k in range(n):
+        dst[k] = cute.arch.shuffle_sync_bfly(src[k], 2)
+    return dst.load()
+
+
+def gated_m64_p_words(
+    p_v: cute.TensorSSA, dtype: type[Numeric], parity: cutlass.Int32
+) -> cute.TensorSSA:
+    """Packed 16-bit P words a thread stores with ``St16x64b`` at the 64-row tile.
+
+    ``p_v`` holds the gate values of the thread's columns ``base + 2j +
+    parity`` (``j < C``); the partner thread (lane ``^ 2``) holds the other
+    parity of the same row.  The 16-bit A operand packs adjacent columns per
+    32-bit TMEM word and the store hands this thread the words ``2r + parity``,
+    i.e. the column pairs ``(base + 4r + 2 parity, base + 4r + 2 parity + 1)``:
+    one value of each pair comes from the partner.  With the converted values
+    packed two per word (``w_k = {lo: j = 2k, hi: j = 2k + 1}``), word ``r``
+    of a parity-0 thread is ``{lo: own w_r.lo, hi: partner's w_r.lo}`` and of
+    a parity-1 thread ``{lo: partner's w_r.hi, hi: own w_r.hi}``.  Each thread
+    packs the halves its partner needs two per word (``prmt``), exchanges
+    them with ``C / 4`` shuffles and merges with one ``prmt`` per stored word.
+    Pure data movement: the only rounding is the ``to(dtype)`` the 128-row
+    path also performs.
+    """
+    h = p_v.to(dtype)
+    n = cute.size(h.shape) // 2  # packed words
+    words = cute.make_rmem_tensor((n,), cutlass.Int32)
+    words.store(h.bitcast(cutlass.Int32))
+    odd = parity != 0
+    sel_send = cutlass.select_(
+        odd, cutlass.Int32(_PRMT_LO_LO), cutlass.Int32(_PRMT_HI_HI)
+    )
+    sel_even = cutlass.select_(
+        odd, cutlass.Int32(_PRMT_BLO_AHI), cutlass.Int32(_PRMT_LO_LO)
+    )
+    sel_odd = cutlass.select_(
+        odd, cutlass.Int32(_PRMT_BHI_AHI), cutlass.Int32(_PRMT_LO_HI)
+    )
+    recv = cute.make_rmem_tensor((n // 2,), cutlass.Int32)
+    for m in range(n // 2):
+        sent = _prmt(words[2 * m], words[2 * m + 1], sel_send)
+        recv[m] = cute.arch.shuffle_sync_bfly(sent, 2)
+    out = cute.make_rmem_tensor((n,), cutlass.Int32)
+    for r in range(n):
+        out[r] = _prmt(words[r], recv[r // 2], sel_even if r % 2 == 0 else sel_odd)
+    return out.load()
+
+
+def _gated_interleave(
+    a: cute.TensorSSA, b: cute.TensorSSA, dtype: type[Numeric]
+) -> cute.TensorSSA:
+    """``(n,)`` + ``(n,)`` -> ``(2n,)`` with ``a`` in the even and ``b`` in the odd slots."""
+    n = cute.size(a.shape)
+    frag = cute.make_rmem_tensor((2 * n,), dtype)
+    iterator = cast("cute.Pointer", frag.iterator)
+    half = cute.make_layout((n,), stride=(2,))
+    cute.make_tensor(iterator, half).store(a)
+    cute.make_tensor(iterator + 1, half).store(b)
+    return frag.load()
+
+
+def gated_m64_o_half_row(
+    o_v: cute.TensorSSA, dtype: type[Numeric], parity: cutlass.Int32
+) -> cute.TensorSSA:
+    """The contiguous half row ``[parity * H, (parity + 1) * H)`` of an O row
+    (``H = head_dim / 2``) in ``dtype``, at the 64-row tile.
+
+    ``o_v`` holds ``O[row, 2j + parity]`` (``j < H``): the thread keeps the
+    half of its values that falls in its half row (parity 0 the lower, parity 1
+    the upper), sends the other half to the partner (lane ``^ 2``) and
+    interleaves what it kept with what it received into consecutive columns.
+    16-bit dtypes move packed words: the kept and received halves are ``H / 4``
+    words each and every output word is one ``prmt`` of a kept and a received
+    word; 32-bit values are moved whole.  Pure data movement after the single
+    ``to(dtype)`` the 128-row path also performs.
+    """
+    h = o_v.to(dtype)
+    n = cute.size(h.shape)
+    if dtype.width == 32:
+        frag = cute.make_rmem_tensor((n,), dtype)
+        frag.store(h)
+        iterator = cast("cute.Pointer", frag.iterator)
+        quarter = cute.make_layout((n // 2,), stride=(1,))
+        low = cute.make_tensor(iterator, quarter).load()
+        high = cute.make_tensor(iterator + n // 2, quarter).load()
+        is_even = cute.full(low.shape, parity == 0, cutlass.Boolean)
+        keep = cute.where(is_even, low, high)
+        send = cute.where(is_even, high, low)
+        recv = _gated_shuffle_words_xor2(send.bitcast(cutlass.Int32)).bitcast(dtype)
+        a = cute.where(is_even, keep, recv)
+        b = cute.where(is_even, recv, keep)
+        return _gated_interleave(a, b, dtype)
+    words_n = n // 2  # packed words
+    half = words_n // 2  # words per half row
+    words = cute.make_rmem_tensor((words_n,), cutlass.Int32)
+    words.store(h.bitcast(cutlass.Int32))
+    odd = parity != 0
+    keep = cute.make_rmem_tensor((half,), cutlass.Int32)
+    recv = cute.make_rmem_tensor((half,), cutlass.Int32)
+    for m in range(half):
+        sent = cutlass.select_(odd, words[m], words[half + m])
+        keep[m] = cutlass.select_(odd, words[half + m], words[m])
+        recv[m] = cute.arch.shuffle_sync_bfly(sent, 2)
+    # Parity 0: {lo: own, hi: partner}; parity 1: {lo: partner, hi: own}.
+    sel_even = cutlass.select_(
+        odd, cutlass.Int32(_PRMT_BLO_ALO), cutlass.Int32(_PRMT_LO_LO)
+    )
+    sel_odd = cutlass.select_(
+        odd, cutlass.Int32(_PRMT_BHI_AHI), cutlass.Int32(_PRMT_HI_HI)
+    )
+    out = cute.make_rmem_tensor((words_n,), cutlass.Int32)
+    for t in range(words_n):
+        out[t] = _prmt(keep[t // 2], recv[t // 2], sel_even if t % 2 == 0 else sel_odd)
+    return out.load().bitcast(dtype)
 
 
 def relu_fragment_inplace(frg: cute.Tensor) -> None:

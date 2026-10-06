@@ -5307,6 +5307,37 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         return seeds[0] if seeds else None
 
 
+class CuteFlashGatedAttentionHeuristic(AutotunerHeuristic):
+    """Seed the fused tile shape for detected gated (softmax-free) attention.
+
+    The gated tcgen05 body (``cute_flash_gated``) fires only at 128x128 tiles,
+    which ``enable_cute_flash_gated_search`` pins; the seeds put every legal
+    K/V TMA ring depth into generation zero so the fused family is measured
+    against the rest of the search.
+    """
+
+    name = "cute_flash_gated_attention"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_flash_gated_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        seeds = env.config_spec.cute_flash_gated_seed_configs()
+        return seeds or None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
 class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
     """Seed the one-CTA tile used by tcgen05 thread-local epilogues.
 
