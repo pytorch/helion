@@ -102,6 +102,20 @@ def pallas_static_conditional_expression(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_static_value_slices(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        [128, 128],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for tile_rows in hl.tile(x.size(0), block_size=256):
+        values = x[tile_rows, :] * 2
+        first_half = values[0:128, :]
+        out[:, :] = first_half[:, 128:256]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sin(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -1063,6 +1077,14 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_nested_static_value_slices(self) -> None:
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_nested_static_value_slices,
+            (x,),
+        )
+        torch.testing.assert_close(result.cpu(), (x[:128, 128:256] * 2).cpu())
+
     def test_static_conditional_expression(self) -> None:
         x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
         _code, result = code_and_output(
@@ -1993,8 +2015,8 @@ class TestPallas(TestCase):
         ):
             code_and_output(reshape_then_narrow, (x, out), pallas_loop_type="fori_loop")
 
-    def test_resident_subview_recursive_failure_keeps_cause(self) -> None:
-        """A child failure invalidates every tentative ancestor with its cause."""
+    def test_rank_reduced_resident_subview_handles_padded_tile(self) -> None:
+        """Rank-reduced resident views preserve a partial final tile."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def nested_narrowing(x: torch.Tensor, out: torch.Tensor) -> None:
@@ -2008,24 +2030,17 @@ class TestPallas(TestCase):
                     acc += head.float().sum(dim=0)
                 out[0, :] = acc.to(out.dtype)
 
-        x = torch.ones(6, 2, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(
-            nested_narrowing,
-            (x, out),
-            block_sizes=[2],
-            pallas_loop_type="fori_loop",
-        )
-        self.assertNarrowingIsResident(code)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "may contain padding.*this config"
-        ):
+        x = torch.randn(6, 2, 2, 128, device=DEVICE, dtype=torch.float32)
+        expected = x[:, 0, 0, :].sum(dim=0, keepdim=True)
+        for block_size in (2, 4):
+            out = torch.empty(1, 128, device=DEVICE, dtype=torch.float32)
             code_and_output(
                 nested_narrowing,
                 (x, out),
-                block_sizes=[4],
+                block_sizes=[block_size],
                 pallas_loop_type="fori_loop",
             )
+            torch.testing.assert_close(out.cpu(), expected.cpu())
 
     def test_resident_subview_masked_boundary_is_structural(self) -> None:
         """A masked boundary outranks a simultaneous config-dependent failure."""

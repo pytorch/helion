@@ -257,10 +257,13 @@ def _is_static_basic_value_subscript(
         if source.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
             source = source.args[0]
             continue
-        # An earlier narrowing subscript may still carry a resident Ref and its
-        # boundary-mask invariants. A root load, by contrast, can materialize as
-        # an ordinary value before applying this compile-time basic index.
-        return source.target is not subscript
+        if source.target is subscript:
+            # A previous basic-value subscript has already ended any resident-Ref
+            # chain, so another static slice can safely use ordinary JAX indexing.
+            return bool(source.meta.get(STATIC_BASIC_VALUE_SUBSCRIPT_META))
+        # A root load can materialize as an ordinary value before applying this
+        # compile-time basic index.
+        return True
     return False
 
 
