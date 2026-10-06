@@ -1156,5 +1156,162 @@ class TestLayoutProvenance(unittest.TestCase):
                     self.assertIs(stride, harness.runtime_stride)
 
 
+@onlyBackends(["cute"])
+class TestDerivedInputStorageProvenance(unittest.TestCase):
+    def test_derived_storage_owner_offsets_and_alignment_are_separate(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=True)
+        )
+        real_x = torch.empty(4, 8)
+        with env:
+            x = env.to_fake(real_x, ArgumentOrigin("x"))
+            assert isinstance(x, torch.Tensor)
+            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": x}))
+            with patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ):
+                source = env.tensor_input_source(x)
+                for view in (x.flatten(), x.transpose(0, 1), x.flatten()[1:]):
+                    self.assertIsNone(env.tensor_input_source(view))
+                    self.assertEqual(env.tensor_storage_input_source(view), source)
+                self.assertEqual(
+                    env.tensor_descriptor_alignment_source(x.flatten()), source
+                )
+                self.assertIsNone(
+                    env.tensor_descriptor_alignment_source(x.flatten()[1:])
+                )
+                self.assertIsNone(env.tensor_storage_input_source(x.clone()))
+
+    def test_derived_storage_owner_rejects_ambiguity_and_unknown_layout(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=True)
+        )
+        real_x = torch.empty(4, 8)
+        with env:
+            x = env.to_fake(real_x, ArgumentOrigin("x"))
+            assert isinstance(x, torch.Tensor)
+            view = x.flatten()
+            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": x}))
+            with patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ):
+                self.assertIsNotNone(env.tensor_storage_input_source(view))
+                env._ambiguous_tensor_input_source_ids.add(id(x))
+                self.assertIsNone(env.tensor_storage_input_source(view))
+                env._ambiguous_tensor_input_source_ids.clear()
+                other = x[1:]
+                env.input_sources[other] = LocalSource("other", is_input=True)
+                self.assertIsNone(env.tensor_storage_input_source(view))
+                # Existing alignment selects the sole zero-offset owner, unchanged.
+                self.assertEqual(
+                    env.tensor_descriptor_alignment_source(view), env.input_sources[x]
+                )
+                env.input_sources.pop(other)
+                with (
+                    patch.object(env.settings, "static_shapes", False),
+                    patch.object(
+                        env, "tensor_layout_is_symbolically_exact", return_value=False
+                    ),
+                ):
+                    self.assertIsNone(env.tensor_storage_input_source(view))
+                    self.assertIsNone(env.tensor_descriptor_alignment_source(view))
+
+    def test_derived_storage_disjointness_uses_real_guard_and_lifetime(self) -> None:
+        from helion._compiler.cute.memory_ops import (
+            register_cute_tensor_alias_specializations,
+        )
+
+        real_x, real_out = torch.empty(4, 8), torch.empty(4)
+        aliases = (real_x.flatten()[:4], torch.from_dlpack(real_x).flatten()[:4])
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=True)
+        )
+        with env:
+            x = env.to_fake(real_x, ArgumentOrigin("x"))
+            out = env.to_fake(real_out, ArgumentOrigin("out"))
+            assert isinstance(x, torch.Tensor) and isinstance(out, torch.Tensor)
+            derived = x.flatten()[1:]
+            host = SimpleNamespace(
+                params=SimpleNamespace(arguments={"x": x, "out": out})
+            )
+            key = _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+            with patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ):
+                with env.use_runtime_arg_values({"x": real_x, "out": real_out}):
+                    # Fake storage inequality alone is never sufficient.
+                    self.assertFalse(
+                        runtime_tensors_are_proven_disjoint(
+                            env, derived, out, allow_unbound=True
+                        )
+                    )
+                    register_cute_tensor_alias_specializations(env)
+                    self.assertFalse(
+                        runtime_tensors_are_proven_disjoint(env, derived, out)
+                    )
+                    self.assertTrue(
+                        runtime_tensors_are_proven_disjoint(
+                            env, derived, out, allow_unbound=True
+                        )
+                    )
+                    descriptor = env.runtime_input_specializations[key]
+                    env.bound_runtime_input_specialization_results[key] = (
+                        descriptor.classifier((real_x, real_out))
+                    )
+                    self.assertTrue(
+                        runtime_tensors_are_proven_disjoint(env, derived, out)
+                    )
+                # Bound runtime facts remain usable after weak construction inputs expire.
+                with env.use_runtime_arg_values({}):
+                    self.assertTrue(
+                        runtime_tensors_are_proven_disjoint(env, derived, out)
+                    )
+                for alias in aliases:
+                    with env.use_runtime_arg_values({"x": real_x, "out": alias}):
+                        self.assertFalse(
+                            runtime_tensors_are_proven_disjoint(env, derived, out)
+                        )
+                        self.assertFalse(
+                            runtime_tensors_are_proven_disjoint(
+                                env, derived, out, allow_unbound=True
+                            )
+                        )
+                env.bound_runtime_input_specialization_results[key] = (False,)
+                with env.use_runtime_arg_values({"x": real_x, "out": real_out}):
+                    self.assertFalse(
+                        runtime_tensors_are_proven_disjoint(
+                            env, derived, out, allow_unbound=True
+                        )
+                    )
+
+    def test_derived_storage_dispatch_rejects_later_aliasing_inputs(self) -> None:
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def viewed_scan(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            flat = x.flatten()
+            for tile in hl.tile(flat.numel(), block_size=32):
+                out[tile] = hl.cumsum(flat[tile], dim=0)
+            return out
+
+        x, out = torch.empty(4, 8), torch.empty(32)
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            patch(
+                "torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")
+            ),
+        ):
+            disjoint = viewed_scan.bind((x, out))
+            self.assertIn(
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+                disjoint.env.runtime_input_specializations,
+            )
+            for alias in (x.flatten(), torch.from_dlpack(x).flatten()):
+                self.assertIsNot(viewed_scan.bind((x, alias)), disjoint)
+            self.assertIs(viewed_scan.bind((x, torch.empty_like(out))), disjoint)
+
+
 if __name__ == "__main__":
     unittest.main()

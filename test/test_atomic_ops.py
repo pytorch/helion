@@ -8610,7 +8610,16 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
                     )
                     for flag in (False, True)
                 ]
-                self.assertEqual(*codes)
+                if options.get("cute_fragment_atomic_aggregation"):
+                    self.assertEqual(*codes)
+                else:
+                    self.assertNotEqual(*codes)
+                    for code in codes:
+                        args[1].fill_(-99)
+                        _simulate_register_load_program(
+                            code, args[0], 32, host_tensors={"out": args[1]}
+                        )
+                        _check_fused_compaction(args)
 
     def test_input_register_escape_rejection_is_preserved(self):
         # This base's load-register proof does not admit the indexed atomic
@@ -10753,3 +10762,484 @@ class TestFragmentRegisterProducerNative(TestCase):
                     ):
                         torch.testing.assert_close(value, reference, rtol=0, atol=0)
                     torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _fragment_register_fused_scatter(x, mode: hl.constexpr = "valid"):
+    rows, width = x.shape
+    out = torch.full((rows, width), -1, dtype=torch.int32, device=x.device)
+    packed = torch.zeros((rows, width * 2 + 2), dtype=torch.int32, device=x.device)
+    for row in hl.grid(rows):
+        i = hl.arange(helion.next_power_of_2(width))
+        value = hl.load(x, [row, i], extra_mask=i < width)
+        if mode == "load_output":
+            value = hl.load(out, [row, i], extra_mask=i < width)
+        positive = (i < width) & (value > 0)
+        negative = (i < width) & (value < 0)
+        count = hl.zeros([1], dtype=torch.int32)
+        higher = hl.zeros([1], dtype=torch.int32)
+        if mode == "nonzero":
+            higher = hl.full([1], 1, dtype=torch.int32)
+        keys = hl.zeros([helion.next_power_of_2(width)], dtype=torch.int32)
+        ids = hl.zeros([helion.next_power_of_2(width)], dtype=torch.int32)
+        ticket = hl.atomic_add(
+            count, [torch.where(positive, 0, 1)], positive.to(torch.int32)
+        )
+        hl.atomic_add(
+            keys,
+            [torch.where(positive, ticket, helion.next_power_of_2(width))],
+            torch.where(positive, value, 0),
+        )
+        hl.atomic_add(
+            ids,
+            [torch.where(positive, ticket, helion.next_power_of_2(width))],
+            torch.where(positive, i + 1, 0).to(torch.int32),
+        )
+        if mode == "observer":
+            observed = keys.sum()
+            negative = negative & (observed > 0)
+        if mode == "late_init":
+            higher = hl.zeros([1], dtype=torch.int32)
+        increment = negative.to(torch.int32)
+        if mode == "two":
+            increment = increment * 2
+        if mode == "signed":
+            increment = -increment
+        position = hl.atomic_add(higher, [torch.where(negative, 0, 1)], increment)
+        index = position
+        if mode == "modulo":
+            index = position % 2
+        mask = negative
+        if mode == "unmasked":
+            mask = i < width
+        hl.store(out, [row, index], i.to(torch.int32), extra_mask=mask)
+        hl.store(packed, [row, 0], count.sum().to(torch.int32))
+        hl.store(packed, [row, 1], higher.sum().to(torch.int32))
+        hl.store(packed, [row, i + 2], keys, extra_mask=i < width)
+        hl.store(packed, [row, i + width + 2], ids, extra_mask=i < width)
+    return out, packed
+
+
+class TestFragmentRegisterAtomicFusionCPU(unittest.TestCase):
+    def test_independent_ticket_chains_register_tails_and_scatter(self):
+        import ast
+
+        for width, threads in ((1, 32), (17, 32), (65, 32), (129, 128)):
+            for registers in (False, True):
+                with self.subTest(width=width, registers=registers):
+                    x = (torch.arange(2 * width).reshape(2, width) % 7 - 3).int()
+                    codes = [
+                        _atomic_consumer_fusion_codegen(
+                            _fragment_register_fused_scatter,
+                            (x,),
+                            enabled,
+                            threads,
+                            cute_fragment_local_atomic_registers=registers,
+                        )
+                        for enabled in (False, True)
+                    ]
+                    effects = []
+                    for code in codes:
+                        tree = ast.parse(code)
+                        effects.append(
+                            max(
+                                sum(
+                                    isinstance(n, ast.Call)
+                                    and ast.unparse(n.func) == "cute.arch.atomic_add"
+                                    for n in ast.walk(loop)
+                                )
+                                for loop in ast.walk(tree)
+                                if isinstance(loop, ast.For)
+                            )
+                        )
+                    self.assertEqual(effects, [1, 4])
+                    self.assertEqual(
+                        codes[0].count("cute.arch.sync_threads()"),
+                        codes[1].count("cute.arch.sync_threads()"),
+                    )
+                    for order in (list(range(threads)), list(reversed(range(threads)))):
+                        results = []
+                        for code in codes:
+                            out = torch.full_like(x, -1)
+                            packed = torch.zeros((2, width * 2 + 2), dtype=torch.int32)
+                            before = x.clone()
+                            _simulate_register_load_program(
+                                code,
+                                x,
+                                threads,
+                                host_tensors={"out": out, "packed": packed},
+                                lane_order=order,
+                            )
+                            torch.testing.assert_close(x, before, rtol=0, atol=0)
+                            for row in range(2):
+                                pos = torch.nonzero(x[row] > 0).flatten()
+                                neg = torch.nonzero(x[row] < 0).flatten()
+                                self.assertEqual(int(packed[row, 0]), pos.numel())
+                                self.assertEqual(int(packed[row, 1]), neg.numel())
+                                ids = (
+                                    packed[
+                                        row, width + 2 : width + 2 + pos.numel()
+                                    ].long()
+                                    - 1
+                                )
+                                self.assertEqual(ids.unique().numel(), pos.numel())
+                                self.assertTrue(torch.isin(ids, pos).all())
+                                torch.testing.assert_close(
+                                    packed[row, 2 : 2 + pos.numel()],
+                                    x[row, ids],
+                                    rtol=0,
+                                    atol=0,
+                                )
+                                torch.testing.assert_close(
+                                    out[row, : neg.numel()].sort().values,
+                                    neg.int(),
+                                    rtol=0,
+                                    atol=0,
+                                )
+                                self.assertTrue((out[row, neg.numel() :] == -1).all())
+                            results.append((out, packed))
+                        torch.testing.assert_close(
+                            results[0], results[1], rtol=0, atol=0
+                        )
+
+    def test_nonunique_or_observed_scatter_is_not_joined(self):
+        import ast
+
+        x = torch.arange(130, dtype=torch.int32).reshape(2, 65) - 32
+        for mode in (
+            "nonzero",
+            "two",
+            "signed",
+            "modulo",
+            "unmasked",
+            "observer",
+            "late_init",
+            "load_output",
+        ):
+            with self.subTest(mode=mode):
+                code = _atomic_consumer_fusion_codegen(
+                    _fragment_register_fused_scatter,
+                    (x, mode),
+                    True,
+                    cute_fragment_local_atomic_registers=True,
+                )
+                largest = max(
+                    sum(
+                        isinstance(n, ast.Call)
+                        and ast.unparse(n.func) == "cute.arch.atomic_add"
+                        for n in ast.walk(loop)
+                    )
+                    for loop in ast.walk(ast.parse(code))
+                    if isinstance(loop, ast.For)
+                )
+                self.assertEqual(largest, 3)
+
+    def test_zero_and_integer_extremes_preserve_ticket_payloads(self):
+        import random
+
+        order = list(range(32))
+        random.Random(123).shuffle(order)
+        for x in (
+            torch.zeros((2, 65), dtype=torch.int32),
+            torch.tensor([-2147483648, 2147483647, -1, 0, 1], dtype=torch.int32)
+            .repeat(26)
+            .reshape(2, 65),
+        ):
+            with self.subTest(all_zero=not bool(x.any())):
+                for enabled in (False, True):
+                    code = _atomic_consumer_fusion_codegen(
+                        _fragment_register_fused_scatter,
+                        (x,),
+                        enabled,
+                        cute_fragment_local_atomic_registers=True,
+                        cute_fragment_skip_zero_atomics=True,
+                    )
+                    out = torch.full_like(x, -1)
+                    packed = torch.zeros((2, 132), dtype=torch.int32)
+                    _simulate_register_load_program(
+                        code,
+                        x,
+                        32,
+                        host_tensors={"out": out, "packed": packed},
+                        lane_order=order,
+                    )
+                    for row in range(2):
+                        pos = torch.nonzero(x[row] > 0).flatten()
+                        neg = torch.nonzero(x[row] < 0).flatten()
+                        self.assertEqual(int(packed[row, 0]), pos.numel())
+                        self.assertEqual(int(packed[row, 1]), neg.numel())
+                        ids = packed[row, 67 : 67 + pos.numel()].long() - 1
+                        torch.testing.assert_close(
+                            packed[row, 2 : 2 + pos.numel()],
+                            x[row, ids],
+                            rtol=0,
+                            atol=0,
+                        )
+                        torch.testing.assert_close(
+                            out[row, : neg.numel()].sort().values,
+                            neg.int(),
+                            rtol=0,
+                            atol=0,
+                        )
+                        self.assertTrue((out[row, neg.numel() :] == -1).all())
+
+    def test_actual_fx_scatter_binding_and_cast_rejections(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.atomic_consumer_fusion import atomic_consumer_regions
+        from helion.language import _tracing_ops
+        from helion.language import memory_ops
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(
+                _fragment_register_fused_scatter,
+                (torch.ones((2, 65), dtype=torch.int32),),
+            )
+            with bound.env, bound.host_function:
+                graphs = bound.host_function.device_ir.graphs
+                graph = graphs[0].graph
+                store = next(n for n in graph.nodes if n.target is memory_ops.store)
+                source = next(
+                    n
+                    for n in graph.nodes
+                    if n.target is _tracing_ops._host_tensor and n.args[0] == "x"
+                )
+
+                def largest():
+                    return max(
+                        len(region.atomics)
+                        for region in atomic_consumer_regions(
+                            graphs, bound.env
+                        ).values()
+                    )
+
+                self.assertEqual(largest(), 4)
+                original = store.args
+                for args in (
+                    (source, *original[1:]),
+                    (original[0], [0, original[1][1]], *original[2:]),
+                ):
+                    with self.subTest(args=str(args)):
+                        store.args = args
+                        self.assertEqual(largest(), 3)
+                        store.args = original
+                index = store.args[1][1]
+                old_target, old_args, old_value = (
+                    index.target,
+                    index.args,
+                    index.meta["val"],
+                )
+                index.target = torch.ops.prims.convert_element_type.default
+                index.args = (old_args[0], torch.int16)
+                index.meta["val"] = old_value.to(torch.int16)
+                self.assertEqual(largest(), 3)
+                index.target, index.args, index.meta["val"] = (
+                    old_target,
+                    old_args,
+                    old_value,
+                )
+                self.assertEqual(largest(), 4)
+
+
+@onlyBackends("cute")
+class TestFragmentRegisterAtomicFusionNative(TestCase):
+    def test_independent_compaction_and_unique_global_tickets(self):
+        for width in (17, 65, 129):
+            x = (torch.arange(3 * width, device=DEVICE).reshape(3, width) % 7 - 3).int()
+            x[0].zero_()
+            before = x.clone()
+            for enabled in (False, True):
+                with self.subTest(width=width, enabled=enabled):
+                    _code, (out, packed) = code_and_output(
+                        _fragment_register_fused_scatter,
+                        (x,),
+                        cute_fragment_threads=128,
+                        cute_fragment_local_atomic_registers=True,
+                        cute_fragment_atomic_consumer_fusion=enabled,
+                        cute_fragment_skip_zero_atomics=True,
+                    )
+                    for row in range(3):
+                        positive = torch.nonzero(x[row] > 0).flatten()
+                        negative = torch.nonzero(x[row] < 0).flatten()
+                        self.assertEqual(int(packed[row, 0]), positive.numel())
+                        self.assertEqual(int(packed[row, 1]), negative.numel())
+                        ids = (
+                            packed[row, width + 2 : width + 2 + positive.numel()].long()
+                            - 1
+                        )
+                        self.assertEqual(ids.unique().numel(), positive.numel())
+                        self.assertTrue(torch.isin(ids, positive).all())
+                        torch.testing.assert_close(
+                            packed[row, 2 : 2 + positive.numel()],
+                            x[row, ids],
+                            rtol=0,
+                            atol=0,
+                        )
+                        torch.testing.assert_close(
+                            out[row, : negative.numel()].sort().values,
+                            negative.int(),
+                            rtol=0,
+                            atol=0,
+                        )
+                        self.assertTrue((out[row, negative.numel() :] == -1).all())
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _fragment_scoped_ticket_epochs(x, rounds: hl.constexpr):
+    rows, width = x.shape
+    size = helion.next_power_of_2(width)
+    out = torch.zeros((rows, 17 + size * 2), dtype=torch.int32, device=x.device)
+    for row in hl.grid(rows):
+        i = hl.arange(size)
+        value = hl.load(x, [row, i], extra_mask=i < width)
+        live = (i < width) & (value != 0)
+        counter = hl.full([1], 2147483647, dtype=torch.int32)
+        bins = hl.full([16], 3, dtype=torch.int32)
+        ticket = hl.atomic_add(counter, [torch.where(live, 0, 1)], value)
+        alias = ticket.to(torch.int32)
+        hl.atomic_add(bins, [torch.where(live, alias & 15, 16)], value)
+        j = hl.arange(16)
+        hl.store(out, [row, j], bins)
+        hl.store(out, [row, 16], counter.sum())
+        # Later storage is larger than either ticket or histogram. Its pending
+        # atomics must publish even when the following loop executes zero times.
+        later = hl.full([size * 2], 7, dtype=torch.int32)
+        hl.atomic_add(later, [torch.where(i < width, i, size * 2)], value)
+        for _iteration in range(rounds):
+            hl.atomic_add(later, [torch.where(i < width, i, size * 2)], value)
+        k = hl.arange(size * 2)
+        hl.store(out, [row, k + 17], later)
+    return out
+
+
+class TestFragmentIterationLocalReturnsCPU(unittest.TestCase):
+    def test_wrap_masks_zero_trip_and_later_allocation_epochs(self):
+        for width, rounds, threads in (
+            (1, 0, 32),
+            (17, 2, 32),
+            (65, 0, 32),
+            (129, 2, 128),
+        ):
+            for registers in (False, True):
+                with self.subTest(width=width, rounds=rounds, registers=registers):
+                    x = (torch.arange(2 * width).reshape(2, width) % 7 - 3).int()
+                    x[0].zero_()
+                    codes = [
+                        _atomic_consumer_fusion_codegen(
+                            _fragment_scoped_ticket_epochs,
+                            (x, rounds),
+                            fusion,
+                            threads,
+                            cute_fragment_local_atomic_registers=registers,
+                        )
+                        for fusion in (False, True)
+                    ]
+                    self.assertNotIn("fragment_iteration_ticket", codes[0])
+                    self.assertIn("fragment_iteration_ticket", codes[1])
+                    self.assertNotIn("fragment_local_tickets", codes[1])
+                    self.assertEqual(
+                        codes[0].count("cute.arch.sync_threads()"),
+                        codes[1].count("cute.arch.sync_threads()"),
+                    )
+                    for order in (list(range(threads)), list(reversed(range(threads)))):
+                        outputs = []
+                        for code in codes:
+                            out = torch.zeros(
+                                (2, 17 + helion.next_power_of_2(width) * 2),
+                                dtype=torch.int32,
+                            )
+                            _simulate_register_load_program(
+                                code,
+                                x,
+                                threads,
+                                host_tensors={"out": out},
+                                lane_order=order,
+                            )
+                            expected = torch.full_like(out[:, 17:], 7)
+                            expected[:, :width] += x * (rounds + 1)
+                            torch.testing.assert_close(
+                                out[:, 17:], expected, rtol=0, atol=0
+                            )
+                            total = x.to(torch.int64).sum(1) + 2147483647
+                            torch.testing.assert_close(
+                                out[:, 16], total.to(torch.int32), rtol=0, atol=0
+                            )
+                            outputs.append(out)
+                        torch.testing.assert_close(*outputs, rtol=0, atol=0)
+
+    def test_current_coordinate_proof_runs_for_actual_consumers(self):
+        from unittest.mock import patch
+
+        from helion._compiler.cute.register_snapshots import SnapshotOwner
+
+        original = SnapshotOwner.prove
+        coordinates = []
+
+        def record(owner, coordinate):
+            coordinates.append(coordinate)
+            return original(owner, coordinate)
+
+        with patch.object(SnapshotOwner, "prove", record):
+            _atomic_consumer_fusion_codegen(
+                _fragment_register_fused_scatter,
+                (torch.ones((2, 65), dtype=torch.int32),),
+                True,
+            )
+        self.assertGreaterEqual(len(coordinates), 3)
+
+        # A remapped consumer must fail the same proof used by the actual
+        # emitted callback, even inside an otherwise valid selected region.
+        def remap(owner, coordinate):
+            return original(owner, f"({coordinate}) + 1")
+
+        with (
+            patch.object(SnapshotOwner, "prove", remap),
+            self.assertRaises(helion.exc.InvalidConfig),
+        ):
+            _atomic_consumer_fusion_codegen(
+                _fragment_register_fused_scatter,
+                (torch.ones((2, 65), dtype=torch.int32),),
+                True,
+            )
+
+
+@onlyBackends("cute")
+class TestFragmentIterationLocalReturnsNative(TestCase):
+    def test_masked_wrap_and_later_atomic_epochs(self):
+        for width, rounds in ((17, 0), (65, 2)):
+            for registers in (False, True):
+                for fusion in (False, True):
+                    with self.subTest(width=width, registers=registers, fusion=fusion):
+                        x = (
+                            torch.arange(2 * width, device=DEVICE).reshape(2, width) % 7
+                            - 3
+                        ).int()
+                        x[0].zero_()
+                        before = x.clone()
+                        _, out = code_and_output(
+                            _fragment_scoped_ticket_epochs,
+                            (x, rounds),
+                            cute_fragment_threads=32,
+                            cute_fragment_local_atomic_registers=registers,
+                            cute_fragment_atomic_consumer_fusion=fusion,
+                        )
+                        expected = torch.full_like(out[:, 17:], 7)
+                        expected[:, :width] += x * (rounds + 1)
+                        torch.testing.assert_close(
+                            out[:, 17:], expected, rtol=0, atol=0
+                        )
+                        total = x.to(torch.int64).sum(1)
+                        torch.testing.assert_close(
+                            out[:, 16],
+                            (total + 2147483647).to(torch.int32),
+                            rtol=0,
+                            atol=0,
+                        )
+                        torch.testing.assert_close(
+                            out[:, :16].sum(1), total + 48, rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(x, before, rtol=0, atol=0)
