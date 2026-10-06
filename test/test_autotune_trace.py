@@ -459,6 +459,7 @@ def test_multi_shape_rebenchmark_traces_only_fresh_results(
             "ok",
             0.1,
             completed_at=307.0,
+            per_shape=(6.0, 12.0),
         ),
         BenchmarkResult(
             configs[1], lambda: None, math.inf, "timeout", 0.2, completed_at=308.0
@@ -470,8 +471,7 @@ def test_multi_shape_rebenchmark_traces_only_fresh_results(
     metrics = AutotuneMetrics()
     provider = object.__new__(MultiShapeBenchmarkProvider)
     provider.log = log
-    provider.args = SimpleNamespace(relative_to=relative_to)
-    provider.raw_latency = Mock(return_value=12.0)
+    provider.args = SimpleNamespace(relative_to=relative_to, aggregation="max")
     provider._autotune_metrics = metrics
     provider.budget_exceeded_fn = Mock(return_value=False)
     provider._benchmark = Mock(return_value=results)
@@ -509,7 +509,6 @@ def test_multi_shape_rebenchmark_traces_only_fresh_results(
         configs, desc="Rebenchmarking", record_results=False, check_budget=False
     )
     assert provider.budget_exceeded_fn.call_count == 2
-    provider.raw_latency.assert_called_once_with(configs[0])
 
 
 @pytest.mark.parametrize(

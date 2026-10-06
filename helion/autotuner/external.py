@@ -85,7 +85,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
 
     Private for now; could be made public/subclassable once the interface
     stabilises.  Subclassing would let DSL authors override the diagnostic
-    hooks: ``get_cached_path``, ``to_triton_code``, ``format_kernel_decorator``,
+    hooks: ``get_cached_path``, ``to_code``, ``format_kernel_decorator``,
     and ``maybe_log_repro``.
     """
 
@@ -164,7 +164,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
     def get_cached_path(self, config: Config | None = None) -> str | None:
         return None
 
-    def to_triton_code(
+    def to_code(
         self,
         config: Config | dict[str, object] | None = None,
         *,
@@ -172,6 +172,20 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         output_origin_lines: bool | None = None,
     ) -> str | None:
         return None
+
+    def to_triton_code(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str | None:
+        """Backward-compatible alias for :meth:`to_code`."""
+        return self.to_code(
+            config,
+            emit_repro_caller=emit_repro_caller,
+            output_origin_lines=output_origin_lines,
+        )
 
     def maybe_log_repro(
         self,
