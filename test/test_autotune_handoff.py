@@ -543,6 +543,111 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(point.progress.trials, 1)
         self.assert_cleaned_up(script)
 
+    def test_automatic_plateau_uses_distinct_sources_and_confirmations(self) -> None:
+        script = _Script({index: [1.0] for index in range(1, 7)})
+
+        point = find_handoff(
+            _Search(_Kernel(script), [[index] for index in range(1, 7)]),
+            HandoffPolicy(automatic=True, min_unique_sources=2, patience=2),
+        )
+
+        self.assertEqual(point.reason, "plateau")
+        self.assertEqual(point.progress.trials, 4)
+        self.assertEqual(point.progress.unique_sources, 4)
+        self.assertNotIn(5, script.calls)
+        self.assertTrue(all(candidate.noise == 0 for candidate in point.finalists))
+        self.assert_cleaned_up(script)
+
+    def test_automatic_handoff_waits_for_nested_required_phases(self) -> None:
+        script = _Script({index: [1.0] for index in range(1, 7)})
+        kernel = _Kernel(script)
+        test = self
+
+        class RequiredSearch(_Search):
+            def _autotune(self) -> Config:
+                with self.defer_automatic_handoff():
+                    return super()._autotune()
+
+        class NestedSearch(_Search):
+            def _autotune(self) -> Config:
+                with self.defer_automatic_handoff():
+                    RequiredSearch(kernel, [[1], [2]]).autotune()
+                    # Ending the inner deferral must not end the outer one.
+                    self.benchmark(_config(3))
+                    test.assertEqual(dict(script.calls), {1: 1, 2: 1, 3: 1})
+                return super()._autotune()
+
+        point = find_handoff(
+            NestedSearch(kernel, [[4], [5], [6]]),
+            HandoffPolicy(automatic=True, min_unique_sources=2, patience=1),
+        )
+
+        self.assertEqual(point.reason, "plateau")
+        self.assertEqual(point.progress.trials, 5)
+        self.assertNotIn(6, script.calls)
+        self.assert_cleaned_up(script)
+
+    def test_explicit_limit_still_stops_a_deferred_phase(self) -> None:
+        script = _Script({1: [1.0], 2: [1.0]})
+
+        class RequiredSearch(_Search):
+            def _autotune(self) -> Config:
+                with self.defer_automatic_handoff():
+                    return super()._autotune()
+
+        point = find_handoff(
+            RequiredSearch(_Kernel(script), [[1], [2]]),
+            HandoffPolicy(automatic=True, after_trials=1),
+        )
+
+        self.assertEqual(point.reason, "trials")
+        self.assertEqual(point.progress.trials, 1)
+        self.assertNotIn(2, script.calls)
+        self.assert_cleaned_up(script)
+
+    def test_automatic_material_improvement_resets_plateau(self) -> None:
+        script = _Script({index: [10.0 if index < 3 else 5.0] for index in range(1, 8)})
+
+        point = find_handoff(
+            _Search(_Kernel(script), [[index] for index in range(1, 8)]),
+            HandoffPolicy(automatic=True, min_unique_sources=2, patience=2),
+        )
+
+        self.assertEqual(point.reason, "plateau")
+        self.assertEqual(point.progress.trials, 6)
+        self.assertNotIn(7, script.calls)
+        self.assertEqual(point.finalists[0].perf, 5.0)
+        self.assert_cleaned_up(script)
+
+    def test_noisy_confirmation_does_not_trigger_plateau(self) -> None:
+        script = _Script({index: [10.0, 8.0, 10.0, 12.0] for index in range(1, 5)})
+
+        point = find_handoff(
+            _Search(_Kernel(script), [[index] for index in range(1, 5)]),
+            HandoffPolicy(automatic=True, min_unique_sources=2, patience=2),
+        )
+
+        self.assertEqual(point.reason, "completed")
+        self.assertEqual(point.progress.trials, 4)
+        self.assert_cleaned_up(script)
+
+    def test_duplicate_sources_cannot_satisfy_minimum_exploration(self) -> None:
+        script = _Script(
+            {index: [1.0] for index in range(1, 7)},
+            sources=dict.fromkeys(range(1, 7), "same"),
+        )
+
+        point = find_handoff(
+            _Search(_Kernel(script), [[index] for index in range(1, 7)]),
+            HandoffPolicy(automatic=True, min_unique_sources=2, patience=1),
+        )
+
+        self.assertEqual(point.reason, "completed")
+        self.assertEqual(point.progress.trials, 6)
+        self.assertEqual(point.progress.unique_sources, 1)
+        self.assertEqual(len(point.finalists), 1)
+        self.assert_cleaned_up(script)
+
     def test_skip_cache_bypasses_read_but_preserves_write(self) -> None:
         script = _Script({1: [1.0]})
         cache = _Cache(_Search(_Kernel(script), [[1]]), _config(2))
@@ -575,6 +680,10 @@ class TestAutotuneHandoff(unittest.TestCase):
             {"after_trials": 0},
             {"after_seconds": math.inf},
             {"after_seconds": -1.0},
+            {"min_unique_sources": 0},
+            {"patience": 0},
+            {"min_improvement": 0.0},
+            {"min_improvement": 1.0},
             {"finalists": 0},
             {"repetitions": 2},
         ):
@@ -822,6 +931,24 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(
             len({candidate.source_hash for candidate in point.finalists}), 2
         )
+        self.assert_cleaned_up(script)
+
+    def test_unavailable_source_identity_cannot_trigger_plateau(self) -> None:
+        script = _Script({index: [1.0] for index in range(1, 5)})
+        kernel = _Kernel(script)
+        with (
+            patch.object(_Backend, "generated_source_hash", return_value=None),
+            patch.object(kernel, "to_code", return_value=None),
+        ):
+            point = find_handoff(
+                _Search(kernel, [[index] for index in range(1, 5)]),
+                HandoffPolicy(automatic=True, min_unique_sources=1, patience=1),
+            )
+
+        self.assertEqual(point.reason, "completed")
+        self.assertEqual(point.progress.trials, 4)
+        self.assertEqual(point.progress.unique_sources, 0)
+        self.assertTrue(all(row.source_hash is None for row in point.measurements))
         self.assert_cleaned_up(script)
 
 

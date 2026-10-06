@@ -25,9 +25,9 @@ to benchmark in-process.
 
 ## Choosing a source-optimization handoff point
 
-`find_handoff` runs an autotuner until a user-selected stopping point or search
-completion, then confirms a starting kernel for source optimization. It is
-opt-in; ordinary `autotune()` calls are unchanged.
+`find_handoff` runs an autotuner until a user-selected stopping point or an
+automatically detected plateau, then confirms a starting kernel for source
+optimization. It is opt-in; ordinary `autotune()` calls are unchanged.
 
 ```python
 from helion.autotuner import HandoffPolicy, LFBOTreeSearch, find_handoff
@@ -35,7 +35,7 @@ from helion.autotuner import HandoffPolicy, LFBOTreeSearch, find_handoff
 bound = kernel.bind(args)
 point = find_handoff(
     LFBOTreeSearch(bound, args),
-    HandoffPolicy(after_trials=100),
+    HandoffPolicy(automatic=True),
 )
 # point.config and point.fn identify the selected starting kernel.
 # point.measurements retains search trials and fresh confirmation measurements.
@@ -52,13 +52,22 @@ them on each rank and synchronize the decision.
 If `autotune_baseline_fn` triggers autotuning of another Helion kernel, those
 trials share the handoff session and can interfere with selection.
 
-Multi-shape searches count the combined source identity across all shapes and
-preserve their aggregate objective.
+Automatic mode first explores `min_unique_sources=32` successfully measured
+sources, then checks after each `patience=16` additional sources. It compares
+freshly measured finalists against the previous incumbent. An improvement below
+`min_improvement=0.01` signals a plateau only when repeated timings are stable;
+noisy results keep the search running. Backends without source identity can use
+explicit triggers or completion, but do not contribute to the unique-source
+threshold. Multi-shape searches count the combined source identity across all
+shapes and preserve their aggregate objective. Automatic checks wait for required
+initialization, family qualification, and hybrid LLM seeding to finish; explicit
+triggers remain active during those stages.
 
 Selection rechecks correctness and benchmarks up to `finalists=5` distinct
-sources, plus the returned config, using `repetitions=3` fresh passes with rotating
-order. It chooses the lowest median among candidates that pass every repetition.
-Final confirmation after stopping can extend the time limit. Confirmation does
+sources, plus the returned config or previous incumbent, using `repetitions=3`
+fresh passes with rotating order. It chooses the lowest median among candidates
+that pass every repetition. Automatic checkpoints count toward elapsed time;
+final confirmation after stopping can extend the time limit. Confirmation does
 not count as exploration. A cache-wrapped search is also accepted: cache hits are
 confirmed and report `"completed"` with zero search trials. Completed searches
 retain normal cache behavior; early handoff unwinds before the cache write.

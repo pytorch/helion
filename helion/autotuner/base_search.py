@@ -53,6 +53,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
+from .handoff import _defer_automatic_handoff
 from .handoff import _observe_handoff
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
@@ -904,6 +905,16 @@ class BaseSearch(BaseAutotuner):
         # their resources.
         _observe_handoff(self, results)
         return results
+
+    @contextlib.contextmanager
+    def defer_automatic_handoff(self) -> Iterator[None]:
+        """Finish a required search phase before checking for a plateau.
+
+        Deferrals compose across nested searches. Explicit trial, time, and
+        callback cutoffs still apply at completed benchmark batches.
+        """
+        with _defer_automatic_handoff():
+            yield
 
     def benchmark(self, config: Config) -> BenchmarkResult:
         """Compile and benchmark a single configuration.
