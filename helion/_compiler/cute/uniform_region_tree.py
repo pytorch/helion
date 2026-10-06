@@ -70,6 +70,7 @@ class UniformRegionTree:
     auxiliary_graph_ids: tuple[int, ...]
     indexed_reads: tuple[CompletedLocalRead, ...] = ()
     scan_calls: tuple[Node, ...] = ()
+    output_stores: frozenset[Node] = frozenset()
     requirements: tuple[str, ...] = (
         "scalar_CTA_owner_and_shared_predicate_publication",
         "readonly_captures_and_logical_domains_in_actual_parent_context",
@@ -437,8 +438,10 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
     """
     from ...language import memory_ops
     from ...language import scan_ops
+    from ...language import view_ops
     from ..aten_lowering import alias_lowering
     from ..aten_lowering import view_dtype_lowering
+    from ..inductor_lowering import APIFuncLowering
     from ..inductor_lowering import PointwiseLowering
     from ..inductor_lowering import ReductionLowering
     from ..inductor_lowering import SympyExprLowering
@@ -538,12 +541,111 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
             and origin(node.args[0]).target is not _tracing_ops._host_tensor
         )
 
+    def pure_subscript(node: Node) -> bool:
+        lowering = node.meta.get("lowering")
+        if (
+            node.target is not view_ops.subscript
+            or not isinstance(lowering, APIFuncLowering)
+            or lowering.api_func is not view_ops.subscript
+            or len(node.args) != 2
+            or node.kwargs
+            or not isinstance(node.args[0], Node)
+            or node.args[0].graph is not node.graph
+            or not isinstance(node.args[1], (tuple, list))
+        ):
+            return False
+        source = node.args[0].meta.get("val")
+        result = node.meta.get("val")
+        indices = node.args[1]
+        if (
+            not isinstance(source, torch.Tensor)
+            or not isinstance(result, torch.Tensor)
+            or source.dtype != result.dtype
+            or source.device != result.device
+            or source.layout != torch.strided
+            or result.layout != torch.strided
+            or not all(type(size) is int and size > 0 for size in source.shape)
+            or not all(type(size) is int and size > 0 for size in result.shape)
+            or any(
+                index is not None
+                and (not isinstance(index, slice) or index != slice(None))
+                for index in indices
+            )
+            or sum(index is not None for index in indices) != source.ndim
+            or origin(node.args[0]).target is _tracing_ops._host_tensor
+        ):
+            return False
+        axis = iter(source.shape)
+        expected = tuple(1 if index is None else next(axis) for index in indices)
+        return tuple(result.shape) == expected
+
     def through_view(node: Node) -> bool:
         # A readonly view becomes an owner-local value recipe, not a new
         # mutable target. Follow the same current-call aliases as origin().
         while node in captures or node.target is _tracing_ops._new_var:
             node = captures[node] if node in captures else cast("Node", node.args[0])
-        return node.target in (torch.ops.aten.view.dtype, torch.ops.aten.alias.default)
+        return node.target in (
+            torch.ops.aten.view.dtype,
+            torch.ops.aten.alias.default,
+            view_ops.subscript,
+        )
+
+    stores = frozenset(
+        node
+        for frame in tree.frames
+        for node in frame.graph.graph.nodes
+        if node.target is memory_ops.store
+    )
+    # Preserve the existing root-only path. A new nested output store uses one
+    # approved set for both operation admission and completed-local final reads.
+    output_stores = (
+        stores
+        if any(frames[node.graph].role != "root" for node in stores)
+        else frozenset()
+    )
+    for node in output_stores:
+        require(
+            len(node.args) == 4
+            and not node.kwargs
+            and not node.users
+            and node.meta.get("val") is None,
+            "write-only store ABI",
+        )
+        target = node.args[0]
+        require(
+            isinstance(target, Node)
+            and target.graph is node.graph
+            and target.target is _tracing_ops._host_tensor
+            and len(target.args) == 1
+            and isinstance(target.args[0], str)
+            and not target.kwargs
+            and isinstance(target.meta.get("val"), torch.Tensor)
+            and target.meta["val"].layout == torch.strided,
+            "direct frame-local output pointer required",
+        )
+        require(
+            isinstance(node.args[1], (tuple, list))
+            and target not in node.args[1]
+            and node.args[2] is not target
+            and node.args[3] is not target,
+            "output pointer is not an index, value or mask",
+        )
+    output_values = {
+        id(cast("Node", node.args[0]).meta["val"]) for node in output_stores
+    }
+    for frame in tree.frames:
+        for node in frame.graph.graph.nodes:
+            if (
+                node.target is _tracing_ops._host_tensor
+                and id(node.meta.get("val")) in output_values
+            ):
+                require(
+                    all(
+                        user in output_stores and user.args[0] is node
+                        for user in node.users
+                    ),
+                    "output pointers are write-only and cannot be captured",
+                )
 
     indexed_reads: list[tuple[Node, Node, int]] = []
     for frame in tree.frames:
@@ -575,7 +677,10 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                         "direct readonly host or completed local loads only",
                     )
             elif node.target is memory_ops.store:
-                require(frame.role == "root", "nested host writes excluded")
+                require(
+                    frame.role == "root" or node in output_stores,
+                    "approved output store required",
+                )
                 require(
                     not through_view(cast("Node", node.args[0])),
                     "view and alias values are readonly",
@@ -584,6 +689,10 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                 require(pure_bitcast(node), "same-width pure bitcast metadata")
             elif node.target is torch.ops.aten.alias.default:
                 require(pure_alias(node), "typed readonly alias metadata")
+            elif node.target is view_ops.subscript:
+                require(
+                    pure_subscript(node), "readonly singleton-axis subscript metadata"
+                )
             elif node.target in (
                 _tracing_ops._if,
                 _tracing_ops._while_loop,
@@ -719,6 +828,7 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                         in (scan_ops._associative_scan, _tracing_ops._mask_to)
                         or pure_bitcast(user)
                         or pure_alias(user)
+                        or pure_subscript(user)
                         or (
                             isinstance(user.target, torch._ops.OpOverload)
                             and not user.target._schema.is_mutable
@@ -726,6 +836,12 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                                 user.meta.get("lowering"),
                                 (PointwiseLowering, ReductionLowering),
                             )
+                        )
+                        or user in output_stores
+                        and (
+                            user.args[2] is alias
+                            or user.args[3] is alias
+                            or alias in user.args[1]
                         )
                         or user.target is memory_ops.store
                         and user.args[2] is alias
@@ -744,12 +860,83 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
         )
     return replace(
         tree,
+        output_stores=output_stores,
         indexed_reads=tuple(
             CompletedLocalRead(
                 node, source, graph_id, cast("list[int]", source.args[0])[0]
             )
             for node, source, graph_id in indexed_reads
         ),
+    )
+
+
+def uniform_output_stores_are_writeonly(
+    env: CompileEnvironment,
+    graphs: Sequence[GraphInfo],
+    tree: UniformRegionTree,
+    *,
+    allow_unbound: bool = False,
+) -> bool:
+    """Bind the approved stores to fresh or cache-specialized disjoint outputs.
+
+    Pointer metadata alone is not an input-alias proof. Check every other
+    public tensor, including inputs with no load in this region, and every
+    distinct output. Repeated stores through one exact tensor retain order.
+    """
+    from ...language import memory_ops
+    from .memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    from .memory_ops import runtime_tensors_are_proven_disjoint
+    from .register_loads import host_load_is_readonly
+
+    if not tree.output_stores:
+        return True
+    targets = {
+        id(value): value
+        for node in tree.output_stores
+        for value in (cast("Node", node.args[0]).meta["val"],)
+    }
+    for target in targets.values():
+        storage = target.untyped_storage()
+        fresh = storage in env._symbolically_exact_layout_storages
+        if not fresh:
+            source = env.tensor_input_source(target)
+            specialization = env.runtime_input_specializations.get(
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+            )
+            if (
+                source is None
+                or specialization is None
+                or source not in specialization.sources
+                or (
+                    not allow_unbound
+                    and _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+                    not in env.bound_runtime_input_specialization_results
+                )
+            ):
+                return False
+        # Fake storage inequality is only sufficient for compiler allocations.
+        others = {id(value): value for value in env.input_sources}
+        others.update(targets)
+        for other in others.values():
+            if other is target:
+                continue
+            other_storage = other.untyped_storage()
+            if storage == other_storage:
+                return False
+            if (
+                not fresh
+                and other_storage not in env._symbolically_exact_layout_storages
+                and not runtime_tensors_are_proven_disjoint(
+                    env, target, other, allow_unbound=allow_unbound
+                )
+            ):
+                return False
+    local_reads = {read.node for read in tree.indexed_reads}
+    return all(
+        host_load_is_readonly(node, env, graphs, allow_unbound=allow_unbound)
+        for frame in tree.frames
+        for node in frame.graph.graph.nodes
+        if node.target is memory_ops.load and node not in local_reads
     )
 
 
@@ -772,6 +959,10 @@ def uniform_region_domains(
 
     try:
         tree = uniform_local_regions(graphs)
+        if not uniform_output_stores_are_writeonly(
+            env, graphs, tree, allow_unbound=allow_unbound
+        ):
+            return incoming
         local_reads = {read.node for read in tree.indexed_reads}
         trial = GatherDomainFacts(
             dict(incoming.shapes),
