@@ -143,7 +143,7 @@ Configs are typically discovered automatically through autotuning, but can also 
 
    - ``"pointer"``: Pointer-based indexing (default)
    - ``"tensor_descriptor"``: Tensor descriptor indexing (requires Hopper+ GPU)
-   - ``"block_ptr"``: Block pointer indexing
+   - ``"block_ptr"``: Block pointer indexing (Triton < 3.9 only; newer Triton removed block pointers, so this value is lowered as ``"pointer"`` and the autotuner no longer searches it)
 
    .. note::
       When using a list, provide one strategy for each load and store operation in the order
