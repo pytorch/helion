@@ -17,6 +17,7 @@ from ...runtime.config import Config
 from .cute_fragment_bounded_gather import bounded_gather_roots
 from .cute_fragment_common import FragmentRootRequirement
 from .cute_fragment_common import active_fragment_roots
+from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -102,7 +103,6 @@ class CuteFragmentWarpScanHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        from ..cute.computed_fragment import computed_fragment_supported
 
         host = device_ir.host_function
         assert host is not None
@@ -121,7 +121,7 @@ class CuteFragmentWarpScanHeuristic(AutotunerHeuristic):
                     and node.meta["val"].dtype in WARP_SCAN_DTYPES
                     for node in scans
                 ):
-                    if computed_fragment_supported(env, graphs):
+                    if computed_fragment_discovery_supported(env, graphs):
                         roots.add(root)
                     else:
                         dependent.add(root)

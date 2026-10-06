@@ -9,6 +9,7 @@ from ...autotuner.compiler_coverage import CompilerCoverageGroup
 from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -31,15 +32,13 @@ class CuteFragmentThreadsHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        from ..cute.computed_fragment import computed_fragment_supported
-
         host = device_ir.host_function
         assert host is not None
         with host:
             env.config_spec.cute_fragment_thread_root_ids = frozenset(
                 root
                 for root, graphs in fragment_root_regions(device_ir)
-                if computed_fragment_supported(env, graphs)
+                if computed_fragment_discovery_supported(env, graphs)
             )
         # Shape/stride assumptions of an admitted root must survive rebinding.
         return (

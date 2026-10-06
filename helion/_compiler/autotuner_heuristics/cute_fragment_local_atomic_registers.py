@@ -12,6 +12,7 @@ from ...autotuner.compiler_coverage import CoverageDependency
 from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_root_regions
 from .cute_fragment_threads import THREADS
 from .registry import AutotunerHeuristic
@@ -32,7 +33,6 @@ class CuteFragmentLocalAtomicRegistersHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        from ..cute.computed_fragment import computed_fragment_supported
         from ..cute.local_atomic_registers import MAX_SLOTS
         from ..cute.local_atomic_registers import local_atomic_register_chains
         from ..cute.warp_results import static_shape
@@ -43,7 +43,7 @@ class CuteFragmentLocalAtomicRegistersHeuristic(AutotunerHeuristic):
         sizes = []
         with host:
             for root, graphs in fragment_root_regions(device_ir):
-                if not computed_fragment_supported(env, graphs):
+                if not computed_fragment_discovery_supported(env, graphs):
                     continue
                 counts = [
                     math.prod(shape)

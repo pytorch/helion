@@ -590,6 +590,14 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
     The emitter additionally proves scalar grid/loop geometry and capacity.
     """
     from .resident_while import resident_while_plan
+    from .uniform_region_tree import uniform_local_regions
+
+    try:
+        tree = uniform_local_regions(graphs)
+    except exc.InvalidConfig:
+        pass
+    else:
+        return frozenset(a for frame in tree.frames for a in frame.local_targets)
 
     # Keep the indexed current-call graph list for the recurrence proof before
     # traversing reachable graphs in dependency order.

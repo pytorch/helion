@@ -12,6 +12,7 @@ from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...language import _tracing_ops
 from ...runtime.config import Config
+from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -31,7 +32,6 @@ class CuteFragmentSkipZeroAtomicsHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        from ..cute.computed_fragment import computed_fragment_supported
         from ..cute.dead_zero_atomics import dead_zero_atomic_results
         from ..cute.local_atomic import atomic_target_origins
 
@@ -52,7 +52,7 @@ class CuteFragmentSkipZeroAtomicsHeuristic(AutotunerHeuristic):
                 )
                 # Includes the existing nonescape/no-alias, uniform-loop and
                 # initialization -> updates -> final-read lifetime proof.
-                if eligible and computed_fragment_supported(env, graphs):
+                if eligible and computed_fragment_discovery_supported(env, graphs):
                     roots.add(root)
         env.config_spec.cute_fragment_skip_zero_atomics_root_ids = frozenset(roots)
         # Emission retains the logical-domain and wrapped-index bounds.
