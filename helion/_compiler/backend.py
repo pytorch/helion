@@ -1053,6 +1053,15 @@ class Backend(abc.ABC):
             "to_code(allow_helion_deps=False) yet"
         )
 
+    def build_standalone_code(
+        self,
+        bound: BoundKernel[Any],
+        import_lines: list[str],
+        body_root: ast.Module,
+    ) -> ast.Module | None:
+        """Optionally specialize standalone launch code for the bound workload."""
+        return None
+
     def capture_jax_launch_metadata(
         self, bound: BoundKernel[Any], config: Config | dict[str, object]
     ) -> object:

@@ -1248,6 +1248,16 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    def build_standalone_code(
+        self,
+        bound: BoundKernel[Any],
+        import_lines: list[str],
+        body_root: ast.Module,
+    ) -> ast.Module:
+        from .standalone import build_standalone_code
+
+        return build_standalone_code(bound, import_lines, body_root)
+
     def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
         from ..compile_environment import CompileEnvironment
         from .grouped_row_union import physical_schedule

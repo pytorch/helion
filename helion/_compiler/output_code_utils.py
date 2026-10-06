@@ -15,7 +15,8 @@ body's verbatim ``helion.runtime.<fn>(...)`` calls resolve without the real pack
 plus any in-kernel runtime helpers the body references (via
 ``Backend.embedded_helper_source``). The per-backend launcher info lives on the
 backend classes (``Backend.dependency_free_launcher_info`` in
-:mod:`helion._compiler.backend`).
+:mod:`helion._compiler.backend`). Backends that need workload-specific native
+launch wrappers can instead implement ``Backend.build_standalone_code``.
 """
 
 from __future__ import annotations
@@ -61,6 +62,10 @@ def build_dependency_free_code(
     Torch-tensor only; ``jax_fn`` is handled by :func:`build_jax_fn_module`.
     """
     backend = bound.env.backend
+    # CuTe builds launch wrappers from bound inputs; other backends use the shim below.
+    specialized = backend.build_standalone_code(bound, import_lines, body_root)
+    if specialized is not None:
+        return specialized
     info = backend.dependency_free_launcher_info
     kernel_name = bound.kernel.name
     _reject_body_helion_imports(body_root, kernel_name)
