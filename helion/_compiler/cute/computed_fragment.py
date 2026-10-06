@@ -263,6 +263,7 @@ class FragmentCompiler:
 
         self.snapshot_owner: SnapshotOwner | None = None
         self.snapshot_loads: set[Node] = set()
+        self.register_snapshot_buffers: dict[str, int] = {}
         self.snapshot_reductions: set[Node] = set()
         self.snapshot_shapes: set[tuple[int, ...]] = set()
         if self.df.config.get("cute_fragment_register_snapshots", False):
@@ -1306,6 +1307,7 @@ class FragmentCompiler:
         if node in self.snapshot_loads:
             slots = (math.prod(shape) + self.threads - 1) // self.threads
             name = self.df.new_var("fragment_snapshot")
+            self.register_snapshot_buffers[name] = shape[0]
             self.emit(
                 f"{name} = cute.make_rmem_tensor(({slots},), {self.dtype(output.dtype)})"
             )
@@ -3493,6 +3495,17 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         compiler.df.cute_state.published_scalar_requests.append(
             PublishedScalarRequest(
                 frozenset(name for name, _, _ in compiler.buffers),
+                compiler.thread,
+                compiler.threads,
+            )
+        )
+    if compiler.df.config.get("cute_fragment_register_producers", False):
+        from .register_producers import RegisterProducerRequest
+
+        compiler.df.cute_state.register_producer_requests.append(
+            RegisterProducerRequest(
+                frozenset(name for name, _, _ in compiler.buffers),
+                tuple(compiler.register_snapshot_buffers.items()),
                 compiler.thread,
                 compiler.threads,
             )
