@@ -464,6 +464,7 @@ class PallasBackend(Backend):
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
+            "pallas_internal_scratch",
         }
     )
 
@@ -1704,9 +1705,11 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
 
-        from .internal_scratch import plan_internal_remote_scratch
+        from .internal_scratch import plan_internal_scratch
 
-        plan_internal_remote_scratch()
+        plan_internal_scratch(
+            include_local_temporaries=bool(config.get("pallas_internal_scratch", False))
+        )
         plan_tiling(graphs, config, tile_strategy)
         build_tensorcore_plans(graphs, config)
 
