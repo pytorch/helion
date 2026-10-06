@@ -71,7 +71,10 @@ class CuteFragmentScanHeuristic(AutotunerHeuristic):
 
 
 def register_fragment_scan_coverage(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    supplemental_carrier: Config | None = None,
 ) -> None:
     spec = env.config_spec
     if not spec.cute_fragment_scan_root_ids:
@@ -102,5 +105,10 @@ def register_fragment_scan_coverage(
             domain=MODES,
             legacy="serial",
             witnesses=(CoverageWitness(carrier, "cooperative"),),
+            supplemental_witnesses=(
+                CoverageWitness(supplemental_carrier, "cooperative"),
+            )
+            if supplemental_carrier is not None
+            else (),
         )
     )

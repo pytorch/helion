@@ -94,7 +94,10 @@ class CuteFragmentReductionHeuristic(AutotunerHeuristic):
 
 
 def register_fragment_reduction_coverage(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    supplemental_carrier: Config | None = None,
 ) -> None:
     spec = env.config_spec
     if not spec.cute_fragment_reduction_root_ids:
@@ -125,5 +128,8 @@ def register_fragment_reduction_coverage(
             domain=MODES,
             legacy="serial",
             witnesses=(CoverageWitness(carrier, "warp"),),
+            supplemental_witnesses=(CoverageWitness(supplemental_carrier, "warp"),)
+            if supplemental_carrier is not None
+            else (),
         )
     )

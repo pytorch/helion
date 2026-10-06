@@ -155,10 +155,12 @@ class TileStrategyDispatch:
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
         active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
+        inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
         rdims = [
             bs.block_id
             for bs in env.block_sizes
             if bs.reduction
+            and bs.block_id not in inactive_aliases
             and (active_block_ids is None or bs.block_id in active_block_ids)
         ]
         reduction_loop_block_ids = set(
@@ -193,6 +195,58 @@ class TileStrategyDispatch:
                 fn, block_id, reduction_loop
             )
             self._register_strategy([block_id], strategy)
+
+    def _inactive_cute_broadcast_aliases(self, fn: DeviceFunction) -> set[int]:
+        """Drop duplicate output-range reservations before physical allocation.
+
+        Register broadcasting can allocate a reduction block whose variable is
+        exactly an existing tile variable. A pure pointwise root has no work to
+        execute on that duplicate range; the canonical tile already owns its
+        coordinates. Keep all strategies when nested or free-iota ownership is
+        present, and never elide executable reductions or matrix dimensions.
+        """
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        graphs = fn.codegen.codegen_graphs
+        if (
+            env.backend_name != "cute"
+            or not spec.pointwise_facts
+            or spec.matmul_facts
+            or any(not isinstance(graph, RootGraphInfo) for graph in graphs)
+            or any(
+                isinstance(node.target, torch._ops.OpOverload)
+                and node.target.overloadpacket is torch.ops.aten.arange
+                for graph in graphs
+                for node in graph.graph.nodes
+            )
+        ):
+            return set()
+        tile_blocks = {
+            block_id for strategy in self.strategies for block_id in strategy.block_ids
+        }
+        executable = set(spec.reduction_loops.valid_block_ids())
+        if spec.reduction_kernel_fact is not None:
+            executable.update(
+                reduction.block_id
+                for reduction in spec.reduction_kernel_fact.reductions
+            )
+        if spec.kernel_matmul_fact is not None:
+            executable.update(
+                matmul.fact.k_block_id
+                for matmul in spec.kernel_matmul_fact.matmuls
+                if matmul.fact.k_block_id is not None
+            )
+        return {
+            block.block_id
+            for block in env.block_sizes
+            if block.reduction
+            and block.block_id not in executable
+            and (canonical := env.canonical_block_id(block.block_id)) != block.block_id
+            and canonical in tile_blocks
+            and not env.block_sizes[canonical].reduction
+            and block.symbol() == env.block_sizes[canonical].symbol()
+            and block.numel == env.block_sizes[canonical].symbol()
+        }
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]

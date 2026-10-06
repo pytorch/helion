@@ -1119,7 +1119,7 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
         )
 
 
-@pytest.mark.parametrize("widths", [(17, 65), (31, 19)])
+@pytest.mark.parametrize("widths", [(17, 65), (31, 19), (17, 17)])
 @pytest.mark.parametrize("row_offset", [False, True])
 @pytest.mark.parametrize("block_rows", [1, 4])
 def test_independent_full_reduction_fragment_codegen_and_values(
@@ -1198,6 +1198,39 @@ def test_existing_tile_or_row_reduction_keeps_native_path(tiled):
         bound = _cpu_bind(kernel, (torch.ones(5, 17),))
         source = bound.to_code(bound.config_spec.default_config())
     assert "fragment_smem" not in source
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _native_same_axis_statistic(
+    key: torch.Tensor, values: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(values)
+    for row in hl.tile(values.size(0)):
+        column = hl.arange(values.size(1))
+        normalized = key[column] - key[column].amax()
+        out[row, column] = values[row, column] * normalized[None, :]
+    return out
+
+
+def test_same_axis_statistic_broadcast_preserves_native_owner():
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(
+            _native_same_axis_statistic, (torch.ones(17), torch.ones(5, 17))
+        )
+        config = bound.config_spec.default_config()
+        config.config["reduction_loops"] = [None]
+        source = bound.to_code(config)
+    assert "fragment_smem" not in source
+    assert "warp_reduction_max" in source
 
 
 def test_independent_full_reduction_records_dynamic_metadata_before_projection():
@@ -2181,3 +2214,185 @@ def test_fragment_expression_native_diamond_scan(dtype, row_tile):
     config = bound.config_spec.default_config()
     config.config["block_sizes"] = [row_tile]
     torch.testing.assert_close(bound.compile_config(config)(x, 8), expected)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_captured_reduction(x: torch.Tensor, steps: int):
+    out = torch.empty((x.size(0),), dtype=torch.int32, device=x.device)
+    for row in hl.tile(x.size(0)):
+        weights = x[row, :]
+        threshold = hl.full([row], 0, dtype=torch.int32)
+        for _step in range(steps):
+            count = (weights > threshold[:, None]).sum(-1)
+            threshold = torch.where(count >= 3, threshold + 1, threshold)
+        out[row] = threshold
+    return out
+
+
+def _captured_reduction_reference(x, steps):
+    threshold = torch.zeros(x.size(0), dtype=torch.int32, device=x.device)
+    for _step in range(steps):
+        count = (x > threshold[:, None]).sum(-1)
+        threshold = torch.where(count >= 3, threshold + 1, threshold)
+    return threshold
+
+
+def _captured_reduction_config(bound, row_tile, reduction_tile):
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"] = [row_tile]
+    config.config["reduction_loops"] = [reduction_tile] * len(config.reduction_loops)
+    # Four lanes intentionally require a synthetic lane loop in the old scalar
+    # path even for width 17. A complete fragment owns its own CTA geometry.
+    config.config["num_threads"] = [1, 4]
+    return config
+
+
+@pytest.mark.parametrize(
+    "width,row_tile,reduction_tile", [(17, 1, None), (65, 2, 16), (1025, 2, 32)]
+)
+@pytest.mark.parametrize("steps", [0, 1, 3])
+def test_captured_full_reduction_loop_generated_values(
+    width, row_tile, reduction_tile, steps
+):
+    x = (torch.arange(3 * width).reshape(3, width) % 9).float() - 2
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_captured_reduction, (x, steps))
+        source = bound.to_code(
+            _captured_reduction_config(bound, row_tile, reduction_tile)
+        )
+    actual = torch.full((3,), -1, dtype=torch.int32)
+    _simulate_independent_fragment(
+        source,
+        {"x": x, "steps": steps},
+        {"out": actual},
+        (3 + row_tile - 1) // row_tile,
+    )
+    torch.testing.assert_close(
+        actual, _captured_reduction_reference(x, steps), rtol=0, atol=0
+    )
+
+
+def test_captured_full_reduction_loop_default_values():
+    x = torch.ones(3, 1025)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_captured_reduction, (x, 3))
+        source = bound.to_code(bound.config_spec.default_config())
+    actual = torch.full((3,), -1, dtype=torch.int32)
+    _simulate_independent_fragment(source, {"x": x, "steps": 3}, {"out": actual}, 3)
+    torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure", ["capacity", "admission"])
+def test_captured_full_reduction_loop_rejects_unsafe_fallback(failure):
+    x = torch.ones(3, 131072 if failure == "capacity" else 17)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_captured_reduction, (x, 3))
+        config = _captured_reduction_config(bound, 1, None)
+        with ExitStack() as stack:
+            if failure == "admission":
+                stack.enter_context(
+                    patch(
+                        "helion._compiler.cute.computed_fragment.computed_fragment_supported",
+                        return_value=False,
+                    )
+                )
+            with pytest.raises(
+                exc.InvalidConfig, match="shared bytes|captured full reductions"
+            ):
+                bound.to_code(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_tiled_capture_control(x: torch.Tensor, steps: int):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        for col in hl.tile(x.size(1)):
+            weights = x[row, col]
+            threshold = hl.full([row], 0, dtype=torch.int32)
+            for _step in range(steps):
+                count = (weights > threshold[:, None]).sum(-1)
+                threshold = torch.where(count >= 3, threshold + 1, threshold)
+            out[row, col] = threshold[:, None].to(x.dtype)
+    return out
+
+
+def test_captured_explicit_tile_reduction_keeps_native_owner():
+    from helion._compiler.cute.captured_reduction import captured_reduction_coordinates
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_tiled_capture_control, (torch.ones(3, 17), 3))
+        with bound.env, bound.host_function:
+            assert not captured_reduction_coordinates(
+                bound.env, bound.host_function.device_ir.graphs
+            )
+        source = bound.to_code(bound.config_spec.default_config())
+    assert "fragment_smem" not in source
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "width,row_tile,reduction_tile", [(17, 1, None), (65, 2, 16), (1025, 2, 32)]
+)
+def test_captured_full_reduction_loop_native(width, row_tile, reduction_tile):
+    x = (torch.arange(3 * width, device=DEVICE).reshape(3, width) % 9).float() - 2
+    bound = _fragment_captured_reduction.bind((x, 3))
+    actual = bound.compile_config(
+        _captured_reduction_config(bound, row_tile, reduction_tile)
+    )(x, 3)
+    torch.testing.assert_close(
+        actual, _captured_reduction_reference(x, 3), rtol=0, atol=0
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_captured_conditional(
+    x: torch.Tensor, steps: int, unchanged: hl.constexpr
+):
+    out = torch.empty((x.size(0),), dtype=torch.int32, device=x.device)
+    for row in hl.tile(x.size(0)):
+        weights = x[row, :]
+        value = hl.full([row], 0, dtype=torch.int32)
+        for _step in range(steps):
+            if steps > 1:
+                count = (weights > value[:, None]).sum(-1)
+                value = torch.where(count >= 3, value + 1, value)
+            elif not unchanged:
+                value = value + 2
+        out[row] = value
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_captured_conditional_missing(x: torch.Tensor, steps: int):
+    out = torch.empty((x.size(0),), dtype=torch.int32, device=x.device)
+    for row in hl.tile(x.size(0)):
+        weights = x[row, :]
+        value = hl.full([row], 0, dtype=torch.int32)
+        for _step in range(steps):
+            if steps > 1:
+                count = (weights > value[:, None]).sum(-1)
+                value = torch.where(count >= 3, value + 1, value)
+        out[row] = value
+    return out
+
+
+@pytest.mark.parametrize("steps", [3, 4])
+def test_captured_conditional_missing_unchanged_output_rejects(steps):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(
+            _fragment_captured_conditional_missing, (torch.ones(3, 17), steps)
+        )
+        with pytest.raises(exc.InvalidConfig, match="captured unchanged output"):
+            bound.to_code(_captured_reduction_config(bound, 1, 16))
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+def test_captured_conditional_explicit_outputs_keep_generated_values(steps):
+    x = torch.ones(3, 17)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_captured_conditional, (x, steps, False))
+        source = bound.to_code(_captured_reduction_config(bound, 1, 16))
+    actual = torch.full((3,), -1, dtype=torch.int32)
+    _simulate_independent_fragment(source, {"x": x, "steps": steps}, {"out": actual}, 3)
+    expected = torch.full_like(actual, 2 if steps == 1 else 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

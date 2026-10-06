@@ -73,6 +73,14 @@ _PURE = frozenset(
 )
 
 
+def _affine_loop_candidate(loop: ast.For) -> bool:
+    return (
+        isinstance(loop.target, ast.Name)
+        and _LANE.fullmatch(loop.target.id) is not None
+        and _range_extent(loop) in (2, 4, 8)
+    )
+
+
 @dataclasses.dataclass
 class _Access:
     call: ast.Call
@@ -775,6 +783,10 @@ class _Vectorizer:
                 result.append(candidate)
         return result, uniform
 
+    def candidate_loop(self, loop: ast.For) -> bool:
+        """Check necessary syntax before constructing definition snapshots."""
+        return _affine_loop_candidate(loop)
+
     def loop(
         self,
         original: ast.For,
@@ -782,13 +794,12 @@ class _Vectorizer:
         multiples: dict[str, int],
         int32_names: frozenset[str],
     ) -> list[ast.stmt] | None:
-        width = _range_extent(original)
-        if (
-            not isinstance(original.target, ast.Name)
-            or _LANE.fullmatch(original.target.id) is None
-            or width not in (2, 4, 8)
-        ):
+        # Subclasses can broaden traversal, but this emitter's intrinsic
+        # preconditions also apply when called through super().loop().
+        if not _affine_loop_candidate(original):
             return None
+        width = _range_extent(original)
+        assert width is not None and isinstance(original.target, ast.Name)
         lane = original.target.id
         # Work on a private clone. A failed proof leaves the original intact.
         loop = ast.parse(ast.unparse(original)).body[0]
@@ -1029,6 +1040,14 @@ class _Vectorizer:
         multiples: dict[str, int] | None = None,
         int32_names: frozenset[str] = frozenset(),
     ) -> list[ast.stmt]:
+        # Only loop() can rewrite this scope. Avoid expanding unrelated scalar
+        # definitions, while retaining nested candidates and subclass rules.
+        if not any(
+            isinstance(node, ast.For) and self.candidate_loop(node)
+            for statement in statements
+            for node in ast.walk(statement)
+        ):
+            return statements
         outer = dict(outer or {})
         multiples = dict(multiples or {})
         snapshots = self.snapshots(statements)
