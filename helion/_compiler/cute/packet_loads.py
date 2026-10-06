@@ -11,6 +11,8 @@ import torch
 
 from ..ast_extension import statement_from_string
 from .memory_ops import tensor_has_specialized_base_alignment
+from .published_scalars import _integer_slot
+from .published_scalars import immutable_publications
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -51,13 +53,13 @@ _PURE = frozenset(
 
 
 def _load_assignment(
-    body: list[ast.AST], tensor_name: str
+    body: list[ast.AST], tensor_name: str, shared_slots: frozenset[str] = frozenset()
 ) -> tuple[ast.Assign, ast.expr] | None:
     """Prove that address preparation contains only pure scalar operations.
 
-    In particular an index loaded from another fragment is not a coordinate
-    recipe. Captured/shared reads, gathers, atomics and unknown calls decline.
-    No expression is moved out of its original conditional scope.
+    Only explicitly proved published shared slots may augment the coordinate
+    recipe. Gathers, atomics and unknown calls decline. No expression is moved
+    out of its original conditional scope.
     """
     loads = []
     for statement in body:
@@ -67,7 +69,13 @@ def _load_assignment(
             ):
                 return None
             if isinstance(node, ast.Subscript):
-                return None
+                if not (
+                    isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in shared_slots
+                    and _integer_slot(node.slice) == 0
+                ):
+                    return None
             if isinstance(node, ast.Assign) and (
                 len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name)
             ):
@@ -108,6 +116,37 @@ def _load_assignment(
     return parent, pointer.right
 
 
+def _published_dependencies(
+    compiler: FragmentCompiler, dependencies: tuple[Fragment, ...]
+) -> frozenset[str]:
+    """Known shared scalar epochs; every transitive allocation stays held.
+
+    Register-owned snapshots cannot be read by the packet's different physical
+    owner. Unknown storage and publications outside this lexical body decline.
+    This proof does not move a read or require a constant effective address.
+    """
+    seen: set[int] = set()
+    pending = list(dependencies)
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if value.resident and value.storage is None and not value.dependencies:
+            return frozenset()
+        pending.extend(value.dependencies)
+    buffers = compiler.referenced_buffers(dependencies)
+    allocated = {name for name, _dtype, _capacity in compiler.buffers}
+    if not buffers <= allocated & compiler.live_buffers():
+        return frozenset()
+    if buffers & compiler.pending_local_atomics:
+        return frozenset()
+    published = immutable_publications(
+        compiler.cg.statements_stack[-1], buffers, compiler.thread, compiler.threads
+    )
+    return frozenset(published)
+
+
 class _CaptureAddress(ast.NodeTransformer):
     def __init__(
         self, assignment: ast.Assign, address: str, predicate: str, offset: ast.expr
@@ -131,6 +170,7 @@ def materialize_packet_load(
     tensor: HostTensor,
     value: Fragment,
     load: Callable[[tuple[str, ...]], str],
+    dependencies: tuple[Fragment, ...] = (),
 ) -> Fragment | None:
     """Publish the same scalar values at the same dense shared coordinates.
 
@@ -158,18 +198,27 @@ def materialize_packet_load(
     )
     loop.body.clear()
     captures = []
+    shared_slots = _published_dependencies(compiler, dependencies)
+    shared_reads: set[str] = set()
     for lane in range(4):
         index = f"({packet_index} * 4 + {lane})"
         coords = compiler.coordinates(index, value.shape)
         statements: list[ast.AST] = []
         with compiler.cg.set_statements(statements):
             name = load(coords)
-        assignment = _load_assignment(statements, tensor.name)
+        assignment = _load_assignment(statements, tensor.name, shared_slots)
         if assignment is None:
             return None
+        shared_reads.update(
+            node.value.id
+            for statement in statements
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+        )
         captures.append((index, coords, name, statements, *assignment))
-    compiler.held.append(value)
+    compiler.held.append((value, *dependencies) if shared_reads else value)
     result = compiler.allocate(value)
+    assert result.storage not in shared_reads
     addresses = []
     predicates = []
     names = []
