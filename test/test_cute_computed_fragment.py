@@ -7126,3 +7126,414 @@ class TestImmutableWhileSnapshotsNative(TestCase):
 
     def test_float32_padded_snapshot_and_zero_trip(self):
         self._check_snapshot_pair(17, torch.float32)
+
+
+# A complete producer prefix changes ownership; its scalar publications and
+# every later allocation/consumer retain the ordinary shared lifetime.
+def _warp_producer_source(x, threshold, *, threads=128, enabled=True, kind="paired"):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_completed_scan_exports, (x, threshold, kind))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=threads,
+            cute_fragment_warp_scan=True,
+            cute_fragment_reduction="warp",
+        )
+        if enabled:
+            config.config["cute_fragment_warp_producer_regions"] = True
+        return bound.to_code(config)
+
+
+@pytest.mark.parametrize(
+    "threads,width",
+    [(32, 33), (128, 17), (256, 126), (128, 257), (256, 1024), (512, 65)],
+)
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
+)
+def test_warp_producer_regions_emitted(threads, width, dtype):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = (torch.arange(3 * width).reshape(3, width) % 11 - 5).to(dtype)
+    if dtype.is_floating_point:
+        x[0] = -0.0
+        x[1, 0] = 16777216
+        x[1, min(31, width - 1)] = -16777216
+        x[2, width // 2] = float("nan")
+    else:
+        x[1, width // 2] = torch.iinfo(dtype).max
+    threshold = torch.tensor([0, 3, -2], dtype=dtype)
+    cdf = _warp_scan_tree_reference(x, False)
+    index = torch.arange(width).expand_as(x).to(torch.int64)
+    expected = (
+        torch.where(cdf > threshold[:, None], index, width).amin(-1),
+        torch.where(x > 0, index, -1).amax(-1),
+    )
+    for enabled in (False, True):
+        source = _warp_producer_source(x, threshold, threads=threads, enabled=enabled)
+        assert ("fragment_producer_lane" in source) == enabled
+        for reverse in (False, True):
+            outputs = {
+                "selected": torch.full((3,), -99, dtype=torch.int64),
+                "last": torch.full((3,), -99, dtype=torch.int64),
+            }
+            _simulate_register_load_program(
+                _completed_scan_model_source(source),
+                x,
+                threads,
+                host_tensors=outputs | {"threshold": threshold},
+                lane_order=list(range(threads))[:: -1 if reverse else 1],
+            )
+            torch.testing.assert_close(
+                (outputs["selected"], outputs["last"]), expected, rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize(
+    "kind,width", [("reverse", 17), ("opaque", 17), ("store", 17), ("paired", 2048)]
+)
+def test_warp_producer_regions_declines(kind, width):
+    x = torch.ones((3, width))
+    threshold = torch.zeros(3)
+    with pytest.raises(exc.InvalidConfig):
+        _warp_producer_source(x, threshold, kind=kind)
+
+
+@pytest.mark.parametrize("strategy_name", ["FROM_RANDOM", "FROM_BEST_AVAILABLE"])
+def test_warp_producer_regions_prefix_and_rng(strategy_name):
+    import random
+
+    from test.test_compiler_coverage import make_search
+
+    from helion.autotuner.pattern_search import InitialPopulationStrategy
+
+    def bind():
+        return _cpu_bind(
+            helion.kernel(
+                _fragment_completed_scan_exports.fn, backend="cute", static_shapes=True
+            ),
+            (torch.ones((2, 65)), torch.zeros(2), "paired"),
+        )
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_warp_producer_regions_coverage"
+        ):
+            previous = bind()
+        current = bind()
+    strategy = InitialPopulationStrategy[strategy_name]
+    old = make_search(previous.config_spec, count=20, strategy=strategy)
+    new = make_search(current.config_spec, count=20, strategy=strategy)
+    for seed in (73, 741, 2031):
+        random.seed(seed)
+        prior = old._generate_initial_population_flat()
+        state = random.getstate()
+        random.seed(seed)
+        rows = new._generate_initial_population_flat()
+        assert random.getstate() == state
+        expected = [old.config_gen.unflatten(row) for row in prior]
+        actual = [new.config_gen.unflatten(row) for row in rows]
+        assert actual[: len(expected)] == expected
+        assert len(actual) == len(expected) + 1
+        assert actual[-1]["cute_fragment_warp_producer_regions"] is True
+    assert previous.config_spec.default_config() == current.config_spec.default_config()
+    assert (
+        previous.config_spec.compiler_seed_configs
+        == current.config_spec.compiler_seed_configs
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["dtype", "shape", "frontier", "suffix_read", "storage_alias", "opaque_vector"],
+)
+def test_warp_producer_regions_transactional_decline(mutation):
+    from dataclasses import replace
+
+    from helion._compiler.cute.warp_producer_regions import CopyStep
+    from helion._compiler.cute.warp_producer_regions import WarpProducerRecorder
+
+    old_lower = WarpProducerRecorder.lower
+    checked = []
+
+    def lower(recorder, body):
+        step = next(
+            item
+            for item in recorder.steps
+            if isinstance(item, CopyStep) and math.prod(item.target.shape) > 1
+        )
+        index = recorder.steps.index(step)
+        if mutation == "dtype":
+            recorder.steps[index] = replace(
+                step, target=replace(step.target, dtype=torch.float64)
+            )
+        elif mutation == "shape":
+            recorder.steps[index] = replace(
+                step, target=replace(step.target, shape=(1,))
+            )
+        elif mutation == "frontier":
+            recorder.frontier.add(step.target.storage)
+        elif mutation == "suffix_read":
+            end = body.index(recorder.steps[-1].statements[-1]) + 1
+            body.insert(end, ast.parse(f"escaped = {step.target.storage}[0]").body[0])
+        else:
+            outer = cast("ast.For", step.statements[0])
+            if mutation == "storage_alias":
+                extra = f"escaped = {step.target.storage}"
+            else:
+                extra = "escaped = _cute_inline_asm_elementwise([], asm='mov.u32 $0, %tid.x;', constraints='=r', dtype=cutlass.Int32, is_pure=True)"
+            outer.body.insert(0, ast.parse(extra).body[0])
+        before = ast.dump(ast.Module(body=body, type_ignores=[]))
+        namespace = recorder.compiler.df.namespace
+        with pytest.raises(exc.InvalidConfig):
+            old_lower(recorder, body)
+        assert ast.dump(ast.Module(body=body, type_ignores=[])) == before
+        assert recorder.compiler.df.namespace is namespace
+        checked.append(mutation)
+        raise exc.InvalidConfig("injected ownership mutation")
+
+    x = torch.ones((1, 33))
+    threshold = torch.zeros(1)
+    before = _warp_producer_source(x, threshold, enabled=False)
+    with (
+        patch.object(WarpProducerRecorder, "lower", lower),
+        pytest.raises(exc.InvalidConfig),
+    ):
+        _warp_producer_source(x, threshold)
+    assert checked == [mutation]
+    assert _warp_producer_source(x, threshold, enabled=False) == before
+
+
+def test_warp_producer_regions_strict_option_and_nested_decline():
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        x = torch.ones((3, 16), dtype=torch.int32)
+        bound, config = _resident_while_readonly_bound(
+            x, torch.tensor([0, 1, 3], dtype=torch.int32), torch.empty_like(x), 2
+        )
+        config.config.update(
+            cute_fragment_warp_scan=True,
+            cute_fragment_reduction="warp",
+            cute_fragment_warp_producer_regions=True,
+        )
+        with pytest.raises(exc.InvalidConfig):
+            bound.to_code(config)
+        x = torch.ones((1, 17))
+        bound = _cpu_bind(
+            _fragment_completed_scan_exports, (x, torch.zeros(1), "paired")
+        )
+        original = bound.to_code(bound.config_spec.default_config())
+        for value in (1, None, "prefix"):
+            config = bound.config_spec.default_config()
+            config.config["cute_fragment_warp_producer_regions"] = value
+            with pytest.raises(exc.InvalidConfig):
+                bound.to_code(config)
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_warp_producer_regions"] = False
+        assert bound.to_code(config) == original
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
+def _fragment_warp_prefix_frontiers(x: torch.Tensor, y: torch.Tensor, valid: int):
+    valid = hl.specialize(valid)
+    width = hl.specialize(x.size(1))
+    peak = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+    total = torch.empty_like(peak)
+    before = torch.empty_like(peak)
+    broadcast = torch.empty_like(x)
+    for row in hl.tile(x.size(0), block_size=1):
+        index = hl.arange(width)
+        values = x[row, :] * 1
+        values = torch.where(index[None, :] < valid, values, -0.0)
+        cdf = hl.cumsum(values, dim=-1)
+        row_peak = values.amax(-1)
+        row_total = cdf.amax(-1)
+        row_before = torch.where(index[None, :] < valid - 1, cdf, 0.0).amax(-1)
+        peak[row] = row_peak
+        total[row] = row_total
+        before[row] = row_before
+        broadcast[row, :] = y[row, :] + row_total[:, None]
+    return peak, total, before, broadcast
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("valid", [0, 1, 17])
+def test_warp_producer_regions_scalar_bits_and_suffix(dtype, valid):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = torch.arange(3 * 17, dtype=dtype).reshape(3, 17) - 8
+    x[0] = -0.0
+    x[1, 0] = 16777216
+    x[1, 8] = -16777216
+    x[2, 9] = float("nan")
+    results = []
+    codes = []
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(
+            helion.kernel(
+                _fragment_warp_prefix_frontiers.fn, backend="cute", static_shapes=True
+            ),
+            (x, x.clone(), valid),
+        )
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=128,
+            cute_fragment_warp_scan=True,
+            cute_fragment_reduction="warp",
+        )
+        for enabled in (False, True):
+            cfg = helion.Config.from_dict(
+                config.config | {"cute_fragment_warp_producer_regions": enabled}
+            )
+            codes.append(bound.to_code(cfg))
+    for code in codes:
+        for reverse in (False, True):
+            outputs = {
+                name: torch.full((3,), -999, dtype=dtype)
+                for name in ("peak", "total", "before")
+            }
+            outputs["broadcast"] = torch.full_like(x, -999)
+            _simulate_register_load_program(
+                _completed_scan_model_source(code),
+                x,
+                128,
+                host_tensors=outputs | {"y": x.clone()},
+                lane_order=list(range(128))[:: -1 if reverse else 1],
+            )
+            bits = torch.int32 if dtype is torch.float32 else torch.int64
+            results.append({name: value.view(bits) for name, value in outputs.items()})
+    for result in results[1:]:
+        for name in results[0]:
+            torch.testing.assert_close(result[name], results[0][name], rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+def _fragment_warp_prefix_cooperative_suffix(x: torch.Tensor, y: torch.Tensor):
+    out = torch.empty_like(y)
+    for row in hl.tile(x.size(0), block_size=1):
+        partial = hl.cumsum(x[row, :], dim=-1)
+        total = partial.amax(-1)
+        values = y[row, :] + total[:, None]
+        out[row, :] = hl.cumsum(values, dim=-1)
+    return out
+
+
+def _warp_prefix_cooperative_source(x, y, *, enabled):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_warp_prefix_cooperative_suffix, (x, y))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=128,
+            cute_fragment_warp_scan=True,
+            cute_fragment_reduction="warp",
+            cute_fragment_scan="cooperative",
+            cute_fragment_warp_producer_regions=enabled,
+        )
+        return bound.to_code(config)
+
+
+@pytest.mark.parametrize("dtype,width", [(torch.float32, 1025), (torch.float64, 2049)])
+def test_warp_producer_regions_cooperative_publications(dtype, width):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    from helion._compiler.cute.warp_producer_regions import PublicationStep
+    from helion._compiler.cute.warp_producer_regions import WarpProducerRecorder
+
+    checked = []
+    original_lower = WarpProducerRecorder.lower
+
+    def lower(recorder, body):
+        publications = [
+            step for step in recorder.suffix_steps if isinstance(step, PublicationStep)
+        ]
+        assert len(publications) == 1 + (width - 1).bit_length()
+        prefix_storage = {step.target.storage for step in recorder.steps}
+        assert any(step.target.storage in prefix_storage for step in publications)
+        assert all(
+            len(step.statements) == 2
+            and isinstance(step.statements[0], ast.For)
+            and ast.unparse(step.statements[-1]) == "cute.arch.sync_threads()"
+            for step in publications
+        )
+        suffix_start = body.index(recorder.steps[-1].statements[-1]) + 1
+        suffix = tuple(body[suffix_start:])
+        before = ast.dump(ast.Module(body=list(suffix), type_ignores=[]))
+        buffers = list(recorder.compiler.buffers)
+        original_lower(recorder, body)
+        assert tuple(body[-len(suffix) :]) == suffix
+        assert ast.dump(ast.Module(body=list(suffix), type_ignores=[])) == before
+        assert recorder.compiler.buffers == buffers
+        checked.append(True)
+
+    x = (torch.arange(3 * 17).reshape(3, 17) % 11 - 5).to(dtype)
+    y = (torch.arange(3 * width).reshape(3, width) % 13 - 6).to(dtype)
+    x[0] = -0.0
+    y[0] = -0.0
+    x[1, 0], x[1, 8] = 16777216, -16777216
+    y[1, width // 2] = 16777216
+    x[2, 8] = float("nan")
+    codes = [_warp_prefix_cooperative_source(x, y, enabled=False)]
+    with patch.object(WarpProducerRecorder, "lower", lower):
+        codes.append(_warp_prefix_cooperative_source(x, y, enabled=True))
+    assert checked == [True]
+    results = []
+    for code in codes:
+        for reverse in (False, True):
+            out = torch.full_like(y, -999)
+            _simulate_register_load_program(
+                _completed_scan_model_source(code),
+                x,
+                128,
+                host_tensors={"y": y, "out": out},
+                lane_order=list(range(128))[:: -1 if reverse else 1],
+            )
+            results.append(
+                out.view(torch.int32 if dtype is torch.float32 else torch.int64)
+            )
+    for result in results[1:]:
+        torch.testing.assert_close(result, results[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mutation", ["unrecorded", "before_write", "before_barrier"])
+def test_warp_producer_regions_cooperative_publication_declines(mutation):
+    from helion._compiler.cute.warp_producer_regions import PublicationStep
+    from helion._compiler.cute.warp_producer_regions import WarpProducerRecorder
+
+    original_lower = WarpProducerRecorder.lower
+    checked = []
+
+    def lower(recorder, body):
+        prefix_storage = {step.target.storage for step in recorder.steps}
+        step = next(
+            step
+            for step in recorder.suffix_steps
+            if isinstance(step, PublicationStep)
+            and step.target.storage in prefix_storage
+            and step.target.storage not in recorder.frontier
+        )
+        if mutation == "unrecorded":
+            recorder.suffix_steps.remove(step)
+        else:
+            position = body.index(
+                step.statements[0 if mutation == "before_write" else -1]
+            )
+            body.insert(
+                position, ast.parse(f"early = {step.target.storage}[0]").body[0]
+            )
+        before = ast.dump(ast.Module(body=body, type_ignores=[]))
+        namespace = recorder.compiler.df.namespace
+        with pytest.raises(exc.InvalidConfig):
+            original_lower(recorder, body)
+        assert ast.dump(ast.Module(body=body, type_ignores=[])) == before
+        assert recorder.compiler.df.namespace is namespace
+        checked.append(True)
+        raise exc.InvalidConfig("injected cooperative publication mutation")
+
+    x, y = torch.ones((1, 17)), torch.ones((1, 1025))
+    before = _warp_prefix_cooperative_source(x, y, enabled=False)
+    with (
+        patch.object(WarpProducerRecorder, "lower", lower),
+        pytest.raises(exc.InvalidConfig),
+    ):
+        _warp_prefix_cooperative_source(x, y, enabled=True)
+    assert checked == [True]
+    assert _warp_prefix_cooperative_source(x, y, enabled=False) == before

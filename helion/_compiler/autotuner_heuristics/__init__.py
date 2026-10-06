@@ -127,6 +127,12 @@ from .cute_fragment_skip_zero_atomics import (
 )
 from .cute_fragment_threads import CuteFragmentThreadsHeuristic
 from .cute_fragment_threads import register_fragment_threads_coverage
+from .cute_fragment_warp_producer_regions import (
+    CuteFragmentWarpProducerRegionsHeuristic,
+)
+from .cute_fragment_warp_producer_regions import (
+    register_fragment_warp_producer_regions_coverage,
+)
 from .cute_fragment_warp_results import CuteFragmentWarpResultsHeuristic
 from .cute_fragment_warp_results import register_fragment_warp_results_coverage
 from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
@@ -242,6 +248,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentPacketLoadsHeuristic,
         CuteFragmentRegisterProducersHeuristic,
         CuteFragmentScanExportsHeuristic,
+        CuteFragmentWarpProducerRegionsHeuristic,
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
     ),
@@ -732,3 +739,4 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_scan_exports_coverage(env, device_ir)
+    register_fragment_warp_producer_regions_coverage(env, device_ir)
