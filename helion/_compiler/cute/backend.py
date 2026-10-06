@@ -1589,6 +1589,7 @@ class CuteBackend(Backend):
                 "cute_fragment_register_snapshots",
                 "cute_fragment_register_producers",
                 "cute_fragment_scan_exports",
+                "cute_fragment_warp_producer_regions",
                 "cute_fragment_bounded_gather",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",

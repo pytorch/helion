@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .warp_producer_regions import WarpProducerRecorder
 
 
 def _resolve(value: object, values: dict[Node, object]) -> object:
@@ -501,6 +502,7 @@ class FragmentCompiler:
                         warp_result_chain(node, self.env, self.threads)
                     )
 
+        self.warp_producer_recorder: WarpProducerRecorder | None = None
         self.scan_plans: dict[Node, CompletedScan] = {}
         self.scan_reductions: dict[Node, CompletedScan] = {}
         self.scan_pending: list[tuple[Fragment, Callable, torch.dtype, str]] = []
@@ -954,11 +956,17 @@ class FragmentCompiler:
                 store = f"if {self.thread} % {threads_per_element} == 0:\n    {store}"
             self.emit(store)
 
+        statements = self.cg.statements_stack[-1]
+        start = len(statements)
         self.elements(
             source.shape,
             write,
             threads_per_element=threads_per_element,
         )
+        if self.warp_producer_recorder is not None:
+            self.warp_producer_recorder.copy(
+                statements[start:], source, target, threads_per_element
+            )
 
     def materialize(
         self, value: Fragment, *, copy: bool = False, threads_per_element: int = 1
@@ -1814,6 +1822,8 @@ class FragmentCompiler:
             index_values = (
                 values[index] for index in indices if isinstance(index, Node)
             )
+            statements = self.cg.statements_stack[-1]
+            start = len(statements)
             packet = materialize_packet_load(
                 self,
                 tensor,
@@ -1823,6 +1833,8 @@ class FragmentCompiler:
                 + ((mask_value,) if isinstance(mask_value, Fragment) else ()),
             )
             if packet is not None:
+                if self.warp_producer_recorder is not None:
+                    self.warp_producer_recorder.publication(statements[start:], packet)
                 return packet
         if (
             self.df.config.get("cute_fragment_register_loads", False)
@@ -2781,6 +2793,8 @@ class FragmentCompiler:
         forward even when the original positions are visited in reverse order.
         Small scans retain the original two-phase floating-point tree verbatim.
         """
+        statements = self.cg.statements_stack[-1]
+        start = len(statements)
         capacity = source.shape[dim]
         assert capacity <= 1024 or source.dtype in (torch.int32, torch.int64)
         row_shape = (*source.shape[:dim], *source.shape[dim + 1 :])
@@ -2950,6 +2964,8 @@ class FragmentCompiler:
         self.held.pop()
         self.held.pop()
         self.held.pop()
+        if self.warp_producer_recorder is not None:
+            self.warp_producer_recorder.scan(statements[start:], source, result, totals)
         if export:
 
             def read(coords: tuple[str, ...]) -> str:
@@ -3069,7 +3085,11 @@ class FragmentCompiler:
                 f"    {current.read(coords)} = {self.cast('0', source.dtype)}"
             )
 
+        statements = self.cg.statements_stack[-1]
+        start = len(statements)
         self.elements(source.shape, initialize)
+        if self.warp_producer_recorder is not None:
+            self.warp_producer_recorder.publication(statements[start:], current)
         # Every stage reads only the preceding stage. A CTA barrier follows
         # each complete tile write, including when a thread owns several
         # elements. Never overwrite the input: it may have other consumers.
@@ -3101,7 +3121,10 @@ class FragmentCompiler:
                     f"    {other.read(coords)} = {right}"
                 )
 
+            start = len(statements)
             self.elements(source.shape, combine)
+            if self.warp_producer_recorder is not None:
+                self.warp_producer_recorder.publication(statements[start:], other)
             current, other = other, current
         self.held.pop()
         self.held.pop()
@@ -3443,6 +3466,8 @@ class FragmentCompiler:
         self.scopes.append(values)
         try:
             for node in graph.nodes:
+                if self.warp_producer_recorder is not None:
+                    self.warp_producer_recorder.enter(node)
                 if node.op == "placeholder":
                     continue
                 if node.op == "output":
@@ -4615,6 +4640,13 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         return decline()
     root = graphs[root.graph_id]
     compiler = FragmentCompiler(cg, graphs)
+    if compiler.df.config.get("cute_fragment_warp_producer_regions", False):
+        from .warp_producer_regions import WarpProducerRecorder
+        from .warp_producer_regions import producer_prefix
+
+        plan = producer_prefix(root.graph, env, graphs, compiler.shape)
+        if plan is not None:
+            compiler.warp_producer_recorder = WarpProducerRecorder(compiler, plan)
     if (
         pure_regions_required
         and not pure_producer_plan(root.graph, env, shape=compiler.shape).lazy
@@ -4692,6 +4724,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         compiler.graph(root.graph, {})
         # Root lifetime can be nested in an outer generated grid loop.
         compiler.synchronize_local_atomics()
+    if compiler.warp_producer_recorder is not None:
+        compiler.warp_producer_recorder.lower(body)
     capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(compiler.env.device)
     if not capacity and any(
         node.target is _tracing_ops._while_loop
