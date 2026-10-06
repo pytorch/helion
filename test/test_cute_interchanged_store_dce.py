@@ -12,6 +12,7 @@ import torch
 
 from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
+from test.test_cute_persistent_reduction_coverage import _assert_fragment_norm_coverage
 
 import helion
 from helion import exc
@@ -344,6 +345,15 @@ def test_norm_backward_emits_one_dx_store(name: str) -> None:
             and "grad_x.iterator" in ast.unparse(node.func.value)
             for node in ast.walk(ast.parse(source))
         )
+
+    if "fragment_buffer" in code:
+        assert name == "layer_norm"
+        # The complete fragment owner already emits one write per element;
+        # it does not pass through the scalar interchange/DCE rewrite.
+        assert stores(original) == stores(code) == 1
+        assert ast.dump(ast.parse(original)) == ast.dump(ast.parse(code))
+        _assert_fragment_norm_coverage(code, 256, 1024)
+        return
 
     assert stores(original) == 2
     assert stores(code) == 1

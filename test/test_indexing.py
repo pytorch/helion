@@ -38,6 +38,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
@@ -3631,3 +3632,272 @@ def test_cute_live_invalid_grid_axis_rejected_after_codegen():
         bound = _cpu_bind(add_one, (torch.zeros(5, 65),))
         with pytest.raises(exc.BackendUnsupported, match="thread axis 3"):
             bound.to_code(bound.config_spec.default_config())
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_coordinate_pad_2d(x: torch.Tensor, width: int):
+    width = hl.specialize(width)
+    flat = x.reshape(-1)
+    out = torch.empty((x.size(0), width), device=x.device, dtype=x.dtype)
+    for row, col in hl.tile(out.shape):
+        address = row.index[:, None] * x.size(1) + col.index[None, :]
+        valid = col.index[None, :] < x.size(1)
+        value = hl.load(flat, [address], extra_mask=valid)
+        out[row, col] = torch.where(valid, value + 1, -7)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_coordinate_pad_3d(x: torch.Tensor, width: int):
+    width = hl.specialize(width)
+    flat = x.reshape(-1)
+    out = torch.empty((x.size(0), x.size(1), width), device=x.device, dtype=x.dtype)
+    for plane, row, col in hl.tile(out.shape):
+        address = (
+            plane.index[:, None, None] * x.size(1) + row.index[None, :, None]
+        ) * x.size(2) + col.index[None, None, :]
+        valid = col.index[None, None, :] < x.size(2)
+        value = hl.load(flat, [address], extra_mask=valid)
+        out[plane, row, col] = torch.where(valid, value + 1, -7)
+    return out
+
+
+def _execute_pointwise_thread_program(source, inputs):
+    """Execute the actual scalar program for every launched CTA/thread on CPU."""
+    import itertools
+    import operator
+    from types import SimpleNamespace
+
+    writes = {}
+
+    class Pointer:
+        def __init__(self, tensor, offset=0):
+            self.tensor, self.offset = tensor, int(offset)
+
+        def __add__(self, offset):
+            return Pointer(self.tensor, self.offset + int(offset))
+
+        def load(self):
+            assert 0 <= self.offset < self.tensor.numel()
+            return self.tensor.reshape(-1)[self.offset].item()
+
+        def store(self, value):
+            assert 0 <= self.offset < self.tensor.numel()
+            key = (self.tensor.data_ptr(), self.offset)
+            writes[key] = writes.get(key, 0) + 1
+            self.tensor.reshape(-1)[self.offset] = value
+
+    current = {"block": (0, 0, 0), "thread": (0, 0, 0)}
+    launches = []
+
+    def launcher(function, grid, *arguments, block):
+        launches.append(block)
+        args = [
+            SimpleNamespace(
+                iterator=Pointer(arg), layout=SimpleNamespace(stride=arg.stride())
+            )
+            if isinstance(arg, torch.Tensor)
+            else arg
+            for arg in arguments
+        ]
+        for cta in itertools.product(*(range(size) for size in grid)):
+            current["block"] = (*cta, *((0,) * (3 - len(cta))))
+            for thread in itertools.product(*(range(size) for size in block)):
+                current["thread"] = thread
+                function(*args)
+
+    tree = ast.parse(source)
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.FunctionDef):
+            node.decorator_list = []
+        body.append(node)
+    namespace = {
+        "torch": torch,
+        "operator": operator,
+        "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float, Boolean=bool),
+        "cute": SimpleNamespace(
+            arch=SimpleNamespace(
+                block_idx=lambda: current["block"], thread_idx=lambda: current["thread"]
+            )
+        ),
+        "_default_cute_launcher": launcher,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
+            "<pointwise-thread-model>",
+            "exec",
+        ),
+        namespace,
+    )
+    wrapper = next(
+        node.name for node in reversed(body) if isinstance(node, ast.FunctionDef)
+    )
+    result = namespace[wrapper](*inputs)
+    assert len(writes) == result.numel()
+    assert set(writes.values()) == {1}, "duplicate or missing output ownership"
+    return result, launches
+
+
+@pytest.mark.parametrize(
+    "shape,width,tiles",
+    [((3, 67), 73, [4, 32]), ((5, 9), 17, [4, 8]), ((3, 5, 9), 17, [2, 4, 8])],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reverse):
+    from helion._compiler.tile_dispatch import TileStrategyDispatch
+
+    inputs = (torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape), width)
+    aliases = []
+    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+
+    def observe(dispatch, function):
+        result = original(dispatch, function)
+        aliases.append(result)
+        return result
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
+    ):
+        bound = _cpu_bind(
+            _broadcast_coordinate_pad_2d
+            if len(shape) == 2
+            else _broadcast_coordinate_pad_3d,
+            inputs,
+        )
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = tiles
+        config.config["loop_orders"] = [
+            list(reversed(range(len(shape)))) if reverse else list(range(len(shape)))
+        ]
+        source = bound.to_code(config)
+    assert any(aliases)
+    validate_thread_axis_accesses(ast.parse(source).body)
+    actual, launches = _execute_pointwise_thread_program(source, inputs)
+    expected = torch.full((*shape[:-1], width), -7.0)
+    expected[..., : shape[-1]] = inputs[0] + 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert all(len(block) == 3 for block in launches)
+
+
+@pytest.mark.parametrize("axis", [-1, 3, 4])
+def test_cute_pointwise_invalid_axis_rejects_structurally(axis):
+    from helion._compiler.cute.backend import _pointwise_grid_thread_dims
+
+    with pytest.raises(exc.BackendUnsupported, match="physical thread axes"):
+        _pointwise_grid_thread_dims(
+            {axis: 4},
+            {axis},
+            [1, 1, 1],
+            has_pointwise_fact=True,
+            has_nested_device_loops=False,
+            has_synthetic_free_axes=False,
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_axis_free_iota(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        index = hl.arange(x.size(1))
+        out[row, :] = x[row, :] + index[None, :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_axis_nested(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        for col in hl.tile(x.size(1)):
+            out[row, col] = x[row, col] + row.index[:, None]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_axis_matmul(x: torch.Tensor, y: torch.Tensor):
+    out = torch.empty((x.size(0), y.size(1)), dtype=x.dtype, device=x.device)
+    for row, col in hl.tile(out.shape):
+        out[row, col] = hl.dot(x[row, :], y[:, col])
+    return out
+
+
+@pytest.mark.parametrize("kind", ["reduction", "free_iota", "nested", "matmul"])
+def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
+    from helion._compiler.tile_dispatch import TileStrategyDispatch
+
+    cases = {
+        "reduction": (
+            helion.kernel(
+                reduction_sum.fn,
+                backend="cute",
+                static_shapes=True,
+                autotune_effort="none",
+            ),
+            (torch.ones(3, 8),),
+        ),
+        "free_iota": (_broadcast_axis_free_iota, (torch.ones(3, 8),)),
+        "nested": (_broadcast_axis_nested, (torch.ones(3, 17),)),
+        "matmul": (
+            _broadcast_axis_matmul,
+            (
+                torch.ones(16, 16, dtype=torch.float16),
+                torch.ones(16, 16, dtype=torch.float16),
+            ),
+        ),
+    }
+    kernel, inputs = cases[kind]
+    aliases = []
+    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+
+    def observe(dispatch, function):
+        result = original(dispatch, function)
+        aliases.append(result)
+        return result
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        bound = _cpu_bind(kernel, inputs)
+        config = bound.config_spec.default_config()
+        with patch.object(
+            TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe
+        ):
+            actual = bound.to_code(config)
+        with patch.object(
+            TileStrategyDispatch, "_inactive_cute_broadcast_aliases", return_value=set()
+        ):
+            previous = bound.to_code(config)
+    assert aliases and not any(aliases)
+    assert ast.dump(ast.parse(actual)) == ast.dump(ast.parse(previous))
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "shape,width,tiles", [((3, 67), 73, [4, 32]), ((3, 5, 9), 17, [2, 4, 8])]
+)
+def test_cute_inactive_broadcast_axes_native(shape, width, tiles):
+    x = torch.arange(math.prod(shape), device=DEVICE, dtype=torch.float32).reshape(
+        shape
+    )
+    kernel = (
+        _broadcast_coordinate_pad_2d
+        if len(shape) == 2
+        else _broadcast_coordinate_pad_3d
+    )
+    bound = kernel.bind((x, width))
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"] = tiles
+    actual = bound.compile_config(config)(x, width)
+    expected = torch.full((*shape[:-1], width), -7.0, device=DEVICE)
+    expected[..., : shape[-1]] = x + 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
