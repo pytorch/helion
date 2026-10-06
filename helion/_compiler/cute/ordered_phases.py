@@ -13,9 +13,12 @@ from ... import exc
 from ...language import _tracing_ops
 from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
+from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
 from ..type_info import BarrierResultType
 from ..type_info import BlockSizeType
+from ..type_info import CallableType
+from ..type_info import TensorAttributeType
 from ..type_info import TensorType
 from .materialized_fission import MaterializedFissionPlan
 from .materialized_fission import _shape_only
@@ -31,6 +34,80 @@ if TYPE_CHECKING:
 def _require(condition: bool, detail: str) -> None:
     if not condition:
         raise exc.BackendUnsupported("cute", f"ordered grid phases: {detail}")
+
+
+def _contiguous_host_view(node: ast.AST, tensor_names: set[str]) -> bool:
+    """Prove a full-span host view whose exact object can be captured once.
+
+    This does not make an input fresh or read-only. Both a writable parameter
+    and a fresh output retain their original storage owner, and the existing
+    explicit phase barriers still order every device access. The stage wrapper
+    receives the same view object created by the outer host, not a new buffer.
+    """
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node, ExtendedAST)
+        and isinstance(node._type_info, TensorType)
+        and isinstance(node.func, ExtendedAST)
+    ):
+        return False
+    callee = node.func._type_info
+    if (
+        isinstance(callee, TensorAttributeType)
+        and callee.attr() in ("reshape", "view", "flatten")
+        and isinstance(node.func, ast.Attribute)
+    ):
+        owner = node.func.value
+        arguments = node.args
+    elif (
+        isinstance(callee, CallableType)
+        and any(callee.value is fn for fn in (torch.reshape, torch.flatten))
+        and node.args
+    ):
+        owner, *arguments = node.args
+    else:
+        return False
+    if not (
+        isinstance(owner, ast.Name)
+        and owner.id in tensor_names
+        and isinstance(owner, ExtendedAST)
+        and isinstance(owner._type_info, TensorType)
+    ):
+        return False
+
+    def shape_only(value: ast.AST) -> bool:
+        if isinstance(value, ast.UnaryOp) and isinstance(
+            value.op, (ast.UAdd, ast.USub)
+        ):
+            return shape_only(value.operand)
+        if isinstance(value, (ast.Tuple, ast.List)):
+            return all(shape_only(item) for item in value.elts)
+        return _shape_only(value, tensor_names)
+
+    if any(keyword.arg in (None, "out") for keyword in node.keywords) or not all(
+        shape_only(value) for value in (*arguments, *(k.value for k in node.keywords))
+    ):
+        return False
+    base = owner._type_info.proxy()
+    view = node._type_info.proxy()
+    env = CompileEnvironment.current()
+    if not (
+        base.dtype == view.dtype
+        and base.device == view.device
+        and base.untyped_storage()._cdata == view.untyped_storage()._cdata
+        and env.known_equal(base.storage_offset(), view.storage_offset())
+        and env.known_equal(base.numel(), view.numel())
+    ):
+        return False
+    for tensor in (base, view):
+        stride: int | torch.SymInt = 1
+        for size, actual_stride in reversed(
+            tuple(zip(tensor.shape, tensor.stride(), strict=True))
+        ):
+            if not env.known_equal(actual_stride, stride):
+                return False
+            stride = stride * size
+    return True
 
 
 def generate_ordered_phases(
@@ -144,8 +221,11 @@ def generate_ordered_phases(
             _require(
                 len(statement.targets) == 1
                 and isinstance(statement.targets[0], ast.Name)
-                and value_type.proxy() in fresh,
-                "host tensor prelude must allocate a fresh named buffer",
+                and (
+                    value_type.proxy() in fresh
+                    or _contiguous_host_view(statement.value, tensor_names)
+                ),
+                "host tensor prelude must allocate fresh storage or a proved contiguous view",
             )
             captures.extend(targets)
             tensor_names.update(targets)
