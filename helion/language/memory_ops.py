@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.signed_bitfield import PackedStoreValue
     from .._compiler.cute.signed_bitfield import SignedByteSite
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.tile_strategy import DeviceLoopOrGridState
     from .._compiler.tile_strategy import LoopDimInfo
 
 from .._compiler.host_function import SymbolOrigin
@@ -1658,6 +1659,32 @@ def _cute_is_tile_scalar(
     return _symint_expr(idx) != _symint_expr(env.block_sizes[block_id].var)
 
 
+def _cute_tile_id_thread_extent_is_complete(
+    state: CodegenState, owner: DeviceLoopOrGridState, block_id: int
+) -> bool:
+    """A tile-level bound cannot discard a live physical/serial-lane mask."""
+    from .._compiler.tile_strategy import DeviceLoopState
+    from .._compiler.tile_strategy import PerThreadNDTileStrategy
+
+    # A serial device loop may still emit its store inside each element-lane
+    # iteration. Keep the original mask until that store's placement is proved:
+    # an empty tail lane must not overwrite a preceding nonempty lane's result.
+    if isinstance(owner, DeviceLoopState) and block_id in owner.lane_loop_blocks:
+        return False
+    axis = owner.block_thread_axes.get(block_id)
+    if axis is None:
+        return True
+    extent = owner.thread_axis_sizes.get(axis)
+    if extent is None:
+        return False
+    if isinstance(owner.strategy, PerThreadNDTileStrategy):
+        extent = owner.strategy.thread_extent_for_masking(block_id, extent)
+    # The dispatch includes ordinary sibling branches/roots. A wider sibling
+    # therefore keeps the original element mask and its existing arbitration.
+    planned = state.device_function.tile_strategy.thread_block_dims()
+    return 0 <= axis < len(planned) and 0 < planned[axis] <= extent
+
+
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -1665,7 +1692,10 @@ def _cute_combined_mask(
     tensor: torch.Tensor | None = None,
     *,
     include_tensor_index_masks: bool = True,
+    for_store: bool = False,
 ) -> str | None:
+    # Destination stores may need an element-owner mask for arbitration.
+    # A source/reloaded tile scalar must remain uniform across those lanes.
     env = CompileEnvironment.current()
     terms: list[str] = []
 
@@ -1800,6 +1830,63 @@ def _cute_combined_mask(
             continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
+            origin = _maybe_get_symbol_origin(idx)
+            if (
+                for_store
+                and origin is not None
+                and isinstance(origin.origin, TileIdOrigin)
+                and block_id is not None
+                and mask_var_for_block_id(block_id) is not None
+            ):
+                # A tile ID denotes one scalar per nonempty tile, not the
+                # current element of that tile. Its element mask can depend
+                # on both a thread coordinate and a serial lane loop, neither
+                # of which belongs to this address. Keep the tile's absolute
+                # end and destination bounds instead of borrowing that mask.
+                from .._compiler.tile_strategy import DeviceGridState
+
+                remapped = _cute_remap_block_id(state, block_id)
+                owners = state.codegen.active_device_loops.get(remapped)
+                owner = owners[-1] if owners else state.codegen.current_grid_state
+                info = (
+                    owner.block_id_to_info.get(remapped) if owner is not None else None
+                )
+                if info is None or owner is None:
+                    raise exc.BackendUnsupported("cute", "tile ID has no active owner")
+                if not _cute_tile_id_thread_extent_is_complete(state, owner, remapped):
+                    original_mask = mask_var_for_block_id(block_id)
+                    assert original_mask is not None
+                    terms.append(original_mask)
+                    seen.add(block_id)
+                    tensor_dim += 1
+                    continue
+                if isinstance(owner, DeviceGridState):
+                    end = info.grid_end_expr
+                    end_expr = (
+                        state.device_function.literal_expr(end)
+                        if end is not None
+                        else None
+                    )
+                else:
+                    end_expr = info.end_var_name
+                    if end_expr is None and info.end_expr is not None:
+                        end_expr = state.device_function.literal_expr(info.end_expr)
+                if end_expr is None:
+                    raise exc.BackendUnsupported("cute", "tile ID has no logical end")
+                begin = tile_begin_expr(block_id)
+                terms.append(f"({begin}) < ({end_expr})")
+                if tensor is not None and tensor_dim < tensor.ndim:
+                    size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+                    tile_size = state.device_function.block_size_var(remapped) or "1"
+                    terms.extend(
+                        (
+                            f"(({begin}) // ({tile_size})) >= 0",
+                            f"(({begin}) // ({tile_size})) < ({size})",
+                        )
+                    )
+                seen.add(block_id)
+                tensor_dim += 1
+                continue
             if block_id is not None and _cute_is_tile_scalar(env, idx, block_id):
                 # A tile attribute (``tile.begin``, ``tile.id``) or a grid
                 # index is one address for the whole tile, in range whenever
@@ -6987,7 +7074,9 @@ def _codegen_cute_store_permute_lane_loops(
         inactive_singleton_slice_expr="0",
     )
     index_tuple = _cute_index_tuple(index_exprs)
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    mask_expr = _cute_combined_mask(
+        state, subscript, extra_mask, tensor=tensor, for_store=True
+    )
     tensor_name = state.device_function.tensor_arg(tensor).name
 
     input_node: torch.fx.Node
