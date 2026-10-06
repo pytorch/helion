@@ -10,6 +10,7 @@ from .base_search import performance
 from .base_search import population_statistics
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
+from .pattern_search import random_fallback_population_target
 from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
@@ -66,7 +67,9 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
                 cached configs with random configs to reach 2x population size.
-                When False, use only the default and cached configs (no random padding).
+                When False, use only the default and cached configs; random configs
+                are added only as a fallback when every one of them fails to compile
+                or run (see PopulationBasedSearch.benchmark_initial_population).
             finishing_rounds: Number of finishing rounds to run after the main search.
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
             compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
@@ -172,6 +175,12 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         oversized_population = sorted(
             self.benchmark_flat_batch(
                 self._generate_initial_population_flat(),
+                random_fallback_target=random_fallback_population_target(
+                    self.initial_population_strategy,
+                    self.best_available_pad_random,
+                    self.config_spec,
+                    self.population_size * 2,
+                ),
             ),
             key=performance,
         )
