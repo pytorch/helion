@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -255,6 +256,25 @@ class AutotuningLogger:
                 unique_sources=point.progress.unique_sources,
                 samples=point.finalists[0].samples,
             )
+
+    @_logging_errors()
+    def record_handoff_event(self, event: str, **fields: object) -> None:
+        """Record native-source progress separately from configuration timings."""
+        if self._trace_sink is not None:
+            self._trace_sink.record(event, "native_source", **fields)
+
+    @_logging_errors()
+    def record_handoff_chat(self, transcript: Path, session_id: str) -> Path | None:
+        """Save each full agent conversation beside the autotune log files."""
+        filename = self._settings.autotune_log
+        if not filename:
+            return None
+        path = (
+            Path(filename).with_suffix(f".handoff.{session_id}.chat.jsonl").absolute()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(transcript, path)
+        return path
 
     @_logging_errors()
     def record_handoff_measurement(
