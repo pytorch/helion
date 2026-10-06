@@ -23,6 +23,7 @@ from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import _compat
+from helion._compat import supports_block_ptr
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import PROJECT_ROOT
@@ -662,7 +663,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
 
-        if _get_backend() == "triton":
+        if _get_backend() == "triton" and supports_block_ptr():
+            # Without block pointers the block_ptr request lowers as pointer code.
             self.assertNotEqualCode(code_pointer, code_block)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")

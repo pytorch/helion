@@ -250,7 +250,12 @@ def test_source64_reaches_original_full_search_first_benchmark(
     class HeldBenchmark(Exception):
         pass
 
-    def hold(members: Sequence[PopulationMember], *, desc: str) -> None:
+    def hold(
+        members: Sequence[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool = True,
+    ) -> None:
         assert desc == "Initial population"
         delivered.extend(deepcopy(member.config) for member in members)
         raise HeldBenchmark

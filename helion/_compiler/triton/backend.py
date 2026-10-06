@@ -49,6 +49,12 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    def supports_block_ptr_indexing(self) -> bool:
+        from ..._compat import supports_block_ptr
+
+        # Triton >= 3.9 removed block pointers (triton-lang/triton#10833).
+        return supports_block_ptr()
+
     @property
     def name(self) -> str:
         return "triton"

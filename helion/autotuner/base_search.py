@@ -798,7 +798,11 @@ class BaseSearch(BaseAutotuner):
         )
 
     def benchmark_batch(
-        self, configs: list[Config], *, desc: str = "Benchmarking"
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         """Compile and benchmark a batch of configurations.
 
@@ -808,6 +812,9 @@ class BaseSearch(BaseAutotuner):
         Args:
             configs: A list of configurations to benchmark.
             desc: Description for the progress bar.
+            raise_if_no_viable_config: Re-raise the compile error when nothing
+                has been measured yet and the whole batch fails to compile.
+                Pass ``False`` for a batch that has a fallback population.
 
         Returns:
             A list of BenchmarkResult entries, one per input config.
@@ -824,7 +831,11 @@ class BaseSearch(BaseAutotuner):
                     "Exploration tracking failed; continuing autotuning",
                     exc_info=True,
                 )
-        inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
+        inner_results = self.benchmark_provider.benchmark(
+            passing_configs,
+            desc=desc,
+            raise_if_no_viable_config=raise_if_no_viable_config,
+        )
 
         if len(passing_indices) == len(configs):
             results = inner_results
@@ -1433,22 +1444,31 @@ class PopulationBasedSearch(BaseSearch):
         return member
 
     def benchmark_flat_batch(
-        self, to_check: list[FlatConfig]
+        self,
+        to_check: list[FlatConfig],
+        *,
+        random_fallback_target: int | None = None,
     ) -> list[PopulationMember]:
         """
         Benchmark multiple flat configurations in parallel.
 
-        The returned list has the same length as ``to_check`` and preserves
-        positional correspondence.  Invalid configurations that cannot be
-        unflattened are represented as ``PopulationMember`` objects with
-        ``perf == inf`` and ``status == "error"`` (they are not benchmarked).
+        The first ``len(to_check)`` entries of the returned list preserve
+        positional correspondence with ``to_check``.  Invalid configurations
+        that cannot be unflattened are represented as ``PopulationMember``
+        objects with ``perf == inf`` and ``status == "error"`` (they are not
+        benchmarked).
 
         Args:
             to_check: A list of flat configurations to benchmark.
+            random_fallback_target: When given, ``to_check`` is a seed-only
+                initial population; see :meth:`benchmark_initial_population`.
 
         Returns:
             A list of population members with the benchmark results, one per
-            entry in *to_check*.
+            entry in *to_check*.  When ``random_fallback_target`` is given and
+            every entry fails, the random fallback members are appended after
+            the positional entries, so the list is then longer than
+            ``to_check``.
         """
         from ..runtime.config import Config
 
@@ -1466,7 +1486,14 @@ class PopulationBasedSearch(BaseSearch):
                     )
                 )
 
-        self.benchmark_population(valid)
+        if random_fallback_target is None:
+            self.benchmark_population(valid)
+            return result
+        num_valid = len(valid)
+        self.benchmark_initial_population(
+            valid, random_fallback_target=random_fallback_target
+        )
+        result.extend(valid[num_valid:])
         return result
 
     def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
@@ -1737,7 +1764,11 @@ class PopulationBasedSearch(BaseSearch):
         self._best_available_seed_configs = list(configs)
 
     def benchmark_population(
-        self, members: list[PopulationMember], *, desc: str = "Benchmarking"
+        self,
+        members: list[PopulationMember],
+        *,
+        desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
     ) -> list[PopulationMember]:
         """
         Benchmark multiple population members in parallel.  Members should be created with make_unbenchmarked.
@@ -1745,8 +1776,13 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
+            raise_if_no_viable_config: See :meth:`BaseSearch.benchmark_batch`.
         """
-        results = self.benchmark_batch([m.config for m in members], desc=desc)
+        results = self.benchmark_batch(
+            [m.config for m in members],
+            desc=desc,
+            raise_if_no_viable_config=raise_if_no_viable_config,
+        )
         for member, result in zip(members, results, strict=True):
             member.config = result.config
             member.flat_values = self.config_gen.flatten(result.config)
@@ -1758,6 +1794,65 @@ class PopulationBasedSearch(BaseSearch):
         repairs = self.benchmark_provider.take_effective_source_repairs()
         if repairs:
             self._apply_effective_source_repairs(repairs, members)
+        return members
+
+    def benchmark_initial_population(
+        self,
+        members: list[PopulationMember],
+        *,
+        random_fallback_target: int | None = None,
+        visited: set[Config] | None = None,
+        desc: str = "Initial population",
+    ) -> list[PopulationMember]:
+        """Benchmark the initial population, recovering from an all-failing seed set.
+
+        ``random_fallback_target`` is the number of unique random configs to
+        add when ``members`` holds only seed/default/cache configs and none of
+        them compiles or runs (for example a backend default config that
+        raises ``BackendUnsupported`` for this kernel). It counts configs
+        beyond the seeds, so the fallback is the same size however many
+        cached configs were seeded. ``None`` keeps the immediate re-raise of
+        the compile error, which is right for random populations: their total
+        failure already shows the search space is broken, so padding would
+        only double the time to the same error. Fallback members are appended
+        to ``members`` (and ``visited``) in place; when no fallback config can
+        be generated, or the fallback also fails entirely, the compile error
+        is raised exactly as for a random population.
+        """
+        self.benchmark_population(
+            members,
+            desc=desc,
+            raise_if_no_viable_config=random_fallback_target is None,
+        )
+        if random_fallback_target is None or any(
+            math.isfinite(member.perf) for member in members
+        ):
+            return members
+        compile_error = self.benchmark_provider.take_no_viable_config_error()
+        seen = {member.config for member in members} if visited is None else visited
+        fallback: list[PopulationMember] = []
+        # The padding helper re-adds the seeds first, so pad past them.
+        for flat in self._pad_initial_population_with_unique_random(
+            [member.flat_values for member in members],
+            len(members) + random_fallback_target,
+        ):
+            member = self.make_unbenchmarked(flat)
+            if member is not None and member.config not in seen:
+                seen.add(member.config)
+                fallback.append(member)
+        if not fallback:
+            # Nothing to fall back to: surface the real compile error rather
+            # than letting the search end in a generic NoConfigFound.
+            if compile_error is not None:
+                raise compile_error
+            return members
+        self.log.warning(
+            f"None of the {len(members)} seed/default/cache configs compiled or "
+            "ran (the backend may not support the default config for this "
+            f"kernel); continuing with {len(fallback)} random configs."
+        )
+        self.benchmark_population(fallback, desc="Random fallback population")
+        members.extend(fallback)
         return members
 
     def _apply_effective_source_repairs(

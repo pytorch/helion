@@ -345,7 +345,12 @@ def test_full_search_delivers_new_witness_without_changing_old_seeds(
     class HeldBenchmark(Exception):
         pass
 
-    def hold(members: Sequence[PopulationMember], *, desc: str) -> None:
+    def hold(
+        members: Sequence[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool = True,
+    ) -> None:
         assert desc == "Initial population"
         delivered.extend(member.config for member in members)
         raise HeldBenchmark

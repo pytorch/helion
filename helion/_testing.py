@@ -34,6 +34,7 @@ from ._compat import get_mtia_tunable_fragments
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import supports_block_ptr
 from ._compat import supports_host_tensor_descriptor
 from ._compat import supports_tensor_descriptor
 from ._compat import target_device_capability
@@ -512,6 +513,19 @@ def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
+
+
+def skipUnlessBlockPtr(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless the installed Triton still supports block pointers.
+
+    Triton >= 3.9 removed ``tl.make_block_ptr`` (triton-lang/triton#10833);
+    tests that pin ``indexing="block_ptr"`` and check the generated code have
+    nothing to check there.  Other backends keep running them as numerics
+    checks.
+    """
+    return skipIfFn(
+        lambda: matchesBackends(["triton"]) and not supports_block_ptr(), reason
+    )
 
 
 def skipUnlessHostTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:

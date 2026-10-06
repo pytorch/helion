@@ -29,6 +29,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -380,6 +381,7 @@ class TestInt64Indexing(RefEagerTestBase, TestCase):
     @skipIfRefEager("Test checks generated code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipUnlessBlockPtr("asserts tl.make_block_ptr in the generated code")
     def test_int32_block_ptr_still_works(self):
         """Test that int32 (default) still uses block_ptr when requested."""
 

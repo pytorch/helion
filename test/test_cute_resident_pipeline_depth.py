@@ -330,7 +330,12 @@ def test_full_lfbo_initial_population_receives_deep_pipeline_seeds() -> None:
     class HeldBenchmark(Exception):
         pass
 
-    def hold(members: Sequence[PopulationMember], *, desc: str) -> None:
+    def hold(
+        members: Sequence[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool = True,
+    ) -> None:
         assert desc == "Initial population"
         delivered.extend(deepcopy(member.config) for member in members)
         raise HeldBenchmark
