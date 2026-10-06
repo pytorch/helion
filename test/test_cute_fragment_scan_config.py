@@ -199,6 +199,7 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
         InitialPopulationStrategy.FROM_BEST_AVAILABLE,
     ],
 )
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_scan_coverage_preserves_original_population_and_rng(strategy):
     with patch("helion._compiler.autotuner_heuristics.register_fragment_scan_coverage"):
         old_bound = _bind()
@@ -280,6 +281,7 @@ def test_scan_search_full_neighbors_and_random_mutation_reach_both_modes():
 
 
 @pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_scan_coverage_honors_explicit_legacy_override_and_disabled_heuristics(
     disabled,
 ):
@@ -454,6 +456,7 @@ def test_fragment_reduction_explicit_phase_roots_share_capability():
         InitialPopulationStrategy.FROM_BEST_AVAILABLE,
     ],
 )
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_fragment_reduction_coverage_preserves_original_population_and_rng(strategy):
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
@@ -488,6 +491,7 @@ def test_fragment_reduction_coverage_preserves_original_population_and_rng(strat
     assert full.config_gen.unflatten(actual[-1])[REDUCTION_KEY] == "warp"
 
 
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_fragment_reduction_neighbors_random_mutation_and_overrides():
     bound = _bind_reduction()
     generation = bound.config_spec.create_config_generation()
@@ -544,6 +548,7 @@ def _scan_and_fragment_reduction(x: torch.Tensor):
     return out
 
 
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
@@ -677,6 +682,7 @@ def _resource_bound_and_actual(bound, config):
 
 
 @pytest.mark.parametrize("width", [4097, 8193])
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
     inputs = (torch.ones(3, width),)
     with patch(
@@ -757,6 +763,7 @@ def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents(
             )
 
 
+@pytest.mark.usefixtures("_without_thread_coverage")
 def test_fragment_resource_carrier_builds_catalog_only_once():
     from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
@@ -777,3 +784,481 @@ def test_fragment_resource_carrier_builds_catalog_only_once():
         group.supplemental_witnesses
         for group in bound.config_spec.compiler_coverage_groups
     )
+
+
+@pytest.mark.parametrize("rows", [65536, 131072])
+@pytest.mark.usefixtures("_without_thread_coverage")
+def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentResourceCatalog,
+    )
+
+    with FakeTensorMode():
+        inputs = (torch.empty(rows, 4097),)
+    # Without the supplemental tier, these large-grid floors exclude every
+    # storage-feasible row tile. Ordinary seeds and coverage remain unchanged.
+    with patch(
+        "helion._compiler.autotuner_heuristics.fragment_resource_carrier",
+        return_value=None,
+    ):
+        old_bound = _cpu_bind(_resource_fullrow_scan, inputs)
+    kernel = helion.kernel(
+        _resource_fullrow_scan.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = _cpu_bind(kernel, inputs)
+    spec = bound.config_spec
+    block = spec.block_sizes[0]
+    assert block.min_size < block.autotuner_min
+    assert spec.default_config() == old_bound.config_spec.default_config()
+    assert spec.compiler_seed_configs == old_bound.config_spec.compiler_seed_configs
+    old = make_search(old_bound.config_spec, count=20)
+    full = make_search(spec, count=20)
+    random.seed(421)
+    expected = old._generate_initial_population_flat()
+    expected_state = random.getstate()
+    random.seed(421)
+    actual = full._generate_initial_population_flat()
+    assert random.getstate() == expected_state
+    assert actual[: len(expected)] == expected
+    assert len(actual) == len(expected) + 2
+    for flat in actual[len(expected) :]:
+        config = full.config_gen.unflatten(flat)
+        assert config in full._pinned_finalist_configs
+        assert config["block_sizes"] == [block.min_size]
+        assert full.config_gen.strict_config_pair(config)[1] == config
+        with bound.env, bound.host_function:
+            catalog = FragmentResourceCatalog.create(
+                bound.env, bound.host_function.device_ir, config
+            )
+            assert catalog is not None
+            floor = deepcopy(config)
+            floor["block_sizes"][0] = block.autotuner_min
+            assert catalog.shared_bytes(bound.env, floor) > 232448
+        _resource_bound_and_actual(bound, config)
+
+
+def test_fragment_resource_hard_minima_keep_legal_bounds_and_scheduling():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentResourceCatalog,
+    )
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        fragment_resource_carrier,
+    )
+
+    with FakeTensorMode():
+        inputs = (torch.empty(131072, 4097),)
+    bound = _cpu_bind(_resource_fullrow_scan, inputs)
+    spec = bound.config_spec
+    original_default = spec.default_config()
+    # A non-unit hard minimum is legal but must never be crossed. Raising it
+    # further makes the conservative model infeasible, rather than waiving it.
+    with bound.env, bound.host_function:
+        spec.block_sizes[0].min_size = 2
+        carrier = fragment_resource_carrier(bound.env, bound.host_function.device_ir)
+        assert carrier is not None and carrier["block_sizes"] == [2]
+        assert {
+            key: value for key, value in carrier.items() if key != "block_sizes"
+        } == {
+            key: value
+            for key, value in original_default.items()
+            if key != "block_sizes"
+        }
+        catalog = FragmentResourceCatalog.create(
+            bound.env, bound.host_function.device_ir, carrier
+        )
+        assert catalog is not None
+        assert catalog.shared_bytes(bound.env, carrier) <= 232448
+        spec.block_sizes[0].min_size = 4
+        assert (
+            fragment_resource_carrier(bound.env, bound.host_function.device_ir) is None
+        )
+
+
+def test_fragment_resource_hard_minima_never_codegen_neighbors():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentResourceCatalog,
+    )
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        fragment_resource_carrier,
+    )
+    from helion.runtime.kernel import BoundKernel
+
+    with FakeTensorMode():
+        inputs = (torch.empty(65536, 4097),)
+    bound = _cpu_bind(_resource_fullrow_scan, inputs)
+    with (
+        bound.env,
+        bound.host_function,
+        patch.object(
+            FragmentResourceCatalog, "create", wraps=FragmentResourceCatalog.create
+        ) as create,
+        patch.object(
+            BoundKernel,
+            "to_code",
+            side_effect=AssertionError("no codegen in resource scoring"),
+        ),
+    ):
+        carrier = fragment_resource_carrier(bound.env, bound.host_function.device_ir)
+    assert carrier is not None and carrier["block_sizes"] == [1]
+    assert create.call_count == 1
+
+
+@pytest.fixture
+def _without_thread_coverage():
+    # Keep each earlier coordinate's population-size tests isolated. Combined
+    # old/new coverage and the full prior prefix are tested below.
+    with patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
+    ):
+        yield
+
+
+THREAD_KEY = "cute_fragment_threads"
+
+
+def _thread_config(bound, count):
+    return helion.Config.from_dict(
+        dict(bound.config_spec.default_config()) | {THREAD_KEY: count}
+    )
+
+
+def test_fragment_threads_strict_domain_and_roundtrip():
+    from helion._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
+
+    bound = _bind()
+    spec = bound.config_spec
+    assert spec._flat_fields()[THREAD_KEY].choices == THREADS
+    default = spec.default_config()
+    assert THREAD_KEY not in default
+    generation = spec.create_config_generation()
+    for count in THREADS:
+        flat, config = generation.strict_config_pair(_thread_config(bound, count))
+        assert config.get(THREAD_KEY, 128) == count
+        assert generation.unflatten(flat) == config
+        assert helion.Config.from_json(config.to_json()) == config
+    assert generation.strict_config_pair(_thread_config(bound, 128))[1] == default
+    for value in (True, False, 0, 16, 96, 1024, "512", 128.0, None):
+        with pytest.raises(exc.InvalidConfig, match="computed fragment root"):
+            spec.normalize(_thread_config(bound, value).config)
+
+
+@pytest.mark.parametrize("kernel", [_direct_scan, _computed_product])
+def test_fragment_threads_unsupported_root_rejected(kernel):
+    bound = _cpu_bind(kernel, (torch.ones(3, 65),))
+    assert not bound.config_spec.cute_fragment_thread_root_ids
+    assert THREAD_KEY not in bound.config_spec._flat_fields()
+    with pytest.raises(exc.InvalidConfig, match="computed fragment root"):
+        bound.config_spec.normalize(_thread_config(bound, 512).config)
+
+
+@pytest.mark.parametrize("count", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("mode", ["serial", "cooperative"])
+def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
+    import ast
+
+    from test.test_cute_computed_fragment import _simulate_independent_fragment
+
+    x = torch.arange(3 * 5 * 65, dtype=torch.float32).reshape(3, 5, 65) % 8
+    bound = _cpu_bind(_computed_scan, (x, 2, False))
+    config = _thread_config(bound, count)
+    config.config[KEY] = mode
+    code = bound.to_code(config)
+    assert f"block=({count}, 1, 1)" in code
+    loops = [
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id.startswith("fragment_index")
+    ]
+    assert loops
+    for node in loops:
+        assert ast.literal_eval(node.iter.args[2]) == count
+        extent = ast.literal_eval(node.iter.args[1])
+        owned = [i for thread in range(count) for i in range(thread, extent, count)]
+        assert sorted(owned) == list(range(extent))
+    actual = torch.empty_like(x)
+    reused = torch.empty_like(x)
+    _simulate_independent_fragment(code, {"x": x}, {"out": actual, "reused": reused}, 1)
+    torch.testing.assert_close(actual, (x + 1).cumsum(2), rtol=0, atol=0)
+    torch.testing.assert_close(reused, (x + 1) * 2, rtol=0, atol=0)
+
+
+def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
+    bound = _bind()
+    assert bound.to_code(_thread_config(bound, 128)) == bound.to_code(
+        bound.config_spec.default_config()
+    )
+    assert "block=(512, 1, 1)" in bound.to_code(_thread_config(bound, 512))
+    with (
+        patch(
+            "helion._compiler.cute.computed_fragment.computed_fragment_supported",
+            return_value=False,
+        ),
+        pytest.raises(exc.InvalidConfig, match="computed fragment root"),
+    ):
+        bound.to_code(_thread_config(bound, 512))
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        InitialPopulationStrategy.FROM_RANDOM,
+        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+    ],
+)
+@pytest.mark.parametrize("resource", [False, True])
+def test_fragment_threads_complete_prior_population_and_rng(strategy, resource):
+    kernel = _resource_fullrow_scan if resource else _scan_and_fragment_reduction
+    x = torch.ones(3, 8193) if resource else torch.ones(3, 128)
+    with patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
+    ):
+        old_bound = _cpu_bind(kernel, (x,))
+    bound = _cpu_bind(kernel, (x,))
+    old = make_search(old_bound.config_spec, count=20, strategy=strategy)
+    full = make_search(bound.config_spec, count=20, strategy=strategy)
+    random.seed(91234)
+    expected = old._generate_initial_population_flat()
+    rng = random.getstate()
+    random.seed(91234)
+    actual = full._generate_initial_population_flat()
+    assert random.getstate() == rng
+    old_configs = [old.config_gen.unflatten(row) for row in expected]
+    new_configs = [full.config_gen.unflatten(row) for row in actual]
+    assert new_configs[: len(old_configs)] == old_configs
+    assert len(new_configs) == len(old_configs) + 4
+    assert [config[THREAD_KEY] for config in new_configs[len(old_configs) :]] == [
+        32,
+        64,
+        256,
+        512,
+    ]
+    assert (
+        bound.config_spec.compiler_seed_configs
+        == old_bound.config_spec.compiler_seed_configs
+    )
+    assert bound.config_spec.default_config() == old_bound.config_spec.default_config()
+
+
+def test_fragment_threads_disabled_seeds_neighbors_and_override():
+    kernel = helion.kernel(
+        _computed_scan.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+        disable_autotuner_heuristics=True,
+    )
+    bound = _cpu_bind(kernel, (torch.ones(3, 5, 65), 2, False))
+    assert bound.config_spec.cute_fragment_thread_root_ids
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    generation = bound.config_spec.create_config_generation()
+    assert any(
+        item.key == THREAD_KEY and item.outcome == "candidate"
+        for item in generation.coordinate_neighbor_projections(
+            generation.default_flat()
+        )
+    )
+    for overrides, disabled in (({THREAD_KEY: 128}, False), ({}, True)):
+        search = make_search(
+            bound.config_spec, count=20, overrides=overrides, disabled=disabled
+        )
+        rows = search._generate_initial_population_flat()
+        assert all(
+            search.config_gen.unflatten(row).get(THREAD_KEY, 128) == 128 for row in rows
+        )
+
+
+def test_fragment_threads_both_ordered_phases_and_dynamic_rebind():
+    for shape in ((3, 65), (5, 129)):
+        bound = _cpu_bind(_barrier_scan, (torch.ones(shape),))
+        assert len(bound.config_spec.cute_fragment_thread_root_ids) == 2
+        code = bound.to_code(_thread_config(bound, 512))
+        assert code.count("block=(512, 1, 1)") == 2
+
+
+def test_fragment_threads_backend_specific():
+    from helion._compiler.cute.backend import CuteBackend
+    from helion._compiler.triton.backend import TritonBackend
+
+    assert CuteBackend().supports_config_key(THREAD_KEY)
+    assert not TritonBackend().supports_config_key(THREAD_KEY)
+
+
+REGISTER_LOADS_KEY = "cute_fragment_register_loads"
+
+
+def _register_load_bound():
+    from test.test_atomic_ops import _register_load_histogram
+
+    return _cpu_bind(_register_load_histogram, (torch.ones(2, 65), 3, 128))
+
+
+def test_register_loads_strict_bool_roundtrip_and_neighbors():
+    from helion.autotuner.config_fragment import BooleanFragment
+
+    bound = _register_load_bound()
+    spec = bound.config_spec
+    assert isinstance(spec._flat_fields()[REGISTER_LOADS_KEY], BooleanFragment)
+    assert REGISTER_LOADS_KEY not in spec.default_config()
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    config = spec.default_config()
+    config.config[REGISTER_LOADS_KEY] = False
+    spec.normalize(config.config)
+    assert config == spec.default_config()
+    for value in (0, 1, "true", None):
+        config = spec.default_config()
+        config.config[REGISTER_LOADS_KEY] = value
+        with pytest.raises(exc.InvalidConfig, match="lane-private"):
+            spec.normalize(config.config)
+    config = spec.default_config()
+    config.config[REGISTER_LOADS_KEY] = True
+    generation = spec.create_config_generation()
+    flat, effective = generation.strict_config_pair(config)
+    assert effective[REGISTER_LOADS_KEY] is True
+    assert generation.unflatten(flat)[REGISTER_LOADS_KEY] is True
+    assert any(
+        item.key == REGISTER_LOADS_KEY and item.outcome == "candidate"
+        for item in generation.coordinate_neighbor_projections(
+            generation.default_flat()
+        )
+    )
+    random.seed(147)
+    assert {
+        generation.random_config().get(REGISTER_LOADS_KEY, False) for _ in range(32)
+    } == {False, True}
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        InitialPopulationStrategy.FROM_RANDOM,
+        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+    ],
+)
+def test_register_loads_complete_existing_prefix_and_rng(strategy):
+    with patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_register_loads_coverage"
+    ):
+        old_bound = _register_load_bound()
+    bound = _register_load_bound()
+    old = make_search(old_bound.config_spec, count=20, strategy=strategy)
+    new = make_search(bound.config_spec, count=20, strategy=strategy)
+    random.seed(741)
+    prior = old._generate_initial_population_flat()
+    rng = random.getstate()
+    random.seed(741)
+    actual = new._generate_initial_population_flat()
+    assert random.getstate() == rng
+    expected_configs = [old.config_gen.unflatten(row) for row in prior]
+    actual_configs = [new.config_gen.unflatten(row) for row in actual]
+    assert actual_configs[: len(expected_configs)] == expected_configs
+    assert len(actual_configs) == len(expected_configs) + 1
+    assert all(
+        config[REGISTER_LOADS_KEY] is True
+        for config in actual_configs[len(expected_configs) :]
+    )
+    assert (
+        bound.config_spec.compiler_seed_configs
+        == old_bound.config_spec.compiler_seed_configs
+    )
+    assert bound.config_spec.default_config() == old_bound.config_spec.default_config()
+    for overrides, disabled in (({REGISTER_LOADS_KEY: False}, False), ({}, True)):
+        search = make_search(
+            bound.config_spec, count=20, overrides=overrides, disabled=disabled
+        )
+        rows = search._generate_initial_population_flat()
+        assert all(
+            not search.config_gen.unflatten(row).get(REGISTER_LOADS_KEY, False)
+            for row in rows
+        )
+
+
+def test_register_loads_ineligible_scan_and_backend():
+    from helion._compiler.cute.backend import CuteBackend
+    from helion._compiler.triton.backend import TritonBackend
+
+    bound = _cpu_bind(_direct_scan, (torch.ones(2, 65),))
+    assert not bound.config_spec.cute_fragment_register_load_root_ids
+    assert REGISTER_LOADS_KEY not in bound.config_spec._flat_fields()
+    config = bound.config_spec.default_config()
+    config.config[REGISTER_LOADS_KEY] = True
+    with pytest.raises(exc.InvalidConfig, match="lane-private"):
+        bound.config_spec.normalize(config.config)
+    assert CuteBackend().supports_config_key(REGISTER_LOADS_KEY)
+    assert not TritonBackend().supports_config_key(REGISTER_LOADS_KEY)
+
+
+def test_register_loads_proof_rejects_remapping_reduction_carry_branch_and_mutation():
+    import operator
+    from types import SimpleNamespace
+
+    from torch.fx import Graph
+
+    from helion._compiler.cute.register_loads import lane_private_load
+    from helion.language import _tracing_ops
+    from helion.language import atomic_ops
+    from helion.language import memory_ops
+
+    env = SimpleNamespace(known_equal=operator.eq)
+    for mode in (
+        "pointwise",
+        "same_shape_transpose",
+        "scan",
+        "reduce",
+        "carry",
+        "branch",
+        "mutable",
+        "shape_change",
+        "atomic_return",
+    ):
+        graph = Graph()
+        host = graph.call_function(_tracing_ops._host_tensor, ("input",))
+        host.meta["val"] = torch.empty(4, 4)
+        load = graph.call_function(
+            memory_ops.load, (host, [slice(None), slice(None)], None, None)
+        )
+        load.meta["val"] = torch.empty(4, 4)
+        target = graph.call_function(_tracing_ops._host_tensor, ("output",))
+        target.meta["val"] = torch.empty(4, 4)
+        op = {
+            "pointwise": torch.ops.aten.add.Tensor,
+            "same_shape_transpose": torch.ops.aten.transpose.int,
+            "scan": torch.ops.aten.cumsum.default,
+            "reduce": torch.ops.aten.sum.dim_IntList,
+            "carry": _tracing_ops._phi,
+            "branch": _tracing_ops._if,
+            "mutable": torch.ops.aten.add_.Tensor,
+            "shape_change": torch.ops.aten.reshape.default,
+            "atomic_return": torch.ops.aten.add.Tensor,
+        }[mode]
+        user = graph.call_function(op, (load, 1))
+        user.meta["val"] = (
+            torch.empty(16) if mode == "shape_change" else torch.empty(4, 4)
+        )
+        atomic = graph.call_function(
+            atomic_ops.atomic_add, (target, [0, 0], user, "relaxed")
+        )
+        atomic.meta["val"] = torch.empty(4, 4)
+        graph.output(atomic if mode == "atomic_return" else None)
+        assert lane_private_load(load, env) == (mode == "pointwise")
+
+
+def test_register_loads_preloop_capture_remains_shared():
+    from test.test_atomic_ops import _local_atomic_histogram
+
+    bound = _cpu_bind(_local_atomic_histogram, (torch.ones(2, 32), 17, 3, "plain"))
+    assert not bound.config_spec.cute_fragment_register_load_root_ids
+    config = bound.config_spec.default_config()
+    config.config[REGISTER_LOADS_KEY] = True
+    with pytest.raises(exc.InvalidConfig, match="lane-private"):
+        bound.to_code(config)

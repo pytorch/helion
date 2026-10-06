@@ -92,8 +92,11 @@ class CompilerCoverageGroup:
     witnesses: tuple[CoverageWitness, ...]
     dependencies: tuple[CoverageDependency, ...] = ()
     supplemental_witnesses: tuple[CoverageWitness, ...] = ()
+    deferred: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.deferred) is not bool:
+            raise ValueError("Coverage deferred flag must be a Boolean")
         if not self.mechanism or not self.key:
             raise ValueError("Coverage mechanism and key must be nonempty")
         if type(self.version) is not int or self.version < 1:
@@ -209,6 +212,8 @@ class CompilerCoverageGroup:
             ),
             "max_additions": MAX_COMPILER_COVERAGE_CONFIGS,
         }
+        if self.deferred:
+            result["deferred"] = True
         if self.supplemental_witnesses:
             result["supplemental_witnesses"] = tuple(
                 (witness._carrier_json, witness.value)
@@ -353,46 +358,55 @@ def append_compiler_coverage(
             CoverageOutcome(group.mechanism, origin, requested, effective, outcome)
         )
 
-    for group in groups:
-        for witness in group.witnesses:
-            append(group, witness, "declared")
+    cached_rows: Sequence[Config] | None = None
+    for deferred in (False, True):
+        tier = [group for group in groups if group.deferred == deferred]
+        if not tier:
+            continue
+        for group in tier:
+            for witness in group.witnesses:
+                append(group, witness, "declared")
 
-    # Preserve every existing declared witness before supplemental carriers.
-    # Optional warm-cache rows retain the remaining per-mechanism budget.
-    for group in groups:
-        for witness in group.supplemental_witnesses:
-            append(group, witness, "declared")
+        # Preserve every existing declared witness before supplemental carriers.
+        # Optional warm-cache rows retain the remaining per-mechanism budget.
+        for group in tier:
+            for witness in group.supplemental_witnesses:
+                append(group, witness, "declared")
 
-    if any(count < MAX_COMPILER_COVERAGE_CONFIGS for count in counts.values()):
-        warm: dict[str, list[CoverageWitness]] = {
-            group.mechanism: [] for group in groups
-        }
-        for config in cached_configs():
-            active = [
-                group
-                for group in groups
-                if not same_value(
-                    config.config.get(group.key, group.legacy), group.legacy
-                )
-            ]
-            if len(active) != 1:
-                continue
-            group = active[0]
-            if counts[group.mechanism] >= MAX_COMPILER_COVERAGE_CONFIGS:
-                continue
-            value = config.config[group.key]
-            if not any(same_value(value, mode) for mode in group.domain):
-                continue
-            carrier = copy.deepcopy(config)
-            carrier.config.pop(group.key, None)
-            warm[group.mechanism].append(
-                CoverageWitness(carrier, cast("CoverageValue", value))
-            )
-        # Declared witnesses have priority. Warm entries then retain registry
-        # order and their original cache order inside each mechanism's budget.
-        for group in groups:
-            for witness in warm[group.mechanism]:
+        if any(
+            counts[group.mechanism] < MAX_COMPILER_COVERAGE_CONFIGS for group in tier
+        ):
+            warm: dict[str, list[CoverageWitness]] = {
+                group.mechanism: [] for group in groups
+            }
+            if cached_rows is None:
+                cached_rows = cached_configs()
+            for config in cached_rows:
+                active = [
+                    group
+                    for group in groups
+                    if not same_value(
+                        config.config.get(group.key, group.legacy), group.legacy
+                    )
+                ]
+                if len(active) != 1:
+                    continue
+                group = active[0]
                 if counts[group.mechanism] >= MAX_COMPILER_COVERAGE_CONFIGS:
-                    break
-                append(group, witness, "cache")
+                    continue
+                value = config.config[group.key]
+                if not any(same_value(value, mode) for mode in group.domain):
+                    continue
+                carrier = copy.deepcopy(config)
+                carrier.config.pop(group.key, None)
+                warm[group.mechanism].append(
+                    CoverageWitness(carrier, cast("CoverageValue", value))
+                )
+            # Declared witnesses have priority. Warm entries then retain registry
+            # order and their original cache order inside each mechanism's budget.
+            for group in tier:
+                for witness in warm[group.mechanism]:
+                    if counts[group.mechanism] >= MAX_COMPILER_COVERAGE_CONFIGS:
+                        break
+                    append(group, witness, "cache")
     return result, outcomes

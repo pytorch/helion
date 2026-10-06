@@ -24,6 +24,7 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _tracing_ops
+from ...language import atomic_ops
 from ...language import creation_ops
 from ...language import inline_asm_ops
 from ...language import matmul_ops
@@ -52,11 +53,17 @@ from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
 from .captured_reduction import captured_reduction_coordinates
+from .captured_reduction import physical_capture_axes
 from .fragment_expression import FragmentExpression
+from .fragment_indexing import memory_index_coordinates
 from .fragment_storage import aligned_shared_bytes
 from .fragment_storage import configured_fragment_expr
 from .fragment_storage import metadata_guarded
 from .independent_reduction import independent_reduction_coordinates
+from .local_atomic import local_atomic_allocations
+from .local_atomic import prove_local_atomics
+from .register_loads import host_load_is_readonly
+from .register_loads import lane_private_load
 from .tcgen05_config import CuteTcgen05Config
 
 if TYPE_CHECKING:
@@ -99,6 +106,7 @@ class Fragment:
     resident: bool = False
     dependencies: tuple[Fragment, ...] = ()
     storage: str | None = None
+    logical_domain: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None
 
     def read(self, indices: tuple[str, ...]) -> str:
         assert len(indices) == len(self.shape)
@@ -107,6 +115,29 @@ class Fragment:
     def broadcast(self, indices: tuple[str, ...]) -> str:
         indices = indices[len(indices) - len(self.shape) :] if self.shape else ()
         return self.read(
+            tuple(
+                "0" if size == 1 else index
+                for size, index in zip(self.shape, indices, strict=True)
+            )
+        )
+
+    def domain(self, indices: tuple[str, ...]) -> tuple[str, ...]:
+        """Coordinate ownership, independent of a value or memory-load mask."""
+        return tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        f"0 <= ({index}) and ({index}) < ({size})"
+                        for index, size in zip(indices, self.shape, strict=True)
+                    ),
+                    *(self.logical_domain(indices) if self.logical_domain else ()),
+                )
+            )
+        )
+
+    def broadcast_domain(self, indices: tuple[str, ...]) -> tuple[str, ...]:
+        indices = indices[len(indices) - len(self.shape) :] if self.shape else ()
+        return self.domain(
             tuple(
                 "0" if size == 1 else index
                 for size, index in zip(self.shape, indices, strict=True)
@@ -181,10 +212,13 @@ class FragmentCompiler:
         self.buffers: list[tuple[str, torch.dtype, int]] = []
         self.scopes: list[dict[Node, object]] = []
         self.held: list[object] = []
-        self.threads = 128
+        self.threads = cast("int", self.df.config.get("cute_fragment_threads", 128))
         self.thread = ""
         self.sym_indices: dict[sympy.Symbol, str] = {}
         self.expression: FragmentExpression | None = None
+        self.local_allocations: frozenset[Node] = frozenset()
+        self.local_logical_sizes: dict[int, int] = {}
+        self.local_storage: list[Fragment] = []
         self.graphs = cg.codegen_graphs if graphs is None else graphs
 
     def begin(self) -> None:
@@ -209,6 +243,14 @@ class FragmentCompiler:
         return configured_fragment_expr(self.env, value, self.df.resolved_block_size)
 
     def extent(self, value: object) -> int:
+        resolved = self.static_extent(value)
+        if resolved is None:
+            raise exc.InvalidConfig(
+                f"computed fragments require static local extents: {value}"
+            )
+        return resolved
+
+    def static_extent(self, value: object) -> int | None:
         if isinstance(value, int):
             return value
         if isinstance(value, torch.SymInt):
@@ -216,11 +258,7 @@ class FragmentCompiler:
         assert isinstance(value, sympy.Expr)
         value = self.configured_expr(value)
         value = self.env.specialize_expr(sympy.sympify(value))
-        if not value.is_number:
-            raise exc.InvalidConfig(
-                f"computed fragments require static local extents: {value}"
-            )
-        return int(value)
+        return int(value) if value.is_number else None
 
     def shape(self, shape: object) -> tuple[int, ...]:
         return tuple(self.extent(x) for x in cast("tuple[object, ...]", shape))
@@ -371,6 +409,7 @@ class FragmentCompiler:
             True,
             (),
             name,
+            value.logical_domain,
         )
 
     @staticmethod
@@ -446,6 +485,116 @@ class FragmentCompiler:
         self.held.pop()
         return result
 
+    def atomic_add(self, node: Node, values: dict[Node, object]) -> None:
+        """Each contribution is owned once; barriers are outside lane loops."""
+        target, indices, value, sem = cast(
+            "tuple[object, object, object, object]", _resolve(node.args, values)
+        )
+        if node.users or sem != "relaxed":
+            raise exc.InvalidConfig("fragment atomics require unused relaxed results")
+        assert isinstance(target, (Fragment, HostTensor))
+        assert isinstance(indices, (tuple, list))
+        fake = cast("torch.Tensor", node.meta["val"])
+        shape = self.shape(fake.shape)
+        target_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
+        if len(indices) != target_fake.ndim or any(
+            isinstance(i, slice) or i is None for i in indices
+        ):
+            raise exc.InvalidConfig(
+                "fragment atomics require scalar/tensor indices for every axis"
+            )
+        local = isinstance(target, Fragment)
+        if local and (target.storage is None or len(target.shape) != 1):
+            raise exc.InvalidConfig("CTA-local atomics require direct resident storage")
+        if target_fake.dtype not in (torch.float32, torch.int32):
+            raise exc.InvalidConfig("fragment atomic add supports float32/int32")
+
+        def update(coords: tuple[str, ...]) -> None:
+            masks = [
+                f"({coord}) < ({self.logical_axis_extent(fake, dim, shape[dim])})"
+                for dim, coord in enumerate(coords)
+            ]
+            # Indexing can pad the result shape after an index tensor has
+            # retained its concrete logical extent. Destination bounds do not
+            # exclude those extra contributions when an index wraps or clamps.
+            # Preserve each index operand's broadcast domain independently.
+            index_nodes = cast("list[Node | int]", node.args[1])
+            for source, index in zip(index_nodes, indices, strict=True):
+                if not isinstance(index, Fragment):
+                    continue
+                index_fake = cast("torch.Tensor", cast("Node", source).meta["val"])
+                offset = len(coords) - len(index.shape)
+                for dim, capacity in enumerate(index.shape):
+                    if capacity == 1:
+                        continue  # A singleton broadcasts over the output axis.
+                    extent = self.logical_axis_extent(index_fake, dim, capacity)
+                    mask = f"({coords[offset + dim]}) < ({extent})"
+                    if mask not in masks:
+                        masks.append(mask)
+                if index.logical_domain is not None:
+                    for mask in index.broadcast_domain(coords):
+                        if mask not in masks:
+                            masks.append(mask)
+            positions = []
+            for dim, index in enumerate(indices):
+                position = (
+                    index.broadcast(coords)
+                    if isinstance(index, Fragment)
+                    else self.scalar(index)
+                )
+                position = self.cg.lift(
+                    expr_from_string(position), prefix="fragment_atomic_index"
+                ).id
+                # The logical allocation can be smaller than its padded capacity.
+                size = self.sym(target_fake.shape[dim])
+                if local:
+                    assert isinstance(target, Fragment) and target.storage is not None
+                    size = str(self.local_logical_sizes[id(target)])
+                logical_extent = (
+                    self.local_logical_sizes[id(target)]
+                    if isinstance(target, Fragment)
+                    else target_fake.shape[dim]
+                )
+                if (
+                    isinstance(index, int)
+                    and isinstance(logical_extent, int)
+                    and not -logical_extent <= index < logical_extent
+                ):
+                    raise exc.InvalidConfig(
+                        "fragment atomic static index is outside the logical target"
+                    )
+                # Python/PyTorch indexing wraps one valid negative extent.
+                # Widen before adding a possibly 64-bit host extent; this is
+                # address arithmetic, not a conversion of the update value.
+                wrapped = self.df.new_var("fragment_atomic_wrapped")
+                self.emit(f"{wrapped} = cutlass.Int64({position})")
+                self.emit(
+                    f"if {wrapped} < 0:\n    {wrapped} = {wrapped} + cutlass.Int64({size})"
+                )
+                masks.append(f"0 <= ({wrapped}) and ({wrapped}) < ({size})")
+                positions.append(wrapped)
+            if isinstance(target, Fragment):
+                pointer = f"({target.storage}.iterator + ({positions[0]})).llvm_ptr"
+                scope = "cta"
+            else:
+                offset = " + ".join(
+                    f"cutlass.Int64({position}) * cutlass.Int64({self.sym(target.value.stride()[dim])})"
+                    for dim, position in enumerate(positions)
+                )
+                pointer = f"({target.name}.iterator + ({offset})).llvm_ptr"
+                scope = "gpu"
+            contribution = (
+                value.broadcast(coords)
+                if isinstance(value, Fragment)
+                else self.scalar(value)
+            )
+            self.emit(
+                f"if {' and '.join(masks) or 'True'}:\n"
+                f"    cute.arch.atomic_add({pointer}, {self.cast(contribution, target_fake.dtype)}, sem='relaxed', scope={scope!r})"
+            )
+
+        self.elements(shape, update)
+
     def memory(self, node: Node, values: dict[Node, object], store: bool) -> object:
         tensor = values[cast("Node", node.args[0])]
         indices = cast("list[object]", node.args[1])
@@ -478,29 +627,55 @@ class FragmentCompiler:
             ):
                 raise exc.BackendUnsupported("cute", "computed fragment indexed memory")
 
-            def view(coords: tuple[str, ...]) -> str:
+            def view_coordinates(coords: tuple[str, ...]) -> tuple[str, ...]:
                 selected = tuple(
                     coord
                     for coord, index in zip(coords, indices, strict=False)
                     if index is not None
                 )
-                return tensor.read(
-                    self.coordinate_locals((*selected, *coords[len(indices) :]))
-                )
+                return (*selected, *coords[len(indices) :])
+
+            def view(coords: tuple[str, ...]) -> str:
+                return tensor.read(self.coordinate_locals(view_coordinates(coords)))
 
             return Fragment(
-                shape, output.dtype, view, tensor.resident, dependencies=(tensor,)
+                shape,
+                output.dtype,
+                view,
+                tensor.resident,
+                dependencies=(tensor,),
+                logical_domain=lambda coords: tensor.domain(view_coordinates(coords)),
             )
         assert isinstance(tensor, HostTensor)
+        index_coordinates = memory_index_coordinates(
+            self.env,
+            [
+                index.meta["val"] if isinstance(index, Node) else index
+                for index in indices
+            ],
+            {
+                i: value.shape
+                for i, index in enumerate(indices)
+                if isinstance(index, Node)
+                and isinstance(value := values[index], Fragment)
+            },
+            shape,
+        )
+
+        def selected_coordinates(
+            ordinal: int, coords: tuple[str, ...]
+        ) -> tuple[str, ...]:
+            return tuple(
+                "0" if axis is None else coords[axis]
+                for axis in index_coordinates[ordinal]
+            )
 
         def address(coords: tuple[str, ...]) -> tuple[str, str]:
-            position = 0
             tensor_indices: list[str] = []
             masks: list[str] = []
             dim = 0
-            for index in indices:
+            for ordinal, index in enumerate(indices):
                 if index is None:
-                    position += 1
                     continue
                 proxy = index.meta["val"] if isinstance(index, Node) else index
                 block = (
@@ -516,19 +691,29 @@ class FragmentCompiler:
                     block = None
                 if isinstance(index, slice):
                     assert index == slice(None)
-                    expression = coords[position]
-                    position += 1
+                    expression = selected_coordinates(ordinal, coords)[0]
                 elif block is not None:
-                    expression = f"({self.offsets[block]}) + ({coords[position]})"
+                    expression = f"({self.offsets[block]}) + ({selected_coordinates(ordinal, coords)[0]})"
                     masks.append(f"(({expression}) < ({self.bounds[block]}))")
-                    position += 1
                 elif isinstance(index, Node):
                     value = values[index]
                     if isinstance(value, Fragment) and value.shape:
-                        expression = value.read(
-                            coords[position : position + len(value.shape)]
+                        selected = selected_coordinates(ordinal, coords)
+                        domain = value.domain(selected)
+                        masks.extend(domain)
+                        # Index fragments may have exact static capacity while
+                        # the indexed output is padded. Read only coordinates
+                        # owned by the index, before dereferencing host memory.
+                        expression = self.df.new_var("fragment_tensor_index")
+                        self.emit(f"{expression} = {self.cast('0', value.dtype)}")
+                        branch = statement_from_string(
+                            f"if {' and '.join(domain) or 'True'}:\n    pass"
                         )
-                        position += len(value.shape)
+                        assert isinstance(branch, ast.If)
+                        branch.body.clear()
+                        with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                            self.emit(f"{expression} = {value.read(selected)}")
+                        self.cg.add_statement(branch)
                     else:
                         expression = self.scalar(value)
                 else:
@@ -584,7 +769,81 @@ class FragmentCompiler:
             self.emit(f"if {mask}:\n    {name} = {loaded}")
             return name
 
-        return self.materialize(Fragment(shape, output.dtype, load))
+        index_domains: list[tuple[int, Fragment]] = []
+        domain_bounds: list[tuple[int, str]] = []
+        dim = 0
+        for ordinal, index in enumerate(indices):
+            if index is None:
+                continue
+            if isinstance(index, slice):
+                domain_bounds.append((ordinal, self.sym(tensor.value.shape[dim])))
+            elif isinstance(index, Node) and isinstance(values[index], Fragment):
+                index_domains.append((ordinal, cast("Fragment", values[index])))
+            elif isinstance(index, Node):
+                proxy = index.meta["val"]
+                if isinstance(proxy, torch.SymInt):
+                    block = self.env.resolve_block_id(proxy)
+                    if (
+                        block in self.offsets
+                        and proxy._sympy_() == self.env.block_sizes[block].var._sympy_()
+                    ):
+                        domain_bounds.append(
+                            (
+                                ordinal,
+                                f"({self.bounds[block]}) - ({self.offsets[block]})",
+                            )
+                        )
+            dim += 1
+
+        def logical_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+            return (
+                *(
+                    f"({selected_coordinates(ordinal, coords)[0]}) < ({bound})"
+                    for ordinal, bound in domain_bounds
+                ),
+                *(
+                    mask
+                    for ordinal, index_value in index_domains
+                    for mask in index_value.domain(
+                        selected_coordinates(ordinal, coords)
+                    )
+                ),
+            )
+
+        loaded_fragment = Fragment(
+            shape,
+            output.dtype,
+            load,
+            logical_domain=logical_domain if index_domains or domain_bounds else None,
+        )
+        if (
+            self.df.config.get("cute_fragment_register_loads", False)
+            and math.prod(shape) <= self.threads
+            and lane_private_load(node, self.env)
+            and host_load_is_readonly(node, self.env, self.graphs)
+        ):
+            # One typed scalar per active lane, in the current lexical body.
+            # The graph proof forbids remapping, carries and branch escapes.
+            # Keep the ordinary atomic/store element loops and their barriers.
+            name = self.df.new_var("fragment_register_load")
+            self.emit(f"{name} = {self.cast('0', output.dtype)}")
+            branch = statement_from_string(
+                f"if {self.thread} < {math.prod(shape)}:\n    pass"
+            )
+            assert isinstance(branch, ast.If)
+            branch.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                loaded = load(self.coordinates(self.thread, shape))
+                self.emit(f"{name} = {self.cast(loaded, output.dtype)}")
+            self.cg.add_statement(branch)
+            return Fragment(
+                shape,
+                output.dtype,
+                lambda _coords: name,
+                True,
+                logical_domain=loaded_fragment.logical_domain,
+            )
+        return self.materialize(loaded_fragment)
 
     def logical_axis_extent(self, fake: torch.Tensor, dim: int, capacity: int) -> str:
         """Use logical bounds for arithmetic over a padded local allocation."""
@@ -821,6 +1080,15 @@ class FragmentCompiler:
                 threads_per_element=32 if warp else 1,
             )
         producer = object()
+        logical_dependencies = tuple(
+            value for value in dependencies if value.logical_domain is not None
+        )
+        # These elementwise operations preserve broadcast coordinates. Other
+        # lowerings (for example gather) define a different output domain.
+        pointwise_domain = isinstance(node.target, torch._ops.OpOverload) and (
+            torch.Tag.pointwise in node.target.tags
+            or node.target is torch.ops.aten._to_copy.default
+        )
         return Fragment(
             self.shape(fake.shape),
             fake.dtype,
@@ -828,6 +1096,15 @@ class FragmentCompiler:
                 producer, coords, lambda: self.cast(element(coords), fake.dtype)
             ),
             dependencies=dependencies,
+            logical_domain=(
+                lambda coords: tuple(
+                    mask
+                    for value in logical_dependencies
+                    for mask in value.broadcast_domain(coords)
+                )
+            )
+            if pointwise_domain and logical_dependencies
+            else None,
         )
 
     def loop(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
@@ -835,6 +1112,10 @@ class FragmentCompiler:
         assert isinstance(graph_id, int)
         graph = self.graphs[graph_id]
         assert isinstance(graph, ForLoopGraphInfo)
+        if self.local_allocations and any(
+            self.df.resolved_block_size(bid) != 1 for bid in graph.block_ids
+        ):
+            raise exc.InvalidConfig("CTA-local atomics require uniform scalar loops")
         args = [values[x] for x in cast("list[Node]", node.args[3])]
         placeholders = list(graph.graph.find_nodes(op="placeholder"))
         output_node = graph.graph.find_nodes(op="output")[0]
@@ -848,7 +1129,12 @@ class FragmentCompiler:
         for index, output in enumerate(outputs):
             if index in carry_slots:
                 slot = carry_slots[index]
-                carry = self.materialize(cast("Fragment", args[slot]), copy=True)
+                incoming = cast("Fragment", args[slot])
+                carry = (
+                    incoming
+                    if id(incoming) in self.local_logical_sizes
+                    else self.materialize(incoming, copy=True)
+                )
                 inner_args[slot] = carry
             else:
                 fake = cast("torch.Tensor", output.meta["val"])
@@ -884,10 +1170,17 @@ class FragmentCompiler:
                 snapshots.append(
                     self.materialize(value, copy=True)
                     if self.referenced_buffers([value]) & destinations
+                    and id(value) not in self.local_logical_sizes
                     else value
                 )
             for target, source in zip(carries, snapshots, strict=True):
-                self.copy(source, target)
+                if id(target) in self.local_logical_sizes:
+                    if source is not target:
+                        raise exc.InvalidConfig(
+                            "CTA-local atomic loop changed its allocation"
+                        )
+                else:
+                    self.copy(source, target)
             self.held.pop()
             self.held.pop()
         for index in reversed(range(len(graph.block_ids))):
@@ -1022,11 +1315,22 @@ class FragmentCompiler:
         info = self.graphs[cast("int", node.args[1])]
         assert isinstance(info, IfGraphInfo)
         assert info.branches_outputs is not None
+        # An unchanged branch output can be captured only by the other branch.
+        # Both lists bind values in this outer graph, not branch-local results.
+        outer_captures: dict[str, Node] = {}
         for side, names in enumerate((info.if_arg_names, info.else_arg_names)):
             assert names is not None
+            for name, source in zip(
+                names, cast("list[Node]", node.args[3 + side]), strict=True
+            ):
+                if name in outer_captures and outer_captures[name] is not source:
+                    raise exc.InvalidConfig(
+                        "computed fragment conditional has conflicting outer captures"
+                    )
+                outer_captures[name] = source
+        for slots in info.branches_outputs:
             if any(
-                isinstance(slots[side], str) and slots[side] not in names
-                for slots in info.branches_outputs
+                isinstance(slot, str) and slot not in outer_captures for slot in slots
             ):
                 raise exc.InvalidConfig(
                     "computed fragment conditional requires a captured unchanged output"
@@ -1046,9 +1350,6 @@ class FragmentCompiler:
             captures = [
                 values[source] for source in cast("list[Node]", node.args[3 + side])
             ]
-            names = info.if_arg_names if side == 0 else info.else_arg_names
-            assert names is not None
-            captured = dict(zip(names, captures, strict=True))
             body: list[ast.AST] = []
             with self.cg.set_statements(body):
                 outputs = self.graph(
@@ -1065,7 +1366,11 @@ class FragmentCompiler:
                 self.held.append(outputs)
                 for target, slots in zip(merged, info.branches_outputs, strict=True):
                     slot = slots[side]
-                    source = outputs[slot] if isinstance(slot, int) else captured[slot]
+                    source = (
+                        outputs[slot]
+                        if isinstance(slot, int)
+                        else values[outer_captures[slot]]
+                    )
                     assert isinstance(source, Fragment)
                     self.copy(source, target)
                 self.held.pop()
@@ -1133,6 +1438,8 @@ class FragmentCompiler:
             return self.conditional(node, values)
         if _tracing_ops.is_for_loop_target(target):
             return self.loop(node, values)
+        if target is atomic_ops.atomic_add:
+            return self.atomic_add(node, values)
         if target in (memory_ops.load, memory_ops.store):
             return self.memory(node, values, target is memory_ops.store)
         if target is matmul_ops.dot:
@@ -1195,12 +1502,33 @@ class FragmentCompiler:
                 if target in (creation_ops.full, torch.ops.aten.full.default)
                 else args[0]
             )
-            return Fragment(
+            declared_shape = (
+                self.shape(args[0])
+                if target in (creation_ops.full, torch.ops.aten.full.default)
+                else shape
+            )
+            result = Fragment(
                 shape,
                 fake.dtype,
                 lambda _: self.cast(self.scalar(value), fake.dtype),
                 dependencies=(value,) if isinstance(value, Fragment) else (),
+                logical_domain=(
+                    lambda coords: tuple(
+                        f"({coord}) < ({size})"
+                        for coord, size in zip(coords, declared_shape, strict=True)
+                    )
+                )
+                if declared_shape != shape
+                else None,
             )
+            if node in self.local_allocations:
+                result = self.materialize(result)
+                assert result.storage is not None
+                self.local_storage.append(result)
+                self.local_logical_sizes[id(result)] = cast("list[int]", node.args[0])[
+                    0
+                ]
+            return result
         if target is torch.ops.prims.iota.default:
             start, step = node.kwargs.get("start", 0), node.kwargs.get("step", 1)
             return Fragment(
@@ -1226,6 +1554,7 @@ class FragmentCompiler:
                     f".bitcast({self.dtype(fake.dtype)})"
                 ),
                 dependencies=(source,),
+                logical_domain=source.logical_domain,
             )
         if target is _tracing_ops._mask_to:
             source_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
@@ -1247,11 +1576,17 @@ class FragmentCompiler:
                 mask = " and ".join(masks) or "True"
                 return f"({self.cast(source.read(coords), fake.dtype)} if {mask} else {self.cast(self.scalar(args[1]), fake.dtype)})"
 
-            return Fragment(shape, fake.dtype, masked, dependencies=(source,))
+            return Fragment(
+                shape,
+                fake.dtype,
+                masked,
+                dependencies=(source,),
+                logical_domain=source.logical_domain,
+            )
         if target is view_ops.subscript:
             slices = cast("list[object]", args[1])
 
-            def subscript(coords: tuple[str, ...]) -> str:
+            def subscript_coordinates(coords: tuple[str, ...]) -> tuple[str, ...]:
                 result: list[str] = []
                 dim = 0
                 source_dim = 0
@@ -1271,9 +1606,23 @@ class FragmentCompiler:
                         result.append(f"({position}) % {source.shape[source_dim]}")
                         source_dim += 1
                 result.extend(coords[dim:])
-                return source.read(self.coordinate_locals(tuple(result)))
+                return tuple(result)
 
-            return Fragment(shape, fake.dtype, subscript, source.resident, (source,))
+            def subscript(coords: tuple[str, ...]) -> str:
+                return source.read(
+                    self.coordinate_locals(subscript_coordinates(coords))
+                )
+
+            return Fragment(
+                shape,
+                fake.dtype,
+                subscript,
+                source.resident,
+                (source,),
+                logical_domain=lambda coords: source.domain(
+                    subscript_coordinates(coords)
+                ),
+            )
         if target is torch.ops.aten.permute.default:
             order = cast("list[int]", args[1])
             return Fragment(
@@ -1284,10 +1633,18 @@ class FragmentCompiler:
                 ),
                 source.resident,
                 (source,),
+                logical_domain=lambda coords: source.domain(
+                    tuple(coords[order.index(i)] for i in range(len(order)))
+                ),
             )
         if target in (torch.ops.aten.expand.default, torch.ops.aten.clone.default):
             return Fragment(
-                shape, fake.dtype, source.broadcast, source.resident, (source,)
+                shape,
+                fake.dtype,
+                source.broadcast,
+                source.resident,
+                (source,),
+                logical_domain=source.broadcast_domain,
             )
         if target in (
             torch.ops.aten.view.default,
@@ -1301,16 +1658,26 @@ class FragmentCompiler:
             # Singleton views preserve logical element order. Read through the
             # source recipe so permuted layouts and resident aliases retain
             # their own physical addressing and shared-buffer lifetimes.
+            def view_coordinates(coords: tuple[str, ...]) -> tuple[str, ...]:
+                return self.coordinates(self.flatten(coords, shape), source.shape)
+
+            def view_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+                # Indexing may pad a singleton view without preserving numel.
+                # Bound the flat coordinate before unflattening can wrap it.
+                return (
+                    f"({self.flatten(coords, shape)}) < ({math.prod(source.shape)})",
+                    *source.domain(view_coordinates(coords)),
+                )
+
             return Fragment(
                 shape,
                 fake.dtype,
                 lambda coords: source.read(
-                    self.coordinate_locals(
-                        self.coordinates(self.flatten(coords, shape), source.shape)
-                    )
+                    self.coordinate_locals(view_coordinates(coords))
                 ),
                 source.resident,
                 (source,),
+                logical_domain=view_domain,
             )
         if target is torch.ops.aten.where.self:
             condition, lhs, rhs = cast("tuple[Fragment, Fragment, Fragment]", args)
@@ -1326,16 +1693,37 @@ class FragmentCompiler:
 
 
 def computed_fragment_supported(
-    env: CompileEnvironment, graphs: list[GraphInfo]
+    env: CompileEnvironment,
+    graphs: list[GraphInfo],
+    *,
+    physical_axes: frozenset[int] = frozenset(),
 ) -> bool:
     """Structural root ownership shared by search discovery and code generation.
 
     Exact local sizes, strides, scalar predicates and shared capacity remain
     configuration-dependent checks in the emitter.
     """
+    # Jagged loops carry per-parent bounds in their first captured tensor.
+    # This owner currently tracks only scalar loop ends; preserve the ordinary
+    # jagged lowering instead of treating the maximum end as every row's end.
+    if any(
+        isinstance(info, ForLoopGraphInfo)
+        and any(env.is_jagged_tile(bid) for bid in info.block_ids)
+        for info in graphs
+    ):
+        return False
     graph_by_id = {info.graph_id: info for info in graphs}
     independent_reductions = independent_reduction_coordinates(env, graphs)
-    captured_reductions = captured_reduction_coordinates(env, graphs)
+    captured_reductions = captured_reduction_coordinates(
+        env, graphs, physical_axes=physical_axes
+    )
+    local_allocations = local_atomic_allocations(graphs)
+    if not local_allocations and any(
+        node.target is atomic_ops.atomic_add
+        for info in graphs
+        for node in info.graph.nodes
+    ):
+        return False
 
     def configured_axis(size: int | torch.SymInt) -> bool:
         if isinstance(size, int):
@@ -1414,7 +1802,11 @@ def computed_fragment_supported(
         return len(sizes) != len(set(sizes))
 
     def needs_coordinates(node: Node) -> bool:
-        if node in independent_reductions or node in captured_reductions:
+        if (
+            node in local_allocations
+            or node in independent_reductions
+            or node in captured_reductions
+        ):
             return True
         if node.target is _tracing_ops._host_tensor:
             return False
@@ -1518,6 +1910,7 @@ def computed_fragment_supported(
         _tracing_ops._for_loop_step,
         memory_ops.load,
         memory_ops.store,
+        atomic_ops.atomic_add,
         matmul_ops.dot,
         scan_ops._associative_scan,
         inline_asm_ops.inline_asm_elementwise,
@@ -1668,26 +2061,76 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         return False
     root = cg.current_root_graph_info
     assert root is not None
+    threads_required = (
+        cg.device_function.config.get("cute_fragment_threads", 128) != 128
+        and root.graph_id in env.config_spec.cute_fragment_thread_root_ids
+    )
+    register_loads_required = (
+        cg.device_function.config.get("cute_fragment_register_loads", False)
+        and root.graph_id in env.config_spec.cute_fragment_register_load_root_ids
+    )
+    local_required = bool(local_atomic_allocations(cg.host_function.device_ir.graphs))
+    physical_axes = (
+        frozenset()
+        if threads_required
+        or register_loads_required
+        or cg.device_function.config.get("cute_fragment_scan", "serial") != "serial"
+        or cg.device_function.config.get("cute_fragment_reduction", "serial")
+        != "serial"
+        else physical_capture_axes(cg)
+    )
     captured_required = bool(
         captured_reduction_coordinates(
-            env, cg.host_function.device_ir.graphs, root_graph_id=root.graph_id
+            env,
+            cg.host_function.device_ir.graphs,
+            root_graph_id=root.graph_id,
+            physical_axes=physical_axes,
         )
     )
+    if cg.device_function.config.get("cute_reduction_schedule", "scalar") != "scalar":
+        # An explicit resident schedule owns its rectangular carries and
+        # performs its own complete proof during materialization. Replacing
+        # its scalar producer here erases the structure that proof consumes.
+        if (
+            local_required
+            or threads_required
+            or register_loads_required
+            or (
+                cg.device_function.config.get("cute_fragment_scan", "serial")
+                == "cooperative"
+                and root.graph_id in env.config_spec.cute_fragment_scan_root_ids
+            )
+            or (
+                cg.device_function.config.get("cute_fragment_reduction", "serial")
+                == "warp"
+                and root.graph_id in env.config_spec.cute_fragment_reduction_root_ids
+            )
+        ):
+            raise exc.InvalidConfig(
+                "resident reduction schedules cannot share a computed fragment root"
+            )
+        return False
     if (
         len(cg.host_function.device_ir.root_ids) != 1
         or cg.device_function.config.get("cute_collective_mma", False)
         or cg.device_function.config.get("cute_register_chain", False)
     ):
-        if captured_required:
+        if local_required:
+            raise exc.InvalidConfig(
+                "CTA-local atomics require a complete fragment root"
+            )
+        if captured_required or threads_required or register_loads_required:
             raise exc.InvalidConfig(
                 "captured full reductions require a computed fragment root"
+                if captured_required
+                else "CTA threads/register loads require a computed fragment root"
             )
         return False
     graphs = (
         cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
-        if captured_required
+        if captured_required or local_required
         else cg.codegen_graphs
     )
 
@@ -1703,13 +2146,25 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
 
     def decline() -> bool:
-        if captured_required or scan_required or reduction_required:
+        if local_required:
+            raise exc.InvalidConfig(
+                "CTA-local atomics require a supported complete fragment root"
+            )
+        if (
+            captured_required
+            or scan_required
+            or reduction_required
+            or threads_required
+            or register_loads_required
+        ):
             raise exc.InvalidConfig(
                 "captured full reductions require a computed fragment root"
                 if captured_required
                 else "cooperative scan requires a computed fragment root"
                 if scan_required
                 else "warp reduction requires a computed fragment root"
+                if reduction_required
+                else "CTA threads/register loads require a computed fragment root"
             )
         return False
 
@@ -1725,19 +2180,24 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         for node in info.graph.nodes
     ):
         return decline()
-    if not computed_fragment_supported(CompileEnvironment.current(), graphs):
+    if not computed_fragment_supported(
+        CompileEnvironment.current(), graphs, physical_axes=physical_axes
+    ):
         return decline()
     # This owner implements configured reduction tiling directly. Keep the
     # logical producer graph, including every other codegen transformation,
     # rather than applying scalar graph rolling before fragment ownership.
-    if not captured_required:
+    if not captured_required and not local_required:
         graphs = cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
-    if not computed_fragment_supported(CompileEnvironment.current(), graphs):
+    if not computed_fragment_supported(
+        CompileEnvironment.current(), graphs, physical_axes=physical_axes
+    ):
         return decline()
     root = graphs[root.graph_id]
     compiler = FragmentCompiler(cg, graphs)
+    compiler.local_allocations = prove_local_atomics(graphs)
     for info in graphs:
         for node in info.graph.nodes:
             if node.target is _tracing_ops._if:
@@ -1752,10 +2212,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     return decline()
     for info in graphs:
         for node in info.graph.nodes:
-            if not isinstance(
-                node.meta.get("lowering"), (PointwiseLowering, ReductionLowering)
-            ):
+            lowering = node.meta.get("lowering")
+            if not isinstance(lowering, (PointwiseLowering, ReductionLowering)):
                 continue
+            ranges = lowering.buffer.data.ranges
+            if isinstance(lowering, ReductionLowering):
+                assert isinstance(lowering.buffer.data, Reduction)
+                ranges = [*ranges, *lowering.buffer.data.reduction_ranges]
+            if any(compiler.static_extent(dim) is None for dim in ranges):
+                return decline()
             for source in node.all_input_nodes:
                 value = source.meta.get("val")
                 if not isinstance(value, torch.Tensor):
@@ -1765,11 +2230,17 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     ):
                         continue
                     return decline()
+                shape = tuple(compiler.static_extent(dim) for dim in value.shape)
+                strides = tuple(compiler.static_extent(dim) for dim in value.stride())
+                if any(dim is None for dim in (*shape, *strides)):
+                    # Ordinary lowering can retain host constexpr dimensions.
+                    # This owner requires proved capacities and coordinate strides.
+                    return decline()
                 span = 1
                 for stride, size in sorted(
                     zip(
-                        compiler.shape(value.stride()),
-                        compiler.shape(value.shape),
+                        cast("tuple[int, ...]", strides),
+                        cast("tuple[int, ...]", shape),
                         strict=True,
                     )
                 ):
@@ -1780,6 +2251,12 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     span += (size - 1) * stride
     grid = cg.current_grid_state
     assert grid is not None
+    if local_required:
+        if any(
+            cg.device_function.resolved_block_size(bid) != 1
+            for bid in grid.block_id_to_info
+        ):
+            raise exc.InvalidConfig("CTA-local atomics require scalar grid owners")
     compiler.begin()
     for bid, info in grid.block_id_to_info.items():
         compiler.offsets[bid] = grid.strategy.grid_origin_var(bid)
@@ -1789,6 +2266,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         compiler.emit(f"{compiler.thread} = cutlass.Int32(cute.arch.thread_idx()[0])")
         compiler.graph(root.graph, {})
     capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(compiler.env.device)
+    if local_required and not capacity:
+        raise exc.InvalidConfig(
+            "CTA-local atomics require a known shared memory capacity"
+        )
     if capacity and compiler.smem_bytes > capacity:
         raise exc.InvalidConfig(
             f"computed fragments need {compiler.smem_bytes} shared bytes, exceeding {capacity}"

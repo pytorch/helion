@@ -1752,7 +1752,7 @@ class SubscriptIndexing(NamedTuple):
                 # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
 
-                if slice_size != 1:
+                if not env.is_singleton_size(slice_size):
                     # On backends that don't pad factory ops to
                     # power-of-2, keep concrete dims concrete so shape
                     # inference can prove equality with concretely-sized
@@ -2051,7 +2051,7 @@ class SubscriptIndexing(NamedTuple):
                     step = k.step
                     slice_size = compute_slice_size(k, size)
 
-                    if slice_size != 1:
+                    if not env.is_singleton_size(slice_size):
                         rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         if _has_active_codegen_block(state, block_idx):
@@ -2496,7 +2496,7 @@ class BlockedSubscriptIndexing:
                 start = k.start if k.start is not None else 0
                 start_expr = state.device_function.literal_expr(start)
                 slice_size = compute_slice_size(k, size)
-                if slice_size != 1:
+                if not env.is_singleton_size(slice_size):
                     rdim = env.allocate_reduction_dimension(slice_size)
                     if _has_active_codegen_block(state, rdim.block_id):
                         offset_var = state.codegen.offset_var(rdim.block_id)

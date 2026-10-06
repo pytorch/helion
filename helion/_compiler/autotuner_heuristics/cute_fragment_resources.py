@@ -6,10 +6,12 @@ remove ordinary configurations, defaults, seeds, or coverage witnesses.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
@@ -193,6 +195,36 @@ def fragment_resource_carrier(env: CompileEnvironment, ir: DeviceIR) -> Config |
                     estimate = catalog.shared_bytes(env, candidate)
                     if estimate < bound:
                         candidates.append((estimate, item.flat_index, candidate))
+                if not candidates:
+                    # Search floors prefer larger tiles but are not legality
+                    # bounds. Try hard-minimum geometry only after ordinary
+                    # descent stalls, preserving every existing carrier.
+                    for index, block in enumerate(spec.block_sizes):
+                        if block.min_size >= block.autotuner_min:
+                            continue
+                        candidate = deepcopy(current)
+                        cast("list[int]", candidate["block_sizes"])[index] = (
+                            block.min_size
+                        )
+                        try:
+                            _, candidate = generation.strict_config_pair(candidate)
+                        except exc.InvalidConfig:
+                            continue
+                        if any(
+                            candidate.get(key) != current.get(key)
+                            for key in set(candidate) | set(current)
+                            if key != "block_sizes"
+                        ):
+                            continue
+                        estimate = catalog.shared_bytes(env, candidate)
+                        if estimate < bound:
+                            candidates.append(
+                                (
+                                    estimate,
+                                    generation.block_size_indices[index],
+                                    candidate,
+                                )
+                            )
                 if not candidates:
                     return None
                 bound, _, current = min(candidates, key=operator.itemgetter(slice(2)))
