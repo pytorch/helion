@@ -206,6 +206,83 @@ _TensorExpr = (
 )
 
 
+def aux_leaf_promoted_by_f32_root(
+    chain: Tcgen05UnaryEpilogueChain, leaf: _AuxiliaryTensorLoadExpr
+) -> bool:
+    """Whether ``leaf`` is consumed only by the FP32 root ``acc <op> aux`` step.
+
+    True when the chain is that single step, the leaf carries no cast wrapper
+    and the step's result dtype is FP32 (``_round_epilogue_expression`` left
+    the template unrounded), i.e. the DSL promotes the loaded operand to FP32
+    before the op. A 16-bit leaf may then be staged already converted: the
+    fp16/bf16 -> fp32 conversion is exact, so the result is bit-identical.
+    """
+    if leaf.template != "{aux}" or len(chain.steps) != 1:
+        return False
+    root = chain.steps[0].expr
+    if not isinstance(root, _BinaryTensorExpr) or ".to(" in root.op_template:
+        return False
+    return (isinstance(root.lhs, _CurrentTensorExpr) and root.rhs is leaf) or (
+        isinstance(root.rhs, _CurrentTensorExpr) and root.lhs is leaf
+    )
+
+
+def tcgen05_rowvec_stage_copy_shape(
+    *, epi_warp_count: int, bn: int, aux_extent: int | None
+) -> tuple[int, int] | None:
+    """``(threads, elems)`` of the one cooperative copy filling a promoted
+    FP32 row stage of width ``bn``.
+
+    Rows at least as wide as the epilogue warps' thread count spread one or
+    more elements per thread; narrower rows (bn=64 or 32) use whole warps of
+    one element each, so every ``bn`` that is a multiple of 32 gets the stage
+    instead of the per-subtile GMEM path. ``None`` when the row's static
+    extent is unknown or does not split into whole copies.
+    """
+    max_threads = epi_warp_count * 32
+    if aux_extent is None or max_threads <= 0 or bn % 32 != 0:
+        return None
+    copy_elems = max(1, bn // max_threads)
+    if bn % copy_elems != 0 or aux_extent % copy_elems != 0:
+        return None
+    threads = bn // copy_elems
+    if threads % 32 != 0 or threads > max_threads:
+        return None
+    return threads, copy_elems
+
+
+def aux_leaf_takes_promoted_f32_stage(
+    chain: Tcgen05UnaryEpilogueChain,
+    leaf: _AuxiliaryTensorLoadExpr,
+    *,
+    aux_dtype_bits: int,
+    epi_warp_count: int,
+    bn: int,
+    aux_extent: int | None,
+) -> bool:
+    """Whether the store lowering stages ``leaf`` as a promoted FP32 row.
+
+    One predicate for the matmul plan (which picks the (128, 32) subtile for
+    such epilogues) and the store lowering (which allocates the stage): a
+    16-bit N-broadcast row consumed only by the FP32 root op
+    (:func:`aux_leaf_promoted_by_f32_root`) whose width splits into whole
+    cooperative copies (:func:`tcgen05_rowvec_stage_copy_shape`). The
+    store-site conditions both sides also require -- ``pre_acc_wait``, a
+    full-tile TMA-store epilogue into a row-major output, an epilogue subtile
+    at least 128 rows tall and no whole-fragment register hoist -- are
+    checked by the callers.
+    """
+    return (
+        aux_dtype_bits == 16
+        and leaf.broadcast_axis == 1
+        and aux_leaf_promoted_by_f32_root(chain, leaf)
+        and tcgen05_rowvec_stage_copy_shape(
+            epi_warp_count=epi_warp_count, bn=bn, aux_extent=aux_extent
+        )
+        is not None
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _AuxiliaryTensorExprStep:
     """One expression over the current carrier, scalars, and auxiliary loads."""

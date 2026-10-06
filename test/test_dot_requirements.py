@@ -324,7 +324,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
-        self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
+        # Two 128x128 output tiles on this device: the search admits the
+        # 64-row one-CTA tile for grids smaller than the SM count (the
+        # 256-row operands alone would pin the floor at 128 rows).
+        self.assertEqual([x.min_size for x in spec.block_sizes], [64, 8, 16])
         # tile_k upper bound was previously hardcoded to 16; the cute tcgen05
         # path now allows multiples of 16 up to min(128, static_k) so the
         # autotuner can pack more cute.gemm instructions per K iteration.
@@ -332,7 +335,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         default_block_sizes = spec.default_config().config["block_sizes"]
         self.assertGreaterEqual(default_block_sizes[2], 16)
         self.assertLessEqual(default_block_sizes[2], 64)
-        self.assertGreaterEqual(default_block_sizes[0], 128)
+        self.assertGreaterEqual(default_block_sizes[0], 64)
         self.assertLessEqual(default_block_sizes[0], 256)
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 128)
@@ -561,11 +564,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             ):
                 return cute_matmul_mma.bind(args).config_spec
 
-        # Suppressed: 1024^3 = 16 cluster slots < 148 // 4 = 37. cluster_m=2
-        # search is suppressed and the cluster_m2 seed / fixup machinery is
-        # disabled so the autotuner never spends budget on the cluster_m=2 seed
-        # for a shape where it has no productive lever.
-        suppressed_spec = bind_at(1024)
+        # Suppressed: 512^3 = 4 cluster slots of 256x256 and 16 of the
+        # narrowest one-wave tile (256x64) < 148 // 4 = 37. cluster_m=2 search
+        # is suppressed and the cluster_m2 seed / fixup machinery is disabled
+        # so the autotuner never spends budget on the cluster_m=2 seed for a
+        # shape where it has no productive lever.
+        suppressed_spec = bind_at(512)
         self.assertEqual(suppressed_spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertIsNone(suppressed_spec._tcgen05_cluster_m2_search_constraints)
         # Keep this assertion scoped to the cluster_m=2 seed heuristic:
@@ -578,6 +582,17 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # above this is unaffected) — only the cluster_m search arm narrows.
         self.assertIn("persistent_interleaved", suppressed_spec.allowed_pid_types)
         self.assertIn("persistent_blocked", suppressed_spec.allowed_pid_types)
+
+        # Admitted through the one-wave tiles: 1024^3 has only 16 slots of
+        # 256x256 but 64 slots of 256x64 (>= 37), so cluster_m=2 search stays
+        # exposed with the narrow two-CTA tiles admitted (the measured winner
+        # there: 2-CTA 256x64x64 with a 9-deep ring, 6.2 us vs 7.8 for the
+        # one-CTA tiles the unseeded search found; cuBLAS runs 128x64 2cta).
+        one_wave_spec = bind_at(1024)
+        self.assertEqual(one_wave_spec._tcgen05_cluster_m_search_choices, (1, 2))
+        one_wave_constraints = one_wave_spec._tcgen05_cluster_m2_search_constraints
+        self.assertIsNotNone(one_wave_constraints)
+        self.assertTrue(one_wave_constraints.allow_one_wave_tiles)
 
         # Admitted (positive control for the lowered // 4 boundary): 2048^3 = 64
         # cluster slots >= 37. cluster_m=2 search stays exposed, its constraints
@@ -1133,10 +1148,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             self.assertEqual(seed["tcgen05_ab_stages"], 3)
         # The same SMEM gate admits the deep-staged short-K variant, which must
         # be seeded alongside the canonical family: bk=64 with the ab=6
-        # pipeline (nvjet's 64x6 staging).
+        # pipeline (nvjet's 64x6 staging), once for the CLC cluster_n=1 seed
+        # and once each for the static-persistent 2x2 multicast seed and its
+        # 2x1 twin.
         deep_seeds = [seed for seed in cluster_m2_seeds if seed["block_sizes"][2] == 64]
-        self.assertEqual(len(deep_seeds), 1)
-        self.assertEqual(deep_seeds[0]["tcgen05_ab_stages"], 6)
+        self.assertEqual(
+            sorted(seed.get("tcgen05_cluster_n", 1) for seed in deep_seeds), [1, 1, 2]
+        )
+        for seed in deep_seeds:
+            self.assertEqual(seed["tcgen05_ab_stages"], 6)
+            self.assertEqual(seed["tcgen05_c_stages"], 2)
         # M-paired block_m=512 seeds keep the baseline ab=2: the doubled A
         # staging leaves no headroom for a deeper AB pipeline at bk=128.
         m_pair_seeds = [

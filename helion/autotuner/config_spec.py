@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
     from .._compiler.cute.split_k_cluster import ClusterKFacts
+    from .._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxFacts
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
@@ -1743,6 +1744,16 @@ class ConfigSpec:
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
+    @property
+    def cute_tcgen05_rowvec_aux_facts(self) -> Tcgen05RowvecAuxFacts | None:
+        return self._cute_tcgen05_config.rowvec_aux_facts
+
+    @cute_tcgen05_rowvec_aux_facts.setter
+    def cute_tcgen05_rowvec_aux_facts(
+        self, value: Tcgen05RowvecAuxFacts | None
+    ) -> None:
+        self._cute_tcgen05_config.rowvec_aux_facts = value
+
     def _cute_flash_autotune_fragments(
         self,
         topology_override: str | None = None,
@@ -2855,6 +2866,7 @@ class ConfigSpec:
         input_dtype: torch.dtype,
         has_leading_passthrough: bool,
         explicit_epi_tile_compatible: bool,
+        leading_work_multiplier: int = 1,
     ) -> None:
         self._cute_tcgen05_config.register_mma_analysis(
             m_block_id=m_block_id,
@@ -2864,6 +2876,7 @@ class ConfigSpec:
             input_dtype=input_dtype,
             has_leading_passthrough=has_leading_passthrough,
             explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+            leading_work_multiplier=leading_work_multiplier,
         )
 
     def _tcgen05_matmul_block_fragments(
@@ -3043,6 +3056,8 @@ class ConfigSpec:
         cluster_m2_static_k: int | None = None,
         allow_cluster_m2_edge_k_tail_family: bool = False,
         allow_cluster_m2_fp8_small_grid: bool = False,
+        allow_cluster_m2_one_wave_tiles: bool = False,
+        cluster_m2_one_wave_only: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
         reason: str | None = None,
@@ -3053,6 +3068,8 @@ class ConfigSpec:
             cluster_m2_static_k=cluster_m2_static_k,
             allow_cluster_m2_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
             allow_cluster_m2_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
+            allow_cluster_m2_one_wave_tiles=allow_cluster_m2_one_wave_tiles,
+            cluster_m2_one_wave_only=cluster_m2_one_wave_only,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
         )

@@ -22,6 +22,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_D
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from .._compiler.matmul_utils import _compute_out_dtype
 from ..autotuner.config_spec import MatmulFact
 from . import _decorators
@@ -583,6 +584,24 @@ def _plan_cute_tcgen05_search_candidate(
         and static_n % max_search_n != 0
     ):
         max_search_m = min(max_search_m, 128)
+    # A GEMM with fewer 128x128 output tiles than SMs is bound by per-CTA
+    # fixed latency, not MMA throughput: more, narrower CTAs spread the work
+    # (cuBLAS runs 256^3 as 128 CTAs of 64x8 tiles).  Operands that admit
+    # 256-row tiles keep 128 rows as the search floor only when the grid can
+    # fill the machine; below that the 64-row one-CTA tile is searchable.
+    if (
+        min_search_m > 64
+        and static_m is not None
+        and static_n is not None
+        and static_m % 64 == 0
+    ):
+        num_sms = _cuda_num_sms_or_zero(lhs.device)
+        if (
+            num_sms > 0
+            and leading_work_multiplier * -(-static_m // 128) * -(-static_n // 128)
+            < num_sms
+        ):
+            min_search_m = 64
     if small_n_requires_role_local_tma and (
         static_m is None
         or static_k is None
@@ -659,6 +678,7 @@ def enable_cute_tcgen05_search(
         input_dtype=input_dtype,
         has_leading_passthrough=has_leading_passthrough,
         explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        leading_work_multiplier=plan.leading_work_multiplier,
     )
     static_m = plan.static_m
     static_n = plan.static_n
@@ -674,6 +694,7 @@ def enable_cute_tcgen05_search(
         allow_full_tile_cluster_m2_search = False
         allow_edge_cluster_m2_search = False
         allow_fp8_small_grid_cluster_m2_search = False
+        allow_one_wave_cluster_m2_search = False
     else:
         allow_full_tile_persistent_pid_types = (
             static_m % max_search_m == 0
@@ -714,11 +735,29 @@ def enable_cute_tcgen05_search(
             and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
             and static_k <= max_cluster_m2_search_k
         )
+        # One-wave 256 x {128, 64} CtaGroup.TWO tiles for GEMMs whose
+        # 256x256 two-CTA grid leaves most SMs idle (below, the small-grid
+        # demotion turns cluster_m=2 search off when even the narrowest of
+        # these tiles cannot fill a quarter of the SMs).
+        allow_one_wave_cluster_m2_search = (
+            allow_full_tile_cluster_m2_search
+            and static_n % min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS) == 0
+            and plan.leading_work_multiplier
+            * (static_m // TCGEN05_TWO_CTA_BLOCK_M)
+            * (static_n // TCGEN05_TWO_CTA_BLOCK_N)
+            * 2
+            < _cuda_num_sms_or_zero(lhs.device)
+        )
     allow_cluster_m2_search = (
         allow_full_tile_cluster_m2_search
         or allow_edge_cluster_m2_search
         or allow_fp8_small_grid_cluster_m2_search
     )
+    # True when only the one-wave tiles clear the quarter-wave gate below:
+    # the 256x256 two-CTA families then stay off (their seeds, the FFI
+    # coordinate and the aux-TMA surface) and the search keeps just the
+    # narrow tiles.
+    one_wave_only_cluster_m2_search = False
     num_sms = _cuda_num_sms_or_zero(lhs.device)
     spec._cute_tcgen05_config.device_sm_count = num_sms
     if allow_cluster_m2_search:
@@ -735,9 +774,20 @@ def enable_cute_tcgen05_search(
                 * (static_m // cluster_m)
                 * (static_n // cluster_n)
             )
+            if allow_one_wave_cluster_m2_search:
+                one_wave_work_clusters = (
+                    plan.leading_work_multiplier
+                    * (static_m // TCGEN05_TWO_CTA_BLOCK_M)
+                    * (static_n // min(TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS))
+                )
+                one_wave_only_cluster_m2_search = (
+                    work_clusters < num_sms // 4 <= one_wave_work_clusters
+                )
+                work_clusters = max(work_clusters, one_wave_work_clusters)
             if work_clusters < num_sms // 4:
                 allow_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
+                allow_one_wave_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
         allow_persistent_pid_types=(
             allow_full_tile_persistent_pid_types or allow_small_n_persistent_pid_types
@@ -746,6 +796,8 @@ def enable_cute_tcgen05_search(
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
         allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
+        allow_cluster_m2_one_wave_tiles=allow_one_wave_cluster_m2_search,
+        cluster_m2_one_wave_only=one_wave_only_cluster_m2_search,
         ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
         ab_stages_three_device=lhs.device,
         reason="matmul kernel with CuTe tcgen05 backend",
