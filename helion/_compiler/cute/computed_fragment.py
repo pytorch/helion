@@ -66,9 +66,12 @@ from .free_iota_reduction import free_iota_reductions
 from .free_iota_reduction import owned_iota_reduction_axes
 from .independent_reduction import independent_reduction_coordinates
 from .local_atomic import local_atomic_allocations
+from .local_atomic import local_buffer_conditional_inputs
 from .local_atomic import prove_local_atomics
 from .local_atomic import terminal_finalizer_inputs
 from .local_atomic import terminal_loop_symbols
+from .local_atomic_registers import MAX_SLOTS
+from .local_atomic_registers import local_atomic_register_chains
 from .private_scalar_loops import private_scalar_loop_nodes
 from .private_scalar_loops import privatize_scalar_loop
 from .register_loads import host_load_is_readonly
@@ -453,6 +456,19 @@ class FragmentCompiler:
                         warp_result_chain(node, self.env, self.threads)
                     )
 
+        self.local_register_nodes: set[Node] = set()
+        self.local_register_slot: str | None = None
+        if self.df.config.get("cute_fragment_local_atomic_registers", False):
+            for node, chain in local_atomic_register_chains(
+                self.graphs, self.env
+            ).items():
+                if self.warp_result_nodes.keys() & chain:
+                    continue
+                fake = cast("torch.Tensor", node.meta["val"])
+                count = math.prod(self.shape(fake.shape))
+                if 0 < count <= self.threads * MAX_SLOTS:
+                    self.local_register_nodes.update(chain)
+
     def begin(self) -> None:
         self.allocator = self.df.new_var("fragment_smem")
         self.thread = self.df.new_var("fragment_thread")
@@ -727,7 +743,42 @@ class FragmentCompiler:
         threads_per_element: int = 1,
         warp_owned: bool = False,
         synchronize: bool = True,
+        register_owned: bool = False,
     ) -> None:
+        if register_owned:
+            assert not warp_owned and threads_per_element == 1
+            slots = (math.prod(shape) + self.threads - 1) // self.threads
+            assert 0 < slots <= MAX_SLOTS
+            slot = self.df.new_var("fragment_register_slot")
+            index = self.df.new_var("fragment_register_index")
+            loop = cast(
+                "ast.For",
+                statement_from_string(
+                    f"for {slot} in cutlass.range_constexpr({slots}):\n    pass"
+                ),
+            )
+            loop.body.clear()
+            prior = self.local_register_slot
+            self.local_register_slot = slot
+            try:
+                with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+                    self.emit(f"{index} = {self.thread} + {slot} * {self.threads}")
+                    branch = cast(
+                        "ast.If",
+                        statement_from_string(
+                            f"if {index} < {math.prod(shape)}:\n    pass"
+                        ),
+                    )
+                    branch.body.clear()
+                    with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                        body(self.coordinates(index, shape))
+                    self.cg.add_statement(branch)
+            finally:
+                self.local_register_slot = prior
+            self.cg.add_statement(loop)
+            if synchronize:
+                self.synchronize()
+            return
         if warp_owned:
             assert threads_per_element == 1
             threads_per_element = 32
@@ -797,6 +848,8 @@ class FragmentCompiler:
         storage: str,
         variables: tuple[str, ...],
         prepare: Callable[[tuple[str, ...]], None],
+        *,
+        register_owned: bool = False,
     ) -> None:
         """Aggregate one private relaxed Int32 update epoch, without new barriers.
 
@@ -809,10 +862,14 @@ class FragmentCompiler:
         iteration = self.df.new_var("fragment_atomic_round")
         index = self.df.new_var("fragment_atomic_element")
         address, value, active = variables
+        slots = (size + self.threads - 1) // self.threads
+        if register_owned:
+            assert 0 < slots <= MAX_SLOTS
+        loop_range = "cutlass.range_constexpr" if register_owned else "range"
         loop = cast(
             "ast.For",
             statement_from_string(
-                f"for {iteration} in range({(size + self.threads - 1) // self.threads}):\n    pass"
+                f"for {iteration} in {loop_range}({slots}):\n    pass"
             ),
         )
         loop.body.clear()
@@ -827,7 +884,13 @@ class FragmentCompiler:
             )
             valid.body.clear()
             with self.cg.set_statements(cast("list[ast.AST]", valid.body)):
-                prepare(self.coordinates(index, shape))
+                prior = self.local_register_slot
+                if register_owned:
+                    self.local_register_slot = iteration
+                try:
+                    prepare(self.coordinates(index, shape))
+                finally:
+                    self.local_register_slot = prior
             self.cg.add_statement(valid)
             members = self.df.new_var("fragment_atomic_members")
             peers = self.df.new_var("fragment_atomic_peers")
@@ -864,9 +927,10 @@ class FragmentCompiler:
             raise exc.InvalidConfig(
                 "ordered fragment atomics require a global int32 target"
             )
-        if node.users and (local or target_fake.dtype != torch.int32):
+        if node.users and target_fake.dtype != torch.int32:
             raise exc.InvalidConfig(
-                "fragment atomic results require a global int32 target"
+                "fragment atomic results require a global int32 target "
+                "or a relaxed local int32 target"
             )
         if isinstance(target, Fragment) and (
             target.storage is None or len(target.shape) != 1
@@ -914,7 +978,9 @@ class FragmentCompiler:
         # The side effect is emitted once below, never embedded in a lazy
         # element recipe. Repeated consumers read this immutable snapshot.
         warp_groups = self.warp_result_nodes.get(node)
-        warp_owned = warp_groups is not None and math.prod(shape) == warp_groups
+        warp_owned = (
+            not local and warp_groups is not None and math.prod(shape) == warp_groups
+        )
         register = (
             self.df.new_var("fragment_warp_atomic")
             if node.users and warp_owned
@@ -922,8 +988,32 @@ class FragmentCompiler:
         )
         if register is not None:
             self.emit(f"{register} = {self.cast('0', target_fake.dtype)}")
+        local_registers = (
+            self.df.new_var("fragment_local_tickets")
+            if local and node.users and node in self.local_register_nodes
+            else None
+        )
+        if local_registers is not None:
+            slots = (math.prod(shape) + self.threads - 1) // self.threads
+            self.emit(
+                f"{local_registers} = cute.make_rmem_tensor(({slots},), cutlass.Int32)"
+            )
+            self.emit(f"{local_registers}.fill(0)")
+
+        def local_register_read(_coords: tuple[str, ...]) -> str:
+            assert self.local_register_slot is not None
+            return f"{local_registers}[{self.local_register_slot}]"
+
         result = (
             Fragment(
+                shape,
+                target_fake.dtype,
+                local_register_read,
+                True,
+                logical_domain=logical_domain,
+            )
+            if local_registers is not None
+            else Fragment(
                 shape,
                 target_fake.dtype,
                 lambda _coords: cast("str", register),
@@ -1049,11 +1139,27 @@ class FragmentCompiler:
                 self.emit(f"{result.read(coords)} = {previous}")
 
         if aggregate_vars is None:
-            self.elements(shape, update, warp_owned=warp_owned, synchronize=not local)
+            # Returned local values are immutable per-element snapshots. Finish
+            # every worker's update/result write before a cross-lane consumer;
+            # the target and result have distinct live allocations. Local
+            # unused-result epochs retain their existing coalescing behavior.
+            self.elements(
+                shape,
+                update,
+                warp_owned=warp_owned,
+                synchronize=not local or result is not None,
+                register_owned=node in self.local_register_nodes,
+            )
         else:
             assert isinstance(target, Fragment) and target.storage is not None
-            self.aggregate_local_updates(shape, target.storage, aggregate_vars, update)
-        if local:
+            self.aggregate_local_updates(
+                shape,
+                target.storage,
+                aggregate_vars,
+                update,
+                register_owned=node in self.local_register_nodes,
+            )
+        if local and result is None:
             assert isinstance(target, Fragment) and target.storage is not None
             self.pending_local_atomics.add(target.storage)
         if register is not None:
@@ -1228,6 +1334,7 @@ class FragmentCompiler:
                 shape,
                 write,
                 warp_owned=self.warp_result_nodes.get(node) == math.prod(shape),
+                register_owned=node in self.local_register_nodes,
             )
             return None
 
@@ -2280,7 +2387,36 @@ class FragmentCompiler:
                     )
 
     def conditional(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
-        if self.local_allocations:
+        local_inputs = (
+            local_buffer_conditional_inputs(node, self.graphs)
+            if self.local_allocations
+            else None
+        )
+        if local_inputs is not None:
+            reductions, symbols = local_inputs
+            self.uniform_finalizer_symbols(symbols)
+            if reductions & self.warp_result_nodes.keys():
+                raise exc.InvalidConfig(
+                    "local-buffer predicate requires CTA-shared reduction ownership"
+                )
+            predicate = cast("Node", node.args[0])
+            value = values[predicate]
+            if not isinstance(value, Fragment) or value.shape != ():
+                raise exc.InvalidConfig("local-buffer predicate must be scalar")
+            # Even a one-element reduction may remain lazy. Evaluate exactly once
+            # and exchange before all CTA threads read the same scalar address.
+            values[predicate] = self.materialize(value, copy=True)
+            self.held.append(
+                [
+                    values[predicate],
+                    *(
+                        values[source]
+                        for side in node.args[3:5]
+                        for source in cast("list[Node]", side)
+                    ),
+                ]
+            )
+        elif self.local_allocations:
             tickets, symbols = terminal_finalizer_inputs(node, self.graphs)
             predicate_value = values[cast("Node", node.args[0])]
             predicate_buffers = self.referenced_buffers([predicate_value])
@@ -2330,6 +2466,11 @@ class FragmentCompiler:
                     Fragment(self.shape(fake.shape), fake.dtype, lambda _: "0")
                 )
             )
+        branch_local = local_inputs is not None and any(
+            allocation.graph is self.graphs[cast("int", graph_id)].graph
+            for allocation in self.local_allocations
+            for graph_id in node.args[1:3]
+        )
         branches: list[list[ast.AST]] = []
         for side in range(2):
             branch = self.graphs[cast("int", node.args[1 + side])]
@@ -2348,6 +2489,11 @@ class FragmentCompiler:
                         )
                     ),
                 )
+                if branch_local:
+                    # Each arm starts with no pending incoming atomic epoch.
+                    # An unused final update must complete inside this arm, not
+                    # borrow a barrier emitted while generating its sibling.
+                    self.synchronize_local_atomics()
                 assert isinstance(outputs, list)
                 self.held.append(outputs)
                 for target, slots in zip(merged, info.branches_outputs, strict=True):
@@ -2376,7 +2522,13 @@ class FragmentCompiler:
         statement.body = cast("list[ast.stmt]", branches[0])
         statement.orelse = cast("list[ast.stmt]", branches[1])
         self.cg.add_statement(statement)
+        if branch_local:
+            # Keep predicate/captures alive until all CTA threads have left the
+            # selected arm, before any branch-local storage lifetime can end.
+            self.synchronize()
         self.held.pop()
+        if local_inputs is not None:
+            self.held.pop()
         return [*merged, *merged]
 
     def graph(self, graph: torch.fx.Graph, values: dict[Node, object]) -> object:
