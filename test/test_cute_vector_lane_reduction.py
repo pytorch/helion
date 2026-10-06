@@ -153,3 +153,79 @@ def test_single_outer_vector_retains_every_coordinate():
     assert ast.literal_eval(flat.iter.args[0]) == 8
     assert "outer // 8" in ast.unparse(flat)
     assert "outer % 8" in ast.unparse(flat)
+
+
+def _readonly_packet_loop():
+    loop, vector = _loop(
+        "base = outer * 8\n"
+        "packet = cute.arch.load(x.iterator + base * x.layout.stride[0], "
+        "ir.VectorType.get([8], cutlass.Uint32.mlir_type))"
+    )
+    vector.body[1] = ast.parse("value = packet[vector]").body[0]
+    vector.body.pop()  # The final result is consumed after the complete reduction.
+    return loop, vector
+
+
+def test_vector_readonly_packet_preserves_scalar_coordinates():
+    loop, vector = _readonly_packet_loop()
+    flat = lanes._flatten_vector_reduction_lane(loop, vector, "outer")
+    assert ast.literal_eval(flat.iter.args[0]) == 16
+    # Evaluate the exact transformed coordinate assignments and extraction.
+    values = list(range(16))
+    for index in range(16):
+        scope = {"outer": index, "packet": values[index // 8 * 8 : index // 8 * 8 + 8]}
+        for stmt in (flat.body[0], flat.body[2], flat.body[3]):
+            exec(
+                compile(
+                    ast.fix_missing_locations(ast.Module([stmt], [])),
+                    "<coordinate>",
+                    "exec",
+                ),
+                scope,
+            )
+        assert scope["index"] == index
+        assert scope["value"] == values[index]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "store",
+        "atomic",
+        "unknown",
+        "barrier",
+        "address",
+        "result",
+        "volatile",
+        "width",
+        "type",
+        "nested_load",
+        "subscript",
+    ],
+)
+def test_vector_packet_replay_rejects_effects_and_unstable_addresses(mutation):
+    loop, vector = _readonly_packet_loop()
+    if mutation in {"store", "atomic", "unknown", "barrier", "address", "result"}:
+        text = {
+            "store": "x.store(value)",
+            "atomic": "old = cute.arch.atomic_add(x, value)",
+            "unknown": "value = opaque(value)",
+            "barrier": "cute.arch.sync_threads()",
+            "address": "x = other",
+            "result": "packet = other",
+        }[mutation]
+        vector.body.append(ast.parse(text).body[0])
+    else:
+        load = loop.body[1].value
+        if mutation == "volatile":
+            load.keywords.append(ast.keyword(arg="volatile", value=ast.Constant(True)))
+        elif mutation == "width":
+            load.args[1].args[0].elts[0] = ast.Constant(4)
+        elif mutation == "type":
+            load.args[1].func = ast.parse("unknown.VectorType.get", mode="eval").body
+        elif mutation == "nested_load":
+            load.args[0] = ast.parse("ptr.load()", mode="eval").body
+        else:
+            load.args[0] = ast.parse("pointers[0]", mode="eval").body
+    with pytest.raises(helion.exc.BackendUnsupported, match="scalar ownership proof"):
+        lanes._flatten_vector_reduction_lane(loop, vector, "outer")

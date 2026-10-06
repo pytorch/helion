@@ -54,6 +54,38 @@ def _constant(node: ast.AST, value: int) -> bool:
     )
 
 
+def _integer_slot(node: ast.AST) -> int | None:
+    """Evaluate only closed Python integer coordinates, never SDK arithmetic.
+
+    Both operands must be known even for multiplication by zero. Names,
+    calls, booleans, floating values and typed casts cannot establish a slot.
+    Recognition leaves the original expression and its evaluation unchanged.
+    """
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.UnaryOp):
+        value = _integer_slot(node.operand)
+        if value is not None:
+            if isinstance(node.op, ast.UAdd):
+                return value
+            if isinstance(node.op, ast.USub):
+                return -value
+    if isinstance(node, ast.BinOp):
+        left, right = _integer_slot(node.left), _integer_slot(node.right)
+        if left is not None and right is not None:
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.FloorDiv) and right != 0:
+                return left // right
+            if isinstance(node.op, ast.Mod) and right != 0:
+                return left % right
+    return None
+
+
 def _sync(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Expr)
@@ -132,7 +164,7 @@ def immutable_publications(
         if any(
             roots[node] >= index
             and (
-                not _constant(cast("ast.Subscript", parents[node]).slice, 0)
+                _integer_slot(cast("ast.Subscript", parents[node]).slice) != 0
                 or (roots[node] == index and parents.get(parents[node]) is not writer)
                 or (
                     roots[node] > index
@@ -238,7 +270,7 @@ def _recipe(
         if (
             isinstance(node.value, ast.Name)
             and node.value.id in published
-            and _constant(node.slice, 0)
+            and _integer_slot(node.slice) == 0
         ):
             return _Value(_clone(node), frozenset((node.value.id,)))
         return None

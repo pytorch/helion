@@ -6379,7 +6379,17 @@ def test_coarse_rank_topk_entire_sdk_module(
 
     # Use the installed, unmodified AST processor and IR builders for every
     # selection helper. No native compiler, GPU context, or arithmetic mock.
-    namespace = dict(vars(topk))
+    # The installed SDK replaces a called jit function's __code__ with its
+    # decorator-free transformed body. Re-read the unchanged module source
+    # into private namespaces so prior native/SDK calls cannot alter this
+    # preprocessing test. Do not reload or mutate the live runtime modules.
+    pristine = {}
+    for helper_module in (topk, coarse_topk):
+        scope = dict(vars(helper_module))
+        path = Path(helper_module.__file__)
+        exec(compile(path.read_text(), str(path), "exec"), scope)
+        pristine[helper_module.__name__] = scope
+    namespace = dict(pristine[topk.__name__])
     for module, name in [
         (topk, "_sort_descending"),
         (topk, "_merge_descending"),
@@ -6389,7 +6399,7 @@ def test_coarse_rank_topk_entire_sdk_module(
         (topk, "distributed_topk"),
         (coarse_topk, "coarse_rank_topk"),
     ]:
-        raw = inspect.unwrap(getattr(module, name))
+        raw = inspect.unwrap(pristine[module.__name__][name])
         with DSLPreprocessor(["cutlass"]).get_session() as session:
             tree = session.transform(raw, dict(raw.__globals__))
             exec(
@@ -8059,6 +8069,7 @@ def test_fragment_network_topk_sdk(tmp_path, dtype, width, k, largest, block_row
     from cutlass._mlir.dialects import func
     import cutlass.cute as cute
 
+    cuda_initialized = torch.cuda.is_initialized()
     x = torch.empty((5, 3, width), dtype=dtype)
     with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
         bound = _cpu_bind(_fragment_leading_axes_topk, (x, k, largest))
@@ -8122,10 +8133,35 @@ def test_fragment_network_topk_sdk(tmp_path, dtype, width, k, largest, block_row
         text = str(emitted)
         (tmp_path / "sdk.mlir").write_text(text)
         assert "nvvm.shfl.sync" in text and "scf.for" in text
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized
+
+
+@pytest.fixture
+def _network_prefix_without_later_coverage():
+    from contextlib import ExitStack
+
+    # This unit test checks the network group's exact one-row extension.
+    # Full combined populations are checked independently without suppression.
+    with ExitStack() as stack:
+        for registration in (
+            "register_fragment_local_atomic_registers_coverage",
+            "register_fragment_register_snapshots_coverage",
+            "register_fragment_published_scalars_coverage",
+            "register_fragment_skip_zero_atomics_coverage",
+            "register_fragment_atomic_consumer_fusion_coverage",
+            "register_integer_loop_reduction_coverage",
+            "register_fragment_integer_atomic_epochs_coverage",
+            "register_fragment_packet_loads_coverage",
+            "register_fragment_register_producers_coverage",
+        ):
+            stack.enter_context(
+                patch("helion._compiler.autotuner_heuristics." + registration)
+            )
+        yield
 
 
 @pytest.mark.parametrize("seed", [31, 61, 97])
+@pytest.mark.usefixtures("_network_prefix_without_later_coverage")
 def test_fragment_network_topk_population_prefix(seed):
     from test.cute_population_contracts import checked_initial_population
 
@@ -8389,3 +8425,65 @@ def test_fragment_network_topk_strict_boolean(value):
         c.config["cute_fragment_topk_network"] = value
         with pytest.raises(InvalidConfig, match="complete fragment top-k"):
             b.to_code(c)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_coarse_rank_topk_sdk_after_runtime_preprocessing():
+    import inspect
+
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    from helion.runtime.cute import coarse_topk
+
+    # Model the exact worker state left by an earlier real jit invocation.
+    # Restore that state after the test; the SDK test must not mutate it.
+    raw = inspect.unwrap(coarse_topk.coarse_rank_topk)
+    original_code = raw.__code__
+    original_attributes = dict(vars(raw))
+    try:
+        BaseDSL._preprocess_and_replace_code(raw)
+        processed_code = raw.__code__
+        test_coarse_rank_topk_entire_sdk_module(16, 8, 16, 8)
+        assert raw.__code__ is processed_code
+    finally:
+        raw.__code__ = original_code
+        raw.__dict__.clear()
+        raw.__dict__.update(original_attributes)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("initialized", [False, True])
+def test_fragment_network_sdk_preserves_existing_cuda_state(tmp_path, initialized):
+    with (
+        patch("torch.cuda.is_initialized", return_value=initialized),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU SDK only")),
+    ):
+        test_fragment_network_topk_sdk(tmp_path, torch.int32, 33, 7, False)
+
+
+@pytest.mark.parametrize("seed", [31, 61, 97])
+def test_fragment_network_full_population_keeps_later_coverage(seed):
+    from test.cute_population_contracts import checked_initial_population
+
+    from helion.autotuner.pattern_search import PatternSearch
+
+    args = (torch.empty((5, 3, 65)), 7, True)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_leading_axes_topk, args)
+        keys = [group.key for group in bound.config_spec.compiler_coverage_groups]
+        assert keys.index("cute_fragment_topk_network") < keys.index(
+            "cute_fragment_packet_loads"
+        )
+        with bound.env:
+            random.seed(seed)
+            search = PatternSearch(bound, args, initial_population=100)
+            # This helper verifies the whole base prefix, RNG state and every
+            # declared appended witness, with no registration suppression.
+            population = checked_initial_population(search)
+            configs = [search.config_gen.canonicalize_flat(x)[1] for x in population]
+        assert any(
+            config.get("cute_fragment_topk_network", False) for config in configs
+        )
+        assert any(
+            config.get("cute_fragment_packet_loads", False) for config in configs
+        )

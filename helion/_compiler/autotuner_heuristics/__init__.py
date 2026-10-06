@@ -73,6 +73,8 @@ from .cute_fragment_atomic_consumer_fusion import (
 from .cute_fragment_atomic_consumer_fusion import (
     register_fragment_atomic_consumer_fusion_coverage,
 )
+from .cute_fragment_bounded_gather import CuteFragmentBoundedGatherHeuristic
+from .cute_fragment_bounded_gather import register_fragment_bounded_gather_coverage
 from .cute_fragment_integer_atomic_epochs import (
     CuteFragmentIntegerAtomicEpochsHeuristic,
 )
@@ -124,6 +126,7 @@ from .cute_fragment_warp_results import CuteFragmentWarpResultsHeuristic
 from .cute_fragment_warp_results import register_fragment_warp_results_coverage
 from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
 from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
+from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -237,6 +240,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentIntegerAtomicEpochsHeuristic,
         CuteFragmentPacketLoadsHeuristic,
         CuteFragmentRegisterProducersHeuristic,
+        CuteFragmentBoundedGatherHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -712,3 +716,7 @@ def register_compiler_coverage_groups(
     register_fragment_register_producers_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
+    register_fragment_bounded_gather_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_gather_warp_scan_coverage(env, device_ir)

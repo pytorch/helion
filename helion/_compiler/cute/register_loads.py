@@ -30,8 +30,8 @@ def lane_private_load(node: Node, env: CompileEnvironment) -> bool:
     """
     if node.target is not memory_ops.load or not node.users:
         return False
-    source = cast("Node", node.args[0])
-    if source.target is not _tracing_ops._host_tensor:
+    source = node.args[0]
+    if not isinstance(source, Node) or source.target is not _tracing_ops._host_tensor:
         return False
     fake = node.meta.get("val")
     if not isinstance(fake, torch.Tensor) or not fake.ndim:
@@ -66,8 +66,11 @@ def lane_private_load(node: Node, env: CompileEnvironment) -> bool:
         if user.target is memory_ops.store:
             if user.args[2] not in visited and user.args[2] is not node:
                 return False
-            target = cast("Node", user.args[0])
-            if target.target is not _tracing_ops._host_tensor:
+            target = user.args[0]
+            if (
+                not isinstance(target, Node)
+                or target.target is not _tracing_ops._host_tensor
+            ):
                 return False
             indices = [
                 x.meta["val"] if isinstance(x, Node) else x
@@ -116,7 +119,10 @@ def host_load_is_readonly(
     from .local_atomic import atomic_target_origins
     from .memory_ops import runtime_tensors_are_proven_disjoint
 
-    source = cast("Node", node.args[0]).meta.get("val")
+    source_node = node.args[0]
+    if not isinstance(source_node, Node):
+        return False
+    source = source_node.meta.get("val")
     if not isinstance(source, torch.Tensor):
         return False
     # Analysis IR can retain inactive rolled alternatives. Use the same
@@ -133,7 +139,11 @@ def host_load_is_readonly(
             and effect.target not in atomic_ops.ATOMIC_OPS
         ):
             continue
-        target_node = atomic_targets.get(effect, cast("Node", effect.args[0]))
+        target_node = atomic_targets.get(effect, effect.args[0])
+        if not isinstance(target_node, Node):
+            # Stack tensors carry indirect pointer tuples. Their pointees may
+            # alias the source even when the pointer tensor itself is disjoint.
+            return False
         if effect in atomic_targets and target_node.target is creation_ops.full:
             # The complete-fragment ownership proof certifies these fresh
             # CTA-local shared allocations and their identity-preserving carries.

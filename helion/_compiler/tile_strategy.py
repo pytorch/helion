@@ -4771,9 +4771,10 @@ def _flatten_vector_reduction_lane(
 
     The strategy records this ownership when it emits the reduction marker.
     Flattening preserves the original (outer, vector) visitation order. Only
-    pure coordinate preparation may move from once per outer lane to once per
-    element; vector loads/stores, staging, and unproved carries must decline.
-    The existing splitter still checks all producer/consumer aliasing.
+    pure coordinate preparation and proved read-only packet loads may move from
+    once per outer lane to once per element. Stores, staging, and unproved
+    carries must decline. The existing splitter still checks all
+    producer/consumer aliasing.
     """
     from .ast_read_writes import ReadWrites
 
@@ -4807,12 +4808,64 @@ def _flatten_vector_reduction_lane(
     body_rw = ReadWrites.from_list(vector_loop.body)
     body_writes = set(body_rw.writes) | set(body_rw.inplace_writes)
     prefix_writes = set(ReadWrites.from_list(prefix).writes)
+    # A packet load may be replayed at each scalar coordinate only when the
+    # complete element body is read-only. No store, atomic, synchronization,
+    # unknown call, or vector-address mutation may cross the repeated read.
+    readonly_body = all(
+        _plain_assignment_name(statement) is not None
+        and not _has_observable_memory_write(statement)
+        and all(
+            _qualified_name(node.func) == "_helion_lane_reduce"
+            or _is_proven_relocatable_call(node, allow_load=True)
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+        )
+        for statement in vector_loop.body
+    )
+
+    def readonly_packet(statement: ast.AST) -> bool:
+        if not readonly_body or not isinstance(statement, ast.Assign):
+            return False
+        call = statement.value
+        if not (
+            isinstance(call, ast.Call)
+            and _qualified_name(call.func) == "cute.arch.load"
+            and len(call.args) == 2
+            and not call.keywords
+        ):
+            return False
+        dtype = call.args[1]
+        if not (
+            isinstance(dtype, ast.Call)
+            and _qualified_name(dtype.func) == "ir.VectorType.get"
+            and len(dtype.args) == 2
+            and not dtype.keywords
+            and isinstance(dtype.args[0], ast.List)
+            and len(dtype.args[0].elts) == 1
+            and isinstance(dtype.args[0].elts[0], ast.Constant)
+            and type(dtype.args[0].elts[0].value) is int
+            and dtype.args[0].elts[0].value == vector_size
+            and _qualified_name(dtype.args[1])
+            in {"cutlass.Uint16.mlir_type", "cutlass.Uint32.mlir_type"}
+        ):
+            return False
+        return all(
+            node is call
+            or node is dtype
+            or _is_proven_relocatable_call(node, allow_load=False)
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+        )
+
     prepared: set[str] = set()
     for statement in prefix:
         name = _plain_assignment_name(statement)
+        packet = readonly_packet(statement)
         if (
             name is None
-            or not _is_proven_relocatable_assignment(statement, allow_load=False)
+            or not (
+                packet or _is_proven_relocatable_assignment(statement, allow_load=False)
+            )
             or name in body_writes | prepared | {lane_var, vector_var}
             or any(
                 isinstance(node, ast.Subscript)
@@ -4820,6 +4873,15 @@ def _flatten_vector_reduction_lane(
                     isinstance(node.value, ast.Call)
                     and ast.unparse(node.value.func)
                     in ("cute.arch.thread_idx", "cute.arch.block_idx")
+                    or packet
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "stride"
+                    and isinstance(node.value.value, ast.Attribute)
+                    and node.value.value.attr == "layout"
+                    and isinstance(node.value.value.value, ast.Name)
+                    and isinstance(node.slice, ast.Constant)
+                    and type(node.slice.value) is int
+                    and node.slice.value >= 0
                 )
                 for node in ast.walk(statement)
             )

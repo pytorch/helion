@@ -4863,5 +4863,1776 @@ class TestCuteIntegerModuloNative(TestCase):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_rows(x: torch.Tensor, mode: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        source = x[row, :] * 3 + 1
+        lane = hl.arange(source.size(0))
+        if mode == "duplicate":
+            index = lane % 3
+        elif mode == "xor":
+            index = (lane ^ 1) % x.size(1)
+        elif mode == "data":
+            index = source.to(torch.int64) % x.size(1)
+        else:
+            index = (lane * 5 + 3) % x.size(1)
+        result = torch.gather(source, -1, index.to(torch.int64))
+        out[row, :] = result + source
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_leading(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        source = x[row, :, :] * 3 + 1
+        index = source.to(torch.int64) % x.size(2)
+        first = torch.gather(source, -1, index)
+        other = first + source
+        index2 = (source.to(torch.int64) * 5 + 2) % x.size(2)
+        second = torch.gather(other, -1, index2)
+        out[row, :, :] = first + second
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_bad(x: torch.Tensor, mode: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        source = x[row, :]
+        if mode == "negative":
+            index = source.to(torch.int64) % x.size(1) - 1
+        elif mode == "upper":
+            index = source.to(torch.int64) % x.size(1) + 1
+        elif mode == "raw":
+            index = source.to(torch.int64)
+        else:
+            index = (source.to(torch.int64) % x.size(1)).to(torch.int32)
+        out[row, :] = torch.gather(source, -1, index)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_shift(x: torch.Tensor):
+    out = torch.empty((x.size(0), x.size(1) - 1), dtype=x.dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        source = x[row, :]
+        index = hl.arange(x.size(1) - 1) + 1
+        out[row, :] = torch.gather(source, -1, index.to(torch.int64))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_maps(x: torch.Tensor, mode: hl.constexpr, offset: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        source = x[row, :]
+        lane = hl.arange(1024)
+        if mode == "down":
+            index = torch.minimum(lane + offset, lane | 31)
+        elif mode == "up":
+            index = torch.maximum(lane - offset, lane & -32)
+        elif mode == "xor":
+            index = lane ^ offset
+        elif mode == "end":
+            index = lane | 31
+        elif mode == "pack":
+            index = (lane & 31) * 32
+        elif mode == "prefix":
+            index = lane // 32
+        else:
+            index = lane * 0 + offset * 32
+        out[row, :] = torch.gather(source, -1, index.to(torch.int64))
+    return out
+
+
+def _bounded_gather_codegen(kernel, args):
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        bound = _cpu_bind(kernel, args)
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_bounded_gather"] = True
+        source = bound.to_code(config)
+    return bound, source
+
+
+class TestCuteBoundedGatherCPU(TestCase):
+    def test_logical_exchange_maps_and_exact_float_payloads(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        lane = torch.arange(1024)
+        cases = (
+            ("down", 16, torch.minimum(lane + 16, lane | 31)),
+            ("up", 16, torch.maximum(lane - 16, lane & -32)),
+            ("xor", 16, lane ^ 16),
+            ("end", 0, lane | 31),
+            ("pack", 0, (lane & 31) * 32),
+            ("prefix", 0, lane // 32),
+            ("constant", 0, lane * 0),
+            ("constant", 31, lane * 0 + 31 * 32),
+        )
+        bits = (
+            torch.tensor(
+                [
+                    0,
+                    -2147483648,
+                    1,
+                    0x7FFFFF,
+                    0x800000,
+                    0x7F800000,
+                    -8388608,
+                    0x7FC00000,
+                ],
+                dtype=torch.int32,
+            )
+            .repeat(256)
+            .reshape(2, 1024)
+        )
+        x = bits.view(torch.float32)
+        for mode, offset, index in cases:
+            with self.subTest(mode=mode, offset=offset):
+                _bound, code = _bounded_gather_codegen(
+                    _bounded_gather_maps, (x, mode, offset)
+                )
+                out = torch.empty_like(x)
+                _simulate_register_load_program(
+                    code,
+                    x,
+                    128,
+                    host_tensors={"out": out},
+                    lane_order=list(reversed(range(128))),
+                )
+                torch.testing.assert_close(
+                    out.view(torch.int32), bits[:, index], rtol=0, atol=0
+                )
+
+    def test_all_exchange_index_range_proofs(self):
+        from helion._compiler.cute.bounded_gather import integer_bounds
+
+        graph = torch.fx.Graph()
+        fake = torch.empty(1024, dtype=torch.int64)
+
+        def call(target, *args, **kwargs):
+            node = graph.call_function(target, args, kwargs)
+            node.meta["val"] = fake
+            return node
+
+        lane = call(torch.ops.prims.iota.default, 1024, start=0, step=1)
+        end = call(torch.ops.aten.bitwise_or.Scalar, lane, 31)
+        begin = call(torch.ops.aten.bitwise_and.Scalar, lane, -32)
+        maps = [
+            end,
+            call(torch.ops.aten.div.Scalar_mode, lane, 32, rounding_mode="floor"),
+        ]
+        maps.append(
+            call(
+                torch.ops.aten.mul.Scalar,
+                call(torch.ops.aten.bitwise_and.Scalar, lane, 31),
+                32,
+            )
+        )
+        for offset in (1, 2, 4, 8, 16):
+            maps.extend(
+                (
+                    call(
+                        torch.ops.aten.minimum.default,
+                        call(torch.ops.aten.add.Scalar, lane, offset),
+                        end,
+                    ),
+                    call(
+                        torch.ops.aten.maximum.default,
+                        call(torch.ops.aten.sub.Scalar, lane, offset),
+                        begin,
+                    ),
+                    call(torch.ops.aten.bitwise_xor.Scalar, lane, offset),
+                )
+            )
+        for warp in range(32):
+            maps.append(
+                call(
+                    torch.ops.aten.add.Scalar,
+                    call(torch.ops.aten.mul.Scalar, lane, 0),
+                    warp * 32,
+                )
+            )
+        for node in maps:
+            interval = integer_bounds(node)
+            self.assertIsNotNone(interval)
+            assert interval is not None
+            self.assertLessEqual(0, interval[0])
+            self.assertLess(interval[1], 1024)
+
+    def test_padded_indices_do_not_read_outside_source(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for width in (18, 34, 66):
+            with self.subTest(width=width):
+                x = torch.arange(3 * width).reshape(3, width).int()
+                _bound, code = _bounded_gather_codegen(_bounded_gather_shift, (x,))
+                for order in (list(range(128)), list(reversed(range(128)))):
+                    out = torch.full((3, width - 1), -999, dtype=x.dtype)
+                    _simulate_register_load_program(
+                        code, x, 128, host_tensors={"out": out}, lane_order=order
+                    )
+                    torch.testing.assert_close(out, x[:, 1:], rtol=0, atol=0)
+
+    def test_tail_permutations_duplicates_and_source_lifetime(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+        ):
+            for width, mode in (
+                (17, "rotate"),
+                (65, "duplicate"),
+                (64, "xor"),
+                (33, "data"),
+            ):
+                with self.subTest(dtype=dtype, width=width, mode=mode):
+                    x = torch.arange(2 * width).reshape(2, width).to(dtype)
+                    bound, code = _bounded_gather_codegen(
+                        _bounded_gather_rows, (x, mode)
+                    )
+                    self.assertTrue(
+                        bound.config_spec.cute_fragment_bounded_gather_root_ids
+                    )
+                    source = x * 3 + 1
+                    lane = torch.arange(width).expand(2, width)
+                    if mode == "duplicate":
+                        index = lane % 3
+                    elif mode == "xor":
+                        index = lane ^ 1
+                    elif mode == "data":
+                        index = source.long() % width
+                    else:
+                        index = (lane * 5 + 3) % width
+                    expected = torch.gather(source, -1, index) + source
+                    for order in (list(range(128)), list(reversed(range(128)))):
+                        out = torch.full_like(x, -999)
+                        _simulate_register_load_program(
+                            code, x, 128, host_tensors={"out": out}, lane_order=order
+                        )
+                        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_independent_leading_axes_and_repeated_gather_lifetimes(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for shape in ((2, 3, 17), (1, 5, 65)):
+            for dtype in (torch.float32, torch.int64):
+                with self.subTest(shape=shape, dtype=dtype):
+                    x = torch.arange(math.prod(shape)).reshape(shape).to(dtype)
+                    _bound, code = _bounded_gather_codegen(
+                        _bounded_gather_leading, (x,)
+                    )
+                    source = x * 3 + 1
+                    first = torch.gather(source, -1, source.long() % shape[-1])
+                    expected = first + torch.gather(
+                        first + source, -1, (source.long() * 5 + 2) % shape[-1]
+                    )
+                    for order in (list(range(128)), list(reversed(range(128)))):
+                        out = torch.full_like(x, -999)
+                        _simulate_register_load_program(
+                            code, x, 128, host_tensors={"out": out}, lane_order=order
+                        )
+                        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_unproved_bounds_and_invalid_index_dtype_reject(self):
+        for mode in ("negative", "upper", "raw", "int32"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaises((exc.InvalidConfig, exc.TorchOpTracingError)),
+            ):
+                _bounded_gather_codegen(_bounded_gather_bad, (torch.ones(2, 17), mode))
+
+    def test_integer_range_wrap_and_modulo_proofs(self):
+        from helion._compiler.cute.bounded_gather import integer_bounds
+
+        for dtype in (torch.int32, torch.int64):
+            graph = torch.fx.Graph()
+            raw = graph.placeholder("raw")
+            raw.meta["val"] = torch.empty(17, dtype=dtype)
+            modulo = graph.call_function(torch.ops.aten.remainder.Scalar, (raw, 17))
+            modulo.meta["val"] = torch.empty(17, dtype=dtype)
+            self.assertEqual(integer_bounds(modulo), (0, 16))
+            bad = graph.call_function(
+                torch.ops.aten.add.Scalar, (modulo, torch.iinfo(dtype).max)
+            )
+            bad.meta["val"] = torch.empty(17, dtype=dtype)
+            self.assertIsNone(integer_bounds(bad))
+            shift = graph.call_function(torch.ops.aten.sub.Scalar, (modulo, 1))
+            shift.meta["val"] = torch.empty(17, dtype=dtype)
+            self.assertEqual(integer_bounds(shift), (-1, 15))
+
+    def test_strided_inputs_and_empty_or_unproved_domains(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        storage = torch.arange(3 * 66).reshape(3, 66).int()
+        for x in (storage[:, 1::2], storage.t()):
+            with self.subTest(stride=x.stride()):
+                _bound, code = _bounded_gather_codegen(
+                    _bounded_gather_rows, (x, "data")
+                )
+                source = x * 3 + 1
+                expected = torch.gather(source, -1, source.long() % x.size(1)) + source
+                out = torch.empty_like(x)
+                _simulate_register_load_program(code, x, 128, host_tensors={"out": out})
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        with self.assertRaises(
+            (exc.InvalidConfig, exc.BackendUnsupported, exc.TorchOpTracingError)
+        ):
+            _bounded_gather_codegen(_bounded_gather_rows, (torch.empty(2, 0), "data"))
+
+    def test_default_strict_and_deferred_population_prefix(self):
+        from copy import deepcopy
+        import random
+
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion._compiler import autotuner_heuristics
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        key = "cute_fragment_bounded_gather"
+        args = (torch.ones(2, 33), "data")
+
+        def capture(enabled):
+            with patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_bounded_gather_coverage",
+                wraps=autotuner_heuristics.register_fragment_bounded_gather_coverage
+                if enabled
+                else None,
+            ) as hook:
+                if not enabled:
+                    hook.return_value = None
+                bound = _cpu_bind(_bounded_gather_rows, args)
+            spec = bound.config_spec
+            default = spec.default_config()
+            self.assertNotIn(key, default)
+            for value in (1, None, "yes"):
+                invalid = deepcopy(default)
+                invalid.config[key] = value
+                with self.assertRaises(exc.InvalidConfig):
+                    spec.normalized_config(invalid)
+            records = []
+            for seed in (0, 91):
+                for strategy in (
+                    InitialPopulationStrategy.FROM_RANDOM,
+                    InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                ):
+                    random.seed(seed)
+                    with bound.env:
+                        search = PatternSearch(
+                            bound,
+                            args,
+                            initial_population=100,
+                            initial_population_strategy=strategy,
+                        )
+                        rows = [
+                            dict(search.config_gen.canonicalize_flat(row)[1])
+                            for row in checked_initial_population(search)
+                        ]
+                    records.append((rows, random.getstate()))
+            if enabled:
+                group = spec.compiler_coverage_groups[-1]
+                self.assertEqual(group.key, key)
+                self.assertTrue(group.deferred)
+                requested = group.witnesses[0].carrier
+                requested.config[key] = True
+                self.assertIn("fragment_buffer", bound.to_code(requested))
+            return records
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            previous, current = capture(False), capture(True)
+        for (old, old_rng), (new, new_rng) in zip(previous, current, strict=True):
+            self.assertEqual(old, new[: len(old)])
+            self.assertEqual(old_rng, new_rng)
+            self.assertTrue(any(row.get(key) is True for row in new[len(old) :]))
+
+
+@onlyBackends("cute")
+class TestCuteBoundedGatherNative(TestCase):
+    def test_cross_lane_dtypes_and_tail(self):
+        for dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+        ):
+            with self.subTest(dtype=dtype):
+                x = (torch.arange(66, device=DEVICE).reshape(2, 33) % 17).to(dtype)
+                source = x * 3 + 1
+                expected = torch.gather(source, -1, source.long() % 33) + source
+                before = x.clone()
+                _, actual = code_and_output(
+                    _bounded_gather_rows,
+                    (x, "data"),
+                    cute_fragment_bounded_gather=True,
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+    def test_leading_axes_and_repeated_producer(self):
+        with self.subTest(shape=(2, 3, 17)):
+            x = torch.arange(102, device=DEVICE).reshape(2, 3, 17).long() + 2**24
+            source = x * 3 + 1
+            first = torch.gather(source, -1, source % 17)
+            expected = first + torch.gather(first + source, -1, (source * 5 + 2) % 17)
+            before = x.clone()
+            _, actual = code_and_output(
+                _bounded_gather_leading,
+                (x,),
+                cute_fragment_bounded_gather=True,
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+    def test_padding_and_exchange_maps(self):
+        with self.subTest(mode="padded"):
+            x = torch.arange(54, device=DEVICE).reshape(3, 18).int()
+            _, actual = code_and_output(
+                _bounded_gather_shift,
+                (x,),
+                cute_fragment_bounded_gather=True,
+            )
+            torch.testing.assert_close(actual, x[:, 1:], rtol=0, atol=0)
+        lane = torch.arange(1024, device=DEVICE)
+        x = torch.arange(2048, device=DEVICE).reshape(2, 1024).float()
+        for mode, index in (
+            ("down", torch.minimum(lane + 16, lane | 31)),
+            ("up", torch.maximum(lane - 16, lane & -32)),
+            ("xor", lane ^ 16),
+        ):
+            with self.subTest(mode=mode):
+                _, actual = code_and_output(
+                    _bounded_gather_maps,
+                    (x, mode, 16),
+                    cute_fragment_bounded_gather=True,
+                )
+                torch.testing.assert_close(actual, x[:, index], rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _indexed_bounded_gather(x: torch.Tensor, mode: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))
+        if mode == "masked" or mode == "filled":
+            valid = (lane % 3 != 0) & (lane + 1 < x.size(1))
+            loaded = hl.load(x, [row, lane + 1], extra_mask=valid)
+            if mode == "filled":
+                source = torch.where(valid, loaded, -7)
+            else:
+                source = loaded
+        elif mode == "reverse":
+            source = x[row, x.size(1) - 1 - lane]
+        else:
+            source = x[row, lane]
+        index = (lane * 5 + 3) % x.size(1)
+        first = torch.gather(source, 0, index.long())
+        if mode == "repeated":
+            second = torch.gather(first + source, 0, (lane % 3).long())
+            out[row, lane] = second + first
+        else:
+            out[row, lane] = first
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _indexed_bounded_leading(x: torch.Tensor, broadcast: hl.constexpr):
+    out = torch.empty_like(x)
+    for batch in hl.grid(x.size(0)):
+        rows = hl.arange(x.size(1))
+        columns = hl.arange(x.size(2))
+        if broadcast:
+            source = x[batch, rows[:, None], columns[None, :]]
+        else:
+            source = x[batch, rows, columns]
+        index = ((rows[:, None] * 0 + columns[None, :] * 5 + 3) % x.size(2)).long()
+        out[batch, rows, columns] = torch.gather(source, -1, index)
+    return out
+
+
+def _indexed_bounded_expected(x, mode):
+    lane = torch.arange(x.size(1), device=x.device)
+    if mode == "masked" or mode == "filled":
+        source = torch.full_like(x, -7 if mode == "filled" else 0)
+        valid = (lane + 1 < x.size(1)) & (lane % 3 != 0)
+        source[:, valid] = x[:, lane[valid] + 1]
+    elif mode == "reverse":
+        source = x.flip(-1)
+    else:
+        source = x
+    first = source[:, (lane * 5 + 3) % x.size(1)]
+    if mode == "repeated":
+        return (first + source)[:, lane % 3] + first
+    return first
+
+
+class TestCuteIndexedGatherCPU(TestCase):
+    def test_indexed_masked_tail_and_repeated_producers(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for width, mode in (
+            (17, "masked"),
+            (33, "reverse"),
+            (64, "repeated"),
+            (1024, "plain"),
+            (64, "filled"),
+        ):
+            for dtype in (torch.float32, torch.int64):
+                with self.subTest(width=width, mode=mode, dtype=dtype):
+                    x = torch.arange(3 * width).reshape(3, width).to(dtype)
+                    _bound, code = _bounded_gather_codegen(
+                        _indexed_bounded_gather, (x, mode)
+                    )
+                    expected = _indexed_bounded_expected(x, mode)
+                    for order in (list(range(128)), list(reversed(range(128)))):
+                        out = torch.full_like(x, -999)
+                        _simulate_register_load_program(
+                            code, x, 128, host_tensors={"out": out}, lane_order=order
+                        )
+                        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_indexed_cartesian_and_broadcast_leading_axes(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for shape in ((2, 3, 17), (1, 5, 33), (2, 1, 17), (2, 3, 1)):
+            for broadcast in (False, True):
+                with self.subTest(shape=shape, broadcast=broadcast):
+                    x = torch.arange(math.prod(shape)).reshape(shape).float()
+                    _bound, code = _bounded_gather_codegen(
+                        _indexed_bounded_leading, (x, broadcast)
+                    )
+                    expected = x[:, :, (torch.arange(shape[-1]) * 5 + 3) % shape[-1]]
+                    out = torch.full_like(x, -999)
+                    _simulate_register_load_program(
+                        code,
+                        x,
+                        128,
+                        host_tensors={"out": out},
+                        lane_order=list(reversed(range(128))),
+                    )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_indexed_strides_offsets_and_float_payload(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        storage = torch.arange(3 * 66).reshape(3, 66).int()
+        for x in (storage[:, 1::2], storage.t()):
+            with self.subTest(stride=x.stride()):
+                _bound, code = _bounded_gather_codegen(
+                    _indexed_bounded_gather, (x, "reverse")
+                )
+                out = torch.empty_like(x)
+                _simulate_register_load_program(code, x, 128, host_tensors={"out": out})
+                torch.testing.assert_close(
+                    out, _indexed_bounded_expected(x, "reverse"), rtol=0, atol=0
+                )
+        bits = (
+            torch.tensor(
+                [
+                    0,
+                    -2147483648,
+                    1,
+                    0x7FFFFF,
+                    0x800000,
+                    0x7F800000,
+                    -8388608,
+                    0x7FC00000,
+                ],
+                dtype=torch.int32,
+            )
+            .repeat(8)
+            .reshape(2, 32)
+        )
+        x = bits.view(torch.float32)
+        _bound, code = _bounded_gather_codegen(_indexed_bounded_gather, (x, "reverse"))
+        out = torch.empty_like(x)
+        _simulate_register_load_program(code, x, 128, host_tensors={"out": out})
+        torch.testing.assert_close(
+            out.view(torch.int32),
+            _indexed_bounded_expected(x, "reverse").view(torch.int32),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_index_values_do_not_define_domains_and_unknowns_decline(self):
+        import sympy
+
+        from helion._compiler.cute.bounded_gather import indexed_load_shapes
+
+        bound, _code = _bounded_gather_codegen(
+            _indexed_bounded_gather, (torch.ones(2, 17), "masked")
+        )
+        graph = torch.fx.Graph()
+        index = graph.placeholder("index")
+        index.meta["val"] = torch.empty(32, dtype=torch.int64)
+        with bound.env:
+
+            def infer(node):
+                return (sympy.Integer(17),) if node is index else None
+
+            self.assertEqual(
+                indexed_load_shapes(bound.env, [index], infer, sympy.sympify),
+                {0: (sympy.Integer(17),)},
+            )
+            self.assertIsNone(
+                indexed_load_shapes(
+                    bound.env, [index], lambda node: None, sympy.sympify
+                )
+            )
+            # Equal padded capacities cannot reconcile unequal logical axes.
+            left = graph.placeholder("left")
+            right = graph.placeholder("right")
+            left.meta["val"] = torch.empty(2, 32, dtype=torch.int64)
+            right.meta["val"] = torch.empty(2, 32, dtype=torch.int64)
+            shapes = {
+                left: (sympy.Integer(2), sympy.Integer(17)),
+                right: (sympy.Integer(2), sympy.Integer(18)),
+            }
+            self.assertIsNone(
+                indexed_load_shapes(bound.env, [left, right], shapes.get, sympy.sympify)
+            )
+            # A logical singleton cannot reuse a non-singleton physical axis.
+            self.assertIsNone(
+                indexed_load_shapes(
+                    bound.env, [index], lambda node: (sympy.Integer(1),), sympy.sympify
+                )
+            )
+
+
+@onlyBackends("cute")
+class TestCuteIndexedGatherNative(TestCase):
+    def test_indexed_tail_masks_and_repeated(self):
+        for mode in ("masked", "reverse", "repeated", "filled"):
+            with self.subTest(mode=mode):
+                width = 64 if mode in ("repeated", "filled") else 33
+                x = torch.arange(3 * width, device=DEVICE).reshape(3, width).float()
+                before = x.clone()
+                _, actual = code_and_output(
+                    _indexed_bounded_gather,
+                    (x, mode),
+                    cute_fragment_bounded_gather=True,
+                )
+                torch.testing.assert_close(
+                    actual, _indexed_bounded_expected(x, mode), rtol=0, atol=0
+                )
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+    def test_indexed_leading_mapping(self):
+        for broadcast in (False, True):
+            with self.subTest(broadcast=broadcast):
+                x = torch.arange(102, device=DEVICE).reshape(2, 3, 17).long()
+                before = x.clone()
+                _, actual = code_and_output(
+                    _indexed_bounded_leading,
+                    (x, broadcast),
+                    cute_fragment_bounded_gather=True,
+                )
+                expected = x[:, :, (torch.arange(17, device=DEVICE) * 5 + 3) % 17]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _loop_bounded_exchange(x: torch.Tensor, steps: int, mode: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))[:]
+        left = hl.full([x.size(1)], 1, dtype=x.dtype)
+        right = x[row, :]
+        for _step in range(steps):
+            if mode == "swap":
+                previous = left
+                left = right
+                right = previous
+            else:
+                left = left + x[row, lane]
+                index = (left.long() * 0 + lane * 5 + 3) % x.size(1)
+                left = torch.gather(left, -1, index)
+        if mode == "swap":
+            index = (lane * 5 + 3) % x.size(1)
+            out[row, :] = torch.gather(left + right * 2, -1, index.long())
+        else:
+            out[row, :] = left + right
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _loop_bounded_index_drift(x: torch.Tensor, clamp: hl.constexpr):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        index = hl.arange(x.size(1)).long()
+        source = x[row, :]
+        result = x[row, :]
+        for _step in range(2):
+            index = index + 1
+            if clamp:
+                selected = index % x.size(1)
+            else:
+                selected = index
+            result = torch.gather(source, -1, selected)
+        out[row, :] = result
+    return out
+
+
+class TestCuteLoopGatherDomainsCPU(TestCase):
+    def test_simultaneous_carries_keep_parallel_assignment(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for steps in (0, 1, 2, 3):
+            with self.subTest(steps=steps):
+                x = torch.arange(128).reshape(2, 64).long()
+                _bound, code = _bounded_gather_codegen(
+                    _loop_bounded_exchange, (x, steps, "swap")
+                )
+                left, right = torch.ones_like(x), x
+                for _ in range(steps):
+                    left, right = right, left
+                expected = (left + right * 2)[:, (torch.arange(64) * 5 + 3) % 64]
+                out = torch.empty_like(x)
+                _simulate_register_load_program(
+                    code,
+                    x,
+                    128,
+                    host_tensors={"out": out},
+                    scalar_args={"steps": steps},
+                    lane_order=list(reversed(range(128))),
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_loop_entry_backedges_zero_trip_and_tails(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for width in (17, 64):
+            for steps in (0, 1, 3):
+                for dtype in (torch.float32, torch.int64):
+                    with self.subTest(width=width, steps=steps, dtype=dtype):
+                        x = torch.arange(2 * width).reshape(2, width).to(dtype)
+                        _bound, code = _bounded_gather_codegen(
+                            _loop_bounded_exchange, (x, steps, "gather")
+                        )
+                        expected = torch.ones_like(x)
+                        index = (torch.arange(width) * 5 + 3) % width
+                        for _ in range(steps):
+                            expected = (expected + x)[:, index]
+                        expected += x
+                        for order in (list(range(128)), list(reversed(range(128)))):
+                            out = torch.full_like(x, -999)
+                            _simulate_register_load_program(
+                                code,
+                                x,
+                                128,
+                                host_tensors={"out": out},
+                                lane_order=order,
+                                scalar_args={"steps": steps},
+                            )
+                            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_mutable_index_range_does_not_inherit_entry(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        x = torch.arange(128).reshape(2, 64).int()
+        with self.assertRaises(exc.InvalidConfig):
+            _bounded_gather_codegen(_loop_bounded_index_drift, (x, False))
+        _bound, code = _bounded_gather_codegen(_loop_bounded_index_drift, (x, True))
+        out = torch.empty_like(x)
+        _simulate_register_load_program(
+            code,
+            x,
+            128,
+            host_tensors={"out": out},
+            lane_order=list(reversed(range(128))),
+        )
+        torch.testing.assert_close(
+            out, x[:, (torch.arange(64) + 2) % 64], rtol=0, atol=0
+        )
+
+    def test_actual_phi_mapping_and_all_backedges_are_required(self):
+        import operator
+
+        from helion._compiler.cute.gather_domains import loop_domain_facts
+        from helion._compiler.device_ir import ForLoopGraphInfo
+        from helion._compiler.device_ir import RootGraphInfo
+        from helion.language import _tracing_ops
+        from helion.language import creation_ops
+
+        bound, _code = _bounded_gather_codegen(
+            _indexed_bounded_gather, (torch.ones(2, 64), "plain")
+        )
+        cases = (
+            "valid",
+            "stale_metadata",
+            "arity",
+            "multiple_calls",
+            "missing_phi",
+            "duplicate_entry",
+            "backedge_shape",
+            "backedge_dtype",
+            "logical_backedge",
+            "placeholder_dtype",
+            "output_arity",
+            "phi_position",
+            "duplicate_graph",
+            "misplaced_graph",
+            "nested",
+        )
+        for bad in cases:
+            with self.subTest(case=bad), bound.env:
+                root = torch.fx.Graph()
+                a = root.call_function(
+                    creation_ops.full, ([18 if bad == "logical_backedge" else 64], 0)
+                )
+                b = root.call_function(creation_ops.full, ([64], 1))
+                lane = root.call_function(torch.ops.prims.iota.default, (64,))
+                for n in (a, b, lane):
+                    n.meta["val"] = torch.empty(64, dtype=torch.int64)
+                child = torch.fx.Graph()
+                # Read-only lane deliberately precedes the two mutable entries.
+                lp, bp, ap = (child.placeholder(n) for n in ("lane", "b", "a"))
+                for n in (lp, bp, ap):
+                    n.meta["val"] = torch.empty(64, dtype=torch.int64)
+                if bad == "placeholder_dtype":
+                    ap.meta["val"] = torch.empty(64, dtype=torch.float32)
+                first = child.call_function(
+                    creation_ops.full,
+                    (
+                        [
+                            32
+                            if bad == "backedge_shape"
+                            else 17
+                            if bad == "logical_backedge"
+                            else 64
+                        ],
+                        2,
+                    ),
+                )
+                first.meta["val"] = torch.empty(
+                    32 if bad == "backedge_shape" else 64,
+                    dtype=torch.float32 if bad == "backedge_dtype" else torch.int64,
+                )
+                second = child.call_function(_tracing_ops._new_var, (bp,))
+                second.meta["val"] = torch.empty(64, dtype=torch.int64)
+                if bad == "nested":
+                    child.call_function(_tracing_ops._for_loop, (2, [0], [2], []))
+                child.output([first] if bad == "output_arity" else [first, second])
+                captures = [lane, b, a]
+                call = root.call_function(
+                    _tracing_ops._for_loop,
+                    (1, [0], [2], captures[:-1] if bad == "arity" else captures),
+                )
+                i0 = root.call_function(operator.getitem, (call, 0))
+                i1 = root.call_function(operator.getitem, (call, 1))
+                for n in (i0, i1):
+                    n.meta["val"] = torch.empty(64, dtype=torch.int64)
+                p0 = root.call_function(
+                    _tracing_ops._phi, (i0, a) if bad == "phi_position" else (a, i0)
+                )
+                p0.meta["val"] = torch.empty(64, dtype=torch.int64)
+                if bad != "missing_phi":
+                    p1 = root.call_function(
+                        _tracing_ops._phi, (a if bad == "duplicate_entry" else b, i1)
+                    )
+                    p1.meta["val"] = torch.empty(64, dtype=torch.int64)
+                if bad == "multiple_calls":
+                    root.call_function(_tracing_ops._for_loop, (1, [0], [2], captures))
+                root.output([])
+                info = ForLoopGraphInfo(
+                    graph_id=1,
+                    graph=child,
+                    node_args=[lane, a, b] if bad == "stale_metadata" else captures,
+                    block_ids=[],
+                )
+                graphs = [RootGraphInfo(graph_id=0, graph=root), info]
+                if bad == "duplicate_graph":
+                    graphs.append(info)
+                if bad == "misplaced_graph":
+                    graphs.reverse()
+                facts = loop_domain_facts(bound.env, graphs)
+                if bad in ("valid", "stale_metadata"):
+                    self.assertIn(lp, facts.shapes)
+                    self.assertEqual(facts.readonly_ranges[lp], (0, 63))
+                    self.assertNotIn(ap, facts.readonly_ranges)
+                    self.assertNotIn(bp, facts.readonly_ranges)
+                    self.assertIn(p0, facts.shapes)
+                else:
+                    self.assertEqual(facts.shapes, {})
+                    self.assertEqual(facts.readonly_ranges, {})
+
+
+@onlyBackends("cute")
+class TestCuteLoopGatherDomainsNative(TestCase):
+    def test_loop_exchange_and_zero_trip(self):
+        for steps in (0, 1, 3):
+            with self.subTest(steps=steps):
+                x = torch.arange(128, device=DEVICE).reshape(2, 64).int()
+                expected = torch.ones_like(x)
+                index = (torch.arange(64, device=DEVICE) * 5 + 3) % 64
+                for _ in range(steps):
+                    expected = (expected + x)[:, index]
+                before = x.clone()
+                _, actual = code_and_output(
+                    _loop_bounded_exchange,
+                    (x, steps, "gather"),
+                    cute_fragment_bounded_gather=True,
+                )
+                torch.testing.assert_close(actual, expected + x, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _asm_bounded_gather(x: torch.Tensor, mode: hl.constexpr):
+    out = torch.empty_like(x, dtype=torch.float32 if mode == "convert" else x.dtype)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))[:]
+        if mode == "convert":
+            value = hl.inline_asm_elementwise(
+                "cvt.rn.f32.s32 $0, $1;",
+                "=f,r",
+                [x[row, :]],
+                dtype=torch.float32,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            scalar = hl.full([], 3, dtype=torch.int32)
+            bias = hl.inline_asm_elementwise(
+                "add.s32 $0, $1, $2;",
+                "=r,r,r",
+                [scalar, scalar],
+                dtype=torch.int32,
+                is_pure=True,
+                pack=1,
+            )
+            value = hl.inline_asm_elementwise(
+                "add.s32 $0, $1, $2;",
+                "=r,r,r",
+                [x[row, :], bias],
+                dtype=torch.int32,
+                is_pure=True,
+                pack=1,
+            )
+        out[row, :] = torch.gather(value, -1, ((lane * 5 + 3) % x.size(1)).long())
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _asm_bounded_leading(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(2))[None, :]
+        bias = hl.full([x.size(1), 1], 7, dtype=torch.int32)
+        value = hl.inline_asm_elementwise(
+            "add.s32 $0, $1, $2;",
+            "=r,r,r",
+            [x[row, :, :], bias],
+            dtype=torch.int32,
+            is_pure=True,
+            pack=1,
+        )
+        index = ((value.long() * 0 + lane * 5 + 3) % x.size(2)).long()
+        out[row, :, :] = torch.gather(value, -1, index)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _asm_bounded_loop(x: torch.Tensor, steps: int):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))[:]
+        value = hl.full([x.size(1)], 1, dtype=torch.int32)
+        for _step in range(steps):
+            value = hl.inline_asm_elementwise(
+                "add.s32 $0, $1, $2;",
+                "=r,r,r",
+                [value, x[row, :]],
+                dtype=torch.int32,
+                is_pure=True,
+                pack=1,
+            )
+            value = torch.gather(value, -1, ((lane * 5 + 3) % x.size(1)).long())
+        out[row, :] = value
+    return out
+
+
+def _asm_gather_model_source(code):
+    """Model only these tests' declared integer add/conversion scalar ops."""
+    import ast
+
+    class Model(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (
+                not isinstance(node.func, ast.Name)
+                or node.func.id != "_cute_inline_asm_elementwise"
+            ):
+                return node
+            keywords = {item.arg: item.value for item in node.keywords}
+            assert ast.literal_eval(keywords["is_pure"]) is True
+            asm = ast.literal_eval(keywords["asm"])
+            operands = node.args[0].elts
+            if asm == "add.s32 $0, $1, $2;":
+                assert len(operands) == 2
+                expression = ast.BinOp(operands[0], ast.Add(), operands[1])
+            else:
+                assert asm == "cvt.rn.f32.s32 $0, $1;" and len(operands) == 1
+                expression = operands[0]
+            return ast.Call(keywords["dtype"], [expression], [])
+
+    return ast.unparse(ast.fix_missing_locations(Model().visit(ast.parse(code))))
+
+
+class TestCuteInlineAsmGatherCPU(TestCase):
+    def test_exact_contract_and_opaque_range_declines(self):
+        import operator
+
+        import sympy
+
+        from helion._compiler.cute.bounded_gather import integer_bounds
+        from helion._compiler.cute.computed_fragment import _selection_logical_shape
+        from helion.language import creation_ops
+        from helion.language import inline_asm_ops
+
+        bound, _code = _bounded_gather_codegen(
+            _indexed_bounded_gather, (torch.ones(2, 64), "plain")
+        )
+        cases = (
+            "valid",
+            "scalar",
+            "conversion",
+            "unknown",
+            "logical_mismatch",
+            "singleton_mismatch",
+            "physical_output",
+            "output_dtype",
+            "tuple",
+            "tuple_getitem",
+            "effectful",
+            "pack2",
+            "pack4",
+            "empty",
+        )
+        for case in cases:
+            with self.subTest(case=case), bound.env:
+                graph = torch.fx.Graph()
+                shape = [] if case == "scalar" else [17]
+                capacity = () if case == "scalar" else (32,)
+                x = graph.call_function(creation_ops.full, (shape, 3))
+                x.meta["val"] = torch.empty(capacity, dtype=torch.int32)
+                y = graph.call_function(creation_ops.full, (shape, 5))
+                y.meta["val"] = torch.empty(capacity, dtype=torch.int32)
+                if case == "unknown":
+                    y = graph.placeholder("unknown")
+                    y.meta["val"] = torch.empty(capacity, dtype=torch.int32)
+                if case == "logical_mismatch":
+                    y.args = ([18], 5)
+                if case == "singleton_mismatch":
+                    y.args = ([1], 5)
+                dtype = torch.float32 if case == "conversion" else torch.int32
+                declared = (
+                    (dtype, dtype) if case in ("tuple", "tuple_getitem") else dtype
+                )
+                operands = [] if case == "empty" else [x, y]
+                pack = 2 if case == "pack2" else 4 if case == "pack4" else 1
+                node = graph.call_function(
+                    inline_asm_ops.inline_asm_elementwise,
+                    (
+                        "opaque program",
+                        "constraints",
+                        operands,
+                        declared,
+                        case != "effectful",
+                        pack,
+                    ),
+                )
+                node.meta["val"] = torch.empty(
+                    (64,) if case == "physical_output" else capacity,
+                    dtype=torch.float64 if case == "output_dtype" else dtype,
+                )
+                if case in ("tuple", "tuple_getitem"):
+                    node.meta["val"] = (node.meta["val"], node.meta["val"])
+                if case == "tuple_getitem":
+                    parent = node
+                    node = graph.call_function(operator.getitem, (parent, 0))
+                    node.meta["val"] = parent.meta["val"][0]
+                self.assertIsNone(_selection_logical_shape(bound.env, node))
+                actual = _selection_logical_shape(bound.env, node, pure_inline_asm=True)
+                if case in ("valid", "scalar", "conversion"):
+                    self.assertEqual(actual, tuple(map(sympy.Integer, shape)))
+                else:
+                    self.assertIsNone(actual)
+                # A proved domain does not prove any opaque assembly value.
+                self.assertIsNone(integer_bounds(node))
+
+    def test_scalar_vector_dtype_tails_and_leading_broadcast(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        cases = [
+            (
+                _asm_bounded_gather,
+                (torch.arange(3 * width).reshape(3, width).int(), mode),
+            )
+            for width in (17, 33)
+            for mode in ("scalar", "convert")
+        ]
+        cases += [
+            (_asm_bounded_leading, (torch.arange(2 * 3 * 17).reshape(2, 3, 17).int(),))
+        ]
+        for kernel, args in cases:
+            with self.subTest(
+                kernel=kernel.fn.__name__, shape=args[0].shape, mode=args[1:]
+            ):
+                x = args[0]
+                _bound, code = _bounded_gather_codegen(kernel, args)
+                source = _asm_gather_model_source(code)
+                if kernel is _asm_bounded_leading:
+                    expected = (x + 7)[
+                        :, :, (torch.arange(x.size(-1)) * 5 + 3) % x.size(-1)
+                    ]
+                else:
+                    expected = x.float() if args[1] == "convert" else x + 6
+                    expected = expected[
+                        :, (torch.arange(x.size(-1)) * 5 + 3) % x.size(-1)
+                    ]
+                for order in (list(range(128)), list(reversed(range(128)))):
+                    out = torch.empty_like(expected)
+                    _simulate_register_load_program(
+                        source, x, 128, host_tensors={"out": out}, lane_order=order
+                    )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_loop_assembly_domains_and_zero_trip(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        for width in (17, 64):
+            for steps in (0, 1, 3):
+                with self.subTest(width=width, steps=steps):
+                    x = torch.arange(2 * width).reshape(2, width).int()
+                    _bound, code = _bounded_gather_codegen(
+                        _asm_bounded_loop, (x, steps)
+                    )
+                    expected = torch.ones_like(x)
+                    for _ in range(steps):
+                        expected = (expected + x)[
+                            :, (torch.arange(width) * 5 + 3) % width
+                        ]
+                    out = torch.empty_like(x)
+                    _simulate_register_load_program(
+                        _asm_gather_model_source(code),
+                        x,
+                        128,
+                        host_tensors={"out": out},
+                        scalar_args={"steps": steps},
+                        lane_order=list(reversed(range(128))),
+                    )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@onlyBackends("cute")
+class TestCuteInlineAsmGatherNative(TestCase):
+    def test_scalar_vector_tail_and_loop(self):
+        for width, mode in ((17, "scalar"), (33, "convert")):
+            with self.subTest(width=width, mode=mode):
+                x = torch.arange(2 * width, device=DEVICE).reshape(2, width).int()
+                before = x.clone()
+                _, actual = code_and_output(
+                    _asm_bounded_gather, (x, mode), cute_fragment_bounded_gather=True
+                )
+                expected = x.float() if mode == "convert" else x + 6
+                expected = expected[
+                    :, (torch.arange(width, device=DEVICE) * 5 + 3) % width
+                ]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+        with self.subTest(leading=True):
+            x = torch.arange(102, device=DEVICE).reshape(2, 3, 17).int()
+            before = x.clone()
+            _, actual = code_and_output(
+                _asm_bounded_leading, (x,), cute_fragment_bounded_gather=True
+            )
+            expected = (x + 7)[:, :, (torch.arange(17, device=DEVICE) * 5 + 3) % 17]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(x, before, rtol=0, atol=0)
+        for steps in (0, 3):
+            with self.subTest(steps=steps):
+                x = torch.arange(34, device=DEVICE).reshape(2, 17).int()
+                before = x.clone()
+                _, actual = code_and_output(
+                    _asm_bounded_loop, (x, steps), cute_fragment_bounded_gather=True
+                )
+                expected = torch.ones_like(x)
+                for _ in range(steps):
+                    expected = (expected + x)[
+                        :, (torch.arange(17, device=DEVICE) * 5 + 3) % 17
+                    ]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_warp_scan(x: torch.Tensor, reverse: hl.constexpr):
+    out = torch.empty_like(x)
+    reused = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))
+        values = hl.load(x, [row, lane])
+        index = ((lane * 3 + 5) % x.size(1)).long()
+        chosen = torch.gather(values, 0, index)
+        out[row, lane] = hl.cumsum(chosen, dim=0, reverse=reverse)
+        reused[row, lane] = torch.gather(values, 0, index)
+    return out, reused
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_gather_mixed_scan(x: torch.Tensor, unsafe: hl.constexpr):
+    partial = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        partial[row, :] = hl.cumsum(x[row, :] + 1, dim=-1)
+    hl.barrier()
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))
+        values = hl.load(partial, [row, lane])
+        if unsafe:
+            index = (lane + 1).long()
+        else:
+            index = ((lane * 3 + 5) % x.size(1)).long()
+        out[row, lane] = hl.cumsum(torch.gather(values, 0, index), dim=0)
+    return out
+
+
+class TestCuteGatherWarpScanCPU(TestCase):
+    def test_explicit_options_and_wide_generated_model(self):
+        from test.test_cute_computed_fragment import _simulate_fragment_warp_reduction
+
+        for dtype in (torch.int32, torch.int64):
+            for reverse in (False, True):
+                with self.subTest(dtype=dtype, reverse=reverse):
+                    x = (torch.arange(2 * 2049).reshape(2, 2049) % 29 - 14).to(dtype)
+                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                        bound = _cpu_bind(_bounded_gather_warp_scan, (x, reverse))
+                        for gather in (False, True):
+                            for scan in (False, True):
+                                config = bound.config_spec.default_config()
+                                config.config.update(
+                                    pid_type="flat",
+                                    cute_fragment_bounded_gather=gather,
+                                    cute_fragment_warp_scan=scan,
+                                )
+                                before = dict(config)
+                                if not gather:
+                                    with self.assertRaises(
+                                        (exc.InvalidConfig, exc.BackendUnsupported)
+                                    ):
+                                        bound.to_code(config)
+                                    self.assertEqual(dict(config), before)
+                                    continue
+                                code = bound.to_code(config)
+                                out, reused = torch.empty_like(x), torch.empty_like(x)
+                                _simulate_fragment_warp_reduction(
+                                    code,
+                                    {"x": x},
+                                    {"out": out, "reused": reused},
+                                    2,
+                                    allow_lane_stores=True,
+                                )
+                                selected = x[:, (torch.arange(2049) * 3 + 5) % 2049]
+                                expected = (
+                                    selected.flip(-1).cumsum(-1, dtype=dtype).flip(-1)
+                                    if reverse
+                                    else selected.cumsum(-1, dtype=dtype)
+                                )
+                                self.assertTrue(torch.equal(out, expected))
+                                self.assertTrue(torch.equal(reused, selected))
+                                self.assertEqual("shuffle_sync_up" in code, scan)
+
+    def test_dependent_carrier_and_strict_mutation(self):
+        from helion._compiler.autotuner_heuristics.cute_fragment_warp_scan import (
+            register_gather_warp_scan_coverage,
+        )
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(
+                _bounded_gather_warp_scan, (torch.ones(2, 2049).int(), False)
+            )
+            spec = bound.config_spec
+            self.assertFalse(spec.cute_fragment_warp_scan_root_ids)
+            groups = spec.compiler_coverage_groups
+            self.assertEqual(
+                [g.key for g in groups][-2:],
+                ["cute_fragment_bounded_gather", "cute_fragment_warp_scan"],
+            )
+            group = groups[-1]
+            self.assertEqual(len(group.dependencies), 1)
+            dependency = group.dependencies[0]
+            self.assertEqual(dependency.key, "cute_fragment_bounded_gather")
+            self.assertIs(dependency.value, True)
+            carrier = group.witnesses[0].carrier
+            self.assertIs(carrier.get(dependency.key), True)
+            requested = helion.Config.from_dict(carrier.config | {group.key: True})
+            spec.create_config_generation().strict_config_pair(requested)
+            self.assertIn("shuffle_sync_up", bound.to_code(requested))
+            for missing in (False, 1, None):
+                bad = helion.Config.from_dict(
+                    requested.config | {dependency.key: missing}
+                )
+                before = dict(bad)
+                with self.assertRaises(exc.InvalidConfig):
+                    spec.create_config_generation().strict_config_pair(bad)
+                self.assertEqual(dict(bad), before)
+            register_gather_warp_scan_coverage(bound.env, bound.host_function.device_ir)
+            self.assertEqual(spec.compiler_coverage_groups, groups)
+
+    def test_mixed_roots_and_unsupported_gather(self):
+        from helion._compiler.autotuner_heuristics.cute_fragment_warp_scan import (
+            active_warp_scan_roots,
+        )
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            for unsafe in (False, True):
+                with self.subTest(unsafe=unsafe):
+                    bound = _cpu_bind(
+                        _bounded_gather_mixed_scan, (torch.ones(2, 65).int(), unsafe)
+                    )
+                    spec = bound.config_spec
+                    self.assertEqual(len(spec.cute_fragment_warp_scan_root_ids), 1)
+                    self.assertEqual(
+                        len(spec.cute_fragment_warp_scan_requirements),
+                        0 if unsafe else 1,
+                    )
+                    self.assertEqual(
+                        sum(
+                            g.key == "cute_fragment_warp_scan"
+                            for g in spec.compiler_coverage_groups
+                        ),
+                        1,
+                    )
+                    for gather in (False, True):
+                        config = spec.default_config()
+                        config.config.update(
+                            pid_type="flat",
+                            cute_fragment_bounded_gather=gather,
+                            cute_fragment_warp_scan=True,
+                        )
+                        self.assertEqual(
+                            len(active_warp_scan_roots(bound.env, config)),
+                            2 if gather and not unsafe else 1,
+                        )
+                        if gather and unsafe:
+                            with self.assertRaisesRegex(
+                                exc.InvalidConfig, "proved bounded last-axis gather"
+                            ):
+                                bound.to_code(config)
+                            continue
+                        code = bound.to_code(config)
+                        phases = [
+                            node.value
+                            for node in ast.walk(ast.parse(code))
+                            if isinstance(node, ast.Constant)
+                            and isinstance(node.value, str)
+                            and "@cute.kernel" in node.value
+                        ]
+                        self.assertEqual(len(phases), 2)
+                        # The unproved gather retains ordinary lowering;
+                        # only eligible phases use the fragment warp scan.
+                        self.assertEqual(
+                            sum("fragment_scan_lane" in phase for phase in phases),
+                            2 if gather and not unsafe else 1,
+                        )
+
+    def test_mixed_phases_execute_and_keep_publication(self):
+        from test.test_cute_computed_fragment import _simulate_fragment_warp_reduction
+
+        x = (torch.arange(130).reshape(2, 65) % 11 - 5).int()
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(_bounded_gather_mixed_scan, (x, False))
+            for scan in (False, True):
+                with self.subTest(scan=scan):
+                    config = bound.config_spec.default_config()
+                    config.config.update(
+                        pid_type="flat",
+                        cute_fragment_bounded_gather=True,
+                        cute_fragment_warp_scan=scan,
+                    )
+                    code = bound.to_code(config)
+                    phases = [
+                        node.value
+                        for node in ast.walk(ast.parse(code))
+                        if isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and "@cute.kernel" in node.value
+                    ]
+                    self.assertEqual(len(phases), 2)
+                    partial = torch.full_like(x, -999)
+                    out = torch.full_like(x, -777)
+                    for phase in phases:
+                        _simulate_fragment_warp_reduction(
+                            phase,
+                            {"x": x, "partial": partial},
+                            {"partial": partial, "out": out},
+                            2,
+                            allow_lane_stores=True,
+                        )
+                        self.assertEqual("shuffle_sync_up" in phase, scan)
+                    expected_partial = (x + 1).cumsum(-1, dtype=x.dtype)
+                    expected = expected_partial[
+                        :, (torch.arange(65) * 3 + 5) % 65
+                    ].cumsum(-1, dtype=x.dtype)
+                    self.assertTrue(torch.equal(partial, expected_partial))
+                    self.assertTrue(torch.equal(out, expected))
+
+    def test_unsupported_capacity_and_resource_decline(self):
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            for width, dtype in (
+                (0, torch.int32),
+                (2049, torch.float32),
+                (65537, torch.int64),
+            ):
+                with self.subTest(width=width, dtype=dtype):
+                    bound = _cpu_bind(
+                        _bounded_gather_warp_scan,
+                        (torch.empty(1, width, dtype=dtype), False),
+                    )
+                    config = bound.config_spec.default_config()
+                    config.config.update(
+                        pid_type="flat",
+                        cute_fragment_bounded_gather=True,
+                        cute_fragment_warp_scan=True,
+                    )
+                    before = dict(config)
+                    with self.assertRaises(exc.InvalidConfig):
+                        bound.to_code(config)
+                    self.assertEqual(dict(config), before)
+
+
+@onlyBackends("cute")
+class TestCuteGatherWarpScanNative(TestCase):
+    def test_wide_tails_reverse_and_reuse(self):
+        for dtype in (torch.int32, torch.int64):
+            for reverse in (False, True):
+                with self.subTest(dtype=dtype, reverse=reverse):
+                    x = (
+                        torch.arange(3 * 2049, device=DEVICE).reshape(3, 2049) % 29 - 14
+                    ).to(dtype)
+                    before = x.clone()
+                    _, (out, reused) = code_and_output(
+                        _bounded_gather_warp_scan,
+                        (x, reverse),
+                        cute_fragment_bounded_gather=True,
+                        cute_fragment_warp_scan=True,
+                    )
+                    selected = x[:, (torch.arange(2049, device=DEVICE) * 3 + 5) % 2049]
+                    expected = (
+                        selected.flip(-1).cumsum(-1, dtype=dtype).flip(-1)
+                        if reverse
+                        else selected.cumsum(-1, dtype=dtype)
+                    )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(reused, selected, rtol=0, atol=0)
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+    def test_mixed_ordered_roots(self):
+        x = (torch.arange(3 * 65, device=DEVICE).reshape(3, 65) % 11 - 5).int()
+        before = x.clone()
+        _, out = code_and_output(
+            _bounded_gather_mixed_scan,
+            (x, False),
+            block_sizes=[1],
+            cute_fragment_bounded_gather=True,
+            cute_fragment_warp_scan=True,
+        )
+        expected = (
+            (x + 1)
+            .cumsum(-1, dtype=x.dtype)[
+                :, (torch.arange(65, device=DEVICE) * 3 + 5) % 65
+            ]
+            .cumsum(-1, dtype=x.dtype)
+        )
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _all_axis_bounded_gather(
+    x: torch.Tensor, op: hl.constexpr, mode: hl.constexpr, keep: hl.constexpr
+):
+    dtype = torch.int64 if op in ("sum", "prod") and x.dtype == torch.int32 else x.dtype
+    out = torch.empty_like(x, dtype=dtype)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(-1))
+        if x.ndim == 3:
+            leading = hl.arange(x.size(1))
+            value = x[row, leading, lane]
+            index = ((leading[:, None] * 0 + lane[None, :] * 5 + 3) % x.size(-1)).long()
+        else:
+            value = x[row, lane]
+            index = ((lane * 5 + 3) % x.size(-1)).long()
+        if op == "min":
+            if mode == "omitted":
+                reduced = value.amin(keepdim=keep)
+            elif mode == "none":
+                reduced = value.amin(dim=None, keepdim=keep)
+            else:
+                reduced = value.amin(dim=[], keepdim=keep)
+        elif op == "max":
+            if mode == "omitted":
+                reduced = value.amax(keepdim=keep)
+            elif mode == "none":
+                reduced = value.amax(dim=None, keepdim=keep)
+            else:
+                reduced = value.amax(dim=[], keepdim=keep)
+        elif op == "sum":
+            reduced = value.sum(dim=None, keepdim=True)
+        else:
+            reduced = value.prod()
+        source = value + reduced
+        result = torch.gather(source, -1, index)
+        if x.ndim == 3:
+            out[row, leading, lane] = result
+        else:
+            out[row, lane] = result
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _all_axis_bounded_loop(x: torch.Tensor, steps: int):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))[:]
+        value = x[row, :]
+        carry = hl.full([], 0, dtype=x.dtype)
+        for _step in range(steps):
+            carry = (value + carry).amin()
+            value = torch.gather(value + carry, -1, ((lane * 5 + 3) % x.size(1)).long())
+        out[row, :] = value
+    return out
+
+
+class TestCuteAllAxisGatherCPU(TestCase):
+    def test_canonical_dims_keepdim_and_promotion(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        cases = [
+            ((2, 16), op, mode, keep)
+            for op in ("min", "max")
+            for mode in ("omitted", "none", "empty")
+            for keep in (False, True)
+        ] + [
+            ((2, 16), "sum", "none", True),
+            ((2, 16), "prod", "omitted", False),
+        ]
+        for shape, op, mode, keep in cases:
+            with self.subTest(shape=shape, op=op, mode=mode, keep=keep):
+                x = torch.arange(math.prod(shape)).reshape(shape).remainder(3).int()
+                if op == "prod":
+                    x = x.remainder(2) + 1
+                if op in ("min", "max"):
+                    x = x.float()
+                _bound, code = _bounded_gather_codegen(
+                    _all_axis_bounded_gather, (x, op, mode, keep)
+                )
+                rows = []
+                for value in x:
+                    if op == "min":
+                        reduced = value.amin(keepdim=keep)
+                    elif op == "max":
+                        reduced = value.amax(keepdim=keep)
+                    elif op == "sum":
+                        reduced = value.sum(dim=None, keepdim=True)
+                    else:
+                        reduced = value.prod()
+                    source = value + reduced
+                    rows.append(
+                        source[..., (torch.arange(x.size(-1)) * 5 + 3) % x.size(-1)]
+                    )
+                expected = torch.stack(rows)
+                out = torch.empty_like(expected)
+                _simulate_register_load_program(
+                    code,
+                    x,
+                    128,
+                    host_tensors={"out": out},
+                    lane_order=list(reversed(range(128))),
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_scalar_carry_zero_trip_and_padded_decline(self):
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        x = torch.arange(32).reshape(2, 16).float()
+        for steps in (0, 1, 3):
+            with self.subTest(steps=steps):
+                _bound, code = _bounded_gather_codegen(
+                    _all_axis_bounded_loop, (x, steps)
+                )
+                rows = []
+                for original in x:
+                    value, carry = original, torch.tensor(0.0)
+                    for _ in range(steps):
+                        carry = (value + carry).amin()
+                        value = (value + carry)[(torch.arange(16) * 5 + 3) % 16]
+                    rows.append(value)
+                out = torch.empty_like(x)
+                _simulate_register_load_program(
+                    code,
+                    x,
+                    128,
+                    host_tensors={"out": out},
+                    scalar_args={"steps": steps},
+                    lane_order=list(reversed(range(128))),
+                )
+                torch.testing.assert_close(out, torch.stack(rows), rtol=0, atol=0)
+        with self.assertRaises(exc.InvalidConfig):
+            _bounded_gather_codegen(_all_axis_bounded_loop, (torch.ones(2, 17), 2))
+
+    def test_schema_volume_dtype_and_existing_multiaxis_declines(self):
+        import sympy
+
+        from helion._compiler.cute.bounded_gather import all_axis_reduction_shape
+        from helion._compiler.cute.computed_fragment import _selection_logical_shape
+        from helion._compiler.inductor_lowering import ReductionLowering
+
+        x = torch.arange(32).reshape(2, 16).float()
+        bound, _code = _bounded_gather_codegen(
+            _all_axis_bounded_gather, (x, "min", "omitted", False)
+        )
+        with bound.env, bound.host_function:
+            node = next(
+                n
+                for graph in bound.host_function.device_ir.graphs
+                for n in graph.graph.nodes
+                if n.target is torch.ops.aten.amin.default
+                and isinstance(n.meta.get("lowering"), ReductionLowering)
+            )
+
+            def infer(n):
+                return _selection_logical_shape(
+                    bound.env, n, scalar_indexed_loads=True, tensor_indexed_loads=True
+                )
+
+            def dimension(size):
+                return bound.env.specialize_expr(sympy.sympify(size))
+
+            def prove():
+                return all_axis_reduction_shape(node, infer, dimension)
+
+            self.assertEqual(prove(), ())
+            args, kwargs, value = node.args, node.kwargs, node.meta["val"]
+            mutations = (
+                ((args[0], [0]), {}),
+                ((args[0], None), {}),
+                ((args[0], [], True), {}),
+                ((args[0], [], 1), {}),
+                (args, {"self": args[0]}),
+                (args, {"unexpected": 1}),
+                ((*args, [], False, 7), {}),
+            )
+            for changed_args, changed_kwargs in mutations:
+                with self.subTest(args=changed_args[1:], kwargs=changed_kwargs):
+                    try:
+                        node.args, node.kwargs = changed_args, changed_kwargs
+                        self.assertIsNone(prove())
+                    finally:
+                        node.args, node.kwargs = args, kwargs
+            data = node.meta["lowering"].buffer.data
+            for field, changed in (("reduction_ranges", [15]), ("ranges", [2])):
+                with self.subTest(field=field):
+                    original = getattr(data, field)
+                    try:
+                        object.__setattr__(data, field, changed)
+                        self.assertIsNone(prove())
+                    finally:
+                        object.__setattr__(data, field, original)
+            for changed in (torch.empty((), dtype=torch.float64), torch.empty(1)):
+                try:
+                    node.meta["val"] = changed
+                    self.assertIsNone(prove())
+                finally:
+                    node.meta["val"] = value
+            for logical in ((sympy.Integer(0),), (sympy.Integer(15),), ()):
+                with self.subTest(logical=logical):
+                    self.assertIsNone(
+                        all_axis_reduction_shape(
+                            node, lambda _node, shape=logical: shape, dimension
+                        )
+                    )
+            self.assertEqual(prove(), ())
+        # The unchanged lowerer rejects truly multiple reduction dimensions.
+        for op, mode, keep in (("min", "empty", True), ("max", "none", False)):
+            with (
+                self.subTest(op=op),
+                self.assertRaisesRegex(
+                    NotImplementedError, "multiple reduction dimensions"
+                ),
+            ):
+                _bounded_gather_codegen(
+                    _all_axis_bounded_gather, (torch.ones(2, 4, 8), op, mode, keep)
+                )
+
+
+@onlyBackends("cute")
+class TestCuteAllAxisGatherNative(TestCase):
+    def test_reductions_and_scalar_loop(self):
+        for op, mode, keep in (
+            ("min", "none", False),
+            ("max", "empty", True),
+            ("sum", "none", True),
+            ("prod", "omitted", False),
+        ):
+            with self.subTest(op=op):
+                x = torch.arange(32, device=DEVICE).reshape(2, 16).remainder(3)
+                x = x.int() if op in ("sum", "prod") else x.float()
+                if op == "prod":
+                    x = x.remainder(2) + 1
+                before = x.clone()
+                _, actual = code_and_output(
+                    _all_axis_bounded_gather,
+                    (x, op, mode, keep),
+                    cute_fragment_bounded_gather=True,
+                )
+                if op == "min":
+                    reduced = x.amin(-1, keepdim=True)
+                elif op == "max":
+                    reduced = x.amax(-1, keepdim=True)
+                elif op == "sum":
+                    reduced = x.sum(-1, keepdim=True)
+                else:
+                    reduced = x.prod(-1, keepdim=True)
+                expected = (x + reduced)[
+                    :, (torch.arange(16, device=DEVICE) * 5 + 3) % 16
+                ]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+        for steps in (0, 3):
+            with self.subTest(steps=steps):
+                x = torch.arange(32, device=DEVICE).reshape(2, 16).float()
+                before = x.clone()
+                _, actual = code_and_output(
+                    _all_axis_bounded_loop,
+                    (x, steps),
+                    cute_fragment_bounded_gather=True,
+                )
+                expected, carry = x.clone(), torch.zeros((2, 1), device=DEVICE)
+                for _ in range(steps):
+                    carry = (expected + carry).amin(-1, keepdim=True)
+                    expected = (expected + carry)[
+                        :, (torch.arange(16, device=DEVICE) * 5 + 3) % 16
+                    ]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()
