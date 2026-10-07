@@ -565,6 +565,9 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+        # hl.pdl_* ops in source order, run at kernel entry or exit.
+        self.pdl_entry: list[str] = []
+        self.pdl_exit: list[str] = []
 
     def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""

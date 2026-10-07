@@ -1977,3 +1977,7 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 class BarrierResultType(LiteralType):
     """Marker type returned by hl.barrier() to signal a phase boundary."""
+
+
+class PdlResultType(LiteralType):
+    """Marker type returned by the hl.pdl_* ops; the value names the op."""

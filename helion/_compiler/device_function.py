@@ -1213,13 +1213,26 @@ class DeviceFunction:
                 statement_from_string("cute.arch.cluster_arrive_relaxed()"),
                 statement_from_string("cute.arch.cluster_wait()"),
             ]
+        env = CompileEnvironment.current()
+        if (
+            self.triton_persistent_state_specs
+            and env.pdl_exit + env.pdl_entry
+            and "wait" not in env.pdl_entry
+        ):
+            raise exc.PdlStateWithoutWait
+        pdl = {
+            "wait": "tl.extra.cuda.gdc_wait()",
+            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
+        }
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
+                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
+                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
         if backend.name == "cute":
