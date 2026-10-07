@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from ...autotuner.compiler_coverage import CompilerCoverageGroup
-from ...autotuner.compiler_coverage import CoverageWitness
-from ...exc import InvalidConfig
-from ...runtime.config import Config
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
+from .cute_fragment_common import register_fragment_boolean_coverage
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
@@ -72,32 +70,10 @@ def register_fragment_atomic_consumer_fusion_coverage(
     # Newly eligible owner/store regions append after all prior coverage groups.
     if extended_only == bool(legacy):
         return
-    previous = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = previous.canonicalize_flat(previous.default_flat())
-        previous.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     previous_enabled = spec.cute_fragment_atomic_consumer_fusion_search_enabled
     spec.cute_fragment_atomic_consumer_fusion_search_enabled = True
-    generation = spec.create_config_generation()
-    try:
-        generation.strict_config_pair(
-            Config.from_dict(deepcopy(carrier.config) | {KEY: True})
-        )
-    except InvalidConfig:
+    if not register_fragment_boolean_coverage(spec, KEY, carrier):
         spec.cute_fragment_atomic_consumer_fusion_search_enabled = previous_enabled
-        return
-    spec.register_compiler_coverage_group(
-        CompilerCoverageGroup(
-            mechanism="cute.fragment_atomic_consumer_fusion",
-            version=1,
-            key=KEY,
-            domain=(False, True),
-            legacy=False,
-            witnesses=(CoverageWitness(carrier, True),),
-            deferred=True,
-        )
-    )

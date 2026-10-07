@@ -14,6 +14,7 @@ from ...exc import InvalidConfig
 from ...language import _tracing_ops
 from ...runtime.config import Config
 from .cute_fragment_bounded_gather import bounded_gather_roots
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
 from .cute_fragment_threads import THREADS
 from .registry import AutotunerHeuristic
@@ -117,13 +118,8 @@ def register_fragment_register_snapshots_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_register_snapshots_root_ids:
         return
-    previous = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = previous.canonicalize_flat(previous.default_flat())
-        previous.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     while_dependency = ()
     if spec.cute_fragment_register_snapshot_while_root_ids:
