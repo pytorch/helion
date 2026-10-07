@@ -29,6 +29,7 @@ from helion._compat import requires_torch_version
 from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import supports_torch_compile_fusion
+from helion._compat import torch_uses_template_producer_fusion
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
@@ -1934,10 +1935,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         ) -> bool:
             template: Any = object.__new__(HelionTemplateBuffer)
             template.inputs = [FakeInput(input_name, reads)]
+            node = FakeSchedulerNode(mutating_outputs if outputs is None else outputs)
+            if torch_uses_template_producer_fusion():
+                template.load_input_fusion_allowed_inputs = OrderedSet((input_name,))
+                return template.has_aliasing_or_mutation_for_producer_fusion(node)
             template.allowed_prologue_inps = OrderedSet((input_name,))
-            return template.has_aliasing_or_mutation_for_prologue_fusion(
-                FakeSchedulerNode(mutating_outputs if outputs is None else outputs)
-            )
+            return template.has_aliasing_or_mutation_for_prologue_fusion(node)
 
         cases = [
             (

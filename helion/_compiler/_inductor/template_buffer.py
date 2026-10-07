@@ -48,6 +48,7 @@ from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
 from ..output_header import _active_library_imports
 from ..output_header import get_needed_import_lines
+from helion._compat import torch_uses_template_producer_fusion
 from helion.runtime.config import Config
 
 if TYPE_CHECKING:
@@ -182,15 +183,18 @@ class HelionTemplateBuffer(TemplateBuffer):
 
             return kernel, render
 
-        # supports_torch_compile_fusion() gates the legacy prologue API, which
-        # is absent from newer PyTorch builds used for type checking.
+        prologue_input_key = (
+            "load_input_fusion_allowed_inputs"
+            if torch_uses_template_producer_fusion()
+            else "allowed_prologue_inps"
+        )
         super().__init__(
             layout=layout,
             inputs=inputs,
             make_kernel_render=_make_kernel_render,
             mutated_inputs=mutated_inputs,
-            allowed_prologue_inps=allowed_prologue_inps,  # pyrefly: ignore[unexpected-keyword]
             named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
+            **{prologue_input_key: allowed_prologue_inps},
         )
 
     @staticmethod
@@ -443,7 +447,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         if not mutation_names:
             return False
 
-        allowed_prologue_inps = self.get_allowed_prologue_inps()  # pyrefly: ignore[missing-attribute]
+        allowed_prologue_inps = self.get_allowed_prologue_inps()
         if any(name in allowed_prologue_inps for name in mutation_names):
             return True
 
@@ -454,6 +458,18 @@ class HelionTemplateBuffer(TemplateBuffer):
             ):
                 return True
         return False
+
+    def get_allowed_prologue_inps(self) -> OrderedSet[str]:
+        """Expose a single accessor across the PyTorch template API rename."""
+        if torch_uses_template_producer_fusion():
+            return self.load_input_fusion_allowed_inputs  # pyrefly: ignore[missing-attribute]
+        return super().get_allowed_prologue_inps()  # pyrefly: ignore[missing-attribute]
+
+    def has_aliasing_or_mutation_for_producer_fusion(
+        self, scheduler_node: object
+    ) -> bool:
+        # Keep both scheduler entrypoints on Helion's mutation-safety policy.
+        return self.has_aliasing_or_mutation_for_prologue_fusion(scheduler_node)
 
     def _build_call_args(
         self,
