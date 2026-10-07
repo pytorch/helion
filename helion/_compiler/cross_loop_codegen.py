@@ -3514,6 +3514,12 @@ def emit_cross_loop_schedule(
             statement_from_string(
                 f"{stride} = tl.maximum(({total} + {rounds} - 1) // {rounds}, 1)"
             ),
+            # If A's live tasks fit one round, each gets its own worker: B's
+            # tasks wait on A's, so a second A round would delay all of B.
+            statement_from_string(
+                f"{stride} = tl.where({live} <= {workers}, "
+                f"tl.maximum({stride}, {live}), {stride})"
+            ),
             create(
                 ast.For,
                 target=create(ast.Name, id=vp, ctx=ast.Store()),
