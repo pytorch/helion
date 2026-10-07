@@ -3343,6 +3343,39 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
 
+    def test_zero_dimensional_load_and_store(self):
+        @helion.kernel(autotune_effort="none")
+        def increment(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _grid in hl.grid(1):
+                out[...] = x[...] + 1
+            return out
+
+        for dtype in (torch.float32, torch.int64):
+            with self.subTest(dtype=dtype):
+                # A view checks that the iterator already includes storage_offset.
+                backing = torch.arange(7, device=DEVICE, dtype=dtype)
+                x = backing[3]
+                result = increment(x)
+                torch.testing.assert_close(result, x + 1)
+                self.assertEqual(result.shape, torch.Size([]))
+                torch.testing.assert_close(
+                    backing, torch.arange(7, device=DEVICE, dtype=dtype)
+                )
+
+    def test_zero_dimensional_load_broadcast(self):
+        @helion.kernel
+        def add_scalar(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + bias[...]
+            return out
+
+        x = torch.randn(137, device=DEVICE)
+        bias = torch.tensor(2.5, device=DEVICE)
+        code, result = code_and_output(add_scalar, (x, bias), block_sizes=[32])
+        torch.testing.assert_close(result, x + bias)
+
     def test_scalar_tensor_index_with_grid(self):
         """Index a tensor with a 0-dim scalar tensor from a grid load."""
 
