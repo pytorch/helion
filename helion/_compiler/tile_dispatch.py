@@ -209,7 +209,8 @@ class TileStrategyDispatch:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
         return strategy.codegen_device_loop(state)
 
-    def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
+    def compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
+        """Return physical dimensions with their logical axis and block mappings."""
         compacted_shapes = []
         for idx, shape in enumerate(shapes):
             block_idx = CompileEnvironment.current().resolve_block_id(shape)
@@ -261,7 +262,7 @@ class TileStrategyDispatch:
         return f"[{', '.join(self.shape_dims(shape))}]"
 
     def shape_dims(self, shape: ShapeLike) -> list[str]:
-        compacted_shapes = self._compact_shape(shape)
+        compacted_shapes = self.compact_shape(shape)
         return [s.size_str for s in compacted_shapes]
 
     def supports_index_rank_expansion(self) -> bool:
@@ -580,8 +581,16 @@ class TileStrategyDispatch:
                 next_axis = total_axes
             if local_axis >= next_axis:
                 continue
-            size = next(size_iter, None)
             expr = next(expr_iter, None)
+            # ``thread_block_sizes`` lists the static extents only, while
+            # ``thread_block_size_exprs`` has an entry for every thread axis
+            # (an argument-sized block's is its ``_BLOCK_SIZE_n`` constant),
+            # so a static size pairs with the next digit expression and a
+            # symbolic expression ahead of it takes none.
+            if expr is not None and not expr.isdigit():
+                size = None
+            else:
+                size = next(size_iter, None)
             result.append((block_id, local_axis, size, expr))
         return result
 
@@ -702,6 +711,46 @@ class TileStrategyDispatch:
                     return expr
         return None
 
+    def symbolic_thread_extent_expr(self, target_block_id: int) -> str | None:
+        """The thread extent of a block that is only known at launch.
+
+        ``hl.tile(n, block_size=bsz)`` with ``bsz`` an int argument of a kernel
+        bound with ``static_shapes=False`` holds one element per thread on the
+        host constant ``_BLOCK_SIZE_n``, which is the expression returned here;
+        the static shape (:meth:`thread_block_dims`) has a one for its axis.
+        ``None`` for a static extent and for a block without a thread axis.
+        """
+        if self.thread_extent_for_block_id(target_block_id) is not None:
+            return None
+        expr = self._thread_extent_expr_for_block_id(target_block_id)
+        if expr is None or expr.isdigit():
+            return None
+        return expr
+
+    def symbolic_thread_axes(self) -> dict[int, str]:
+        """The launch axes whose thread extent is only known at launch, by axis.
+
+        Each value is the extent's expression (see
+        :meth:`symbolic_thread_extent_expr`); the first block claiming an axis
+        names it.
+        """
+        axes: dict[int, str] = {}
+        for strategy in self.strategies:
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                continue
+            for block_id, local_axis, _size, expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if (
+                    expr is None
+                    or expr.isdigit()
+                    or self.thread_extent_for_block_id(block_id) is not None
+                ):
+                    continue
+                axes.setdefault(base_axis + local_axis, expr)
+        return axes
+
     def thread_block_dims(self) -> tuple[int, int, int]:
         """Compute the CUDA thread block dims from all strategies.
 
@@ -760,7 +809,7 @@ class TileStrategyDispatch:
         if len(shape) == 0 and i == 0:
             return ""
         assert 0 <= i < len(shape), f"Invalid index {i} for shape {shape}"
-        compacted_shapes = self._compact_shape(shape)
+        compacted_shapes = self.compact_shape(shape)
         result = []
         for dim in compacted_shapes:
             if i in dim.user_indices:
@@ -848,8 +897,8 @@ class TileStrategyDispatch:
             return []
 
         env = CompileEnvironment.current()
-        src_compacted = self._compact_shape(input_shape)
-        dst_compacted = self._compact_shape(output_shape)
+        src_compacted = self.compact_shape(input_shape)
+        dst_compacted = self.compact_shape(output_shape)
 
         # Map each source compacted dim to a destination compacted dim.
         src_to_dst: list[int] = []
@@ -927,7 +976,7 @@ class TileStrategyDispatch:
         )
         assert end_idx <= len(shape), f"Invalid end_idx {end_idx} for shape {shape}"
 
-        compacted_shapes = self._compact_shape(shape)
+        compacted_shapes = self.compact_shape(shape)
         result = []
         for dim in compacted_shapes:
             # Check if any of this dim's user_indices fall in our range [start_idx, end_idx)

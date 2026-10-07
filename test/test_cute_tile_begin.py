@@ -11,6 +11,7 @@ from .test_cute_grid_launch_extents import _code
 from .test_cute_grid_launch_extents import _launch_block
 from .test_cute_grid_launch_extents import _tile_coordinates
 import helion
+from helion import exc
 from helion._compiler.cute import tile_ops
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_reshape import _per_thread_nd_tile_offset
@@ -404,3 +405,53 @@ def test_flattened_begin_without_a_recorded_tile_base(block: int) -> None:
     begin = tile_id * block
     extent = torch.minimum(begin + block, torch.full_like(begin, n)) - begin
     torch.testing.assert_close(result, tile_id * 1000 + begin + extent)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _tile_count_weight(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for row, col in hl.tile(x.shape):
+        out[row, col] = x[row, col] + w[row.count]
+    return out
+
+
+def test_grid_tile_count_counts_the_whole_axis() -> None:
+    # ``tile.count`` of a grid tile is the number of tiles along the axis
+    # (``cdiv(end - begin, block)`` from the iteration space's begin), the
+    # same in every program; the CuTe index renderer counted the tiles left
+    # from the program's own tile offset.
+    x = torch.zeros((8, 256))
+    w = torch.zeros(8)
+    code = _code(_tile_count_weight, (x, w), helion.Config(block_sizes=[4, 256]))
+    (scalar_load,) = [line for line in code.splitlines() if "w.iterator" in line]
+    assert "tile_offset_0" not in scalar_load, scalar_load
+    assert "begin_0" in scalar_load, scalar_load
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [8, 6])
+def test_grid_tile_count_matches_the_triton_semantics(rows: int) -> None:
+    # Two row tiles of four: every program reads ``w[2]`` (Triton agrees).
+    x = torch.zeros((rows, 256), device=DEVICE)
+    w = torch.arange(1, 9, device=DEVICE).float() * 100
+    config = helion.Config(block_sizes=[4, 256], num_threads=[1, 64])
+    out = _tile_count_weight.bind((x, w)).compile_config(config)(x, w)
+    torch.testing.assert_close(out, torch.full_like(x, 300.0), rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _shared_block_size(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    block = hl.register_block_size(x.size(1))
+    for row, col in hl.tile([x.size(0), x.size(1)], block_size=[block, block]):
+        out[row, col] = x[row, col] * 2.0
+    return out
+
+
+def test_tile_dimensions_sharing_one_block_size_are_rejected() -> None:
+    # Both dimensions receive the same block id, hence one index and one
+    # mask: the kernel would walk the diagonal.  The CuTe backend fails closed.
+    with pytest.raises(exc.BackendUnsupported, match="share one block size symbol"):
+        _code(
+            _shared_block_size, (torch.zeros((8, 256)),), helion.Config(block_sizes=[8])
+        )

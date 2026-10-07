@@ -298,6 +298,7 @@ def _append_cute_wrapper_plan(
     call_args: list[str],
     plan: dict[str, object],
     num_sm: int | None = None,
+    schema_key: Sequence[tuple[object, ...]] | None = None,
 ) -> None:
     descriptor_identity = plan.get("wrapped_grouped_descriptors")
     descriptors = (
@@ -697,6 +698,48 @@ def _append_cute_wrapper_plan(
             ]
         )
         return
+    if kind == "helion_flash_row_mma":
+        # Register-MMA row programs: one CTA per (batch*head, row tile), plain
+        # tensor arguments, no host-side descriptors. The body moves 16-byte
+        # cp.async and st.global.v4 packets from the tensor bases; codegen
+        # resolves bindings with an under-aligned base to the tcgen05
+        # families, and a wrapper schema that still proves one only 8-byte
+        # aligned is refused here rather than faulting on the device.
+        if schema_key is not None:
+            aux_keys = tuple(
+                f"epi_aux{index}_idx"
+                for index in range(plan_int("epi_aux_count", default=0))
+            )
+            for key in ("q_idx", "k_idx", "v_idx", "o_idx", "lse_idx", *aux_keys):
+                index = plan_optional_int(key)
+                if index is not None and (
+                    _cute_schema_pointer_alignment(schema_key[index]) % 16
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "row_mma flash requires 16-byte-aligned q/k/v/o/lse "
+                        "and row-epilogue aux bases",
+                    )
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
+    if kind == "helion_warp_mma_gemm":
+        # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
+        # plain tensor arguments, no host-side descriptors.
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
 
     if kind == "helion_flash":
         # Fused tcgen05 flash-attention host setup: reorder Helion's (B, S, D)
@@ -987,6 +1030,81 @@ def _append_cute_wrapper_plan(
         call_args.extend(f"_flash_mEpiAux{index}" for index in range(epi_aux_count))
         if plan.get("epi_aux_tma"):
             call_args.extend(["_flash_tma_aux0", "_flash_mEpiAux0t"])
+        return
+    if kind == "helion_flash_gated":
+        # Imported here: the gated module pulls in the compiler's device IR,
+        # which imports the runtime package this module belongs to.
+        from ..._compiler.cute.cute_flash_gated import GATED_KERNEL_PARAMS
+
+        # Fused tcgen05 gated attention over jagged rows: Q/K/V/O are rank-3
+        # ``[rows, D, lanes]`` (or ``[lanes, rows, D]``) host tensors. The TMA
+        # descriptors cover the whole tensor with its runtime row extent so the
+        # device body can ``domain_offset`` to any row base and partial tiles
+        # past the end are zero-filled. Layout literals come from the
+        # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` wrapper bindings.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        o_idx = plan_int("o_idx")
+        hd = plan_int("head_dim")
+        bn = plan_int("kv_tile")
+        bm = plan_int("q_tile", default=128)
+        kv_stage = plan_int("kv_stage")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16", "cutlass.Float32")
+        # fp32 tensors run the MMA as tf32 (Helion's default dot precision):
+        # the gmem tensors keep Float32, the smem layouts / MMA use TFloat32
+        # and the TMA descriptors recast via ``internal_type`` (same width).
+        mma_dtype = str(plan.get("mma_dtype", dtype))
+        tma_internal = (
+            ", internal_type=cutlass.TFloat32"
+            if mma_dtype == "cutlass.TFloat32"
+            else ""
+        )
+
+        def rows_layout(idx: int, key: str) -> str:
+            row_dim = plan_int(f"{key}_row_dim")
+            lane_dim = plan_int(f"{key}_lane_dim")
+            return (
+                f"cute.make_layout((arg{idx}_shape{row_dim}, {hd}, "
+                f"arg{idx}_shape{lane_dim}), stride=(arg{idx}_stride{row_dim}, 1, "
+                f"arg{idx}_stride{lane_dim}))"
+            )
+
+        def cols_layout(idx: int, key: str) -> str:
+            row_dim = plan_int(f"{key}_row_dim")
+            lane_dim = plan_int(f"{key}_lane_dim")
+            return (
+                f"cute.make_layout(({hd}, arg{idx}_shape{row_dim}, "
+                f"arg{idx}_shape{lane_dim}), stride=(1, arg{idx}_stride{row_dim}, "
+                f"arg{idx}_stride{lane_dim}))"
+            )
+
+        bw = "cutlass.utils.blackwell_helpers"
+        qkd = f"({bm}, {bn}, {hd})"
+        pvd = f"({bm}, {hd}, {bn})"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        gated_lines = [
+            f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {rows_layout(q_idx, 'q')})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {rows_layout(k_idx, 'k')})",
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {cols_layout(v_idx, 'v')})",
+            f"_flash_mOt = cute.make_tensor(arg{o_idx}.iterator, {rows_layout(o_idx, 'o')})",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({mma_dtype}, {mma_dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, ({bm}, {bn}))",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({mma_dtype}, {mma_dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, ({bm}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            "_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
+            f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {mma_dtype}, 1)",
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {mma_dtype}, {kv_stage})",
+            f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {mma_dtype}, {kv_stage})",
+            f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {mma_dtype}, 1)",
+            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg1})",
+            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+        ]
+        body.extend(f"    {line}" for line in gated_lines)
+        call_args.extend(GATED_KERNEL_PARAMS)
         return
     if kind == "helion_flash_bwd" and plan.get("two_cta"):
         # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened
@@ -1761,6 +1879,16 @@ def _cute_cluster_shape_from_wrapper_plans(
     return (cluster_m, cluster_n, 1)
 
 
+def _cute_use_pdl(cute_kernel: object) -> bool:
+    """Whether the generated kernel asked for programmatic dependent launch.
+
+    The device function then waits (``griddepcontrol_wait``) before its first
+    global memory access, so the launch and prologue overlap the previous
+    kernel in the stream.
+    """
+    return getattr(cast("Any", cute_kernel), "_helion_cute_use_pdl", False) is True
+
+
 def _cute_cluster_shape(
     cute_kernel: object, wrapper_plans: list[dict[str, object]]
 ) -> tuple[int, int, int] | None:
@@ -2291,7 +2419,9 @@ def _create_cute_wrapper(
             "cute", "TF32 TMA RN requires its proved 256-thread block"
         )
     for plan in wrapper_plans:
-        _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
+        _append_cute_wrapper_plan(
+            body, call_args, plan, num_sm=num_sm, schema_key=schema_key
+        )
     gathered_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "gathered_mma_tma"
     ]
@@ -2362,7 +2492,7 @@ def _create_cute_wrapper(
     # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` is active. Reading
     # from the plan rather than a kernel-level side-channel attribute
     # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
-    if any(plan.get("use_pdl") for plan in wrapper_plans):
+    if any(plan.get("use_pdl") for plan in wrapper_plans) or _cute_use_pdl(cute_kernel):
         launch_suffix += ", use_pdl=True"
     # The fa4 flash topology (16-warp/512-thread) uses ``cute.arch.setmaxregister``
     # for per-warp register reallocation (softmax warps inc to 200; mma/corr/load/empty
@@ -2849,6 +2979,7 @@ def _cute_disk_cache_key(
             _cute_cache_relevant_env(),
             cutlass_version,
             num_sm,
+            _cute_use_pdl(cute_kernel),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -3214,6 +3345,84 @@ def _cute_schema_pointer_alignment(entry: tuple[object, ...]) -> int:
     """Read a tensor/wrapper tensor entry's optional alignment specialization."""
     has_alignment = len(entry) in (4, 6) if entry[0] == "tensor" else len(entry) == 7
     return cast("int", entry[-1]) if has_alignment else 16
+
+
+# Wrapper plans whose device bodies address the named tensors with 16-byte-wide
+# instructions: TMA tensor maps over q/k/v (and the outputs the epilogues store
+# or reduce through TMA), 128-bit copies of the output tile, the row programs'
+# 16-byte packets. A TMA descriptor encodes its global address in 16-byte
+# units, and the CuTe DSL builds one over a pointer whose assumed alignment
+# is only 8 bytes without complaint: the base is rounded down to 16 bytes and
+# every tile reads (or writes) 8 bytes before the tensor, giving a wrong
+# result instead of a fault. ``default_cute_launcher`` therefore stages an
+# under-aligned binding of these operands through a 16-byte-aligned copy and
+# copies the outputs back after the launch. Values are (input index keys,
+# output index keys); the flash kinds add their ``epi_aux{i}_idx`` inputs.
+_CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "helion_flash": (
+        ("q_idx", "k_idx", "v_idx", "bias_idx", "alibi_idx", "document_idx"),
+        ("o_idx", "lse_idx"),
+    ),
+    "helion_flash_row_mma": (("q_idx", "k_idx", "v_idx"), ("o_idx", "lse_idx")),
+    "helion_flash_gated": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
+    "helion_flash_bwd": (
+        ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
+        ("dq_idx", "dk_idx", "dv_idx"),
+    ),
+}
+_CUTE_STAGED_OPERAND_ALIGNMENT = 16
+
+
+def _cute_staged_plan_operands(
+    cute_kernel: object,
+) -> tuple[tuple[int, bool], ...]:
+    """The (argument index, is_output) operands the kernel's plans stage."""
+    operands: dict[int, bool] = {}
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        kind = str(plan.get("kind"))
+        roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
+        if roles is None:
+            continue
+        input_keys, output_keys = roles
+        if kind in ("helion_flash", "helion_flash_row_mma"):
+            aux_count = plan.get("epi_aux_count", 0)
+            assert isinstance(aux_count, int)
+            input_keys += tuple(f"epi_aux{i}_idx" for i in range(aux_count))
+        for keys, is_output in ((input_keys, False), (output_keys, True)):
+            for key in keys:
+                index = plan.get(key)
+                if isinstance(index, int):
+                    operands[index] = operands.get(index, False) or is_output
+    return tuple(operands.items())
+
+
+def _cute_stage_under_aligned_operands(
+    cute_kernel: object, args: tuple[object, ...]
+) -> tuple[tuple[object, ...], list[tuple[torch.Tensor, torch.Tensor]]] | None:
+    """Replace under-aligned staged operands by 16-byte-aligned copies.
+
+    Returns the launch arguments with each such operand cloned (a fresh
+    allocation is at least 16-byte aligned) and the (destination, copy) pairs
+    to write back after the launch, or None when every operand is aligned.
+    """
+    staged: list[object] | None = None
+    copy_backs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for index, is_output in _cute_staged_plan_operands(cute_kernel):
+        tensor = args[index]
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.data_ptr() % _CUTE_STAGED_OPERAND_ALIGNMENT == 0
+        ):
+            continue
+        if staged is None:
+            staged = list(args)
+        copy = tensor.clone()
+        staged[index] = copy
+        if is_output:
+            copy_backs.append((tensor, copy))
+    if staged is None:
+        return None
+    return tuple(staged), copy_backs
 
 
 def _validate_tcgen05_grouped_tensor_devices(
@@ -5278,6 +5487,8 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
     kind = str(plan.get("kind", ""))
     if kind in {
         "helion_small_biased_attention",
+        "helion_flash_row_mma",
+        "helion_warp_mma_gemm",
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
@@ -6785,6 +6996,31 @@ def default_cute_launcher(
         )
         if hit:
             return result
+    # Under-aligned TMA/vector operands of the staged plan kinds never reach
+    # the compiled wrapper: the fast path's alignment guard rejected them
+    # above, and the copies below are what the slower paths see and cache.
+    staging = _cute_stage_under_aligned_operands(cute_kernel, args_tuple)
+    if staging is None:
+        return _launch_cute_marshalled(
+            cute_kernel, args_tuple, grid_xyz, block_xyz, cute_compile_options
+        )
+    staged_args, copy_backs = staging
+    result = _launch_cute_marshalled(
+        cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+    )
+    for destination, copy in copy_backs:
+        destination.copy_(copy)
+    return result
+
+
+def _launch_cute_marshalled(
+    cute_kernel: object,
+    args_tuple: tuple[object, ...],
+    grid_xyz: tuple[int, int, int],
+    block_xyz: tuple[int, int, int],
+    cute_compile_options: str | None,
+) -> object:
+    """Launch through the last-launch cache or the schema-cached build path."""
     last_launch = _cute_last_launch_cache_entry(
         cute_kernel,
         args_tuple,

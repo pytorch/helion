@@ -88,12 +88,22 @@ def test_padding_guards_actual_role_and_mailbox_codegen(
             unguarded = bound.to_code(_config(order, swizzle, mailbox))
     logical_counts = [7, 2, 5]
     needs_guard = logical_counts[order[1]] % swizzle != 0
+    if not mailbox:
+        # 7 x 2 x 5 = 70 tiles fit one wave: the monolithic role-local form
+        # owns one tile per CTA (one-shot scheduler) and the plan drops the
+        # raster swizzle, so there are no padding slots and no guard whatever
+        # the knob says.  The scheduler-warp (mailbox) form keeps the
+        # persistent raster and is pinned below.
+        assert code == unguarded
+        assert "while tcgen05_role_local" not in code
+        assert "swizzle_size" not in code
+        return
     if not needs_guard:
         assert code == unguarded
         return
     tree = ast.parse(code)
     guards = [node for node in ast.walk(tree) if _predicate_guard(node)]
-    assert len(guards) == (1 if mailbox else 3), code
+    assert len(guards) == 1, code
     parents = {
         child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
@@ -101,22 +111,17 @@ def test_padding_guards_actual_role_and_mailbox_codegen(
         assert isinstance(guard, ast.If)
         body = ast.unparse(ast.Module(body=guard.body, type_ignores=[]))
         assert "advance_to_next_work" not in body
-        if mailbox:
-            assert ".producer_commit(" in body
-        else:
-            assert "virtual_pid =" in body
+        assert ".producer_commit(" in body
         loop = parents[guard]
         assert isinstance(loop, ast.While)
         assert ast.unparse(loop.test).endswith(".is_valid_tile")
         assert "advance_to_next_work" in ast.unparse(loop.body[-2])
         assert "get_current_work" in ast.unparse(loop.body[-1])
-    if mailbox:
-        # One terminating publish remains outside the producer loop, never
-        # an invalid publication for a padding slot in the middle of work.
-        assert (
-            code.count("tcgen05_work_tile_smem[cutlass.Int32(3)] = cutlass.Int32(0)")
-            == 1
-        )
+    # One terminating publish remains outside the producer loop, never an
+    # invalid publication for a padding slot in the middle of work.
+    assert (
+        code.count("tcgen05_work_tile_smem[cutlass.Int32(3)] = cutlass.Int32(0)") == 1
+    )
 
 
 @pytest.mark.parametrize("swizzle", [1, 2, 4, 8])

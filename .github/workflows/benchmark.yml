@@ -43,7 +43,6 @@ on:
 
 jobs:
   benchmark:
-    if: inputs.suite != 'linattn'
     name: benchmark-${{ inputs.runtime-version }}-${{ inputs.kernels }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     env:
@@ -164,6 +163,8 @@ jobs:
           if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
             uv pip install einops
             MAX_JOBS=4 uv pip install "mamba-ssm==2.3.2.post1" --no-build-isolation --no-deps
+            FLA_COMMIT=$(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/flash_linear_attention.txt)
+            uv pip install "git+https://github.com/fla-org/flash-linear-attention@${FLA_COMMIT}" --no-deps
           fi
           uv pip install -e . --no-deps
           popd

@@ -38,9 +38,14 @@ if TYPE_CHECKING:
 
 TWO_STAGE = "_cute_grouped_reduce_shared_two_stage"
 MAX_THREADS_PER_BLOCK = 1024
-# The two-stage shared reduce keys its per-group shared memory on the linear
-# thread id across ALL launch-block threads, taken from the runtime block dims
-# so a redundant thread axis mapped later in codegen cannot alias the slots.
+# The two-stage shared reduce is emitted keyed on the linear thread id across
+# ALL launch-block threads, taken from the runtime block dims, with a group
+# for every warp-row the 1024-thread budget allows: a redundant thread axis
+# mapped later in codegen must not alias the slots.  Once the launch shape is
+# final, ``finalize_shared_reduce_groups`` sizes the groups for the threads
+# that launch and reduces the lane of a one-dimensional block to
+# ``thread_idx()[0]``.
+X_LANE = "cutlass.Int32(cute.arch.thread_idx()[0])"
 RUNTIME_LANE = (
     "cutlass.Int32(cute.arch.thread_idx()[0])"
     " + cutlass.Int32(cute.arch.thread_idx()[1])"
@@ -124,9 +129,13 @@ def _row_config(
     vec: int,
     row_block: int = 1,
     row_threads: int = 0,
+    load_eviction_policies: list[str] | None = None,
 ) -> helion.Config:
     spec = bound.config_spec
     reduction = _reduction_block_id(bound)
+    extra: dict[str, object] = {}
+    if load_eviction_policies is not None:
+        extra["load_eviction_policies"] = load_eviction_policies
     return spec.normalized_config(
         helion.Config(
             block_sizes=[row_block for _ in spec.block_sizes.valid_block_ids()],
@@ -138,6 +147,7 @@ def _row_config(
                 vec if block_id == reduction else 1
                 for block_id in spec.cute_vector_widths.valid_block_ids()
             ],
+            **extra,
         )
     )
 
@@ -206,19 +216,26 @@ def _two_stage_reduces(code: str) -> list[tuple[str, dict[str, int]]]:
 
 
 def _assert_reduces_once_per_reduction(
-    code: str, *, reductions: int, group_span: int, broadcast_stores: int = 1
+    code: str,
+    *,
+    reductions: int,
+    group_span: int,
+    broadcast_stores: int = 1,
+    block_rows: int = 1,
 ) -> None:
     reduces = _two_stage_reduces(code)
     assert len(reduces) == reductions
     for lane_expr, kwargs in reduces:
-        # Shared memory keyed on the full runtime thread id: one group of
-        # ``group_span`` consecutive lanes per row of the launch block, with
-        # enough groups for every thread a redundant axis could add.
-        assert lane_expr == RUNTIME_LANE
+        # Sized for the launched block: one group of ``group_span``
+        # consecutive lanes per row of the launch block.  A one-dimensional
+        # block owns a single group keyed on ``thread_idx()[0]``; rows sharing
+        # a CTA keep the runtime thread id (``thread_idx()[1]`` selects the
+        # row's group).
+        assert lane_expr == (X_LANE if block_rows == 1 else RUNTIME_LANE)
         assert kwargs == {
             "pre": 1,
             "group_span": group_span,
-            "group_count": MAX_THREADS_PER_BLOCK // group_span,
+            "group_count": block_rows,
         }
     # The runtime key must not leak into the ownership analysis: a broadcast
     # result is stored by lane 0 of the (static) reduce axis, and nothing is
@@ -281,36 +298,211 @@ def test_rms_norm_1024_bf16_one_vector_per_thread_uses_four_warps() -> None:
 
 
 @skipUnlessBackends(["cute"])
-def test_multiwarp_row_keys_shared_memory_on_runtime_thread_id() -> None:
+def test_multiwarp_row_reduce_is_sized_for_the_launched_block() -> None:
     # The thread axes known when the reduce is emitted only cover the row's
     # own axis; a sibling branch can still map a redundant axis onto
-    # thread_idx()[1]/[2] later in codegen.  Keying on the reduce axis alone
-    # would let those redundant rows race on the same shared slots, so the
-    # lane is the full runtime thread id (as for a non-synthetic persistent
-    # cross-warp reduce) with a group for every possible warp-row.
+    # thread_idx()[1]/[2] later in codegen, so the marker is lowered keyed on
+    # the full runtime thread id with a group for every possible warp-row
+    # (see ``test_finalize_shared_reduce_groups_*``).  The launch shape is
+    # final before the late passes run: a 128-thread row ends up as the one
+    # group spanning the CTA, keyed on ``thread_idx()[0]`` -- the form the
+    # helper's cheaper serial fold and the replicated-reduction rewrite need.
     bound, _arguments = _bind_rms_norm(256, 1024, torch.bfloat16)
     code = bound.to_code(_row_config(bound, reduction_threads=128, vec=8))
     [(lane_expr, kwargs)] = _two_stage_reduces(code)
-    assert lane_expr == RUNTIME_LANE
-    assert kwargs == {"pre": 1, "group_span": 128, "group_count": 8}
-    # Not keyed on the axes discovered so far.
-    assert lane_expr != "cutlass.Int32(cute.arch.thread_idx()[0])"
-    assert "_lane = cutlass.Int32(cute.arch.thread_idx()[0])\n" not in code
-    # The runtime key is only the shared-memory key.  The marker's static lane
-    # still drives ownership: the per-thread ``out`` vector store is emitted
-    # for every thread, and only the broadcast inv_rms store gets the static
-    # lane-0 guard (a guard on the runtime lane would leave one thread in 128
-    # storing ``out``).
+    assert lane_expr == X_LANE
+    assert kwargs == {"pre": 1, "group_span": 128, "group_count": 1}
+    assert "block_dim()" not in _kernel_body(code)
+    # The static lane still drives ownership: the per-thread ``out`` vector
+    # store is emitted for every thread, and only the broadcast inv_rms store
+    # gets the lane-0 guard.
     assert len(_top_level_store_lines(code, "_cute_store_u16_vec")) == 1
     assert code.count("if cutlass.Int32(cute.arch.thread_idx()[0]) % 128 < 1:") == 1
-    assert f"if ({RUNTIME_LANE})" not in code
     # The lane setup is shared with the non-synthetic persistent cross-warp
-    # path: the same expression keys a 1024-thread row's reduce.
+    # path: a 1024-thread row's reduce is one group as well.
     wide = bound.to_code(_row_config(bound, reduction_threads=0, vec=1))
     assert "block=(1024, 1, 1)" in wide
     [(wide_lane_expr, wide_kwargs)] = _two_stage_reduces(wide)
-    assert wide_lane_expr == RUNTIME_LANE
+    assert wide_lane_expr == X_LANE
     assert wide_kwargs == {"pre": 1, "group_span": 1024, "group_count": 1}
+
+
+def _finalize(source: str, dims: tuple[int, int, int]) -> str:
+    from helion._compiler.cute.finalize_reduce_groups import (
+        finalize_shared_reduce_groups,
+    )
+
+    body = ast.parse(source).body
+    return "\n".join(
+        ast.unparse(stmt)
+        for stmt in finalize_shared_reduce_groups(body, thread_block_dims=dims)
+    )
+
+
+_EMITTED_REDUCE = (
+    f"lane = {RUNTIME_LANE}\n"
+    "lane_in_group = lane % 128\n"
+    "lane_mod_pre = lane_in_group % 1\n"
+    "acc = _cute_grouped_reduce_shared_two_stage(part, 'sum', cutlass.Float32(0), "
+    "lane, lane_in_group, lane_mod_pre, pre=1, group_span=128, group_count=8)"
+)
+
+
+def test_finalize_shared_reduce_groups_sizes_one_dimensional_block() -> None:
+    # Emitted for the 1024-thread budget (8 groups of 128), launched as one
+    # 128-thread row: one group, lane reduced to thread_idx()[0].
+    code = _finalize(_EMITTED_REDUCE, (128, 1, 1))
+    assert f"lane = {X_LANE}" in code
+    assert "group_count=1)" in code
+    assert "block_dim()" not in code
+
+
+def test_finalize_shared_reduce_groups_keeps_rows_sharing_a_cta_apart() -> None:
+    # Two rows per CTA (block (128, 2, 1)): two groups, keyed on the runtime
+    # thread id so thread_idx()[1] selects the row's group.
+    code = _finalize(_EMITTED_REDUCE, (128, 2, 1))
+    assert f"lane = {RUNTIME_LANE}" in code
+    assert "group_count=2)" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sumsq_per_arange_row(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    # x: [M, N], w: [4, N]; the free arange(4) selects the w row and feeds the
+    # reduced values, so the threads along its axis reduce different data.
+    rows, width = x.shape
+    out = torch.empty((rows, 4), dtype=torch.float32, device=x.device)
+    for tile_rows in hl.tile(rows):
+        cols = hl.arange(width)
+        j = hl.arange(4)
+        x_tile = x[tile_rows, cols].float()
+        w_tile = w[j[:, None], cols[None, :]].float()
+        vals = x_tile[:, None, :] * w_tile[None, :, :]
+        out[tile_rows, j] = (vals * vals).sum(-1)
+    return out
+
+
+@skipUnlessBackends(["cute"])
+def test_free_arange_thread_axis_keeps_the_runtime_lane_form() -> None:
+    # The free arange claims a synthetic thread axis the strategies' static
+    # shape does not know about: the launch is block=(128, 4, 1), not the
+    # (128, 1, 1) the row planned.  Sizing the shared stage for the planned
+    # shape would let the four arange rows alias one group's slots, so the
+    # finalization declines and the conservative runtime-lane form stays.
+    bound, _arguments = _bind(
+        _row_sumsq_per_arange_row,
+        (
+            torch.empty((64, 1024), dtype=torch.bfloat16),
+            torch.empty((4, 1024), dtype=torch.bfloat16),
+        ),
+    )
+    code = bound.to_code(_row_config(bound, reduction_threads=128, vec=8))
+    assert "block=(128, 4, 1)" in code
+    [(lane_expr, kwargs)] = _two_stage_reduces(code)
+    assert lane_expr == RUNTIME_LANE
+    assert kwargs["group_span"] == 128
+    assert kwargs["group_count"] >= 4
+    assert kwargs == {
+        "pre": 1,
+        "group_span": 128,
+        "group_count": MAX_THREADS_PER_BLOCK // 128,
+    }
+
+
+def test_finalize_shared_reduce_groups_for_launch_declines_wider_claims() -> None:
+    from helion._compiler.cute.finalize_reduce_groups import (
+        finalize_shared_reduce_groups_for_launch,
+    )
+
+    body = ast.parse(_EMITTED_REDUCE).body
+    # A claimed axis wider than the static shape (a free arange on axis 1):
+    # untouched, nothing recorded.
+    result, sized_for = finalize_shared_reduce_groups_for_launch(
+        body, thread_block_dims=(128, 1, 1), claimed_axis_sizes={0: 128, 1: 4}
+    )
+    assert sized_for is None
+    assert "group_count=8)" in "\n".join(ast.unparse(stmt) for stmt in result)
+    # Claims within the static shape: rewritten, the shape recorded.
+    result, sized_for = finalize_shared_reduce_groups_for_launch(
+        body, thread_block_dims=(128, 1, 1), claimed_axis_sizes={0: 128}
+    )
+    assert sized_for == (128, 1, 1)
+    assert "group_count=1)" in "\n".join(ast.unparse(stmt) for stmt in result)
+    # Nothing to rewrite (two rows per CTA already sized as two groups, the
+    # runtime lane kept for the multi-dimensional block): nothing recorded.
+    exact = ast.parse(_EMITTED_REDUCE.replace("group_count=8", "group_count=2")).body
+    _result, sized_for = finalize_shared_reduce_groups_for_launch(
+        exact, thread_block_dims=(128, 2, 1), claimed_axis_sizes={0: 128, 1: 2}
+    )
+    assert sized_for is None
+    # The lane simplification alone is a rewrite that assumes the shape.
+    one_group = ast.parse(
+        _EMITTED_REDUCE.replace("group_count=8", "group_count=1")
+    ).body
+    _result, sized_for = finalize_shared_reduce_groups_for_launch(
+        one_group, thread_block_dims=(128, 1, 1), claimed_axis_sizes={}
+    )
+    assert sized_for == (128, 1, 1)
+
+
+def test_finalize_shared_reduce_groups_matches_the_int64_lane() -> None:
+    # ``index_dtype=torch.int64`` spells the runtime lane with cutlass.Int64;
+    # the rewrite keeps the index type.
+    source = _EMITTED_REDUCE.replace("cutlass.Int32", "cutlass.Int64")
+    code = _finalize(source, (128, 1, 1))
+    assert "lane = cutlass.Int64(cute.arch.thread_idx()[0])" in code
+    assert "group_count=1)" in code
+    assert "block_dim()" not in code
+
+
+def test_finalize_shared_reduce_groups_leaves_other_shapes_alone() -> None:
+    # A span that does not divide the block keeps its count (the lane of a
+    # one-dimensional block still reduces: thread_idx()[1]/[2] are zero); a
+    # count already at or below the launched groups is not the conservative
+    # form and stays, as does the runtime lane of a multi-dimensional block.
+    odd = _finalize(_EMITTED_REDUCE, (96, 1, 1))
+    assert "group_count=8)" in odd
+    assert f"lane = {X_LANE}" in odd
+    exact = _EMITTED_REDUCE.replace("group_count=8", "group_count=1")
+    assert "group_count=1)" in _finalize(exact, (1024, 1, 1))
+    assert f"lane = {RUNTIME_LANE}" in _finalize(exact, (256, 2, 2))
+    assert "group_count=1)" in _finalize(exact, (256, 2, 2))
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "dtype,threads,vec,suffix",
+    [
+        (torch.bfloat16, 128, 8, ""),
+        (torch.float16, 256, 4, "_8b"),
+        (torch.float16, 512, 2, "_4b"),
+        (torch.float32, 256, 4, ""),
+        (torch.float32, 512, 2, "_8b"),
+    ],
+)
+def test_hinted_row_loads_use_the_cache_policy_helper_of_their_width(
+    dtype: torch.dtype, threads: int, vec: int, suffix: str
+) -> None:
+    # ``load_eviction_policies`` L2 hints are inline-PTX helpers, one per
+    # packet width (16, 8 and 4 bytes).  Dropping the hint below 16 bytes
+    # cost the 1024-wide fp16 row a DRAM round trip per replay under an L2
+    # flush (the Triton backend's evict_last keeps the row resident).
+    bound, _arguments = _bind_rms_norm(256, 1024, dtype)
+    code = bound.to_code(
+        _row_config(
+            bound,
+            reduction_threads=threads,
+            vec=vec,
+            load_eviction_policies=["l1_l2_last", "l2_last"],
+        )
+    )
+    assert f"block=({threads}, 1, 1)" in code
+    body = _kernel_body(code)
+    assert f"_cute_load_l1_l2_evict_last{suffix}(x.iterator" in body
+    assert f"_cute_load_l2_evict_last{suffix}(weight.iterator" in body
+    assert "cute.arch.load(" not in body
+    element = "Uint16" if dtype.itemsize == 2 else "Uint32"
+    assert body.count(f"ir.VectorType.get([{vec}], cutlass.{element}.mlir_type)") == 2
+    _assert_reduces_once_per_reduction(code, reductions=1, group_span=threads)
 
 
 @skipUnlessBackends(["cute"])
@@ -360,7 +552,7 @@ def test_rows_sharing_a_cta_reduce_in_separate_groups() -> None:
     # into each other.  The kernel has no broadcast store; every thread stores
     # its own output vector (under the row's bounds mask, not an owner guard).
     _assert_reduces_once_per_reduction(
-        code, reductions=1, group_span=128, broadcast_stores=0
+        code, reductions=1, group_span=128, broadcast_stores=0, block_rows=2
     )
     assert code.count("_cute_store_u16_vec(out.iterator") == 1
     assert "% 128 < 1" not in code

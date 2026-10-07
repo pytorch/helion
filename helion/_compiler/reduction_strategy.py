@@ -883,6 +883,31 @@ class ReductionStrategy(TileStrategy):
         )
 
 
+def _int_argument_symbol(numel: object) -> str | None:
+    """The name of the int argument a symbolic extent depends on, by provenance.
+
+    ``CompileEnvironment.to_fake`` records a bare input ``LocalSource`` for the
+    unbacked symbol of an int argument and nothing else does; a tensor size's
+    symbol carries a ``TensorPropertySource``, whatever host local names it
+    (``m, n = x.size()`` gives the size symbol a ``NameOrigin`` too, which is
+    why the origin's class cannot tell them apart).  ``None`` for a static
+    extent and for an extent of tensor sizes and block sizes.
+    """
+    from torch._dynamo.source import LocalSource
+
+    expr = numel._sympy_() if isinstance(numel, torch.SymInt) else numel
+    if not isinstance(expr, sympy.Expr):
+        return None
+    var_to_sources = CompileEnvironment.current().shape_env.var_to_sources
+    for symbol in sorted(expr.free_symbols, key=str):
+        if not isinstance(symbol, sympy.Symbol):
+            continue
+        for source in var_to_sources.get(symbol, ()):
+            if type(source) is LocalSource and source.is_input:
+                return source.local_name
+    return None
+
+
 class PersistentReductionStrategy(ReductionStrategy):
     def __init__(
         self,
@@ -899,6 +924,21 @@ class PersistentReductionStrategy(ReductionStrategy):
             size_hint = shape_env_size_hint(env.shape_env, numel)
         else:
             size_hint = env.size_hint(numel)
+        if (
+            env.backend.name == "cute"
+            and (int_argument := _int_argument_symbol(numel)) is not None
+        ):
+            # The thread layout below is sized from the bound value's hint
+            # and fixed at codegen; a register dim ``hl.zeros([tile, bsz])``
+            # with ``bsz`` an int argument then holds the hint's elements at
+            # every call, dropping or repeating the dim's at another value
+            # (an int argument is not part of the specialization key).
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"a reduction dim sized by the int argument {int_argument}: the "
+                "persistent reduction's thread layout is fixed at codegen from "
+                "the bound value and would not follow the argument",
+            )
         # Skip the mask when RDIM_SIZE == numel (no padding needed).
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
@@ -2694,6 +2734,25 @@ class BlockReductionStrategy(ReductionStrategy):
                         return candidate_block_id
         return None
 
+    def _launch_thread_axis_extent(self, axis: int, extent: int) -> int:
+        """``extent`` widened to the launch's thread count along ``axis``.
+
+        Sibling loop paths reuse a CUDA axis and the launch takes the widest
+        of them, so a narrower sibling (a 16-row ``hl.tile`` beside a
+        32-thread K loop) runs with surplus threads: their tile mask fails,
+        so they hold the reduction's identity, but they execute every
+        collective of the body.  A cross-thread combine over the axis has to
+        span them.  A group sized to the strategy's own extent leaves the
+        surplus threads reducing among themselves, so a value every thread of
+        the row is meant to hold -- a per-column sum multiplied back into the
+        row and stored by all of them -- differs between the real and the
+        surplus writers of one address, and the shared-memory combines index
+        slots past their allocation.  ``_normalize_shared_tile_thread_extents``
+        widens SIMT tile strategies to the launch ahead of codegen, but not in
+        a kernel with a matmul, whose layouts keep their own thread contracts.
+        """
+        return max(extent, self._codegen.launch_thread_axis_sizes().get(axis, 1))
+
     def _strided_thread_reduction_expr(
         self,
         state: CodegenState,
@@ -2972,7 +3031,17 @@ class BlockReductionStrategy(ReductionStrategy):
             strategy = self.fn.tile_strategy.block_id_to_strategy.get(
                 (self.block_index,)
             )
-            if strategy is not None:
+            # A strategy's starting axis belongs to its first block that
+            # holds threads.  A block of one holds none (its
+            # ``_thread_axis_map`` entry is the next block's axis), so a
+            # reduction over it has nothing to combine across: taking the
+            # axis would fold the sibling block's tile instead of passing
+            # the single element through.
+            if (
+                strategy is not None
+                and self.fn.tile_strategy.thread_extent_for_block_id(self.block_index)
+                is not None
+            ):
                 reduce_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
             if reduce_axis is not None:
                 hint = _reduction_threads_from_annotation(state)
@@ -3033,6 +3102,18 @@ class BlockReductionStrategy(ReductionStrategy):
                 logical_axis_sizes.get(reduce_axis, 1),
                 self._codegen.max_thread_block_dims[reduce_axis],
             )
+
+        # Every axis the tile is distributed over spans the launch's threads
+        # along it: the surplus threads of a sibling narrower than the launch
+        # execute this combine holding the identity, and the lane expression
+        # has to follow the physical layout (``_launch_thread_axis_extent``).
+        # An axis of extent 1 is not distributed: every thread holds the same
+        # element there, so the launch's threads along it are not combined.
+        strategy_axis_sizes = dict(logical_axis_sizes)
+        for axis, size in strategy_axis_sizes.items():
+            if size > 1:
+                logical_axis_sizes[axis] = self._launch_thread_axis_extent(axis, size)
+        surplus_threads = logical_axis_sizes != strategy_axis_sizes
 
         pre = 1
         for axis in range(reduce_axis):
@@ -3108,7 +3189,19 @@ class BlockReductionStrategy(ReductionStrategy):
         # the reduction block is no longer in ``active_device_loops``
         # (e.g. ``cute_dynamic_row_sum``'s ``acc.sum(-1)`` after the
         # inner ``hl.tile`` exits) and would silently drop the reduce.
-        if pre <= 1 and group_span <= 32 and num_threads == group_span:
+        # Under surplus threads the direct path would size its group by the
+        # block's own extent, so the strided form is kept.  The same drop
+        # happens with one warp per CTA when the block's loop has exited
+        # (one row per CTA on 32 column threads: ``acc.mean(dim=1)`` after
+        # the loop became each thread's own column), so the shortcut is
+        # only taken by a block with a live thread axis.
+        if (
+            pre <= 1
+            and group_span <= 32
+            and num_threads == group_span
+            and not surplus_threads
+            and self._reduction_block_has_live_thread_axis()
+        ):
             debug(
                 "skip small direct",
                 tuple(fake_input.size()),
@@ -3263,6 +3356,23 @@ class BlockReductionStrategy(ReductionStrategy):
         identity_expr = env.backend.cast_expr(
             constant_repr(default), _dtype_str(acc_dtype)
         )
+        reduce_axis = self.fn.tile_strategy.thread_axis_for_block_id(self.block_index)
+        if (
+            threads > 1
+            and reduce_axis is not None
+            and self._launch_thread_axis_extent(reduce_axis, threads) != threads
+        ):
+            # The surplus threads of the launch walk this lane loop too; with
+            # a strided lane layout their elements alias the real threads'
+            # and a group spanning them would count those twice, while a
+            # group of the block's own threads leaves them a partial every
+            # owner-guarded consume store would race with.
+            raise exc.BackendUnsupported(
+                "cute",
+                "lane-looped reduction over a tile axis narrower than the "
+                f"launch (threads={threads}, launch="
+                f"{self._launch_thread_axis_extent(reduce_axis, threads)})",
+            )
         group_params = self._lane_loop_group_params()
         owner_lane = self._lane_reduce_owner(state)
         cluster_n = self._lane_reduce_cluster_n()
@@ -3340,9 +3450,10 @@ class BlockReductionStrategy(ReductionStrategy):
         threads = self._lane_reduce_threads_in_group()
         if threads is None:
             return None
-        # The loop body keeps its per-element strided form (consumers carry the
-        # lane accumulation); when the two-pass split is unsafe the marker is
-        # finalized per lane instead of rejecting the config.
+        # The loop body keeps its per-element strided form; when the two-pass
+        # split is unsafe the marker is finalized per lane, which is complete
+        # for lane-carry consumers, and the shares are totalled over the lanes
+        # for any other lane-invariant consumer (``_restore_lane_markers``).
         return self._lane_loop_marker_expr(
             state,
             input_name,
@@ -3455,6 +3566,27 @@ class BlockReductionStrategy(ReductionStrategy):
                 env.backend.full_expr(
                     shape_dims, constant_repr(default), fake_output.dtype
                 )
+            )
+        if (
+            env.backend.name == "cute"
+            and (
+                symbolic_extent := self.fn.tile_strategy.symbolic_thread_extent_expr(
+                    self.block_index
+                )
+            )
+            is not None
+        ):
+            # The dim lives one element per thread on a launch axis whose
+            # extent is a kernel argument (``hl.tile(n, block_size=bsz)``).
+            # Every combine across threads is sized at codegen, where the
+            # extent is unknown: the strided and direct forms find no thread
+            # axis and the fallback below passes each thread's own element
+            # through as the total.
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"{reduction_type} over tile dim {self.block_index}, whose "
+                f"{symbolic_extent} threads are sized by a kernel argument: the "
+                "combine across them needs a static thread extent",
             )
         has_lane_loop = (
             self._reduction_block_has_lane_loops()

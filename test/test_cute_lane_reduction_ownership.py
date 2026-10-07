@@ -645,3 +645,682 @@ def test_exact_rejected_backward_config_declines_before_emission() -> None:
         bound = _cpu_bind(kernel, args)
         with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
             bound.to_code(config)
+
+
+# --- a reduction input a device loop of the lane body accumulates -----------
+
+_TID = "cutlass.Int32(cute.arch.thread_idx()[0])"
+_COLLECTIVE_END = (
+    "amax = _cute_grouped_reduce_shared_two_stage(length, 'max', cutlass.Int64(0), "
+    "0, 0, 0, pre=1, group_span=256, group_count=1)\n"
+)
+# The device function's aliases of the carried values: the jagged loop's
+# output ``v_8`` is ``row_sums``, the lane body's ``v_9`` is ``mean_acc``.
+_ROW_SUMS_RENAMES = {
+    "v_8": "row_sums",
+    "row_sums": "row_sums",
+    "v_9": "mean_acc",
+    "mean_acc": "mean_acc",
+}
+
+
+def _masked_marker(value: str, *, strided_restore: bool = True) -> str:
+    return lanes._lane_reduce_marker_expr(
+        value,
+        "sum",
+        "cutlass.Float32(0)",
+        256,
+        group_pre=1,
+        group_span=256,
+        group_lane_expr=_TID,
+        group_count=1,
+        owner_lane="lane",
+        strided_restore=strided_restore,
+    )
+
+
+def _accumulated_rows_body(
+    *, collective_end: bool, strided_restore: bool = True
+) -> str:
+    """The nested-row seed's column lane body under dynamic shapes.
+
+    A jagged device loop accumulates ``row_sums`` under its loop-output name
+    ``v_8`` (``row_sums_copy = row_sums`` at the top of its body is the
+    carry's phi copy); the column mask then turns ``row_sums.sum()`` into a
+    masked lane reduction of ``_mask_to``, and the result updates the
+    cross-lane ``mean_acc`` carry.
+    """
+    end = _COLLECTIVE_END if collective_end else "amax = length\n"
+    return (
+        f"indices = tile_offset + {_TID} + lane * 256\n"
+        "mask = indices < M\n"
+        "mean_acc_copy = mean_acc\n"
+        "row_sums = cutlass.Float32(0.0)\n"
+        f"{end}"
+        "for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(amax), "
+        "cutlass.Int32(32)):\n"
+        "    row_sums_copy = row_sums\n"
+        "    partial = (x.iterator + cutlass.Int32(tile_offset_2 * M + indices)"
+        " * cutlass.Int32(x.layout.stride[0])).load() if mask else "
+        "cutlass.Float32(0)\n"
+        "    v_8 = row_sums_copy + partial\n"
+        "_mask_to = cutlass.Float32(row_sums) if mask else cutlass.Float32(0)\n"
+        f"sum_2 = cutlass.Float32({_masked_marker('_mask_to', strided_restore=strided_restore)})\n"
+        "v_9 = mean_acc_copy + sum_2\n"
+    )
+
+
+def _split(
+    text: str,
+    renames: dict[str, str],
+    disjoint: set[frozenset[str]] | None = None,
+) -> str:
+    loop = lanes._create_lane_loop("lane", 2, _body(text))
+    lanes.validate_lane_reduce_owners([loop])
+    result = lanes.split_lane_loop_reductions(
+        [loop], rename_groups=renames, proven_disjoint_tensor_pairs=disjoint
+    )
+    return _source(lanes.restore_unprocessed_lane_reduce_markers(result))
+
+
+def _lane_passes(code: str) -> list[str]:
+    """The bodies of the lane loops of ``code``, in order."""
+    return [
+        _source(list(node.body))
+        for node in ast.parse(code).body
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "lane"
+    ]
+
+
+def test_lane_reduction_of_an_accumulated_row_runs_after_the_loop_that_accumulates_it() -> (
+    None
+):
+    """The accumulate pass folds ``row_sums`` only after the jagged loop ran.
+
+    The slice producing the reduction input reads the rename groups: the loop
+    writes ``v_8``, which is ``row_sums``.  The two-pass split used to fold
+    the fresh zero in a first pass and run the loop in the second (the
+    dynamic-shape nested-row seeds of jagged_layer_norm returned mean =
+    variance = 0).
+    """
+    code = _split(_accumulated_rows_body(collective_end=False), _ROW_SUMS_RENAMES)
+    accumulate = _lane_passes(code)[0]
+    assert "sum_2_lane_acc = sum_2_lane_acc +" in accumulate
+    assert accumulate.index("for tile_offset_2 in") < accumulate.index(
+        "sum_2_lane_acc = sum_2_lane_acc +"
+    )
+    assert code.count("v_9 = mean_acc_copy + sum_2") == 1
+    assert code.index("sum_2 = cutlass.Float32(sum_2_lane_acc_reduced)") < code.index(
+        "v_9 = mean_acc_copy + sum_2"
+    )
+
+
+def test_an_accumulated_row_under_a_collective_end_is_reduced_per_lane() -> None:
+    """The jagged loop's trip count is a cross-thread max, which no pass may re-run: the owned marker is restored per lane, after the loop, and an owner without a per-lane restore is declined rather than split."""
+    code = _split(_accumulated_rows_body(collective_end=True), _ROW_SUMS_RENAMES)
+    (body,) = _lane_passes(code)
+    assert "_lane_acc" not in code
+    assert body.index("for tile_offset_2 in") < body.index(
+        "_cute_grouped_reduce_shared_two_stage(_mask_to,"
+    )
+    assert body.index("sum_2 = cutlass.Float32(_mask_to_reduced)") < body.index(
+        "v_9 = mean_acc_copy + sum_2"
+    )
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        _split(
+            _accumulated_rows_body(collective_end=True, strided_restore=False),
+            _ROW_SUMS_RENAMES,
+        )
+
+
+def test_a_carry_the_rename_groups_do_not_map_is_read_off_its_phi_copy() -> None:
+    """Without the alias of ``v_8`` the slice sees the initializer alone; the loop's ``row_sums_copy = row_sums`` marks it as the carry, and the marker is restored per lane instead of being folded ahead of the loop."""
+    code = _split(_accumulated_rows_body(collective_end=False), {})
+    (body,) = _lane_passes(code)
+    assert "_lane_acc" not in code
+    assert body.index("for tile_offset_2 in") < body.index(
+        "_cute_grouped_reduce_shared_two_stage(_mask_to,"
+    )
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        _split(_accumulated_rows_body(collective_end=False, strided_restore=False), {})
+
+
+def test_a_loop_reading_the_reduction_input_without_carrying_it_stays_a_consumer() -> (
+    None
+):
+    """A loop that only reads an input of the reduction (no phi copy) is no producer: the split keeps it in the consume pass."""
+    text = (
+        f"indices = tile_offset + {_TID} + lane * 256\n"
+        "mask = indices < M\n"
+        "mean_acc_copy = mean_acc\n"
+        "row_sums = (x.iterator + cutlass.Int32(indices) * "
+        "cutlass.Int32(x.layout.stride[0])).load() if mask else cutlass.Float32(0)\n"
+        "for k in range(4):\n"
+        "    scaled = row_sums * k\n"
+        "_mask_to = cutlass.Float32(row_sums) if mask else cutlass.Float32(0)\n"
+        f"sum_2 = cutlass.Float32({_masked_marker('_mask_to')})\n"
+        "v_9 = mean_acc_copy + sum_2\n"
+    )
+    code = _split(text, _ROW_SUMS_RENAMES)
+    accumulate, consume = _lane_passes(code)
+    assert "sum_2_lane_acc = sum_2_lane_acc +" in accumulate
+    assert "for k in range(4)" not in accumulate
+    assert "for k in range(4)" in consume
+
+
+_XYZ_DISJOINT = {frozenset({"x", "y"}), frozenset({"x", "z"}), frozenset({"y", "z"})}
+# The K loop's output ``v_8`` and the later rewrite ``v_11`` are both ``acc``.
+_ACCUMULATED_RENAMES = {
+    "v_8": "acc",
+    "v_11": "acc",
+    "acc": "acc",
+    "v_9": "mean_acc",
+    "mean_acc": "mean_acc",
+}
+_CONTINUING_LOOP = (
+    "for tile_offset_3 in range(cutlass.Int32(0), cutlass.Int32(4), "
+    "cutlass.Int32(1)):\n"
+    "    acc_copy_1 = acc\n"
+    "    v_11 = acc_copy_1 + (z.iterator + cutlass.Int32(tile_offset_3 * M + "
+    "indices)).load()\n"
+)
+_JOIN_REWRITE = (
+    "if flag:\n    v_11 = acc + cutlass.Float32(1.0)\nelse:\n    v_11 = acc\n"
+)
+
+
+def _stored_accumulator_body(*, after_marker: str = "") -> str:
+    """A per-column accumulator reduced across the columns and stored.
+
+    A K loop accumulates ``acc`` under its loop-output name ``v_8``, the
+    unmasked (static-shape) reduction of ``acc`` across the column lanes
+    updates the carried ``mean_acc``, and ``acc`` is stored per column, after
+    ``after_marker`` rewrote it under another spelling of its group.
+    """
+    return (
+        f"indices = tile_offset + {_TID} + lane * 256\n"
+        "mean_acc_copy = mean_acc\n"
+        "acc = cutlass.Float32(0.0)\n"
+        "for tile_offset_2 in range(cutlass.Int32(0), cutlass.Int32(4), "
+        "cutlass.Int32(1)):\n"
+        "    acc_copy = acc\n"
+        "    partial = (x.iterator + cutlass.Int32(tile_offset_2 * M + indices))"
+        ".load()\n"
+        "    v_8 = acc_copy + partial\n"
+        f"sum_2 = cutlass.Float32({_masked_marker('acc')})\n"
+        "v_9 = mean_acc_copy + sum_2\n"
+        f"{after_marker}"
+        "(y.iterator + cutlass.Int32(indices)).store(cutlass.Float32(acc))\n"
+    )
+
+
+def test_the_initializer_of_an_accumulator_a_lane_varying_loop_rewrites_runs_in_every_pass() -> (
+    None
+):
+    """``acc = 0`` is lane-varying through the K loop's rewrite of ``acc``.
+
+    The loop writes ``acc`` under ``v_8``; the classification of the consume
+    pass read the names as spelled, took the initializer for lane-invariant
+    and emitted it once between the passes, so the consume pass's loop
+    continued every lane after the first from the previous lane's final
+    ``acc`` and stored that.
+    """
+    code = _split(_stored_accumulator_body(), _ACCUMULATED_RENAMES, _XYZ_DISJOINT)
+    accumulate, consume = _lane_passes(code)
+    init = "acc = cutlass.Float32(0.0)"
+    assert code.count(init) == 2
+    assert (
+        accumulate.index(init)
+        < accumulate.index("for tile_offset_2 in")
+        < accumulate.index("sum_2_lane_acc = sum_2_lane_acc +")
+    )
+    assert (
+        consume.index(init)
+        < consume.index("for tile_offset_2 in")
+        < consume.index(".store(")
+    )
+    assert code.count("v_9 = mean_acc_copy + sum_2") == 1
+
+
+@pytest.mark.parametrize(
+    "rewrite", [_CONTINUING_LOOP, _JOIN_REWRITE], ids=["loop", "join"]
+)
+def test_a_rewrite_of_the_reduction_input_after_its_marker_is_a_consumer(
+    rewrite: str,
+) -> None:
+    """A later loop or if-join rewriting ``acc`` is no producer of the reduction.
+
+    The producer slice is read over the statements before the marker: sliced
+    over the whole body, the later rewrite of ``acc``'s group was taken into
+    the accumulate pass and the fold read the value behind it.
+    """
+    code = _split(
+        _stored_accumulator_body(after_marker=rewrite),
+        _ACCUMULATED_RENAMES,
+        _XYZ_DISJOINT,
+    )
+    accumulate, consume = _lane_passes(code)
+    head = rewrite.partition("\n")[0]
+    assert head not in accumulate
+    assert accumulate.index("for tile_offset_2 in") < accumulate.index(
+        "sum_2_lane_acc = sum_2_lane_acc +"
+    )
+    assert (
+        consume.index("for tile_offset_2 in")
+        < consume.index(head)
+        < consume.index(".store(")
+    )
+
+
+def test_a_dependent_chains_consume_pass_restarts_an_accumulator_a_lane_varying_loop_rewrites() -> (
+    None
+):
+    """The chained split's final pass re-runs ``acc = 0`` per lane too.
+
+    Two chained reductions (the second's input reads the first's result) are
+    followed by a loop that accumulates ``acc`` from the second result under
+    ``v_8`` and a store of ``acc``: the initializer belongs to the final lane
+    pass, not to the invariant tail between the passes.
+    """
+    text = (
+        f"indices = tile_offset + {_TID} + lane * 256\n"
+        "p = (x.iterator + cutlass.Int32(indices)).load()\n"
+        f"m1 = cutlass.Float32({_masked_marker('p')})\n"
+        "q = p * m1\n"
+        f"m2 = cutlass.Float32({_masked_marker('q')})\n"
+        "acc = cutlass.Float32(0.0)\n"
+        "for k in range(cutlass.Int32(0), cutlass.Int32(4), cutlass.Int32(1)):\n"
+        "    acc_copy = acc\n"
+        "    v_8 = acc_copy + q * m2\n"
+        "(y.iterator + cutlass.Int32(indices)).store(cutlass.Float32(acc))\n"
+    )
+    code = _split(text, {"v_8": "acc", "acc": "acc"}, _XYZ_DISJOINT)
+    passes = _lane_passes(code)
+    assert len(passes) == 3
+    init = "acc = cutlass.Float32(0.0)"
+    assert code.count(init) == 1
+    consume = passes[-1]
+    assert (
+        consume.index(init) < consume.index("for k in range") < consume.index(".store(")
+    )
+
+
+_STORED_TOTAL = (
+    "(tot.iterator + cutlass.Int32(tile_offset) * cutlass.Int32(tot.layout.stride[0]))"
+    ".store(cutlass.Float32(sum_2))\n"
+)
+_SCALED_ROW = (
+    "(out.iterator + cutlass.Int32(indices) * cutlass.Int32(out.layout.stride[0]))"
+    ".store(cutlass.Float32(_mask_to * sum_2))\n"
+)
+_STORED_CARRY_COPY = (
+    "(tot.iterator + cutlass.Int32(tile_offset) * cutlass.Int32(tot.layout.stride[0]))"
+    ".store(cutlass.Float32(mean_acc_copy))\n"
+)
+# The tensors the restored bodies store to are not the one they load.
+_RESTORED_DISJOINT = {frozenset({"x", "tot"}), frozenset({"x", "out"})}
+_CARRY_COPIES = {
+    0: "",
+    1: "mean_acc_copy = mean_acc\n",
+    2: "mean_acc_copy = mean_acc\nmean_acc_copy_0 = mean_acc_copy\n",
+}
+
+
+def _restored_rows_body(tail: str, *, carry_copies: int = 0) -> str:
+    """``_accumulated_rows_body`` under a collective end, ``tail`` for its carry update.
+
+    The jagged loop's collective trip count keeps the two-pass split off this
+    body, so its marker is restored per lane.  ``carry_copies`` chained phi
+    copies of ``mean_acc`` (``mean_acc_copy = mean_acc``, ``mean_acc_copy_0 =
+    mean_acc_copy``) precede the loop for a ``tail`` that updates the carry.
+    """
+    body = _accumulated_rows_body(collective_end=True)
+    update = "v_9 = mean_acc_copy + sum_2\n"
+    copy = "mean_acc_copy = mean_acc\n"
+    assert body.endswith(update) and body.count(copy) == 1
+    return body[: -len(update)].replace(copy, _CARRY_COPIES[carry_copies]) + tail
+
+
+@pytest.mark.parametrize("carry_copies", [1, 2])
+def test_a_strided_restore_is_kept_for_a_lane_carry_update(carry_copies: int) -> None:
+    """A lane's share is complete through a carry: the update off the last of the chained phi copies runs per lane and the marker stays restored (jagged_layer_norm's schedule)."""
+    copy = "mean_acc_copy" if carry_copies == 1 else "mean_acc_copy_0"
+    code = _split(
+        _restored_rows_body(f"v_9 = {copy} + sum_2\n", carry_copies=carry_copies),
+        _ROW_SUMS_RENAMES,
+        _RESTORED_DISJOINT,
+    )
+    (body,) = _lane_passes(code)
+    assert "_lane_total" not in code and "_lane_acc" not in code
+    assert body.index("_cute_grouped_reduce_shared_two_stage(_mask_to,") < body.index(
+        f"v_9 = {copy} + sum_2"
+    )
+
+
+def test_a_stored_strided_reduction_is_totalled_across_the_lanes() -> None:
+    """A store of the result would read one lane's share: the lane loop stays whole, each lane's share is folded into a total the loop carries, and the store runs once after the loop on the total, owner-guarded."""
+    code = _split(
+        _restored_rows_body(_STORED_TOTAL), _ROW_SUMS_RENAMES, _RESTORED_DISJOINT
+    )
+    (body,) = _lane_passes(code)
+    assert "_lane_acc" not in code
+    assert code.index("sum_2_lane_total = cutlass.Float32(0)") < code.index(
+        "for lane in range(2):"
+    )
+    assert body.index("for tile_offset_2 in") < body.index(
+        "_cute_grouped_reduce_shared_two_stage(_mask_to,"
+    )
+    assert "sum_2_lane_share = _mask_to_reduced" in body
+    assert (
+        "sum_2_lane_total = sum_2_lane_total + cutlass.Float32(sum_2_lane_share)"
+        in body
+    )
+    assert "tot.iterator" not in body
+    after = code[code.index("sum_2 = cutlass.Float32(sum_2_lane_total)") :]
+    assert after.index(
+        "if cutlass.Int32(cute.arch.thread_idx()[0]) % 256 < 1:"
+    ) < after.index("tot.iterator")
+
+
+@pytest.mark.parametrize(
+    ("tail", "carry_copies"),
+    [
+        (_SCALED_ROW, 0),
+        ("v_9 = mean_acc_copy + sum_2\n" + _STORED_TOTAL, 1),
+        ("v_9 = mean_acc_copy + sum_2\n" + _STORED_CARRY_COPY, 1),
+    ],
+    ids=["scaled_per_lane", "carry_and_store", "second_reader_of_the_carry"],
+)
+def test_a_strided_reduction_without_a_whole_loop_lowering_is_declined(
+    tail: str, carry_copies: int
+) -> None:
+    """A result consumed inside the lanes (scaled back into the per-lane values), beside a carry update, or whose carry is read elsewhere has neither a complete restore nor a lane-invariant tail: the config is declined."""
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        _split(
+            _restored_rows_body(tail, carry_copies=carry_copies),
+            _ROW_SUMS_RENAMES,
+            _RESTORED_DISJOINT,
+        )
+
+
+def test_the_restore_declines_a_stored_strided_reduction() -> None:
+    loop = lanes._create_lane_loop("lane", 2, _body(_restored_rows_body(_STORED_TOTAL)))
+    (index,) = [
+        i
+        for i, stmt in enumerate(loop.body)
+        if lanes._is_lane_reduce_marker_assign(stmt) is not None
+    ]
+    marker = lanes._is_lane_reduce_marker_assign(loop.body[index])
+    assert marker is not None and marker.strided_restore
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        lanes._restore_per_lane_markers(loop, [(index, marker)], _ROW_SUMS_RENAMES)
+
+
+_MAX_CARRY_UPDATES = {
+    "cute_math_max_under_casts": (
+        "v_9 = cute.math.max(cutlass.Float32(mean_acc_copy), "
+        "cutlass.Float32(amax_2), propagate_nan=True)\n"
+    ),
+    "ternary": "v_9 = mean_acc_copy if mean_acc_copy > amax_2 else amax_2\n",
+    "ternary_swapped": "v_9 = amax_2 if mean_acc_copy < amax_2 else mean_acc_copy\n",
+    "builtin_max": "v_9 = max(mean_acc_copy, amax_2)\n",
+}
+_MIN_OF_A_MAX_MARKER = {
+    "ternary_min": "v_9 = mean_acc_copy if mean_acc_copy < amax_2 else amax_2\n",
+    "cute_math_min": (
+        "v_9 = cute.math.min(cutlass.Float32(mean_acc_copy), "
+        "cutlass.Float32(amax_2), propagate_nan=True)\n"
+    ),
+}
+_GUARDED_ATOMIC_ADD = (
+    "if cute.arch.thread_idx()[0] == 0:\n"
+    "    cute.arch.atomic_add((tot.iterator + cute.crd2idx((tile_offset,), "
+    "tot.layout)).llvm_ptr, val=cutlass.Float32(sum_2), sem='relaxed')\n"
+    "else:\n"
+    "    pass\n"
+)
+_SUM_MARKER_LINE = f"sum_2 = cutlass.Float32({_masked_marker('_mask_to')})\n"
+_STORED_AMAX = (
+    "(tot2.iterator + cutlass.Int32(tile_offset) * cutlass.Int32(tot2.layout.stride[0]))"
+    ".store(cutlass.Float32(amax_3))\n"
+)
+_TWO_TENSORS_DISJOINT = _RESTORED_DISJOINT | {
+    frozenset({"x", "tot2"}),
+    frozenset({"tot", "tot2"}),
+}
+
+
+def _max_marker(value: str) -> str:
+    return lanes._lane_reduce_marker_expr(
+        value,
+        "max",
+        "cutlass.Float32(float('-inf'))",
+        256,
+        group_pre=1,
+        group_span=256,
+        group_lane_expr=_TID,
+        group_count=1,
+        owner_lane="lane",
+        strided_restore=True,
+    )
+
+
+def _restored_rows_max_body(tail: str) -> str:
+    """``_restored_rows_body`` with a max marker ``amax_2`` in place of the sum, one phi copy of the carry."""
+    body = _restored_rows_body("", carry_copies=1)
+    assert body.count(_SUM_MARKER_LINE) == 1
+    return (
+        body.replace(
+            _SUM_MARKER_LINE,
+            f"amax_2 = cutlass.Float32({_max_marker('_mask_to')})\n",
+        )
+        + tail
+    )
+
+
+def _assert_restored_before(code: str, update: str) -> None:
+    (body,) = _lane_passes(code)
+    assert "_lane_total" not in code
+    assert body.index("_cute_grouped_reduce_shared_two_stage(_mask_to,") < body.index(
+        update.strip()
+    )
+
+
+@pytest.mark.parametrize(
+    "update", list(_MAX_CARRY_UPDATES.values()), ids=list(_MAX_CARRY_UPDATES)
+)
+def test_a_strided_restore_is_kept_for_a_running_max_carry(update: str) -> None:
+    """The max over the lanes of the lanes' maxes is the max over the tile: a running-max carry (``cute.math.max`` under casts, the ternary, ``max()``) keeps the per-lane restore."""
+    _assert_restored_before(
+        _split(_restored_rows_max_body(update), _ROW_SUMS_RENAMES, _RESTORED_DISJOINT),
+        update,
+    )
+
+
+@pytest.mark.parametrize(
+    "update", list(_MIN_OF_A_MAX_MARKER.values()), ids=list(_MIN_OF_A_MAX_MARKER)
+)
+def test_a_min_carry_of_a_max_reduction_is_declined(update: str) -> None:
+    """A carry folding the other extremum would keep one lane's max per lane: it is no carry of this marker, and the tail touching the carry has no re-reduce either."""
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        _split(_restored_rows_max_body(update), _ROW_SUMS_RENAMES, _RESTORED_DISJOINT)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        "v_9 = mean_acc_copy + cutlass.Float32(sum_2)\n",
+        "v_9 = cutlass.Float32(mean_acc_copy + sum_2)\n",
+    ],
+    ids=["cast_operand", "cast_sum"],
+)
+def test_a_strided_restore_is_kept_for_a_carry_update_under_a_cast(
+    update: str,
+) -> None:
+    """A cast to the accumulator dtype around an operand or the sum is the render's spelling of the same carry update."""
+    _assert_restored_before(
+        _split(
+            _restored_rows_body(update, carry_copies=1),
+            _ROW_SUMS_RENAMES,
+            _RESTORED_DISJOINT,
+        ),
+        update,
+    )
+
+
+def test_a_carry_update_under_a_narrowing_cast_is_declined() -> None:
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        _split(
+            _restored_rows_body(
+                "v_9 = mean_acc_copy + cutlass.BFloat16(sum_2)\n", carry_copies=1
+            ),
+            _ROW_SUMS_RENAMES,
+            _RESTORED_DISJOINT,
+        )
+
+
+def test_a_strided_restore_is_kept_for_a_carry_update_in_an_if_join() -> None:
+    """An if-join that adds the share under a lane-invariant condition and keeps the carry otherwise adds every lane's share or none: still the carry's reduction over the tile."""
+    update = (
+        "if cond_u:\n    v_9 = mean_acc_copy + sum_2\nelse:\n    v_9 = mean_acc_copy\n"
+    )
+    code = _split(
+        _restored_rows_body(update, carry_copies=1),
+        _ROW_SUMS_RENAMES,
+        _RESTORED_DISJOINT,
+    )
+    (body,) = _lane_passes(code)
+    assert "_lane_total" not in code
+    assert body.index("_cute_grouped_reduce_shared_two_stage(_mask_to,") < body.index(
+        "if cond_u:"
+    )
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        "if mask:\n    v_9 = mean_acc_copy + sum_2\nelse:\n    v_9 = mean_acc_copy\n",
+        (
+            "if mean_acc_copy > 0:\n    v_9 = mean_acc_copy + sum_2\n"
+            "else:\n    v_9 = mean_acc_copy\n"
+        ),
+        (
+            "if cond_u:\n    v_9 = mean_acc_copy + sum_2\n"
+            "else:\n    v_9 = cutlass.Float32(0.0)\n"
+        ),
+    ],
+    ids=["lane_varying_condition", "condition_reads_the_carry", "else_resets"],
+)
+def test_an_if_join_that_is_not_the_same_carry_in_every_lane_is_declined(
+    update: str,
+) -> None:
+    """A condition varying with the lane or reading the carry, or a branch that resets the carry, would leave some lanes' shares out."""
+    with pytest.raises(
+        helion.exc.BackendUnsupported,
+        match="no proved complete per-lane restore|loop-carried value",
+    ):
+        _split(
+            _restored_rows_body(update, carry_copies=1),
+            _ROW_SUMS_RENAMES,
+            _RESTORED_DISJOINT,
+        )
+
+
+def test_an_atomic_add_of_a_strided_reduction_runs_once_on_the_lanes_total() -> None:
+    """The emitted atomic spells its operand by keyword (``val=``); it is a lane-invariant consumer of the total, so the shares are totalled and the one guarded atomic runs after the loop."""
+    code = _split(
+        _restored_rows_body(_GUARDED_ATOMIC_ADD), _ROW_SUMS_RENAMES, _RESTORED_DISJOINT
+    )
+    (body,) = _lane_passes(code)
+    assert (
+        "sum_2_lane_total = sum_2_lane_total + cutlass.Float32(sum_2_lane_share)"
+        in body
+    )
+    assert "atomic_add" not in body
+    after = code[code.index("sum_2 = cutlass.Float32(sum_2_lane_total)") :]
+    assert after.count("cute.arch.atomic_add(") == 1
+    assert after.index("if cute.arch.thread_idx()[0] == 0:") < after.index(
+        "cute.arch.atomic_add("
+    )
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        ("cute.arch.atomic_add(p, val=v, sem='relaxed')", ("p", "v")),
+        ("cute.arch.atomic_add(p, v)", ("p", "v")),
+        ("cute.arch.atomic_cas(p, cmp=a, val=b, sem='relaxed')", None),
+    ],
+    ids=["keyword", "positional", "compare_and_swap"],
+)
+def test_the_atomic_operand_parser_reads_the_keyword_form(
+    call: str, expected: tuple[str, str] | None
+) -> None:
+    node = ast.parse(call, mode="eval").body
+    assert isinstance(node, ast.Call)
+    parts = lanes._atomic_pointer_and_value(node)
+    if expected is None:
+        assert parts is None
+    else:
+        assert parts is not None
+        assert tuple(ast.unparse(part) for part in parts) == expected
+
+
+def test_a_second_marker_input_produced_between_the_markers_joins_the_prefix() -> None:
+    """Two stored reductions of one accumulator under dynamic shapes render the second's masked input between the markers; it reads prefix values only, so it moves before the first marker and both shares are totalled."""
+    body = _restored_rows_body(_STORED_TOTAL).replace(
+        _SUM_MARKER_LINE,
+        _SUM_MARKER_LINE
+        + _STORED_TOTAL
+        + "_mask_to2 = cutlass.Float32(row_sums) if mask else "
+        "cutlass.Float32(float('-inf'))\n"
+        + f"amax_3 = cutlass.Float32({_max_marker('_mask_to2')})\n",
+        1,
+    )
+    body = body[: -len(_STORED_TOTAL)] + _STORED_AMAX
+    code = _split(body, _ROW_SUMS_RENAMES, _TWO_TENSORS_DISJOINT)
+    (lane_body,) = _lane_passes(code)
+    assert (
+        code.index("sum_2_lane_total = cutlass.Float32(0)")
+        < code.index("amax_3_lane_total = cutlass.Float32(float('-inf'))")
+        < code.index("for lane in range(2):")
+    )
+    assert lane_body.index("_mask_to2 = ") < lane_body.index(
+        "_cute_grouped_reduce_shared_two_stage(_mask_to,"
+    )
+    assert "tot.iterator" not in lane_body and "tot2.iterator" not in lane_body
+    after = code[code.index("amax_3 = cutlass.Float32(amax_3_lane_total)") :]
+    assert after.count("% 256 < 1") == 2
+    assert after.index("tot.iterator") < after.index("tot2.iterator")
+
+
+def test_a_second_marker_input_reading_the_first_result_stays_declined() -> None:
+    body = _restored_rows_body(_STORED_TOTAL).replace(
+        _SUM_MARKER_LINE,
+        _SUM_MARKER_LINE
+        + "_mask_to2 = _mask_to * sum_2\n"
+        + f"sum_3 = cutlass.Float32({_masked_marker('_mask_to2')})\n",
+        1,
+    )
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        _split(
+            body + _STORED_AMAX.replace("amax_3", "sum_3"),
+            _ROW_SUMS_RENAMES,
+            _TWO_TENSORS_DISJOINT,
+        )

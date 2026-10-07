@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from ..ast_read_writes import ReadWrites
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
+from .cache_policy_loads import cache_hinted_load_helper
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -1627,10 +1628,15 @@ class _BranchLocalPersistentVectorizer:
                             f"ir.VectorType.get([{width}], {carrier}.mlir_type)"
                         )
                         if eviction in _CUTE_CACHE_LOAD_HELPERS:
+                            # An L2-policy marker is not a ``cute.arch.load``
+                            # kwarg: the 16-, 8- and 4-byte packets go
+                            # through the inline-PTX helper of their width.
+                            helper = cache_hinted_load_helper(
+                                eviction, width * itemsize
+                            )
                             load_source = (
-                                f"{_CUTE_CACHE_LOAD_HELPERS[eviction]}({ast.unparse(base)}, "
-                                f"{vector_type})"
-                                if width * itemsize == 16
+                                f"{helper}({ast.unparse(base)}, {vector_type})"
+                                if helper is not None
                                 else f"cute.arch.load({ast.unparse(base)}, {vector_type})"
                             )
                         else:

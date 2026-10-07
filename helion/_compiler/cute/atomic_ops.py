@@ -198,7 +198,9 @@ def _codegen_common_cute(
     )
     if tensor_index_stmt is not None:
         return tensor_index_stmt
+    from ...language.memory_ops import _cute_access_regions
     from ...language.memory_ops import _cute_index_exprs
+    from ...language.memory_ops import _cute_tag_access_regions
 
     ast_index = state.ast_args[1]
     assert isinstance(ast_index, (list, tuple))
@@ -216,6 +218,11 @@ def _codegen_common_cute(
         ptr=expr_from_string(pointer),
         sem=sem,
         **placeholders,
+    )
+    # The elements the atomic touches, for the barrier analysis
+    # (``lane_loop_distribution``), like a store's.
+    _cute_tag_access_regions(
+        atomic_expr, tensor_name, _cute_access_regions(state, index, target)
     )
     if (
         cute_func == "atomic_add"
@@ -585,6 +592,7 @@ def _cute_vector_atomic_site(
     body = stack[-1]
 
     def emit() -> ast.AST | None:
+        from ...language.memory_ops import CuteTileVecStoreSite
         from .lane_loop_distribution import _tensor_mentions
 
         # The flush runs after the whole V-loop: a later statement of the
@@ -592,25 +600,36 @@ def _cute_vector_atomic_site(
         site = next((i for i, stmt in enumerate(body) if stmt is scalar), len(body))
         if any(tensor_name in _tensor_mentions(stmt) for stmt in body[site + 1 :]):
             return None
-        # Shares the store flush numbering so flushes keep source order.
+        # Shares the store flush numbering so flushes keep source order, and
+        # the store site record so the memory-effect checks see the append as
+        # a write of the target (``_cute_statement_written_tensors``) and the
+        # flush is restored to the scalar atomic like a store's would be.
         sites = sites_by_block.setdefault(block_id, [])
         site_index = len(sites)
         list_var = state.device_function.new_var(
             f"_tile_atomic_vals_{block_id}_{site_index}", dce=False
         )
-        sites.append(list_var)
+        init_stmt = statement_from_string(f"{list_var} = []")
         lane_body.insert(
-            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body),
-            statement_from_string(f"{list_var} = []"),
+            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body), init_stmt
         )
         flush = f"_cute_red_add_f32_vec({base_pointer}, {list_var})"
         if guard:
             flush = f"if {guard}:\n    {flush}"
+        flush_stmt = statement_from_string(flush)
         lane_body.insert(
             _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
-            statement_from_string(flush),
+            flush_stmt,
         )
-        return statement_from_string(f"{list_var}.append({{value}})", value=value_expr)
+        body_stmt = statement_from_string(
+            f"{list_var}.append({{value}})", value=value_expr
+        )
+        sites.append(
+            CuteTileVecStoreSite(
+                list_var, tensor_name, body_stmt, scalar, init_stmt, flush_stmt
+            )
+        )
+        return body_stmt
 
     assert isinstance(atomic_expr, ast.expr)
     scalar: ast.stmt = ast.Expr(value=atomic_expr)
@@ -708,6 +727,9 @@ def _cute_tensor_index_leader_predicate(
     block_id = env.resolve_codegen_block_id(
         block_id, state.codegen, state.fx_node.graph
     )
+    # The gather index covers its own tile axis; the update value's tile axes
+    # are varied along as well (see ``_cute_atomic_value_tile_blocks``).
+    covered_block_ids = {block_id, *_cute_atomic_value_tile_blocks(state)}
 
     index_axes: set[int] = set()
     other_axes: set[int] = set()
@@ -715,14 +737,14 @@ def _cute_tensor_index_leader_predicate(
     grid_state = state.codegen.current_grid_state
     if grid_state is not None:
         for candidate_block_id, thread_axis in grid_state.block_thread_axes.items():
-            if candidate_block_id == block_id:
+            if candidate_block_id in covered_block_ids:
                 index_axes.add(thread_axis)
             else:
                 other_axes.add(thread_axis)
     for loops in state.codegen.active_device_loops.values():
         for loop_state in loops:
             for candidate_block_id, thread_axis in loop_state.block_thread_axes.items():
-                if candidate_block_id == block_id:
+                if candidate_block_id in covered_block_ids:
                     index_axes.add(thread_axis)
                 else:
                     other_axes.add(thread_axis)
@@ -775,7 +797,8 @@ def _cute_uniform_index_value_blocks(
     """Tile axes a tile-uniform atomic varies along, or None when not uniform.
 
     A constant index, or one made of tile attributes (``tile.begin``,
-    ``tile.id``) and 0-d tensors (a scalar the body loaded or reduced,
+    ``tile.id``), ``hl.grid`` indices (one value per program, as a block of one
+    has no thread axis) and 0-d tensors (a scalar the body loaded or reduced,
     ``idx[tile.begin]``), addresses one element for the whole tile.  Such an atomic
     varies only along the tile axes of a tensor update value
     (``hl.atomic_add(total, [0], x[tile])``): along those axes every element
@@ -798,7 +821,7 @@ def _cute_uniform_index_value_blocks(
                 host_function.expr_to_origin.get(expr) if expr is not None else None
             )
             origin = origin_info.origin if origin_info is not None else None
-            if isinstance(origin, GridOrigin) and type(origin) is not GridOrigin:
+            if isinstance(origin, GridOrigin):
                 continue
         return None
     fx_node = state.fx_node
@@ -962,7 +985,46 @@ def _cute_atomic_indexed_blocks(
         indexed_block_ids |= uniform_value_blocks
     if not has_block_size_index:
         return None
-    return indexed_block_ids
+    # The atomic varies along every tile axis of its update value, whatever
+    # the index covers: ``hl.atomic_add(out, [tile_m], x[tile_b, tile_m])``
+    # applies each row's element to ``out[m]``.  Collapsing such an axis to
+    # its leader thread kept the first row of every tile only.
+    return indexed_block_ids | _cute_atomic_value_tile_blocks(state)
+
+
+def _cute_atomic_value_tile_blocks(state: CodegenState) -> set[int]:
+    """Resolved ids of the tile axes the update value(s) of an atomic span.
+
+    Dims that are not a tile axis (ones, static sizes, symbols without a
+    block) are left out; unlike :func:`_cute_uniform_index_value_blocks` this
+    never gives up, because it only widens the axes the atomic varies along.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    fx_node = state.fx_node
+    if fx_node is None:
+        return set()
+    env = CompileEnvironment.current()
+    block_ids: set[int] = set()
+    for position in _cute_atomic_value_positions(state):
+        value = state.proxy_arg(position)
+        if not isinstance(value, torch.Tensor):
+            continue
+        for size in value.shape:
+            if not isinstance(size, torch.SymInt):
+                continue
+            expr = _symint_expr(size)
+            if expr is None:
+                continue
+            for symbol in expr.free_symbols:
+                block_id = env.get_block_id(symbol)
+                if block_id is not None:
+                    block_ids.add(
+                        env.resolve_codegen_block_id(
+                            block_id, state.codegen, fx_node.graph
+                        )
+                    )
+    return block_ids
 
 
 def _cute_unindexed_leader_axes(
@@ -1033,6 +1095,15 @@ def _cute_unindexed_leader_axes(
     # owning loop has finished but whose threads remain live.
     for axis, size in enumerate(state.codegen.max_thread_block_dims):
         if size > 1 and axis not in active_thread_axes:
+            leader_axes.add(axis)
+    # A launch axis sized by a kernel argument has no size here (its block is
+    # recorded without one, ``ThreadAxisTracker.record_symbolic_axis``), yet
+    # its threads are as resident as a static ghost axis's: with its loop
+    # exited or not yet entered, the atomic still runs on the axis's leader.
+    # Exact at every value of the argument; an axis the body never reads
+    # keeps one thread, where the guard holds.
+    for axis in state.device_function.tile_strategy.symbolic_thread_axes():
+        if axis not in active_thread_axes:
             leader_axes.add(axis)
     return leader_axes
 
@@ -1184,6 +1255,65 @@ def _resolve_tensor_index_iota_node(
         current = outer_node
 
 
+_DERIVED_ARANGE_INDEX = (
+    "an atomic index computed from hl.arange (arithmetic on it, a gather by "
+    "it, or a second index component beside it) is not lowered: the per-thread "
+    "form would repeat the atomic across the tile; index with the bare "
+    "hl.arange(start, end, step)"
+)
+_USED_ARANGE_ATOMIC_RESULT = (
+    "an atomic indexed by hl.arange whose result is used is not lowered: the "
+    "leader-thread loop issues one atomic per entry and carries no per-thread "
+    "result; drop the result or index the atomic with a tile"
+)
+_SYMBOLIC_ARANGE_INDEX = (
+    "an atomic indexed by an hl.arange with a symbolic length, start or step is "
+    "not lowered: the leader-thread loop needs static entries and the per-thread "
+    "form would repeat the atomic across the tile; use literal arange bounds"
+)
+_IOTA_TARGETS = frozenset(
+    {
+        torch.ops.prims.iota.default,
+        torch.ops.aten.arange.default,
+        torch.ops.aten.arange.start,
+        torch.ops.aten.arange.start_step,
+    }
+)
+
+
+def _index_derives_from_iota(state: CodegenState, node: torch.fx.Node) -> bool:
+    """Whether ``node``'s value is computed from an ``hl.arange`` (an iota).
+
+    Walks the inputs in this graph and, through a placeholder, the enclosing
+    graph's argument, as :func:`_resolve_tensor_index_iota_node` does for the
+    bare chain; bounded, so an unrelated deep expression is not an iota.
+    """
+    from ..device_ir import NodeArgsGraphInfo
+
+    pending = [node]
+    seen: set[torch.fx.Node] = set()
+    while pending and len(seen) < 64:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current.target in _IOTA_TARGETS:
+            return True
+        if current.op == "placeholder":
+            graph_infos = [
+                graph_info
+                for graph_info in state.codegen.codegen_graphs
+                if graph_info.graph is current.graph
+            ]
+            if len(graph_infos) == 1 and isinstance(graph_infos[0], NodeArgsGraphInfo):
+                outer = graph_infos[0].placeholder_to_outer_arg(current)
+                if isinstance(outer, torch.fx.Node):
+                    pending.append(outer)
+            continue
+        pending.extend(current.all_input_nodes)
+    return False
+
+
 def _codegen_tensor_index_common_cute(
     cute_func: str,
     state: CodegenState,
@@ -1200,17 +1330,29 @@ def _codegen_tensor_index_common_cute(
     from ..compile_environment import CompileEnvironment
 
     fx_node = state.fx_node
-    if fx_node is None or len(index) != 1 or len(fx_node.args) < 2:
+    if fx_node is None or len(fx_node.args) < 2:
+        return None
+    fx_index = fx_node.args[1]
+    if not isinstance(fx_index, (list, tuple)):
+        return None
+    if len(index) != 1 or len(fx_index) != 1:
+        # A second component beside an arange keeps the generic per-thread
+        # form from here, whose iota is the matcher's per-thread fold: not a
+        # lowering of the tile-uniform index.
+        for component in fx_index:
+            if isinstance(component, torch.fx.Node) and _index_derives_from_iota(
+                state, component
+            ):
+                raise exc.BackendUnsupported("cute", _DERIVED_ARANGE_INDEX)
         return None
     tensor_index = index[0] if isinstance(index[0], torch.Tensor) else None
-    fx_index = fx_node.args[1]
-    if not isinstance(fx_index, (list, tuple)) or len(fx_index) != 1:
-        return None
     index_node = fx_index[0]
     if not isinstance(index_node, torch.fx.Node):
         return None
     iota_node = _resolve_tensor_index_iota_node(state, index_node)
     if iota_node is None:
+        if _index_derives_from_iota(state, index_node):
+            raise exc.BackendUnsupported("cute", _DERIVED_ARANGE_INDEX)
         return None
     iota_val = iota_node.meta.get("val")
     if isinstance(iota_val, torch.Tensor) and iota_val.ndim == 1:
@@ -1308,56 +1450,100 @@ def _codegen_tensor_index_loop_common_cute(
 ) -> ast.AST | None:
     from ..ast_extension import statement_from_string
 
+    iota_node = _resolve_tensor_index_iota_node(state, index_node)
+    if iota_node is None:
+        return None
+    # The index is an hl.arange from here on and the leader loop below is its
+    # only lowering: a shape the loop cannot take declines instead of falling
+    # through to the per-thread form, which repeats the atomic across the tile.
     fx_node = state.fx_node
     if fx_node is None or len(fx_node.users) > 0:
-        return None
+        raise exc.BackendUnsupported("cute", _USED_ARANGE_ATOMIC_RESULT)
     if tensor_index.ndim != 1:
-        return None
+        raise exc.BackendUnsupported("cute", _DERIVED_ARANGE_INDEX)
     extent = tensor_index.shape[0]
-    if not isinstance(extent, int):
-        return None
+    start = iota_node.kwargs.get("start", 0)
+    step = iota_node.kwargs.get("step", 1)
+    if not all(isinstance(value, int) for value in (extent, start, step)):
+        raise exc.BackendUnsupported("cute", _SYMBOLIC_ARANGE_INDEX)
 
-    ast_index = state.ast_args[1]
-    if not isinstance(ast_index, (list, tuple)) or len(ast_index) != 1:
-        return None
-    ast_index_expr = ast_index[0]
-    if not isinstance(ast_index_expr, ast.AST):
-        return None
+    # The index is the same ``extent`` entries on every thread, so the loop
+    # below is the tile program: one thread of the tile walks the entries
+    # (``hl.arange(k)`` as an index).  The iota matcher's per-thread
+    # coordinate (``indices_0 // 8`` for ``hl.arange(4)`` under a 32-row tile)
+    # is not a lowering of it: every row thread would add, 8 per entry per
+    # tile, and a partial tile past the buffer.
+    from ..compile_environment import CompileEnvironment
 
-    iota_node = _resolve_tensor_index_iota_node(state, index_node)
+    env = CompileEnvironment.current()
+    host_function = HostFunction.current()
     indexed_values: list[ast.AST] = []
     value_arg_offset = 2
     for value_expr, _keyword_name in zip(value_exprs, keyword_names, strict=True):
         value_proxy = state.proxy_arg(value_arg_offset)
         value_arg_offset += 1
         if isinstance(value_proxy, torch.Tensor) and value_proxy.ndim == 1:
+            # A host tensor is read per entry (or once, when it has one entry:
+            # torch broadcasts it); a register tensor's elements live one per
+            # thread and have no per-entry element here.
+            if value_proxy not in host_function.tensor_to_origin:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "an atomic indexed by hl.arange with a device tensor value: the "
+                    "index is the same on every thread while the value's elements "
+                    "live one per thread",
+                )
+            length = value_proxy.shape[0]
+            if isinstance(length, int) and length == 1:
+                entry = "0"
+            elif (isinstance(length, int) and length == extent) or (
+                isinstance(length, torch.SymInt) and env.known_equal(length, extent)
+            ):
+                entry = "_tensor_index_i"
+            elif isinstance(length, torch.SymInt):
+                # A dynamic length (every size is one under
+                # ``static_shapes=False``) is read per entry, or once when the
+                # call passes one entry: the select is a real branch in the
+                # DSL, so the one-entry value is never read past its end.
+                size_expr = state.device_function.tensor_size(value_proxy, 0).name
+                entry = f"(_tensor_index_i if {size_expr} > 1 else 0)"
+            else:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"an atomic indexed by hl.arange of {extent} entries with a "
+                    f"value of length {length}: the value is read per entry, or "
+                    "once when it has one",
+                )
             tensor_arg = state.device_function.tensor_arg(value_proxy)
             indexed_values.append(
                 expr_from_string(
                     "{value}[{idx}]",
                     value=expr_from_string(tensor_arg.name),
-                    idx=expr_from_string("_tensor_index_i"),
+                    idx=expr_from_string(entry),
                 )
             )
             continue
-        if extent != 1:
-            return None
+        # A scalar (a Python or symbolic number) or a 0-d tensor is the one
+        # value of every entry.
+        if not (
+            extent == 1
+            or isinstance(
+                value_proxy,
+                (bool, int, float, torch.SymInt, torch.SymFloat, torch.SymBool),
+            )
+            or (isinstance(value_proxy, torch.Tensor) and value_proxy.ndim == 0)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "an atomic indexed by hl.arange with a value of rank "
+                f"{getattr(value_proxy, 'ndim', type(value_proxy).__name__)}: one "
+                "value per entry or one for all is lowered",
+            )
         indexed_values.append(value_expr)
 
-    if iota_node is not None:
-        start = iota_node.kwargs.get("start", 0)
-        step = iota_node.kwargs.get("step", 1)
-        if not isinstance(start, int) or not isinstance(step, int):
-            return None
-        index_expr = expr_from_string(
-            f"cutlass.Int32({start}) + cutlass.Int32({step}) * cutlass.Int32(_tensor_index_i)"
-        )
-    else:
-        index_expr = expr_from_string(
-            "cutlass.Int32({index}[{idx}])",
-            index=ast_index_expr,
-            idx=expr_from_string("_tensor_index_i"),
-        )
+    index_expr = expr_from_string(
+        f"cutlass.Int32({start}) + cutlass.Int32({step}) * cutlass.Int32(_tensor_index_i)"
+    )
 
     tensor_name = state.device_function.tensor_arg(target).name
     resolved_kwargs = _resolve_cute_atomic_kwargs(cute_func, keyword_names)
@@ -1378,11 +1564,25 @@ def _codegen_tensor_index_loop_common_cute(
         **placeholders,
     )
     assert isinstance(atomic_expr, ast.expr)
+    # The tile-uniform index covers no tile axis; the value's tile axes (a
+    # host tensor has none) are the only ones the atomic varies along, so the
+    # leader of every other launch axis issues the loop: the active ones, the
+    # ghosts of exited loops and the argument-sized axes alike
+    # (``_cute_unindexed_leader_axes``), pinned to the first lane of the
+    # lane loops it does not vary along (``_cute_uniform_lane_vars``).
+    covered_block_ids = _cute_atomic_value_tile_blocks(state)
+    setattr(
+        atomic_expr,
+        HELION_ATOMIC_UNIFORM_LANES_ATTR,
+        _cute_uniform_lane_vars(state, covered_block_ids),
+    )
     predicate_terms = [
         predicate
         for predicate in (
-            _cute_active_mask_predicate(state),
-            _cute_tensor_index_leader_predicate(state, tensor_index),
+            _cute_active_mask_predicate(state, covered_block_ids),
+            _cute_leader_predicate(
+                _cute_unindexed_leader_axes(state, covered_block_ids)
+            ),
         )
         if predicate is not None
     ]

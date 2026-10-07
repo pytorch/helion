@@ -821,17 +821,28 @@ def test_small_grid_seeds_add_one_cta_tiles_with_pdl() -> None:
             for seed in spec.compiler_seed_configs
             if seed.config.get("tcgen05_cta_group") == "auto"
         ]
-        # A 128x128 output is one standard tile: 64-row tiles with 16/32/64
-        # columns spread the operand re-reads over 16/8/4 CTAs.
+        # A 128x128 output is one standard tile: 128-row tiles with 16/32/64
+        # columns spread the operand re-reads over 16/8/4 CTAs, and the 64-row
+        # tiles halve each CTA's A tile over twice the CTAs; both row heights
+        # are seeded because the 64-row grids (32/16/8 CTAs) stay within one
+        # wave of the 148 SMs.  The one-wave seed adds the same 64x32 tile
+        # (the one-tile-per-CTA grid closest to the SM count) at the narrowest
+        # K step with the whole K loop in flight (ab_stages = 256 / 64).
         assert sorted({tuple(seed.block_sizes[2:]) for seed in one_cta}) == [
             (64, 16, 128),
+            (64, 32, 64),
             (64, 32, 128),
             (64, 64, 128),
+            (128, 16, 128),
+            (128, 32, 128),
+            (128, 64, 128),
         ]
         for seed in one_cta:
             assert seed.config["pid_type"] == "persistent_interleaved"
             assert seed.config["tcgen05_cluster_m"] == 1
-            assert seed.config["tcgen05_ab_stages"] == 2
+            assert seed.config["tcgen05_ab_stages"] == (
+                4 if seed.block_sizes[4] == 64 else 2
+            )
         # The producer-layout carriers of those seeds ask for the programmatic
         # dependent launch; the bare native seeds keep the search default.
         assert all(

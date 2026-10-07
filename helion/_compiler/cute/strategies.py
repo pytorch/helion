@@ -515,6 +515,36 @@ TCGEN05_NUM_EPI_WARPS_CONFIG_KEY = "tcgen05_num_epi_warps"
 # the constructor instead of relying on the ``swizzle_size=1`` default.
 TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY = "tcgen05_l2_swizzle_size"
 
+# Persistent walk over a batched (leading passthrough) tcgen05 GEMM grid.
+# The static scheduler pairs its ``cluster_m`` CTAs along its dim 0 and its
+# ``cluster_n`` CTAs along dim 1, so the (batch, m, n) PID axes can sit on
+# the scheduler dims in two orders: ``batch_fastest`` keeps the batch on dim
+# 0 (consecutive clusters take consecutive batches of the same output tile,
+# the pre-knob order); ``batch_slowest`` walks (m, n, batch), so consecutive
+# clusters exhaust one batch before moving on and its A tile is shared by the
+# N peers and its B tile by the M clusters *at the same time* (cuBLAS's
+# batched nvjet grids put the batch on grid z).  Measured on 16 x
+# 512x768x1024 fp16 with the 2x2 256x256x64 ab6 cluster: 16.86 -> 16.10 us
+# (the batch_fastest order fetched every B tile from DRAM in two separate
+# persistent rounds); the 2x1 pair is indifferent at that shape.  Only
+# batched grids carry the knob; plain GEMMs raster through ``loop_orders``.
+TCGEN05_BATCH_RASTER_CONFIG_KEY = "tcgen05_batch_raster"
+TCGEN05_BATCH_RASTER_FASTEST = "batch_fastest"
+TCGEN05_BATCH_RASTER_SLOWEST = "batch_slowest"
+TCGEN05_BATCH_RASTER_CHOICES: tuple[str, ...] = (
+    TCGEN05_BATCH_RASTER_FASTEST,
+    TCGEN05_BATCH_RASTER_SLOWEST,
+)
+TCGEN05_BATCH_RASTER_DEFAULT = TCGEN05_BATCH_RASTER_FASTEST
+
+
+def batch_raster_from_config(config: Mapping[str, object]) -> str:
+    """Decode ``tcgen05_batch_raster`` (default ``batch_fastest``)."""
+    value = config.get(TCGEN05_BATCH_RASTER_CONFIG_KEY, TCGEN05_BATCH_RASTER_DEFAULT)
+    assert value in TCGEN05_BATCH_RASTER_CHOICES, value
+    return str(value)
+
+
 # Legal L2 tile-scheduler swizzle sizes. ``1`` means no swizzle (current
 # default), the others mirror Quack's ``max_swizzle_size`` envelope (the
 # upstream knob accepts powers of two from ``1`` up). The accept set is
@@ -672,6 +702,40 @@ def layout_overrides_from_config(
         d_store_box_n=_as_optional_int(
             config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY)
         ),
+    )
+
+
+def tcgen05_explicit_epilogue_tile_supported(
+    *,
+    is_two_cta: bool,
+    bm: int,
+    bn: int,
+    tile_shape: tuple[int | None, int | None, int | None],
+) -> bool:
+    """Whether the current tcgen05 explicit-epilogue path supports the tile.
+
+    Shared by the matmul plan (configured tiles and the promoted row-vector
+    (128, 32) subtile) and the autotune seeds' SMEM model, so both agree on
+    which geometries take an explicit subtile.
+    """
+    epi_tile_m, epi_tile_n, d_store_box_n = tile_shape
+    return (
+        # Four epilogue warps own 16 or 32 supported TMEM datapaths each.
+        epi_tile_m in (64, 128)
+        # Use the dtype-independent, power-of-two TMA store widths validated by
+        # this backend; 16 is the minimum that also gives FP8 a 128-bit row.
+        and epi_tile_n in (16, 32, 64)
+        # Helion emits one epilogue subtile per TMA store box.
+        and d_store_box_n == epi_tile_n
+        # Every MMA M tile must partition into whole epilogue subtiles.
+        and bm % epi_tile_m == 0
+        # Every MMA N tile must partition into whole store boxes.
+        and bn % epi_tile_n == 0
+        # Explicit 2CTA uses the established per-CTA M128 partition.
+        and (not is_two_cta or epi_tile_m == 128)
+        # 2CTA BM128 needs a permuted per-CTA M64 layout that integer explicit
+        # tile overrides cannot express, so it stays on the implicit path.
+        and not (is_two_cta and bm == 128)
     )
 
 

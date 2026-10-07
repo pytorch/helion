@@ -45,6 +45,7 @@ from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
+from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
@@ -79,6 +80,7 @@ from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
+from .type_info import TensorAttributeType
 from .type_info import TensorType
 from .type_info import TileIndexType
 from .type_info import TypeInfo
@@ -555,14 +557,21 @@ class IfGraphInfo(NodeArgsGraphInfo):
         if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
         state.add_statement(if_ast_node)
 
-        with state.codegen.set_statements(body_stmts):
+        # A constant condition is one branch for every thread.  A context
+        # manager instance cannot be entered twice, so build one per branch.
+        def divergent() -> contextlib.AbstractContextManager[None]:
+            if constexpr_test is None:
+                return state.codegen.divergent_control_flow()
+            return contextlib.nullcontext()
+
+        with divergent(), state.codegen.set_statements(body_stmts):
             if_outputs = codegen_call_with_graph(state.codegen, self.graph, if_args)
 
         else_outputs = []
         if self.else_branch is not None:
             else_graph = state.get_graph(self.else_branch)
             assert isinstance(else_graph, ElseGraphInfo)
-            with state.codegen.set_statements(orelse_stmts):
+            with divergent(), state.codegen.set_statements(orelse_stmts):
                 else_outputs = codegen_call_with_graph(
                     state.codegen, else_graph.graph, else_args
                 )
@@ -674,15 +683,18 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         )
 
         body_statements: list[ast.AST] = []
-        with state.codegen.set_statements(body_statements):
+        with (
+            state.codegen.divergent_control_flow(),
+            state.codegen.set_statements(body_statements),
+        ):
             outputs = codegen_call_with_graph(
                 state.codegen,
                 self.graph,
                 args,
                 copy_named_args=False,
             )
-        loop_condition_update: list[ast.AST] = []
-        cond_expr_loop = emit_condition(loop_condition_update)
+            loop_condition_update: list[ast.AST] = []
+            cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
         body_statements.append(
             create(
@@ -2277,6 +2289,12 @@ class WalkDeviceAST(NodeVisitor):
             return
         self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
+    def visit_IfExp(self, node: ast.IfExp) -> object:
+        test_proxy = self.visit(node.test)
+        if isinstance(test_proxy, _tracing_ops._symbolic_types):
+            raise exc.StatementNotSupported("dynamic conditional expression")
+        return self.visit(node.body if test_proxy else node.orelse)
+
     def _create_if_subgraph(
         self,
         test_proxy: object,
@@ -2746,7 +2764,20 @@ class WalkDeviceAST(NodeVisitor):
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
-        return getattr(self.visit(node.value), node.attr)
+        value = self.visit(node.value)
+        # Apply the replacement here so saved bound methods use it too.
+        assert isinstance(node, ExtendedAST)
+        if (
+            isinstance(node._type_info, TensorAttributeType)
+            and node.attr in _TENSOR_METHOD_REPLACEMENTS
+            and (
+                replacement := get_device_func_replacement(
+                    getattr(torch.Tensor, node.attr)
+                )
+            )
+        ):
+            return functools.partial(replacement, value)
+        return getattr(value, node.attr)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.scope[node.name] = None
@@ -3377,9 +3408,15 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # ordinary cute kernels.
             from .backend import detect_flash_search_surface
             from .cute.cute_flash_bwd import detect_flash_bwd_search_surface
+            from .cute.cute_flash_gated import detect_flash_gated_search_surface
 
             detect_flash_bwd_search_surface(device_ir)
             flash_shape = detect_flash_search_surface(device_ir)
+            gated_surface = (
+                None
+                if flash_shape is not None
+                else detect_flash_gated_search_surface(device_ir)
+            )
             if flash_shape is not None:
                 from ..language.matmul_ops import _cuda_num_sms_or_zero
 
@@ -3400,8 +3437,26 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
                     has_row_epilogue=flash_shape.has_row_epilogue,
                     plain_row_body=flash_shape.plain_row_body,
+                    has_score_modifiers=flash_shape.has_score_modifiers,
                     device_sm_count=_cuda_num_sms_or_zero(
                         CompileEnvironment.current().device
+                    ),
+                )
+            elif gated_surface is not None:
+                # The fused gated body owns the whole root; tcgen05 matmul
+                # planning would add search fields that hide the gated knob.
+                config_spec.enable_cute_flash_gated_search(
+                    block_size_targets=gated_surface.block_size_targets,
+                    kv_block_id=gated_surface.kv_block_id,
+                    q_block_id=gated_surface.q_block_id,
+                    q_tile_choices=gated_surface.q_tile_choices,
+                    kv_tile_choices=gated_surface.kv_tile_choices,
+                    kv_stage_choices=gated_surface.kv_stage_choices,
+                    kv_stage_default=gated_surface.kv_stage_default,
+                    gate_warpgroup_choices=gated_surface.gate_warpgroup_choices,
+                    gate_warpgroup_default=gated_surface.gate_warpgroup_default,
+                    kv_stage_choices_by_tile=dict(
+                        gated_surface.kv_stage_choices_by_tile
                     ),
                 )
             else:
@@ -3490,6 +3545,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             candidate.operands.rhs.rhs_segment_group is not None
                             or candidate.operands.rhs.rhs_packed_group is not None
                         ),
+                        lhs_source=candidate.operands.lhs.source_fake,
+                        rhs_source=candidate.operands.rhs.source_fake,
+                        operands_permuted=(
+                            candidate.operands.lhs.source_to_logical_order is not None
+                            or candidate.operands.rhs.source_to_logical_order
+                            is not None
+                        ),
                     )
                     planning_results.append(planning_result)
                     search_plan = planning_result.plan
@@ -3535,6 +3597,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             item.explicit_epi_tile_compatible
                             for item, _lhs, _plan in search_candidates
                         ),
+                        leading_block_id=(
+                            candidate.operands.leading_passthrough_block_id
+                        ),
+                        # The register-MMA family replaces the whole device
+                        # body of ONE GEMM (its root tile loop around its K
+                        # loop); kernels with several matmuls keep tcgen05.
+                        warp_mma_plain_kernel=len(mma_candidates) == 1,
                     )
                     if len(mma_candidates) == 1 and not (
                         config_spec.reduction_block_ids

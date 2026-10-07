@@ -4368,7 +4368,8 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     assert policy["kind"] == "canonical_cute_flash"
     # Every surface seeds the flat ws_overlap grid once next to the persistent
     # family seed (a distinct source variant); the dense hd64 surface still
-    # carries one alias among its raw seeds.
+    # carries one alias among its raw seeds. These grids are far beyond the
+    # row_mma search bound, so the row programs seed nothing here.
     assert policy["raw_config_count"] == (10 if causal else 27)
     assert len(policy["effective_config_ids"]) == (10 if causal else 26)
     assert len(generation_zero_ids) == 100
@@ -4378,8 +4379,9 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
 @pytest.mark.parametrize(
     ("kernel_name", "shape", "expected_raw_count", "expected_effective_count"),
     (
-        # The dense hd128 surface seeds the four plain batched exp2 packets too.
-        ("attention_output", (2, 32, 262144, 128), 12, 12),
+        # The dense hd128 surface seeds the four plain batched exp2 packets too
+        # and the alternating-warpgroup family.
+        ("attention_output", (2, 32, 262144, 128), 13, 13),
         ("causal_attention_output", (2, 32, 524288, 128), 2, 2),
         ("attention_output", (1, 32, 524288, 64), 16, 15),
         ("causal_attention_output", (1, 32, 1048576, 64), 8, 8),
@@ -7732,10 +7734,17 @@ def _full_autotune_trial_with_failed_clc_combination():
     leaf = cast("dict[str, Any]", phase["leaf_results"][0])
     clc = cast("dict[str, Any]", phase["clc_families"][0])
     depth_ids = set(cast("list[str]", clc["combination_depth_config_ids"]))
+    # The failed cell must be a config first measured in the combination pass:
+    # a generation-zero member keeps its (successful) initial snapshot, so
+    # failing its later cell would make the timeline inconsistent.
+    initial_ids = {
+        cast("str", record["config_id"])
+        for record in cast("list[dict[str, Any]]", phase["initial_results"])
+    }
     failed_cell = next(
         cell
         for cell in cast("list[dict[str, Any]]", clc["combination_cells"])
-        if cell["config_id"] not in depth_ids
+        if cell["config_id"] not in depth_ids and cell["config_id"] not in initial_ids
     )
     failed_id = cast("str", failed_cell["config_id"])
     failed_cell.update(

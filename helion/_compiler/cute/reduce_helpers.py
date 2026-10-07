@@ -1252,18 +1252,19 @@ def _cute_grouped_reduce_shared_two_stage_fragment_body(
                 ),
             )
         if lane_in_warp < pre:
-            smem[
-                partials_base
-                + (lane_in_warp * count + i) * warps_per_group
-                + warp_in_group
-            ] = value
+            # Warp-major partials: the ``pre`` writing lanes of a warp hit
+            # ``count``-strided words and the second stage's consecutive
+            # threads read consecutive words, so neither stage bank-conflicts
+            # (slot-major placed the warps of one slot ``warps_per_group``
+            # words apart: a 4-way store and a 16-way load conflict).
+            smem[partials_base + warp_in_group * slots + lane_in_warp * count + i] = (
+                value
+            )
     cute.arch.sync_threads()
     if lane_in_group_var < slots:
-        total = smem[partials_base + lane_in_group_var * warps_per_group]
+        total = smem[partials_base + lane_in_group_var]
         for w in cutlass.range_constexpr(1, warps_per_group):
-            total = combine(
-                total, smem[partials_base + lane_in_group_var * warps_per_group + w]
-            )
+            total = combine(total, smem[partials_base + w * slots + lane_in_group_var])
         smem[results_base + lane_in_group_var] = total
     cute.arch.sync_threads()
     for i in cutlass.range_constexpr(count):

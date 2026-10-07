@@ -35,8 +35,12 @@ from ..compile_environment import CompileEnvironment
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
+from .cute_epilogue import aux_leaf_promoted_by_f32_root
+from .cute_epilogue import aux_leaf_takes_promoted_f32_stage
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
+from .tcgen05_constants import Tcgen05RowvecAuxFacts
+from .tcgen05_constants import Tcgen05RowvecAuxRow
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -301,6 +305,62 @@ def discover_tcgen05_aux_tensor_descriptors(
     return tuple(descriptors)
 
 
+def tcgen05_promoted_rowvec_epilogue(
+    cg: GenerateAST,
+    matmul_fx_node: torch.fx.Node,
+    *,
+    epi_warp_count: int,
+    bn: int,
+    output_column_major: bool,
+    partial_output_tma_store: bool,
+) -> bool:
+    """Whether every store of this matmul is a 16-bit row-vector epilogue whose
+    rows the store lowering stages as FP32 (``memory_ops``
+    ``rowvec_stage_promotes_to_f32``, i.e. the shared
+    :func:`aux_leaf_takes_promoted_f32_stage`): one store value, one or more
+    N-broadcast 16-bit aux leaves consumed only by the FP32 root op, each wide
+    enough for the cooperative stage copy, on a full-tile TMA-store epilogue
+    into a row-major output.
+
+    The matmul plan uses this to pick the epilogue subtile ahead of the store
+    lowering, so the plan, the store body and the wrapper-side TMA store box
+    agree, and so the (128, 32) subtile is only chosen when the stage is taken.
+    """
+    if output_column_major or partial_output_tma_store:
+        return False
+    if matmul_fx_node not in cg.device_function.cute_state.matmul_fx_nodes:
+        return False
+    analyzed_stores = analyze_tcgen05_matmul_store_chains(
+        cg.codegen_graphs, matmul_fx_node
+    )
+    if not analyzed_stores:
+        return False
+    store_values = {store_node.args[2] for store_node, _chain in analyzed_stores}
+    if len(store_values) != 1:
+        return False
+    _store_node, chain = analyzed_stores[0]
+    leaves = chain.auxiliary_tensor_loads
+    if not leaves:
+        return False
+    for leaf in leaves:
+        host_tensor = leaf.load_node.args[0]
+        assert isinstance(host_tensor, torch.fx.Node)
+        host_val = host_tensor.meta.get("val")
+        if not isinstance(host_val, torch.Tensor):
+            return False
+        extent = host_val.shape[0] if leaf.broadcast_axis == 1 else None
+        if not aux_leaf_takes_promoted_f32_stage(
+            chain,
+            leaf,
+            aux_dtype_bits=host_val.dtype.itemsize * 8,
+            epi_warp_count=epi_warp_count,
+            bn=bn,
+            aux_extent=extent if isinstance(extent, int) else None,
+        ):
+            return False
+    return True
+
+
 def host_function_has_tcgen05_aux_kernel_pattern(
     host_function: HostFunction,
 ) -> bool:
@@ -341,6 +401,56 @@ def host_function_has_tcgen05_aux_kernel_pattern(
         ):
             return True
     return False
+
+
+def host_function_tcgen05_rowvec_aux_facts(
+    host_function: HostFunction,
+) -> Tcgen05RowvecAuxFacts | None:
+    """Row-vector aux rows of the kernel's tcgen05 epilogue chains.
+
+    Pre-codegen companion of :func:`host_function_has_tcgen05_aux_kernel_pattern`
+    for the autotune seeds: the N-broadcast rows the analyzed stores load, their
+    element sizes and whether the store lowering stages them promoted to FP32
+    (:func:`aux_leaf_promoted_by_f32_root`), plus the stored output's element
+    size. Rows are counted per store, as the store lowering allocates them.
+    ``None`` when no store chain was analyzed or the analyzed stores disagree
+    on the output element size.
+    """
+    graphs = host_function.device_ir.graphs
+    if not graphs:
+        return None
+    output_itemsize: int | None = None
+    rows: list[Tcgen05RowvecAuxRow] = []
+    for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        if analyzed_stores is None:
+            continue
+        for store_node, chain in analyzed_stores:
+            output = _output_tensor_from_store_node(store_node)
+            if output is None or (
+                output_itemsize is not None and output.dtype.itemsize != output_itemsize
+            ):
+                return None
+            output_itemsize = output.dtype.itemsize
+            for leaf in chain.auxiliary_tensor_loads:
+                if leaf.broadcast_axis != 1:
+                    continue
+                host_tensor = leaf.load_node.args[0]
+                assert isinstance(host_tensor, torch.fx.Node)
+                host_val = host_tensor.meta.get("val")
+                if not isinstance(host_val, torch.Tensor):
+                    return None
+                itemsize = host_val.dtype.itemsize
+                rows.append(
+                    Tcgen05RowvecAuxRow(
+                        itemsize=itemsize,
+                        promoted=itemsize == 2
+                        and aux_leaf_promoted_by_f32_root(chain, leaf),
+                    )
+                )
+    if output_itemsize is None:
+        return None
+    return Tcgen05RowvecAuxFacts(output_itemsize=output_itemsize, rows=tuple(rows))
 
 
 def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(

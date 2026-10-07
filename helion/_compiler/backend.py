@@ -79,6 +79,7 @@ class FlashSearchSurface(NamedTuple):
     supports_tensor_4d_tma: bool
     has_row_epilogue: bool
     plain_row_body: bool
+    has_score_modifiers: bool
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3238,6 +3239,8 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 plain_row_body=(
                     not pattern.score_plan.modifiers and not has_row_epilogue
                 ),
+                # The row programs take a fused row epilogue but no modifier.
+                has_score_modifiers=bool(pattern.score_plan.modifiers),
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(

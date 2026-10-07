@@ -437,12 +437,14 @@ def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
             declined.append(True)
             raise
 
+    # The knob-off code puts the row threads on the z axis, whose launch limit
+    # is 64; 128 of them were an unlaunchable ``block=(2, 4, 128)``.
     with patch.object(sink_vector_loops._Sinker, "run", run):
         code = _both(
             col_reduce_sum_lower_triangle_static,
             (x,),
             **_sink_config(
-                block_sizes=[1024, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+                block_sizes=[1024, 16], num_threads=[64, 4], vec=[1, 4], unroll=8
             ),
         )
     assert declined == [True]
@@ -914,10 +916,20 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         (128, 4),
         (128, 2),
     }
+    # The half-width vector seed: four grid threads owning 8-byte vectors.
+    assert any(
+        seed.config["block_sizes"] == [4096, 16]
+        and seed.config["num_threads"] == [128, 4]
+        and seed.config["cute_vector_widths"] == [1, 4]
+        for seed in seeds
+    )
+    # Every coalesced seed overlaps its launch with the output's zero fill.
+    assert all(seed.config["cute_pdl"] is True for seed in seeds)
     # The seeded knobs are searchable and normalize unchanged.
     normalized = spec.normalized_config(seeds[0])
     assert normalized.config["cute_vloop_sink"] is True
     assert normalized.config["cute_lane_unroll"] == 8
+    assert normalized.config["cute_pdl"] is True
     # The seeded layout actually sinks.
     assert FRAGMENT_REDUCE in bound.to_code(normalized)
     # Dynamic extents are proven through the exact input metadata; static

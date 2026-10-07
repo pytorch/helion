@@ -51,6 +51,7 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 from .variable_origin import TileBeginOrigin
+from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
+    from helion._compiler.pallas.plan_tiling import GridScalarIndex
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -79,9 +81,19 @@ tls: _TLS = cast("_TLS", threading.local())
 def _exact_thread_block_dims(
     tile_strategy: TileStrategyDispatch,
 ) -> tuple[int, int, int] | None:
-    """Return a proven-static launch shape, or ``None`` when inference fails."""
+    """Return a proven-static launch shape, or ``None`` when inference fails.
+
+    ``None`` as well when a launch axis is sized by a kernel argument
+    (``TileStrategyDispatch.symbolic_thread_axes``): the static shape holds a
+    one for it, and a pass proving bounds from that one (the lane-tile bounds
+    simplifier erased the leader guard ``cute.arch.thread_idx()[axis] == 0``
+    of an atomic beside the axis, which then ran once per thread of it) would
+    prove the wrong thing.
+    """
 
     try:
+        if tile_strategy.symbolic_thread_axes():
+            return None
         thread_dims = tile_strategy.thread_block_dims()
         if len(thread_dims) != 3 or any(
             not isinstance(dim, (int, sympy.Integer)) for dim in thread_dims
@@ -438,6 +450,10 @@ class DeviceFunction:
         self._flydsl_setup: dict[tuple[object, ...], dict[str, int | str]] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
+        # Pallas: tensor dimensions selected by scalar metadata indexed by one
+        # outer grid axis. The launcher scalar-prefetches the metadata and uses
+        # it directly in the selected tensor's BlockSpec index map.
+        self.pallas_grid_scalar_indices: dict[int, dict[int, GridScalarIndex]] = {}
         # Track Pallas remote-copy operands by tensor and storage identity. The
         # storage key keeps views of the same allocation consistent across
         # nested control-flow graphs.
@@ -774,6 +790,8 @@ class DeviceFunction:
                 return self.codegen.offset_var(resolved)
             if type(origin.origin) is TileBeginOrigin:
                 return self.codegen.tile_begin_var(resolved)
+            if type(origin.origin) is TileExtentOrigin:
+                return self.tile_extent_expr(resolved)
             # Render through the origin so each derived edge keeps its own
             # formula, but on the resolved live loop: host_str() reads
             # offset_var and active_device_loops by block_id, and an aliased
@@ -781,6 +799,44 @@ class DeviceFunction:
             derived = dataclasses.replace(origin.origin, block_id=resolved)
             return f"({derived.host_str()})"
         return self.expr_arg(expr, origin.origin).name
+
+    def tile_extent_expr(self, block_id: int) -> str:
+        """The elements the current tile of ``block_id`` holds, as device code.
+
+        The block size when the loop needs no mask (the block divides the
+        dim), otherwise ``min(begin + block, end) - begin``: the last tile of
+        a dim the block does not divide, or a block wider than the dim, holds
+        fewer elements than the block, and the masked ones must not count
+        in a mean.  Spelled as a parenthesized compound expression in that
+        case, as the other derived tile edges are.
+
+        A masked loop that carries no end variable has no per-dim extent to
+        divide by: a flattened loop's dims share one flat bound, and some
+        strategies keep a data-dependent end as a tensor.  No shipped
+        strategy hosts a reduction in such a loop (a loop with a reduction
+        is never flattened); should one, the mean is declined rather than
+        divided by the block.
+        """
+        env = CompileEnvironment.current()
+        block_size = self.block_size_var(env.canonical_block_id(block_id))
+        if block_size is None:
+            block_size = "1"
+        if self.codegen.mask_var(block_id) is None:
+            return block_size
+        end = (
+            self.codegen.active_device_loops[block_id][-1]
+            .block_id_to_info[block_id]
+            .end_var_name
+        )
+        if end is None:
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"a mean over tile dim {block_id} in a masked loop without an end "
+                "variable: the tile's extent is unknown there",
+            )
+        begin = self.codegen.tile_begin_var(block_id)
+        clamped = env.backend.minimum_expr(f"{begin} + {block_size}", end)
+        return f"(({clamped}) - {begin})"
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
@@ -1041,6 +1097,19 @@ class DeviceFunction:
             )
         self._constexpr_host_defs.add(name)
 
+    def host_constexpr_def(self, name: str, host_expr: str) -> str:
+        """Define a host-only constant once (launch-grid inputs, not kernel args).
+
+        Returns ``name``; the definition is appended to the host statements
+        the first time it is requested for this function.
+        """
+        if name not in self._constexpr_host_defs:
+            self._constexpr_host_defs.add(name)
+            self.codegen.host_statements.append(
+                statement_from_string(f"{name} = {host_expr}")
+            )
+        return name
+
     def _format_constexpr_value(self, value: object) -> str:
         if isinstance(value, str):
             return value
@@ -1211,9 +1280,19 @@ class DeviceFunction:
                 statement_from_string("cute.arch.cluster_arrive_relaxed()"),
                 statement_from_string("cute.arch.cluster_wait()"),
             ]
+        dependent_launch: list[ast.stmt] = []
+        if self._cute_pdl_applies():
+            # Programmatic dependent launch (``cute_pdl``): the launch and
+            # this prologue overlap the previous kernel in the stream; wait
+            # for it before the first global memory access.
+            with SyntheticLocation():
+                dependent_launch = [
+                    statement_from_string("cute.arch.griddepcontrol_wait()")
+                ]
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
+                *dependent_launch,
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
@@ -1343,6 +1422,23 @@ class DeviceFunction:
                     thread_block_dims = exact_thread_block_dims
                     thread_block_dims_are_exact = True
             if exact_thread_block_dims is not None:
+                # The strategies' launch shape is final here: size the
+                # cross-warp shared reductions for the threads that launch
+                # instead of the 1024-thread budget they were emitted against.
+                # Declined when the body claimed a wider axis (a free
+                # ``hl.arange`` thread axis the launcher adds to ``block=``);
+                # the launcher checks the recorded shape against its launch.
+                from .cute.finalize_reduce_groups import (
+                    finalize_shared_reduce_groups_for_launch,
+                )
+
+                kernel_body, sized_for = finalize_shared_reduce_groups_for_launch(
+                    kernel_body,
+                    thread_block_dims=exact_thread_block_dims,
+                    claimed_axis_sizes=self.codegen.launch_thread_axis_sizes(),
+                )
+                if sized_for is not None:
+                    self.cute_state.shared_reduce_launch_block = sized_for
                 kernel_body = fuse_two_pass_loads(
                     kernel_body,
                     constexpr_values,
@@ -1864,6 +1960,13 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_cluster_shape = (1, {simt_cluster_n}, 1)"
                 )
             )
+        if self._cute_pdl_applies():
+            # The CuTe launcher reads this attribute to launch the kernel
+            # with programmatic dependent launch (``use_pdl``).
+            with SyntheticLocation():
+                result.append(
+                    statement_from_string(f"{self.name}._helion_cute_use_pdl = True")
+                )
         min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
         if (
             CompileEnvironment.current().backend.name == "cute"
@@ -2034,6 +2137,42 @@ class DeviceFunction:
                 )
         return result
 
+    def _cute_pdl_applies(self) -> bool:
+        """Whether ``cute_pdl`` shapes this kernel.
+
+        The knob launches the kernel as a programmatic dependent of the
+        previous kernel in the stream and splices ``griddepcontrol_wait()``
+        in ahead of the scalar preamble, the preamble, the cluster sync and
+        the body, so every global read, write, atomic and bulk copy, on
+        every path, follows the wait; the passes that run afterwards may
+        hoist register or shared allocations above it, never a memory
+        access.  It stays out of kernels that already take part in
+        dependent launch, which generate exactly the knob-off code: native
+        plans launched with ``use_pdl``, and bodies that wait on or release
+        their dependents themselves.  A release ahead of the knob's wait
+        would let the dependents start before this kernel's predecessors
+        finish; the materialized-fission producer gets its release inserted
+        after this function runs, so ``_stage_config`` keeps the knob away
+        from it.  ``griddepcontrol`` needs sm_90, so older targets are left
+        alone as well.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name != "cute" or self.config.config.get("cute_pdl") is not True:
+            return False
+        capability = env.config_spec.target_device_capability
+        if capability is None or capability < (9, 0):
+            return False
+        if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
+            return False
+        return not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in ("griddepcontrol_wait", "griddepcontrol_launch_dependents")
+            for stmt in [*self.preamble, *self.body]
+            for node in ast.walk(stmt)
+        )
+
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
@@ -2059,6 +2198,15 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        grid_multiplier = self.cute_state.launch_grid_multiplier
+        if grid_multiplier != 1:
+            # A fused body running one CTA per (grid index, lane).
+            assert (
+                isinstance(call_grid_expr, ast.Tuple) and len(call_grid_expr.elts) == 1
+            )
+            call_grid_expr = expr_from_string(
+                f"(({{grid}}[0]) * {grid_multiplier},)", grid=call_grid_expr
+            )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:
             # The cluster splits each row across ``cluster_n`` CTAs on a new

@@ -17,6 +17,12 @@ HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
 # whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
 # distribution pins the atomic to their first lane when it runs inside them.
 HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
+# On a CuTe load or store call: the elements the tile program's access covers,
+# per tensor dimension, as ``(begin, end)`` SymPy bounds or None for a
+# dimension without a known interval (``language/memory_ops.py``,
+# ``_cute_access_regions``); the lane-loop distribution's barrier analysis
+# needs no barrier between accesses whose regions are apart.
+HELION_ACCESS_REGIONS_ATTR = "_helion_access_regions"
 
 # Accessing these tensor attributes only reads host-side metadata, not tensor
 # storage.  Keep counting them as ordinary reads for liveness, but identify them

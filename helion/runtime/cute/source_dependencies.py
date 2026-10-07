@@ -22,9 +22,10 @@ _COMMON_DEPENDENCIES = (
 )
 
 # The flash families (dense, gated, backward) share one generated preamble that
-# imports these runtime modules.
+# imports these runtime modules; the alternating-warpgroup body adds its own.
 _FLASH_DEPENDENCIES = (
     "_compiler/cute/_flash_runtime.py",
+    "_compiler/cute/_flash_alt_runtime.py",
     "_compiler/cute/_flash_gemm_ptx.py",
     "_compiler/cute/_mlir_compat.py",
     "_compiler/cute/epilogue_helpers.py",
@@ -75,6 +76,11 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "helion_flash": _FLASH_DEPENDENCIES,
     "helion_flash_gated": _FLASH_DEPENDENCIES,
     "helion_flash_bwd": _FLASH_DEPENDENCIES,
+    "helion_flash_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
+    "helion_warp_mma_gemm": (
+        "_compiler/cute/_warp_mma_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+    ),
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",

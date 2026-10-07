@@ -51,6 +51,10 @@ class _TorchTensorOrJaxArray(Protocol):
 # check at codegen time.
 _PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
 
+_BlockSpecGridDim = (
+    int | tuple[int, int, int] | tuple[Literal["scalar"], int, int] | None
+)
+
 
 def _pallas_interpret_enabled() -> bool:
     """Whether Pallas interpret mode (CPU, no TPU) is on, per the
@@ -94,9 +98,13 @@ def _pallas_make_block_spec(
     jnp: object,
     pltpu: object,
     tensor: _TorchTensorOrJaxArray,
-    entry: tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
+    entry: tuple[
+        tuple[int | None, ...],
+        tuple[_BlockSpecGridDim, ...],
+    ]
     | None,
     should_use_smem: bool = False,
+    num_scalar_prefetch: int = 0,
 ) -> object:
     """Build one ``pl.BlockSpec`` from compile-time ``(block_shape, grid_dims)``."""
 
@@ -131,15 +139,22 @@ def _pallas_make_block_spec(
 
     def _index_for_dim(
         grid_args: tuple[object, ...],
-        g: int | tuple[int, int, int] | None,
+        g: _BlockSpecGridDim,
         d: int,
         jnp: object = jnp,
     ) -> object:
         if g is None:
             return jnp.int32(0)  # pyrefly: ignore[missing-attribute]
         if isinstance(g, tuple):
+            if g[0] == "scalar":
+                kind, scalar_pos, work_grid_dim = g
+                assert kind == "scalar"
+                scalar_refs = grid_args[-num_scalar_prefetch:]
+                scalar_ref = scalar_refs[scalar_pos]
+                return jnp.int32(scalar_ref[grid_args[work_grid_dim]])  # type: ignore[index,union-attr]
             # Flat grid decomposition: (grid_dim, stride, num_blocks)
             grid_dim, stride, num_blocks = g
+            assert isinstance(grid_dim, int)
             val = grid_args[grid_dim]
             if stride > 1:
                 val = val // stride  # type: ignore[operator]
@@ -152,7 +167,7 @@ def _pallas_make_block_spec(
 
     def index_map(
         *grid_args: object,
-        _grid_dims: tuple[int | tuple[int, int, int] | None, ...] = grid_dims,
+        _grid_dims: tuple[_BlockSpecGridDim, ...] = grid_dims,
     ) -> tuple[object, ...]:
         return tuple(_index_for_dim(grid_args, g, d) for d, g in enumerate(_grid_dims))
 
@@ -427,7 +442,11 @@ def _estimate_pallas_vmem_bytes(
 # grid_dims entries are int (direct grid dim), tuple (flat decomposition),
 # or None (untiled dim).
 _BlockSpecInfo = list[
-    tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]] | None
+    tuple[
+        tuple[int | None, ...],
+        tuple[_BlockSpecGridDim, ...],
+    ]
+    | None
 ]
 _PallasCopyGuards = dict[int, tuple[int, ...]]
 _PallasDimensionSemantic = Literal["parallel", "arbitrary"]
@@ -443,7 +462,8 @@ def _pallas_tensor_pos_map(
 
 def _pallas_grid_dims_used_by_block_spec(
     block_info: tuple[
-        tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]
+        tuple[int | None, ...],
+        tuple[_BlockSpecGridDim, ...],
     ],
 ) -> set[int]:
     used: set[int] = set()
@@ -452,7 +472,7 @@ def _pallas_grid_dims_used_by_block_spec(
         if isinstance(grid_dim, int):
             used.add(grid_dim)
         elif isinstance(grid_dim, tuple):
-            used.add(grid_dim[0])
+            used.add(grid_dim[2] if isinstance(grid_dim[0], str) else grid_dim[0])
     return used
 
 
@@ -507,6 +527,7 @@ def _pallas_build_block_specs(
     block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     output_only_indices: list[int] | None = None,
+    num_scalar_prefetch: int = 0,
 ) -> tuple[list[object] | None, object | None]:
     """Build ``in_specs`` and ``out_specs`` for the launcher.
 
@@ -528,7 +549,13 @@ def _pallas_build_block_specs(
         should_use_smem = tensor_pos in (_smem_arg_indices or [])
         in_specs.append(
             _pallas_make_block_spec(
-                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
+                pl,
+                jnp,
+                pltpu,
+                t,
+                block_spec_info[tensor_pos],
+                should_use_smem,
+                num_scalar_prefetch,
             )
         )
 
@@ -546,6 +573,7 @@ def _pallas_build_block_specs(
                 t,
                 block_spec_info[tensor_pos],
                 should_use_smem,
+                num_scalar_prefetch,
             )
         )
 
@@ -1841,6 +1869,148 @@ class _PallasCompileResult:
     pallas_aliases: dict[int, int]
 
 
+def _pallas_scalar_prefetch_grid_dims(
+    grid: tuple[int, ...],
+    block_spec_info: _BlockSpecInfo,
+) -> tuple[_PallasDimensionSemantic, ...]:
+    """Mark grid axes that drive indirect BlockSpec windows as ordered."""
+    semantics: list[_PallasDimensionSemantic] = ["parallel"] * len(grid)
+    for block_info in block_spec_info:
+        if block_info is None:
+            continue
+        for selector in block_info[1]:
+            if (
+                isinstance(selector, tuple)
+                and isinstance(selector[0], str)
+                and selector[0] == "scalar"
+            ):
+                semantics[selector[2]] = "arbitrary"
+    return tuple(semantics)
+
+
+def _pallas_scalar_prefetch_jit_fn(
+    pl: object,
+    jnp: object,
+    pltpu: object,
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    *,
+    scalar_arg_indices: list[int],
+    tensor_arg_indices: list[int],
+    output_only_indices: list[int],
+    non_tensor_args: dict[int, object],
+    n_tensor_inputs: int,
+    arg_to_tensor_pos: dict[int, int],
+    inplace_positions: set[int],
+    output_indices: list[int],
+    block_spec_info: _BlockSpecInfo,
+    smem_arg_indices: list[int] | None,
+    scratch_shapes: list[object],
+    out_shape_arg: object,
+    pallas_aliases: dict[int, int],
+    collective_id: int | None,
+    use_low_level_scheduler: bool,
+    interpret: bool,
+) -> Callable[..., object]:
+    """Build a direct Pallas call whose BlockSpecs use prefetched scalars."""
+    if inplace_positions:
+        raise RuntimeError(
+            "grid scalar-prefetch lowering currently requires output-only results"
+        )
+
+    scalar_set = set(scalar_arg_indices)
+    if not scalar_set.issubset(tensor_arg_indices):
+        raise RuntimeError("grid scalar-prefetch arguments must be tensor inputs")
+    data_arg_indices = [i for i in tensor_arg_indices if i not in scalar_set]
+    num_scalar_prefetch = len(scalar_arg_indices)
+
+    all_in_specs, out_specs = _pallas_build_block_specs(
+        pl,
+        jnp,
+        pltpu,
+        grid,
+        args,
+        tensor_arg_indices,
+        output_indices,
+        block_spec_info,
+        smem_arg_indices,
+        output_only_indices,
+        num_scalar_prefetch,
+    )
+    assert all_in_specs is not None and out_specs is not None
+    input_spec_by_arg = dict(zip(tensor_arg_indices, all_in_specs, strict=True))
+    in_specs = [input_spec_by_arg[index] for index in data_arg_indices]
+
+    base_kernel = _pallas_make_reordered_kernel(
+        pallas_kernel,
+        args,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        output_indices,
+        inplace_positions,
+        arg_to_tensor_pos,
+        n_extra_refs=len(scratch_shapes),
+        _smem_arg_indices=smem_arg_indices,
+    )
+
+    def reordered_kernel(*refs: object) -> None:
+        scalar_refs = refs[:num_scalar_prefetch]
+        data_end = num_scalar_prefetch + len(data_arg_indices)
+        data_refs = refs[num_scalar_prefetch:data_end]
+        trailing_refs = refs[data_end:]
+        ref_by_arg = {
+            **dict(zip(scalar_arg_indices, scalar_refs, strict=True)),
+            **dict(zip(data_arg_indices, data_refs, strict=True)),
+        }
+        ordered_inputs = [ref_by_arg[index] for index in tensor_arg_indices]
+        base_kernel(*ordered_inputs, *trailing_refs)  # type: ignore[operator]
+
+    compiler_params: dict[str, object] = {
+        "dimension_semantics": _pallas_scalar_prefetch_grid_dims(grid, block_spec_info),
+        "vmem_limit_bytes": _get_vmem_limit_bytes(pltpu, interpret),
+    }
+    if use_low_level_scheduler:
+        compiler_params["flags"] = {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True}
+    if collective_id is not None:
+        compiler_params["collective_id"] = collective_id
+
+    data_pos_by_arg = {index: pos for pos, index in enumerate(data_arg_indices)}
+    call_aliases = {
+        num_scalar_prefetch + data_pos_by_arg[tensor_arg_indices[input_pos]]: out_pos
+        for input_pos, out_pos in pallas_aliases.items()
+        if tensor_arg_indices[input_pos] in data_pos_by_arg
+    }
+    call = pl.pallas_call(  # type: ignore[union-attr]
+        reordered_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(  # type: ignore[union-attr]
+            num_scalar_prefetch=num_scalar_prefetch,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            grid=grid,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(**compiler_params),  # type: ignore[union-attr]
+        input_output_aliases=call_aliases,
+        out_shape=out_shape_arg,
+        interpret=interpret,
+    )
+
+    tensor_pos_by_arg = {index: pos for pos, index in enumerate(tensor_arg_indices)}
+
+    def jit_fn(*jax_inputs: object) -> object:
+        scalar_inputs = [
+            jax_inputs[tensor_pos_by_arg[index]] for index in scalar_arg_indices
+        ]
+        data_inputs = [
+            jax_inputs[tensor_pos_by_arg[index]] for index in data_arg_indices
+        ]
+        return call(*scalar_inputs, *data_inputs)  # type: ignore[operator]
+
+    return _x64_scoped_jit_fn(jit_fn)
+
+
 def _pallas_compile_jit_fn(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1855,6 +2025,7 @@ def _pallas_compile_jit_fn(
     _matmul_dot_general: dict[str, object] | None,
     _collective_id: int | None,
     _use_low_level_scheduler: bool,
+    _grid_scalar_prefetch_arg_indices: list[int] | None,
     interpret: bool,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
@@ -1926,6 +2097,11 @@ def _pallas_compile_jit_fn(
     #      buffers or DMA semaphores.
     needs_pipeline_specs = bool(_hbm_arg_indices) or bool(_scratch_shapes)
     has_scratch = bool(_scratch_shapes)
+    scalar_prefetch_args = _grid_scalar_prefetch_arg_indices or []
+    if scalar_prefetch_args and _hbm_arg_indices:
+        raise RuntimeError(
+            "grid scalar-prefetch lowering does not support raw HBM arguments"
+        )
     if needs_pipeline_specs:
         assert _block_spec_info is not None, (
             "pallas pipeline / scratch kernels require _block_spec_info from codegen"
@@ -1995,7 +2171,33 @@ def _pallas_compile_jit_fn(
             pallas_aliases,
         )
 
-    if _matmul_dot_general is not None:
+    if scalar_prefetch_args:
+        assert _block_spec_info is not None
+        jit_fn = _pallas_scalar_prefetch_jit_fn(
+            pl,
+            jnp,
+            pltpu,
+            pallas_kernel,
+            grid,
+            args,
+            scalar_arg_indices=scalar_prefetch_args,
+            tensor_arg_indices=tensor_arg_indices,
+            output_only_indices=output_only_indices,
+            non_tensor_args=non_tensor_args,
+            n_tensor_inputs=n_tensor_inputs,
+            arg_to_tensor_pos=arg_to_tensor_pos,
+            inplace_positions=inplace_positions,
+            output_indices=_output_indices,
+            block_spec_info=_block_spec_info,
+            smem_arg_indices=_smem_arg_indices,
+            scratch_shapes=scratch_shapes,
+            out_shape_arg=out_shape_arg,
+            pallas_aliases=pallas_aliases,
+            collective_id=_collective_id,
+            use_low_level_scheduler=_use_low_level_scheduler,
+            interpret=interpret,
+        )
+    elif _matmul_dot_general is not None:
         # Substitute ``lax.dot_general`` for the Pallas launch on
         # no-tiling matmul configs so XLA sees a regular ``dot`` and
         # can attach ``cross_program_prefetch_index``.
@@ -2076,6 +2278,7 @@ def _pallas_jax_call(
     collective_id: int | None,
     interpret: bool,
     use_low_level_scheduler: bool = False,
+    grid_scalar_prefetch_arg_indices: list[int] | None = None,
     compact: dict[str, object] | None = None,
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
     ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
@@ -2120,6 +2323,7 @@ def _pallas_jax_call(
             _matmul_dot_general=None,
             _collective_id=collective_id,
             _use_low_level_scheduler=use_low_level_scheduler,
+            _grid_scalar_prefetch_arg_indices=grid_scalar_prefetch_arg_indices,
             interpret=interpret,
         )
 
@@ -2176,6 +2380,7 @@ def _pallas_install_launcher_cache(
     _pallas_interpret: bool | None,
     _collective_id: int | None,
     _use_low_level_scheduler: bool,
+    _grid_scalar_prefetch_arg_indices: list[int] | None,
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
 ) -> tuple[object, ...]:
@@ -2221,6 +2426,7 @@ def _pallas_install_launcher_cache(
         _matmul_dot_general=_matmul_dot_general,
         _collective_id=_collective_id,
         _use_low_level_scheduler=_use_low_level_scheduler,
+        _grid_scalar_prefetch_arg_indices=_grid_scalar_prefetch_arg_indices,
         interpret=interpret,
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
@@ -2315,6 +2521,7 @@ def default_pallas_launcher(
     _pallas_interpret: bool | None = None,
     _collective_id: int | None = None,
     _use_low_level_scheduler: bool = False,
+    _grid_scalar_prefetch_arg_indices: list[int] | None = None,
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
@@ -2422,6 +2629,7 @@ def default_pallas_launcher(
                 _pallas_interpret=_pallas_interpret,
                 _collective_id=_collective_id,
                 _use_low_level_scheduler=_use_low_level_scheduler,
+                _grid_scalar_prefetch_arg_indices=_grid_scalar_prefetch_arg_indices,
                 _uses_remote_copy=_uses_remote_copy,
                 _matmul_dot_general=_matmul_dot_general,
             )

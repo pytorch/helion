@@ -41,6 +41,15 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
 # AB SMEM so 16-bit operands fit a 5-stage AB pipeline within the B200 budget
 # (bf16 5000^3 measures 948 vs 815 TFLOP/s against the bk=128 edge seed).
 TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K = 64
+# nvjet's ``64x6`` staging for the full-tile 256x256 cluster-2x2 family: six
+# bk=64 stages hold the same 192 KB as three bk=128 stages, so the deep seed
+# only trades stage granularity (earlier first MMA, shorter drain).
+TCGEN05_TWO_CTA_DEEP_AB_STAGES = 6
+# One-wave two-CTA tiles: 256 x {128, 64} CtaGroup.TWO tiles for GEMMs whose
+# 256x256 grid leaves most SMs idle (cuBLAS's nvjet picks 2-CTA 128x64 tiles
+# in 2x2 clusters with a 64x10 K ring for fp16 1024^3).  Admitted by the
+# search projection and seeded when the 256x256 grid is below the SM count.
+TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS = (128, 64)
 # The post row-vector-staging Target8 CLC + aux-TMA edge rows now measure
 # fastest with two accumulator stages. Keep the historical edge-family default
 # above for non-CLC/non-aux variants. Narrow-N keeps a separate value above.
@@ -68,6 +77,12 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
 # (no scheduler swizzle) measured faster than the monolithic edge seed's size=4.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE = 1
 TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
+# Plain 16-bit two-CTA epilogues take the (128, 32) subtile (and the
+# explicit-store family's no-unroll K loop) on this N tile, where CuTe's
+# with-source rule would give (128, 64); narrower tiles already get (128, 32)
+# from the default rule. Measured in ``cute_mma`` next to the decision
+# (``tcgen05_plain_narrow_subtile``).
+TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
 assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
     <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
@@ -95,6 +110,42 @@ TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 # acc-stage variant cheaply and ``ptxas: shared > 232KB`` is bad UX during
 # tuning.
 TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 * 1024
+# Static SMEM model of the DEFAULT-layout role-local GEMM
+# (``CuteTcgen05Config.default_layout_smem_bytes``), measured on B200 from the
+# compiled cubins and the kept PTX. Every ``cute.arch.alloc_smem`` becomes one
+# PTX ``.shared`` variable; ptxas places them in reverse allocation order,
+# each at the next offset rounded up to its alignment, and the arena may fill
+# the opt-in capacity exactly (a probe allocating the 232 448 B opt-in
+# compiles and launches; 8 B more fails in NVVM). ``cuobjdump`` reports the
+# arena plus the 1 KiB the system reserves per CTA. The kernel allocates, in
+# order: the TMEM holding buffer (4 B), the two-CTA dealloc mbarrier (8 B,
+# dropped from one-CTA kernels), the accumulator barriers (16 B per acc
+# stage), the A and B rings (128 B aligned), the AB mbarriers (16 B per
+# stage), the C ring (1 KiB aligned) and the ``pre_acc_wait`` row stages
+# (128 B aligned). Laid out in reverse, the row stages are padded to the C
+# ring's alignment and the AB mbarriers to the B ring's, so the arena is
+#   round_up(row stages, 1 KiB) + C ring + round_up(16 B * ab_stages, 128 B)
+#   + AB ring + 16 B * acc_stages + 4 B (+ 8 B on a CTA pair),
+# which matches every calibrated kernel to the byte: 215 204 B for the
+# one-CTA 128x128x64 ab=6 fp16 GEMM with a 2 KiB fp32 row stage
+# (2 048 + 16 384 + 128 + 196 608 + 36), 231 596 B for the 2x1 256x128x64
+# ab=8 c=4 twin (2 048 + 32 768 + 128 + 196 608 + 44), 214 180 B with a
+# promoted bn=128 row (512 B staged, 1 KiB occupied), 231 716 B at ab=12
+# (256 B of mbarriers).
+TCGEN05_SMEM_MBARRIER_BYTES = 8
+# The B ring's 128 B alignment follows the AB mbarriers in the arena.
+TCGEN05_SMEM_AB_MBARRIER_CHUNK_BYTES = 128
+# The C ring's 1 KiB alignment follows the row stages in the arena.
+TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES = 1024
+TCGEN05_SMEM_TMEM_HOLDING_BUFFER_BYTES = 4
+TCGEN05_SMEM_TWO_CTA_TMEM_DEALLOC_MBARRIER_BYTES = 8
+# Small allocations the model does not enumerate, all 8/16 B aligned and
+# placed after the A ring: the scheduler-warp mailbox barriers (16 B per
+# stage, at most two stages), the CLC response buffer and mbarrier (24 B at
+# 16 B alignment) and the DSL's own bookkeeping; measured at +40 B on a
+# scheduler-warp kernel and +68 B on a CLC kernel. One 128 B chunk covers
+# them.
+TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES = 128
 # Hard floor on the per-CTA SMEM optin cap required to admit
 # ``tcgen05_ab_stages=3`` into autotune search. B200's optin reports
 # 232 448 bytes (= 227 * 1024). Devices below this threshold sit
@@ -140,6 +191,36 @@ def tcgen05_ab_smem_bytes_per_cta(
         a_per_stage //= 2
         b_per_stage //= 2
     return ab_stages * (a_per_stage + b_per_stage)
+
+
+def tcgen05_round_up_smem_bytes(value: int, alignment: int) -> int:
+    """Round ``value`` up to a multiple of ``alignment`` (both positive)."""
+    assert alignment > 0
+    return -(-value // alignment) * alignment
+
+
+def tcgen05_fixed_smem_overhead_bytes(
+    *, ab_stages: int, acc_stages: int, cluster_m: int
+) -> int:
+    """Static SMEM the role-local GEMM allocates besides its rings and stages.
+
+    The AB mbarriers as the arena lays them out (padded to the B ring's
+    128 B alignment: 128 B up to eight stages, 256 B up to sixteen), the
+    accumulator barriers, the TMEM holding buffer and, on a CTA pair, the
+    dealloc mbarrier. Exact for the measured kernels (164 B one-CTA / 172 B
+    two-CTA up to eight AB stages, 292 B / 300 B at nine to sixteen).
+    """
+    assert ab_stages > 0 and acc_stages > 0
+    assert cluster_m in (1, 2)
+    ab_mbarriers = tcgen05_round_up_smem_bytes(
+        2 * ab_stages * TCGEN05_SMEM_MBARRIER_BYTES,
+        TCGEN05_SMEM_AB_MBARRIER_CHUNK_BYTES,
+    )
+    acc_mbarriers = 2 * acc_stages * TCGEN05_SMEM_MBARRIER_BYTES
+    dealloc = TCGEN05_SMEM_TWO_CTA_TMEM_DEALLOC_MBARRIER_BYTES if cluster_m == 2 else 0
+    return (
+        ab_mbarriers + acc_mbarriers + TCGEN05_SMEM_TMEM_HOLDING_BUFFER_BYTES + dealloc
+    )
 
 
 # Workstream A Stage 2 (cycle 90): the residual full-tile family gets a deeper
@@ -259,6 +340,52 @@ TCGEN05_AUX_LOAD_PLACEMENTS = (
 )
 
 
+class Tcgen05RowvecAuxRow(NamedTuple):
+    """One N-broadcast (row-vector) aux operand of a tcgen05 epilogue."""
+
+    itemsize: int
+    # The store lowering stages the row converted to FP32 once per tile
+    # (``memory_ops`` ``rowvec_stage_promotes_to_f32``): a 16-bit row that only
+    # the FP32 root op ``acc <op> row`` consumes.
+    promoted: bool
+
+
+class Tcgen05RowvecAuxFacts(NamedTuple):
+    """Pre-codegen facts about the row-vector aux rows of a matmul's stores.
+
+    ``output_itemsize`` is the element size of the stored output(s); ``rows``
+    lists every N-broadcast aux leaf the analyzed epilogue chains load. The
+    autotune seeds use them to model the SMEM the ``pre_acc_wait`` row stages
+    add (``CuteTcgen05Config.rowvec_aux_stage_fits``).
+    """
+
+    output_itemsize: int
+    rows: tuple[Tcgen05RowvecAuxRow, ...]
+
+
+def tcgen05_rowvec_stage_smem_bytes(
+    *, rows: tuple[Tcgen05RowvecAuxRow, ...], bn: int, epi_warps: int
+) -> int:
+    """Per-CTA SMEM of the ``pre_acc_wait`` row stages for an N tile of ``bn``.
+
+    Charges every stage the store lowering (``memory_ops``) may take: a
+    promoted 16-bit row becomes one CTA-shared FP32 row (``bn * 4`` B, rows a
+    multiple of 32 wide); a 32-bit row is staged once per epilogue warp
+    (``epi_warps * bn * 4`` B) when it covers whole 128-bit copy tiles
+    (``bn % 128 == 0``), is at least 64 wide and the stage stays within 4 KiB;
+    every other row is read from GMEM per subtile and needs no SMEM.
+    """
+    total = 0
+    for row in rows:
+        if row.promoted and bn % 32 == 0:
+            total += bn * 4
+        elif row.itemsize == 4 and bn % 128 == 0 and bn >= 64:
+            stage_bytes = epi_warps * bn * 4
+            if stage_bytes <= 4 * 1024:
+                total += stage_bytes
+    return total
+
+
 def tcgen05_two_cta_edge_k_tail_seed_overrides() -> dict[str, object]:
     """Return the measured CtaGroup.TWO edge+K-tail seed/fixup knobs."""
     return {
@@ -296,8 +423,19 @@ TCGEN05_C_STORE_MODE_NORMAL = "normal"
 # Invalid-output diagnostic modes intentionally change correctness. General
 # config validation requires the explicit diagnostic-invalid-output opt-in above.
 TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE = "skip_epilogue_store"
+# Register-direct output store: the epilogue warps write the converted
+# accumulator fragments straight to global memory (the SIMT ``CopyR2GOp``
+# body) instead of staging them through the C ring for a TMA store.  Exact
+# (same conversion, same values); it trades the TMA store's coalescing for a
+# shorter per-tile chain (no named barriers, no async-proxy fence, no
+# bulk-store drain), which pays off when a CTA's whole epilogue is exposed.
+TCGEN05_C_STORE_MODE_DIRECT = "direct"
+# Small-grid seeds up to this N tile get a register-direct twin: at 16-bit
+# output widths a thread's chunk is at most two 16-byte stores per tile.
+TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN = 32
 TCGEN05_C_STORE_MODES = (
     TCGEN05_C_STORE_MODE_NORMAL,
+    TCGEN05_C_STORE_MODE_DIRECT,
     TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
 )
 TCGEN05_AUX_LOAD_MODE_CONFIG_KEY = "tcgen05_aux_load_mode"

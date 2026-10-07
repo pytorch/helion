@@ -50,6 +50,7 @@ from .cute.launcher import (
 )
 from .cute.launcher import cute_cuda_graph as cute_cuda_graph
 from .cute.launcher import default_cute_launcher as default_cute_launcher
+from .cute.occupancy import get_max_active_clusters as get_max_active_clusters
 from .kernel import Kernel as Kernel
 from .kernel import OutputCodeOptions as OutputCodeOptions
 from .kernel import kernel as kernel

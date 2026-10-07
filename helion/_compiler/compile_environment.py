@@ -1322,16 +1322,26 @@ class CompileEnvironment:
                 block_size_source=source,
             )
         )
-        if isinstance(source, FixedBlockSizeSource) and isinstance(
-            source.value, torch.SymInt
-        ):
-            source_expr = _symint_expr(source.value)
-            if isinstance(source_expr, sympy.Symbol):
-                self.shape_env._constrain_unify(source.value, info.var)
-                # Match the block var's hint to the size it is now unified with,
-                # so both agree once the shared range is narrowed.
+        if isinstance(source, FixedBlockSizeSource):
+            if isinstance(source.value, torch.SymInt):
+                source_expr = _symint_expr(source.value)
+                if isinstance(source_expr, sympy.Symbol):
+                    self.shape_env._constrain_unify(source.value, info.var)
+                    # Match the block var's hint to the size it is now unified
+                    # with, so both agree once the shared range is narrowed.
+                    shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
+                        self.size_hint(source.value)
+                    )
+            else:
+                # A fixed integer extent is exact, but keep its block symbol
+                # distinct so backend codegen can still track the tile axis.
+                # A singleton range gives fake-tensor propagation the same
+                # equality fact without replacing the symbol with the integer.
                 shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
-                    self.size_hint(source.value)
+                    source.value
+                )
+                self.shape_env.constrain_symbol_range(
+                    info.symbol(), source.value, source.value
                 )
 
         from .host_function import HostFunction

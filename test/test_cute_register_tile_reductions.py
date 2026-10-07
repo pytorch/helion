@@ -53,7 +53,6 @@ from helion._compiler.cute.register_tile_admission import (
     _CUTE_REGISTER_TILE_CONTROL_FLOW,
 )
 from helion._compiler.cute.register_tile_admission import RegisterTileUnsupported
-from helion._compiler.cute.thread_budget import MAX_THREADS_PER_BLOCK
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -318,19 +317,29 @@ def test_mismatched_vector_width_keeps_rolled_lanes() -> None:
 
 @skipUnlessBackends(["cute"])
 def test_aliasing_inputs_reject_the_split(caplog: pytest.LogCaptureFixture) -> None:
-    # ``q`` viewing the state storage removes the disjointness proof, so the
-    # loads of one lane may not move above another lane's state store: the
-    # register tile rejects the split, and so does the rolled nesting the
-    # kernel is regenerated with.
+    # ``q`` viewing the state storage removes the disjointness proof.  The
+    # deferred vector store of ``state`` may not flush past the later load of
+    # ``q`` (``demote_reordered_tile_vec_stores``, which logs the pair), so it
+    # keeps its scalar form inside the element loop, which the register tile
+    # cannot schedule (a structural rejection ahead of its aliasing proof); the
+    # rolled nesting the kernel is regenerated with is then rejected by the
+    # aliasing gate, as the loads of one lane may not move above another
+    # lane's state store.  Each of the three stages names its reason.
     state = torch.empty((BH, D, DV), dtype=torch.float32)
     q, k, v, _state, alpha = _arguments(state)
     bound, _arguments_alive = _bind((state[:, :, 0], k, v, state, alpha))
     with (
+        caplog.at_level(logging.DEBUG, logger="helion._compiler.cute.memory_ops"),
         caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
         pytest.raises(helion.exc.BackendUnsupported, match="aliasing write"),
     ):
         bound.to_code(_config(bound, dv_block=32, dv_threads=8, reduction_threads=8))
-    assert "may alias a store of another lane" in caplog.text
+    assert (
+        "deferred store of state restored to its scalar form: q accessed later"
+        in caplog.text
+    )
+    assert FALLBACK_LOG in caplog.text
+    assert "a store repeats inside an element loop" in caplog.text
 
 
 @skipUnlessBackends(["cute"])
@@ -469,15 +478,15 @@ def test_single_vector_thread_uses_the_warp_column_path() -> None:
     )
     assert "for synthetic_lane_1 in cutlass.range_constexpr(2):" in code
     assert code.count(COLUMN_REDUCE) == 1
-    # The shared-memory exchange is keyed on the full runtime thread id (a
-    # redundant thread axis may still be mapped later in codegen), so its
-    # group count covers the largest launch block.
-    assert (
-        "sum_1_lane_acc_lane = cutlass.Int32(cute.arch.thread_idx()[0]) "
-        "+ cutlass.Int32(cute.arch.thread_idx()[1]) "
-        "* cutlass.Int32(cute.arch.block_dim()[0])"
-    ) in code
-    assert f"pre=1, group_span=64, group_count={MAX_THREADS_PER_BLOCK // 64})" in code
+    # The shared-memory exchange is emitted keyed on the full runtime thread
+    # id with a group count covering the largest launch block (a redundant
+    # thread axis may still be mapped later in codegen); once the launch
+    # shape is final, ``finalize_shared_reduce_groups`` sizes it for the one
+    # 64-thread group that launches and keys it on ``thread_idx()[0]``.
+    assert "block=(64, 1, 1)" in code
+    assert "sum_1_lane_acc_lane = cutlass.Int32(cute.arch.thread_idx()[0])\n" in code
+    assert "block_dim()" not in code
+    assert "pre=1, group_span=64, group_count=1)" in code
 
 
 def _rolled_code(bound: Any, config: helion.Config) -> str:
@@ -816,10 +825,11 @@ def test_eight_byte_policy_loads_are_stashed() -> None:
     ids=("plain-loads", "16-byte-helper", "8-byte-helper"),
 )
 def test_aliasing_views_reject_every_load_form(
-    vec: int, block: int, policy: str | None
+    vec: int, block: int, policy: str | None, caplog: pytest.LogCaptureFixture
 ) -> None:
     # ``x`` and ``y`` overlap, so a lane's load may alias another lane's
-    # store.  Neither the register tile nor the rolled split may reorder them,
+    # store.  Neither the register tile (its aliasing proof, the store being
+    # the tile's last access) nor the rolled split may reorder them,
     # whichever helper the load goes through.
     base = _f32(129, 1024)
     arguments = (base[:128], base[1:])
@@ -827,7 +837,10 @@ def test_aliasing_views_reject_every_load_form(
     extra: dict[str, Any] = (
         {} if policy is None else {"load_eviction_policies": [policy]}
     )
-    with pytest.raises(helion.exc.BackendUnsupported, match="aliasing write"):
+    with (
+        caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"),
+        pytest.raises(helion.exc.BackendUnsupported, match="aliasing write"),
+    ):
         bound.to_code(
             column_config(
                 bound,
@@ -838,6 +851,7 @@ def test_aliasing_views_reject_every_load_form(
                 **extra,
             )
         )
+    assert "a load of one lane may alias a store of another lane" in caplog.text
 
 
 @skipUnlessBackends(["cute"])

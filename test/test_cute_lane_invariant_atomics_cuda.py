@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from test.test_cute_lane_invariant_atomics import _FLAT
+from test.test_cute_lane_invariant_atomics import _GRID_ROW
+from test.test_cute_lane_invariant_atomics import _GRID_ROW_WIDE
 from test.test_cute_lane_invariant_atomics import _LANES
 from test.test_cute_lane_invariant_atomics import _NESTED
 from test.test_cute_lane_invariant_atomics import _NESTED_3D
@@ -34,6 +36,7 @@ from test.test_cute_lane_invariant_atomics import _first_element_then_copy
 from test.test_cute_lane_invariant_atomics import _first_row_then_copy
 from test.test_cute_lane_invariant_atomics import _flag_col_count_copy
 from test.test_cute_lane_invariant_atomics import _flagged_col_count_then_copy
+from test.test_cute_lane_invariant_atomics import _grid_count_then_copy
 from test.test_cute_lane_invariant_atomics import _guarded_col_count_and_flag_then_copy
 from test.test_cute_lane_invariant_atomics import _guarded_col_count_then_copy
 from test.test_cute_lane_invariant_atomics import _loaded_index_count_then_copy
@@ -43,6 +46,7 @@ from test.test_cute_lane_invariant_atomics import _read_then_row_increment
 from test.test_cute_lane_invariant_atomics import _row_count_then_copy
 from test.test_cute_lane_invariant_atomics import _row_count_then_copy_3d
 from test.test_cute_lane_invariant_atomics import _row_increment_then_read
+from test.test_cute_lane_invariant_atomics import _segment_sums
 from test.test_cute_lane_invariant_atomics import _sum_into_scalar
 from test.test_cute_lane_loop_distribution import _TWO_SLICE_CONFIG
 from test.test_cute_lane_loop_distribution import _atomic_into_the_copied_tensor
@@ -251,12 +255,15 @@ def test_column_count_is_once_per_row_tile(
         assert flag.item() == 1.0
 
 
-def test_pinned_row_increment_precedes_every_row_read() -> None:
+@pytest.mark.parametrize("config", [_NESTED_SCALAR, _NESTED], ids=["scalar", "vector"])
+def test_pinned_row_increment_precedes_every_row_read(
+    config: dict[str, object],
+) -> None:
     out = torch.randn((4, 256), device=CUDA_DEVICE)
     expected = out.clone()
     expected[1] += 1.0
     out2 = torch.empty_like(out)
-    result = _run(_row_increment_then_read, (out, out2), **_NESTED_SCALAR)
+    result = _run(_row_increment_then_read, (out, out2), **config)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(out, expected)
 
@@ -364,3 +371,30 @@ def test_flagged_column_count_is_once_per_flagged_row_tile(
     # Both row tiles of four start at a flagged row.
     torch.testing.assert_close(counts, torch.full_like(counts, 2.0))
     torch.testing.assert_close(out, x)
+
+
+@pytest.mark.parametrize("config", [_GRID_ROW, _GRID_ROW_WIDE], ids=["warp", "cta"])
+def test_a_grid_indexed_count_is_once_per_column_tile(
+    config: dict[str, object],
+) -> None:
+    x = torch.randn((6, 100), device=CUDA_DEVICE)
+    counts = torch.zeros((6,), device=CUDA_DEVICE)
+    out = _run(_grid_count_then_copy, (x, counts), **config)
+    block_sizes = config["block_sizes"]
+    assert isinstance(block_sizes, list)
+    assert counts.tolist() == [-(-100 // block_sizes[0])] * 6
+    torch.testing.assert_close(out, x)
+
+
+@pytest.mark.parametrize("config", [_GRID_ROW, _GRID_ROW_WIDE], ids=["warp", "cta"])
+def test_segment_sums_under_a_grid_index_match_reference(
+    config: dict[str, object],
+) -> None:
+    """Every thread used to add the warp's (or CTA's) total: 20 to 38 times the segment sum."""
+    offsets = torch.tensor([0, 50, 50, 57, 89, 189, 192])
+    x = torch.randn((192,), device=CUDA_DEVICE)
+    out = _run(_segment_sums, (x, offsets.to(CUDA_DEVICE)), **config)
+    expected = torch.stack(
+        [x[int(offsets[i]) : int(offsets[i + 1])].sum() for i in range(6)]
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)

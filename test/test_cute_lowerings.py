@@ -80,7 +80,6 @@ from helion._compiler.cute.cute_mma import _operand_infos_exclusive_for_mma
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
-from helion._compiler.cute.cute_mma import _tcgen05_explicit_epilogue_tile_supported
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
@@ -118,6 +117,7 @@ from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
+from helion._compiler.cute.strategies import tcgen05_explicit_epilogue_tile_supported
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
 )
@@ -1051,7 +1051,7 @@ class TestCuteLowerings(unittest.TestCase):
             for is_two_cta, bm, bn, tile_shape in cases:
                 with self.subTest(tile_shape=tile_shape, bm=bm, bn=bn):
                     self.assertEqual(
-                        _tcgen05_explicit_epilogue_tile_supported(
+                        tcgen05_explicit_epilogue_tile_supported(
                             is_two_cta=is_two_cta,
                             bm=bm,
                             bn=bn,
@@ -1710,10 +1710,9 @@ class TestCuteLowerings(unittest.TestCase):
         dealloc = "num_allocated_columns=tcgen05_acc_tmem_cols"
         invariant_setup = [
             "tcgen05_kernel_desc = type('Tcgen05KernelDesc'",
-            (
-                "tcgen05_store_epi_tile = "
-                "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-            ),
+            # CuTe's rule or the plan's (128, 32) subtile, set up once ahead of
+            # the roles either way.
+            "tcgen05_store_epi_tile = ",
             "tcgen05_sD_layout = cutlass.utils.blackwell_helpers.make_smem_layout_epi(",
             "tcgen05_sD_ptr = cute.arch.alloc_smem(",
             "tcgen05_sD = cute.make_tensor(",
@@ -1736,7 +1735,24 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertNotIn(needle, role_src)
             self.assertLess(code.index(needle), role_start)
         self.assertLess(role_end, tail_pos)
-        self.assertLess(tail_pos, dealloc_pos)
+        if "tcgen05_tmem_allocator.free(" in role_src:
+            # One tile per CTA: the epilogue frees TMEM after issuing its last
+            # TMA store (its last TMEM read was fenced at the last subtile);
+            # the teardown keeps only the producer tails and the store drain.
+            self.assertLess(role_start, dealloc_pos)
+            self.assertLess(dealloc_pos, role_end)
+            self.assertLess(
+                code.rindex("cute.copy(tcgen05_tma_store_atom"), dealloc_pos
+            )
+            self.assertEqual(code.count(dealloc), 1)
+            return role_src
+        self.assertLess(role_end, dealloc_pos)
+        if "tcgen05_pipeline_init_barrier" in code:
+            # Merged-init (plain single-CTA) teardown: the TMA-store drain
+            # follows the TMEM dealloc so the two overlap.
+            self.assertLess(dealloc_pos, tail_pos)
+        else:
+            self.assertLess(tail_pos, dealloc_pos)
         return role_src
 
     def test_mma_k_loop_selection_uses_reduction_block(self) -> None:
@@ -1944,8 +1960,9 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_exec_active = tcgen05_warp_idx == cutlass.Int32(4)",
             code,
         )
-        # 4 epi + 1 exec + 1 ab_load = 6 warps, no power-of-2 round-up.
-        self.assertIn("block=(64, 6, 1)", code)
+        # 4 epi + 1 exec + 1 ab_load = 6 warps of one 32-lane row each, no
+        # power-of-2 round-up; the N=8 tile does not widen the row.
+        self.assertIn("block=(32, 6, 1)", code)
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
         self.assertIn(
@@ -1987,7 +2004,9 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(config)
 
         self.assertEqual(config.config["block_sizes"][2], 16)
-        self.assertGreaterEqual(config.config["block_sizes"][0], 128)
+        # Two 128x128 tiles on 148 SMs: the search admits the 64-row one-CTA
+        # tile for this small grid, so the default may sit at 64 rows.
+        self.assertGreaterEqual(config.config["block_sizes"][0], 64)
         self.assertLessEqual(config.config["block_sizes"][0], 256)
         self.assertGreaterEqual(config.config["block_sizes"][1], 8)
         self.assertLessEqual(config.config["block_sizes"][1], 128)
@@ -10633,14 +10652,24 @@ class TestCuteLowerings(unittest.TestCase):
             tmem_free_pos = code.index("tcgen05_tmem_allocator.free(")
             self.assertLess(pdl_launch_pos, tmem_arrive_pos)
             self.assertLess(tmem_arrive_pos, acc_tail_pos)
-            self.assertLess(acc_tail_pos, tmem_dealloc_allocator_pos)
-            self.assertLess(tmem_dealloc_allocator_pos, relinquish_pos)
-            self.assertLess(relinquish_pos, tmem_wait_pos)
-            self.assertLess(tmem_wait_pos, tmem_free_pos)
-            self.assertNotIn(
-                "cute.arch.sync_threads()",
-                code[tmem_dealloc_allocator_pos:relinquish_pos],
+            # One tile per CTA on the clustered path: the permit is relinquished
+            # right after the allocation, the epilogue meets the MMA warp and
+            # frees TMEM after issuing its last TMA store (its last TMEM read
+            # was fenced at the last subtile), and no CTA-wide sync publishes
+            # the allocation.
+            self.assertLess(
+                code.index("tcgen05_tmem_allocator.allocate("), relinquish_pos
             )
+            self.assertLess(
+                relinquish_pos, code.index("tcgen05_tmem_allocator.wait_for_alloc()")
+            )
+            self.assertLess(tmem_wait_pos, tmem_dealloc_allocator_pos)
+            self.assertLess(tmem_dealloc_allocator_pos, tmem_free_pos)
+            self.assertLess(
+                code.rindex("cute.copy(tcgen05_tma_store_atom"), tmem_free_pos
+            )
+            self.assertLess(tmem_free_pos, acc_tail_pos)
+            self.assertNotIn("cute.arch.sync_threads()", code)
             init_arrive = "cutlass.pipeline.pipeline_init_arrive("
             init_wait = "cutlass.pipeline.pipeline_init_wait("
             self.assertLess(
@@ -12726,12 +12755,16 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive()", code)
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
 
-        # Allocation must publish its shared pointer to all threads, including
-        # producer warps when the compiler hoists pointer loads. Consumers must
-        # then rendezvous at one static named-barrier site across both roles.
+        # Every pipeline defers its mbarrier-init sync; one fence publishes
+        # them. The non-epilogue warps (and warp 0, which initialized the
+        # barriers) meet on the pipeline-init named barrier, and the TMEM
+        # consumers then rendezvous at one static named-barrier site across
+        # both roles (``wait_for_alloc``), which also publishes the allocation.
         self.assertEqual(code.count("tcgen05_tmem_allocator.wait_for_alloc()"), 1)
         self.assertIn(
-            "cute.arch.sync_threads()\n"
+            "cute.arch.mbarrier_init_fence()\n"
+            "    if not tcgen05_epi_active or tcgen05_warp_idx == cutlass.Int32(0):\n"
+            "        tcgen05_pipeline_init_barrier.arrive_and_wait()\n"
             "    if tcgen05_exec_active or tcgen05_epi_active:\n"
             "        tcgen05_tmem_allocator.wait_for_alloc()\n",
             code,
@@ -12756,7 +12789,18 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 16, device=DEVICE, dtype=torch.float16),
             torch.randn(16, 8, device=DEVICE, dtype=torch.float16),
         )
+        # An explicit one-warp M axis (the tcgen05 role launch is one physical
+        # warp per role row) with the tile-wide N axis; the MMA keeps its two
+        # serialized N threads whatever the request.
         config = helion.Config(
+            block_sizes=[128, 8, 16],
+            num_threads=[32, 8, 0],
+            loop_orders=[[0, 1]],
+        )
+        # A wider M axis would launch 128-lane role rows (four warps per role
+        # slot the roles and the init barrier do not count); the MMA detection
+        # declines the request and the matmul takes the generic SIMT lowering.
+        wide_config = helion.Config(
             block_sizes=[128, 8, 16],
             num_threads=[128, 2, 0],
             loop_orders=[[0, 1]],
@@ -12766,8 +12810,15 @@ class TestCuteLowerings(unittest.TestCase):
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
             patch_cute_mma_support(),
         ):
-            code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
+            bound = cute_matmul_mma_codegen_only.bind(args)
+            code = bound.to_triton_code(config)
+            wide_code = bound.to_triton_code(wide_config)
 
+        self.assertIn("block=(32, 6, 1)", code)
+        self.assertIn(
+            "tcgen05_pipeline_init_barrier = cutlass.pipeline.NamedBarrier(barrier_id=3, num_threads=96)",
+            code,
+        )
         self.assertIn(
             "mma_active = cutlass.Int32(cute.arch.thread_idx()[1]) < cutlass.Int32(2)",
             code,
@@ -12786,7 +12837,11 @@ class TestCuteLowerings(unittest.TestCase):
             "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition",
             code,
         )
-        self.assertIn("block=(128, 2, 1)", code)
+        # The wide request is a plain SIMT launch with no tcgen05 roles.
+        self.assertIn("block=(128, 2, 1)", wide_code)
+        self.assertNotIn("mma_active =", wide_code)
+        self.assertNotIn("tcgen05_tmem_alloc_barrier", wide_code)
+        self.assertNotIn("tcgen05_tma_store_atom", wide_code)
 
     def test_mma_role_coordinate_plan_exprs(
         self,
@@ -14458,12 +14513,21 @@ class TestCuteLowerings(unittest.TestCase):
             config_spec=SimpleNamespace(
                 cute_attention_generic_fallback_enabled=False,
                 cute_flash_bwd_search_enabled=False,
+                cute_flash_gated_search_enabled=False,
                 num_threads=SimpleNamespace(config_get=lambda *args: 0),
                 loop_orders=SimpleNamespace(config_get=lambda *args: None),
                 l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
             ),
         )
-        config = SimpleNamespace(loop_orders=None, l2_groupings=None, num_threads=None)
+        # The planner reads the matmul family key through ``Config.get``
+        # (``warp_mma`` takes its own detector); the fake config carries no
+        # family, so the tcgen05 detectors below run.
+        config = SimpleNamespace(
+            loop_orders=None,
+            l2_groupings=None,
+            num_threads=None,
+            get=lambda key, default=None: default,
+        )
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -15528,7 +15592,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(_tcgen05_epi_warp_count(_spec(4), cta_thread_count=128), 4)
         self.assertEqual(_tcgen05_epi_warp_count(_spec(2), cta_thread_count=256), 2)
         self.assertEqual(_tcgen05_epi_warp_count(_spec(8), cta_thread_count=128), 4)
-        self.assertEqual(_tcgen05_root_m_threads(64, 8), 64)
+        self.assertEqual(_tcgen05_root_m_threads(64, 8), 32)
         self.assertEqual(_tcgen05_root_m_threads(64, 16), 32)
         self.assertEqual(_tcgen05_root_m_threads(128, 256), 32)
         self.assertEqual(_tcgen05_tmem_barrier_thread_count(1), 64)
@@ -17849,6 +17913,31 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         return cute_matmul_bias_residual_gelu
 
+    def _bias_residual_gelu_into_kernel(self):  # type: ignore[no-untyped-def]
+        """``_bias_residual_gelu_kernel`` writing into an output argument."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu_into(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        return cute_matmul_bias_residual_gelu_into
+
     def _assert_partial_tma_rowvec_bias_staged(
         self, code: str, *, block_m: int = 256, block_n: int = 256
     ) -> None:
@@ -18520,17 +18609,20 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     ) -> None:
         """Row-vector staging only fires when the vectorized copy cannot overread."""
 
-        kernel = self._bias_residual_gelu_kernel()
+        # The TMA store proves its destination: a 642-column output has to
+        # arrive as an argument with TensorMap-legal (16-byte) row strides,
+        # since a fresh contiguous bf16 ``[640, 642]`` has 1284-byte rows.
+        n, padded = 642, 648
         args = (
             torch.empty([640, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
-            torch.empty([642], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([640, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
+            torch.empty([128, padded], device=DEVICE, dtype=torch.bfloat16)[:, :n],
+            torch.empty([n], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([640, padded], device=DEVICE, dtype=torch.bfloat16)[:, :n],
+            torch.empty([640, padded], device=DEVICE, dtype=torch.bfloat16)[:, :n],
         )
 
-        with patch_cute_mma_support():
-            bound = kernel.bind(args)
-            cfg = _make_tcgen05_persistent_config(
+        def make_config(bound):  # type: ignore[no-untyped-def]
+            return _make_tcgen05_persistent_config(
                 block_sizes=[256, 256, 128],
                 l2_groupings=[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
                 pid_type="persistent_interleaved",
@@ -18548,11 +18640,25 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
-            code = bound.to_triton_code(cfg)
+
+        with patch_cute_mma_support():
+            bound = self._bias_residual_gelu_into_kernel().bind(args)
+            code = bound.to_triton_code(make_config(bound))
 
         self.assertIn("'kind': 'tcgen05_aux_tma'", code)
+        self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("if tcgen05_full_tile:", code)
         self.assertNotIn("tcgen05_aux_rowvec_smem_1", code)
+
+        # The same kernel allocating the 642-column output itself cannot be
+        # TMA-stored, and bulk aux TMA with partial tiles has no other
+        # epilogue: it fails loudly instead of storing through an illegal
+        # TensorMap.
+        with patch_cute_mma_support():
+            fresh_bound = self._bias_residual_gelu_kernel().bind(args[:4])
+            with self.assertRaises(exc.BackendUnsupported) as cm:
+                fresh_bound.to_triton_code(make_config(fresh_bound))
+        self.assertIn("partial output tiles", str(cm.exception))
 
     def test_aux_tma_partial_store_keeps_guard_for_unaligned_rowvec_tile(
         self,
@@ -20033,14 +20139,14 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         producer_body = code.split(c_input_marker, 1)[1]
         # The dependency walker brings in ``inner_2d_pid``,
-        # ``group_id``, ``first_pid_m``, ``group_size_m``,
-        # ``pid_0``, ``pid_1``, ``tile_offset_0``,
-        # ``tile_offset_1``.
+        # ``group_id``, ``first_pid_m``, ``pid_0``, ``pid_1``,
+        # ``tile_offset_0``, ``tile_offset_1``.  ``group_size_m`` is a
+        # constant here (16 M tiles in groups of 4: every group is full),
+        # so it folds to ``4`` and is hoisted out of every role body.
         for name in (
             "inner_2d_pid",
             "group_id",
             "first_pid_m",
-            "group_size_m",
             "pid_0",
             "pid_1",
             "tile_offset_0",
@@ -20052,6 +20158,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 f"expected L2-grouping decomposition var {name!r} "
                 f"defined inside the C-input producer body",
             )
+        self.assertIn("group_size_m = 4\n", code)
+        self.assertNotIn("group_size_m = ", producer_body)
+        self.assertIn("% group_size_m", producer_body)
         # The producer's per-CTA aux M tile coord must derive
         # from post-L2 ``tile_offset_0 // bm * cluster_m`` plus
         # ``peer_m = block_idx_in_cluster() %% cluster_m``
@@ -21930,6 +22039,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
                 self.body = [self_stmt]
                 self.pid = fake_pid
                 self.codegen = SimpleNamespace(host_statements=[])
+                self.cute_state = SimpleNamespace(tcgen05_tma_role_hoist_anchor=None)
 
         splitter, _ = self._make_helper()
         splitter.virtual_pid_var = "virtual_pid"  # type: ignore[attr-defined]
@@ -22020,6 +22130,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
                 self.body = [shared_stmt]
                 self.pid = fake_pid
                 self.codegen = SimpleNamespace(host_statements=[])
+                self.cute_state = SimpleNamespace(tcgen05_tma_role_hoist_anchor=None)
 
         splitter, _ = self._make_helper()
         splitter.virtual_pid_var = "virtual_pid"  # type: ignore[attr-defined]

@@ -53,6 +53,92 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         _, result = code_and_output(jagged_row_sum, (x, offsets))
         torch.testing.assert_close(result, ref(x, offsets))
 
+    def test_jagged_tile_mean_over_the_jagged_dim_is_rejected(self):
+        """Each row of the parent tile holds its own number of elements, so a mean over the jagged dim has no one divisor; it used to divide by the block."""
+
+        @helion.kernel(autotune_effort="none")
+        def jagged_row_means(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b], dtype=x_data.dtype)
+
+                for tile_k in hl.jagged_tile(nnz):
+                    idx = starts[:, None] + tile_k.index[None, :]
+                    acc += x_data[idx].mean(dim=1)
+
+                out[tile_b] = acc
+            return out
+
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long)
+        x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.InductorLoweringError, "mean over the jagged tile dim"
+        ):
+            jagged_row_means.bind((x, offsets))
+
+    def test_jagged_tile_mean_over_a_derived_jagged_dim_is_rejected(self):
+        """``torch.cat([v, v], dim=1)`` sizes its dim ``2 * block`` rather than the block symbol; the mean divided by the padded ``2 * 4096``."""
+
+        @helion.kernel(autotune_effort="none")
+        def jagged_doubled_row_means(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b], dtype=x_data.dtype)
+
+                for tile_k in hl.jagged_tile(nnz):
+                    idx = starts[:, None] + tile_k.index[None, :]
+                    v = x_data[idx]
+                    acc += torch.cat([v, v], dim=1).mean(dim=1)
+
+                out[tile_b] = acc
+            return out
+
+        offsets = torch.tensor([0, 3, 4, 8, 10], device=DEVICE, dtype=torch.long)
+        x = torch.randn(int(offsets[-1].item()), device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.InductorLoweringError, "mean over the jagged tile dim"
+        ):
+            jagged_doubled_row_means.bind((x, offsets))
+
+    def test_jagged_tile_mean_over_a_sibling_dim_is_allowed(self):
+        """A sum over the jagged dim followed by a mean over the sibling feature dim has one divisor per tile and stays."""
+
+        @helion.kernel(autotune_effort="none")
+        def jagged_sum_then_feature_mean(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            b, _, f = x.size()
+            out = torch.zeros([b], dtype=x.dtype, device=x.device)
+            for tile_b in hl.tile(b):
+                lens = lengths[tile_b]
+                for tile_m in hl.tile(f):
+                    acc = hl.zeros([tile_b, tile_m], dtype=x.dtype)
+                    for tile_k in hl.jagged_tile(lens):
+                        acc = acc + x[tile_b, tile_k, tile_m].sum(dim=1)
+                    hl.atomic_add(out, [tile_b], acc.mean(dim=1))
+            return out
+
+        lengths = torch.tensor([3, 0, 8, 5], device=DEVICE, dtype=torch.long)
+        x = torch.randn(4, 8, 16, device=DEVICE, dtype=torch.float32)
+        keep = torch.arange(8, device=DEVICE)[None, :, None] < lengths[:, None, None]
+        expected = (x * keep).sum(dim=1).mean(dim=1)
+        _, result = code_and_output(jagged_sum_then_feature_mean, (x, lengths))
+        torch.testing.assert_close(result, expected)
+
     def test_jagged_tile_reduction_mask(self):
         @helion.kernel(autotune_effort="none")
         def jagged_row_sum(

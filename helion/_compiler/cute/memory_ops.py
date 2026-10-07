@@ -34,8 +34,10 @@ from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
+from ...language.memory_ops import CuteTileVecStoreSite
 from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
 from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
+from ...language.memory_ops import _cute_access_regions
 from ...language.memory_ops import _cute_active_index_var
 from ...language.memory_ops import _cute_active_mask_var
 from ...language.memory_ops import _cute_combined_mask
@@ -48,6 +50,7 @@ from ...language.memory_ops import _cute_register_tile_unroll_vec_hoist
 from ...language.memory_ops import _cute_register_tile_unroll_vec_store
 from ...language.memory_ops import _cute_scalar_load_expr
 from ...language.memory_ops import _cute_scalar_pointer_expr
+from ...language.memory_ops import _cute_tag_access_regions
 from ...language.memory_ops import _cute_tensor_dim_size_expr
 from ...language.memory_ops import _cute_unique_graph_block_id
 from ...language.memory_ops import _cute_unroll_vec_load_expr
@@ -75,6 +78,7 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import LoopedReductionStrategy
@@ -2932,6 +2936,7 @@ def _(state: CodegenState) -> ast.AST:
         tensor=tensor,
         inactive_singleton_slice_expr="0",
     )
+    regions = _cute_access_regions(state, subscript, tensor)
     topk_lane_expr: object | None = None
     topk_k: object | None = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
@@ -2976,6 +2981,15 @@ def _(state: CodegenState) -> ast.AST:
             # the deferred hoist has recorded its signed-byte packet. Resolve the
             # packed value then, but prove scope with this store's own site.
             store_site = signed_byte_site(state)
+            scalar_store = statement_from_string(
+                _cute_scalar_store_expr(tensor_name, index_exprs, "{value}"),
+                value=value,
+            )
+            _cute_tag_access_regions(scalar_store, tensor_name, regions)
+            if mask_expr is not None:
+                scalar_store = statement_from_string(
+                    f"if {mask_expr}:\n    {{store}}", store=scalar_store
+                )
 
             def emit_tile_store() -> ast.AST | None:
                 packed_values = packed_store_value(
@@ -2997,18 +3011,11 @@ def _(state: CodegenState) -> ast.AST:
                     ast.unparse(value),
                     mask_expr,
                     tensor.dtype,
+                    scalar_stmt=scalar_store,
                     lane_axis_pos=lane_axis_pos,
                     packed_values=packed_values,
                 )
 
-            scalar_store = statement_from_string(
-                _cute_scalar_store_expr(tensor_name, index_exprs, "{value}"),
-                value=value,
-            )
-            if mask_expr is not None:
-                scalar_store = statement_from_string(
-                    f"if {mask_expr}:\n    {{store}}", store=scalar_store
-                )
             if _cute_defer_grid_vector_op(
                 state, strategy, vec_block_id, scalar_store, emit_tile_store
             ):
@@ -3119,6 +3126,7 @@ def _(state: CodegenState) -> ast.AST:
 
     store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
     assign_expr = expr_from_string(store_expr, value=value)
+    _cute_tag_access_regions(assign_expr, tensor_name, regions)
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
         topk_mask = f"({topk_lane_expr}) < {topk_k}"
         mask_expr = topk_mask if mask_expr is None else f"({mask_expr}) and {topk_mask}"
@@ -4007,6 +4015,218 @@ def _cute_tensor_access_names(node: ast.AST) -> set[str]:
     return names
 
 
+# Calls without memory effects that ``_is_proven_relocatable_call`` does not
+# vouch for: loop ranges, and the layout arithmetic of an atomic's pointer.
+_CUTE_EFFECT_FREE_CALLS = frozenset(
+    {
+        "range",
+        "cutlass.range",
+        "cutlass.range_constexpr",
+        "cutlass.range_dynamic",
+        "cute.crd2idx",
+    }
+)
+
+
+def _cute_write_call_roots(call: ast.Call) -> set[str]:
+    """Generated tensor names addressed by a recognized memory-write call.
+
+    Pointer-method writes (``(ptr).store(v)``, ``t.__setitem__(...)``,
+    ``(ptr).atomic_add(v)``) carry their pointer in the callee receiver;
+    ``cute.arch.atomic_*`` and the helper stores/atomics take it as the first
+    argument.  An empty result means the pointer does not name its tensor.
+    """
+    func = call.func
+    if isinstance(func, ast.Attribute) and ast.unparse(func.value) != "cute.arch":
+        pointer: ast.AST | None = func.value
+    else:
+        pointer = call.args[0] if call.args else None
+    if pointer is None:
+        return set()
+    roots = _cute_tensor_access_names(pointer)
+    if isinstance(pointer, ast.Name):
+        roots.add(pointer.id)
+    return roots
+
+
+def _cute_statement_written_tensors(
+    statement: ast.AST, sites: Sequence[CuteTileVecStoreSite]
+) -> set[str] | None:
+    """Generated tensor names ``statement`` may write; None for unknown effects.
+
+    A collected vector store (``sites``) writes the tensor its flush
+    addresses: its site statement, and the scalar store a grid keeps in its
+    place until the wrap, are decided by identity first because a packed site
+    is a plain name assignment that would otherwise pass as pure.  A proven
+    pure assignment writes nothing.  Otherwise every call in the
+    statement must be proven pure, effect-free (a loop range, layout
+    arithmetic), or a recognized memory write whose pointer names its tensor,
+    and every subscript assignment must name its target; a barrier, a helper
+    of unknown purity, or an unfamiliar statement kind leaves the effects
+    unknown.  The cross-thread reduction helpers synchronize the CTA like a
+    barrier and are left unknown too.
+    """
+    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ..tile_strategy import _is_proven_relocatable_call
+    from ..tile_strategy import _memory_write_calls
+    from ..tile_strategy import _qualified_name
+
+    for site in sites:
+        if statement is site.body_stmt or statement is site.scalar_stmt:
+            return {site.tensor_name}
+    if _is_proven_relocatable_assignment(statement, allow_load=True):
+        return set()
+    write_calls = {id(call) for call in _memory_write_calls(statement)}
+    written: set[str] = set()
+    for node in ast.walk(statement):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    continue
+                roots = _cute_tensor_access_names(target)
+                if not roots:
+                    return None
+                written |= roots
+        elif isinstance(node, ast.stmt):
+            if not isinstance(node, (ast.Expr, ast.If, ast.For, ast.Pass)):
+                return None
+        elif isinstance(node, ast.Call):
+            if id(node) in write_calls:
+                roots = _cute_write_call_roots(node)
+                if not roots:
+                    return None
+                written |= roots
+            elif not (
+                _is_proven_relocatable_call(node, allow_load=True)
+                or _qualified_name(node.func) in _CUTE_EFFECT_FREE_CALLS
+            ):
+                return None
+    return written
+
+
+def _cute_tile_unroll_preceding_statements(
+    body: list[ast.AST], placeholder: ast.AST | None
+) -> list[ast.AST] | None:
+    """Statements of a V-loop body that run before a tile-vector load site.
+
+    A device-loop site is lowered while its body is being built, so every
+    statement present precedes it.  A grid site is emitted once the root body
+    is wrapped, so the statements before the one holding its scalar
+    ``placeholder`` precede it; None when the placeholder is not in the body.
+    """
+    if placeholder is None:
+        return list(body)
+    for index, statement in enumerate(body):
+        if any(node is placeholder for node in ast.walk(statement)):
+            return body[:index]
+    return None
+
+
+def _cute_tile_unroll_hoist_allowed(
+    state: CodegenState,
+    strategy: CuteLaneTileStrategy,
+    block_id: int,
+    preceding: list[ast.AST],
+    tensor_name: str,
+) -> bool:
+    """Whether a packet of ``tensor_name`` may be loaded above the V-loop.
+
+    The hoisted packet reads before every statement of the body, so each
+    preceding statement must be proven not to write ``tensor_name``: it is
+    pure, or writes only tensors proven disjoint from it.  A statement of
+    unknown effect (a barrier, a helper call), a write to the same tensor, or a
+    write to a tensor that may alias it keeps the site on its scalar load.
+    """
+    sites = strategy._cute_lane_vec_stores_by_block.get(block_id, [])
+    disjoint: set[frozenset[str]] | None = None
+    for statement in preceding:
+        written = _cute_statement_written_tensors(statement, sites)
+        if written is None:
+            return False
+        for name in written:
+            if name == tensor_name:
+                return False
+            if disjoint is None:
+                disjoint = state.device_function.proven_disjoint_tensor_pairs()
+            if frozenset((name, tensor_name)) not in disjoint:
+                return False
+    return True
+
+
+def demote_reordered_tile_vec_stores(
+    strategy: CuteLaneTileStrategy,
+    device_function: DeviceFunction,
+    block_id: int,
+    body: list[ast.AST] | list[ast.stmt],
+    *,
+    inside: Sequence[ast.AST] | None = None,
+) -> list[CuteTileVecStoreSite]:
+    """Restore scalar stores whose deferred flush would run past a later access.
+
+    A tile-vector store of ``block_id`` runs after the V-loop instead of in its
+    lane, so a later statement of its lane loop (nested statements included)
+    that names the stored tensor, or a tensor not proven disjoint from it,
+    would observe memory before the store.  ``inside`` lists the statements of
+    ``body`` that run inside the loop, in order, when the caller has placed
+    the others around it (``distribute_lane_loops`` orders those against the
+    flush); by default every statement of ``body`` does.  Only the other
+    collected stores, which flush in source order, are exempt.  Later sites
+    are decided first, so a demoted one counts as an access for the sites
+    before it.  Returns the demoted sites.
+    """
+    from ..device_function import TensorArg
+
+    sites = strategy._cute_lane_vec_stores_by_block.get(block_id)
+    if not sites:
+        return []
+    lane_body = strategy._cute_lane_body_by_block[block_id]
+    scope = body if inside is None else inside
+    tensor_names = {
+        arg.name for arg in device_function.arguments if isinstance(arg, TensorArg)
+    }
+    disjoint = device_function.proven_disjoint_tensor_pairs()
+    demoted: list[CuteTileVecStoreSite] = []
+    for site in reversed(list(sites)):
+        index = next(
+            (i for i, statement in enumerate(scope) if statement is site.body_stmt),
+            None,
+        )
+        if index is None:
+            continue
+        exempt = {id(other.body_stmt) for other in sites if other is not site}
+        accessed = {
+            node.id
+            for statement in scope[index + 1 :]
+            if id(statement) not in exempt
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and node.id in tensor_names
+        }
+        observers = sorted(
+            name
+            for name in accessed
+            if name == site.tensor_name
+            or frozenset((name, site.tensor_name)) not in disjoint
+        )
+        if not observers:
+            continue
+        log.debug(
+            "deferred store of %s restored to its scalar form: %s accessed later",
+            site.tensor_name,
+            ", ".join(observers),
+        )
+        position = next(
+            i for i, statement in enumerate(body) if statement is site.body_stmt
+        )
+        body[position] = site.scalar_stmt
+        if site.init_stmt is not None:
+            lane_body.remove(site.init_stmt)
+        lane_body.remove(site.flush_stmt)
+        sites.remove(site)
+        demoted.append(site)
+    return demoted
+
+
 def _cute_tile_unroll_uniform_definitions(
     scope: _CuteVloopScope,
     index_exprs: list[str],
@@ -4864,6 +5084,7 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
+    regions = _cute_access_regions(state, subscript, tensor)
     mask_expr = _cute_resolved_load_mask(
         state, tensor, subscript, index_exprs, extra_mask
     )
@@ -5013,9 +5234,13 @@ def _(state: CodegenState) -> object:
             assert vec_mode == "tile_unroll"
             # Same hoist protocol as ``LoopedReductionStrategy``'s
             # ``unroll`` mode but for ``PerThreadNDTileStrategy`` lane loops.
-            from ..tile_strategy import BlockSizeTileStrategy
+            from ..tile_strategy import DeviceGridState
+            from ..tile_strategy import PerThreadFlattenedTileStrategy
+            from ..tile_strategy import PerThreadNDTileStrategy
 
-            assert isinstance(strategy, BlockSizeTileStrategy)
+            assert isinstance(
+                strategy, (PerThreadNDTileStrategy, PerThreadFlattenedTileStrategy)
+            )
             lane_axis_pos = _cute_lane_axis_pos(strategy, vec_block_id, index_exprs)
             # The hoist may be emitted when the root body is wrapped; record a
             # signed-byte packet against the load's original lowering site.
@@ -5040,13 +5265,39 @@ def _(state: CodegenState) -> object:
                     state, strategy, vec_block_id, index_exprs, lane_axis_pos
                 )
             )
-            relocation_scope = (
-                _cute_tile_unroll_vloop_scope(state, strategy, vec_block_id)
-                if needs_hoist_plan
-                else None
+            # The memory-effect gate in ``emit_tile_load`` reads the V-loop
+            # body whether or not the packet needs a relocation plan.
+            vloop_scope = _cute_tile_unroll_vloop_scope(state, strategy, vec_block_id)
+            relocation_scope = vloop_scope if needs_hoist_plan else None
+            # A grid emits the packet once its root body is wrapped; the
+            # scalar placeholder then marks where this load sits in that body.
+            deferred_site = isinstance(
+                state.codegen.active_device_loops[vec_block_id][-1], DeviceGridState
+            )
+            scalar_load = expr_from_string(
+                _cute_scalar_load_expr(
+                    tensor_name,
+                    index_exprs,
+                    tensor.dtype,
+                    eviction_suffix=eviction_suffix,
+                )
             )
 
             def emit_tile_load() -> ast.AST | None:
+                # The packet reads before every statement of the V-loop body,
+                # so a store, atomic or barrier that precedes this load in the
+                # body must be proven not to touch this tensor.
+                preceding = (
+                    _cute_tile_unroll_preceding_statements(
+                        vloop_scope.body, scalar_load if deferred_site else None
+                    )
+                    if vloop_scope is not None
+                    else None
+                )
+                if preceding is None or not _cute_tile_unroll_hoist_allowed(
+                    state, strategy, vec_block_id, preceding, tensor_name
+                ):
+                    return None
                 packet_mask = uniform_mask
                 lane_base_expr = None
                 if needs_hoist_plan:
@@ -5079,14 +5330,6 @@ def _(state: CodegenState) -> object:
                     )
                 )
 
-            scalar_load = expr_from_string(
-                _cute_scalar_load_expr(
-                    tensor_name,
-                    index_exprs,
-                    tensor.dtype,
-                    eviction_suffix=eviction_suffix,
-                )
-            )
             if _cute_defer_grid_vector_op(
                 state, strategy, vec_block_id, scalar_load, emit_tile_load
             ):
@@ -5146,6 +5389,7 @@ def _(state: CodegenState) -> object:
     if mask_expr is None:
         result = expr_from_string(load_expr, **load_placeholders)
         assert isinstance(result, ast.expr)
+        _cute_tag_access_regions(result, tensor_name, regions)
         if branch_vec_candidate is not None:
             vec_block_id, vec_width = branch_vec_candidate
             return _persistent_branch_vec_load_marker(
@@ -5162,6 +5406,7 @@ def _(state: CodegenState) -> object:
         f"({load_expr} if {mask_expr} else {zero}(0))", **load_placeholders
     )
     assert isinstance(result, ast.expr)
+    _cute_tag_access_regions(result, tensor_name, regions)
     if branch_vec_candidate is not None:
         vec_block_id, vec_width = branch_vec_candidate
         return _persistent_branch_vec_load_marker(

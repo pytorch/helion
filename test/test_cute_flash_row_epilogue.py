@@ -772,6 +772,10 @@ def test_row_programs_with_folded_products_match_reference(
         {"cute_flash_pipeline_family": "fa4"},
         {"cute_flash_pipeline_family": "fa4", "cute_flash_epi_tma": True},
         {"cute_flash_pipeline_family": "ws_overlap"},
+        # The register-MMA row programs evaluate the program in their combine
+        # epilogue (here behind a double-buffered chunk loop over 256 keys per
+        # warp); explicit configs are legal on any grid.
+        {"cute_flash_pipeline_family": "row_mma"},
     ),
 )
 def test_row_program_runtime_matches_reference(config: dict[str, object]) -> None:

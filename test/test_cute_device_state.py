@@ -14,6 +14,7 @@ from torch.fx import Graph
 
 from helion import exc
 from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.cute.access_regions import tile_begin_symbol
 from helion._compiler.cute.cute_mma import _collective_load_dependency_nodes
 from helion._compiler.cute.cute_mma import _emit_tcgen05_device_segments_setup
 from helion._compiler.cute.cutedsl_compat import emit_pipeline_advance
@@ -1020,3 +1021,16 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
 
         self.assertEqual(loop.inner_statements, [stmt])
         self.assertFalse(state.is_tcgen05_kloop_owned_stmt(loop, stmt))
+
+
+def test_loop_states_built_in_turn_name_distinct_tile_begins() -> None:
+    # The state of a finished loop is collected before the next loop's begin
+    # symbol is built, and CPython may hand the next state the same address:
+    # the symbol names the state's serial, never its address.
+    symbols = set()
+    for _ in range(64):
+        state = _kloop_with_inner()
+        symbol = tile_begin_symbol(0, state)
+        assert f"{id(state):x}" not in symbol.name
+        symbols.add(symbol)
+    assert len(symbols) == 64

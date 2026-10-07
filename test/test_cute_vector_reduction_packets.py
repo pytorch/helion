@@ -194,11 +194,29 @@ def test_eight_byte_hints_preserve_width_and_other_load_policies() -> None:
             code = _cute_unroll_vec_load_expr(
                 "ptr", dtype, width, f"__l1_l2_{policy}__"
             )
-            assert f"_cute_load_l1_l2_evict_{policy}_8b" in code
+            assert f"_cute_load_l1_l2_evict_{policy}_8b(" in code
             assert f"[{width}]" in code
-        assert "cute.arch.load" in _cute_unroll_vec_load_expr(
-            "ptr", dtype, width, "__l2_last__"
-        )
+        code = _cute_unroll_vec_load_expr("ptr", dtype, width, "__l2_last__")
+        assert "_cute_load_l2_evict_last_8b(" in code
+        assert f"[{width}]" in code
+
+
+def test_four_byte_hints_use_the_four_byte_helpers() -> None:
+    # A 4-byte packet (two 16-bit lanes or one fp32 lane) carries the hint
+    # through the scalar ``ld.global...b32`` form of each policy.
+    for dtype, width in ((torch.float16, 2), (torch.bfloat16, 2), (torch.float32, 1)):
+        for suffix, helper in (
+            ("__l2_last__", "_cute_load_l2_evict_last_4b"),
+            ("__l1_l2_first__", "_cute_load_l1_l2_evict_first_4b"),
+            ("__l1_l2_last__", "_cute_load_l1_l2_evict_last_4b"),
+        ):
+            code = _cute_unroll_vec_load_expr("ptr", dtype, width, suffix)
+            assert f"{helper}(" in code
+            assert f"[{width}]" in code
+    # A 2-byte scalar packet has no hinted form: plain load, hint dropped.
+    code = _cute_unroll_vec_load_expr("ptr", torch.float16, 1, "__l1_l2_last__")
+    assert code.startswith("cute.arch.load(")
+    assert "evict" not in code
 
 
 def test_cache_helpers_build_matching_eight_and_sixteen_byte_ir() -> None:
@@ -211,37 +229,39 @@ def test_cache_helpers_build_matching_eight_and_sixteen_byte_ir() -> None:
     with ir.Context(), ir.Location.unknown():
         module = ir.Module.create()
         with ir.InsertionPoint(module.body):
-            for width in (4, 8):
-                for policy in ("first", "last"):
-                    vector_type = ir.VectorType.get([width], cutlass.Uint16.mlir_type)
-                    function = func.FuncOp(
-                        f"load_{width}_{policy}",
-                        ir.FunctionType.get([cutlass.Uint64.mlir_type], [vector_type]),
-                    )
-                    block = function.add_entry_block()
-                    with ir.InsertionPoint(block):
+            helpers = {
+                (2, "first"): l2_policy.load_v4b_l1_l2_evict_first,
+                (2, "last"): l2_policy.load_v4b_l1_l2_evict_last,
+                (2, "l2"): l2_policy.load_v4b_l2_evict_last,
+                (4, "first"): l2_policy.load_v8b_l1_l2_evict_first,
+                (4, "last"): l2_policy.load_v8b_l1_l2_evict_last,
+                (4, "l2"): l2_policy.load_v8b_l2_evict_last,
+                (8, "first"): l2_policy.load_v16b_l1_l2_evict_first,
+                (8, "last"): l2_policy.load_v16b_l1_l2_evict_last,
+                (8, "l2"): l2_policy.load_v16b_l2_evict_last,
+            }
+            for (width, policy), helper in helpers.items():
+                vector_type = ir.VectorType.get([width], cutlass.Uint16.mlir_type)
+                function = func.FuncOp(
+                    f"load_{width}_{policy}",
+                    ir.FunctionType.get([cutlass.Uint64.mlir_type], [vector_type]),
+                )
+                block = function.add_entry_block()
+                with ir.InsertionPoint(block):
 
-                        class Address:
-                            def __init__(self, value):
-                                self.value = value
+                    class Address:
+                        def __init__(self, value):
+                            self.value = value
 
-                            def toint(self, **kwargs):
-                                return self
+                        def toint(self, **kwargs):
+                            return self
 
-                            def ir_value(self, **kwargs):
-                                return self.value
+                        def ir_value(self, **kwargs):
+                            return self.value
 
-                        helpers = {
-                            (4, "first"): l2_policy.load_v8b_l1_l2_evict_first,
-                            (4, "last"): l2_policy.load_v8b_l1_l2_evict_last,
-                            (8, "first"): l2_policy.load_v16b_l1_l2_evict_first,
-                            (8, "last"): l2_policy.load_v16b_l1_l2_evict_last,
-                        }
-                        value = helpers[width, policy](
-                            Address(block.arguments[0]), vector_type
-                        )
-                        assert value.type == vector_type
-                        func.ReturnOp([value])
+                    value = helper(Address(block.arguments[0]), vector_type)
+                    assert value.type == vector_type
+                    func.ReturnOp([value])
         module.operation.verify()
         text = str(module)
         for words in (2, 4):
@@ -249,4 +269,15 @@ def test_cache_helpers_build_matching_eight_and_sixteen_byte_ir() -> None:
                 assert (
                     f"ld.global.L1::evict_{policy}.L2::cache_hint.v{words}.b32" in text
                 )
-        assert text.count("llvm.inline_asm has_side_effects") == 4
+            assert f"ld.global.L2::cache_hint.v{words}.b32" in text
+        # The 4-byte forms are scalar ``.b32`` loads (PTX has no ``.v1``).
+        for policy in ("first", "last"):
+            assert (
+                f"ld.global.L1::evict_{policy}.L2::cache_hint.b32 $0, [$1], pol;"
+                in text
+            )
+        assert "ld.global.L2::cache_hint.b32 $0, [$1], pol;" in text
+        assert ".v1." not in text
+        assert text.count("llvm.inline_asm has_side_effects") == len(helpers)
+        # A single output is the scalar result type, not a one-element struct.
+        assert "struct<(i32)>" not in text

@@ -99,7 +99,12 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
     assert after[1].index("cute.arch.griddepcontrol_wait()") < after[1].index(
         "cute.copy(tma_atom_"
     )
-    assert "sync_threads()" in after[1]
+    # The plain clustered consumer publishes its pipeline init through the
+    # cluster-wide ``pipeline_init_wait`` and the TMEM allocation through
+    # ``wait_for_alloc``; the CTA-wide ``sync_threads`` stays only on the grouped
+    # and row-union kernels, whose prologues publish SMEM tables through it.
+    assert "sync_threads()" not in after[1]
+    assert "pipeline_init_wait(" in after[1]
     assert after[1].count("wait_for_alloc()") == 1
     assert after[1].replace(", 'use_pdl': True", "") == before[1]
     # Full caller/allocation/ABI inverse, including the embedded source hashes.
@@ -110,6 +115,58 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
             sha256(new.encode()).hexdigest(), sha256(old.encode()).hexdigest()
         )
     assert ast.dump(ast.parse(restored)) == ast.dump(ast.parse(baseline))
+
+
+@pytest.mark.parametrize(
+    "kernel,packed", [(matmul_bf16_int4, True), (_computed_rhs, False)]
+)
+def test_cute_pdl_never_reaches_the_stage_that_releases_dependents_at_entry(
+    kernel: Kernel[Any], packed: bool
+) -> None:
+    bound = _bind(kernel, _args(packed=packed))
+    serial = _serial(bound)
+    # With the protocol on, the producer stage releases its dependents at
+    # entry and the consumer's TMA role loads the ordinary operand ahead of
+    # its own wait, relying on the producer being an ordinary launch that
+    # started after everything ahead of it.  ``cute_pdl`` must not turn the
+    # producer into a programmatic dependent launch (its wait would land
+    # behind the release), and the consumer's plan already launches with one:
+    # the knob is inert on the whole bundle.
+    protocol = bound.to_code(helion.Config.from_dict(serial.config | {KEY: True}))
+    assert (
+        bound.to_code(
+            helion.Config.from_dict(serial.config | {KEY: True, "cute_pdl": True})
+        )
+        == protocol
+    )
+    producer, consumer = _stage_sources(protocol)
+    assert (
+        ast.unparse(_device(producer).body[0])
+        == "cute.arch.griddepcontrol_launch_dependents()"
+    )
+    assert WAIT not in producer and "_helion_cute_use_pdl" not in producer
+    assert "'use_pdl': True" in consumer and "_helion_cute_use_pdl" not in consumer
+    # Without the protocol the producer is an ordinary pointwise stage and
+    # takes the knob like any kernel: the wait ahead of its first access plus
+    # the launch attribute, nothing else.  The consumer keeps its role-local
+    # wait and stays inert.
+    off = _stage_sources(bound.to_code(serial))
+    on = _stage_sources(
+        bound.to_code(helion.Config.from_dict(serial.config | {"cute_pdl": True}))
+    )
+    device = _device(on[0])
+    attribute = f"{device.name}._helion_cute_use_pdl = True"
+    assert ast.unparse(device.body[0]) == WAIT
+    assert on[0].count(WAIT) == 1 and on[0].count(attribute) == 1
+    assert [
+        line
+        for line in on[0].splitlines()
+        if WAIT not in line and attribute not in line
+    ] == off[0].splitlines()
+    assert on[1] == off[1]
+    # The bundle's search space comes from the tcgen05 branch, which never
+    # offers the knob; only an explicit config reaches the producer with it.
+    assert "cute_pdl" not in bound.config_spec._flat_fields()
 
 
 def test_coverage_is_additive_serial_default_and_acc1_is_capacity_derived() -> None:
@@ -475,16 +532,17 @@ def test_codegen_rejects_a_wait_after_the_materialized_operand_loads() -> None:
 
 
 def test_one_cta_pdl_waits_inside_the_persistent_tile_loop() -> None:
-    # Four SMs for sixteen 64x16 tiles: the TMA role loops over tiles and the
-    # split prefetch, wait included, sits inside that loop.
+    # Three SMs for sixteen 128x16 tiles (the 64-row small-grid seeds are only
+    # offered within one wave, which three SMs cannot give): the TMA role loops
+    # over tiles and the split prefetch, wait included, sits inside that loop.
     with (
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=4),
-        patch("helion.runtime.get_num_sm", return_value=4),
+        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=3),
+        patch("helion.runtime.get_num_sm", return_value=3),
     ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
         with bound.env:
             config = _producer_seed(bound, tcgen05_cta_group="auto")
-        assert config.block_sizes[2:] == [64, 16, 128]
+        assert config.block_sizes[2:] == [128, 16, 128]
         producer, consumer = _stage_sources(bound.to_code(config))
     assert "cute.arch.griddepcontrol_launch_dependents()" in producer
     assert ".is_valid_tile:" in consumer

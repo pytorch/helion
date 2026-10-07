@@ -4386,6 +4386,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generation.flat_spec = [EnumFragment(tuple(range(7)))]
         generation.compiler_coverage_enabled = True
         generation._override_values = {}
+        # The one-fragment stub carries no pipeline-family axis, so the exact
+        # enumeration runs as one global product.
+        generation._key_to_flat_indices = {}
         generation.unflatten = lambda _flat: initial.config
         self.assertIsNone(generation.flash_exact_effective_search_space_configs(1))
         self.assertEqual(
@@ -4947,6 +4950,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         qualification_counts = prefix_leaf_counts(qualification_count)
         self.assertTrue(compound_leaves)
         self.assertTrue(all(parent_counts[leaf] == 1 for leaf in leaves))
+        # A leaf with a single reachable normalized config under these
+        # overrides is complete after its one parent row.
+        singleton_leaves = set(generation.flash_structural_singleton_leaves())
+        self.assertEqual(singleton_leaves, set())
         self.assertTrue(
             all(qualification_counts[leaf] == 2 for leaf in ordinary_leaves)
         )
@@ -4967,6 +4974,115 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(
             generation.flash_structural_population_budget(2 * qualification_count),
             qualification_count,
+        )
+
+    def test_flash_initial_prefix_singleton_leaf_takes_one_witness(self):
+        # A small grid admits the row_mma family, whose only searchable
+        # knobs are its two row knobs. Overriding them leaves the leaf a
+        # single reachable normalized config: every other live key is dead
+        # for the row programs, so no second distinct witness exists and
+        # qualification reserves one row for it, two for every other
+        # ordinary leaf.
+        with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
+            spec = ConfigSpec(
+                backend=CuteBackend(),
+                target_device_capability=(10, 0),
+                num_sm=148,
+            )
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        surface = {
+            "num_bh": 1,
+            "dtype": torch.float16,
+            "standard_dense_output": True,
+        }
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=4,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            **surface,
+        )
+        fragments = cute_flash.flash_autotune_fragments(64, 4, **surface)
+        self.assertIn(
+            "row_mma", fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+        )
+        ws_values = cute_flash.flash_effective_config_values(
+            cute_flash.resolve_flash_config(
+                64, 4, {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}, **surface
+            )
+        )
+        live_prefix_keys = {
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY,
+            cute_flash.FLASH_EXP2_PACKET_KEY,
+            cute_flash.FLASH_WAIT_HINT_KEY,
+            *(
+                key
+                for key, fragment in fragments.items()
+                if ws_values.get(key) != fragment.default()
+            ),
+        }
+        generation = spec.create_config_generation(
+            overrides={
+                key: fragment.default()
+                for key, fragment in fragments.items()
+                if key not in live_prefix_keys
+            }
+        )
+        rows = generation.flash_deterministic_population_configs()
+        leaves = generation.flash_structural_leaf_catalog()
+        singleton_leaves = generation.flash_structural_singleton_leaves()
+        self.assertEqual(
+            [leaf.pipeline_family for leaf in singleton_leaves], ["row_mma"]
+        )
+        ordinary_leaves = [
+            leaf
+            for leaf in leaves
+            if leaf.compound_exp2_packet is None and leaf not in singleton_leaves
+        ]
+        self.assertTrue(ordinary_leaves)
+        parent_count = generation.flash_structural_parent_coverage_prefix_count()
+        qualification_count = generation.flash_structural_qualification_prefix_count()
+
+        def prefix_leaf_counts(limit: int) -> dict[object, int]:
+            counts = dict.fromkeys(leaves, 0)
+            for config in rows[:limit]:
+                leaf = flash_structural_leaf_from_config(config.config)
+                if leaf in counts:
+                    counts[leaf] += 1
+            return counts
+
+        parent_counts = prefix_leaf_counts(parent_count)
+        qualification_counts = prefix_leaf_counts(qualification_count)
+        self.assertTrue(all(parent_counts[leaf] == 1 for leaf in leaves))
+        self.assertTrue(
+            all(qualification_counts[leaf] == 1 for leaf in singleton_leaves)
+        )
+        self.assertTrue(
+            all(qualification_counts[leaf] == 2 for leaf in ordinary_leaves)
+        )
+        self.assertEqual(qualification_count, parent_count + len(ordinary_leaves))
+        self.assertEqual(
+            generation.flash_structural_coverage_underqualified_leaves(), []
+        )
+        # The family value keeps reporting its single witness: the report
+        # stays honest about the collapsed surface while the leaf catalog
+        # carries the singleton exemption.
+        self.assertEqual(
+            generation.flash_structural_coverage_underqualified_values(),
+            [(cute_flash.FLASH_PIPELINE_FAMILY_KEY, "row_mma", 1)],
+        )
+        # The row_mma leaf is a singleton only because its knobs are
+        # overridden: the live surface gives it two witnesses.
+        live = spec.create_config_generation()
+        self.assertEqual(live.flash_structural_singleton_leaves(), [])
+        self.assertGreaterEqual(
+            sum(
+                config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "row_mma"
+                for config in live.flash_deterministic_population_configs()[
+                    : live.flash_structural_qualification_prefix_count()
+                ]
+            ),
+            2,
         )
 
     def test_lfbo_flash_pipeline_lane_witness_uses_generation_catalog(self):
@@ -9113,7 +9229,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 resolve_block_id=lambda _shape: 3,
             ),
         ):
-            compacted = dispatch._compact_shape([object()])
+            compacted = dispatch.compact_shape([object()])
 
         self.assertEqual(len(compacted), 1)
         self.assertEqual(compacted[0].size_str, "_BLOCK_3")
@@ -11973,6 +12089,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_vector_packet_unroll",
                 "cute_vloop_sink",
                 "cute_lane_unroll",
+                "cute_pdl",
                 "load_eviction_policies",
             },
         )
@@ -12004,6 +12121,7 @@ class TestCuteAutotuner(TestCase):
                     "cute_vector_packet_unroll",
                     "cute_vloop_sink",
                     "cute_lane_unroll",
+                    "cute_pdl",
                     "load_eviction_policies",
                 },
             )

@@ -72,6 +72,7 @@ class Config(Mapping[str, object]):
         cute_vector_packet_unroll: bool | None = None,
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
+        cute_pdl: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -145,6 +146,14 @@ class Config(Mapping[str, object]):
             cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for the row lane
                 loop of a sunk vector nest; every copy's vector loads issue
                 before any copy's accumulates. Only applies with cute_vloop_sink.
+            cute_pdl: Launch the kernel as a programmatic dependent of the
+                previous kernel in the stream: its launch and prologue overlap
+                that kernel's tail and it waits (``griddepcontrol.wait``) ahead
+                of its first global memory access. Off by default. Kernels that
+                already take part in dependent launch (native plans launched
+                with it, bodies with their own wait or release, the
+                materialized-fission producer) and pre-sm_90 targets generate
+                exactly the knob-off code.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -234,6 +243,7 @@ class Config(Mapping[str, object]):
             "cute_vector_packet_unroll": cute_vector_packet_unroll,
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
+            "cute_pdl": cute_pdl,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,

@@ -164,6 +164,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.divergent_control_flow_depth = 0
         self.current_root_graph_info: GraphInfo | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.root_thread_block_dims = [1, 1, 1]
@@ -270,7 +271,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 plan.get("kind")
                 in {
                     "helion_small_biased_attention",
+                    "helion_flash_row_mma",
+                    "helion_warp_mma_gemm",
                     "helion_flash",
+                    "helion_flash_gated",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
@@ -477,6 +481,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         cute_state = self.device_function.cute_state
         cute_state.attention_flash_block_ids = None
         cute_state.attention_flash_score_plan = None
+        cute_state.attention_flash_gated_match = None
         cute_state.attention_flash_threads = 128
 
     def _try_codegen_attention_flash_root(self) -> bool:
@@ -494,12 +499,34 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if cute_state.attention_flash_block_ids is None:
             return False
 
+        if cute_state.attention_flash_gated_match is not None:
+            from .cute.cute_flash_gated import codegen_gated_attention_flash
+
+            if codegen_gated_attention_flash(self):
+                return True
+            self._clear_attention_flash_state()
+            raise exc.BackendUnsupported(
+                "cute", "gated attention failed late validation"
+            )
+
         from .cute.cute_flash import codegen_attention_flash
 
         if codegen_attention_flash(self):
             return True
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
+
+    def _try_codegen_warp_mma_gemm_root(self) -> bool:
+        if self.device_function.cute_state.warp_mma_gemm_plan is None:
+            return False
+        from .cute.cute_warp_mma_gemm import codegen_warp_mma_gemm
+
+        if codegen_warp_mma_gemm(self):
+            return True
+        self.device_function.cute_state.warp_mma_gemm_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "warp_mma GEMM family failed late validation"
+        )
 
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
@@ -950,7 +977,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         """
         self._cute_branch_path.append((if_node_id, branch_side))
         try:
-            yield
+            with self.divergent_control_flow():
+                yield
         finally:
             self._cute_branch_path.pop()
 
@@ -973,6 +1001,39 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _record_active_thread_axis_sizes(self) -> None:
         self._record_thread_axis_sizes(self._current_active_thread_axis_sizes())
+
+    @contextlib.contextmanager
+    def divergent_control_flow(self) -> Iterator[None]:
+        """Generate statements of a branch or while loop whose condition a
+        CuTe SIMT thread may evaluate differently from its neighbours; a
+        block-wide barrier must not be placed inside
+        (``divergent_control_flow_depth``)."""
+        self.divergent_control_flow_depth += 1
+        try:
+            yield
+        finally:
+            self.divergent_control_flow_depth -= 1
+
+    def active_thread_axis_sizes(self) -> dict[int, int]:
+        """The thread count along each launch axis the body being generated may
+        address: the active loops' and the free ``hl.arange`` dims'."""
+        return self._current_active_thread_axis_sizes()
+
+    def launch_thread_axis_sizes(self) -> dict[int, int]:
+        """The thread count along each launch axis, as far as the kernel has claimed it.
+
+        The maximum over the loops emitted so far (``max_thread_block_dims``,
+        the launch's block), the active loops and the free ``hl.arange`` dims,
+        and every strategy's reserved axes, entered or not.  A block-wide
+        barrier concerns every thread of the launch: the threads a loop
+        nested in a body addresses run the rest of the body too.
+        """
+        sizes = self._strategy_thread_axis_sizes()
+        for axis, size in self._current_active_thread_axis_sizes().items():
+            sizes[axis] = max(sizes.get(axis, 1), size)
+        for axis, size in enumerate(self.max_thread_block_dims):
+            sizes[axis] = max(sizes.get(axis, 1), size)
+        return sizes
 
     def _current_active_thread_axis_sizes(self) -> dict[int, int]:
         seen: set[int] = set()
@@ -1363,6 +1424,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self._record_statement_thread_references(device_loop.inner_statements)
             try:
                 yield
+                # Finalizers first: a collected tile-vector store that a later
+                # statement of the body observes returns to its scalar form
+                # here, so the nest check and the barrier pass below judge the
+                # body as it is emitted.
+                for finalize in device_loop.body_finalizers:
+                    finalize()
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
@@ -1561,6 +1628,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
+                        and not self._try_codegen_warp_mma_gemm_root()
                         and not self._try_codegen_attention_flash_root()
                     ):
                         grid_state = self.current_grid_state
@@ -1595,6 +1663,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_suffix
                                 )
                             else:
+                                grid_state.add_body_barriers(wrapped_body)
                                 self.statements_stack[-1].extend(wrapped_body)
                         else:
                             codegen_call_with_graph(self, root, [])

@@ -28,8 +28,11 @@ if TYPE_CHECKING:
     from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
+    from .cute_flash_gated import GatedAttentionMatch
+    from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
@@ -715,6 +718,10 @@ class CuteDeviceFunctionState:
         # initial AB prefetch (independent operand first); the role-local
         # prelude must not wait again ahead of those loads.
         self.tcgen05_pdl_wait_in_prefetch: bool = False
+        # One-shot clustered tcgen05 kernels: the cluster ``pipeline_init_arrive``
+        # statement after which ``program_id`` re-emits the TMA-load warp's
+        # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
+        self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -778,6 +785,10 @@ class CuteDeviceFunctionState:
         self.single_token_rank1_plan: CuteSingleTokenRank1Plan | None = None
         self.collective_register_chain_lowered = False
         self.collective_register_chain_block_dims: tuple[int, int, int] | None = None
+        # Launch shape ``finalize_shared_reduce_groups`` sized the shared
+        # cross-warp reductions for (None when it rewrote nothing); the
+        # launcher refuses to emit a different ``block=`` for such a body.
+        self.shared_reduce_launch_block: tuple[int, int, int] | None = None
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
@@ -800,10 +811,25 @@ class CuteDeviceFunctionState:
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
+        # Set by the gated (softmax-free) attention detector: the matched
+        # kernel facts plus the config-selected KV tile / TMA ring depth.
+        self.attention_flash_gated_match: GatedAttentionPlan | None = None
+        # Config-independent gated match, probed once per device function
+        # (``attention_flash_gated_probed`` records that the probe ran).
+        self.attention_flash_gated_probe: GatedAttentionMatch | None = None
+        self.attention_flash_gated_probed: bool = False
+        # The fused body may run one CTA per (grid index, lane): the launch
+        # grid is the PID strategy's grid times this factor.
+        self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
         self.attention_flash_bwd_match: AttentionBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # Set by the register-MMA GEMM detector (``cute_matmul_family=
+        # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
+        # its tile; the dedicated codegen emits the whole device body and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan
