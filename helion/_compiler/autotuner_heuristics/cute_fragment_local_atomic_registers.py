@@ -13,6 +13,7 @@ from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
 from .cute_fragment_common import computed_fragment_discovery_supported
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
 from .cute_fragment_threads import THREADS
 from .registry import AutotunerHeuristic
@@ -77,13 +78,8 @@ def register_fragment_local_atomic_registers_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_local_atomic_registers_root_ids:
         return
-    previous = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = previous.canonicalize_flat(previous.default_flat())
-        previous.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     required = spec.cute_fragment_local_atomic_register_min_threads
     if cast("int", carrier.get("cute_fragment_threads", 128)) < required:

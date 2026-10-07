@@ -25,6 +25,8 @@ from ..inductor_lowering import PointwiseLowering
 from ..inductor_lowering import ReductionLowering
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..device_ir import GraphInfo
 
 
@@ -53,9 +55,9 @@ def _reachable_graphs(graphs: list[GraphInfo]) -> list[GraphInfo]:
     return list(result.values())
 
 
-def atomic_target_origins(graphs: list[GraphInfo]) -> dict[Node, Node]:
-    """Resolve atomic target identities through uniform loop captures."""
-    graphs = _reachable_graphs(graphs)
+def _allocation_origin_resolver(graphs: list[GraphInfo]) -> Callable[[Node], Node]:
+    """Follow current lexical captures, identity nodes and for-loop outputs."""
+    by_id = {info.graph_id: info for info in graphs}
     captures: dict[Node, Node] = {}
     parents = control_flow_parent_entries(graphs)
     for info in graphs:
@@ -81,12 +83,19 @@ def atomic_target_origins(graphs: list[GraphInfo]) -> dict[Node, Node]:
                 and _tracing_ops.is_for_loop_target(node.args[0].target)
             ):
                 call = node.args[0]
-                info = next(info for info in graphs if info.graph_id == call.args[0])
+                info = by_id[cast("int", call.args[0])]
                 output = info.graph.find_nodes(op="output")[0]
                 node = cast("list[Node]", output.args[0])[cast("int", node.args[1])]
             else:
                 return node
 
+    return origin
+
+
+def atomic_target_origins(graphs: list[GraphInfo]) -> dict[Node, Node]:
+    """Resolve atomic target identities through uniform loop captures."""
+    graphs = _reachable_graphs(graphs)
+    origin = _allocation_origin_resolver(graphs)
     return {
         node: origin(cast("Node", node.args[0]))
         for info in graphs
@@ -618,18 +627,9 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
 
     parents = control_flow_parent_entries(graphs)
     by_graph = {info.graph: info for info in graphs}
-    captures: dict[Node, Node] = {}
+    origin = _allocation_origin_resolver(graphs)
     local_branches: set[Node] = set()
     for info in graphs:
-        if info.graph_id in parents:
-            call, slot = parents[info.graph_id]
-            captures.update(
-                zip(
-                    info.graph.find_nodes(op="placeholder"),
-                    cast("list[Node]", call.args[slot]),
-                    strict=True,
-                )
-            )
         for node in info.graph.nodes:
             if node.target is _tracing_ops._if:
                 if uniform_local_branch_inputs(node, graphs) is not None:
@@ -642,24 +642,6 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
         for branch in local_branches
         for graph_id in branch.args[1:3]
     }
-
-    def origin(node: Node) -> Node:
-        while True:
-            if node in captures:
-                node = captures[node]
-            elif node.target in (_tracing_ops._new_var, _tracing_ops._phi):
-                node = cast("Node", node.args[0])
-            elif (
-                node.target is operator.getitem
-                and isinstance(node.args[0], Node)
-                and _tracing_ops.is_for_loop_target(node.args[0].target)
-            ):
-                call = node.args[0]
-                info = next(info for info in graphs if info.graph_id == call.args[0])
-                output = info.graph.find_nodes(op="output")[0]
-                node = cast("list[Node]", output.args[0])[cast("int", node.args[1])]
-            else:
-                return node
 
     for allocation in allocations:
         if allocation.target is not creation_ops.full:

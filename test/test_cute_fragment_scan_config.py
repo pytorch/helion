@@ -187,8 +187,13 @@ def test_partial_tile_bitcast_capability_is_independent_of_scan_strategy():
 def test_phase_bundle_inherits_scan_strategy():
     bound = _cpu_bind(_barrier_scan, (torch.ones(3, 65),))
     assert len(bound.config_spec.cute_fragment_scan_root_ids) == 2
-    serial = bound.to_code(_config(bound, "serial"))
-    cooperative = bound.to_code(_config(bound, "cooperative"))
+    # Flat scheduling selects ordered launches instead of one persistent grid.
+    serial_config = _config(bound, "serial")
+    cooperative_config = _config(bound, "cooperative")
+    serial_config.config["pid_type"] = "flat"
+    cooperative_config.config["pid_type"] = "flat"
+    serial = bound.to_code(serial_config)
+    cooperative = bound.to_code(cooperative_config)
     assert "fragment_scan_initialized" in serial
     assert "fragment_scan_initialized" not in cooperative
     assert "__region_0" in cooperative and "__region_1" in cooperative
@@ -1132,7 +1137,9 @@ def test_fragment_threads_both_ordered_phases_and_dynamic_rebind():
         bound = _cpu_bind(_barrier_scan, (torch.ones(shape),))
         assert len(bound.config_spec.cute_fragment_thread_root_ids) == 2
         for threads in (512, 1024):
-            code = bound.to_code(_thread_config(bound, threads))
+            config = _thread_config(bound, threads)
+            config.config["pid_type"] = "flat"
+            code = bound.to_code(config)
             assert code.count(f"block=({threads}, 1, 1)") == 2
 
 
@@ -1503,7 +1510,9 @@ def test_warp_scan_mixed_phase_roots_keep_ineligible_serial_emitter():
         (torch.ones(3, 33, dtype=torch.float16), torch.ones(3, 65)),
     )
     assert len(bound.config_spec.cute_fragment_warp_scan_root_ids) == 1
-    code = bound.to_code(_warp_scan_config(bound))
+    config = _warp_scan_config(bound)
+    config.config["pid_type"] = "flat"
+    code = bound.to_code(config)
     assert "fragment_scan_initialized" in code
     assert "shuffle_sync_up" in code
 
@@ -1725,6 +1734,7 @@ def test_mixed_warp_scan_phase_capacity_and_default_parity(mode, reverse):
         args = args[::-1]
     bound = _cpu_bind(_mixed_dtype_phase_scans, args)
     default = _config(bound, mode)
+    default.config["pid_type"] = "flat"
     assert bound.to_code(default) == bound.to_code(
         helion.Config.from_dict(dict(default) | {WARP_SCAN_KEY: False})
     )

@@ -2,21 +2,19 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import torch
 
-from ...autotuner.compiler_coverage import CompilerCoverageGroup
-from ...autotuner.compiler_coverage import CoverageWitness
-from ...exc import InvalidConfig
 from ...language import _tracing_ops
-from ...runtime.config import Config
 from .cute_fragment_common import computed_fragment_discovery_supported
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
+from .cute_fragment_common import register_fragment_boolean_coverage
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
@@ -72,32 +70,8 @@ def register_fragment_skip_zero_atomics_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_skip_zero_atomics_root_ids:
         return
-    previous = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = previous.canonicalize_flat(previous.default_flat())
-        previous.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     spec.cute_fragment_skip_zero_atomics_search_enabled = True
-    generation = spec.create_config_generation()
-    try:
-        generation.strict_config_pair(
-            Config.from_dict(deepcopy(carrier.config) | {KEY: True})
-        )
-    except InvalidConfig:
-        return
-    # Registered after every previous group: neither old witnesses nor their
-    # sampling/RNG policy are changed by the new independent coordinate.
-    spec.register_compiler_coverage_group(
-        CompilerCoverageGroup(
-            mechanism="cute.fragment_skip_zero_atomics",
-            version=1,
-            key=KEY,
-            domain=(False, True),
-            legacy=False,
-            witnesses=(CoverageWitness(carrier, True),),
-            deferred=True,
-        )
-    )
+    register_fragment_boolean_coverage(spec, KEY, carrier)
