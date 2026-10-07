@@ -10,6 +10,7 @@ from ...autotuner.compiler_coverage import CoverageDependency
 from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
 from .cute_fragment_threads import LEGACY_COVERAGE_THREADS
 from .registry import AutotunerHeuristic
@@ -68,13 +69,8 @@ def register_fragment_register_loads_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_register_load_root_ids:
         return
-    generation = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = generation.canonicalize_flat(generation.default_flat())
-        generation.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     spec.cute_fragment_register_loads_search_enabled = True
     generation = spec.create_config_generation()
