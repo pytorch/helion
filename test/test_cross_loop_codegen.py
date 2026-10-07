@@ -7,6 +7,7 @@ from typing import Any
 from typing import cast
 from unittest import mock
 
+import pytest
 import torch
 
 import helion
@@ -2284,6 +2285,11 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     torch.cuda.synchronize()
                     torch.testing.assert_close(captured, (x + 1) * 2)
 
+    # Six static-pipeline schedules, each proved and generated twice by
+    # code_and_output, spend ~30s in host codegen on an idle machine; CI's
+    # four workers per GPU push that past the default 60s timeout, and
+    # pytest-timeout then kills the worker.
+    @pytest.mark.timeout(300)
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_grouped_schedule_requires_the_proven_access_order(self) -> None:

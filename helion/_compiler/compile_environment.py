@@ -1332,11 +1332,16 @@ class CompileEnvironment:
                     shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
                         self.size_hint(source.value)
                     )
-            else:
+            elif source.value != 1:
                 # A fixed integer extent is exact, but keep its block symbol
                 # distinct so backend codegen can still track the tile axis.
                 # A singleton range gives fake-tensor propagation the same
                 # equality fact without replacing the symbol with the integer.
+                # An extent of 1 needs no such fact (a literal 1 broadcasts
+                # against the symbol anyway), and narrowing the symbol to
+                # [1, 1] makes every size-1 check take the tile dim for a
+                # broadcast dim and drop its block id from derived shapes
+                # (``routing[tile.index + 1]`` traces as shape [1]).
                 shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
                     source.value
                 )
