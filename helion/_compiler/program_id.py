@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
@@ -487,7 +488,12 @@ class ProgramIDs(abc.ABC):
         raise NotImplementedError
 
     def total_pids_expr(self, *, is_device: bool) -> str:
-        """Get total PIDs expression for device or host."""
+        """Get total PIDs expression for device or host; a literal when static."""
+        counts = [
+            n for pid in self.pid_info if (n := pid.static_num_pids()) is not None
+        ]
+        if len(counts) == len(self.pid_info):
+            return str(math.prod(counts))
         return " * ".join(
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
@@ -587,13 +593,15 @@ class ForEachProgramID(ProgramIDs):
     def _get_cdiv_blocks(
         self, state: CodegenState, exclude_last: bool = False
     ) -> list[str]:
-        """Get non-empty cdiv expressions from cases."""
+        """Get non-empty cdiv expressions from cases; one literal when static."""
         cases = self.cases[:-1] if exclude_last else self.cases
         blocks = []
         for pid in cases:
             cdiv = pid.total_pids_expr(is_device=True)
             if cdiv:  # Only add non-empty cdiv expressions
                 blocks.append(cdiv)
+        if blocks and all(block.isdigit() for block in blocks):
+            return [str(sum(map(int, blocks)))]
         return blocks
 
     def codegen_test(self, state: CodegenState) -> ast.AST:
@@ -644,6 +652,8 @@ class ForEachProgramID(ProgramIDs):
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
+        if all(cdiv.isdigit() for cdiv in cdivs):
+            return str(sum(map(int, cdivs)))
         return " + ".join(cdivs)
 
     def codegen(self, state: CodegenState) -> None:
@@ -669,8 +679,7 @@ class ForEachProgramID(ProgramIDs):
             return self.cases[0].codegen_grid()
 
         # When persistent kernels are not active, use the full grid size
-        host_cdivs = [pid.total_pids_expr(is_device=False) for pid in self.cases]
-        return expr_from_string(f"({'+ '.join(host_cdivs)},)")
+        return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
 
     def _prepare_persistent_body(
         self,
@@ -692,7 +701,11 @@ class ForEachProgramID(ProgramIDs):
         running = "0"
         prev_phase = self.case_phases[0]
         for idx, cdiv in enumerate(cdivs):
-            running = f"({running}) + ({cdiv})"
+            running = (
+                str(int(running) + int(cdiv))
+                if running.isdigit() and cdiv.isdigit()
+                else f"({running}) + ({cdiv})"
+            )
             next_phase = (
                 self.case_phases[idx + 1]
                 if idx + 1 < len(self.case_phases)

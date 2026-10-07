@@ -337,6 +337,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("if pid_shared <", code_blocked)
         self.assertIn("pid_shared", code_interleaved)
         self.assertIn("if pid_shared <", code_interleaved)
+        self.assertIn("if pid_shared < 96:", code_flat)
 
     def test_persistent_shared_vs_flat_shared_equivalence(self):
         """Test that persistent+ForEachProgramID produces same results as flat+ForEachProgramID."""
@@ -707,8 +708,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             ","
         )
 
-        # Flat should use the full grid size calculation (ceiling division)
-        self.assertIn("//", flat_grid)
+        # Flat should use the full grid size: (64 / 32) * (96 / 16) tiles
+        self.assertEqual(flat_grid, "12")
 
         # Persistent kernels should use NUM_SMS
         self.assertEqual(
