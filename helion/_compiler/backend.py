@@ -3078,6 +3078,9 @@ def _attention_softmax_pattern_head_dim(
         RELATIVE_BIAS_KIND,
         ALIBI_BIAS_KIND,
     }
+    from .compile_environment import CompileEnvironment
+
+    fast_math = CompileEnvironment.current().settings.fast_math
     scaled_modifiers = tuple(
         dataclasses.replace(
             modifier,
@@ -3091,6 +3094,7 @@ def _attention_softmax_pattern_head_dim(
                 if modifier.value_log2 is None
                 else modifier.value_log2 * bias_scale_log2
             ),
+            fast_math=fast_math,
         )
         if modifier.kind == SOFTCAP_KIND
         else modifier
