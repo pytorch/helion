@@ -182,13 +182,19 @@ class HelionTemplateBuffer(TemplateBuffer):
 
             return kernel, render
 
+        fusion_kwargs: dict[str, Any] = (
+            {"load_input_fusion_allowed_inputs": allowed_prologue_inps}
+            if "load_input_fusion_allowed_inputs"
+            in TemplateBuffer.__init__.__code__.co_varnames
+            else {"allowed_prologue_inps": allowed_prologue_inps}
+        )
         super().__init__(
             layout=layout,
             inputs=inputs,
             make_kernel_render=_make_kernel_render,
             mutated_inputs=mutated_inputs,
-            allowed_prologue_inps=allowed_prologue_inps,
             named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
+            **fusion_kwargs,
         )
 
     @staticmethod
@@ -409,6 +415,13 @@ class HelionTemplateBuffer(TemplateBuffer):
     def set_current_node(self, node: object) -> AbstractContextManager[None]:
         return nullcontext()
 
+    def get_allowed_prologue_inps(self) -> OrderedSet[str]:
+        allowed = getattr(self, "load_input_fusion_allowed_inputs", None)
+        if allowed is not None:
+            store_out = getattr(self, "store_output_fusion_allowed_inputs", None)
+            return allowed | store_out if store_out else allowed
+        return getattr(self, "allowed_prologue_inps", OrderedSet())
+
     def has_aliasing_or_mutation_for_prologue_fusion(
         self,
         scheduler_node: object,
@@ -452,6 +465,10 @@ class HelionTemplateBuffer(TemplateBuffer):
             ):
                 return True
         return False
+
+    has_aliasing_or_mutation_for_producer_fusion = (
+        has_aliasing_or_mutation_for_prologue_fusion
+    )
 
     def _build_call_args(
         self,

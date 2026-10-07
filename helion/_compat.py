@@ -749,7 +749,9 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
-        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
+        assert hasattr(
+            TemplateBuffer, "has_aliasing_or_mutation_for_producer_fusion"
+        ) or hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
     except (ImportError, AttributeError, AssertionError):
         return False
     return True
