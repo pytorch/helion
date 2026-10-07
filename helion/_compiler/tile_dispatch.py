@@ -567,12 +567,25 @@ class TileStrategyDispatch:
         they map to the same hardware lane.  Without this dedup the
         warp-per-row layout would assign one axis per inner tile loop
         and bury M on axis 2 or 3.
+
+        A reduction that claims no axis (a single live thread on CuTe,
+        ``ReductionStrategy._claims_thread_axis``) is parked on the lowest
+        axis no threaded reduction of the branch (or of another
+        ``hl.barrier()`` phase) holds.  It indexes with the constant 0 and
+        records no thread coordinate, so sharing that axis with a tile is
+        harmless, whereas sharing a threaded reduction's axis would let a
+        lookup of the block's axis extent read the other reduction's threads.
         """
         reserved_axes = self._multi_phase_reserved_reduction_axes()
+        reduction_axis_first = (
+            CompileEnvironment.current().backend.reduction_axis_first()
+        )
         for branch in self._strategy_branches():
             if target not in branch:
                 continue
             axis = 0
+            target_axis: int | None = None
+            threaded_reduction_axes: set[int] = set(range(reserved_axes))
             seen_block_id_sets: dict[tuple[int, ...], int] = {}
             plan = (
                 self.current_cute_grid_execution_plan(
@@ -606,12 +619,25 @@ class TileStrategyDispatch:
                     # they're mutually exclusive in time so they share
                     # the axis.
                     if strategy is target:
-                        return cached
+                        target_axis = cached
                     continue
                 if strategy is target:
-                    return axis
+                    target_axis = axis
                 seen_block_id_sets[key] = axis
-                axis += strategy.thread_axes_used()
+                used = strategy.thread_axes_used()
+                if isinstance(strategy, ReductionStrategy):
+                    threaded_reduction_axes.update(range(axis, axis + used))
+                axis += used
+            if (
+                reduction_axis_first
+                and isinstance(target, ReductionStrategy)
+                and target.thread_axes_used() == 0
+            ):
+                free_axis = 0
+                while free_axis in threaded_reduction_axes:
+                    free_axis += 1
+                return free_axis
+            return target_axis
         return None
 
     def _multi_phase_reserved_reduction_axes(self) -> int:

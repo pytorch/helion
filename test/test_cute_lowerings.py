@@ -15295,6 +15295,7 @@ class TestCuteLowerings(unittest.TestCase):
             _cute_resident_reduction=False,
             # ``__init__`` predicts the register tile; this lane stays rolled.
             _cute_register_tile_predicted=False,
+            _claims_thread_axis=lambda: True,
             block_size_var=lambda block_idx: "_RDIM_SIZE_0",
             index_var=lambda block_idx: "indices_0",
             _get_thread_axis=lambda: 0,
