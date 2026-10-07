@@ -1011,13 +1011,16 @@ class DeviceIR:
         """
         env = CompileEnvironment.current()
         if env.backend_name == "cute":
-            # Mark provably-FTZ-safe exp sites on the pre-roll graphs so the
-            # roller's node_copy carries the mark into the rolled sweeps
-            # (consumed by the cute op overrides; inert for other backends).
+            # Mark provably-FTZ-safe exp sites and explicitly rounded FP32
+            # products on the pre-roll graphs so the roller's node_copy
+            # carries the marks into the rolled sweeps (consumed by the cute
+            # op overrides; inert for other backends).
             from .cute.exp2_fastmath import mark_ftz_safe_exp_nodes
+            from .cute.scalar_recipe_rounding import mark_narrowed_fp32_multiplies
 
             for graph_info in self.graphs:
                 mark_ftz_safe_exp_nodes(graph_info.graph)
+                mark_narrowed_fp32_multiplies(graph_info.graph)
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         if env.backend_name == "cute":
             from .cute.memory_ops import register_cute_tensor_alias_specializations

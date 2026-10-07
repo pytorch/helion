@@ -136,7 +136,13 @@ PURE_DECODE_HELPERS = frozenset(
     }
 )
 _HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod"}
-_GLOBALS = _BUILTINS | _HELPERS | {"cutlass", "cute", "math", "operator"}
+# ``_cute_inline_asm_elementwise`` enters a recipe only as the rounded FP32
+# product ``is_rounded_fp32_multiply`` recognizes (``_PureExpression.visit_Call``).
+_GLOBALS = (
+    _BUILTINS
+    | _HELPERS
+    | {"cutlass", "cute", "math", "operator", "_cute_inline_asm_elementwise"}
+)
 _METADATA = frozenset({"iterator", "layout", "shape", "stride", "element_type"})
 _AstT = TypeVar("_AstT", bound=ast.AST)
 
@@ -179,6 +185,30 @@ def _numeric_type(node: ast.expr) -> bool:
         and path[0] == "cutlass"
         and path[1] in _NUMERIC_TYPES
     )
+
+
+ROUNDED_FP32_MULTIPLY_ASM = "mul.rn.f32 $0, $1, $2;"
+ROUNDED_FP32_MULTIPLY_CONSTRAINTS = "=f,f,f"
+
+
+def is_rounded_fp32_multiply(value: ast.expr) -> bool:
+    """Recognize the explicitly rounded FP32 product of ``scalar_recipe_rounding``."""
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_cute_inline_asm_elementwise"
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Tuple)
+        and len(value.args[0].elts) == 2
+        and len(value.keywords) == 4
+    ):
+        return False
+    return {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords} == {
+        "asm": repr(ROUNDED_FP32_MULTIPLY_ASM),
+        "constraints": repr(ROUNDED_FP32_MULTIPLY_CONSTRAINTS),
+        "dtype": "cutlass.Float32",
+        "is_pure": "True",
+    }
 
 
 class _PureExpression(ast.NodeVisitor):
@@ -258,6 +288,12 @@ class _PureExpression(ast.NodeVisitor):
         self.visit(node.orelse)
 
     def visit_Call(self, node: ast.Call) -> None:
+        if is_rounded_fp32_multiply(node):
+            # ``preserve_fp32_multiply_rounding``'s spelling of an FP32
+            # product, already emitted for a product that
+            # ``mark_narrowed_fp32_multiplies`` flagged at device-IR time.
+            self.visit(node.args[0])
+            return
         path = _path(node.func)
         pure_global = path is not None and (
             len(path) == 1

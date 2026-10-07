@@ -35,7 +35,7 @@ from .scalar_recipe import _read_names
 if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
 
-_PACKET_GLOBALS = _GLOBALS | {"_cute_inline_asm_elementwise", "ir"}
+_PACKET_GLOBALS = _GLOBALS | {"ir"}
 _PTX_ARITHMETIC = frozenset(
     [
         "abs",
