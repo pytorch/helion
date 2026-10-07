@@ -4328,8 +4328,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
     published_scalars_required = (
         cg.device_function.config.get("cute_fragment_published_scalars", False)
-        and root.graph_id
-        in CompileEnvironment.current().config_spec.cute_fragment_published_scalar_root_ids
+        and root.graph_id in env.config_spec.cute_fragment_published_scalar_root_ids
     )
     pure_regions_required = (
         cg.device_function.config.get("cute_fragment_pure_producer_regions", False)
@@ -4359,10 +4358,11 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_warp_results", False)
         and root.graph_id in env.config_spec.cute_fragment_warp_result_root_ids
     )
-    local_required = bool(local_atomic_allocations(cg.host_function.device_ir.graphs))
-    owned_iota_axes = (
-        frozenset()
-        if threads_required
+    # These options require the fragment owner's coordinate layout instead of
+    # borrowing the ordinary scalar/iota layout. Warp-result publication also
+    # owns captured reductions, but does not change free-iota ownership.
+    coordinate_schedule_required = (
+        threads_required
         or register_loads_required
         or producer_cache_required
         or pure_regions_required
@@ -4370,6 +4370,12 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or bounded_gather_required
         or snapshots_required
         or warp_scan_required
+    )
+    capture_schedule_required = coordinate_schedule_required or warp_results_required
+    local_required = bool(local_atomic_allocations(cg.host_function.device_ir.graphs))
+    owned_iota_axes = (
+        frozenset()
+        if coordinate_schedule_required
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
         != "serial"
         else owned_iota_reduction_axes(cg)
@@ -4381,15 +4387,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
     physical_axes = (
         frozenset()
-        if threads_required
-        or register_loads_required
-        or producer_cache_required
-        or pure_regions_required
-        or published_scalars_required
-        or bounded_gather_required
-        or snapshots_required
-        or warp_scan_required
-        or warp_results_required
+        if capture_schedule_required
         or cg.device_function.config.get("cute_fragment_scan", "serial") != "serial"
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
         != "serial"
@@ -4409,15 +4407,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             and root.graph_id
             in env.config_spec.cute_fragment_private_scalar_loop_root_ids
         )
-        or threads_required
-        or register_loads_required
-        or producer_cache_required
-        or pure_regions_required
-        or published_scalars_required
-        or bounded_gather_required
-        or snapshots_required
-        or warp_scan_required
-        or warp_results_required
+        or capture_schedule_required
         or (
             cg.device_function.config.get("cute_fragment_scan", "serial")
             == "cooperative"
@@ -4520,18 +4510,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             raise exc.InvalidConfig(
                 "free iota reductions require a complete fragment root"
             )
-        if (
-            captured_required
-            or threads_required
-            or register_loads_required
-            or producer_cache_required
-            or pure_regions_required
-            or published_scalars_required
-            or bounded_gather_required
-            or snapshots_required
-            or warp_scan_required
-            or warp_results_required
-        ):
+        if captured_required or capture_schedule_required:
             raise exc.InvalidConfig(
                 "captured full reductions require a computed fragment root"
                 if captured_required
@@ -4574,15 +4553,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             captured_required
             or scan_required
             or reduction_required
-            or threads_required
-            or register_loads_required
-            or producer_cache_required
-            or pure_regions_required
-            or published_scalars_required
-            or bounded_gather_required
-            or snapshots_required
-            or warp_scan_required
-            or warp_results_required
+            or capture_schedule_required
         ):
             raise exc.InvalidConfig(
                 "captured full reductions require a computed fragment root"

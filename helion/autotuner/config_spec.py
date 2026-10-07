@@ -3358,93 +3358,77 @@ class ConfigSpec:
             return
         raise InvalidConfig(f"{key}={value!r} requires a proved pointwise region")
 
-    def _normalize_cute_fragment_published_scalars(
-        self, config: dict[str, object], *, fix_invalid: bool
+    def _normalize_cute_fragment_option(
+        self,
+        config: dict[str, object],
+        key: str,
+        root_ids: frozenset[int],
+        requirement: str,
+        *,
+        fix_invalid: bool,
+        choices: tuple[bool | int | str, ...] = (False, True),
     ) -> None:
-        key = "cute_fragment_published_scalars"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_published_scalar_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
+        """Normalize independent modes without weakening their typed defaults."""
+        default = choices[0]
+        value = config.get(key, default)
+        if type(value) is type(default):
+            if value == default:
+                config.pop(key, None)
+                return
+            if (
+                value in choices
+                and root_ids
+                and not config.get("cute_collective_mma")
+                and not config.get("cute_register_chain")
+            ):
+                return
         if fix_invalid:
             config.pop(key, None)
             return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a complete fragment with published scalar candidates"
+        raise InvalidConfig(f"{key}={value!r} requires {requirement}")
+
+    def _normalize_cute_fragment_published_scalars(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_published_scalars",
+            self.cute_fragment_published_scalar_root_ids,
+            "a complete fragment with published scalar candidates",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_skip_zero_atomics(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_skip_zero_atomics"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_skip_zero_atomics_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a proved unused or dead-zero-result "
-            "relaxed CTA-local Int32 atomic add"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_skip_zero_atomics",
+            self.cute_fragment_skip_zero_atomics_root_ids,
+            "a proved unused or dead-zero-result relaxed CTA-local Int32 atomic add",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_private_scalar_loops(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_private_scalar_loops"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_private_scalar_loop_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a proved read-only scalar finalizer loop"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_private_scalar_loops",
+            self.cute_fragment_private_scalar_loop_root_ids,
+            "a proved read-only scalar finalizer loop",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_producer_cache(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_producer_cache"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_producer_cache_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires repeated pure fragment producers"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_producer_cache",
+            self.cute_fragment_producer_cache_root_ids,
+            "repeated pure fragment producers",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_warp_scan(
@@ -3480,89 +3464,45 @@ class ConfigSpec:
     def _normalize_cute_fragment_atomic_aggregation(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_atomic_aggregation"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_atomic_aggregation_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires proved CTA-private Int32 relaxed unused atomic updates"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_atomic_aggregation",
+            self.cute_fragment_atomic_aggregation_root_ids,
+            "proved CTA-private Int32 relaxed unused atomic updates",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_atomic_consumer_fusion(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_atomic_consumer_fusion"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_atomic_consumer_fusion_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a proved same-coordinate local Int32 atomic consumer region"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_atomic_consumer_fusion",
+            self.cute_fragment_atomic_consumer_fusion_root_ids,
+            "a proved same-coordinate local Int32 atomic consumer region",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_pure_producer_regions(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_pure_producer_regions"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_pure_producer_regions_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a proved same-owner pure producer publication region"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_pure_producer_regions",
+            self.cute_fragment_pure_producer_regions_root_ids,
+            "a proved same-owner pure producer publication region",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_integer_atomic_epochs(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_integer_atomic_epochs"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_integer_atomic_epochs_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires proved CTA-private Int32 relaxed unused loop updates"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_integer_atomic_epochs",
+            self.cute_fragment_integer_atomic_epochs_root_ids,
+            "proved CTA-private Int32 relaxed unused loop updates",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_local_atomic_registers(
@@ -3748,45 +3688,23 @@ class ConfigSpec:
     def _normalize_cute_fragment_packet_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_packet_loads"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_packet_load_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a complete fragment root with readonly Float32 host loads"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_packet_loads",
+            self.cute_fragment_packet_load_root_ids,
+            "a complete fragment root with readonly Float32 host loads",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_register_loads"
-        value = config.get(key, False)
-        if value is False:
-            config.pop(key, None)
-            return
-        if (
-            value is True
-            and self.cute_fragment_register_load_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a supported lane-private fragment load"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_register_loads",
+            self.cute_fragment_register_load_root_ids,
+            "a supported lane-private fragment load",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_warp_results(
@@ -3818,70 +3736,37 @@ class ConfigSpec:
     ) -> None:
         from .._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
 
-        key = "cute_fragment_threads"
-        value = config.get(key, 128)
-        if type(value) is int and value == 128:
-            config.pop(key, None)
-            return
-        if (
-            type(value) is int
-            and value in THREADS
-            and self.cute_fragment_thread_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a supported computed fragment root"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_threads",
+            self.cute_fragment_thread_root_ids,
+            "a supported computed fragment root",
+            fix_invalid=fix_invalid,
+            choices=(128, *(count for count in THREADS if count != 128)),
         )
 
     def _normalize_cute_fragment_reduction(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_reduction"
-        value = config.get(key, "serial")
-        if type(value) is str and value == "serial":
-            config.pop(key, None)
-            return
-        if (
-            type(value) is str
-            and value == "warp"
-            and self.cute_fragment_reduction_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a supported computed scalar reduction"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_reduction",
+            self.cute_fragment_reduction_root_ids,
+            "a supported computed scalar reduction",
+            fix_invalid=fix_invalid,
+            choices=("serial", "warp"),
         )
 
     def _normalize_cute_fragment_scan(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        key = "cute_fragment_scan"
-        value = config.get(key, "serial")
-        if type(value) is str and value == "serial":
-            config.pop(key, None)
-            return
-        if (
-            type(value) is str
-            and value == "cooperative"
-            and self.cute_fragment_scan_root_ids
-            and not config.get("cute_collective_mma")
-            and not config.get("cute_register_chain")
-        ):
-            return
-        if fix_invalid:
-            config.pop(key, None)
-            return
-        raise InvalidConfig(
-            f"{key}={value!r} requires a supported computed additive scan"
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_scan",
+            self.cute_fragment_scan_root_ids,
+            "a supported computed additive scan",
+            fix_invalid=fix_invalid,
+            choices=("serial", "cooperative"),
         )
 
     def _normalize_cute_materialized_operand_schedule(

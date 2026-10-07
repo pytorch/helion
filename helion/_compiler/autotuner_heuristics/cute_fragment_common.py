@@ -2,18 +2,67 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ...autotuner.compiler_coverage import CompilerCoverageGroup
+from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...language import _tracing_ops
+from ...runtime.config import Config
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from ...autotuner.config_spec import ConfigSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
+
+
+def fragment_coverage_carrier(
+    spec: ConfigSpec, resource_carrier: Config | None = None
+) -> Config | None:
+    """Strictly admit the carrier before enabling a new search coordinate."""
+    generation = spec.create_config_generation()
+    try:
+        carrier = resource_carrier
+        if carrier is None:
+            _, carrier = generation.canonicalize_flat(generation.default_flat())
+        generation.strict_config_pair(carrier)
+    except InvalidConfig:
+        return None
+    return carrier
+
+
+def register_fragment_boolean_coverage(
+    spec: ConfigSpec, key: str, carrier: Config
+) -> bool:
+    """Append one independent Boolean witness after its field is enabled.
+
+    Callers retain ownership of capability discovery, registration order and
+    search-field rollback. Dependent witnesses keep their explicit declarations.
+    """
+    generation = spec.create_config_generation()
+    try:
+        generation.strict_config_pair(
+            Config.from_dict(deepcopy(carrier.config) | {key: True})
+        )
+    except InvalidConfig:
+        return False
+    spec.register_compiler_coverage_group(
+        CompilerCoverageGroup(
+            mechanism=key.replace("cute_", "cute.", 1),
+            version=1,
+            key=key,
+            domain=(False, True),
+            legacy=False,
+            witnesses=(CoverageWitness(carrier, True),),
+            deferred=True,
+        )
+    )
+    return True
 
 
 @dataclass(frozen=True)
