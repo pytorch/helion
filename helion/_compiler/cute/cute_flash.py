@@ -118,6 +118,9 @@ class FlashGraphOutputPlan(NamedTuple):
     head_dim: int
     dtype: torch.dtype
     row_epilogue: FlashRowEpilogueProgram | None = None
+    # Grouped-query divisor: K/V have ``batch // kv_group`` leading entries and
+    # are read at batch head ``bh // kv_group``.
+    kv_group: int = 1
 
 
 def _flash_supported_io_dtype(dtype: torch.dtype) -> bool:
@@ -144,6 +147,10 @@ def _small_biased_attention_score_plan_supported(
     if has_lse:
         return False
     if seq != 128 or head_dim != 64 or not _flash_supported_io_dtype(io_dtype):
+        return False
+    # The SIMT body indexes K/V by the query batch head; grouped K/V heads
+    # stay on the tcgen05 families.
+    if score_plan.kv_group != 1:
         return False
     if score_plan.modifier_kinds != (TENSOR_BIAS_KIND,):
         return False
@@ -251,16 +258,6 @@ def _flash_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
         and node.target is _get_symnode
         and len(node.args) >= 1
         and node.args[0] == f"block_size_{block_id}"
-    )
-
-
-def _flash_is_inner_batch_index(node: torch.fx.Node) -> bool:
-    return (
-        node.op == "call_function"
-        and node.target is torch.ops.aten.sym_size.int
-        and len(node.args) >= 2
-        and isinstance(node.args[1], int)
-        and node.args[1] == 0
     )
 
 
@@ -418,18 +415,28 @@ def _flash_root_loop_info(
     return root_loop_info
 
 
+class FlashOperandNames(NamedTuple):
+    q_name: str
+    k_name: str
+    v_name: str
+    kv_group: int
+
+
 def _flash_attention_operand_names(
     graphs: Iterable[GraphInfo],
     *,
     root_block_ids: Sequence[int] | None = None,
     kv_block_id: int | None = None,
-) -> tuple[str, str, str] | None:
+) -> FlashOperandNames | None:
+    from ..backend import _attention_canonical_kv_load_indices
+
     root_info = _flash_root_loop_info(graphs, root_block_ids=root_block_ids)
     if root_info is None:
         return None
 
     k_names: set[str] = set()
     v_names: set[str] = set()
+    kv_groups: set[int] = set()
     for graph_info in graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
@@ -438,33 +445,45 @@ def _flash_attention_operand_names(
                 if len(node.args) < 2 or not isinstance(node.args[1], torch.fx.Node):
                     return None
                 k_load = _flash_k_source_load_node(node.args[1])
-                if k_load is None or not _flash_kv_load_has_canonical_indices(
-                    k_load, kv_block_id
-                ):
+                if k_load is None:
+                    return None
+                k_indices = _attention_canonical_kv_load_indices(
+                    k_load, kv_block_id=kv_block_id
+                )
+                if k_indices is None:
                     return None
                 k_name = _flash_load_host_tensor_name(k_load)
                 if k_name is None:
                     return None
                 k_names.add(k_name)
+                kv_groups.add(k_indices.kv_group)
             elif node.target is torch.ops.aten.baddbmm.default:
                 if len(node.args) < 3 or not isinstance(node.args[2], torch.fx.Node):
                     return None
                 v_load = _flash_source_load_node(node.args[2])
-                if v_load is None or not _flash_kv_load_has_canonical_indices(
-                    v_load, kv_block_id
-                ):
+                if v_load is None:
+                    return None
+                v_indices = _attention_canonical_kv_load_indices(
+                    v_load, kv_block_id=kv_block_id
+                )
+                if v_indices is None:
                     return None
                 v_name = _flash_load_host_tensor_name(v_load)
                 if v_name is None:
                     return None
                 v_names.add(v_name)
+                kv_groups.add(v_indices.kv_group)
     if len(k_names) != 1 or len(v_names) != 1:
+        return None
+    # K and V must share one grouped-query divisor: the kernel reads both at
+    # ``bh // kv_group`` from tensors with ``batch // kv_group`` entries.
+    if len(kv_groups) != 1:
         return None
     k_name = next(iter(k_names))
     v_name = next(iter(v_names))
     if len({root_info.q_name, k_name, v_name}) != 3:
         return None
-    return root_info.q_name, k_name, v_name
+    return FlashOperandNames(root_info.q_name, k_name, v_name, next(iter(kv_groups)))
 
 
 def _is_full_slice(value: object) -> bool:
@@ -489,32 +508,6 @@ def _flash_store_has_canonical_indices(
     if len(node.args) > 3 and node.args[3] is not None:
         return False
     return rank == 2 or _is_full_slice(indices[2])
-
-
-def _flash_kv_load_has_canonical_indices(
-    node: torch.fx.Node,
-    kv_block_id: int | None,
-) -> bool:
-    from ...language import memory_ops
-
-    if node.op != "call_function" or node.target is not memory_ops.load:
-        return False
-    if len(node.args) < 4 or node.args[2] is not None or node.args[3] is not None:
-        return False
-    indices = node.args[1] if len(node.args) > 1 else None
-    if not isinstance(indices, (list, tuple)) or len(indices) != 3:
-        return False
-    if not isinstance(indices[0], torch.fx.Node) or not isinstance(
-        indices[1], torch.fx.Node
-    ):
-        return False
-    if not _flash_is_inner_batch_index(indices[0]):
-        return False
-    if kv_block_id is not None and not _flash_is_block_symnode(
-        indices[1], int(kv_block_id)
-    ):
-        return False
-    return _is_full_slice(indices[2])
 
 
 def _flash_store_value_is_output(node: torch.fx.Node) -> bool:
@@ -993,14 +986,17 @@ def _flash_graph_output_plan_from_graphs(
         and _flash_supported_io_dtype(value.dtype)
         and value.is_contiguous()
     }
-    operand_names = _flash_attention_operand_names(
+    operands = _flash_attention_operand_names(
         graphs,
         root_block_ids=root_block_ids,
         kv_block_id=kv_block_id,
     )
-    if operand_names is None:
+    if operands is None:
         return None
-    q_name, k_name, v_name = operand_names
+    q_name, k_name, v_name, kv_group = operands
+    operand_names = (q_name, k_name, v_name)
+    if score_plan is not None and score_plan.kv_group != kv_group:
+        return None
     if not all(name in flash_3d_tensors for name in operand_names):
         return None
     bias_names = (
@@ -1116,6 +1112,11 @@ def _flash_graph_output_plan_from_graphs(
         return None
     if seq % 128 != 0:
         return None
+    # Grouped-query K/V: ``kv_group`` query heads share one K/V head, so the
+    # collapsed batch*heads count must split evenly into K/V entries.
+    if batch % kv_group != 0:
+        return None
+    kv_batch = batch // kv_group
 
     row_epilogue = row_programs[0] if row_programs else None
     aux_names = row_epilogue.aux_names if row_epilogue is not None else ()
@@ -1137,8 +1138,9 @@ def _flash_graph_output_plan_from_graphs(
             return None
     for name in operand_names:
         value = flash_3d_tensors[name]
+        expected_batch = batch if name == q_name else kv_batch
         if (
-            int(value.shape[0]) != batch
+            int(value.shape[0]) != expected_batch
             or int(value.shape[1]) != seq
             or int(value.shape[2]) != head_dim
             or value.dtype != io_dtype
@@ -1263,6 +1265,7 @@ def _flash_graph_output_plan_from_graphs(
         head_dim,
         io_dtype,
         row_epilogue,
+        kv_group,
     )
 
 
@@ -8103,21 +8106,40 @@ def _flash_ws_pv(
     return _flash_guard(pv_body, pv_condition) + v_pf
 
 
-def _flash_persistent_tile_prelude(indent: str) -> str:
+def _flash_kv_bh_expr(kv_group: int, bh_expr: str = "flash_bh") -> str:
+    """The K/V batch-head coordinate for the query batch head ``bh_expr``.
+
+    Grouped-query attention shares one K/V head among ``kv_group`` query
+    heads, so K/V (with ``batch // kv_group`` entries) are read at
+    ``bh // kv_group``. Plain attention keeps the identity so existing renders
+    stay byte-identical.
+    """
+    if kv_group == 1:
+        return bh_expr
+    return f"{bh_expr} // {kv_group}"
+
+
+def _flash_persistent_tile_prelude(indent: str, *, kv_group: int = 1) -> str:
     """Per-tile decode + gmem slices, emitted at the top of each role's strided
     persistent loop (replaces the once-in-setup decode of the flat path). The
     mapping (`% _flash_num_bh`, `// _flash_num_bh`) is byte-identical to the flat
     path's setup decode so the gmem-view math is unchanged."""
-    body = """flash_bh = flash_tile_id % _flash_num_bh
+    kv_bh = _flash_kv_bh_expr(kv_group)
+    body = f"""flash_bh = flash_tile_id % _flash_num_bh
 flash_m_tile = flash_tile_id // _flash_num_bh
 tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
-tKgK = tKgK_kdl[None, None, 0, flash_bh]
-tVgV = tVgV_dkl[None, 0, None, flash_bh]"""
+tKgK = tKgK_kdl[None, None, 0, {kv_bh}]
+tVgV = tVgV_dkl[None, 0, None, {kv_bh}]"""
     return textwrap.indent(body, indent)
 
 
 def _flash_persistent_wrap(
-    role_guard: str, inner: str, persistent: bool, head: str = ""
+    role_guard: str,
+    inner: str,
+    persistent: bool,
+    head: str = "",
+    *,
+    kv_group: int = 1,
 ) -> str:
     """Wrap a role body (the dedented ``if warp_idx ...:`` block's INNER source,
     8-space indented) for the persistent scheduler.
@@ -8156,7 +8178,7 @@ def _flash_persistent_wrap(
     # ``while ...:`` at 4 spaces, so the while body sits at 8 spaces -- exactly
     # ``inner``'s existing indent. The per-tile prelude is emitted at the same
     # 8-space level so it precedes ``inner`` inside the loop.
-    prelude = _flash_persistent_tile_prelude("        ")
+    prelude = _flash_persistent_tile_prelude("        ", kv_group=kv_group)
     return f"""
 {role_guard}
 {head_block}    flash_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
@@ -9247,19 +9269,22 @@ flash_bh = flash_pid % _flash_num_bh
 flash_m_tile = flash_pid // _flash_num_bh"""
     )
     # The per-tile gmem slices depend on flash_bh; in the persistent path they
-    # are re-sliced at the top of each role's per-tile loop instead.
+    # are re-sliced at the top of each role's per-tile loop instead. K/V are
+    # read at the grouped batch head (``flash_bh // kv_group`` under GQA).
+    kv_group = score_plan.kv_group
+    kv_bh = _flash_kv_bh_expr(kv_group)
     setup_qk_gmem_slice = (
         ""
         if persistent
-        else """
+        else f"""
 tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
-tKgK = tKgK_kdl[None, None, 0, flash_bh]"""
+tKgK = tKgK_kdl[None, None, 0, {kv_bh}]"""
     )
     setup_v_gmem_slice = (
         ""
         if persistent
-        else """
-tVgV = tVgV_dkl[None, 0, None, flash_bh]"""
+        else f"""
+tVgV = tVgV_dkl[None, 0, None, {kv_bh}]"""
     )
     setup = f"""
 tidx, _, _ = cute.arch.thread_idx()
@@ -9449,7 +9474,9 @@ else:
             + "\n"
             + producer_body
         )
-    producer = _flash_persistent_wrap("if warp_idx == 0:", producer_body, persistent)
+    producer = _flash_persistent_wrap(
+        "if warp_idx == 0:", producer_body, persistent, kv_group=kv_group
+    )
     consumer = _flash_persistent_wrap(
         "if warp_idx >= 4:",
         _flash_ws_consumer_body(
@@ -9469,6 +9496,7 @@ else:
         ),
         persistent,
         head="    flash_aux_full_phase = cutlass.Int32(0)" if aux_smem_staging else "",
+        kv_group=kv_group,
     )
     if early_teardown:
         # Flat staged grid: the consumer warpgroup joins the teardown barrier
@@ -9503,6 +9531,7 @@ def _flash_fa4_tile_prelude(
     use_2cta_instrs: bool = False,
     use_cga2_local_cta: bool = False,
     tensor_4d_heads: int = 0,
+    kv_group: int = 1,
 ) -> str:
     """Per-work-item tile ids + gmem re-slice for the fa4 persistent scheduler.
 
@@ -9559,12 +9588,13 @@ tKgK = tKgK_kdl[None, None, 0, flash_head, flash_batch]
 tVgV = tVgV_dkl[None, 0, None, flash_head, flash_batch]"""
         )
         return textwrap.indent(body, indent)
+    kv_bh = _flash_kv_bh_expr(kv_group)
     body = (
         decode
-        + """
+        + f"""
 tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
-tKgK = tKgK_kdl[None, None, 0, flash_bh]
-tVgV = tVgV_dkl[None, 0, None, flash_bh]"""
+tKgK = tKgK_kdl[None, None, 0, {kv_bh}]
+tVgV = tVgV_dkl[None, 0, None, {kv_bh}]"""
     )
     return textwrap.indent(body, indent)
 
@@ -9614,6 +9644,7 @@ def _flash_fa4_wrap(
     clc_heads_per_batch: int | None = None,
     tensor_4d_heads: int = 0,
     recompute_tile_coords: bool = False,
+    kv_group: int = 1,
 ) -> str:
     """Wrap an fa4 role body for the (non-)persistent scheduler.
 
@@ -9652,6 +9683,7 @@ def _flash_fa4_wrap(
         use_2cta_instrs=use_2cta_instrs,
         use_cga2_local_cta=use_cga2_local_cta,
         tensor_4d_heads=tensor_4d_heads,
+        kv_group=kv_group,
     )
     prelude_block = f"{prelude_src}\n" if prelude_src else ""
     if use_clc_scheduler:
@@ -9875,6 +9907,9 @@ def emit_flash_fa4_device_body(
     assert q_stage == 2
     s_corr_stage = 2
     assert total_tiles % num_bh == 0
+    # Grouped-query K/V slices read batch head ``flash_bh // kv_group``.
+    kv_group = score_plan.kv_group
+    kv_bh = _flash_kv_bh_expr(kv_group)
     if cfg.skip_rescale_stats:
         cfg = dataclasses.replace(cfg, skip_rescale_stats=False)
     is_causal = score_plan.is_causal
@@ -10511,10 +10546,10 @@ tQgQ = tQgQ_qdl[None, None, 0, flash_head, flash_batch]
 tKgK = tKgK_kdl[None, None, 0, flash_head, flash_batch]
 tVgV = tVgV_dkl[None, 0, None, flash_head, flash_batch]"""
     else:
-        setup_gmem_slice = """
+        setup_gmem_slice = f"""
 tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
-tKgK = tKgK_kdl[None, None, 0, flash_bh]
-tVgV = tVgV_dkl[None, 0, None, flash_bh]"""
+tKgK = tKgK_kdl[None, None, 0, {kv_bh}]
+tVgV = tVgV_dkl[None, 0, None, {kv_bh}]"""
     if use_2cta_instrs:
         cta_group_setup = """
 flash_mma_tile_coord_v = cute.arch.make_warp_uniform(
@@ -11271,8 +11306,8 @@ if warp_idx == 15:
             load_mv_cur = "_flash_mVt[None, None, flash_head, flash_batch]"
         else:
             load_mq_cur = "_flash_mQt[None, None, flash_bh]"
-            load_mk_cur = "_flash_mKt[None, None, flash_bh]"
-            load_mv_cur = "_flash_mVt[None, None, flash_bh]"
+            load_mk_cur = f"_flash_mKt[None, None, {kv_bh}]"
+            load_mv_cur = f"_flash_mVt[None, None, {kv_bh}]"
         local_load_tma_block = f"""        flash_mQ_cur = {load_mq_cur}
         flash_mK_cur = {load_mk_cur}
         flash_mV_cur = {load_mv_cur}
@@ -11360,6 +11395,7 @@ if warp_idx == 15:
         use_clc_scheduler=use_clc_scheduler,
         clc_heads_per_batch=clc_heads_per_batch,
         tensor_4d_heads=tensor_4d_heads,
+        kv_group=kv_group,
         recompute_tile_coords=cfg.recompute_tile_coords,
     )
 
@@ -13724,8 +13760,8 @@ tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
     _flash_tma_v, 0, cute.make_layout(1),
     cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3))
 tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
-tKgK = tKgK_kdl[None, None, 0, flash_bh]
-tVgV = tVgV_dkl[None, 0, None, flash_bh]
+tKgK = tKgK_kdl[None, None, 0, {_flash_kv_bh_expr(score_plan.kv_group)}]
+tVgV = tVgV_dkl[None, 0, None, {_flash_kv_bh_expr(score_plan.kv_group)}]
 
 flash_tmem.wait_for_alloc()
 flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
@@ -13902,6 +13938,7 @@ class FlashTensorPlan(NamedTuple):
     row_epilogue: FlashRowEpilogueProgram | None = None
     epi_aux_args: tuple[TensorArg, ...] = ()
     epi_scalar_names: tuple[str, ...] = ()
+    kv_group: int = 1
 
 
 def _flash_current_block_ids(
@@ -14025,12 +14062,18 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
                 return None
             epi_scalar_names.append(f"cutlass.Float32({df.sympy_expr(expr)})")
 
-    for arg in (q_arg, k_arg, v_arg, o_arg):
+    kv_batch = graph_plan.batch // graph_plan.kv_group
+    for arg, expected_batch in (
+        (q_arg, graph_plan.batch),
+        (k_arg, kv_batch),
+        (v_arg, kv_batch),
+        (o_arg, graph_plan.batch),
+    ):
         if (
             arg.fake_value.ndim != 3
             or arg.fake_value.dtype != graph_plan.dtype
             or not arg.fake_value.is_contiguous()
-            or int(arg.fake_value.shape[0]) != graph_plan.batch
+            or int(arg.fake_value.shape[0]) != expected_batch
             or int(arg.fake_value.shape[1]) != graph_plan.seq
             or int(arg.fake_value.shape[2]) != graph_plan.head_dim
         ):
@@ -14110,6 +14153,7 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
         row_epilogue,
         tuple(resolved_aux_args),
         tuple(epi_scalar_names),
+        graph_plan.kv_group,
     )
 
 
@@ -14141,6 +14185,9 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     alibi_args = plan.alibi_args
     document_args = plan.document_args
     batch, seq, head_dim, io_dtype = plan.batch, plan.seq, plan.head_dim, plan.dtype
+    # Grouped-query attention: K/V hold ``batch // kv_group`` batch heads and
+    # every family reads them at ``bh // kv_group``; Q/O/LSE keep ``batch``.
+    kv_group = plan.kv_group
     io_dtype_str = _flash_io_dtype_str(io_dtype)
     score_plan = df.cute_state.attention_flash_score_plan
     if score_plan is None or score_plan.head_dim != head_dim:
@@ -14282,6 +14329,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         and plan.tensor_4d_heads > 0
         and not score_plan.modifiers
     )
+    # BHSD descriptors address Q's full head set. The tensor plan only proves
+    # the 4D geometry when the K/V bases match Q's, which grouped K/V heads
+    # never do, so the 4D device and launcher paths never see kv_group > 1.
+    assert not (use_tensor_4d_tma and kv_group != 1)
     if (
         cfg.small_biased
         and row_emit is None
@@ -14396,6 +14447,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             row_tile_m=cfg.row_tile_m,
             relu_output=_flash_output_relu_enabled(output_epilogue),
             row_epilogue=row_mma_epilogue,
+            kv_group=kv_group,
         )
         df.preamble = []
         return True
@@ -14452,6 +14504,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         "clc_heads_per_batch": cfg.clc_heads_per_batch,
         "local_tma_partition": cfg.local_tma_partition,
     }
+    if kv_group != 1:
+        # The launcher builds the K/V (S, D, B) views over ``batch // kv_group``
+        # batch heads; Q/O/LSE/bias keep the full ``batch``.
+        wrapper_plan["kv_group"] = kv_group
     if use_tensor_4d_tma:
         wrapper_plan["tensor_4d_batch"] = plan.tensor_4d_batch
         wrapper_plan["tensor_4d_heads"] = plan.tensor_4d_heads
@@ -14576,6 +14632,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 exp2_degree1=alt_exp2.degree1_unmasked,
                 e2e_freq=alt_exp2.e2e_freq,
                 e2e_res=alt_exp2.e2e_res,
+                kv_group=kv_group,
             )
         )
     elif cfg.topology == "fa4":

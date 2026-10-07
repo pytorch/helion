@@ -148,8 +148,13 @@ def emit_flash_fa4_alt_device_body(
     exp2_degree1: bool,
     e2e_freq: int,
     e2e_res: int,
+    kv_group: int = 1,
 ) -> list[ast.stmt]:
-    """Emit the alternating-warpgroup device body (see the module docstring)."""
+    """Emit the alternating-warpgroup device body (see the module docstring).
+
+    ``kv_group`` is the grouped-query divisor: K/V carry ``batch // kv_group``
+    entries and are read at batch head ``flash_bh // kv_group``.
+    """
     hd = head_dim
     assert hd in FA4_ALT_HEAD_DIMS
     assert num_kv >= 2 and num_kv % 2 == 0
@@ -366,18 +371,21 @@ def emit_flash_fa4_alt_device_body(
         k_load(ind + 4, "tKgK", "flash_kv0 + 3")
         v_load(ind + 4, "flash_kv0 + 1")
 
+    def kv_bh(bh: str) -> str:
+        return bh if kv_group == 1 else f"{bh} // {kv_group}"
+
     def load_item(ind: int, with_next: bool) -> None:
         m_expr, bh_expr = _power2_decode("flash_tile_id", num_m_tiles)
         s.line(ind, f"flash_bh = {bh_expr}")
-        s.line(ind, "tKgK = tKgK_kdl[None, None, 0, flash_bh]")
-        s.line(ind, "tVgV = tVgV_dkl[None, 0, None, flash_bh]")
+        s.line(ind, f"tKgK = tKgK_kdl[None, None, 0, {kv_bh('flash_bh')}]")
+        s.line(ind, f"tVgV = tVgV_dkl[None, 0, None, {kv_bh('flash_bh')}]")
         if with_next:
             m_next, bh_next = _power2_decode("flash_tile_next", num_m_tiles)
             s.line(ind, "flash_tile_next = flash_tile_id + flash_grid_dim")
             s.line(ind, f"flash_bh_next = {bh_next}")
             s.line(ind, f"flash_m_next = {m_next}")
             s.line(ind, "tQgQn = tQgQ_qdl[None, None, 0, flash_bh_next]")
-            s.line(ind, "tKgKn = tKgK_kdl[None, None, 0, flash_bh_next]")
+            s.line(ind, f"tKgKn = tKgK_kdl[None, None, 0, {kv_bh('flash_bh_next')}]")
         if pairs == 0:
             # a two-step item: its two V tiles first (nothing else to overlap
             # them with), then the next item's Q and first two K tiles, whose
@@ -420,7 +428,7 @@ def emit_flash_fa4_alt_device_body(
     s.line(4, f"flash_bh = {bh_expr}")
     s.line(4, f"flash_m_tile = {m_expr}")
     s.line(4, "tQgQ = tQgQ_qdl[None, None, 0, flash_bh]")
-    s.line(4, "tKgK = tKgK_kdl[None, None, 0, flash_bh]")
+    s.line(4, f"tKgK = tKgK_kdl[None, None, 0, {kv_bh('flash_bh')}]")
     q_load(4, "tQgQ", "flash_m_tile")
     k_load(4, "tKgK", "0")
     k_load(4, "tKgK", "1")
