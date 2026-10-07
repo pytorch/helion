@@ -14,6 +14,7 @@ from operator import getitem
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.utils import triton_type
 from torch.fx.node import Node
@@ -45,6 +46,8 @@ from ..aten_lowering import topk_lowering
 from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import _symint_sympy_expr
+from ..device_function import find_block_size_symbols
 from ..matmul_utils import emit_tl_dot_with_padding
 
 if TYPE_CHECKING:
@@ -325,20 +328,62 @@ def _triton_iota_expr(
     step: object = 1,
     dtype: torch.dtype | None = None,
 ) -> object:
+    from ..generate_ast import GenerateAST
+
     dtype = dtype or CompileEnvironment.current().index_dtype
     assert isinstance(dtype, torch.dtype)
 
-    # Pad static non-power-of-2 lengths to next power of 2
-    length_expr = "{length}"
-    if isinstance(length_arg, int) and length_arg != next_power_of_2(length_arg):
-        length_expr = str(next_power_of_2(length_arg))
+    # FX scalar nodes can retain expressions derived entirely from tunable
+    # block sizes. Resolve only those proven config constants here: their
+    # ordinary scalar rendering may be a runtime host argument, whereas arange
+    # requires a power-of-two compile-time extent. Keep the logical expression
+    # intact elsewhere so loads, stores and reductions retain their tail masks.
+    length = length_arg.meta["val"] if isinstance(length_arg, Node) else length_arg
+    env = CompileEnvironment.current()
+    block_id = (
+        env.resolve_block_id(length) if isinstance(length, torch.SymInt) else None
+    )
+    expr: str | None = None
+    reused_coordinate = False
+    if (
+        block_id is not None
+        and env.block_sizes[block_id].reduction
+        and isinstance(ctx.cg, GenerateAST)
+        and ctx.cg.active_device_loops.get(block_id)
+    ):
+        # A full-axis iota shares the reduction's physical tile and logical
+        # coordinate. Reusing that coordinate preserves both padded constexpr
+        # capacity and the offset of a rolled reduction's later tiles.
+        expr = ctx.cg.index_var(block_id)
+        reused_coordinate = True
+    elif isinstance(length, torch.SymInt):
+        expression = _symint_sympy_expr(length)
+        block_symbols, runtime_symbols = find_block_size_symbols(expression)
+        replacements: dict[sympy.Basic, sympy.Basic] = {}
+        if not runtime_symbols:
+            for symbol, block_id in block_symbols.items():
+                if env.block_sizes[block_id].reduction:
+                    break
+                value = ctx.cg.device_function.resolved_block_size(block_id)
+                if not isinstance(value, int):
+                    break
+                replacements[symbol] = sympy.Integer(value)
+            else:
+                resolved = expression.xreplace(replacements)
+                if isinstance(resolved, sympy.Integer):
+                    length = int(resolved)
 
-    expr = f"tl.arange(0, {length_expr})"
+    if expr is None:
+        # Pad literal and config-derived non-power-of-two lengths alike.
+        length_expr = "{length}"
+        if isinstance(length, int):
+            length_expr = str(next_power_of_2(length))
+        expr = f"tl.arange(0, {length_expr})"
     if step != 1:
         expr = f"{{step}} * {expr}"
     if start != 0:
         expr = f"{{start}} + {expr}"
-    if dtype != torch.int32:
+    if reused_coordinate or dtype != torch.int32:
         expr = f"({expr}).to({triton_type(dtype)})"
     return expr_from_string(
         expr,
