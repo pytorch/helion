@@ -40,11 +40,13 @@ runs:
           --project="ml-velocity-actions-testing" > /tmp/torch_tpu_ssh_key
         set -x
         chmod 600 /tmp/torch_tpu_ssh_key
-        GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
-          git clone git@github.com:google-pytorch/torch_tpu.git /tmp/torch_tpu
-        rm -f /tmp/torch_tpu_ssh_key
+        mkdir -p /tmp/torch_tpu
         cd /tmp/torch_tpu
-        git checkout "${TORCH_TPU_COMMIT}"
+        git init
+        GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
+          git fetch --depth 1 git@github.com:google-pytorch/torch_tpu.git "${TORCH_TPU_COMMIT}"
+        rm -f /tmp/torch_tpu_ssh_key
+        git checkout FETCH_HEAD
         # Build torch_tpu wheel
         sudo apt-get install -y libpython3-dev
         export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
