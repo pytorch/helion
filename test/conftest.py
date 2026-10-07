@@ -2,25 +2,19 @@
 
 from __future__ import annotations
 
-import importlib
 import os
-from pathlib import Path
-from typing import cast
 import unittest
 import warnings
 
 import pytest
 
 from test.backends import GAP_STASH_KEY
-from test.backends import CollectedItem
-from test.backends import PortableItem
+from test.backends import active_gaps
 from test.backends import apply_gap
-from test.backends import gaps_for_backend
 from test.backends import matching_gap
 from test.backends import portable_subpath
 from test.backends import validate_gaps
 
-from helion._compiler.backend_registry import list_backends
 from helion.runtime.ref_mode import RefMode
 from helion.runtime.settings import _get_backend
 from helion.runtime.settings import _get_ref_mode
@@ -57,58 +51,42 @@ def pytest_configure() -> None:
     )
 
 
-_BACKENDS_DIR = Path(__file__).parent / "backends"
-
-
-def _import_all_backends() -> None:
-    for name in list_backends():
-        if (_BACKENDS_DIR / name / "registry.py").exists():
-            importlib.import_module(f"test.backends.{name}.registry")
-
-
-_import_all_backends()
-
-
-def pytest_collection_modifyitems(items: list[CollectedItem]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     """Apply the active backend's gaps to portable TestCase items."""
-    portable_items = [
-        (item, subpath)
-        for item in items
-        if (subpath := portable_subpath(item)) is not None
-    ]
-    if not portable_items:
-        return
-
-    checked_items: list[tuple[PortableItem, str]] = []
-    for item, subpath in portable_items:
+    checked_items: list[tuple[pytest.Item, str, str]] = []
+    modules = {}
+    for item in items:
+        if (subpath := portable_subpath(item)) is None:
+            continue
         cls = getattr(item, "cls", None)
-        if (
-            cls is None
-            or not isinstance(cls, type)
-            or not issubclass(cls, unittest.TestCase)
-        ):
+        if cls is None or not issubclass(cls, unittest.TestCase):
             raise pytest.UsageError(
                 f"portable test {item.nodeid} must be a unittest.TestCase method"
             )
-        checked_items.append((cast("PortableItem", item), subpath))
+        class_and_method = f"{cls.__name__}::{item.name}"
+        checked_items.append((item, subpath, class_and_method))
+        modules[subpath] = item.module
 
-    collected: dict[str, set[str]] = {}
-    for item, subpath in checked_items:
-        collected.setdefault(subpath, set()).add(f"{item.cls.__name__}::{item.name}")
-    validate_gaps(collected)
+    if not checked_items:
+        return
+
+    validate_gaps(modules)
 
     if _get_ref_mode() == RefMode.EAGER:
         return
 
-    gaps = gaps_for_backend(_get_backend())
-    for item, subpath in checked_items:
-        class_and_method = f"{item.cls.__name__}::{item.name}"
+    gaps = active_gaps(_get_backend())
+    for item, subpath, class_and_method in checked_items:
         if gap := matching_gap(gaps, subpath, class_and_method):
+            if config.option.runxfail and not gap.skip:
+                continue
             apply_gap(item, gap)
 
 
 @pytest.hookimpl(wrapper=True)
-def pytest_runtest_makereport(item: CollectedItem):
+def pytest_runtest_makereport(item: pytest.Item):
     """Attach backend-gap reasons to unittest expected-failure reports."""
     report = yield
     gap = item.stash.get(GAP_STASH_KEY, None)

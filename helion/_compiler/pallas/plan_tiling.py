@@ -79,6 +79,15 @@ class TensorIndexPattern(IndexingPattern):
     index_ndim: int = 1
 
 
+@dataclass(frozen=True)
+class GridScalarIndex:
+    """A scalar metadata lookup that selects one grid program's tensor panel."""
+
+    metadata_tensor: torch.Tensor = field(compare=False)
+    metadata_key: str | int
+    block_id: int
+
+
 @dataclass
 class ContiguousRangeIndexPattern(IndexingPattern):
     """Aligned ``base + arange(length)`` index addressable as one HBM window."""
@@ -102,6 +111,7 @@ class DimensionTiling:
 
 REMOTE_SRC_INDEXING_PATTERNS = "pallas_remote_src_indexing_patterns"
 REMOTE_DST_INDEXING_PATTERNS = "pallas_remote_dst_indexing_patterns"
+GRID_SCALAR_INDEX_DIMS = "pallas_grid_scalar_index_dims"
 
 
 def plan_tiling(
@@ -116,6 +126,147 @@ def plan_tiling(
             graph_info, graph_lookup, parent_ids
         )
         _analyze_indexing_expressions(graph_info, config, local_access_keys)
+
+
+def plan_grid_scalar_indices(graphs: list[GraphInfo], config: Config) -> None:
+    """Find tensor panels selected by scalar metadata indexed by a grid axis.
+
+    A source pattern such as ``table[panel_ids[work], :, :]`` can be represented
+    directly by a Pallas scalar-prefetch BlockSpec: ``work`` selects one scalar
+    from ``panel_ids``, and that scalar selects one panel from ``table``.  This
+    pass records only structurally consistent dimensions; mixed selectors keep
+    the existing ordinary indexing path.
+    """
+    if config.get("pallas_loop_type") != "unroll":
+        return
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+    from ..device_ir import control_flow_parent_entries
+
+    parent_entries = control_flow_parent_entries(graphs)
+    placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node] = {}
+    for graph_info in graphs:
+        entry = parent_entries.get(graph_info.graph_id)
+        if entry is None:
+            continue
+        parent, arg_index = entry
+        outer_args = parent.args[arg_index]
+        if not isinstance(outer_args, (list, tuple)):
+            continue
+        placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+        placeholder_to_outer.update(
+            {
+                placeholder: outer
+                for outer, placeholder in zip(outer_args, placeholders, strict=True)
+                if isinstance(outer, torch.fx.Node)
+            }
+        )
+
+    def resolve(node: object) -> torch.fx.Node | None:
+        seen: set[torch.fx.Node] = set()
+        while isinstance(node, torch.fx.Node) and node not in seen:
+            seen.add(node)
+            if node.target is _tracing_ops._new_var and node.args:
+                node = node.args[0]
+            elif node.op == "placeholder" and node in placeholder_to_outer:
+                node = placeholder_to_outer[node]
+            else:
+                return node
+        return None
+
+    def selector(index: object) -> GridScalarIndex | None:
+        index_node = resolve(index)
+        if (
+            index_node is None
+            or index_node.op != "call_function"
+            or index_node.target is not memory_ops.load
+            or len(index_node.args) < 2
+        ):
+            return None
+        metadata_node, metadata_subscript = index_node.args[:2]
+        if not isinstance(metadata_node, torch.fx.Node) or not isinstance(
+            metadata_subscript, (list, tuple)
+        ):
+            return None
+        metadata = metadata_node.meta.get("val")
+        patterns = index_node.meta.get("indexing_patterns")
+        if (
+            not isinstance(metadata, torch.Tensor)
+            or metadata.ndim != 1
+            or metadata.dtype != torch.int32
+            or not isinstance(patterns, list)
+            or len(patterns) != 1
+            or not isinstance(patterns[0], (TilePattern, TileBeginWithOffsetPattern))
+            or (
+                isinstance(patterns[0], TileBeginWithOffsetPattern)
+                and patterns[0].offset != 0
+            )
+        ):
+            return None
+        return GridScalarIndex(
+            metadata_tensor=metadata,
+            metadata_key=tensor_origin_key(metadata),
+            block_id=patterns[0].block_id,
+        )
+
+    access_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    uses: dict[tuple[int, int], list[tuple[torch.fx.Node, GridScalarIndex | None]]] = {}
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in access_targets:
+                continue
+            tensor_node = node.args[0]
+            subscript = node.args[1]
+            if not isinstance(tensor_node, torch.fx.Node) or not isinstance(
+                subscript, (list, tuple)
+            ):
+                continue
+            tensor = tensor_node.meta.get("val")
+            patterns = node.meta.get("indexing_patterns")
+            if not isinstance(tensor, torch.Tensor) or not isinstance(patterns, list):
+                continue
+            tensor_dim = 0
+            for index, pattern in zip(subscript, patterns, strict=True):
+                if isinstance(pattern, NonePattern):
+                    continue
+                selected = (
+                    selector(index)
+                    if isinstance(pattern, TensorIndexPattern)
+                    and pattern.index_ndim == 0
+                    else None
+                )
+                uses.setdefault((id(tensor), tensor_dim), []).append((node, selected))
+                tensor_dim += 1
+
+    device_fn = DeviceFunction.current()
+    # Scalar-prefetch BlockSpecs and raw-HBM load-site DMA currently use
+    # different launcher paths. Leave the entire kernel on the established DMA
+    # path when any argument needs a raw HBM ref.
+    if PallasMemorySpace.HBM in device_fn.pallas_memory_space.values():
+        return
+    for (tensor_id, tensor_dim), dimension_uses in uses.items():
+        # Raw-HBM operands already have an explicit load-site DMA plan and no
+        # outer BlockSpec. Keep that established path instead of trying to
+        # select the same panel through scalar-prefetch metadata.
+        if device_fn.pallas_memory_space.get(tensor_id) is PallasMemorySpace.HBM:
+            continue
+        selected = [item for _node, item in dimension_uses if item is not None]
+        if not selected or len(selected) != len(dimension_uses):
+            continue
+        first = selected[0]
+        if any(item != first for item in selected[1:]):
+            continue
+        device_fn.pallas_grid_scalar_indices.setdefault(tensor_id, {})[tensor_dim] = (
+            first
+        )
+        for node, _item in dimension_uses:
+            dims = set(node.meta.get(GRID_SCALAR_INDEX_DIMS, ()))
+            dims.add(tensor_dim)
+            node.meta[GRID_SCALAR_INDEX_DIMS] = tuple(sorted(dims))
 
 
 def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:

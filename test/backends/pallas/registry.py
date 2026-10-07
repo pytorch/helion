@@ -1,4 +1,4 @@
-"""Known Metal gaps in the portable test suite."""
+"""Known Pallas gaps in the portable test suite."""
 
 from __future__ import annotations
 
@@ -8,6 +8,6 @@ GAPS = [
     backend_gap(
         "test_indexing",
         "TestIndexing::test_arange",
-        reason="a bare tile.index store fails Metal code generation",
+        reason="a padded tile does not mask the partial output store",
     )
 ]

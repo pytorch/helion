@@ -85,6 +85,37 @@ def pallas_fixed_tile_mask(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_static_conditional_expression(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        [x.size(0), x.size(1) * 2],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for tile_rows in hl.tile(x.size(0)):
+        out[tile_rows, :] = torch.cat(
+            tuple(
+                x[tile_rows, :] if keep else -x[tile_rows, :] for keep in (True, False)
+            ),
+            dim=-1,
+        )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_static_value_slices(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        [128, 128],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for tile_rows in hl.tile(x.size(0), block_size=256):
+        values = x[tile_rows, :] * 2
+        first_half = values[0:128, :]
+        out[:, :] = first_half[:, 128:256]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sin(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -743,6 +774,49 @@ def pallas_repeat_columns(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_private_local_scratch(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    scratch = torch.empty([128, 128], dtype=x.dtype, device=x.device)
+    for _program in hl.grid(1):
+        scratch[:, :] = x[:, :]
+        scratch[:, :] = scratch[:, :] * 2.0 + 1.0
+        out[:, :] = scratch[:, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scalar_selected_panels(
+    table: torch.Tensor,
+    panel_ids: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty(
+        [panel_ids.size(0), table.size(1), table.size(2)],
+        dtype=table.dtype,
+        device=table.device,
+    )
+    for work in hl.grid(panel_ids.size(0)):
+        panel = panel_ids[work]
+        out[work, :, :] = table[panel, :, :] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_rank_reduced_panel_view(x: torch.Tensor) -> torch.Tensor:
+    heads, blocks, rows, _columns = x.size()
+    out = torch.empty(
+        [heads, blocks, rows, 128],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for head, block in hl.grid([heads, blocks]):
+        for tile_rows in hl.tile(rows, block_size=128):
+            panel = x[head, block, tile_rows, :]
+            selected = panel[:, 128:256]
+            out[head, block, tile_rows, :] = selected + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_aligned_dynamic_window(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1003,6 +1077,23 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_nested_static_value_slices(self) -> None:
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_nested_static_value_slices,
+            (x,),
+        )
+        torch.testing.assert_close(result.cpu(), (x[:128, 128:256] * 2).cpu())
+
+    def test_static_conditional_expression(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_static_conditional_expression,
+            (x,),
+            block_sizes=[128],
+        )
+        torch.testing.assert_close(result.cpu(), torch.cat((x, -x), dim=-1).cpu())
+
     def test_fixed_integer_tile_extent(self) -> None:
         x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
         expected = torch.where(
@@ -1078,6 +1169,36 @@ class TestPallas(TestCase):
             block_sizes=[128],
         )
         torch.testing.assert_close(result.cpu(), torch.cat([x] * 4, dim=-1).cpu())
+
+    def test_private_local_scratch(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_private_local_scratch,
+            (x,),
+            block_sizes=[],
+            pallas_internal_scratch=True,
+        )
+        torch.testing.assert_close(result.cpu(), (x * 2.0 + 1.0).cpu())
+
+    def test_scalar_selected_panels(self) -> None:
+        table = torch.randn(4, 128, 128, device=DEVICE, dtype=torch.float32)
+        panel_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
+        _code, result = code_and_output(
+            pallas_scalar_selected_panels,
+            (table, panel_ids),
+            block_sizes=[],
+        )
+        torch.testing.assert_close(result.cpu(), (table[panel_ids] + 1.0).cpu())
+
+    def test_rank_reduced_panel_view(self) -> None:
+        x = torch.randn(2, 3, 256, 256, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_rank_reduced_panel_view,
+            (x,),
+            block_sizes=[],
+        )
+        expected = x[:, :, :, 128:256] + 1.0
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
     def test_fp8_fp4_matmul(self) -> None:
@@ -1894,8 +2015,8 @@ class TestPallas(TestCase):
         ):
             code_and_output(reshape_then_narrow, (x, out), pallas_loop_type="fori_loop")
 
-    def test_resident_subview_recursive_failure_keeps_cause(self) -> None:
-        """A child failure invalidates every tentative ancestor with its cause."""
+    def test_rank_reduced_resident_subview_handles_padded_tile(self) -> None:
+        """Rank-reduced resident views preserve a partial final tile."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def nested_narrowing(x: torch.Tensor, out: torch.Tensor) -> None:
@@ -1909,24 +2030,17 @@ class TestPallas(TestCase):
                     acc += head.float().sum(dim=0)
                 out[0, :] = acc.to(out.dtype)
 
-        x = torch.ones(6, 2, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(
-            nested_narrowing,
-            (x, out),
-            block_sizes=[2],
-            pallas_loop_type="fori_loop",
-        )
-        self.assertNarrowingIsResident(code)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "may contain padding.*this config"
-        ):
+        x = torch.randn(6, 2, 2, 128, device=DEVICE, dtype=torch.float32)
+        expected = x[:, 0, 0, :].sum(dim=0, keepdim=True)
+        for block_size in (2, 4):
+            out = torch.empty(1, 128, device=DEVICE, dtype=torch.float32)
             code_and_output(
                 nested_narrowing,
                 (x, out),
-                block_sizes=[4],
+                block_sizes=[block_size],
                 pallas_loop_type="fori_loop",
             )
+            torch.testing.assert_close(out.cpu(), expected.cpu())
 
     def test_resident_subview_masked_boundary_is_structural(self) -> None:
         """A masked boundary outranks a simultaneous config-dependent failure."""
@@ -4873,6 +4987,31 @@ class TestPallas(TestCase):
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_static_unroll_scheduler_options(self) -> None:
+        """Pallas scheduling options also preserve static-unroll results."""
+        generator = torch.Generator().manual_seed(0)
+        query_cpu = torch.randn(
+            1, 1, 128, 128, dtype=torch.bfloat16, generator=generator
+        )
+        key_cpu = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, generator=generator)
+        val_cpu = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, generator=generator)
+        query = query_cpu.to(DEVICE)
+        key = key_cpu.to(DEVICE)
+        val = val_cpu.to(DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="unroll",
+            pallas_pre_broadcast=False,
+            pallas_use_low_level_scheduler=True,
+            pallas_fold_dot_lhs_cast=True,
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query_cpu.float(), key_cpu.float(), val_cpu.float()
+        ).to(device=DEVICE, dtype=query.dtype)
+        torch.testing.assert_close(result.cpu(), expected.cpu(), rtol=1e-2, atol=1e-2)
 
     def test_attention_folded_dot_lhs_cast_correctness(self) -> None:
         """Folding an f32-to-bf16 dot cast preserves attention results."""

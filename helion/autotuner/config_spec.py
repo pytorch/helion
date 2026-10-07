@@ -1019,6 +1019,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
+        "pallas_internal_scratch",
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
@@ -4801,6 +4802,14 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        use_low_level_scheduler = config.get("pallas_use_low_level_scheduler")
+        if use_low_level_scheduler is not None and not isinstance(
+            use_low_level_scheduler, bool
+        ):
+            raise InvalidConfig("pallas_use_low_level_scheduler must be a bool")
+        fold_dot_lhs_cast = config.get("pallas_fold_dot_lhs_cast")
+        if fold_dot_lhs_cast is not None and not isinstance(fold_dot_lhs_cast, bool):
+            raise InvalidConfig("pallas_fold_dot_lhs_cast must be a bool")
         if config.get("pallas_loop_type") == "emit_pipeline":
             group_size = config.get("pallas_emit_pipeline_group_size")
             if group_size is not None and (
@@ -4809,20 +4818,8 @@ class ConfigSpec:
                 raise InvalidConfig(
                     "pallas_emit_pipeline_group_size must be a positive integer"
                 )
-            use_low_level_scheduler = config.get("pallas_use_low_level_scheduler")
-            if use_low_level_scheduler is not None and not isinstance(
-                use_low_level_scheduler, bool
-            ):
-                raise InvalidConfig("pallas_use_low_level_scheduler must be a bool")
-            fold_dot_lhs_cast = config.get("pallas_fold_dot_lhs_cast")
-            if fold_dot_lhs_cast is not None and not isinstance(
-                fold_dot_lhs_cast, bool
-            ):
-                raise InvalidConfig("pallas_fold_dot_lhs_cast must be a bool")
         else:
             config.pop("pallas_emit_pipeline_group_size", None)
-            config.pop("pallas_use_low_level_scheduler", None)
-            config.pop("pallas_fold_dot_lhs_cast", None)
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
