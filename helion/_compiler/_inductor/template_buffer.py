@@ -182,12 +182,14 @@ class HelionTemplateBuffer(TemplateBuffer):
 
             return kernel, render
 
+        # supports_torch_compile_fusion() gates the legacy prologue API, which
+        # is absent from newer PyTorch builds used for type checking.
         super().__init__(
             layout=layout,
             inputs=inputs,
             make_kernel_render=_make_kernel_render,
             mutated_inputs=mutated_inputs,
-            allowed_prologue_inps=allowed_prologue_inps,
+            allowed_prologue_inps=allowed_prologue_inps,  # pyrefly: ignore[unexpected-keyword]
             named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
         )
 
@@ -441,7 +443,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         if not mutation_names:
             return False
 
-        allowed_prologue_inps = self.get_allowed_prologue_inps()
+        allowed_prologue_inps = self.get_allowed_prologue_inps()  # pyrefly: ignore[missing-attribute]
         if any(name in allowed_prologue_inps for name in mutation_names):
             return True
 
