@@ -4160,6 +4160,37 @@ class TestPallas(TestCase):
         result = bound.compile_config(numerical_config)(x, y)
         torch.testing.assert_close(result, (x + y).to(result.device))
 
+    @parametrize("loop_type", ("fori_loop", "emit_pipeline"))
+    def test_outer_loop_short_extent_padded(self, loop_type: str) -> None:
+        """A partial final tile of an outer device loop yields correct output.
+
+        N = 192 is not a multiple of block_n = 128, so the last iteration of
+        the outer hl.tile(N) loop covers only 64 columns of b and out.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            M, K = a.shape
+            _, N = b.shape
+            out = torch.empty([M, N], dtype=a.dtype, device=a.device)
+            for mt in hl.tile(M):
+                for nt in hl.tile(N):
+                    acc = hl.zeros([mt, nt], dtype=torch.float32)
+                    for kt in hl.tile(K):
+                        acc = acc + torch.matmul(a[mt, kt], b[kt, nt])
+                    out[mt, nt] = acc.to(a.dtype)
+            return out
+
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(128, 192, device=DEVICE, dtype=torch.bfloat16)
+        _code, out = code_and_output(
+            static_matmul,
+            (a, b),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(out, a @ b, rtol=1e-2, atol=1e-2)
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""

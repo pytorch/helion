@@ -3651,6 +3651,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
+                    _record_loop_pad(state, fake, dim_idx, bid)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
