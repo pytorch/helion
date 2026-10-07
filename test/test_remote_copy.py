@@ -1796,10 +1796,12 @@ def _run_torch_tpu_multiprocess() -> None:
     import portpicker  # pyrefly: ignore[missing-import]
     import torch.multiprocessing as mp
     import torch_tpu  # pyrefly: ignore[missing-import]  # noqa: F401  # isort: skip
-    from torch.tpu.distributed import environment  # pyrefly: ignore[missing-import]
+    from torch.tpu import (
+        distributed as tt_distributed,  # pyrefly: ignore[missing-import]
+    )
 
     world_size = 2
-    environment.set_tpu_launch_env(nproc_per_node=world_size)
+    tt_distributed.set_tpu_launch_env(nproc_per_node=world_size)
     master_port = portpicker.pick_unused_port()
     mp.spawn(
         _remote_copy_torch_tpu_worker,
