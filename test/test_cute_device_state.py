@@ -14,6 +14,7 @@ from torch.fx import Graph
 
 from helion import exc
 from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.cute.access_regions import tile_begin_symbol
 from helion._compiler.cute.cute_mma import _collective_load_dependency_nodes
 from helion._compiler.cute.cute_mma import _emit_tcgen05_device_segments_setup
 from helion._compiler.cute.cutedsl_compat import emit_pipeline_advance
@@ -907,6 +908,65 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         with self.assertRaisesRegex(exc.BackendUnsupported, "multi-store fan-out"):
             state.consume_tcgen05_store_value(["matmul_result"])
 
+    def test_tcgen05_fanout_assigns_first_wait_and_last_release(self) -> None:
+        state = CuteDeviceFunctionState()
+        graph = Graph()
+        stores = tuple(graph.placeholder(f"store_{index}") for index in range(3))
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(),
+            output_block_ids=(0, 1),
+            output_stores=stores,
+        )
+        self.assertEqual(
+            state.claim_tcgen05_store_site(value, stores[0]), (False, False)
+        )
+        self.assertEqual(
+            state.claim_tcgen05_store_site(value, stores[1]), (True, False)
+        )
+        self.assertEqual(state.claim_tcgen05_store_site(value, stores[2]), (True, True))
+        with self.assertRaisesRegex(exc.BackendUnsupported, "distinct stores"):
+            state.claim_tcgen05_store_site(value, stores[2])
+
+    def test_tcgen05_fanout_requires_a_complete_store_set(self) -> None:
+        state = CuteDeviceFunctionState()
+        graph = Graph()
+        stores = tuple(graph.placeholder(f"store_{index}") for index in range(2))
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(), output_block_ids=(0, 1)
+        )
+        self.assertEqual(
+            state.claim_tcgen05_store_site(value, stores[0]), (False, True)
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "complete output store set"
+        ):
+            state.claim_tcgen05_store_site(value, stores[1])
+
+    def test_tcgen05_fanout_rejects_different_execution_scopes(self) -> None:
+        state = CuteDeviceFunctionState()
+        stores = tuple(Graph().placeholder(f"store_{index}") for index in range(2))
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(),
+            output_block_ids=(0, 1),
+            output_stores=stores,
+        )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "one FX graph"):
+            state.claim_tcgen05_store_site(value, stores[0])
+
+    def test_tcgen05_fanout_rejects_an_unexpected_store(self) -> None:
+        state = CuteDeviceFunctionState()
+        graph = Graph()
+        expected, unexpected = (
+            graph.placeholder(name) for name in ("expected", "other")
+        )
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(),
+            output_block_ids=(0, 1),
+            output_stores=(expected,),
+        )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "distinct stores"):
+            state.claim_tcgen05_store_site(value, unexpected)
+
     def test_codegen_state_marks_collective_dependency_statement(self) -> None:
         state = CuteDeviceFunctionState()
         loop = _kloop_with_inner()
@@ -961,3 +1021,16 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
 
         self.assertEqual(loop.inner_statements, [stmt])
         self.assertFalse(state.is_tcgen05_kloop_owned_stmt(loop, stmt))
+
+
+def test_loop_states_built_in_turn_name_distinct_tile_begins() -> None:
+    # The state of a finished loop is collected before the next loop's begin
+    # symbol is built, and CPython may hand the next state the same address:
+    # the symbol names the state's serial, never its address.
+    symbols = set()
+    for _ in range(64):
+        state = _kloop_with_inner()
+        symbol = tile_begin_symbol(0, state)
+        assert f"{id(state):x}" not in symbol.name
+        symbols.add(symbol)
+    assert len(symbols) == 64

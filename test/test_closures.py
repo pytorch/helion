@@ -30,6 +30,14 @@ def sin_func_arg(a, fn) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def sin_func_arg_static(a, fn) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size()):
+        out[tile] = fn(torch.sin(a[tile]), tile)
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 class TestClosures(RefEagerTestBase, TestCase):
     def setUp(self):
@@ -54,6 +62,30 @@ class TestClosures(RefEagerTestBase, TestCase):
 
         args = (torch.randn([512], device=DEVICE), fn_with_global)
         code, out = code_and_output(sin_func_arg, args)
+        torch.testing.assert_close(out, args[0].sin() + global_tensor)
+
+    def test_fn_arg_with_global_static_shapes(self):
+        # A static-shapes kernel fakes a global tensor through
+        # ``torch.empty_strided``; the function argument reads the global again
+        # while the device body is traced, and that allocation used to be
+        # recorded as a device node without a host origin (a KeyError in
+        # codegen).  Lifted globals are now faked once per host function.
+        def fn_with_global(x, tile) -> torch.Tensor:
+            return x + global_tensor[tile]
+
+        args = (torch.randn([512], device=DEVICE), fn_with_global)
+        code, out = code_and_output(sin_func_arg_static, args)
+        torch.testing.assert_close(out, args[0].sin() + global_tensor)
+        # Passed through as the module attribute, not re-allocated on device.
+        self.assertIn("_source_module.global_tensor", code)
+        self.assertNotIn("empty_strided", code)
+
+    def test_lambda_arg_with_global_static_shapes(self):
+        args = (
+            torch.randn([512], device=DEVICE),
+            lambda x, tile: x + global_tensor[tile],
+        )
+        code, out = code_and_output(sin_func_arg_static, args)
         torch.testing.assert_close(out, args[0].sin() + global_tensor)
 
     def test_fn_arg_with_global_different_file(self):

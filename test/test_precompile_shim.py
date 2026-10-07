@@ -9,9 +9,12 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from packaging.version import Version
+import torch
 
+from helion._argument_device import _find_argument_device
 from helion._utils import triton_is_available
 from helion.runtime.config import Config
+from helion.runtime.precompile_shim import _device_probe_values
 from helion.runtime.precompile_shim import make_precompiler
 
 
@@ -74,6 +77,19 @@ class TestPrecompileShim(unittest.TestCase):
         )
         self.assertIs(kernel_cache["runtime-cache-key"], compiled_kernel)
         compiled_kernel._init_handles.assert_called_once_with()
+
+    def test_device_discovery_unwraps_tensor_descriptors(self) -> None:
+        # A launch whose tensors all travel as tensor descriptors (every
+        # indexing choice ``tensor_descriptor``, no bare tensor argument) used
+        # to abort the whole autotune with NoTensorArgs in the fork precompile.
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        base = torch.zeros(32, 64)
+        descriptor = TensorDescriptor.from_tensor(base, [16, 16])
+        probed = _device_probe_values([descriptor, 148])
+        self.assertIs(probed[0], base)
+        self.assertEqual(probed[1], 148)
+        self.assertEqual(_find_argument_device(probed), base.device)
 
 
 if __name__ == "__main__":

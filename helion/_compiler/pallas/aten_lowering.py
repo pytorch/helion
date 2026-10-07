@@ -126,6 +126,57 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
     if _resident_plan(node) is not None:
         return _codegen_resident_view(ctx, node)
 
+    # ``torch.cat([x] * repeats, dim=-1)`` is commonly decomposed into
+    # ``x.unsqueeze(-2).expand(..., repeats, width).reshape(..., repeats * width)``.
+    # Preserve the repeat as one Pallas/JAX tile operation instead of first
+    # materializing the expanded intermediate.
+    expanded = node.args[0]
+    while (
+        isinstance(expanded, Node) and expanded.target is torch.ops.aten.clone.default
+    ):
+        expanded = expanded.args[0]
+    if isinstance(expanded, Node) and expanded.target is torch.ops.aten.expand.default:
+        unsqueezed = expanded.args[0]
+        if (
+            isinstance(unsqueezed, Node)
+            and unsqueezed.target is torch.ops.aten.unsqueeze.default
+        ):
+            source = unsqueezed.args[0]
+            source_val = source.meta.get("val") if isinstance(source, Node) else None
+            expanded_val = expanded.meta.get("val")
+            output_val = node.meta.get("val")
+            if all(
+                isinstance(value, torch.Tensor)
+                for value in (source_val, expanded_val, output_val)
+            ):
+                assert isinstance(source_val, torch.Tensor)
+                assert isinstance(expanded_val, torch.Tensor)
+                assert isinstance(output_val, torch.Tensor)
+                dim_arg = unsqueezed.args[1]
+                dim = dim_arg if isinstance(dim_arg, int) else None
+                if dim is not None and dim < 0:
+                    dim += source_val.ndim + 1
+                env = CompileEnvironment.current()
+                source_shape = tuple(env.size_hint(size) for size in source_val.shape)
+                expanded_shape = tuple(
+                    env.size_hint(size) for size in expanded_val.shape
+                )
+                output_shape = tuple(env.size_hint(size) for size in output_val.shape)
+                if (
+                    dim is not None
+                    and dim == source_val.ndim - 1
+                    and expanded_shape[:dim] == source_shape[:dim]
+                    and expanded_shape[dim + 1 :] == source_shape[dim:]
+                    and output_shape[:-1] == source_shape[:-1]
+                    and output_shape[-1] == expanded_shape[dim] * source_shape[-1]
+                ):
+                    source_ast = map_arg(source, lambda arg: _env_arg(ctx, arg))
+                    assert isinstance(source_ast, ast.AST)
+                    return expr_from_string(
+                        f"jnp.tile({{tensor}}, {expanded_shape[dim]})",
+                        tensor=source_ast,
+                    )
+
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(

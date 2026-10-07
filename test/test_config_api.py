@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import pickle
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -52,6 +53,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -81,7 +85,9 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
@@ -166,12 +172,14 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "cute_affine_scan_schedule": st.sampled_from(
                 ["ordinary", "direct_m16n8_v1", "direct_m16n16_v1"]
             ),
+            "cute_packet_prefetch": st.sampled_from([0, 2, 4, 8]),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
             "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
+            "host_tensor_descriptors": st.booleans(),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
             "cute_chunk_prepare_schedule": st.sampled_from(
@@ -221,6 +229,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "cute_bf16x2_recurrence",
                     "cute_proven_bounds",
                     "cute_affine_scan_schedule",
+                    "cute_packet_prefetch",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -506,10 +515,12 @@ class TestConfigAPI(TestCase):
             "cute_bf16x2_recurrence",
             "cute_proven_bounds",
             "cute_affine_scan_schedule",
+            "cute_packet_prefetch",
             "num_warps",
             "num_stages",
             "pid_type",
             "cross_loop_pipeline",
+            "host_tensor_descriptors",
             "indexing",
         }
         compiler_internal = {
@@ -645,6 +656,79 @@ class TestConfigAPI(TestCase):
                 num_sm=1,
             )
             self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
+
+    def test_host_tensor_descriptors_require_cuda_host_support(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            xpu_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertTrue(cuda_spec.supports_config_key("host_tensor_descriptors"))
+            self.assertFalse(xpu_spec.supports_config_key("host_tensor_descriptors"))
+            pre_hopper_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(8, 0),
+            )
+            self.assertFalse(
+                pre_hopper_spec.supports_config_key("host_tensor_descriptors")
+            )
+
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=False,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            self.assertFalse(cuda_spec.supports_config_key("host_tensor_descriptors"))
+
+    def test_host_tensor_descriptors_autotune_and_normalize(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            choices = EnumFragment(("pointer", "tensor_descriptor"))
+            spec.indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
+
+            pointer = helion.Config(indexing="pointer", host_tensor_descriptors=True)
+            spec.normalize(pointer)
+            self.assertFalse(pointer.host_tensor_descriptors)
+
+            descriptor = helion.Config(
+                indexing="tensor_descriptor", host_tensor_descriptors=True
+            )
+            spec.normalize(descriptor)
+            self.assertTrue(descriptor.host_tensor_descriptors)
+
+            spec.indexing = ListOf(choices, length=0)
+            spec.atomic_indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
 
     def test_cute_chunk_internal_config_mapping_serialization(self) -> None:
         from helion.autotuner.local_cache import parse_cache_entry
@@ -1718,7 +1802,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             ] = invalid_value
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
-                r"source_m_tile.*\(32, 224, 256\)",
+                r"source_m_tile.*"
+                + re.escape(str(TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES)),
             ):
                 spec.normalize(wrong_type_config)
 
@@ -2990,3 +3075,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_every_cute_only_config_key_is_backend_specific() -> None:
+    """The base backend accepts every key outside BACKEND_SPECIFIC_KEYS, so a
+    CuTe-only knob missing from the set reaches Triton configs unrejected."""
+    from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+    from helion.autotuner.config_spec import VALID_KEYS
+
+    cute_only = {key for key in VALID_KEYS if key.startswith(("cute_", "tcgen05_"))}
+    assert cute_only
+    assert sorted(cute_only - BACKEND_SPECIFIC_KEYS) == []

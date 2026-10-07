@@ -300,6 +300,7 @@ def _helion_source_provenance() -> dict[str, object]:
     helion_expected_package_path = (REPO_ROOT / "helion").resolve()
     attention_module_path = _module_source_path("examples.attention")
     attention_expected_module_path = (REPO_ROOT / "examples" / "attention.py").resolve()
+    owns_checkout = _git_worktree_root_matches(REPO_ROOT)
     source_snapshot = _git_source_snapshot(
         REPO_ROOT,
         (
@@ -327,8 +328,12 @@ def _helion_source_provenance() -> dict[str, object]:
         "attention_example_import_matches_repo": (
             attention_module_path == attention_expected_module_path
         ),
-        "helion_checkout_git_commit": _git_commit(REPO_ROOT, "HEAD"),
-        "helion_checkout_git_describe": _git_describe(REPO_ROOT),
+        "helion_checkout_git_commit": (
+            _git_commit(REPO_ROOT, "HEAD") if owns_checkout else None
+        ),
+        "helion_checkout_git_describe": (
+            _git_describe(REPO_ROOT) if owns_checkout else None
+        ),
         **source_snapshot,
     }
 
@@ -842,8 +847,30 @@ def _git_commit(root: Path, rev: str) -> str | None:
     return proc.stdout.strip()
 
 
+def _git_worktree_root_matches(root: Path) -> bool:
+    """A source copy inside another checkout does not inherit its provenance."""
+    try:
+        worktree = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return bool(worktree) and Path(worktree).resolve() == root.resolve()
+
+
 def _git_source_snapshot(root: Path, pathspecs: tuple[str, ...]) -> dict[str, object]:
-    """Fingerprint tracked and untracked source content used by the benchmark."""
+    """Fingerprint source content only from the requested Git worktree root."""
+    unavailable: dict[str, object] = {
+        "helion_source_tree_sha256": None,
+        "helion_source_tree_file_count": None,
+        "helion_source_tree_dirty": None,
+    }
+    if not _git_worktree_root_matches(root):
+        return unavailable
     try:
         listed = subprocess.run(
             [
@@ -876,11 +903,7 @@ def _git_source_snapshot(root: Path, pathspecs: tuple[str, ...]) -> dict[str, ob
             text=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
-        return {
-            "helion_source_tree_sha256": None,
-            "helion_source_tree_file_count": None,
-            "helion_source_tree_dirty": None,
-        }
+        return unavailable
 
     relative_paths = sorted(set(listed.rstrip("\0").split("\0"))) if listed else []
     digest = hashlib.sha256()

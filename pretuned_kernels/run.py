@@ -60,8 +60,12 @@ KERNELS = [
     "silu_and_mul_per_block_quant",
     "fused_qk_norm_rope",
     # Fixed-shape model regions compiled as one Triton kernel.
+    "kda_decode",
     "qwen3_decode_layer",
     "gemma4_a4b_moe",
+    "gpt_oss_moe",
+    "flash_mla",
+    "deepseek_v3_moe_nvfp4",
     # External grouped references compile substantial CuTe/DeepGEMM code.
     "grouped_gemm",
     "grouped_gemm_deepgemm",

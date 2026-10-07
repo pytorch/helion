@@ -710,21 +710,32 @@ def index_parts(
             out_pos += 1
             continue
 
-        # Generate code based on the pattern type
-        index_code = _generated_index_code(
-            pattern,
-            idx,
-            state,
-            tensor,
-            i,
-            tensor_dim,
-            in_pipeline,
-            pipeline_block_ids,
-            ast_subscripts,
-            pipeline_scalar_indices_local,
-            tensor_indices_are_scalars,
-            raw_hbm_ref,
+        from .plan_tiling import GRID_SCALAR_INDEX_DIMS
+
+        grid_scalar_dims = (
+            state.fx_node.meta.get(GRID_SCALAR_INDEX_DIMS, ())
+            if state.fx_node is not None
+            else ()
         )
+        if tensor_dim in grid_scalar_dims:
+            # The BlockSpec index map has already selected this panel.
+            index_code = "0"
+        else:
+            # Generate code based on the pattern type
+            index_code = _generated_index_code(
+                pattern,
+                idx,
+                state,
+                tensor,
+                i,
+                tensor_dim,
+                in_pipeline,
+                pipeline_block_ids,
+                ast_subscripts,
+                pipeline_scalar_indices_local,
+                tensor_indices_are_scalars,
+                raw_hbm_ref,
+            )
         parts.append(index_code)
 
         out_pos += 1

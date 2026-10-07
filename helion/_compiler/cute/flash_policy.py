@@ -230,7 +230,7 @@ _FLASH_TARGET_POLICIES = {
                 ),
                 FlashCausalTuningPolicy(
                     num_kv=1024,
-                    kv_stage=3,
+                    kv_stage=6,
                     e2e_offset=1,
                     e2e_offset0=14,
                     role_map="fa4",
@@ -240,7 +240,7 @@ _FLASH_TARGET_POLICIES = {
                 ),
                 FlashCausalTuningPolicy(
                     num_kv=2048,
-                    kv_stage=3,
+                    kv_stage=8,
                     e2e_offset=14,
                     e2e_offset0=12,
                     role_map="fa4",

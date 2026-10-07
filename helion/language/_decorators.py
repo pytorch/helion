@@ -216,7 +216,9 @@ def api(
                     f"{fn.__qualname__} does not have a ref mode implementation yet"
                 )
                 flat_args = api._prepare_args(*bound.arguments.values())
-                return api._ref_fn(*flat_args)
+                from ..runtime.ref_mode import dispatch_reference
+
+                return dispatch_reference(wrapper, api._ref_fn, flat_args)
 
             flat_args = api._prepare_args(*bound.arguments.values())
 
@@ -440,6 +442,7 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 # Tracks 1-1 mapping between Python functions and their Helion API counterparts within device function.
 _DEVICE_FUNC_REPLACEMENTS: dict[object, Callable[..., object]] = {}
+_TENSOR_METHOD_REPLACEMENTS = frozenset({"chunk", "unbind"})
 
 
 def device_func_replacement(python_func: object) -> _Decorator:

@@ -29,6 +29,7 @@ from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
+from helion._compiler.tile_dependency import _interval_hull
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_access_map
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
@@ -39,8 +40,10 @@ from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -55,6 +58,84 @@ def cartesian_affine_stage(x: torch.Tensor) -> torch.Tensor:
     for tile_batch, tile_width in hl.tile([batch, width]):
         out[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
     return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def scalar_and_nonaffine_subscripts(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    y = x.new_empty(4 * n)
+    out = torch.empty_like(x)
+    for tile in hl.tile(n, block_size=16):
+        y[tile] = x[tile] + 1
+    hl.barrier()
+    for tile in hl.tile(n, block_size=16):
+        scalars = y[tile.id + 1] + y[tile.begin + 2] + y[tile.end] + y[tile.id * 2]
+        vectors = y[tile.index // 2] + y[tile.index * 2 + 1]
+        wrapped = y[tile.index.to(torch.int8)]
+        out[tile] = scalars + vectors + wrapped + y[hl.arange(16) + 3].sum()
+    hl.barrier()
+    for i in hl.grid(n):
+        out[i] = y[i + 1] + y[2 * i]
+    hl.barrier()
+    for i in hl.grid(0, n, 2):
+        out[i] = y[i + 1]
+    hl.barrier()
+    for tile in hl.tile(n, block_size=1):
+        out[tile] = y[tile.begin + 1]
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def shifted_inner_grid(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    for i in hl.grid(n):
+        y[i] = x[i]
+    hl.barrier()
+    for tile in hl.tile(n, block_size=16):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for j in hl.grid(2, 6):
+            acc = acc + y[j + 1]
+        x[tile] = acc
+    return x
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def read_through_alias(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = x.new_empty([2 * m, n])[m:]
+    y = x.new_empty(m)
+    for tile_i, tile_j in hl.tile([m, n]):
+        out[tile_i, tile_j] = x[tile_i, tile_j] + 1
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=x.dtype)
+        q = out
+        for tile_n in hl.tile(n):
+            acc = acc + q[tile_m, tile_n].sum(-1)
+            q = out
+        y[tile_m] = acc
+    return y
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def read_through_loop_carried_alias(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    buf = x.new_empty([2 * m, n])
+    lo = buf[:m]
+    out = buf[m:]
+    y = x.new_empty(m)
+    for tile_i, tile_j in hl.tile([m, n]):
+        out[tile_i, tile_j] = x[tile_i, tile_j] + 1
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=x.dtype)
+        q = lo
+        for tile_n in hl.tile(n):
+            acc = acc + q[tile_m, tile_n].sum(-1)
+            q = out
+        y[tile_m] = acc
+    return y
 
 
 def _axis_geometry(
@@ -160,10 +241,13 @@ def _access(
     scalar: tuple[bool, ...] | None = None,
     full_slice: tuple[bool, ...] | None = None,
     static_extents: tuple[int | None, ...] | None = None,
+    dense_spans: tuple[tuple[int, int, int] | None, ...] | None = None,
     masked: bool = False,
     tensor_name: str = "tmp",
     storage_offset: int = 0,
     layout_is_static: bool = True,
+    owner_rank: int | None = None,
+    atomic: bool = False,
 ) -> TileAccess:
     return TileAccess(
         access_id=access_id,
@@ -184,7 +268,10 @@ def _access(
         has_explicit_mask=masked,
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
+        subscript_dense_spans=dense_spans or (),
         layout_is_symbolically_exact=layout_is_static,
+        owner_rank=owner_rank,
+        is_atomic=atomic,
     )
 
 
@@ -369,6 +456,97 @@ class TestTileDependency(TestCase):
         )
 
         self.assertEqual(plan.edges, ())
+
+    def test_symmetric_accesses_ignore_owners_and_regions(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store"),
+                _access(1, root=1, kind="store"),
+                _access(2, root=2, kind="store", owner_rank=1, atomic=True),
+                _access(3, root=3, kind="load", owner_rank=2, storage_offset=128),
+            ),
+            [[0], [1], [2], [3]],
+        )
+        # Other ranks may run other programs: no write covers another, and a
+        # disjoint-looking load of another rank's copy still depends on all.
+        self.assertEqual(
+            {
+                (edge.producer_root, edge.consumer_root, plan.transport(dependency))
+                for edge in plan.edges
+                for dependency in edge.access_dependencies
+            },
+            {
+                (0, 1, "counter"),
+                (0, 2, "peer_counter"),
+                (1, 2, "peer_counter"),
+                (0, 3, "peer_counter"),
+                (1, 3, "peer_counter"),
+                (2, 3, "peer_counter"),
+            },
+        )
+
+    def test_same_root_cross_rank_hazards_are_rejected(self) -> None:
+        for accesses in (
+            (
+                _access(0, root=1, kind="store"),
+                _access(1, root=1, kind="load", owner_rank=1),
+            ),
+            (_access(0, root=1, kind="store", owner_rank=1),),
+            (
+                _access(0, root=1, kind="store", owner_rank=1, atomic=True),
+                _access(1, root=1, kind="load", owner_rank=2),
+            ),
+            (
+                _access(0, root=1, kind="store"),
+                _access(1, root=1, kind="load", owner_rank=1, storage_offset=128),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                exc.CrossLoopSchedulingError, "root 1 may race with another rank"
+            ):
+                build_tile_dependency_graph(accesses, [[0], [1]])
+        # Loads, atomics and local pairs.
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=1, kind="load"),
+                _access(1, root=1, kind="load", owner_rank=1),
+                _access(2, root=1, allocation_id=1, kind="store", atomic=True),
+                _access(
+                    3, root=1, allocation_id=1, kind="store", owner_rank=1, atomic=True
+                ),
+                _access(4, root=1, allocation_id=2, kind="store"),
+                _access(5, root=1, allocation_id=2, kind="load"),
+            ),
+            [[0], [1]],
+        )
+        self.assertEqual(plan.edges, ())
+
+    def test_phase_barrier_does_not_order_other_ranks(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store"),
+                _access(1, root=1, kind="load"),
+                _access(2, root=1, kind="load", owner_rank=1),
+                _access(3, root=0, allocation_id=1, kind="load", owner_rank=1),
+                _access(4, root=1, allocation_id=1, kind="store"),
+                _access(5, root=0, allocation_id=2, kind="store"),
+                _access(6, root=1, allocation_id=2, kind="load"),
+            ),
+            [[0], [1]],
+            root_phases=(0, 1),
+        )
+        # Only symmetric allocations keep reaching accesses across the barrier.
+        self.assertEqual(
+            {
+                (edge.producer_root, dependency.consumer_access_id, dependency.kind)
+                for edge in plan.edges
+                for dependency in edge.access_dependencies
+            },
+            {
+                (0, 2, TileDependencyKind.READ_AFTER_WRITE),
+                (0, 4, TileDependencyKind.WRITE_AFTER_READ),
+            },
+        )
 
     def test_coordinate_domain_separates_geometry_from_linearization_order(
         self,
@@ -1124,6 +1302,117 @@ class TestTileDependency(TestCase):
             device_ir.task_families = original_task_families
             device_ir.grid_block_ids = original_grid_block_ids
 
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_subscript_facts_are_exact_or_whole_dimension(self) -> None:
+        x = torch.empty(256, device=DEVICE, dtype=torch.float32)
+        bound = scalar_and_nonaffine_subscripts.bind((x,))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        with bound.env, bound.host_function:
+            analysis = DeviceIRAnalysis.build(device_ir, bound.env)
+            accesses = analysis.tile_accesses(
+                device_ir,
+                bound.env,
+                bound.host_function,
+            )
+        block_ids = {
+            access.root: access.subscript_affine_block_ids[0]
+            for access in accesses
+            if access.kind == "store"
+        }
+        # (root, kind, block, scale, offset, scalar); no block and no offset is
+        # the whole dimension.
+        whole, whole_slice = (None, 1, None, True), (None, 1, None, False)
+        self.assertEqual(
+            [
+                (
+                    access.root,
+                    access.kind,
+                    access.subscript_affine_block_ids[0],
+                    access.subscript_index_scales[0],
+                    access.subscript_offsets[0],
+                    access.subscript_is_scalar[0],
+                )
+                for access in accesses
+                if access.root > 0
+            ],
+            [
+                (1, "load", block_ids[1], 1, 1, True),  # tile.id + 1
+                (1, "load", *whole),  # tile.begin + 2: one point per block
+                (1, "load", *whole),  # tile.end
+                (1, "load", *whole),  # tile.id * 2
+                (1, "load", *whole_slice),  # tile.index // 2
+                (1, "load", block_ids[1], 2, 1, False),  # tile.index * 2 + 1
+                (1, "load", *whole_slice),  # int8 cast may wrap
+                (1, "load", None, 1, 3, False),  # arange(16) + 3
+                (1, "store", block_ids[1], 1, 0, False),
+                (2, "load", block_ids[2], 1, 1, False),  # unit-step grid i + 1
+                (2, "load", *whole),  # 2 * i
+                (2, "store", block_ids[2], 1, 0, False),
+                (3, "load", *whole),  # stepped grid i + 1
+                (3, "store", *whole),
+                (4, "load", block_ids[4], 1, 1, False),  # unit-block tile.begin + 1
+                (4, "store", block_ids[4], 1, 0, False),
+            ],
+        )
+
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_shifted_inner_loop_has_no_incidence(self) -> None:
+        x = torch.empty(64, device=DEVICE)
+        bound = shifted_inner_grid.bind((x, torch.empty_like(x)))
+        host = bound.host_function
+        assert host is not None
+        with bound.env, host:
+            accesses = DeviceIRAnalysis.build(host.device_ir, bound.env).tile_accesses(
+                host.device_ir, bound.env, host
+            )
+            graph = build_tile_dependency_graph(
+                accesses, device_ir=host.device_ir, root_phases=(0, 0)
+            )
+        (inner,) = (
+            site.site_id
+            for site in graph.execution_sites
+            if len(site.logical_axis_order) == 2
+        )
+        # Blocks: outer grid, root tile, inner grid.
+        root_domains, site_domains = _configured_domains(
+            graph, {0: (64, 1), 1: (4, 16), 2: (4, 1)}
+        )
+        relations = instantiate_symbolic_dependencies(
+            graph, root_domains=root_domains, site_domains=site_domains
+        )
+        # y[j + 1] reads y[c + 3]; a zero-based incidence would claim y[c + 1].
+        self.assertEqual(
+            [r.incidence for r in relations if r.consumer_site_id == inner], [None]
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    @skipIfTileIR("implicit tile-dependency scheduling is Triton-only")
+    @onlyBackends(["triton"])
+    def test_ssa_copies_keep_allocation_identity(self) -> None:
+        x = torch.empty(64, 32, device=DEVICE)
+        host = read_through_alias.bind((x,)).host_function
+        assert host is not None
+        graph = host.device_ir.tile_dependency_graph
+        assert graph is not None
+        (store,) = (a for a in graph.accesses if a.root == 0 and a.kind == "store")
+        (load,) = (a for a in graph.accesses if a.root == 1 and a.kind == "load")
+        # q = out, lifted into the inner loop, reads root 0's store at its offset.
+        self.assertEqual(
+            (load.allocation_id, load.storage_offset, load.tensor_name),
+            (store.allocation_id, store.storage_offset, "out"),
+        )
+        self.assertEqual(
+            [(e.producer_root, e.consumer_root) for e in graph.edges], [(0, 1)]
+        )
+        # A loop-carried q is lo on the first trip and out after it.
+        with self.assertRaisesRegex(
+            exc.CrossLoopSchedulingError, "allocation identity"
+        ):
+            read_through_loop_carried_alias.bind((x,))
+
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
         for layout, left_interval, right_interval, second_dimension in (
             (((2, 1), (0, 1), 0), (0, 1), (0, 1), (0, 1)),
@@ -1372,6 +1661,72 @@ class TestTileDependency(TestCase):
         relation = _root_producers_by_consumer(plan, _one_dimensional_domains())
         self.assertIsNone(relation)
 
+    def test_unknown_subscript_conservatively_spans_dimension(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store", block_ids=(10,)),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    block_ids=(None,),
+                    offsets=(None,),
+                    scalar=(True,),
+                ),
+            ),
+            [[10], [20]],
+        )
+
+        relation = _root_producers_by_consumer(
+            plan,
+            _one_dimensional_domains(consumer_count=4),
+        )
+        self.assertEqual(
+            relation,
+            tuple(frozenset(range(8)) for _ in range(4)),
+        )
+
+    def test_unknown_subscript_preserves_other_affine_dimensions(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(4, 8),
+                    strides=(8, 1),
+                    block_ids=(10, 11),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(4, 8),
+                    strides=(8, 1),
+                    block_ids=(20, None),
+                    scales=(1, 1),
+                    offsets=(0, None),
+                    scalar=(False, True),
+                ),
+            ),
+            [[10, 11], [20, 21]],
+        )
+        producer = CoordinateDomain((10, 11), ((10, 4), (11, 8)), ((10, 1), (11, 1)))
+        consumer = CoordinateDomain((20, 21), ((20, 4), (21, 2)), ((20, 1), (21, 1)))
+
+        relation = _root_producers_by_consumer(plan, (producer, consumer))
+        assert relation is not None
+        for consumer_task, producers in enumerate(relation):
+            batch = _coordinates(consumer, consumer_task)[20]
+            self.assertEqual(
+                producers,
+                frozenset(
+                    _index(producer, {10: batch, 11: column}) for column in range(8)
+                ),
+            )
+
     def test_batch_axis_is_part_of_task_mapping(self) -> None:
         plan = build_tile_dependency_graph(
             (
@@ -1448,6 +1803,82 @@ class TestTileDependency(TestCase):
         self.assertEqual(
             _root_producers_by_consumer(plan, root_domains),
             tuple(frozenset((task,)) for task in range(256)),
+        )
+
+    def test_dense_span_maps_flat_consumer_to_grouped_producers(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(8, 128, 8),
+                    strides=(1024, 8, 1),
+                    block_ids=(10, 11, None),
+                    scales=(1, 1, 1),
+                    offsets=(0, 0, 0),
+                    full_slice=(False, False, True),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(8, 1024),
+                    strides=(1024, 1),
+                    block_ids=(20, None),
+                    scales=(1, 1),
+                    offsets=(0, None),
+                    dense_spans=(None, (22, 8, 0)),
+                ),
+            ),
+            [[10, 11], [20, 21, 22]],
+        )
+        producer = CoordinateDomain((10, 11), ((10, 8), (11, 32)), ((10, 1), (11, 4)))
+        consumer = CoordinateDomain(
+            (20, 21, 22),
+            ((20, 8), (21, 2), (22, 4)),
+            ((20, 1), (21, 256), (22, 32)),
+        )
+        producers_by_consumer = _root_producers_by_consumer(plan, (producer, consumer))
+        self.assertIsNotNone(producers_by_consumer)
+        assert producers_by_consumer is not None
+        consumer_task = _index(consumer, {20: 3, 21: 1, 22: 2})
+        self.assertEqual(
+            producers_by_consumer[consumer_task],
+            frozenset(_index(producer, {10: 3, 11: group}) for group in range(16, 24)),
+        )
+
+    def test_dense_span_with_out_of_bounds_tail_falls_back(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(1024,),
+                    strides=(1,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(1024,),
+                    strides=(1,),
+                    block_ids=(None,),
+                    dense_spans=((20, 8, 16),),
+                ),
+            ),
+            [[10], [20]],
+        )
+        self.assertIsNone(
+            _root_producers_by_consumer(
+                plan,
+                (
+                    CoordinateDomain((10,), ((10, 32),), ((10, 32),)),
+                    CoordinateDomain((20,), ((20, 4),), ((20, 32),)),
+                ),
+            )
         )
 
     def test_nontrivial_reshape_still_falls_back_to_root(self) -> None:
@@ -2227,6 +2658,51 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(
             partition.rekey_fine(Incidence.from_fibers(identity, keys_by_item=identity))
         )
+
+    def test_interval_hull_needs_provable_overlap(self) -> None:
+        n = sympy.Symbol("n", integer=True, positive=True)
+        m = sympy.Symbol("m", integer=True, positive=True)
+        self.assertEqual(_interval_hull((0, n), (1, n + 1), None), (0, n + 1))
+        self.assertEqual(_interval_hull((1, n + 1), (0, n), None), (0, n + 1))
+        self.assertIsNone(_interval_hull((0, n), (1, m), None))
+        self.assertIsNone(_interval_hull((0, 5), (7, 9), None))
+
+    def test_union_coalesces_only_provably_overlapping_fibers(self) -> None:
+        keys = CoordinateDomain.scalar(1, kind="event")
+        items = CoordinateDomain.scalar(37, axis=1)
+        offset = sympy.Symbol("offset", integer=True, nonnegative=True)
+
+        def fibers(*ranges: tuple[sympy.Expr | int, sympy.Expr | int]) -> Incidence:
+            pieces = tuple(
+                _CoordinateRelationPiece(((0, 0, 1, 1),), ((1, begin, end, 1),))
+                for begin, end in ranges
+            )
+            return Incidence.from_fibers(CoordinateRelation(keys, items, pieces))
+
+        # Re-reading items in a different order must not change the union.
+        for name, incidence, expected_count in (
+            ("nested", Incidence.union_all((fibers((0, 37)), fibers((1, 37)))), 37),
+            ("overlap", Incidence.union_all((fibers((0, 20)), fibers((10, 37)))), 37),
+            ("identical", fibers((0, 18), (18, 37), (0, 37)), 37),
+            ("disjoint", Incidence.union_all((fibers((0, 5)), fibers((7, 9)))), None),
+            (
+                "unproved",
+                Incidence.union_all((fibers((0, 5)), fibers((offset, offset + 3)))),
+                None,
+            ),
+        ):
+            with self.subTest(name):
+                assert incidence is not None
+                if expected_count is None:
+                    self.assertEqual(len(incidence.items_by_key.pieces), 2)
+                    self.assertIsNone(incidence.count_by_key)
+                else:
+                    self.assertEqual(len(incidence.items_by_key.pieces), 1)
+                    assert incidence.count_by_key is not None
+                    self.assertEqual(
+                        incidence.count_by_key.value_bounds(),
+                        (expected_count, expected_count),
+                    )
 
     def test_symbolic_uniform_fibers_keep_count_without_dense_order(self) -> None:
         batch = sympy.Symbol("batch", integer=True, positive=True)

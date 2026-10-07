@@ -496,6 +496,14 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        if (
+            node.target is torch.ops.aten.clone.default
+            and CompileEnvironment.current().backend_name == "cute"
+        ):
+            from .cute.cute_reshape import codegen_cute_virtual_clone
+
+            if (result := codegen_cute_virtual_clone(ctx, node)) is not None:
+                return result
         return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
 
     def codegen_from_input_asts(
@@ -832,6 +840,12 @@ class ReductionLowering(InductorLowering):
         mask_node_inputs(node, default)
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.completed_matmul_sum import completed_matmul_sum_input
+
+            completed = completed_matmul_sum_input(ctx, node)
+            if completed is not None:
+                return completed
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]
@@ -1091,6 +1105,37 @@ class SympyExprLowering(Lowering):
         return None
 
 
+_PLAIN_TRUE_DIVISION_TARGETS: frozenset[object] = frozenset(
+    {
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Scalar,
+        torch.ops.aten.true_divide.Tensor,
+        torch.ops.aten.true_divide.Scalar,
+    }
+)
+_MODE_DIVISION_TARGETS: frozenset[object] = frozenset(
+    {torch.ops.aten.div.Tensor_mode, torch.ops.aten.div.Scalar_mode}
+)
+
+
+def _is_plain_true_division(node: torch.fx.Node) -> bool:
+    """Whether ``node`` is a true division whose quotient is the node's result.
+
+    ``div(..., rounding_mode=None)`` counts; ``trunc``/``floor`` modes, floor
+    division and remainder lower their quotient into a rounding step inside the
+    same node, so an approximate quotient would change the integer result.
+    """
+    target = node.target
+    if target in _PLAIN_TRUE_DIVISION_TARGETS:
+        return True
+    if target in _MODE_DIVISION_TARGETS:
+        rounding_mode = node.kwargs.get("rounding_mode")
+        if rounding_mode is None and len(node.args) > 2:
+            rounding_mode = node.args[2]
+        return rounding_mode is None
+    return False
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
         self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
@@ -1203,7 +1248,10 @@ class GenerateASTFromInductor(DefaultHandler):
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
 
-        if CompileEnvironment.current().settings.fast_math:
+        env = CompileEnvironment.current()
+        if env.settings.fast_math and env.backend.name == "triton":
+            # libdevice's fast_dividef / fast_expf exist on the Triton backend
+            # only; TileIR shares the Triton codegen and keeps the exact form.
             result = expr_from_string(
                 f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
             )
@@ -1216,6 +1264,44 @@ class GenerateASTFromInductor(DefaultHandler):
         if expected_dtype is not None and expected_dtype != torch.float32:
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
+
+    def truediv(self, a: object, b: object) -> str:  # type: ignore[override]
+        """Divide; under ``fast_math`` the Triton backend takes the approximate divide.
+
+        Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range).
+        ``fast_dividef`` is ``div.approx.ftz.f32``: cheaper at the same 2 ulp,
+        but a subnormal divisor gives +-inf, a subnormal quotient flushes to
+        zero and a divisor above 2**126 gives 0, so it is only emitted when the
+        ``fast_math`` setting opts the kernel into approximations -- the same
+        contract the CuTe backend follows (IEEE divide by default, approximate
+        reciprocal multiply under the setting).  It is emitted only for the
+        plain true divisions (``aten.div`` without a rounding mode); a quotient
+        that feeds ``trunc``/``floor`` in the same node must be exact, so the
+        rounding-mode divisions, ``floor_divide`` and ``remainder`` keep the
+        default.  Like Triton's ``/``, the result stays fp32 (half-precision
+        and integer operands are promoted to fp32 first); the consumer casts.
+        TileIR shares the Triton codegen but has no libdevice ``fast_dividef``,
+        so it keeps the exact divide under the setting.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name != "triton" or not env.settings.fast_math:
+            return self._default("truediv", (a, b), {})
+        node = V.current_node
+        if node is None or not _is_plain_true_division(node):
+            return self._default("truediv", (a, b), {})
+        if self._expected_tensor_dtype() not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return self._default("truediv", (a, b), {})
+        return self._lift(
+            expr_from_string(
+                "fast_dividef({a}, {b})",
+                a=self._create_cast_expr(a, torch.float32),
+                b=self._create_cast_expr(b, torch.float32),
+            )
+        )
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
         backend_name = CompileEnvironment.current().backend_name
@@ -1501,6 +1587,10 @@ class GraphInterpreter(LoweringContext, Interpreter):
             self.cg.record_codegen_result(node, result)
 
     def run_node(self, n: Node) -> object:
+        if self.cg.device_function.inband_polls:
+            from .triton.distributed_ops import flush_inband_polls
+
+            flush_inband_polls(self.cg, n)
         if n.op == "call_function":
             with (
                 self.cg.statement_owner_node(n),

@@ -43,9 +43,14 @@ from __future__ import annotations
 
 import ast
 import re
+from typing import cast
 
+from ..ast_extension import clone_ast
+from ..ast_extension import create
+from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
@@ -126,11 +131,15 @@ def _looks_like_unmasked_load(node: ast.AST) -> ast.Call | None:
 def _looks_like_vec_load(node: ast.AST) -> ast.Call | None:
     """Return the Call if ``node`` is a ``cute.arch.load(ptr, vec_type)``
     expression — the hoisted U16 vec load emitted by the LoopedReductionStrategy
-    ``unroll`` mode.
+    ``unroll`` mode — or a cache-hinted vector load helper of the same call
+    shape (``_cute_load_l2_evict_last_8b(ptr, vec_type)``, see
+    ``cache_policy_loads``).
     """
     if not isinstance(node, ast.Call):
         return None
     func = node.func
+    if isinstance(func, ast.Name) and func.id in _CUTE_CACHE_LOAD_HELPER_NAMES:
+        return node
     if not isinstance(func, ast.Attribute):
         return None
     if func.attr != "load":
@@ -224,6 +233,82 @@ def _dtype_from_default(node: ast.expr) -> str | None:
     return None
 
 
+def _static_int(expr: ast.expr, constexpr_values: dict[str, int]) -> int | None:
+    """Static value of a literal, a known constexpr name, or either wrapped in
+    a one-argument call such as ``cutlass.Int32(...)``; otherwise None."""
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, int):
+        return expr.value
+    if isinstance(expr, ast.Name) and expr.id in constexpr_values:
+        return constexpr_values[expr.id]
+    if isinstance(expr, ast.Call) and len(expr.args) == 1:
+        inner = expr.args[0]
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, int):
+            return inner.value
+        if isinstance(inner, ast.Name) and inner.id in constexpr_values:
+            return constexpr_values[inner.id]
+    return None
+
+
+def _wrap_dynamic_groups(
+    body: list[ast.stmt],
+    groups: list[tuple[ast.For, ast.For, str]],
+    fused_spans: list[tuple[ast.For, ast.For]],
+    originals: dict[int, ast.stmt],
+) -> list[ast.stmt]:
+    """Guard fused constexpr-trip groups with their trace-time fragment budgets.
+
+    ``groups`` names the first and last rewritten sweep of each group and the
+    condition under which every cache of the group fits its budget for the
+    exact trip count.  The fused statements run when it holds; otherwise the
+    cloned pre-fusion statements run and the later sweeps re-load from
+    gmem/L2.  Only one branch is traced, so the fast path is unchanged.
+    Overlapping groups share one branch under the conjunction of their
+    budgets.
+
+    ``fused_spans`` names the first and last rewritten sweep of every fused
+    group in ``body``, static ones included.  A guarded range grows to cover
+    each fused group it intersects: a group whose populate sweep is traced
+    inside the guard while a consume sweep runs after it would otherwise read
+    a cache only the fused branch fills.
+    """
+    ranges = sorted(
+        (body.index(first), body.index(last), condition)
+        for first, last, condition in groups
+    )
+    spans = [(body.index(first), body.index(last)) for first, last in fused_spans]
+    while True:
+        merged: list[tuple[int, int, str]] = []
+        for lo, hi, condition in ranges:
+            for span_lo, span_hi in spans:
+                if span_lo <= hi and lo <= span_hi:
+                    lo, hi = min(lo, span_lo), max(hi, span_hi)
+            if merged and lo <= merged[-1][1]:
+                prev_lo, prev_hi, prev_condition = merged[-1]
+                merged[-1] = (
+                    min(prev_lo, lo),
+                    max(prev_hi, hi),
+                    f"{prev_condition} and {condition}",
+                )
+            else:
+                merged.append((lo, hi, condition))
+        # Growing a range can reach further groups; iterate to a fixed point.
+        if merged == ranges:
+            break
+        ranges = merged
+    for lo, hi, condition in reversed(merged):
+        fused = body[lo : hi + 1]
+        fallback = [originals[id(stmt)] for stmt in fused if id(stmt) in originals]
+        body[lo : hi + 1] = [
+            create(
+                ast.If,
+                test=expr_from_string(f"cutlass.const_expr({condition})"),
+                body=fused,
+                orelse=fallback,
+            )
+        ]
+    return body
+
+
 def _trip_count_for(
     start: ast.expr,
     end: ast.expr,
@@ -237,17 +322,7 @@ def _trip_count_for(
     """
 
     def _to_int(expr: ast.expr) -> int | None:
-        if isinstance(expr, ast.Constant) and isinstance(expr.value, int):
-            return expr.value
-        if isinstance(expr, ast.Name) and expr.id in constexpr_values:
-            return constexpr_values[expr.id]
-        if isinstance(expr, ast.Call) and len(expr.args) == 1:
-            inner = expr.args[0]
-            if isinstance(inner, ast.Constant) and isinstance(inner.value, int):
-                return inner.value
-            if isinstance(inner, ast.Name) and inner.id in constexpr_values:
-                return constexpr_values[inner.id]
-        return None
+        return _static_int(expr, constexpr_values)
 
     def _peel_wrappers(expr: ast.expr) -> tuple[ast.expr, tuple[str, ...]]:
         # Peel ``cutlass.Int32(...)``-style 1-arg wrapper calls, recording
@@ -314,10 +389,26 @@ def _scalar_load_ptr_text(node: ast.AST) -> str | None:
     return ast.unparse(func.value)
 
 
+def _plain_vec_load_spelling(node: ast.AST) -> ast.AST:
+    """A cache-hinted vector load helper call respelled as the plain
+    ``cute.arch.load(ptr, vec_type)`` it stands for, so the hinted and
+    unhinted twins of one load match across sweeps; other nodes unchanged."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _CUTE_CACHE_LOAD_HELPER_NAMES
+    ):
+        plain = cast("ast.Call", clone_ast(node))
+        plain.func = cast("ast.expr", expr_from_string("cute.arch.load"))
+        return plain
+    return node
+
+
 def _normalized_load_text(node: ast.AST) -> str:
     """Unparse with cache hints stripped and the two scalar load forms
-    collapsed onto one spelling (see ``_scalar_load_ptr_text``)."""
-    node = _unwrap_persistent_branch_vec_load(node)
+    collapsed onto one spelling (see ``_scalar_load_ptr_text``); a hinted
+    vector load helper collapses onto ``cute.arch.load``."""
+    node = _plain_vec_load_spelling(_unwrap_persistent_branch_vec_load(node))
     ptr = _scalar_load_ptr_text(node)
     if ptr is not None:
         return f"__scalar_load__({ptr})"
@@ -638,10 +729,17 @@ class _CuteFuseTwoPassLoads:
         reload_modes: dict[int, str] | None = None,
         proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
         proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
+        dynamic_trip_counts: dict[str, tuple[int, str]] | None = None,
     ) -> None:
         super().__init__()
         self._counter = 0
         self._constexpr_values = constexpr_values or {}
+        # Rolled reductions over a symbolic extent: offset variable (the
+        # sweep loop's target) -> (size-hint trip count for the profitability
+        # policy, name of the constexpr kernel parameter carrying the exact
+        # runtime trip count).  The cache allocation is emitted in terms of
+        # that parameter so the fragment is exact for every runtime extent.
+        self._dynamic_trip_counts = dynamic_trip_counts or {}
         # Autotuner-selected reload mode per rolled or persistent reduction
         # block id ("auto" / "register" / "gmem").  Sweep loops are matched
         # back to their block id through their generated lane/offset variable.
@@ -702,8 +800,18 @@ class _CuteFuseTwoPassLoads:
                 target = stmt.targets[0].id
                 has_memory_access = any(
                     isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in ("load", "store")
+                    and (
+                        (
+                            isinstance(node.func, ast.Attribute)
+                            and node.func.attr in ("load", "store")
+                        )
+                        or (
+                            isinstance(node.func, ast.Name)
+                            and node.func.id.startswith(
+                                ("_cute_load_", "_cute_store_", "_cute_atomic_")
+                            )
+                        )
+                    )
                     for node in ast.walk(stmt.value)
                 )
                 if not has_memory_access:
@@ -764,6 +872,8 @@ class _CuteFuseTwoPassLoads:
         load_call = load_calls[0]
 
         snapshots = _definition_snapshots(container)
+        if snapshots is None:
+            return False
         definitely_written: set[str] = set()
         live_in: set[str] = set()
         may_writes: set[str] = set()
@@ -815,6 +925,8 @@ class _CuteFuseTwoPassLoads:
         start: ast.expr,
         step: ast.expr,
         trip: int,
+        *,
+        fold_single_trip: bool = True,
     ) -> tuple[list[ast.stmt], str, int] | None:
         """Find the body list holding the actual gmem loads + the index
         expression used to address the cache for one iter of ``outer_loop``.
@@ -834,11 +946,13 @@ class _CuteFuseTwoPassLoads:
         """
         body = outer_loop.body
         assert isinstance(outer_loop.target, ast.Name)
-        if trip == 1:
+        if trip == 1 and fold_single_trip:
             # Single-trip outer loop (e.g. a whole-row tile): the outer
             # index folds to a literal 0 so the cache slot expression stays
             # a compile-time constant — the fragment then lives in
-            # registers instead of dynamically-indexed local memory.
+            # registers instead of dynamically-indexed local memory.  A
+            # size-hint trip count of a symbolic extent is not a proof of a
+            # single trip, so it keeps the indexed form.
             cache_index_outer = "0"
         else:
             cache_index_outer = (
@@ -1016,6 +1130,21 @@ class _CuteFuseTwoPassLoads:
 
         any_fused = False
         new_body = list(body)
+        # A group rolled over a constexpr trip count is fused under a
+        # trace-time budget on its exact fragment size
+        # (``_wrap_dynamic_groups``); the pre-fusion statements are cloned
+        # first so that branch can fall back to them.
+        fallback_originals: dict[int, ast.stmt] = {}
+        if any(
+            isinstance(loop.target, ast.Name)
+            and loop.target.id in self._dynamic_trip_counts
+            for loop in loops
+        ):
+            fallback_originals = {
+                id(stmt): cast("ast.stmt", clone_ast(stmt)) for stmt in body
+            }
+        dynamic_groups: list[tuple[ast.For, ast.For, str]] = []
+        fused_spans: list[tuple[ast.For, ast.For]] = []
         for group in groups:
             if len(group) < 2:
                 continue
@@ -1027,6 +1156,17 @@ class _CuteFuseTwoPassLoads:
             trip = _trip_count_for(
                 start, end, step, self._constexpr_values, allow_dynamic_base=True
             )
+            # A rolled reduction over a symbolic extent has no static trip
+            # count; its strategy exposes the exact count as a constexpr
+            # kernel parameter and the size-hint count for the policy
+            # below.  The fragment is then allocated as ``TRIPS * slots``.
+            trip_expr: str | None = None
+            if trip is None:
+                assert isinstance(first_loop.target, ast.Name)
+                dynamic = self._dynamic_trip_counts.get(first_loop.target.id)
+                if dynamic is None or _static_int(start, self._constexpr_values) != 0:
+                    continue
+                trip, trip_expr = dynamic
             # Require a static, bounded trip count.  Single-trip loops
             # (whole-row tiles) are the most profitable case: the cache
             # index folds to a constant and the fragment stays in
@@ -1037,7 +1177,9 @@ class _CuteFuseTwoPassLoads:
             if trip is None or trip < 1 or trip > 2048:
                 continue
 
-            first_ctx = self._resolve_load_container(first_loop, start, step, trip)
+            first_ctx = self._resolve_load_container(
+                first_loop, start, step, trip, fold_single_trip=trip_expr is None
+            )
             if first_ctx is None:
                 continue
             first_container, first_cache_index, first_cache_size = first_ctx
@@ -1063,7 +1205,9 @@ class _CuteFuseTwoPassLoads:
                 ]
             ] = []
             for loop_k in group[1:]:
-                ctx_k = self._resolve_load_container(loop_k, start, step, trip)
+                ctx_k = self._resolve_load_container(
+                    loop_k, start, step, trip, fold_single_trip=trip_expr is None
+                )
                 if ctx_k is None or ctx_k[2] != cache_size:
                     continue
                 body_idx = new_body.index(loop_k)
@@ -1133,20 +1277,25 @@ class _CuteFuseTwoPassLoads:
                 continue
             if _fuser_mode == "register":
                 use_smem = False
-                if cache_elems > 1024:
+                fragment_cap = 1024
+                if cache_elems > fragment_cap:
                     continue
             elif _fuser_mode == "smem":
-                if not allow_smem:
+                # The per-thread SMEM slot stride is baked into every slot
+                # expression; a constexpr trip count has no static stride.
+                if not allow_smem or trip_expr is not None:
                     continue
                 use_smem = True
-                if cache_elems > 1024:
+                fragment_cap = 1024
+                if cache_elems > fragment_cap:
                     continue
             else:  # auto
                 # Reduction sweeps cap on the true element footprint (the
                 # vec path multiplies slots by V); tile-loop sweeps keep
                 # the historical slot-count cap their tunings were
                 # calibrated against.
-                if (cache_elems if is_reduction_sweep else cache_size) > 64:
+                fragment_cap = 64
+                if (cache_elems if is_reduction_sweep else cache_size) > fragment_cap:
                     continue
                 use_smem = False
             cache_index = first_cache_index
@@ -1321,6 +1470,9 @@ class _CuteFuseTwoPassLoads:
             #     sweeps so the consume reads see populated slots.
             cache_names: dict[str, tuple[str, int]] = {}
             cache_decls: list[ast.stmt] = []
+            # Trace-time conditions under which each constexpr-trip fragment
+            # fits the budget the size hint was admitted with.
+            fragment_caps: list[str] = []
             # Build the linear per-thread index expression covering all
             # populated thread-block axes (axis 0 = warp lanes, axis 1
             # = additional thread rows, axis 2 = z).  For a 1-D thread
@@ -1359,12 +1511,32 @@ class _CuteFuseTwoPassLoads:
                         ]
                     )
                 else:
-                    cache_total = cache_total_per_thread
-                    cache_decls.append(
-                        statement_from_string(
-                            f"{cache} = cute.make_rmem_tensor({cache_total}, {dtype})"
-                        )
+                    cache_total_expr = str(cache_total_per_thread)
+                    if trip_expr is not None:
+                        # ``cache_size`` is ``trip * lanes``; scale the exact
+                        # constexpr trip count by the same per-trip slots.
+                        cache_total_expr = f"{trip_expr} * {cache_size // trip * vec_w}"
+                    declaration = (
+                        f"{cache} = cute.make_rmem_tensor({cache_total_expr}, {dtype})"
                     )
+                    if trip_expr is not None:
+                        # The size-hint fragment (``cache_total_per_thread``
+                        # elements of ``dtype`` for this thread count) is what
+                        # the policy admitted and any autotuning measured.  The
+                        # exact fragment is bounded by it at trace time, so a
+                        # kernel bound at a short extent and reused at a long
+                        # one never grows the dynamically indexed per-thread
+                        # array past the measured footprint: longer extents
+                        # take the pre-fusion sweeps instead.  The group's
+                        # sweeps are guarded by the same condition.
+                        fragment_caps.append(
+                            f"{cache_total_expr} <= {cache_total_per_thread}"
+                        )
+                        declaration = (
+                            f"if cutlass.const_expr({fragment_caps[-1]}):\n"
+                            f"    {declaration}"
+                        )
+                    cache_decls.append(statement_from_string(declaration))
             if not cache_names:
                 continue
 
@@ -1532,6 +1704,20 @@ class _CuteFuseTwoPassLoads:
                         statement_from_string("cute.arch.sync_threads()"),
                     )
 
+            rewritten = [
+                loop_k
+                for (_body_idx, loop_k, *_rest), matches in zip(
+                    sweeps, per_sweep_matches, strict=True
+                )
+                if matches
+            ]
+            last_rewritten = rewritten[-1] if rewritten else first_loop
+            fused_spans.append((first_loop, last_rewritten))
+            if fragment_caps:
+                dynamic_groups.append(
+                    (first_loop, last_rewritten, " and ".join(fragment_caps))
+                )
+
             # Declarations are inserted by ``transform`` at kernel scope.
             # This remains valid when the matching sweeps live below a
             # dynamic branch, where CuTe forbids local-memory allocation.
@@ -1540,6 +1726,10 @@ class _CuteFuseTwoPassLoads:
 
         if not any_fused:
             return None
+        if dynamic_groups:
+            new_body = _wrap_dynamic_groups(
+                new_body, dynamic_groups, fused_spans, fallback_originals
+            )
         return new_body
 
     def _transform_body(
@@ -1585,6 +1775,7 @@ def fuse_two_pass_loads(
     reload_modes: dict[int, str] | None = None,
     proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
     proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
+    dynamic_trip_counts: dict[str, tuple[int, str]] | None = None,
 ) -> list[ast.stmt]:
     """Apply two-pass load fusion to a list of statements (the device kernel
     body). Returns the (possibly modified) body.
@@ -1608,6 +1799,15 @@ def fuse_two_pass_loads(
     injectivity proof used by an in-place consume sweep. Without that proof,
     a store to the loaded tensor remains a hard cache barrier.
 
+    ``dynamic_trip_counts`` maps the offset variable (sweep loop target) of
+    a rolled reduction whose extent is symbolic to ``(size_hint_trips,
+    constexpr_name)``: the profitability policy uses the hint, the emitted
+    fragment is allocated as ``constexpr_name * slots_per_trip`` so it is
+    exact at trace time, and the fused group is guarded by a trace-time check
+    that the exact fragment does not exceed the size-hint fragment the policy
+    admitted, falling back to the pre-fusion sweeps otherwise.  Every fused
+    group that intersects such a guarded range is guarded with it.
+
     Safe to call on any kernel body — only rewrites when a strict pattern
     match succeeds.
     """
@@ -1618,5 +1818,6 @@ def fuse_two_pass_loads(
         reload_modes=reload_modes,
         proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
         proven_tensor_stride_values=proven_tensor_stride_values,
+        dynamic_trip_counts=dynamic_trip_counts,
     )
     return transformer.transform(body)

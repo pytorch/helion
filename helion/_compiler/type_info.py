@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
 import re
 import types
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import TypeVar
 from typing import cast
 from unittest.mock import patch
@@ -13,12 +15,15 @@ from unittest.mock import patch
 import sympy
 import torch
 from torch.fx.experimental import proxy_tensor
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..autotuner.config_spec import NumThreadsSpec
+from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
+from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
@@ -29,6 +34,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
+from .compile_environment import RuntimeInputSpecialization
 from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .device_function import contains_only_block_size_symbols
@@ -47,6 +53,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
     from typing_extensions import Self
+
+    from torch._ops import OpOverload
 
     _T = TypeVar("_T")
 
@@ -561,6 +569,18 @@ class TensorAttributeType(TypeInfo):
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
         attr = self.attr()
+        if (
+            origin.is_device()
+            and attr in _TENSOR_METHOD_REPLACEMENTS
+            and (
+                replacement := get_device_func_replacement(getattr(torch.Tensor, attr))
+            )
+        ):
+            result = CallableType(origin, replacement).propagate_call(
+                (self.tensor, *args), kwargs, origin
+            )
+            assert result is not None
+            return result
         if attr in {"dim", "ndimension"} and not (args or kwargs):
             return TypeInfo.from_example(self.tensor.fake_value.ndim, origin)
         stride_dim_kwarg = attr == "stride" and not args and set(kwargs) == {"dim"}
@@ -632,9 +652,17 @@ class TensorAttributeType(TypeInfo):
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
         try:
             fn = getattr(self.tensor.fake_value, attr)
-            output_type = TypeInfo.from_example(
-                _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
-            )
+            result = _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs)
+            if origin.is_host():
+                # ``Tensor.new_*`` allocate like the ``torch.*`` factories;
+                # the receiver is the method's first argument.
+                CompileEnvironment.current().register_tensor_factory_layout(
+                    getattr(torch.Tensor, attr, None),
+                    (self.tensor.fake_value, *proxy_args),
+                    proxy_kwargs,
+                    result,
+                )
+            output_type = TypeInfo.from_example(result, origin)
         except exc.Base:
             raise
         except Exception as e:
@@ -765,6 +793,70 @@ class ConfigFragmentType(LiteralType):
         super().__init__(origin, fragment)
 
 
+def _starts_symmetric_allocation(values: Sequence[object]) -> bool:
+    """Runtime guard: get_remote_tensors views start at the allocation base."""
+    (local,) = values
+    if cast("torch.Tensor", local).storage_offset() != 0:
+        raise exc.InvalidAPIUsage(
+            "get_remote_tensors views start at the symmetric allocation, so the "
+            "tensor passed to it must too"
+        )
+    return True
+
+
+def _offset_expr(tensor: torch.Tensor) -> object:
+    """A tensor's storage offset as an int or a sympy expression."""
+    offset = tensor.storage_offset()
+    return offset if isinstance(offset, int) else _symint_expr(offset)
+
+
+class _PeerViewCapture(TorchDispatchMode):
+    """Record get_remote_tensors views, also when a host helper calls it."""
+
+    def __torch_dispatch__(
+        self,
+        func: OpOverload,
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> object:
+        result = func(*args, **(kwargs or {}))
+        if func is torch.ops.symm_mem.get_remote_tensors.default:
+            local, group_name = args
+            env = CompileEnvironment.current()
+            storage = local.untyped_storage()
+            owners = [t for t in env.input_sources if t.untyped_storage() == storage]
+            source = env.tensor_input_source(owners[0]) if len(owners) == 1 else None
+            # Peer views start at the allocation base, as does the guarded owner;
+            # static fakes drop input offsets, symbolic ones are exact.
+            mapped = (
+                group_name == env.process_group_name
+                and source is not None
+                and _offset_expr(local) in (0, _offset_expr(owners[0]))
+                and local.is_contiguous()
+            )
+            if mapped:
+                env.register_runtime_input_specialization(
+                    f"symmetric_allocation_base:{source!r}",
+                    RuntimeInputSpecialization(
+                        sources=(source,),
+                        classifier_identity="symmetric_allocation_base",
+                        classifier=_starts_symmetric_allocation,
+                        reusable_tensor_properties=frozenset(
+                            ("data_ptr", "storage_span")
+                        ),
+                    ),
+                )
+            HostFunction.current().compiler_state.peer_views.update(
+                (
+                    peer.untyped_storage(),
+                    (local.untyped_storage(), rank) if mapped else None,
+                )
+                for rank, peer in enumerate(result)
+            )
+        return result
+
+
 class CallableType(LiteralType):
     # pyrefly: ignore [bad-override]
     value: Callable[..., object]
@@ -795,10 +887,6 @@ class CallableType(LiteralType):
             return LiteralType(origin, None)
         if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
             raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
-        if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():
-            raise exc.UnsupportedSplitOperation(op="torch.chunk")
-        if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
-            raise exc.UnsupportedSplitOperation(op="torch.unbind")
         if self.value in (torch.split, torch.Tensor.split) and origin.is_device():
             raise exc.UnsupportedSplitOperation(op="torch.split")
         if (
@@ -886,7 +974,12 @@ class CallableType(LiteralType):
                 raise exc.ConfigSpecFragmentWithSymInt(args)
 
         try:
-            with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
+            with (
+                patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
+                _PeerViewCapture()
+                if env.process_group_name is not None
+                else contextlib.nullcontext(),
+            ):
                 result = _CheckForIndexCalls.retry_call(
                     self.value, proxy_args, proxy_kwargs
                 )

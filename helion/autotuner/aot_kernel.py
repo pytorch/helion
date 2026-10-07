@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import functools
+import hashlib
 import importlib.util
 import os
 from typing import TYPE_CHECKING
@@ -27,6 +28,7 @@ from typing import Any
 from typing import Callable
 from typing import ClassVar
 from typing import Hashable
+from typing import Literal
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
@@ -34,7 +36,12 @@ from typing import overload
 
 import torch
 
+from ..runtime.cute_structural_config import StructuralPolicyError
+from .aot_structural_policy import load_policy_module
+from .aot_structural_policy import model_configs
+
 if TYPE_CHECKING:
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from ..runtime.kernel import ConfigLike
     from ..runtime.kernel import Kernel
 
@@ -210,7 +217,7 @@ class HeuristicKeyFunction:
     """
 
     # Class-level cache: (kernel_source_file, kernel_name) -> key_fn or None
-    _key_fn_cache: ClassVar[dict[tuple[str, str], KeyFunction | None]] = {}
+    _key_fn_cache: ClassVar[dict[tuple[str, ...], KeyFunction | None]] = {}
 
     def __init__(
         self,
@@ -223,6 +230,7 @@ class HeuristicKeyFunction:
         self.kernel_name = kernel_name
         self.batched = batched
         self.user_key = user_key
+        self.structural_policy: CuteStructuralPolicy | None = None
         self._loaded: bool = False
         self._key_fn: KeyFunction | None = None
 
@@ -230,6 +238,9 @@ class HeuristicKeyFunction:
         """Load key_<kernel> function from the heuristic file if available."""
         if self._loaded:
             return self._key_fn
+
+        if self.structural_policy is not None:
+            return self._load_policy_key_function()
 
         cache_key = (self.kernel_source_file, self.kernel_name)
 
@@ -263,6 +274,8 @@ class HeuristicKeyFunction:
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
 
+                    model_configs(module, self.kernel_name, None)
+
                     # Load the key_<kernel> function
                     key_fn = getattr(module, f"key_{self.kernel_name}", None)
                     if key_fn is not None:
@@ -270,6 +283,8 @@ class HeuristicKeyFunction:
                         self._loaded = True
                         HeuristicKeyFunction._key_fn_cache[cache_key] = self._key_fn
                         return self._key_fn
+        except StructuralPolicyError:
+            raise
         except Exception:
             pass  # Silently fall back to full features
 
@@ -277,6 +292,44 @@ class HeuristicKeyFunction:
         self._loaded = True
         HeuristicKeyFunction._key_fn_cache[cache_key] = None
         return None
+
+    def _load_policy_key_function(self) -> KeyFunction | None:
+        """Validate a fixed-policy model before its key can influence binding."""
+        from .aot_cache import find_heuristic_file
+        from .aot_cache import get_aot_data_dir
+
+        policy = self.structural_policy
+        assert policy is not None
+        if os.environ.get("HELION_AOT_MODE", "evaluate").lower() != "evaluate":
+            self._loaded = True
+            return None
+        path = find_heuristic_file(
+            self.kernel_source_file,
+            self.kernel_name,
+            get_aot_data_dir(),
+            policy=policy,
+        )
+        if path is None:
+            self._loaded = True
+            return None
+        source = path.read_bytes()
+        cache_key = (
+            self.kernel_source_file,
+            self.kernel_name,
+            policy.identity(),
+            str(path.resolve()),
+            hashlib.sha256(source).hexdigest(),
+        )
+        if cache_key not in self._key_fn_cache:
+            module = load_policy_module(path, source)
+            model_configs(module, self.kernel_name, policy)
+            key_fn = vars(module).get(f"key_{self.kernel_name}")
+            if not callable(key_fn):
+                raise StructuralPolicyError("AOT model has no indexed key selector")
+            self._key_fn_cache[cache_key] = key_fn
+        self._key_fn = self._key_fn_cache[cache_key]
+        self._loaded = True
+        return self._key_fn
 
     def __call__(self, *args: object) -> Hashable:
         """Generate specialization key from arguments."""
@@ -346,6 +399,7 @@ def aot_kernel(
     batched: BatchedSpec = None,
     collect_fn: InputFn | None = None,
     measure_fn: InputFn | None = None,
+    cute_structural_policy: CuteStructuralPolicy | Literal["auto"] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -359,6 +413,7 @@ def aot_kernel(
     batched: BatchedSpec = None,
     collect_fn: InputFn | None = None,
     measure_fn: InputFn | None = None,
+    cute_structural_policy: CuteStructuralPolicy | Literal["auto"] | None = None,
     **settings: object,
 ) -> _AOTKernelDecorator: ...
 
@@ -371,6 +426,7 @@ def aot_kernel(
     batched: BatchedSpec = None,
     collect_fn: InputFn | None = None,
     measure_fn: InputFn | None = None,
+    cute_structural_policy: CuteStructuralPolicy | Literal["auto"] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _AOTKernelDecorator:
     """
@@ -414,6 +470,11 @@ def aot_kernel(
             Used to define which shapes to autotune during the collect phase.
         measure_fn: Optional function that returns input tuples for measurement.
             If set, only these inputs are used for the measure phase.
+        cute_structural_policy: None (the default) preserves the legacy AOT
+            workflow. "auto" selects a fresh policy-partitioned workflow while
+            honoring explicit settings and recorded configs. Pass the same
+            request and settings through collection, measurement, training,
+            evaluation, and export.
         **settings: Additional settings for the Kernel.
 
     Returns:
@@ -483,6 +544,7 @@ def aot_kernel(
                 batched=batched,
                 collect_fn=collect_fn,
                 measure_fn=measure_fn,
+                cute_structural_policy=cute_structural_policy,
                 key=user_key,
                 **settings,
             ),
@@ -493,18 +555,22 @@ def aot_kernel(
     kernel_name = fn.__name__
 
     # Create the key function
-    if user_key is not None:
-        # User provided a key - create a composed key that:
-        # 1. During collect/measure: uses user key for cache, features extracted from key output
-        # 2. During evaluate: loads heuristic that works on flattened key values
-        heuristic_key = make_aot_key(
-            kernel_source_file, kernel_name, batched=batched, user_key=user_key
-        )
-        key_fn: KeyFunction = heuristic_key
-    else:
-        key_fn = make_aot_key(kernel_source_file, kernel_name, batched=batched)
+    key_fn = make_aot_key(
+        kernel_source_file, kernel_name, batched=batched, user_key=user_key
+    )
 
-    k = kernel(fn, config=config, configs=configs, key=key_fn, **settings)
+    k = kernel(
+        fn,
+        config=config,
+        configs=configs,
+        key=key_fn,
+        cute_structural_policy=cute_structural_policy,
+        **settings,
+    )
+
+    # Kernel construction has resolved origins, config envelopes and seeds once.
+    # Its key must use that same policy before the first specialization/binding.
+    key_fn.structural_policy = k.cute_structural_policy
 
     # Store collect_fn/measure_fn on the Kernel object for AOTAutotuneCache to access
     # This avoids global state and keeps the functions scoped to this specific kernel

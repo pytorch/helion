@@ -220,6 +220,12 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 .. autofunction:: rand
 ```
 
+On CuTe, the default ``cute_rng_stream="auto"`` maps an explicit uniform
+``hl.rand`` logical offset ``i`` to Philox word ``i % 4`` at counter ``i // 4``.
+Use ``cute_rng_stream="word0"`` to reproduce the earlier sequence. This setting
+does not change ``hl.rand4x``, ``hl.randint`` or implicit Torch random operations
+under the automatic policy. Other backends retain their existing defaults.
+
 ### rand4x()
 
 ```{eval-rst}

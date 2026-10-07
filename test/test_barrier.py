@@ -86,7 +86,7 @@ def barrier_groups(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestBarrier(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_dep_across_barrier(self) -> None:
@@ -139,15 +139,23 @@ class TestBarrier(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_default_config_is_persistent(self) -> None:
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)
-        code, out = code_and_output(
-            barrier_dep_single,
-            (x,),
-            block_sizes=[4, 4],
-            pid_type="persistent_blocked",
-        )
+        code, out = code_and_output(barrier_dep_single, (x,))
         expected = x * 2 + 1
         torch.testing.assert_close(out, expected)
         # Can't see pid_type in ref-mode code; rely on normalization to succeed.
+
+    @skipIfRefEager("reference configs are only used in compiled mode")
+    @skipIfTileIR("TileIR does not support barrier operations")
+    def test_autotune_reference_config_is_persistent(self) -> None:
+        x = torch.arange(257, device=DEVICE, dtype=torch.float32)
+        bound = barrier_dep_single.bind((x,))
+        spec = bound.config_spec
+        config = spec.autotune_reference_config()
+        self.assertEqual(config.config["pid_type"], "persistent_blocked")
+        generation = spec.create_config_generation()
+        self.assertEqual(generation.unflatten(generation.flatten(config)), config)
+        compiled = bound.compile_config(config)
+        torch.testing.assert_close(compiled(x), x * 2 + 1)
 
     @skipIfRefEager(
         "DeviceIR mutation test does not execute a kernel in ref eager mode"

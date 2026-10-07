@@ -6,6 +6,7 @@ import contextlib
 import contextvars
 import dataclasses
 import logging
+import math
 import sys
 import threading
 import types
@@ -48,6 +49,9 @@ from .variable_origin import TensorSizeOrigin
 log = logging.getLogger(__name__)
 
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+# CUDA TMA limits each box dimension to 256 elements. Other descriptor
+# backends have their own legality checks and must not inherit this cap.
+CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +91,14 @@ class TensorDescriptorLayoutGuard:
     element_size: int
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+    has_derived_block_extent: bool = False
+
+
+@dataclasses.dataclass
+class TensorDescriptorAlignmentGuard:
+    memory_op_indices: set[int] = dataclasses.field(default_factory=set)
+    atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+    requires_zero_storage_offset: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,24 +136,84 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
     return False
 
 
-def _is_supported_tensor_descriptor_layout_guard_source(
-    source: Source,
-    root_values: typing.Mapping[str, object],
+def tensor_descriptor_runtime_alignment_signature(
+    value: object,
+) -> tuple[bool, bool]:
+    """Return the runtime alignment predicates used by descriptor codegen."""
+    if not isinstance(value, torch.Tensor) or type(value).__name__ in (
+        "FakeTensor",
+        "FunctionalTensor",
+    ):
+        return False, False
+    offset = value.storage_offset()
+    return value.data_ptr() % 16 == 0, isinstance(offset, int) and offset == 0
+
+
+def _concrete_tensor_base_is_aligned(value: object) -> bool:
+    return tensor_descriptor_runtime_alignment_signature(value)[0]
+
+
+def _concrete_tensor_satisfies_alignment_guard(
+    value: object, requires_zero_storage_offset: bool
 ) -> bool:
-    if isinstance(source, LocalSource):
+    aligned, zero_storage_offset = tensor_descriptor_runtime_alignment_signature(value)
+    return aligned and (not requires_zero_storage_offset or zero_storage_offset)
+
+
+# Wrapper factories whose result is a fresh allocation (new storage starting
+# at an allocator-aligned base) unless ``out=`` or an aliasing argument says
+# otherwise; ``register_tensor_factory_layout`` records that provenance.  The
+# ``Tensor.new_*`` methods are registered with the receiver as the first
+# argument.
+_FRESH_ALLOCATION_FACTORIES: tuple[object, ...] = (
+    torch.empty,
+    torch.empty_like,
+    torch.empty_strided,
+    torch.zeros,
+    torch.zeros_like,
+    torch.ones,
+    torch.ones_like,
+    torch.full,
+    torch.full_like,
+    torch.Tensor.new_empty,
+    torch.Tensor.new_empty_strided,
+    torch.Tensor.new_zeros,
+    torch.Tensor.new_ones,
+    torch.Tensor.new_full,
+)
+# Factories whose fresh storage starts as positive zeros, and the ``full``
+# family with the positional slot of its fill value (``fill_value=`` otherwise).
+_ZERO_FILLED_FACTORIES: tuple[object, ...] = (
+    torch.zeros,
+    torch.zeros_like,
+    torch.Tensor.new_zeros,
+)
+_FILL_VALUE_FACTORIES: dict[object, int] = {
+    torch.full: 1,
+    torch.full_like: 1,
+    torch.Tensor.new_full: 2,
+}
+
+
+def _factory_fills_positive_zero(
+    factory: object,
+    args: typing.Sequence[object],
+    kwargs: typing.Mapping[str, object],
+) -> bool:
+    """Whether the wrapper factory call fills its allocation with ``+0``.
+
+    Only a literal Python zero counts: ``-0.0`` is a different value for the
+    sign-of-zero reasoning this feeds, and a traced scalar is unknown.
+    """
+    if factory in _ZERO_FILLED_FACTORIES:
         return True
-    if isinstance(source, GetItemSource):
-        return (
-            isinstance(source.index, int)
-            and not source.index_is_slice
-            and _is_supported_tensor_descriptor_layout_guard_source(
-                source.base, root_values
-            )
-            and isinstance(
-                _replay_tensor_input_source(source.base, root_values), (list, tuple)
-            )
-        )
-    return False
+    position = _FILL_VALUE_FACTORIES.get(factory)
+    if position is None:
+        return False
+    fill = kwargs.get("fill_value", args[position] if len(args) > position else None)
+    if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+        return False
+    return fill == 0 and math.copysign(1.0, float(fill)) > 0
 
 
 def _replay_tensor_input_source(
@@ -257,6 +329,7 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
+    from .cute.materialized_fission import MaterializedFissionPlan
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -328,6 +401,12 @@ class CompileEnvironment:
         # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
+        if settings.cute_rng_stream not in ("auto", "word0", "philox4"):
+            raise ValueError("cute_rng_stream must be auto, word0 or philox4")
+        if settings.cute_rng_stream != "word0" and settings.backend != "cute":
+            raise ValueError(
+                f"cute_rng_stream={settings.cute_rng_stream} requires the CuTe backend"
+            )
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
@@ -358,6 +437,11 @@ class CompileEnvironment:
         # view of a user input cannot acquire it merely because it has no direct
         # replayable input source.
         self._symbolically_exact_layout_storages: set[torch.UntypedStorage] = set()
+        # Storage of every fresh wrapper allocation, whatever its layout proof:
+        # its base is allocator-aligned, so a static storage offset decides the
+        # base alignment of any view of it.
+        self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
+        self._zero_filled_allocation_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -365,6 +449,17 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        self.cute_fission_plan: MaterializedFissionPlan | None = None
+        self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
+        # Internal stage compilers may inherit a proved TensorMap-aligned view
+        # of an owning kernel input. Only the stage builder populates this set;
+        # ordinary input tensors still require their runtime cache-key proof.
+        self.cute_proven_tma_inputs: set[torch.Tensor] = set()
+        # Set by ``generate_ast`` while it regenerates a kernel whose
+        # register-tile lane nesting the split-time lowering rejected
+        # (``cute/register_tile_admission.py``); the persistent reduction
+        # strategy then keeps its rolled lane nesting.
+        self.cute_register_tile_disabled: bool = False
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -411,6 +506,10 @@ class CompileEnvironment:
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        self.tensor_descriptor_alignment_guards: dict[
+            Source, TensorDescriptorAlignmentGuard
+        ] = {}
+        self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         # Immutable classifier outputs captured from the arguments that created
         # this BoundKernel.  Codegen may run later and obtain those arguments
@@ -596,13 +695,34 @@ class CompileEnvironment:
         *,
         memory_op_index: int | None = None,
         atomic_op_index: int | None = None,
+        has_derived_block_extent: bool = False,
     ) -> None:
-        """Specialize dynamic kernels on TD-relevant stride layout predicates."""
-        if self.settings.static_shapes:
-            return
+        """Specialize kernels on replayable tensor-descriptor predicates."""
         source = self.tensor_input_source(fake_tensor)
-        if source is None or not self._is_tensor_descriptor_layout_guard_source(source):
+        has_direct_source = source is not None and _is_supported_tensor_input_source(
+            source
+        )
+        # The 16-byte base-address requirement belongs to CUDA TMA. Other
+        # tensor-descriptor backends retain their existing legality checks and
+        # must not acquire a CUDA-specific runtime specialization.
+        alignment_source = (
+            self.tensor_descriptor_alignment_source(fake_tensor)
+            if self.backend_name == "triton" and self.device.type == "cuda"
+            else None
+        )
+        if alignment_source is not None:
+            alignment_guard = self.tensor_descriptor_alignment_guards.setdefault(
+                alignment_source, TensorDescriptorAlignmentGuard()
+            )
+            if memory_op_index is not None:
+                alignment_guard.memory_op_indices.add(memory_op_index)
+            if atomic_op_index is not None:
+                alignment_guard.atomic_op_indices.add(atomic_op_index)
+            alignment_guard.requires_zero_storage_offset |= not has_direct_source
+
+        if not has_direct_source:
             return
+        assert source is not None
         guard = self.tensor_descriptor_layout_guards.setdefault(
             source,
             TensorDescriptorLayoutGuard(
@@ -614,24 +734,104 @@ class CompileEnvironment:
             guard.memory_op_indices.add(memory_op_index)
         if atomic_op_index is not None:
             guard.atomic_op_indices.add(atomic_op_index)
+        guard.has_derived_block_extent |= has_derived_block_extent
 
     def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
-        if self.settings.static_shapes:
-            return True
         source = self.tensor_input_source(fake_tensor)
         return (
             source is not None
-            and self._is_tensor_descriptor_layout_guard_source(source)
+            and _is_supported_tensor_input_source(source)
             and source in self.tensor_descriptor_layout_guards
         )
 
-    def _is_tensor_descriptor_layout_guard_source(self, source: Source) -> bool:
-        from .host_function import HostFunction
-
-        return _is_supported_tensor_descriptor_layout_guard_source(
-            source,
-            HostFunction.current().params.arguments,
+    def tensor_descriptor_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
+        """Whether a tensor descriptor can prove its runtime base is 16B aligned."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source in self.bound_tensor_descriptor_alignments:
+            return self.bound_tensor_descriptor_alignments[source]
+        runtime_value = self.runtime_value_for_tensor(fake_tensor)
+        if _concrete_tensor_base_is_aligned(runtime_value):
+            return True
+        if isinstance(runtime_value, torch.Tensor):
+            return False
+        if (
+            fake_tensor.untyped_storage()
+            not in self._symbolically_exact_layout_storages
+        ):
+            return False
+        storage_offset = fake_tensor.storage_offset()
+        return (
+            isinstance(storage_offset, int)
+            and (storage_offset * fake_tensor.element_size()) % 16 == 0
         )
+
+    def tensor_alignment_owner(
+        self, fake_tensor: torch.Tensor
+    ) -> tuple[Source, int] | None:
+        """The input whose runtime base ``fake_tensor`` starts a fixed number of bytes past.
+
+        A direct input is its own owner at offset zero.  A statically exact
+        view of the storage of exactly one zero-offset input starts
+        ``storage_offset * element_size`` bytes past that input's base, so
+        its base residue follows from the owner's bound residue and the
+        static offset.  Layout legality remains a separate proof.
+        """
+        source = self.tensor_input_source(fake_tensor)
+        if source is not None and _is_supported_tensor_input_source(source):
+            return source, 0
+        storage_offset = fake_tensor.storage_offset()
+        if (
+            not isinstance(storage_offset, int)
+            or not (
+                self.settings.static_shapes
+                or self.tensor_layout_is_symbolically_exact(fake_tensor)
+            )
+            or not all(isinstance(value, int) for value in fake_tensor.size())
+            or not all(isinstance(value, int) for value in fake_tensor.stride())
+        ):
+            return None
+
+        def is_zero_offset(tensor: torch.Tensor) -> bool:
+            offset = tensor.storage_offset()
+            return isinstance(offset, int) and offset == 0
+
+        owners = tuple(
+            (tensor, candidate)
+            for tensor, candidate in self.input_sources.items()
+            if tensor.untyped_storage() == fake_tensor.untyped_storage()
+            and is_zero_offset(tensor)
+            and _is_supported_tensor_input_source(candidate)
+            and id(tensor) not in self._ambiguous_tensor_input_source_ids
+        )
+        if len(owners) != 1:
+            return None
+        return owners[0][1], storage_offset * fake_tensor.element_size()
+
+    def tensor_descriptor_alignment_source(
+        self, fake_tensor: torch.Tensor
+    ) -> Source | None:
+        """Find the input whose base-alignment predicate applies to ``fake_tensor``.
+
+        A zero-offset, statically exact view has the same data pointer as its
+        unique input storage owner.  Layout legality remains a separate proof;
+        this only lets the descriptor reuse that owner's runtime alignment guard.
+        """
+        owner = self.tensor_alignment_owner(fake_tensor)
+        if owner is None or owner[1] != 0:
+            return None
+        return owner[0]
+
+    def snapshot_tensor_descriptor_alignments(
+        self, root_values: typing.Mapping[str, object]
+    ) -> None:
+        """Capture descriptor base-alignment facts for this bound kernel."""
+        self.bound_tensor_descriptor_alignments = {
+            source: _concrete_tensor_satisfies_alignment_guard(
+                value, guard.requires_zero_storage_offset
+            )
+            for source, guard in self.tensor_descriptor_alignment_guards.items()
+            if (value := _replay_tensor_input_source(source, root_values)) is not None
+        }
 
     def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
         """Return a replayable source for a direct or container tensor input."""
@@ -701,6 +901,28 @@ class CompileEnvironment:
             for dim in range(input_tensor.ndim)
         )
 
+    def tensor_storage_is_compiler_allocated(self, fake_tensor: torch.Tensor) -> bool:
+        """Whether ``fake_tensor`` views storage a wrapper factory freshly allocated.
+
+        Such storage starts at an allocator-aligned base, so the base alignment
+        of a view follows from its static storage offset.  Lacking an input
+        source is not enough: input views and dtype-punning aliases lack one
+        too while inheriting an arbitrary runtime base.
+        """
+        return fake_tensor.untyped_storage() in self._fresh_allocation_storages
+
+    def tensor_storage_is_zero_filled_allocation(
+        self, fake_tensor: torch.Tensor
+    ) -> bool:
+        """Whether ``fake_tensor`` views fresh wrapper storage filled with ``+0``.
+
+        ``torch.zeros`` and friends, or a ``full`` with a literal positive
+        zero, recorded by ``register_tensor_factory_layout``.  The zeros are
+        the storage's initial contents only; what the host and the kernel do
+        to it afterwards is the caller's proof.
+        """
+        return fake_tensor.untyped_storage() in self._zero_filled_allocation_storages
+
     def register_tensor_factory_layout(
         self,
         factory: object,
@@ -708,15 +930,19 @@ class CompileEnvironment:
         kwargs: typing.Mapping[str, object],
         result: object,
     ) -> None:
-        """Record exact layout provenance for supported wrapper allocations.
+        """Record allocation and layout provenance for wrapper factory calls.
 
+        Every factory in ``_FRESH_ALLOCATION_FACTORIES`` that neither writes
+        ``out=`` nor aliases an argument produces fresh storage, recorded for
+        base-alignment proofs; for ``Tensor.new_*`` the receiver is passed as
+        the first argument.  Exact layout provenance is narrower:
         ``torch.empty`` creates a fresh layout determined entirely by its host
-        arguments.  ``torch.empty_like`` defaults to preserving its input's
+        arguments, and ``torch.empty_like`` defaults to preserving its input's
         layout, so it is exact only when that input already has this proof.
         Other factories conservatively remain runtime-strided until their
         layout contracts are added here.
         """
-        if factory not in (torch.empty, torch.empty_like):
+        if factory not in _FRESH_ALLOCATION_FACTORIES:
             return
         if not isinstance(result, torch.Tensor) or result.layout != torch.strided:
             return
@@ -733,14 +959,18 @@ class CompileEnvironment:
         }
         if result_storage in argument_storages:
             return
+        self._fresh_allocation_storages.add(result_storage)
+        if _factory_fills_positive_zero(factory, args, kwargs):
+            self._zero_filled_allocation_storages.add(result_storage)
         is_exact = False
         if factory is torch.empty:
             is_exact = True
         elif factory is torch.empty_like:
             like_input = args[0] if args else kwargs.get("input")
-            is_exact = isinstance(
-                like_input, torch.Tensor
-            ) and self.tensor_layout_is_symbolically_exact(like_input)
+            is_exact = self.settings.static_shapes or (
+                isinstance(like_input, torch.Tensor)
+                and self.tensor_layout_is_symbolically_exact(like_input)
+            )
         if is_exact:
             self._symbolically_exact_layout_storages.add(result_storage)
 
@@ -1092,16 +1322,26 @@ class CompileEnvironment:
                 block_size_source=source,
             )
         )
-        if isinstance(source, FixedBlockSizeSource) and isinstance(
-            source.value, torch.SymInt
-        ):
-            source_expr = _symint_expr(source.value)
-            if isinstance(source_expr, sympy.Symbol):
-                self.shape_env._constrain_unify(source.value, info.var)
-                # Match the block var's hint to the size it is now unified with,
-                # so both agree once the shared range is narrowed.
+        if isinstance(source, FixedBlockSizeSource):
+            if isinstance(source.value, torch.SymInt):
+                source_expr = _symint_expr(source.value)
+                if isinstance(source_expr, sympy.Symbol):
+                    self.shape_env._constrain_unify(source.value, info.var)
+                    # Match the block var's hint to the size it is now unified
+                    # with, so both agree once the shared range is narrowed.
+                    shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
+                        self.size_hint(source.value)
+                    )
+            else:
+                # A fixed integer extent is exact, but keep its block symbol
+                # distinct so backend codegen can still track the tile axis.
+                # A singleton range gives fake-tensor propagation the same
+                # equality fact without replacing the symbol with the integer.
                 shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
-                    self.size_hint(source.value)
+                    source.value
+                )
+                self.shape_env.constrain_symbol_range(
+                    info.symbol(), source.value, source.value
                 )
 
         from .host_function import HostFunction
@@ -1585,6 +1825,40 @@ class CompileEnvironment:
             return (int(a) % b) == 0
         return False
 
+    def specialized_multiple(self, value: object, divisor: int) -> bool:
+        """Whether ``value`` (an int, SymInt or sympy expression) is a
+        multiple of ``divisor`` for every input this bound kernel may see.
+
+        A static value proves it directly.  A dynamic value is proven through
+        the ``input_tensor_metadata`` specialization fact: the bound kernel is
+        then keyed on the exact input sizes and strides, so the traced hint
+        is the runtime value.  Unbacked symbols have no such hint.
+        """
+        if divisor <= 1:
+            return True
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value % divisor == 0
+        expr: sympy.Expr
+        if isinstance(value, torch.SymInt):
+            expr = typing.cast("sympy.Expr", value._sympy_())
+        elif isinstance(value, sympy.Expr):
+            expr = value
+        else:
+            return False
+        if isinstance(expr, sympy.Integer):
+            return int(expr) % divisor == 0
+        if "input_tensor_metadata" not in self.compiler_fact_specialization_facts:
+            return False
+        if _has_unbacked(expr):
+            return False
+        try:
+            hint = int(shape_env_size_hint(self.shape_env, expr))
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        return hint % divisor == 0
+
     @property
     def backend(self) -> Backend:
         return self._backend
@@ -1613,6 +1887,16 @@ class CompileEnvironment:
         self.fake_mode.__enter__()
         tls.env = self
         return self
+
+    @contextlib.contextmanager
+    def suspend(self) -> typing.Iterator[None]:
+        """Temporarily leave this environment while compiling an owned stage."""
+        assert tls.env is self
+        self.__exit__(None, None, None)
+        try:
+            yield
+        finally:
+            self.__enter__()
 
     def __exit__(
         self,

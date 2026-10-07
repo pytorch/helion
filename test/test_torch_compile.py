@@ -4,7 +4,9 @@ import contextlib
 import functools
 import math
 import operator
+import os
 import re
+import tempfile
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -24,6 +26,7 @@ from torch.utils._ordered_set import OrderedSet
 
 import helion
 from helion._compat import requires_torch_version
+from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import supports_torch_compile_fusion
 from helion._testing import DEVICE
@@ -702,6 +705,47 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
         )
+
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_fusion_survives_a_codegen_retry(self):
+        """The CuTe register-tile fallback throws a first codegen pass away
+        and generates the kernel again through the same memory transforms.
+        The prologue transform's record of emitted fused-input placeholders
+        belongs to the pass; a stale record would make the retried kernel
+        skip the placeholder and read an undefined variable."""
+        from helion._compiler import generate_ast as generate_ast_module
+        from helion._compiler.cute.register_tile_admission import (
+            RegisterTileUnsupported,
+        )
+
+        generate = generate_ast_module._generate_ast
+        fused_passes: list[object] = []
+
+        def generate_failing_once(*args, **kwargs):
+            module = generate(*args, **kwargs)
+            if kwargs.get("load_transform") is not None:
+                fused_passes.append(module)
+                if len(fused_passes) == 1:
+                    raise RegisterTileUnsupported("the test rejects the first pass")
+            return module
+
+        def f(x: torch.Tensor, y: torch.Tensor, *, _kernels=(k_add,)) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            result = _kernels[0](x, y)
+            return torch.relu(result) + 1.0
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        with patch.object(generate_ast_module, "_generate_ast", generate_failing_once):
+            self._run_compile_test(
+                f,
+                (x, y),
+                kernels=[k_add],
+                allow_torch_compile_fusion=True,
+                expected_num_kernels=1,
+            )
+        self.assertGreaterEqual(len(fused_passes), 2)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -4693,6 +4737,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         """Test: prologue/epilogue with different indexing strategies."""
         if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
             self.skipTest("Tensor descriptor support is required")
+        if indexing == "block_ptr" and not supports_block_ptr():
+            self.skipTest("Block pointer support is required")
 
         @helion.kernel(
             config=helion.Config(block_sizes=[64, 128], indexing=indexing),
@@ -5581,11 +5627,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 "torch.compile fusion requires ExternalTritonTemplateKernel support"
             )
 
+        # This test needs a fused cache miss after its own unfused warmup.
+        # An ambient cache may already contain the same valid fused key.
+        helion_cache_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, HELION_CACHE_DIR=helion_cache_dir))
+        self.enterContext(fresh_cache())
+
         @helion.kernel(
             torch_compile_fusion=True,
             autotune_with_torch_compile_fusion=True,
             autotune_max_generations=1,
             autotune_effort="quick",
+            # The search only has to reach the fused benchmark path; cap its
+            # wall clock so a shared-GPU runner cannot stretch it past the
+            # per-test timeout.
+            autotune_budget_seconds=30,
         )
         def k_add_no_configs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)

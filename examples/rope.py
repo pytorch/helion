@@ -23,74 +23,37 @@ import helion.language as hl
 # %%
 @helion.kernel
 def rope_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary embeddings to query and key tensors."""
-    batch, q_heads, seq_len, head_dim = q.size()
-    _, k_heads, _, _ = k.size()
+    batch, _, seq_len, head_dim = q.size()
     half_dim = head_dim // 2
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
-
+    cos = cos.expand(batch, seq_len, head_dim).unsqueeze(1)
+    sin = sin.expand(batch, seq_len, head_dim).unsqueeze(1)
+    # Round each product to the input dtype before adding, as in PyTorch.
     for tile_b, tile_t in hl.tile([batch, seq_len]):
-        cos_pair = (
-            cos[tile_b, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 3, 2)
-        )
-        sin_pair = (
-            sin[tile_b, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 3, 2)
-        )
-        cos_first, cos_second = hl.split(cos_pair)
-        sin_first, sin_second = hl.split(sin_pair)
-
-        q_pair = (
-            q[tile_b, :, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, q_heads, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 2, 4, 3)
-        )
-        q_first, q_second = hl.split(q_pair)
-        q_first_out = (
-            q_first * cos_first[:, None, :, :] - q_second * sin_first[:, None, :, :]
-        )
-        q_second_out = (
-            q_second * cos_second[:, None, :, :] + q_first * sin_second[:, None, :, :]
-        )
-        q_out[tile_b, :, tile_t, :] = (
-            hl.join(q_first_out, q_second_out)
-            .permute(0, 1, 2, 4, 3)
-            .reshape([tile_b, q_heads, tile_t, head_dim])  # pyrefly: ignore [no-matching-overload]
-            .to(q_out.dtype)
-        )
-
-        k_pair = (
-            k[tile_b, :, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, k_heads, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 2, 4, 3)
-        )
-        k_first, k_second = hl.split(k_pair)
-        k_first_out = (
-            k_first * cos_first[:, None, :, :] - k_second * sin_first[:, None, :, :]
-        )
-        k_second_out = (
-            k_second * cos_second[:, None, :, :] + k_first * sin_second[:, None, :, :]
-        )
-        k_out[tile_b, :, tile_t, :] = (
-            hl.join(k_first_out, k_second_out)
-            .permute(0, 1, 2, 4, 3)
-            .reshape([tile_b, k_heads, tile_t, head_dim])  # pyrefly: ignore [no-matching-overload]
-            .to(k_out.dtype)
-        )
-
+        cos_first = cos[tile_b, :, tile_t, :half_dim].float()
+        cos_second = cos[tile_b, :, tile_t, half_dim:].float()
+        sin_first = sin[tile_b, :, tile_t, :half_dim].float()
+        sin_second = sin[tile_b, :, tile_t, half_dim:].float()
+        q_first = q[tile_b, :, tile_t, :half_dim].float()
+        q_second = q[tile_b, :, tile_t, half_dim:].float()
+        q_out[tile_b, :, tile_t, :half_dim] = (
+            (q_first * cos_first).to(q.dtype) - (q_second * sin_first).to(q.dtype)
+        ).to(q.dtype)
+        q_out[tile_b, :, tile_t, half_dim:] = (
+            (q_second * cos_second).to(q.dtype) + (q_first * sin_second).to(q.dtype)
+        ).to(q.dtype)
+        k_first = k[tile_b, :, tile_t, :half_dim].float()
+        k_second = k[tile_b, :, tile_t, half_dim:].float()
+        k_out[tile_b, :, tile_t, :half_dim] = (
+            (k_first * cos_first).to(k.dtype) - (k_second * sin_first).to(k.dtype)
+        ).to(k.dtype)
+        k_out[tile_b, :, tile_t, half_dim:] = (
+            (k_second * cos_second).to(k.dtype) + (k_first * sin_second).to(k.dtype)
+        ).to(k.dtype)
     return q_out, k_out
 
 
@@ -102,72 +65,38 @@ def rope_bwd(
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute gradients for the RoPE inputs q and k."""
-    batch, q_heads, seq_len, head_dim = grad_q_out.size()
-    _, k_heads, _, _ = grad_k_out.size()
+    batch, _, seq_len, head_dim = grad_q_out.size()
     half_dim = head_dim // 2
     grad_q = torch.empty_like(grad_q_out)
     grad_k = torch.empty_like(grad_k_out)
-
+    cos = cos.expand(batch, seq_len, head_dim).unsqueeze(1)
+    sin = sin.expand(batch, seq_len, head_dim).unsqueeze(1)
+    # Round each product to the input dtype before adding, as in PyTorch.
     for tile_b, tile_t in hl.tile([batch, seq_len]):
-        cos_pair = (
-            cos[tile_b, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 3, 2)
-        )
-        sin_pair = (
-            sin[tile_b, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 3, 2)
-        )
-        cos_first, cos_second = hl.split(cos_pair)
-        sin_first, sin_second = hl.split(sin_pair)
-
-        q_grad_pair = (
-            grad_q_out[tile_b, :, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, q_heads, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 2, 4, 3)
-        )
-        q_grad_first_out, q_grad_second_out = hl.split(q_grad_pair)
-        q_grad_first = (
-            q_grad_first_out * cos_first[:, None, :, :]
-            + q_grad_second_out * sin_second[:, None, :, :]
-        )
-        q_grad_second = (
-            q_grad_second_out * cos_second[:, None, :, :]
-            - q_grad_first_out * sin_first[:, None, :, :]
-        )
-        grad_q[tile_b, :, tile_t, :] = (
-            hl.join(q_grad_first, q_grad_second)
-            .permute(0, 1, 2, 4, 3)
-            .reshape([tile_b, q_heads, tile_t, head_dim])  # pyrefly: ignore [no-matching-overload]
-            .to(grad_q.dtype)
-        )
-
-        k_grad_pair = (
-            grad_k_out[tile_b, :, tile_t, :]
-            .to(torch.float32)
-            .reshape([tile_b, k_heads, tile_t, 2, half_dim])  # pyrefly: ignore [no-matching-overload]
-            .permute(0, 1, 2, 4, 3)
-        )
-        k_grad_first_out, k_grad_second_out = hl.split(k_grad_pair)
-        k_grad_first = (
-            k_grad_first_out * cos_first[:, None, :, :]
-            + k_grad_second_out * sin_second[:, None, :, :]
-        )
-        k_grad_second = (
-            k_grad_second_out * cos_second[:, None, :, :]
-            - k_grad_first_out * sin_first[:, None, :, :]
-        )
-        grad_k[tile_b, :, tile_t, :] = (
-            hl.join(k_grad_first, k_grad_second)
-            .permute(0, 1, 2, 4, 3)
-            .reshape([tile_b, k_heads, tile_t, head_dim])  # pyrefly: ignore [no-matching-overload]
-            .to(grad_k.dtype)
-        )
-
+        cos_first = cos[tile_b, :, tile_t, :half_dim].float()
+        cos_second = cos[tile_b, :, tile_t, half_dim:].float()
+        sin_first = sin[tile_b, :, tile_t, :half_dim].float()
+        sin_second = sin[tile_b, :, tile_t, half_dim:].float()
+        q_first = grad_q_out[tile_b, :, tile_t, :half_dim].float()
+        q_second = grad_q_out[tile_b, :, tile_t, half_dim:].float()
+        grad_q[tile_b, :, tile_t, :half_dim] = (
+            (q_first * cos_first).to(grad_q_out.dtype)
+            + (q_second * sin_second).to(grad_q_out.dtype)
+        ).to(grad_q.dtype)
+        grad_q[tile_b, :, tile_t, half_dim:] = (
+            (q_second * cos_second).to(grad_q_out.dtype)
+            - (q_first * sin_first).to(grad_q_out.dtype)
+        ).to(grad_q.dtype)
+        k_first = grad_k_out[tile_b, :, tile_t, :half_dim].float()
+        k_second = grad_k_out[tile_b, :, tile_t, half_dim:].float()
+        grad_k[tile_b, :, tile_t, :half_dim] = (
+            (k_first * cos_first).to(grad_k_out.dtype)
+            + (k_second * sin_second).to(grad_k_out.dtype)
+        ).to(grad_k.dtype)
+        grad_k[tile_b, :, tile_t, half_dim:] = (
+            (k_second * cos_second).to(grad_k_out.dtype)
+            - (k_first * sin_first).to(grad_k_out.dtype)
+        ).to(grad_k.dtype)
     return grad_q, grad_k
 
 
@@ -210,13 +139,35 @@ def rope(
 
 def rope_tritonbench(
     tb_op: object,
-    hidden_size: int,
-    seq_length: int,
+    *args: Any,  # noqa: ANN401
 ) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
-    """Wrapper for the TritonBench RoPE operator."""
-    # pyrefly: ignore [missing-attribute]
-    prepared_input = tb_op.prepare_input(hidden_size, seq_length)
-    q, k, cos, sin = prepared_input[:4]
+    """Wrapper for the TritonBench RoPE operator.
+
+    TritonBench changed the rope operator's input convention upstream
+    (meta-pytorch/tritonbench@3f34a4e): newer checkouts yield
+    ``(q, k, cos, sin, pos_ids)`` tensors directly from ``get_input_iter``,
+    while older ones yield ``(hidden_size, seq_length)`` and expect each
+    variant to call ``tb_op.prepare_input(...)`` itself. Support both so this
+    keeps working regardless of which TritonBench revision is checked out.
+    """
+    if len(args) == 2:
+        # Old TritonBench: args are (hidden_size, seq_length). `prepare_input`
+        # (patched onto Operator in benchmarks/run.py for old checkouts) also
+        # populates self.q/k/dq/dk for get_bwd_fn.
+        q, k, cos, sin, pos_ids = tb_op.prepare_input(*args)  # pyrefly: ignore [missing-attribute]
+    elif len(args) == 5:
+        # New TritonBench: args are the (q, k, cos, sin, pos_ids) tensors.
+        q, k, cos, sin, pos_ids = args
+        # TritonBench's own bwd variants populate self.q/k/dq/dk via
+        # _save_for_backward inside their @register_benchmark methods;
+        # replicate that here so Operator.get_bwd_fn works for this variant.
+        tb_op._save_for_backward(q, k)  # pyrefly: ignore [missing-attribute]
+    else:
+        raise ValueError(
+            f"rope_tritonbench got {len(args)} positional args, expected 2 "
+            "(old TritonBench: hidden_size, seq_length) or 5 (new TritonBench: "
+            "q, k, cos, sin, pos_ids)"
+        )
     return lambda: rope(q, k, cos, sin)
 
 

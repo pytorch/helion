@@ -412,6 +412,10 @@ class InvalidConfig(BaseError):
     message = "{}"
 
 
+class UnsupportedSplitConfiguration(BaseError):
+    message = "{op} in Helion device loops requires {requirement}."
+
+
 class InductorLoweringError(BaseError):
     message = "{}"
 
@@ -453,6 +457,13 @@ class BaseWarning(_FixedMessage):
 
     def report(self) -> str:
         return f"WARNING[{type(self).__name__}]: {self!s}"
+
+
+class BlockPtrIndexingUnavailable(BaseWarning):
+    message = (
+        "indexing='block_ptr' was requested, but this Triton build has no block "
+        "pointers (removed in Triton 3.9); using pointer indexing instead."
+    )
 
 
 class TensorOperationInWrapper(BaseWarning):

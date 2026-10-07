@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from contextlib import nullcontext
 import dataclasses
-import functools
 import hashlib
 import logging
 from typing import TYPE_CHECKING
@@ -663,8 +662,6 @@ class HelionTemplateBuffer(TemplateBuffer):
         config = Config(**config.config)  # pyrefly: ignore[bad-argument-type]
         self._bound_kernel.env.config_spec.normalize(config)
         extra_params = [p for p, _ in self._extra_params]
-        # Prologue deduplication tracking scoped to this codegen pass.
-        prologue_first_indexing: dict[str, str] = {}
 
         with self._bound_kernel.env:
             host_function = self._bound_kernel.host_function
@@ -675,10 +672,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 store_transform=self._codegen_epilogue_fusion
                 if fm.epilogue_idx_by_param
                 else None,
-                load_transform=functools.partial(
-                    self._codegen_prologue_fusion,
-                    prologue_first_indexing=prologue_first_indexing,
-                )
+                load_transform=self._codegen_prologue_fusion
                 if fm.prologue_fused_params
                 else None,
                 extra_params=extra_params,
@@ -827,8 +821,6 @@ class HelionTemplateBuffer(TemplateBuffer):
         eviction_policy: ast.AST | None,
         cache_modifier: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
-        *,
-        prologue_first_indexing: dict[str, str],
     ) -> ast.expr:
         """Emit prologue variables + single ``<LOAD_INPUT_{param_name}>`` placeholder.
 
@@ -837,8 +829,10 @@ class HelionTemplateBuffer(TemplateBuffer):
         ``<LOAD_INPUT_{param_name}>`` placeholder (expanded at finalize time
         by the hook closure), then returns a reference to the result variable.
 
-        ``prologue_first_indexing`` tracks which params have already been
-        emitted in this codegen pass (for multi-output deduplication).
+        ``state.codegen.prologue_first_indexing`` tracks which params this
+        codegen pass has already emitted (for multi-output deduplication).
+        It belongs to the pass: a kernel ``generate_ast`` regenerates after a
+        rejected first pass emits every placeholder again.
         """
         assert self._fusion_metadata is not None
         param_name = state.device_function.tensor_arg(tensor).name
@@ -862,6 +856,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         # encounter; subsequent references just reuse the result variable.
         # Prologue variables emitted once; reuse is safe because all loads
         # of the same fused input use the same subscript (same tile indices).
+        prologue_first_indexing = state.codegen.prologue_first_indexing
         if param_name not in prologue_first_indexing:
             xindex_name = prologue_vars["xindex"]
             xmask_name = prologue_vars["xmask"]

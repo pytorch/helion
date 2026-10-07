@@ -23,6 +23,7 @@ import torch
 import helion
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import cute_flash_row_mma
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import dense_score_plan
@@ -45,9 +46,13 @@ if TYPE_CHECKING:
 # test_flash_length_classes_preserve_only_structural_legality_boundaries pins
 # the interior lengths to their class.
 _ALIGNED_LENGTHS = (4, 4096)
+# Exactly two KV tiles is its own class: the 64-row tile's one-pass softmax
+# (``cute_flash_ws_one_pass``) exists only there, so its surface differs from
+# the other paired lengths by that one fragment (see
+# test_flash_length_classes_preserve_only_structural_legality_boundaries).
 _LENGTH_CLASSES = (
     pytest.param((3, 97), id="odd"),
-    pytest.param((2, 386), id="paired"),
+    pytest.param((34, 386), id="paired"),
     pytest.param(_ALIGNED_LENGTHS, id="div4"),
 )
 _DENSE_DEG1_PACKETS = frozenset(("deg1_16x8", "deg1_8x2_corr10"))
@@ -245,6 +250,7 @@ def _effective_pipeline_families(
     is_causal: bool,
     requires_ws_overlap: bool = False,
 ) -> frozenset[str]:
+    """Families whose explicit request survives resolution on the test grids."""
     candidates = (
         ("ws_overlap",)
         if requires_ws_overlap
@@ -262,6 +268,34 @@ def _effective_pipeline_families(
         ).pipeline_family
         == family
     )
+
+
+def _searched_pipeline_families(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    requires_ws_overlap: bool = False,
+) -> frozenset[str]:
+    """Families an unattended search measures on the test grids.
+
+    The row programs stay legal for explicit configs on any grid but join
+    unattended surfaces only inside their small-grid search bound, which the
+    64-head test grids exceed at every length.
+    """
+    families = _effective_pipeline_families(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        requires_ws_overlap=requires_ws_overlap,
+    )
+    if not cute_flash_row_mma.row_mma_search_grid(
+        num_bh=_shape_options(dtype, is_causal)["num_bh"], num_kv=num_kv
+    ):
+        families -= {cute_flash_row_mma.ROW_MMA_FAMILY}
+    return families
 
 
 def _assert_structural_coverage(
@@ -303,7 +337,7 @@ def _assert_structural_coverage(
         generation.canonicalize_flat(generation.flatten(config))[1] == config
         for config in configs
     )
-    expected_families = _effective_pipeline_families(
+    expected_families = _searched_pipeline_families(
         head_dim,
         num_kv,
         dtype=dtype,
@@ -1428,8 +1462,9 @@ def test_flash_length_classes_preserve_only_structural_legality_boundaries() -> 
     }
     paired_only = {
         num_kv: _active_choice_sets(64, num_kv, dtype=torch.float16, is_causal=False)
-        for num_kv in (2, 34, 98, 386)
+        for num_kv in (34, 98, 386)
     }
+    two_tiles = _active_choice_sets(64, 2, dtype=torch.float16, is_causal=False)
     odd = {
         num_kv: _active_choice_sets(64, num_kv, dtype=torch.float16, is_causal=False)
         for num_kv in (3, 33, 49, 97)
@@ -1438,6 +1473,21 @@ def test_flash_length_classes_preserve_only_structural_legality_boundaries() -> 
     _assert_all_equal(divisible_by_four)
     _assert_all_equal(paired_only)
     _assert_all_equal(odd)
+    # Exactly two KV tiles differs from the other paired lengths only by the
+    # one-pass softmax of the 64-row tile, which needs the whole sequence in
+    # its two score buffers.
+    paired_surface = next(iter(paired_only.values()))
+    assert two_tiles[cute_flash.FLASH_WS_ONE_PASS_KEY] == frozenset((False, True))
+    assert paired_surface[cute_flash.FLASH_WS_ONE_PASS_KEY] == frozenset((False,))
+    assert {
+        key: value
+        for key, value in two_tiles.items()
+        if key != cute_flash.FLASH_WS_ONE_PASS_KEY
+    } == {
+        key: value
+        for key, value in paired_surface.items()
+        if key != cute_flash.FLASH_WS_ONE_PASS_KEY
+    }
     divisible_families = next(iter(divisible_by_four.values()))[
         cute_flash.FLASH_PIPELINE_FAMILY_KEY
     ]
@@ -1446,16 +1496,16 @@ def test_flash_length_classes_preserve_only_structural_legality_boundaries() -> 
     ]
     odd_families = next(iter(odd.values()))[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     singleton_families = singleton[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
-    assert singleton_families == _effective_pipeline_families(
+    assert singleton_families == _searched_pipeline_families(
         64, 1, dtype=torch.float16, is_causal=False
     )
-    assert odd_families == _effective_pipeline_families(
+    assert odd_families == _searched_pipeline_families(
         64, 33, dtype=torch.float16, is_causal=False
     )
-    assert paired_families == _effective_pipeline_families(
+    assert paired_families == _searched_pipeline_families(
         64, 34, dtype=torch.float16, is_causal=False
     )
-    assert divisible_families == _effective_pipeline_families(
+    assert divisible_families == _searched_pipeline_families(
         64, 48, dtype=torch.float16, is_causal=False
     )
     assert singleton_families == odd_families == frozenset(("ws_overlap",))
@@ -1501,9 +1551,11 @@ def test_singleton_kv_stage_is_canonicalized_before_search(
             {(64, False): 2, (64, True): 2, (128, False): 2, (128, True): 2},
             id="singleton",
         ),
+        # The two-warpgroup ws_overlap body also chooses its O epilogue
+        # (staged coalesced store vs direct per-thread store).
         pytest.param(
             3,
-            {(64, False): 18, (64, True): 12, (128, False): 6, (128, True): 4},
+            {(64, False): 30, (64, True): 18, (128, False): 10, (128, True): 6},
             id="odd",
         ),
     ),
@@ -1925,9 +1977,14 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     assert _active_choices(
         enum_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     ) == frozenset(("ws_overlap",))
-    # 53: the ws surface pins every dimension it cannot vary to one value,
-    # including the KV tile width.
-    assert len(active_values) <= 53
+    # 60: the ws surface pins every dimension it cannot vary to one value,
+    # including the KV tile width, the query-tile height, the one-pass
+    # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
+    # the (fa4-only) per-chunk P release and the two row-program knobs
+    # (``cute_flash_row_warps``, ``cute_flash_row_tile_m`` of the ``row_mma``
+    # family); the two-warpgroup body measures both of its O epilogues
+    # (``cute_flash_epi_stg``).
+    assert len(active_values) <= 60
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -2597,8 +2654,16 @@ def test_family_pinned_generation_rejects_structurally_ineligible_family(
     family_fragment = cast(
         "EnumFragment", spec._flat_fields()[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     )
-    expected_active = eligible - ({"fa4_deep_1cta"} if is_causal else set())
+    expected_active = _searched_pipeline_families(
+        64,
+        num_kv,
+        dtype=torch.float16,
+        is_causal=is_causal,
+        requires_ws_overlap=requires_ws_overlap,
+    ) - ({"fa4_deep_1cta"} if is_causal else set())
     assert _active_choices(family_fragment) == expected_active
+    # Pinning a structurally ineligible family is rejected; the row
+    # programs are eligible on every grid when pinned explicitly.
     ineligible = set(cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES) - eligible
     for family in ineligible:
         with pytest.raises(InvalidConfig, match=r"is not (?:legal|effective)"):

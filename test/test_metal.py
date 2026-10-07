@@ -9,6 +9,7 @@ import torch
 
 import helion
 from helion import exc
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 if sys.platform == "darwin":
@@ -878,7 +879,10 @@ class TestMetalMatmul(unittest.TestCase):
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
         msl = _get_msl(matmul_fp32_out, (x, y))
-        self.assertIn("decltype(_mpp_setup_As), decltype(_mpp_setup_Bs), float", msl)
+        self.assertIn(
+            "decltype(_mpp_setup_lhs_slice), decltype(_mpp_setup_rhs_slice), float",
+            msl,
+        )
         self.assertIn("tensor<device half", msl)
 
     def test_matmul_bfloat16(self) -> None:
@@ -1170,8 +1174,8 @@ class TestMetalMatmul(unittest.TestCase):
 
         from helion._compiler.metal.msl_ast_walker import _extract_mpp_setup_params
 
-        # The original 14-arg marker shape is stale once tile-offset names are
-        # added.
+        # The original 14-arg marker shape is stale once tile-offset names,
+        # transpose flags, and leading extents are added.
         expr = pyast.parse(
             '_metal_mpp_setup("x", "y", 64, 64, 64, 32, 32, 32, 4, '
             '"float", "float", "", "", "acc")'
@@ -1180,7 +1184,7 @@ class TestMetalMatmul(unittest.TestCase):
         self.assertIsInstance(stmt, pyast.Expr)
         call = stmt.value
         self.assertIsInstance(call, pyast.Call)
-        with self.assertRaisesRegex(AssertionError, "expects 16 positional args"):
+        with self.assertRaisesRegex(AssertionError, "expects 20 positional args"):
             _extract_mpp_setup_params(call)
 
     def test_mpp_emission_scopes_symbols_by_setup_name(self) -> None:
@@ -1191,11 +1195,13 @@ class TestMetalMatmul(unittest.TestCase):
 
         code = (
             '_mpp_setup = _metal_mpp_setup("x", "y", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "", "", "acc", offset_0, offset_1)\n'
+            '"float", "float", "", "", "acc", 0, 0, 64, 64, '
+            "offset_0, offset_1)\n"
             "_metal_mpp_k_step(_mpp_setup, 0)\n"
             '_metal_mpp_coop_store(_mpp_setup, "out0", "float")\n'
             '_mpp_setup_1 = _metal_mpp_setup("a", "b", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "", "", "acc_1", offset_0, offset_1)\n'
+            '"float", "float", "", "", "acc_1", 0, 0, 64, 64, '
+            "offset_0, offset_1)\n"
             "_metal_mpp_k_step(_mpp_setup_1, 0)\n"
             '_metal_mpp_coop_store(_mpp_setup_1, "out1", "float")\n'
         )
@@ -1204,13 +1210,13 @@ class TestMetalMatmul(unittest.TestCase):
         _emit_stmts(pyast.parse(code).body, parts, indent=4, state=state)
         msl = "\n".join(parts)
 
-        self.assertIn("_mpp_setup_A", msl)
-        self.assertIn("_mpp_setup_1_A", msl)
+        self.assertIn("_mpp_setup_lhs", msl)
+        self.assertIn("_mpp_setup_1_lhs", msl)
         self.assertIn("_mpp_setup_C", msl)
         self.assertIn("_mpp_setup_1_C", msl)
         self.assertIn("_mpp_setup_op.run", msl)
         self.assertIn("_mpp_setup_1_op.run", msl)
-        self.assertNotIn("auto _A =", msl)
+        self.assertNotIn("auto _lhs =", msl)
         self.assertNotIn("auto _C =", msl)
         self.assertNotIn("matmul2d<_desc", msl)
 
@@ -2534,6 +2540,140 @@ class TestMetalAutotune(unittest.TestCase):
 
         return matmul
 
+    def test_oversized_mpp_tiles_are_rejected(self) -> None:
+        """``matmul2d`` is silently wrong for large M/N tile extents.
+
+        Not a rounding problem: on a 512x512 fp32 product with values of order
+        1e2, the errors reach 1.8e29 and NaN, with no compile or runtime
+        diagnostic.  Reproduces in plain MSL with no Helion involved.
+
+        The predicate is the *extent*, not the aspect ratio: 128x16 (8:1) is
+        correct everywhere while 256x256 (1:1) is wrong at N=1 and N=2.  Nor
+        is it accumulator capacity -- 256x16 at 128 elements per thread fails
+        while 128x128 at 512 does not.  Past 256 there is often no N that
+        works at all: 512x512 is wrong at every N up to the 32 simdgroups a
+        threadgroup can hold.
+        """
+        x = torch.randn(512, 512, device=DEVICE)
+        y = torch.randn(512, 512, device=DEVICE)
+
+        for bm, bn, warps in [(256, 32, 1), (32, 256, 1), (256, 256, 1), (512, 512, 8)]:
+            with (
+                self.subTest(tile=(bm, bn), num_warps=warps),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "MPP matmul tile extent"
+                ),
+            ):
+                self._mpp_matmul(bm, bn, 64, warps)(x, y)
+
+        # Both extents <= 128 is the region that measured clean: 576 of 576
+        # across TILE_K in {16..512} and N in {1..32}.  K is not part of the
+        # predicate, so a large BK must still be accepted.
+        for bm, bn, bk, warps in [
+            (128, 128, 64, 1),
+            (64, 128, 256, 8),
+            (128, 64, 32, 2),
+        ]:
+            with self.subTest(tile=(bm, bn, bk), num_warps=warps):
+                out = self._mpp_matmul(bm, bn, bk, warps)(x, y)
+                torch.testing.assert_close(out, x @ y, rtol=1e-3, atol=1e-3)
+
+    def test_strided_matmul_operands_are_correct(self) -> None:
+        """Transposed and row-padded operands lower through MPP correctly.
+
+        Every MPP operand is built as a ``tensor_inline`` from a pointer and
+        two extents, so the backend derives the handle geometry from the
+        operand's strides instead of assuming packed row-major: a transposed
+        operand swaps the handle extents and sets the descriptor transpose
+        flag, while a row-padded operand widens the handle's leading extent.
+        The launcher binds an offset view at its first logical element.
+        ``mm(x, w.t())`` used to return exactly ``x @ w``, off by 24 on a
+        32x32 fp32 product, with no error.
+        """
+        x = torch.randn(32, 32, device=DEVICE)
+        w = torch.randn(32, 32, device=DEVICE)
+        big = torch.randn(64, 64, device=DEVICE)
+
+        cases = [
+            ("transposed rhs", x, w.t()),
+            ("transposed lhs", x.t(), w),
+            ("transposed lhs and rhs", x.t(), w.t()),
+            ("padded lhs", big[:32, :32], w),
+            ("padded rhs", x, big[:32, :32]),
+            # Packed strides with a nonzero storage offset.
+            ("offset view lhs", big[4:36, 8:40], w),
+        ]
+        for tag, a, b in cases:
+            with self.subTest(operand=tag):
+                torch.testing.assert_close(
+                    self._mpp_matmul(16, 16, 16, 4)(a, b),
+                    a @ b,
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+
+        # Contiguous stays exact, including a contiguous copy of the transpose.
+        for a, b in [(x, w), (x, w.t().contiguous())]:
+            torch.testing.assert_close(
+                self._mpp_matmul(16, 16, 16, 4)(a, b), a @ b, rtol=1e-4, atol=1e-4
+            )
+
+    def test_strided_matmul_nonsquare_transpose_is_correct(self) -> None:
+        """Transposed operands with non-square shapes and tail tiles."""
+        x = torch.randn(32, 64, device=DEVICE)
+        w = torch.randn(16, 64, device=DEVICE)
+        with self.subTest(operand="non-square transposed rhs"):
+            torch.testing.assert_close(
+                self._mpp_matmul(16, 16, 16, 4)(x, w.t()),
+                x @ w.t(),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+        xt = torch.randn(56, 40, device=DEVICE)
+        wt = torch.randn(24, 40, device=DEVICE)
+        with self.subTest(operand="transposed rhs with M/N/K tails"):
+            torch.testing.assert_close(
+                self._mpp_matmul(16, 16, 16, 4)(xt, wt.t()),
+                xt @ wt.t(),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+        wa = torch.randn(40, 56, device=DEVICE)
+        wb = torch.randn(24, 40, device=DEVICE)
+        with self.subTest(operand="transposed lhs and rhs with M/N/K tails"):
+            torch.testing.assert_close(
+                self._mpp_matmul(16, 16, 16, 4)(wa.t(), wb.t()),
+                wa.t() @ wb.t(),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+    def test_row_padded_mpp_tail_is_rejected(self) -> None:
+        """MPP masks against storage extents, not row-padded logical extents."""
+        big = torch.randn(64, 64, device=DEVICE)
+        cases = [
+            (
+                "lhs K tail",
+                big[:32, :40],
+                torch.randn(40, 32, device=DEVICE),
+                "K must be an exact multiple",
+            ),
+            (
+                "rhs N tail",
+                torch.randn(32, 40, device=DEVICE),
+                big[:40, :24],
+                "N must be an exact multiple",
+            ),
+        ]
+        for tag, a, b, message in cases:
+            with (
+                self.subTest(operand=tag),
+                self.assertRaisesRegex(exc.BackendUnsupported, message),
+            ):
+                self._mpp_matmul(16, 16, 16, 4)(a, b)
+
     def test_mpp_grid_axes_come_from_matmul_indices(self) -> None:
         """An unrelated same-sized grid axis must not stand in for M."""
 
@@ -2593,20 +2733,59 @@ class TestMetalAutotune(unittest.TestCase):
         self.assertIn("_ty = (offset_", msl)
         self.assertIn("_tx = (offset_", msl)
 
-    def test_accuracy_check_guards_the_mpp_matmul(self) -> None:
-        """Matmul autotuning depends on candidate validation being on.
+    def test_mpp_tile_guard_uses_resolved_axis(self) -> None:
+        """The cap validates M/N even with an unrelated leading grid axis."""
 
-        ``mpp::tensor_ops::matmul2d`` returns silently wrong results for
-        strongly asymmetric tiles at low ``execution_simdgroups<N>`` -- 8:1
-        needs N>=2 and 1:8 needs N>=4 on an M4 Pro -- with no compile or
-        runtime error.  That predates this backend and reproduces in plain MSL
-        with no Helion involved.  Those tile shapes are exactly what a tuner
-        reaches for on non-square problems, so the search relies on
-        ``autotune_accuracy_check`` rejecting them.
+        @helion.kernel(backend="metal", autotune_effort="none")
+        def three_axis(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.size()
+            _k, n = b.size()
+            out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+            for _tg, tm, tn in hl.tile([1, m, n]):
+                acc = hl.zeros([tm, tn], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+                out[tm, tn] = acc
+            return out
+
+        a = torch.randn(512, 512, device=DEVICE)
+        b = torch.randn(512, 512, device=DEVICE)
+        cfg = [1, 128, 256, 32]
+        with self.assertRaisesRegex(exc.BackendUnsupported, "tile extent 256"):
+            helion.kernel(
+                three_axis.fn,
+                backend="metal",
+                configs=[helion.Config(block_sizes=cfg, num_warps=2)],
+            )(a, b)
+
+        ok = helion.kernel(
+            three_axis.fn,
+            backend="metal",
+            configs=[helion.Config(block_sizes=[1, 128, 128, 32], num_warps=2)],
+        )
+        torch.testing.assert_close(ok(a, b), a @ b, rtol=1e-3, atol=1e-3)
+
+    def test_accuracy_check_is_a_second_line_not_the_only_one(self) -> None:
+        """Autotuning also validates candidates, but cannot be relied on alone.
+
+        It does reject these configs in practice, because they are wrong by
+        many orders of magnitude rather than subtly.  It is not sufficient on
+        its own for three reasons, which is why the codegen guard above
+        exists: it does nothing for a hand-written config, it can be disabled
+        with ``HELION_AUTOTUNE_ACCURACY_CHECK=0``, and it compares against the
+        default config run on the caller's own arguments -- so autotuning on
+        degenerate input (a zero-filled warm-up batch, say) makes the
+        comparison vacuous and it accepts them.
         """
         from helion.runtime.settings import Settings
 
         self.assertTrue(Settings().autotune_accuracy_check)
+
+        # The guard holds even where the accuracy check would not: zeros make
+        # every candidate agree with the baseline.
+        zeros = torch.zeros(512, 512, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "MPP matmul tile extent"):
+            self._mpp_matmul(32, 256, 64, 1)(zeros, zeros)
 
     def test_effort_none_uses_the_default_config(self) -> None:
         @helion.kernel(backend="metal", autotune_effort="none")
@@ -2756,6 +2935,19 @@ class TestMetalAutotune(unittest.TestCase):
         self.assertNotEqual(base, kernel._signature_key((x.to(torch.int32), 1024)))
         kernel.required_threads_per_threadgroup = (128, 1, 1)
         self.assertNotEqual(base, kernel._signature_key((x, 1024)))
+
+
+class TestMetalCodegen(unittest.TestCase):
+    """Renders that need no Metal device."""
+
+    @skipIfRefEager("renders a pinned config; ref mode runs the kernel eagerly")
+    def test_rolled_reduction_has_no_cuda_barrier(self) -> None:
+        # The lane-loop wrapper Metal's rolled reductions share with the CuTe
+        # backend runs CuTe's cross-thread barrier pass only for CuTe: a
+        # ``cute.arch.sync_threads()`` is an undeclared identifier in MSL.
+        code = row_sum.bind((torch.randn(64, 4096),)).to_code()
+        self.assertIn("tg_sum", code)
+        self.assertNotIn("sync_threads", code)
 
 
 if __name__ == "__main__":

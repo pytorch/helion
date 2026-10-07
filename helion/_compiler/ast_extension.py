@@ -138,6 +138,20 @@ def get_wrapper_cls(cls: type[ast.AST]) -> type[ast.AST]:
     return rv
 
 
+def clone_ast(value: object) -> object:
+    """Deep-copy Python/ExtendedAST nodes without dropping Helion source metadata."""
+    if isinstance(value, list):
+        return [clone_ast(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(clone_ast(item) for item in value)
+    if isinstance(value, ast.AST):
+        fields = {field: clone_ast(getattr(value, field)) for field in value._fields}
+        if isinstance(value, ExtendedAST):
+            return value.copy(**fields)
+        return ast.copy_location(type(value)(**fields), value)
+    return value
+
+
 def create(cls: type[_T], **fields: object) -> _T:
     # pyrefly: ignore [unexpected-keyword]
     result = get_wrapper_cls(cls)(**fields, _location=current_location())

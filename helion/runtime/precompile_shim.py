@@ -10,9 +10,11 @@ from .._compat import get_triton_iterable_path
 from .._compat import get_triton_version
 from ..autotuner.logger import classify_triton_exception
 from ..autotuner.logger import format_triton_compile_failure
+from .triton.launcher import compile_only_launch_args
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Sequence
 
     from triton.compiler.compiler import CompiledKernel
     from triton.runtime.jit import JITFunction
@@ -33,6 +35,20 @@ def _get_helion_compilation_success(kernel: CompiledKernel) -> bool:
     return getattr(kernel, "_helion_compilation_success", True)
 
 
+def _device_probe_values(values: Sequence[object]) -> list[object]:
+    """Launch arguments as seen by device discovery.
+
+    A launch whose every tensor travels as a Triton ``TensorDescriptor`` (all
+    ``tensor_descriptor`` indexing, no bare tensor argument) carries its device
+    only inside the descriptors' ``base`` tensors.
+    """
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    return [
+        value.base if isinstance(value, TensorDescriptor) else value for value in values
+    ]
+
+
 def make_precompiler(
     fn: JITFunction[object],
     config: Config,
@@ -47,7 +63,9 @@ def make_precompiler(
         Triton compile and never return.
         """
         # pyrefly: ignore [bad-argument-type]
-        device = _find_device([*args, *kwargs.values()])
+        args, kwargs = compile_only_launch_args(*args, **kwargs)
+        # pyrefly: ignore [bad-argument-type]
+        device = _find_device(_device_probe_values([*args, *kwargs.values()]))
         kwargs["debug"] = (
             kwargs.get("debug", fn.debug) or os.environ.get("TRITON_DEBUG", "0") == "1"
         )

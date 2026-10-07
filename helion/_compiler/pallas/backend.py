@@ -16,7 +16,9 @@ from typing import cast
 import torch
 
 from ... import exc
+from ..._compat import num_compute_units
 from ..ast_extension import expr_from_string
+from ..backend import AutotuneGridPolicy
 from ..backend import Backend
 from ..backend import LauncherInfo
 from ..backend import _loop_contains_matmul
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
@@ -40,6 +43,119 @@ if TYPE_CHECKING:
     from .compact_worklist import CompactWorklistPlan
 
     InductorOpOverrides = OpsHandler[Any]
+
+
+# Static unroll duplicates each loop body in the generated JAX program. Beyond
+# this many copies for one loop, generated autotune candidates can spend minutes
+# in XLA compilation before the tuner gets any timing signal. Explicitly
+# configured kernels are unaffected by this autotune-only limit.
+_MAX_AUTOTUNED_STATIC_UNROLL_STEPS = 16
+_MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT = 64
+# Mosaic's low-level scheduler cost grows quickly with pipeline depth. Grouped
+# stages count once because Mosaic schedules one grouped DMA iteration.
+_MAX_AUTOTUNED_LOW_LEVEL_PIPELINE_STEPS = 64
+
+
+def _autotune_block_size_by_id(
+    config_spec: ConfigSpec, config: Config
+) -> dict[int, int] | None:
+    """Return concrete block sizes when the candidate has a usable shape."""
+    block_sizes = config.config.get("block_sizes")
+    if not isinstance(block_sizes, list) or len(block_sizes) != len(
+        config_spec.block_sizes
+    ):
+        return None
+    if not all(type(value) is int and value > 0 for value in block_sizes):
+        return None
+    return {
+        spec.block_id: value
+        for spec, value in zip(config_spec.block_sizes, block_sizes, strict=True)
+    }
+
+
+def _config_not_viable_due_to_grid_size(
+    config_spec: ConfigSpec,
+    block_size_by_id: dict[int, int],
+    max_programs_per_root_grid: int | None,
+) -> bool:
+    """Return whether any root grid launches too many programs."""
+    grid_fact = config_spec.kernel_grid_fact
+    if max_programs_per_root_grid is None or grid_fact is None:
+        return False
+
+    for root in grid_fact.roots:
+        programs = math.prod(
+            math.ceil(
+                config_spec.block_sizes.block_id_lookup(block_id).size_hint
+                / block_size_by_id[block_id]
+            )
+            for block_id in root.block_ids
+        )
+        if programs > max_programs_per_root_grid:
+            return True
+    return False
+
+
+def _config_not_viable_due_to_static_unroll(
+    config_spec: ConfigSpec,
+    config: Config,
+    block_size_by_id: dict[int, int],
+) -> bool:
+    """Return whether static unrolling would expand a device loop too far."""
+    if config.get("pallas_loop_type") != "unroll":
+        return False
+
+    return _inner_loop_steps_exceed(
+        config_spec,
+        block_size_by_id,
+        group_size=1,
+        limit=_MAX_AUTOTUNED_STATIC_UNROLL_STEPS,
+    )
+
+
+def _inner_loop_steps_exceed(
+    config_spec: ConfigSpec,
+    block_size_by_id: dict[int, int],
+    *,
+    group_size: int,
+    limit: int,
+) -> bool:
+    """Whether any candidate device loop exceeds ``limit`` grouped steps."""
+    grid_block_ids = set(config_spec.grid_block_ids)
+    for spec in config_spec.block_sizes:
+        if spec.block_id in grid_block_ids:
+            continue
+        extent = spec.size_hint
+        if spec.bounded_by_block_id is not None:
+            extent = block_size_by_id.get(spec.bounded_by_block_id, extent)
+        block_size = block_size_by_id[spec.block_id]
+        if math.ceil(extent / (block_size * group_size)) > limit:
+            return True
+    return False
+
+
+def _config_not_viable_due_to_low_level_pipeline(
+    config_spec: ConfigSpec,
+    config: Config,
+    block_size_by_id: dict[int, int],
+) -> bool:
+    """Return whether low-level scheduling would process too many stages."""
+    if config.get("pallas_loop_type") != "emit_pipeline" or not config.get(
+        "pallas_use_low_level_scheduler", False
+    ):
+        return False
+
+    group_size = config.get("pallas_emit_pipeline_group_size", 1)
+    return (
+        type(group_size) is int
+        and group_size > 0
+        and _inner_loop_steps_exceed(
+            config_spec,
+            block_size_by_id,
+            group_size=group_size,
+            limit=_MAX_AUTOTUNED_LOW_LEVEL_PIPELINE_STEPS,
+        )
+    )
 
 
 def _embedded_helper_source(body: str) -> str:
@@ -190,6 +306,39 @@ class PallasBackend(Backend):
     def max_reduction_threads(self) -> int | None:
         return None
 
+    def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
+        """Constrain complete grids while allowing imbalanced grid axes."""
+        return AutotuneGridPolicy(
+            raise_independent_axis_block_size_minimums=False,
+            max_programs_per_root_grid=(
+                num_compute_units() * _MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT
+            ),
+        )
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        """Reject candidates with excessive grids or compile-time work."""
+        block_size_by_id = _autotune_block_size_by_id(config_spec, config)
+        if block_size_by_id is None:
+            return True
+
+        if _config_not_viable_due_to_grid_size(
+            config_spec,
+            block_size_by_id,
+            self.autotune_grid_policy(config_spec).max_programs_per_root_grid,
+        ):
+            return False
+        if _config_not_viable_due_to_static_unroll(
+            config_spec, config, block_size_by_id
+        ):
+            return False
+        if _config_not_viable_due_to_low_level_pipeline(  # noqa: SIM103
+            config_spec, config, block_size_by_id
+        ):
+            return False
+        return True
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
@@ -315,6 +464,7 @@ class PallasBackend(Backend):
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
+            "pallas_internal_scratch",
         }
     )
 
@@ -777,6 +927,13 @@ class PallasBackend(Backend):
 
         return do_bench_generic
 
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        # Pallas benchmarks inline because compiled TorchTPU callables cannot be
+        # sent to the subprocess benchmark worker. A single poor tile choice can
+        # take seconds, so avoid the ordinary five-call estimate for those
+        # candidates.
+        return True
+
     def get_interleaved_bench(self) -> Callable[..., list[float]]:
         from ...autotuner.benchmarking import interleaved_bench_generic
 
@@ -819,7 +976,10 @@ class PallasBackend(Backend):
         list[
             tuple[
                 tuple[int | None, ...],
-                tuple[int | tuple[int, int, int] | None, ...],
+                tuple[
+                    int | tuple[int, int, int] | tuple[str, int, int] | None,
+                    ...,
+                ],
             ]
             | None
         ]
@@ -842,9 +1002,16 @@ class PallasBackend(Backend):
         from ..device_function import TensorStrideArg
         from ..host_function import HostFunction
         from ..program_id import FlatProgramIDs
+        from .memory_access import tensor_origin_key
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
+
+        metadata_arg_indices = self._grid_scalar_prefetch_arg_indices(sorted_args)
+        metadata_ref_positions = {
+            tensor_origin_key(cast("TensorArg", sorted_args[arg_index]).fake_value): pos
+            for pos, arg_index in enumerate(metadata_arg_indices)
+        }
 
         # Build block_id → grid_dim from the actual PID ordering (which
         # reflects loop_order).  ``pid_info`` is ordered by grid dimension,
@@ -888,7 +1055,13 @@ class PallasBackend(Backend):
                     stride *= num_blocks
 
         result: list[
-            tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
+            tuple[
+                tuple[int | None, ...],
+                tuple[
+                    int | tuple[int, int, int] | tuple[str, int, int] | None,
+                    ...,
+                ],
+            ]
             | None
         ] = []
 
@@ -908,8 +1081,19 @@ class PallasBackend(Backend):
                 result.append(None)
                 return None
             block_shape: list[int | None] = []
-            grid_dims: list[int | tuple[int, int, int] | None] = []
+            grid_dims: list[
+                int | tuple[int, int, int] | tuple[str, int, int] | None
+            ] = []
+            scalar_indices = device_fn.pallas_grid_scalar_indices.get(id(tensor), {})
             for d in range(tensor.ndim):
+                if (selector := scalar_indices.get(d)) is not None:
+                    grid_dim = block_id_to_grid_dim.get(selector.block_id)
+                    ref_position = metadata_ref_positions.get(selector.metadata_key)
+                    if grid_dim is None or ref_position is None:
+                        return None
+                    block_shape.append(1)
+                    grid_dims.append(("scalar", ref_position, grid_dim))
+                    continue
                 dim_tiling = dim_tilings[d]
                 if not dim_tiling.can_tile or len(dim_tiling.block_ids) == 0:
                     block_shape.append(None)
@@ -938,6 +1122,29 @@ class PallasBackend(Backend):
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
         return result
+
+    @staticmethod
+    def _grid_scalar_prefetch_arg_indices(
+        sorted_args: list[Argument] | None,
+    ) -> list[int]:
+        """Return sorted argument positions used as grid scalar metadata."""
+        if sorted_args is None:
+            return []
+        from ..device_function import DeviceFunction
+        from ..device_function import TensorArg
+        from .memory_access import tensor_origin_key
+
+        keys = {
+            selector.metadata_key
+            for dimensions in DeviceFunction.current().pallas_grid_scalar_indices.values()
+            for selector in dimensions.values()
+        }
+        return [
+            index
+            for index, argument in enumerate(sorted_args)
+            if isinstance(argument, TensorArg)
+            and tensor_origin_key(argument.fake_value) in keys
+        ]
 
     def _compute_pad_info(
         self,
@@ -1257,6 +1464,11 @@ class PallasBackend(Backend):
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+        grid_scalar_prefetch_args = self._grid_scalar_prefetch_arg_indices(sorted_args)
+        if grid_scalar_prefetch_args:
+            launcher_args.append(
+                f"_grid_scalar_prefetch_arg_indices={grid_scalar_prefetch_args!r}"
+            )
 
         pad_info = self._compute_pad_info(sorted_args, config)
         if pad_info:
@@ -1548,9 +1760,11 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
 
-        from .internal_scratch import plan_internal_remote_scratch
+        from .internal_scratch import plan_internal_scratch
 
-        plan_internal_remote_scratch()
+        plan_internal_scratch(
+            include_local_temporaries=bool(config.get("pallas_internal_scratch", False))
+        )
         plan_tiling(graphs, config, tile_strategy)
         build_tensorcore_plans(graphs, config)
 
@@ -1575,6 +1789,10 @@ class PallasBackend(Backend):
         from .tracing_ops import plan_grid_indirect_accesses
 
         plan_grid_indirect_accesses(graphs)
+
+        from .plan_tiling import plan_grid_scalar_indices
+
+        plan_grid_scalar_indices(graphs, config)
 
         from .view_ops import plan_resident_ref_views
 
