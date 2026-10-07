@@ -1374,9 +1374,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
         # Load from tensor descriptor with permuted offsets
-        load_expr = expr_from_string(
-            f"{indexing.tensor_descriptor(state)}.load({indexing.offsets_str_permuted(state)})"
-        )
+        desc = indexing.tensor_descriptor(state)
+        offsets = indexing.offsets_str_permuted(state)
+        if isinstance(eviction_policy, ast.Constant) and eviction_policy.value:
+            # desc.load drops the policy; cache_hints carries it to the PTX TMA.
+            load_expr = expr_from_string(
+                f"helion_cache_hints.descriptor_load({desc}, {offsets}, eviction_policy={{ev}})",
+                ev=eviction_policy,
+            )
+        else:
+            load_expr = expr_from_string(f"{desc}.load({offsets})")
 
         # Apply inverse permutation to the loaded result if needed
         desc_arg = indexing.tensor_descriptor_arg(state)

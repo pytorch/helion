@@ -2203,6 +2203,14 @@ class BlockSizeInfo:
     def from_config(self, config: Config) -> int | torch.SymInt | None:
         value = self.block_size_source.from_config(config, self)
         if isinstance(value, torch.SymInt):
+            from .host_function import HostFunction
+            from .host_function import NoCurrentFunction
+
+            try:
+                HostFunction.current()
+            except NoCurrentFunction:
+                # Runtime cache keys resolve configs without a host function.
+                return value
             env = CompileEnvironment.current()
             if (block_id := env.get_block_id(value)) is not None:
                 canonical_block_id = env.canonical_block_id(block_id)
