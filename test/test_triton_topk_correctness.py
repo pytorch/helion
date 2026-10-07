@@ -106,11 +106,8 @@ def test_float_topk_preserves_values_and_valid_indices(case, largest, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("algorithm", ["auto", "topk", "sort"])
 @skipIfRefEager("uses an explicitly compiled dynamic-shape configuration")
-def test_float_topk_dynamic_tails(largest, algorithm):
-    if _get_backend() != "triton" and algorithm != "auto":
-        pytest.skip("selection algorithms are a native Triton option")
+def test_float_topk_dynamic_tails(largest):
     kernel = helion.kernel(
         _row_topk.fn,
         backend=_get_backend(),
@@ -119,10 +116,7 @@ def test_float_topk_dynamic_tails(largest, algorithm):
     )
     initial = torch.ones((3, 17), device=DEVICE)
     bound = kernel._bind_isolated((initial, 4, largest))
-    config = bound.config_spec.default_config()
-    if _get_backend() == "triton":
-        config.config["triton_topk_algorithm"] = algorithm
-    compiled = bound.compile_config(config)
+    compiled = bound.compile_config(bound.config_spec.default_config())
     for width in (17, 19, 65):
         x = torch.arange(1, width + 1, device=DEVICE).float()[None, :].repeat(3, 1)
         if largest:
@@ -132,24 +126,27 @@ def test_float_topk_dynamic_tails(largest, algorithm):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@skipUnlessBackends(["triton"])
-@pytest.mark.parametrize("algorithm", ["topk", "sort"])
+@skipUnlessBackends(["triton", "tileir"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("largest", [False, True])
-@pytest.mark.parametrize("k", [3, 17])
-@skipIfRefEager("uses explicit selection and multi-row tile configurations")
-def test_float_topk_algorithms_preserve_payloads(algorithm, dtype, largest, k):
-    x = _input("mixed_nan", dtype)
-    x = torch.cat((x, torch.zeros((3, 1), dtype=dtype, device=DEVICE)), dim=1)
-    x[1, :16] = _input("all_nan", dtype)[0]
+@pytest.mark.parametrize(("width", "k", "rows_per_program"), [(17, 3, 4), (769, 17, 1)])
+@skipIfRefEager("uses shapes that exercise both selection primitives")
+def test_float_topk_selection_paths_preserve_payloads(
+    dtype, largest, width, k, rows_per_program, monkeypatch
+):
+    repetitions = (width + 15) // 16
+    x = _input("mixed_nan", dtype).repeat(1, repetitions)[:, :width].contiguous()
+    x[1, :] = _input("all_nan", dtype)[0].repeat(repetitions)[:width]
     x[2, :] = 0.0
     x[2, 1::2] = -0.0
-    bound = _row_topk._bind_isolated((x, k, largest))
+    bound = _native_topk(_get_backend())._bind_isolated((x, k, largest))
+    # On Triton, emulate the measured target so width 769 and rounded k=32
+    # exercise sort; the small multi-row tile still selects top-k. TileIR uses
+    # its gather-free lowering for both shapes.
+    monkeypatch.setattr(bound.env.config_spec, "target_device_capability", (10, 3))
+    monkeypatch.setattr("helion._compiler.triton.aten_lowering.is_hip", lambda: False)
     config = bound.config_spec.default_config()
-    config.config.update(block_sizes=[4], triton_topk_algorithm=algorithm)
-    code = bound.to_code(config)
-    assert ("tl.sort(" in code) == (algorithm == "sort")
-    assert ("tl.topk(" in code) == (algorithm == "topk")
+    config.config.update(block_sizes=[rows_per_program], num_warps=4)
     values, indices = bound.compile_config(config)(x, k, largest)
     _assert_topk(x, k, largest, values, indices)
 
@@ -359,8 +356,6 @@ def test_float_topk_auto_other_targets(cpu_codegen, capability, hip, monkeypatch
     code = bound.to_code(config)
     assert "tl.sort(" not in code
     assert "tl.topk(" in code
-    config.config["triton_topk_algorithm"] = "sort"
-    assert "tl.sort(" in bound.to_code(config)
 
 
 @pytest.mark.parametrize("largest", [False, True])
@@ -382,15 +377,18 @@ def test_float_topk_sort_multiple_leading_dimensions(
     kernel = helion.kernel(
         batched_topk, backend="triton", static_shapes=True, autotune_effort="none"
     )
-    x = torch.arange(3 * 5 * 17).reshape(3, 5, 17).float()
-    bound = kernel._bind_isolated((x, 3, largest))
+    x = torch.arange(2 * 3 * 769).reshape(2, 3, 769).float()
+    bound = kernel._bind_isolated((x, 17, largest))
+    monkeypatch.setattr(bound.env.config_spec, "target_device_capability", (10, 3))
     config = bound.config_spec.default_config()
-    config.config.update(block_sizes=[2, 4], triton_topk_algorithm="sort")
+    config.config.update(block_sizes=[1, 1], num_warps=4)
     code = bound.to_code(config)
+    selected_ops = set()
     values, indices = _interpret_triton_selection(
-        code, (x, 3, largest), tmp_path / "batched_topk.py", monkeypatch
+        code, (x, 17, largest), tmp_path / "batched_topk.py", monkeypatch, selected_ops
     )
-    _assert_topk(x, 3, largest, values, indices)
+    _assert_topk(x, 17, largest, values, indices)
+    assert selected_ops == {"sort"}
 
 
 @pytest.mark.parametrize("fail", [False, True])

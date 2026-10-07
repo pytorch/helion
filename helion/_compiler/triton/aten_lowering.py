@@ -827,13 +827,17 @@ def _codegen_float_topk(
         else f"tl.topk({keys} ^ 0xffffffffffffffff, {k}) ^ 0xffffffffffffffff"
     )
     topk_statement = f"{selected} = {topk_expr}"
-    algorithm = fn.config.triton_topk_algorithm
     capability = env.config_spec.target_device_capability
-    if algorithm == "auto" and (is_hip() or capability is None or capability[0] != 10):
-        # The untuned crossover was measured on datacenter Blackwell. Other
-        # targets can still select either primitive explicitly or by tuning.
-        algorithm = "topk"
-    if env.backend_name == "triton" and algorithm != "topk":
+    # GB300 measurements favor sort for one row per four-warp program in this
+    # crossover range. Multi-row tiles, smaller k, and other targets use topk.
+    if (
+        env.backend_name == "triton"
+        and not is_hip()
+        and capability is not None
+        and capability[0] == 10
+        and fn.config.num_warps == 4
+        and 32 <= k <= 512
+    ):
         sorted_keys = fn.new_var("topk_sorted")
         selected_shape = ", ".join(
             [*(f"{sorted_keys}.shape[{dim}]" for dim in range(len(shape) - 1)), str(k)]
@@ -842,22 +846,11 @@ def _codegen_float_topk(
             f"{sorted_keys} = tl.sort({keys}, descending={largest!r})",
             f"{selected} = tl.gather({sorted_keys}, tl.broadcast_to(tl.arange(0, {k}){suffix}, [{selected_shape}]), axis={len(shape) - 1})",
         ]
-        if algorithm == "sort":
-            for statement in sort_statements:
-                emit(statement)
-        else:
-            # GB300 measurements favor sort for one row per four-warp program
-            # in this crossover range. Multi-row tiles favor topk instead.
-            # This is only an untuned fallback: search measures both algorithms
-            # along with warp/tile choices. Use physical extents so dynamic
-            # shapes specialize this decision again when padded sizes change.
-            condition = (
-                f"{{tensor}}.shape[-1] == 1024 and {fn.config.num_warps} == 4 "
-                f"and {{tensor}}.numel == 1024 "
-                f"and {k} >= 32 and {k} <= 512"
-            )
-            sort_body = "\n    ".join(sort_statements)
-            emit(f"if {condition}:\n    {sort_body}\nelse:\n    {topk_statement}")
+        # Use physical extents so dynamic shapes specialize this decision again
+        # when their padded width or the number of rows per program changes.
+        condition = "{tensor}.shape[-1] == 1024 and {tensor}.numel == 1024"
+        sort_body = "\n    ".join(sort_statements)
+        emit(f"if {condition}:\n    {sort_body}\nelse:\n    {topk_statement}")
     else:
         # TileIR retains the gather-free top-k path.
         emit(topk_statement)

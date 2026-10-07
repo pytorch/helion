@@ -96,8 +96,6 @@ class TritonBackend(Backend):
         return host_str
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "triton_topk_algorithm":
-            return self.name == "triton"
         if key == "host_tensor_descriptors":
             return self.name == "triton" and _compat.supports_host_tensor_descriptor()
         if key == "cross_loop_pipeline":

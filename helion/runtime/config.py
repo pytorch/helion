@@ -17,7 +17,6 @@ PidTypeLiteral = Literal[
     "persistent_interleaved",
 ]
 CrossLoopPipelineLiteral = Literal["barrier", "static", "dynamic"]
-TritonTopkAlgorithmLiteral = Literal["auto", "topk", "sort"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
@@ -81,7 +80,6 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
-        triton_topk_algorithm: TritonTopkAlgorithmLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral = None,
         host_tensor_descriptors: bool | None = None,
@@ -179,11 +177,6 @@ class Config(Mapping[str, object]):
                 the same compiler-derived dependency schedule with fixed worker
                 ownership or one-shot packet dispatch, respectively.
                 Unsupported kernels reject this field.
-            triton_topk_algorithm: Selection algorithm for floating-point top-k
-                operations on native Triton. ``"auto"`` uses the compiler's
-                shape/config heuristic; ``"topk"`` and ``"sort"`` force the
-                corresponding primitive for every eligible operation. The
-                autotuner searches both primitives.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configurations may use intermediate values.
@@ -260,7 +253,6 @@ class Config(Mapping[str, object]):
             "atomic_indexing": atomic_indexing,
             "pid_type": pid_type,
             "cross_loop_pipeline": cross_loop_pipeline,
-            "triton_topk_algorithm": triton_topk_algorithm,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
             "host_tensor_descriptors": host_tensor_descriptors,
@@ -414,13 +406,6 @@ class Config(Mapping[str, object]):
         return cast(
             "CrossLoopPipelineLiteral",
             self.config.get("cross_loop_pipeline", "barrier"),
-        )
-
-    @property
-    def triton_topk_algorithm(self) -> TritonTopkAlgorithmLiteral:
-        return cast(
-            "TritonTopkAlgorithmLiteral",
-            self.config.get("triton_topk_algorithm", "auto"),
         )
 
     @property

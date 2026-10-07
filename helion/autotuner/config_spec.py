@@ -941,7 +941,6 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_pipeline",
-        "triton_topk_algorithm",
         "cute_flash_gate_warpgroups",
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
@@ -1051,7 +1050,6 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_flattens",
         "static_ranges",
         "cross_loop_pipeline",
-        "triton_topk_algorithm",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1497,8 +1495,6 @@ class ConfigSpec:
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
         self.cross_loop_pipeline: EnumFragment | None = None
-        # Enabled only by floating-point top-k operations on native Triton.
-        self.triton_topk_algorithm: EnumFragment | None = None
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -3371,18 +3367,6 @@ class ConfigSpec:
             )
         self.cross_loop_pipeline = EnumFragment(choices)
 
-    def enable_triton_topk(self) -> None:
-        """Expose selection algorithms only for eligible top-k kernels."""
-        if not self.supports_config_key("triton_topk_algorithm"):
-            raise InvalidConfig(
-                "triton_topk_algorithm is not supported by backend "
-                f"{self.backend_name!r}"
-            )
-        if self.triton_topk_algorithm is None:
-            self.triton_topk_algorithm = EnumFragment(
-                choices=("auto", "topk", "sort"), search_choices=("topk", "sort")
-            )
-
     def enable_cute_async_load_pipeline(self) -> None:
         """Expose the narrow CuTe async state-load search dimensions."""
         if self.backend_name != "cute":
@@ -4644,19 +4628,6 @@ class ConfigSpec:
                 )
 
         if (
-            "triton_topk_algorithm" in config
-            and self.triton_topk_algorithm is None
-            and self.supports_config_key("triton_topk_algorithm")
-        ):
-            if _fix_invalid:
-                config.pop("triton_topk_algorithm")
-            else:
-                raise InvalidConfig(
-                    "triton_topk_algorithm is available only for kernels "
-                    "with floating-point top-k operations"
-                )
-
-        if (
             CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY in config
             and self.cute_chunk_recurrence_dv_partitions is None
             and self.supports_config_key(CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY)
@@ -5371,19 +5342,6 @@ class ConfigSpec:
                         "cross_loop_pipeline must be one of "
                         f"{cross_loop_pipeline_fragment.choices!r}, got "
                         f"{cross_loop_pipeline!r}"
-                    )
-        topk_fragment = self.triton_topk_algorithm
-        if topk_fragment is not None:
-            topk_algorithm = config.setdefault(
-                "triton_topk_algorithm", topk_fragment.default()
-            )
-            if topk_algorithm not in topk_fragment.choices:
-                if _fix_invalid:
-                    config["triton_topk_algorithm"] = topk_fragment.default()
-                else:
-                    raise InvalidConfig(
-                        "triton_topk_algorithm must be one of "
-                        f"{topk_fragment.choices!r}, got {topk_algorithm!r}"
                     )
         recurrence_dv_fragment = self.cute_chunk_recurrence_dv_partitions
         if recurrence_dv_fragment is not None:
@@ -6893,8 +6851,6 @@ class ConfigSpec:
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.cross_loop_pipeline is not None:
             fields["cross_loop_pipeline"] = self.cross_loop_pipeline
-        if self.triton_topk_algorithm is not None:
-            fields["triton_topk_algorithm"] = self.triton_topk_algorithm
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
             fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):
