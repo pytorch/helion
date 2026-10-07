@@ -288,6 +288,6 @@ def test_multiwarp_finalize_without_group_proof_rejects(threads):
         result_var="result",
     )
     with pytest.raises(
-        helion.exc.BackendUnsupported, match="proven CTA reduction group"
+        helion.exc.BackendUnsupported, match="cross-warp grouped finalize"
     ):
         tile_strategy._finalize_lane_reduce_marker(marker, "acc")

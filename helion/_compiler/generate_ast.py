@@ -533,6 +533,65 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         return codegen_computed_fragment_root(self)
 
+    def _prefer_computed_fragment_root(self, root_graph_id: int) -> bool:
+        """Try fragment ownership before other schedules when this root needs it."""
+        env = CompileEnvironment.current()
+        if env.backend_name != "cute":
+            return False
+        from .cute.captured_reduction import captured_reduction_coordinates
+        from .cute.free_iota_reduction import free_iota_reductions
+        from .cute.free_iota_reduction import owned_iota_reduction_axes
+
+        graphs = self.host_function.device_ir.graphs
+        captured = captured_reduction_coordinates(
+            env, graphs, root_graph_id=root_graph_id
+        )
+        owned_iota_axes = owned_iota_reduction_axes(self)
+        free = any(
+            node.graph is graphs[root_graph_id].graph
+            and node.meta["lowering"].block_index not in owned_iota_axes
+            for node in free_iota_reductions(env, graphs)
+        )
+        config = self.device_function.config
+        spec = env.config_spec
+        return (
+            bool(captured)
+            or free
+            or any(
+                enabled and root_graph_id in roots
+                for enabled, roots in (
+                    (
+                        config.get("cute_fragment_producer_cache", False),
+                        spec.cute_fragment_producer_cache_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_warp_scan", False),
+                        spec.cute_fragment_warp_scan_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_register_loads", False),
+                        spec.cute_fragment_register_load_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_warp_results", False),
+                        spec.cute_fragment_warp_result_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_threads", 128) != 128,
+                        spec.cute_fragment_thread_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_scan", "serial") == "cooperative",
+                        spec.cute_fragment_scan_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_reduction", "serial") == "warp",
+                        spec.cute_fragment_reduction_root_ids,
+                    ),
+                )
+            )
+        )
+
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
         if plan is None:
@@ -1625,90 +1684,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             self.statements_stack[-1]
                         )
                     root = root_graph_info.graph
-                    from .cute.captured_reduction import captured_reduction_coordinates
-
-                    captured_fragment = (
-                        CompileEnvironment.current().backend_name == "cute"
-                        and bool(
-                            captured_reduction_coordinates(
-                                CompileEnvironment.current(),
-                                self.host_function.device_ir.graphs,
-                                root_graph_id=root_graph_info.graph_id,
-                            )
-                        )
-                    )
-                    from .cute.free_iota_reduction import free_iota_reductions
-                    from .cute.free_iota_reduction import owned_iota_reduction_axes
-
-                    free_fragment = False
-                    if CompileEnvironment.current().backend_name == "cute":
-                        owned_iota_axes = owned_iota_reduction_axes(self)
-                        free_fragment = any(
-                            node.graph
-                            is self.host_function.device_ir.graphs[
-                                root_graph_info.graph_id
-                            ].graph
-                            and node.meta["lowering"].block_index not in owned_iota_axes
-                            for node in free_iota_reductions(
-                                CompileEnvironment.current(),
-                                self.host_function.device_ir.graphs,
-                            )
-                        )
-                    requested_fragment = (
-                        (
-                            self.device_function.config.get(
-                                "cute_fragment_producer_cache", False
-                            )
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_producer_cache_root_ids
-                        )
-                        or captured_fragment
-                        or free_fragment
-                        or (
-                            self.device_function.config.get(
-                                "cute_fragment_warp_scan", False
-                            )
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_warp_scan_root_ids
-                        )
-                        or (
-                            self.device_function.config.get(
-                                "cute_fragment_register_loads", False
-                            )
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_register_load_root_ids
-                        )
-                        or (
-                            self.device_function.config.get(
-                                "cute_fragment_warp_results", False
-                            )
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_warp_result_root_ids
-                        )
-                        or (
-                            self.device_function.config.get(
-                                "cute_fragment_threads", 128
-                            )
-                            != 128
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_thread_root_ids
-                        )
-                        or (
-                            self.device_function.config.get(
-                                "cute_fragment_scan", "serial"
-                            )
-                            == "cooperative"
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
-                        )
-                        or (
-                            self.device_function.config.get(
-                                "cute_fragment_reduction", "serial"
-                            )
-                            == "warp"
-                            and root_graph_info.graph_id
-                            in CompileEnvironment.current().config_spec.cute_fragment_reduction_root_ids
-                        )
+                    requested_fragment = self._prefer_computed_fragment_root(
+                        root_graph_info.graph_id
                     )
                     if (
                         not (

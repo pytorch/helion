@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from ...autotuner.compiler_coverage import CompilerCoverageGroup
-from ...autotuner.compiler_coverage import CoverageWitness
-from ...exc import InvalidConfig
-from ...runtime.config import Config
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
+from .cute_fragment_common import register_fragment_boolean_coverage
 from .cute_fragment_resources import fragment_resource_carrier
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
@@ -68,29 +66,8 @@ def register_fragment_producer_cache_coverage(
         resource_carrier = fragment_resource_carrier(
             env, device_ir, root_ids=spec.cute_fragment_producer_cache_root_ids
         )
-    generation = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = generation.canonicalize_flat(generation.default_flat())
-        generation.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     spec.cute_fragment_producer_cache_search_enabled = True
-    generation = spec.create_config_generation()
-    requested = Config.from_dict(deepcopy(carrier.config) | {KEY: True})
-    try:
-        generation.strict_config_pair(requested)
-    except InvalidConfig:
-        return
-    spec.register_compiler_coverage_group(
-        CompilerCoverageGroup(
-            mechanism="cute.fragment_producer_cache",
-            version=1,
-            key=KEY,
-            domain=(False, True),
-            legacy=False,
-            witnesses=(CoverageWitness(carrier, True),),
-            deferred=True,
-        )
-    )
+    register_fragment_boolean_coverage(spec, KEY, carrier)
