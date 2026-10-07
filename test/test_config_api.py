@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 import re
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -20,10 +21,12 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.aten_lowering import aten_lowering_dispatch
 from helion._compiler.autotuner_heuristics.cute import (
     _tcgen05_grouped_worklist_seed_family,
 )
 from helion._compiler.backend import PallasBackend
+from helion._compiler.backend import TileIRBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
@@ -179,6 +182,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
             "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
+            "triton_topk_algorithm": st.sampled_from(["auto", "topk", "sort"]),
             "host_tensor_descriptors": st.booleans(),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
@@ -520,6 +524,7 @@ class TestConfigAPI(TestCase):
             "num_stages",
             "pid_type",
             "cross_loop_pipeline",
+            "triton_topk_algorithm",
             "host_tensor_descriptors",
             "indexing",
         }
@@ -586,6 +591,92 @@ class TestConfigAPI(TestCase):
                 spec.normalize(
                     helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
                 )
+
+    def test_triton_topk_algorithm_config(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        self.assertEqual(helion.Config().triton_topk_algorithm, "auto")
+        spec = ConfigSpec(backend=TritonBackend(), device=torch.device("cpu"), num_sm=1)
+        self.assertNotIn("triton_topk_algorithm", spec._flat_fields())
+        with self.assertRaisesRegex(exc.InvalidConfig, "floating-point top-k"):
+            spec.normalize(helion.Config(triton_topk_algorithm="sort"))
+
+        spec.enable_triton_topk()
+        fragment = spec._flat_fields()["triton_topk_algorithm"]
+        self.assertIsInstance(fragment, EnumFragment)
+        assert isinstance(fragment, EnumFragment)
+        self.assertEqual(fragment.search_values(), ["topk", "sort"])
+        self.assertEqual(fragment.pattern_neighbors("auto"), ["topk", "sort"])
+        self.assertEqual(spec.default_config().triton_topk_algorithm, "auto")
+        spec.enable_triton_topk()
+        self.assertIs(spec.triton_topk_algorithm, fragment)
+
+        generation = ConfigGeneration(spec)
+        for algorithm in ("auto", "topk", "sort"):
+            with self.subTest(algorithm=algorithm):
+                config = spec.default_config()
+                config.config["triton_topk_algorithm"] = algorithm
+                spec.normalize(config)
+                restored = generation.unflatten(generation.flatten(config))
+                self.assertEqual(restored.triton_topk_algorithm, algorithm)
+
+        for invalid in ("unknown", 1, [], None):
+            with self.subTest(invalid=invalid):
+                config = helion.Config.from_dict({"triton_topk_algorithm": invalid})
+                with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+                    spec.normalize(config)
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config.triton_topk_algorithm, "auto")
+
+    def test_triton_topk_algorithm_autotune_override(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        settings = helion.Settings(
+            autotune_config_overrides={"triton_topk_algorithm": "sort"}
+        )
+        spec = ConfigSpec(backend=TritonBackend(), device=torch.device("cpu"), num_sm=1)
+        spec.enable_triton_topk()
+        generation = ConfigGeneration(
+            spec, overrides=settings.autotune_config_overrides
+        )
+        for algorithm in ("auto", "topk", "sort"):
+            flat = generation.flatten(
+                helion.Config.from_dict({"triton_topk_algorithm": algorithm})
+            )
+            self.assertEqual(generation.unflatten(flat).triton_topk_algorithm, "sort")
+        configs = generation.random_population(10)
+        self.assertEqual(len(configs), 10)
+        for config in configs:
+            self.assertEqual(config.triton_topk_algorithm, "sort")
+            restored = generation.unflatten(generation.flatten(config))
+            self.assertEqual(restored.triton_topk_algorithm, "sort")
+
+    def test_triton_topk_algorithm_rejects_other_backends(self) -> None:
+        for backend in (PallasBackend(), TileIRBackend()):
+            with self.subTest(backend=backend.name):
+                spec = ConfigSpec(backend=backend, device=torch.device("cpu"), num_sm=1)
+                self.assertFalse(spec.supports_config_key("triton_topk_algorithm"))
+                with self.assertRaisesRegex(exc.InvalidConfig, "not supported"):
+                    spec.enable_triton_topk()
+                with self.assertRaisesRegex(exc.InvalidConfig, "Unsupported config"):
+                    spec.normalize(helion.Config(triton_topk_algorithm="sort"))
+
+    def test_triton_topk_algorithm_admission(self) -> None:
+        for backend in (TritonBackend(), TileIRBackend(), PallasBackend()):
+            for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int32):
+                with self.subTest(backend=backend.name, dtype=dtype):
+                    spec = ConfigSpec(
+                        backend=backend, device=torch.device("cpu"), num_sm=1
+                    )
+                    graph = torch.fx.Graph()
+                    source = graph.placeholder("source")
+                    source.meta["val"] = torch.ones(2, 16, dtype=dtype)
+                    node = graph.call_function(torch.ops.aten.topk.default, (source, 4))
+                    env = SimpleNamespace(backend_name=backend.name, config_spec=spec)
+                    with patch.object(CompileEnvironment, "current", return_value=env):
+                        aten_lowering_dispatch[node.target](node)
+                    expected = backend.name == "triton" and dtype != torch.int32
+                    self.assertEqual(spec.triton_topk_algorithm is not None, expected)
 
     def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:
         with patch("helion._compat.is_hip", return_value=False):

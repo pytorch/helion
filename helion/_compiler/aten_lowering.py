@@ -575,4 +575,19 @@ gather_lowering = register_lowering(
 )
 
 
-topk_lowering = register_lowering(torch.ops.aten.topk.default)
+def _make_topk_lowering(lowering: AtenLowering, node: Node) -> Lowering:
+    env = CompileEnvironment.current()
+    input_node = cast("Node", node.args[0])
+    input_tensor = input_node.meta["val"]
+    if env.backend_name == "triton" and input_tensor.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        env.config_spec.enable_triton_topk()
+    return lowering
+
+
+topk_lowering = register_lowering(
+    torch.ops.aten.topk.default, make_lowering=_make_topk_lowering
+)
