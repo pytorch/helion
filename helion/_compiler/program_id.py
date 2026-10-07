@@ -458,14 +458,10 @@ class PIDInfo(NamedTuple):
         numel = int(self.numel)
         if self.block_size_var == "1":
             return numel
-        block_size = (
-            CompileEnvironment.current()
-            .block_sizes[self.block_id]
-            .from_config(DeviceFunction.current().config)
-        )
-        if not isinstance(block_size, int) or block_size <= 0:
+        block_size = DeviceFunction.current()._constexpr_args.get(self.block_size_var)
+        if block_size is None or not block_size.host_str().isdigit():
             return None
-        return -(-numel // block_size)
+        return -(-numel // int(block_size.host_str()))
 
 
 @dataclasses.dataclass

@@ -22085,7 +22085,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
         host_src = "\n".join(
             ast.unparse(stmt) for stmt in device_function.codegen.host_statements
         )
-        self.assertIn(f"{total_var} = 0 + 1", host_src)
+        self.assertIn(f"{total_var} = 1\n", host_src)
         self.assertIn(f"if {total_var} > 0", host_src)
         self.assertIn("supports runtime execution only", host_src)
 
