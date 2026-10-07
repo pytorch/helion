@@ -3620,7 +3620,7 @@ def emit_cross_loop_schedule(
                 prefix="tile_dependency_root_barrier_wait",
             )
             task_body.extend(peer_waits(root))
-            task_body.extend(
+            prefetches, root_task = task_prefetches(
                 scheduled_root_task_body(
                     root,
                     local_task,
@@ -3628,6 +3628,7 @@ def emit_cross_loop_schedule(
                     (dispatch_ticket,),
                 )
             )
+            task_body.extend(root_task)
             publications = peer_publications(root)
             if publications:
                 task_body.extend(_release_sync(device_function))
@@ -3652,6 +3653,8 @@ def emit_cross_loop_schedule(
                 and not ready_on_admission
             ):
                 task_body = dry_pass_task(task_body) or task_body
+            # A task's own prefetches go ahead of its waits, which they overlap.
+            task_body = [*prefetches, *task_body]
             packet_branches.append(
                 (
                     packet_begin,

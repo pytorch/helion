@@ -22,6 +22,18 @@ def prefetch_rows(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def prefetch_then_wait(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    y = torch.empty_like(x)
+    out = torch.empty_like(w)
+    for tile_a in hl.tile(x.size(0), block_size=1):
+        y[tile_a, :] = x[tile_a, :] + 1
+    for tile_b in hl.tile(w.size(0), block_size=1):
+        hl.prefetch(w, [tile_b.begin])
+        out[tile_b, :] = w[tile_b, :] + torch.sum(y[:, :], dim=0)[None, :]
+    return out
+
+
 @onlyBackends(["triton"])
 class TestPrefetch(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
@@ -39,3 +51,21 @@ class TestPrefetch(RefEagerTestBase, TestCase):
         x = torch.randn((512, 8), device=DEVICE, dtype=torch.float32).t()
         with self.assertRaises(helion.exc.InvalidPrefetchRegion):
             code_and_output(prefetch_rows, (x,))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_task_prefetches_before_its_wait(self) -> None:
+        x = torch.randn((8, 512), device=DEVICE, dtype=torch.float32)
+        w = torch.randn((8, 512), device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            prefetch_then_wait,
+            (x, w),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, w + (x + 1).sum(0)[None, :])
+        prefetch = code.index("helion_cache_hints.prefetch_l2(w + ")
+        self.assertLess(prefetch, code.index("tile_dependency_root_barrier_wait"))

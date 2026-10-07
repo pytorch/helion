@@ -21,10 +21,11 @@ def prefetch(tensor: torch.Tensor, index: list[object]) -> None:
     """Prefetch ``tensor[index]`` into L2 with one bulk prefetch from one thread.
 
     Scalar indices select leading dimensions; the remaining suffix must be one
-    dense byte range of static size. In a megakernel task loop, each program
-    issues it once, before the loop, for the task numbered like the program: an
-    in-loop bulk prefetch would occupy the TMA unit the task's own loads need.
-    Elsewhere it is issued in place. Prefetching never changes values.
+    dense byte range of static size. In a static megakernel task loop, each
+    program issues it once, before the loop, for the task numbered like the
+    program: an in-loop bulk prefetch would occupy the TMA unit the task's own
+    loads need. A dynamically dispatched task issues it before waiting on its
+    producers. Elsewhere it is issued in place. Prefetching never changes values.
 
     Args:
         tensor: The tensor to prefetch from
