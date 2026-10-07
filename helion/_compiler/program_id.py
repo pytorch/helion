@@ -488,12 +488,10 @@ class ProgramIDs(abc.ABC):
         raise NotImplementedError
 
     def total_pids_expr(self, *, is_device: bool) -> str:
-        """Get total PIDs expression for device or host; a literal when static."""
-        counts = [
-            n for pid in self.pid_info if (n := pid.static_num_pids()) is not None
-        ]
-        if len(counts) == len(self.pid_info):
-            return str(math.prod(counts))
+        """Get total PIDs expression for device or host."""
+        counts = [pid.static_num_pids() for pid in self.pid_info]
+        if None not in counts:
+            return str(math.prod(cast("list[int]", counts)))
         return " * ".join(
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
@@ -593,7 +591,7 @@ class ForEachProgramID(ProgramIDs):
     def _get_cdiv_blocks(
         self, state: CodegenState, exclude_last: bool = False
     ) -> list[str]:
-        """Get non-empty cdiv expressions from cases; one literal when static."""
+        """Get non-empty cdiv expressions from cases."""
         cases = self.cases[:-1] if exclude_last else self.cases
         blocks = []
         for pid in cases:
@@ -601,7 +599,7 @@ class ForEachProgramID(ProgramIDs):
             if cdiv:  # Only add non-empty cdiv expressions
                 blocks.append(cdiv)
         if blocks and all(block.isdigit() for block in blocks):
-            return [str(sum(map(int, blocks)))]
+            return [str(sum(int(block) for block in blocks))]
         return blocks
 
     def codegen_test(self, state: CodegenState) -> ast.AST:
@@ -653,7 +651,7 @@ class ForEachProgramID(ProgramIDs):
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
         if all(cdiv.isdigit() for cdiv in cdivs):
-            return str(sum(map(int, cdivs)))
+            return str(sum(int(cdiv) for cdiv in cdivs))
         return " + ".join(cdivs)
 
     def codegen(self, state: CodegenState) -> None:
