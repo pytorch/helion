@@ -3122,6 +3122,10 @@ def emit_cross_loop_schedule(
         body_b = scheduled_root_task_body(
             b, local_b, f"{case_offsets[b]} + {local_b}", (), spin_guard=f"not {is_a}"
         )
+        # A's prefetches run once per worker before the loop (for its first task);
+        # in-loop bulk prefetches would stall the TMA loads, so B's are dropped.
+        prefetches_a, body_a = task_prefetches(body_a)
+        _prefetches_b, body_b = task_prefetches(body_b)
         # Loop-carried phis share a name only after the final alias rename.
         body_a, body_b = (
             _renamed(
@@ -3227,6 +3231,7 @@ def emit_cross_loop_schedule(
         return [
             *hoisted_a,
             *hoisted_b,
+            *entry_prefetches(prefetches_a, worker, f"{worker} < {live_a}"),
             # Opaque captures between the roots' hoists would block their CSE.
             *shared_captures(guarded_extents[a], block_ids),
             *shared_captures(guarded_extents[b], block_ids),
