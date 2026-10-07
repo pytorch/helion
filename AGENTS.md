@@ -32,6 +32,8 @@ This document explains how to work effectively in this repository.
 ## Testing Guidelines
 
 - Framework: PyTest. Place tests in `test/` and name `test_<feature>.py`.
+- Tests in `test/portable/` must run on every backend; declare known gaps in
+  `test/backends/<name>/registry.py` instead of using backend decorators.
 - Use helpers in `helion._testing` (e.g., `check_example`).
 - Runtime: Many tests require CUDA, PyTorch nightly, and Triton dev builds; keep each test fast (<~30s).
 - Local tips: For iteration, use `-k`, or set `HELION_AUTOTUNE_EFFORT=none` to skip autotuning.

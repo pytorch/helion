@@ -114,23 +114,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
-    def test_arange(self):
-        @helion.kernel
-        def arange(length: int, device: torch.device) -> torch.Tensor:
-            out = torch.empty([length], dtype=torch.int32, device=device)
-            for tile in hl.tile(length):
-                out[tile] = tile.index
-            return out
-
-        code, result = code_and_output(
-            arange,
-            (100, DEVICE),
-            block_size=32,
-        )
-        torch.testing.assert_close(
-            result, torch.arange(0, 100, device=DEVICE, dtype=torch.int32)
-        )
-
     @onlyBackends(["triton"])
     @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
     @skipIfRefEager("asserts on generated Triton code")
