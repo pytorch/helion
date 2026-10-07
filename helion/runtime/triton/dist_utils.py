@@ -281,9 +281,9 @@ def _sync_threads(threads: tl.constexpr):  # noqa: ANN202
     )
 
 
-# Not inlined: eight inline copies in a poll loop cost ~0.6us even unexecuted.
+# Inlined: Triton 3.8 rejects non-inlined calls inside warp-specialized loops.
 # No reductions: their full-CTA barriers deadlock on parked WS worker warps.
-@triton.jit(noinline=True)
+@triton.jit
 def _scatter_cover(  # noqa: ANN202
     state,  # noqa: ANN001
     ptrs,  # noqa: ANN001
