@@ -209,6 +209,8 @@ class TypePropagation(ast.NodeVisitor):
         self.scope = scope
         self.device_loop_depth = 0
         self.device_loop_count = 0
+        # Names bound inside device code; they never exist on the host.
+        self.device_names: set[str] = set()
 
     def push_scope(self) -> None:
         self.scope = LocalScope(parent=self.scope)
@@ -458,6 +460,8 @@ class TypePropagation(ast.NodeVisitor):
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )
 
+            if self.device_loop_depth > 0:
+                self.device_names.add(lhs.id)
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:
@@ -1064,7 +1068,15 @@ class TypePropagation(ast.NodeVisitor):
                 raise exc.DeviceLoopElseBlock(fn.__qualname__)
 
             if self.device_loop_depth == 0:
-                self.func.set_local_types(parent_scope.extract_locals())
+                # A one-element list's loop variable leaked from an earlier root
+                # keeps that element's host origin; it is still not a host name.
+                self.func.set_local_types(
+                    {
+                        name: type_info
+                        for name, type_info in parent_scope.extract_locals().items()
+                        if name not in self.device_names
+                    }
+                )
                 node._loop_type = LoopType.GRID
                 node._root_id = self.device_loop_count
                 self.device_loop_count += 1
