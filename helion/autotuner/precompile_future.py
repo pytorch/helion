@@ -95,7 +95,9 @@ class _ExtractedLaunchArgs(Exception):
         super().__init__()
         self.kernel = kernel
         self.grid = grid
-        self.args = args
+        # Exception.args is used when formatting chained tracebacks. Keeping
+        # launch tensors there prints their contents instead of the failure.
+        self.launch_args = args
         self.kwargs = kwargs
 
 
@@ -385,6 +387,12 @@ def _prepare_precompiler_for_fork(
     decorator: str,
     logger: AutotuningLogger,
 ) -> Callable[[], bool] | None:
+    if not kernel.config_spec.backend.supports_precompile():
+        raise exc.InvalidAPIUsage(
+            f"Backend {kernel.settings.backend!r} does not support separate "
+            "precompilation; use the backend's benchmark path instead."
+        )
+
     def extract_launcher(
         triton_kernel: object,
         grid: tuple[int, ...],
@@ -401,7 +409,7 @@ def _prepare_precompiler_for_fork(
             cast("Any", extracted.kernel),
             config,
             cast("BoundKernel", kernel),
-        )(*extracted.args, **extracted.kwargs)
+        )(*extracted.launch_args, **extracted.kwargs)
         if precompiler is already_compiled:
             return None
         return precompiler
@@ -589,13 +597,28 @@ class PrecompileFuture:
                     fn, args, config, ctx.kernel, decorator, ctx.log
                 )
             except Exception as e:
+                diagnostic = traceback.format_exc()
+                # The extraction exception and compiler frames can own launch
+                # tensors. Retain their diagnostic text, not the live chain.
+                cast("Any", e).remote_traceback = diagnostic
                 e.__traceback__ = None
+                e.__context__ = None
+                e.__cause__ = None
+                ctx.log.debug(f"Precompile preparation failed:\n{diagnostic}")
                 if match_unrecoverable_runtime_error(e):
-                    raise
+                    raise e from None
                 action = classify_triton_exception(e)
                 if action == "raise" and not ctx.settings.autotune_ignore_errors:
-                    raise
-                return PrecompileFuture.skip(ctx, config, False)
+                    raise e from None
+                future = PrecompileFuture.skip(ctx, config, False)
+                future.remote_error = RemoteError(
+                    exc_type=type(e).__name__,
+                    exc_module=type(e).__module__,
+                    exc_args=(str(e),),
+                    traceback=diagnostic,
+                    classification=action,
+                )
+                return future
             if precompiler is None:
                 return PrecompileFuture.skip(ctx, config, True)
             mp_ctx = mp.get_context("fork")

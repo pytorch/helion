@@ -415,7 +415,7 @@ def _triton_compile(
             cast("Any", extracted.kernel),
             config,
             cast("BoundKernel", kernel),
-        )(*extracted.args, **extracted.kwargs)
+        )(*extracted.launch_args, **extracted.kwargs)
         if precompiler is already_compiled:
             return True
         if precompiler is already_compiled_fail:
@@ -643,6 +643,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self.config_spec = config_spec
         self.args = args
         self.log = log
+        if (
+            settings.autotune_precompile
+            and not config_spec.backend.supports_precompile()
+        ):
+            # Direct BaseSearch users do not go through Backend.autotune(),
+            # which already honors this capability. Keep their caller-owned
+            # settings intact and preserve the existing benchmark isolation.
+            self.settings = settings.copy(autotune_precompile=None)
+            self.log(
+                f"Backend {settings.backend!r} does not support separate "
+                f"{settings.autotune_precompile!r} precompilation; disabling it "
+                "for this provider. Benchmark subprocess and timeout settings "
+                "are unchanged."
+            )
         self._autotune_metrics = autotune_metrics
         self._accuracy_failure_config_ids: list[int] = []
         self._compile_failure_config_ids: list[int] = []
