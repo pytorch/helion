@@ -48,6 +48,8 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 from .variable_origin import TensorStrideOrigin
+from .variable_origin import TileBeginOrigin
+from .variable_origin import TileEndOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -65,6 +67,30 @@ regexp_allowed_host_ops: re.Pattern[str] = re.compile(
     r"like|new|broadcast|promote|view|reshape|expand|permute|strided|"
     r"transpose|contiguous|unsqueeze|squeeze|zero|rand|full|fill"
 )
+
+
+def tile_spanned_by_slice(lower: object, upper: object) -> torch.SymInt | None:
+    """The tile ``lower:upper`` spans when they are its ``begin`` and ``end``.
+
+    Such a slice indexes what the tile does, with the tile's size; as a range
+    its length would be a value only the device knows.
+    """
+    if not isinstance(lower, torch.SymInt) or not isinstance(upper, torch.SymInt):
+        return None
+    origins = HostFunction.current().expr_to_origin
+    begin = origins.get(lower._sympy_())
+    end = origins.get(upper._sympy_())
+    if (
+        begin is None
+        or end is None
+        or not isinstance(begin.origin, TileBeginOrigin)
+        or not isinstance(end.origin, TileEndOrigin)
+        or begin.origin.block_id != end.origin.block_id
+    ):
+        return None
+    block_size = CompileEnvironment.current().block_sizes[begin.origin.block_id].var
+    assert isinstance(block_size, torch.SymInt)
+    return block_size
 
 
 class TypeInfo:
@@ -405,6 +431,11 @@ class TensorType(TypeInfo):
                 slice_obj = k.proxy()
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
+
+                tile = tile_spanned_by_slice(slice_obj.start, slice_obj.stop)
+                if tile is not None and slice_obj.step in (None, 1):
+                    output_sizes.append(tile)
+                    continue
 
                 # For slices with steps, we need to calculate the output size differently
                 output_size = compute_slice_size(slice_obj, size)

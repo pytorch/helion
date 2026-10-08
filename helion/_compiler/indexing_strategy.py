@@ -581,6 +581,16 @@ def _inactive_slice_index_expr(
     return index_expr, f"({index_expr} < {size_expr})"
 
 
+def _size_one_slice_index(start_expr: str, expand: str, dtype: str) -> str:
+    """The index of a one-element slice: its start, as a one-element index
+    vector when ``expand`` places it among the other output dims (a literal
+    start cannot be subscripted)."""
+    if not expand:
+        return start_expr
+    env = CompileEnvironment.current()
+    return f"({start_expr} + {env.backend.arange_index_expr('1', dtype)}){expand}"
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -2131,15 +2141,19 @@ class SubscriptIndexing(NamedTuple):
                                 state, block_idx, slice_size, dtype
                             )
                         # Generate strided index: start + index * step
+                        start_expr = state.device_function.literal_expr(start)
                         block_dims.append(True)
                         index_values.append(
-                            f"({start} + ({base_index_expr}) * {step}){expand}"
+                            f"({start_expr} + ({base_index_expr}) * {step}){expand}"
                         )
                         if mask_expr is not None:
                             mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
+                        start_expr = state.device_function.literal_expr(start)
                         block_dims.append(False)
-                        index_values.append(f"{start}{expand}")
+                        index_values.append(
+                            _size_one_slice_index(start_expr, expand, dtype)
+                        )
                 else:
                     slice_size = compute_slice_size(k, size)
                     if not _is_size_one(slice_size):
@@ -2160,7 +2174,9 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         start_expr = state.device_function.literal_expr(start)
                         block_dims.append(False)
-                        index_values.append(f"{start_expr}{expand}")
+                        index_values.append(
+                            _size_one_slice_index(start_expr, expand, dtype)
+                        )
                 output_idx += 1
             elif isinstance(k, torch.Tensor):
                 ast_index = state.ast_args[1]

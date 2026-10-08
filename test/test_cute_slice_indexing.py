@@ -11,6 +11,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 pytestmark = skipUnlessBackends(["triton", "cute"])
 
@@ -194,3 +195,66 @@ def test_atomic_slice_rejects_flattened_distinct_update_axes(partial: bool) -> N
     # atomic reads each thread's own element, which the merge has moved.
     with pytest.raises(BackendUnsupported, match="moves elements between threads"):
         bound.to_code(helion.Config())
+
+
+@helion.kernel(static_shapes=True)
+def _register_block_slice_store(x: torch.Tensor, start: int) -> torch.Tensor:
+    m, n = x.shape
+    bn = hl.register_block_size(n)
+    out = torch.zeros([m, 64], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=x.dtype)
+        for tile_n in hl.tile(n, block_size=bn):
+            acc += x[tile_m, tile_n]
+        out[tile_m, start : start + bn] = acc
+    return out
+
+
+@pytest.mark.parametrize("start", [0, 5])
+@skipIfRefEager("checks the compiled store coordinates")
+def test_register_block_accumulator_slice_store(start: int) -> None:
+    """``out[tile_m, start:start + bn] = acc`` writes each column of the
+    accumulator of the ``bn`` loop, which outlives the loop on its thread
+    axis: CuTe indexes the range by that loop's axis, not by a new one."""
+    x = torch.randint(-4, 5, (64, 512), device=DEVICE).float()
+    extra = {"num_threads": [16, 2]} if _get_backend() == "cute" else {}
+    config = helion.Config(block_sizes=[16, 2], **extra)
+    out = _register_block_slice_store.bind((x, start)).compile_config(config)(x, start)
+    expected = torch.zeros_like(out)
+    expected[:, start : start + 16] = x.view(64, -1, 16).sum(1)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@skipUnlessBackends(["cute"])
+@skipIfRefEager("checks a compiled refusal")
+def test_register_block_accumulator_slice_store_lane_loop_refused() -> None:
+    """With a lane loop over ``bn`` each thread keeps one accumulator for
+    its several columns, so the store after the loop is refused."""
+    x = torch.randint(-4, 5, (64, 512), device=DEVICE).float()
+    config = helion.Config(block_sizes=[16, 1], num_threads=[4, 1])
+    bound = _register_block_slice_store.bind((x, 0))
+    with pytest.raises(BackendUnsupported, match="outside its device loop"):
+        bound.compile_config(config)
+
+
+@helion.kernel(static_shapes=True)
+def _tile_bounds_slices(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n.begin : tile_n.end] = (
+                x[tile_m, tile_n.begin : tile_n.end] * 2
+            )
+    return out
+
+
+@skipIfRefEager("checks the compiled tile indexing")
+def test_tile_begin_end_slice_is_the_tile() -> None:
+    """``x[tile.begin:tile.end]`` indexes what ``x[tile]`` does, including the
+    partial last tile, on both backends."""
+    x = torch.randn(64, 250, device=DEVICE)
+    extra = {"num_threads": [2, 32]} if _get_backend() == "cute" else {}
+    config = helion.Config(block_sizes=[2, 32], **extra)
+    out = _tile_bounds_slices.bind((x,)).compile_config(config)(x)
+    torch.testing.assert_close(out, x * 2, atol=0, rtol=0)
