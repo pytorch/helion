@@ -98,7 +98,8 @@ def test_independent_mixed_rank_threads_roundtrip(
         assert result.num_threads == list(threads)
         assert result.block_sizes == config.block_sizes
         assert result.config["cute_vector_widths"] == [1, vector, 1]
-        assert _launch_block(bound.to_code(result)) == (1, max(threads), 1)
+        # The fixed singleton row does not reserve a CUDA thread axis.
+        assert _launch_block(bound.to_code(result)) == (max(threads), 1, 1)
 
 
 @pytest.mark.parametrize("flatten", [False, True])
@@ -230,7 +231,7 @@ def test_multigrid_pointwise_seeds_transfer_by_live_block_id(
             and config.num_threads == [128, 128]
             and config.config["cute_vector_widths"] == [1, width, 1]
         )
-        assert _launch_block(bound.to_code(target)) == (1, 128, 1)
+        assert _launch_block(bound.to_code(target)) == (128, 1, 1)
 
 
 def test_single_root_extra_vector_slot_seed_transfer() -> None:

@@ -25,6 +25,7 @@ import torch
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.attention_plan import DENSE_SCORE_KIND
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
@@ -3060,6 +3061,7 @@ class TestCuteBackend(TestCase):
             cute_flash_pipeline_family="fa4",
             cute_flash_softmax_disc=False,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         with patch.object(
             dense_bound.env.config_spec, "target_device_capability", (10, 3)
@@ -3083,6 +3085,7 @@ class TestCuteBackend(TestCase):
             cute_flash_causal_kv_order="descending",
             cute_flash_causal_loop_split=True,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         with patch.object(
             causal_bound.env.config_spec, "target_device_capability", (10, 3)
@@ -3365,10 +3368,7 @@ class TestCuteBackend(TestCase):
     def test_flash_attention_target_ldred_matches_sdpa(self) -> None:
         capability = torch.cuda.get_device_capability()
         target_policy = get_flash_target_policy(capability)
-        if (
-            not target_policy.hardware.supports_tmem_row_reduce
-            or target_policy.tuning.tmem_row_reduce_min_kv is None
-        ):
+        if not target_policy.hardware.supports_tmem_row_reduce:
             self.skipTest("target has no tcgen05.ld.red flash lowering")
         q, k, v = (
             torch.randn(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
@@ -3379,6 +3379,7 @@ class TestCuteBackend(TestCase):
             cute_flash_pipeline_family="fa4",
             cute_flash_softmax_disc=False,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         dense_bound = cute_dense_attention.bind((q, k, v))
         with patch.object(
@@ -3400,6 +3401,7 @@ class TestCuteBackend(TestCase):
             cute_flash_causal_kv_order="descending",
             cute_flash_causal_loop_split=True,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         causal_bound = cute_causal_attention.bind((q, k, v))
         with patch.object(
@@ -3945,6 +3947,7 @@ class TestCuteBackend(TestCase):
                         has_kv_tile_pruning=False,
                         requires_ws_overlap=requires_ws,
                         modifiers=(),
+                        modifier_kinds=(DENSE_SCORE_KIND,),
                     ),
                 )
                 for requires_ws in requires_ws_order

@@ -999,9 +999,8 @@ def _cute_scan_geometry(state: CodegenState, block_id: int) -> _CuteScanGeometry
     axis = strategy.cute_lane_axis(block_id)
     if axis is None or axis.extent <= 0:
         return None
-    # Grid-owned declarations go to the kernel-scope statement list that later
-    # receives the (possibly lane-wrapped) root body; a grid without lane
-    # loops never flushes its ``outer_prefix``.
+    # Grid-owned declarations go directly to the kernel-scope statement list,
+    # before the hoisted root setup and the possibly lane-wrapped root body.
     if isinstance(owner, DeviceGridState) and owner.hoist_parent_statements is None:
         return None
     threads = axis.threads

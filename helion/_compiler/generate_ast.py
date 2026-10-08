@@ -1664,7 +1664,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                 )
                             else:
                                 grid_state.add_body_barriers(wrapped_body)
+                                # Shared thread extents can remove every lane
+                                # loop while leaving hoisted indices and masks.
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_prefix
+                                )
                                 self.statements_stack[-1].extend(wrapped_body)
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
                         else:
                             codegen_call_with_graph(self, root, [])
                 finally:

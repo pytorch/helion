@@ -167,6 +167,8 @@ class ConfigGeneration:
             if config_spec.cute_flash_search_enabled
             else None
         )
+        self._override_values = dict(overrides or {})
+        self._filter_flash_resident_search_choices()
         self.flat_spec: list[ConfigSpecFragment] = []
         if self._field_view is not None:
             config_spec._flat_config_from_fields(
@@ -186,7 +188,6 @@ class ConfigGeneration:
                 flash_pipeline_family=self._flash_pipeline_family_override,
             )
         assert self.flat_spec, "No config values to tune"
-        self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
             i
             for i, spec in enumerate(self.flat_spec)
@@ -318,6 +319,112 @@ class ConfigGeneration:
                 if group.key in self._key_to_flat_indices:
                     result.update(self._key_to_flat_indices[group.key][0])
         return result
+
+    def _filter_flash_resident_search_choices(self) -> None:
+        if not self.config_spec.cute_flash_search_enabled:
+            return
+        from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+        from .._compiler.cute.cute_flash import FLASH_ROW_SUM_SCHEDULE_KEY
+        from .._compiler.cute.cute_flash import FLASH_SOFTMAX_LOWERING_KEY
+        from .._compiler.cute.cute_flash import _flash_inactive_lpt_domain
+        from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
+
+        topology_controls = dict(self._override_values)
+        if self._flash_pipeline_family_override is not None:
+            topology_controls["cute_flash_pipeline_family"] = (
+                self._flash_pipeline_family_override
+            )
+        topology = self.config_spec._cute_flash_config_topology(topology_controls)
+        inactive_lpt = _flash_inactive_lpt_domain(
+            is_causal=self.config_spec._cute_flash_is_causal, topology=topology
+        )
+        # Explicit contradictory requests are rejected by override normalization.
+        # Only sampled modes need a narrower domain shared by random draws and
+        # deterministic coverage, so neither can request an impossible lowering.
+        fields = self._flat_fields()
+        fragment = fields.get(FLASH_SOFTMAX_LOWERING_KEY)
+        if not isinstance(fragment, EnumFragment):
+            return
+        fixed_lowering = self._override_values.get(FLASH_SOFTMAX_LOWERING_KEY)
+        choices = (
+            (fixed_lowering,)
+            if fixed_lowering is not None
+            else tuple(
+                choice
+                for choice in fragment._active_choices()
+                if all(
+                    key not in self._override_values
+                    or self._override_values[key] == required
+                    or (
+                        key == FLASH_CAUSAL_LPT_SWIZZLE_KEY
+                        and type(self._override_values[key]) is int
+                        and self._override_values[key] in inactive_lpt
+                    )
+                    for key, required in _flash_resident_softmax_overrides(
+                        choice,
+                        is_causal=self.config_spec._cute_flash_is_causal,
+                        topology=topology,
+                    ).items()
+                )
+            )
+        )
+        if fixed_lowering is None and choices != fragment._active_choices():
+            self._field_view = {
+                **fields,
+                FLASH_SOFTMAX_LOWERING_KEY: dataclasses.replace(
+                    fragment,
+                    search_choices=choices,
+                    coverage_choices=(
+                        None
+                        if fragment.coverage_choices is None
+                        else tuple(c for c in fragment.coverage_choices if c in choices)
+                    ),
+                ),
+            }
+        # This schedule exists only inside the explicit stateful lowering.
+        # Fixed parent controls can remove that lowering even on a workload
+        # with detector support. Keep random draws and coverage in the same
+        # resulting legal domain, rather than advertising an unreachable value.
+        row_sum = fields.get(FLASH_ROW_SUM_SCHEDULE_KEY)
+        if "resident_stateful" not in choices and isinstance(row_sum, EnumFragment):
+            self._field_view = {
+                **self._flat_fields(),
+                FLASH_ROW_SUM_SCHEDULE_KEY: dataclasses.replace(
+                    row_sum,
+                    search_choices=tuple(
+                        c for c in row_sum._active_choices() if c == "post_acquire"
+                    ),
+                    coverage_choices=(
+                        None
+                        if row_sum.coverage_choices is None
+                        else tuple(
+                            c for c in row_sum.coverage_choices if c == "post_acquire"
+                        )
+                    ),
+                ),
+            }
+        lpt = fields.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
+        if "resident_stateful" not in choices and isinstance(lpt, EnumFragment):
+            self._field_view = {
+                **self._flat_fields(),
+                FLASH_CAUSAL_LPT_SWIZZLE_KEY: dataclasses.replace(
+                    lpt,
+                    search_choices=tuple(
+                        c
+                        for c in lpt._active_choices()
+                        if type(c) is int and c in inactive_lpt
+                    ),
+                    coverage_choices=(
+                        None
+                        if lpt.coverage_choices is None
+                        else tuple(
+                            c
+                            for c in lpt.coverage_choices
+                            if type(c) is int and c in inactive_lpt
+                        )
+                    ),
+                ),
+            }
 
     def _flat_fields(self) -> Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         if self._field_view is not None:
@@ -811,27 +918,61 @@ class ConfigGeneration:
         }
 
     @_flash_env_scoped
+    def flash_owned_coordinate_indices(self, config: Config) -> list[int]:
+        """Coordinates fixed by the parent's explicit softmax implementation.
+
+        This applies to one-coordinate proposals only. A multi-coordinate
+        request can switch the lowering and change a formerly owned field.
+        """
+        if not self.config_spec.cute_flash_search_enabled:
+            return []
+        from .._compiler.cute.cute_flash import FLASH_SOFTMAX_LOWERING_KEY
+        from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
+
+        owned = _flash_resident_softmax_overrides(
+            config.config.get(FLASH_SOFTMAX_LOWERING_KEY),
+            is_causal=self.config_spec._cute_flash_is_causal,
+            topology=self.config_spec._cute_flash_config_topology(config.config),
+        )
+        return [
+            index
+            for index, (key, _sequence_index) in enumerate(
+                self._flat_coordinate_identities()
+            )
+            if key in owned and index not in self.overridden_flat_indices
+        ]
+
+    @_flash_env_scoped
     def coordinate_neighbor_projections(
-        self, base: FlatConfig, *, radius: int = 1
+        self,
+        base: FlatConfig,
+        *,
+        radius: int = 1,
+        limit: int | None = None,
+        frozen_indices: Sequence[int] = (),
     ) -> list[CoordinateNeighborProjection]:
-        """Enumerate every normalized one-coordinate pattern neighbor.
+        """Enumerate normalized one-coordinate pattern neighbors in order.
 
         The returned order follows the flat ConfigSpec layout and each fragment's
         own deterministic ``pattern_neighbors`` order. Invalid and normalized
         alias requests remain in the result so callers can audit completeness.
+        An optional limit bounds raw requests, including invalid and alias requests.
+        Explicitly frozen coordinates are excluded before generating requests.
         """
         canonical_base, base_config = self.canonicalize_flat(base)
         flat_identities = self._flat_coordinate_identities()
 
         seen = {base_config}
         result: list[CoordinateNeighborProjection] = []
-        overridden = self.overridden_flat_indices
+        overridden = self.overridden_flat_indices | set(frozen_indices)
         for flat_index, spec in enumerate(self.flat_spec):
             if flat_index in overridden:
                 continue
             key, sequence_index = flat_identities[flat_index]
             current = canonical_base[flat_index]
             for value in spec.pattern_neighbors(current, radius):
+                if limit is not None and len(result) >= limit:
+                    return result
                 requested = copy.deepcopy(canonical_base)
                 requested[flat_index] = copy.deepcopy(value)
                 try:

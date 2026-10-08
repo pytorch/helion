@@ -1538,6 +1538,37 @@ class CompileEnvironment:
             range(positions[0], positions[-1] + 1)
         )
 
+    def preserve_broadcast_block_dims(
+        self,
+        output_shape: typing.Sequence[int | torch.SymInt],
+        input_shapes: typing.Sequence[typing.Sequence[int | torch.SymInt]],
+    ) -> list[int | torch.SymInt]:
+        """Retain an unambiguous symbolic unit axis after broadcasting.
+
+        PyTorch can replace a block symbol known to equal one with a literal
+        one. Recover it only from that output axis's aligned operands, never
+        from another equal-sized block in the environment.
+        """
+        result = list(output_shape)
+        for axis, size in enumerate(result):
+            if not isinstance(size, int) or size != 1:
+                continue
+            block_ids: set[int] = set()
+            for shape in input_shapes:
+                input_axis = axis - len(result) + len(shape)
+                if input_axis < 0:
+                    continue
+                dim = shape[input_axis]
+                if (
+                    isinstance(dim, torch.SymInt)
+                    and (block_id := self.get_block_id(dim)) is not None
+                    and self.known_equal(dim, 1)
+                ):
+                    block_ids.add(self.canonical_block_id(block_id))
+            if len(block_ids) == 1:
+                result[axis] = self.block_sizes[block_ids.pop()].var
+        return result
+
     def tensor_indexer_broadcast_shape(
         self, tensors: typing.Sequence[torch.Tensor]
     ) -> list[int | torch.SymInt]:
@@ -1553,7 +1584,9 @@ class CompileEnvironment:
             for dims in zip(*padded, strict=True)
         ]
         # Normalize the result to use canonical block size variables
-        return self._normalize_shape_to_block_vars(result)
+        return self._normalize_shape_to_block_vars(
+            self.preserve_broadcast_block_dims(result, shapes)
+        )
 
     def tensor_indexer_dims(
         self, indexer_tensor: torch.Tensor

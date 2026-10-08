@@ -641,10 +641,25 @@ class TypePropagation(ast.NodeVisitor):
                         self.origin(),
                     )
 
-                return TypeInfo.from_example(
-                    _eval_binary(node.op, left_example, right_example),
-                    self.origin(),
-                )
+                result = _eval_binary(node.op, left_example, right_example)
+                if (
+                    self.device_loop_depth
+                    and isinstance(result, torch.Tensor)
+                    and not isinstance(node.op, ast.MatMult)
+                ):
+                    shape = CompileEnvironment.current().preserve_broadcast_block_dims(
+                        result.shape,
+                        [
+                            value.shape
+                            for value in (left_example, right_example)
+                            if isinstance(value, torch.Tensor)
+                        ],
+                    )
+                    if any(
+                        a is not b for a, b in zip(shape, result.shape, strict=True)
+                    ):
+                        result = result.as_strided(shape, result.stride())
+                return TypeInfo.from_example(result, self.origin())
             except exc.Base:
                 raise
             except TypeError as e:

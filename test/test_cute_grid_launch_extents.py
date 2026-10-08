@@ -255,7 +255,7 @@ def test_mixed_rank_grid_keeps_surplus_thread_mask(
         # A 128-element root cannot spread over 256 threads, so its surplus
         # threads stay masked by the physical thread bound.
         assert "_BLOCK_SIZE_2 = 128" in code
-        assert "cute.arch.thread_idx()[1]) < 128" in code
+        assert "cute.arch.thread_idx()[0]) < 128" in code
         assert "if mask_2:" in code
     elif second_threads > first_threads:
         # The vectorized 2048-element root is re-planned over all 256 launched
