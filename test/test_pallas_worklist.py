@@ -770,12 +770,17 @@ def _offsets(lengths):
 
 
 def _worklist_config(
-    block_sizes: list[int], *, loop_type: str = "unroll", grouping: int = 1
+    block_sizes: list[int],
+    *,
+    loop_type: str = "unroll",
+    grouping: int = 1,
+    load_buffer_count: int = 2,
 ) -> helion.Config:
     return helion.Config(
         block_sizes=block_sizes,
         pallas_loop_type=loop_type,
         pallas_worklist_grouping=grouping,
+        pallas_worklist_load_buffer_count=load_buffer_count,
     )
 
 
@@ -1106,11 +1111,13 @@ class TestDetectAndGating(unittest.TestCase):
         fields = bk.env.config_spec._flat_fields()
         loop_type_field = fields["pallas_loop_type"]
         grouping_field = fields["pallas_worklist_grouping"]
+        load_buffer_field = fields["pallas_worklist_load_buffer_count"]
         self.assertIsInstance(loop_type_field, EnumFragment)
         self.assertIsInstance(grouping_field, EnumFragment)
         choices = loop_type_field.choices
         self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
         self.assertEqual(grouping_field.choices, (0, 1, 2))
+        self.assertEqual(load_buffer_field.choices, (2, 3, 4))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
 
     def test_gating_absent_for_non_jagged(self):
@@ -2259,12 +2266,20 @@ class TestWorklistNumerics(unittest.TestCase):
             if size:
                 reference[start:end] = lhs_cpu[start:end] @ weights_cpu[group]
 
-        _, output = code_and_output(
-            _ragged_grouped_matmul_kernel,
-            (lhs, weights, offsets.to(DEVICE)),
-            **_worklist_config([32], grouping=1),
-        )
-        torch.testing.assert_close(output.cpu(), reference, rtol=2e-2, atol=2e-2)
+        for load_buffer_count in (2, 3, 4):
+            with self.subTest(load_buffer_count=load_buffer_count):
+                _, output = code_and_output(
+                    _ragged_grouped_matmul_kernel,
+                    (lhs, weights, offsets.to(DEVICE)),
+                    **_worklist_config(
+                        [32],
+                        grouping=1,
+                        load_buffer_count=load_buffer_count,
+                    ),
+                )
+                torch.testing.assert_close(
+                    output.cpu(), reference, rtol=2e-2, atol=2e-2
+                )
 
     def test_dense_kv_unaligned_matches_eager(self):
         # Unaligned offsets + partial last tiles => the store-overlap case that

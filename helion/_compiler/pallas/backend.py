@@ -457,6 +457,7 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_worklist_grouping",
+            "pallas_worklist_load_buffer_count",
             "pallas_loop_type",
             "pallas_emit_pipeline_group_size",
             "pallas_use_low_level_scheduler",
@@ -1718,6 +1719,7 @@ class PallasBackend(Backend):
             f"_compact_tile_start_ref_pos={fields.index('tile_starts')}",
             f"_compact_block={env.compact_worklist_block * plan.grouping}",
             f"_compact_build_on_device={env.compact_worklist_device_builder!r}",
+            f"_compact_load_buffer_count={env.compact_worklist_load_buffer_count}",
             f"_compact_ordered_aligned_arg_indices={ordered_indices!r}",
             f"_compact_range_start_ref_pos={range_start_ref_pos}",
             f"_compact_ordered_offset_arg_index={ordered_offset_arg_index}",
@@ -1810,6 +1812,7 @@ class PallasBackend(Backend):
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_device_builder = False
+        env.compact_worklist_load_buffer_count = 2
         env.compact_worklist_offset_params = []
 
         if grouping in (1, 2):
@@ -1912,6 +1915,9 @@ class PallasBackend(Backend):
         compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
         assert compact_block is not None, "compact tile has no block size"
         env.compact_worklist_block = int(compact_block)
+        env.compact_worklist_load_buffer_count = cast(
+            "int", config.get("pallas_worklist_load_buffer_count", 2)
+        )
         # Ordered (reduction) tile block -- resident caching uses this compile-side to
         # choose a block-aligned physical window (it can differ from the compact
         # block, e.g. compact_block != ordered_block).

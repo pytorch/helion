@@ -870,6 +870,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_worklist_grouping",
+        "pallas_worklist_load_buffer_count",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -1088,6 +1089,7 @@ VALID_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+VALID_PALLAS_WORKLIST_LOAD_BUFFER_COUNTS = (2, 3, 4)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -4802,6 +4804,20 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        worklist_load_buffer_count = config.get("pallas_worklist_load_buffer_count")
+        if config.get("pallas_worklist_grouping", 0):
+            if worklist_load_buffer_count is None:
+                config["pallas_worklist_load_buffer_count"] = 2
+            elif worklist_load_buffer_count not in (
+                VALID_PALLAS_WORKLIST_LOAD_BUFFER_COUNTS
+            ):
+                raise InvalidConfig(
+                    "pallas_worklist_load_buffer_count must be one of "
+                    f"{VALID_PALLAS_WORKLIST_LOAD_BUFFER_COUNTS!r}, got "
+                    f"{worklist_load_buffer_count!r}"
+                )
+        else:
+            config.pop("pallas_worklist_load_buffer_count", None)
         use_low_level_scheduler = config.get("pallas_use_low_level_scheduler")
         if use_low_level_scheduler is not None and not isinstance(
             use_low_level_scheduler, bool
@@ -6024,6 +6040,9 @@ class ConfigSpec:
                     choices = (*choices, "unroll")
                     fields["pallas_worklist_grouping"] = EnumFragment(
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
+                    )
+                    fields["pallas_worklist_load_buffer_count"] = EnumFragment(
+                        choices=VALID_PALLAS_WORKLIST_LOAD_BUFFER_COUNTS
                     )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_emit_pipeline_group_size"):

@@ -546,6 +546,9 @@ class CompileEnvironment:
         # Whether the packed-offset form can build its metadata inside the TPU
         # kernel instead of materializing it as JAX arrays before launch.
         self.compact_worklist_device_builder: bool = False
+        # Number of outer emit_pipeline buffers used for owner-indexed HBM
+        # inputs, such as per-group weights in grouped matrix multiplication.
+        self.compact_worklist_load_buffer_count: int = 2
         # Offsets-tensor parameter names the generated _build_worklist takes, in
         # order (set when the builder is emitted); used by the launcher to map
         # them to host-call arg positions.

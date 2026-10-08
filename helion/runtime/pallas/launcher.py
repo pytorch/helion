@@ -2533,6 +2533,7 @@ def default_pallas_launcher(
     _compact_tile_start_ref_pos: int = 1,
     _compact_block: int = 1,
     _compact_build_on_device: bool = False,
+    _compact_load_buffer_count: int = 2,
     # Resident-cache (owner-cache) params: the backstop below reads all of them
     # every call; the three compile-relevant ones are threaded to the install path.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
@@ -2612,6 +2613,7 @@ def default_pallas_launcher(
                 _compact_tile_start_ref_pos=_compact_tile_start_ref_pos,
                 _compact_block=_compact_block,
                 _compact_build_on_device=_compact_build_on_device,
+                _compact_load_buffer_count=_compact_load_buffer_count,
                 _compact_ordered_aligned_arg_indices=_compact_ordered_aligned_arg_indices,
                 _compact_range_start_ref_pos=_compact_range_start_ref_pos,
                 _compact_ordered_window=_compact_ordered_window,
@@ -2651,6 +2653,8 @@ def _compact_window_block_spec(
     window: int,
     ref_pos: int,
     scalar_refs: tuple[object, ...],
+    *,
+    buffer_count: int = 2,
 ) -> object:
     """BlockSpec for one compact-worklist window: up to ``window`` rows of dim 0
     at the runtime row offset in ``scalar_refs[ref_pos]``, other dims full.
@@ -2701,7 +2705,16 @@ def _compact_window_block_spec(
         size = jnp.clip(jnp.int32(_rows) - start, 0, _window)
         return (pl.ds(start, size), *(jnp.int32(0) for _ in range(_nd - 1)))
 
-    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+    pipeline_mode = (
+        pl.Buffered(buffer_count=buffer_count)  # type: ignore[union-attr]
+        if buffer_count != 2
+        else None
+    )
+    return pl.BlockSpec(  # type: ignore[union-attr]
+        block_shape,
+        index_map,
+        pipeline_mode=pipeline_mode,
+    )
 
 
 def _compact_sublane_window_block_spec(
@@ -2712,6 +2725,7 @@ def _compact_sublane_window_block_spec(
     scalar_refs: tuple[object, ...],
     *,
     sublane: int,
+    buffer_count: int = 2,
 ) -> object:
     """Aligned physical view of one logical 2-D compact row window."""
     from jax.experimental import pallas as pl
@@ -2731,7 +2745,16 @@ def _compact_sublane_window_block_spec(
         size = jnp.clip(size, 0, physical_rows - physical_start)
         return (pl.ds(physical_start, size), jnp.int32(0), jnp.int32(0))
 
-    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+    pipeline_mode = (
+        pl.Buffered(buffer_count=buffer_count)  # type: ignore[union-attr]
+        if buffer_count != 2
+        else None
+    )
+    return pl.BlockSpec(  # type: ignore[union-attr]
+        block_shape,
+        index_map,
+        pipeline_mode=pipeline_mode,
+    )
 
 
 def _pallas_compact_in_out_specs(
@@ -2750,6 +2773,7 @@ def _pallas_compact_in_out_specs(
     tile_start_ref_pos: int = 1,
     tile_extent_ref_pos: int = 2,
     compact_block: int = 1,
+    load_buffer_count: int = 2,
     ordered_aligned_set: set[int] | None = None,
     range_start_ref_pos: int = -1,
     ordered_window: int = 0,
@@ -2790,12 +2814,16 @@ def _pallas_compact_in_out_specs(
                     tile_extent_ref_pos,
                     scalar_refs,
                     sublane=32 // min(itemsize, 4),
+                    buffer_count=(
+                        load_buffer_count if idx in tensor_arg_indices else 2
+                    ),
                 )
             return _compact_window_block_spec(
                 t,
                 compact_block,
                 tile_start_ref_pos,
                 scalar_refs,
+                buffer_count=(load_buffer_count if idx in tensor_arg_indices else 2),
             )
         if idx in ordered_aligned_set:
             # Resident caching: per-range resident window sized ``ordered_window``
@@ -2831,10 +2859,16 @@ def _pallas_compact_in_out_specs(
                     )
 
                 mem = pltpu.SMEM if idx in smem_set else None  # type: ignore[union-attr]
+                pipeline_mode = (
+                    pl.Buffered(buffer_count=load_buffer_count)  # type: ignore[union-attr]
+                    if load_buffer_count != 2 and mem is None
+                    else None
+                )
                 return pl.BlockSpec(  # type: ignore[union-attr]
                     block_shape,
                     index_map,
                     memory_space=mem,
+                    pipeline_mode=pipeline_mode,
                 )
         return _pallas_make_block_spec(pl, jnp, pltpu, t, entry, idx in smem_set)
 
@@ -2957,6 +2991,7 @@ def _pallas_compile_compact_jit_fn(
     ordered_window: int = 0,
     compact_upper: int = 1,
     build_on_device: bool = False,
+    load_buffer_count: int = 2,
     interpret: bool = False,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
@@ -3110,6 +3145,7 @@ def _pallas_compile_compact_jit_fn(
                     tile_start_ref_pos,
                     tile_extent_ref_pos,
                     compact_block,
+                    load_buffer_count,
                     ordered_set,
                     range_start_ref_pos,
                     ordered_window,
@@ -3261,6 +3297,7 @@ def _pallas_compile_compact_jit_fn(
                 tile_start_ref_pos,
                 tile_extent_ref_pos,
                 compact_block,
+                load_buffer_count,
                 ordered_set,
                 range_start_ref_pos,
                 ordered_window,
@@ -3346,6 +3383,7 @@ def _pallas_install_compact_launcher_cache(
     _compact_tile_start_ref_pos: int,
     _compact_block: int,
     _compact_build_on_device: bool,
+    _compact_load_buffer_count: int,
     # Resident-cache (owner-cache) compile params; default to inactive so a
     # non-resident compact kernel compiles unchanged.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
@@ -3401,6 +3439,7 @@ def _pallas_install_compact_launcher_cache(
         ordered_window=_compact_ordered_window,
         compact_upper=int(grid[0]),
         build_on_device=_compact_build_on_device,
+        load_buffer_count=_compact_load_buffer_count,
         interpret=interpret,
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
