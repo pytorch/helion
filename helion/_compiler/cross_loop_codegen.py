@@ -1109,6 +1109,195 @@ def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
     }
 
 
+# Device modules a dry pass runs unchanged: memory goes through ``tl`` only.
+_DRY_PASS_PURE_MODULES = frozenset({"tl", "triton_helpers", "tl_math", "libdevice"})
+# Inductor helpers that only compute; the others load, spin, or publish.
+_DRY_PASS_PURE_HELPERS = frozenset(
+    {
+        *("maximum", "minimum", "max2", "min2", "prod", "any"),
+        *("promote_to_tensor", "div_floor_integer", "remainder_integer"),
+        *("max_with_index", "min_with_index"),
+        *("welford", "welford_reduce", "welford_combine"),
+    }
+)
+# Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
+_DRY_PASS_PURE_METHODS = frozenset(
+    {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}
+)
+
+
+def _dry_pass_call_kind(call: ast.Call, helpers: frozenset[str]) -> str:
+    """Classify a call as ``helper``, ``masked``, ``skipped``, or ``pure``."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return "helper" if func.id in helpers else "skipped"
+    if not isinstance(func, ast.Attribute):
+        return "skipped"
+    if not (
+        isinstance(func.value, ast.Name) and func.value.id in _DRY_PASS_PURE_MODULES
+    ):
+        return "pure" if func.attr in _DRY_PASS_PURE_METHODS else "skipped"
+    if func.value.id == "triton_helpers":
+        return "pure" if func.attr in _DRY_PASS_PURE_HELPERS else "skipped"
+    if func.value.id != "tl":
+        return "pure"
+    if func.attr == "inline_asm_elementwise":
+        # Impure asm, such as the compiler's own polls and syncs, may spin or publish.
+        pure = next((k.value for k in call.keywords if k.arg == "is_pure"), None)
+        pure = call.args[4] if pure is None else pure
+        if isinstance(pure, ast.Constant) and pure.value is True:
+            return "pure"
+        return "skipped"
+    if func.attr in ("load", "store") or (
+        func.attr.startswith("atomic_") and func.attr != "atomic_cas"
+    ):
+        # Block pointers take no mask.
+        if any(k.arg == "boundary_check" for k in call.keywords):
+            return "skipped"
+        return "masked"
+    if func.attr.startswith(
+        ("load", "store", "atomic_", "make_block_ptr", "advance", "device_")
+    ):
+        return "skipped"
+    return "pure"
+
+
+def _dry_pass_mask(call: ast.Call, live: str) -> None:
+    """AND the live predicate into a pointer load, store, or atomic mask."""
+    load = cast("ast.Attribute", call.func).attr == "load"
+
+    def update(slot: int, name: str, value: Callable[[ast.expr], ast.expr]) -> None:
+        if len(call.args) > slot:
+            call.args[slot] = value(call.args[slot])
+            return
+        keyword = next((k for k in call.keywords if k.arg == name), None)
+        if keyword is not None:
+            keyword.value = value(keyword.value)
+        else:
+            none = cast("ast.expr", expr_from_string("None"))
+            call.keywords.append(create(ast.keyword, arg=name, value=value(none)))
+
+    def masked(mask: ast.expr) -> ast.expr:
+        if isinstance(mask, ast.Constant) and mask.value is None:
+            return cast("ast.expr", expr_from_string(live))
+        return cast("ast.expr", expr_from_string(f"({{mask}}) & {live}", mask=mask))
+
+    def zero(other: ast.expr) -> ast.expr:
+        if isinstance(other, ast.Constant) and other.value is None:
+            return cast("ast.expr", expr_from_string("0.0"))
+        return other
+
+    update(1 if load else 2, "mask", masked)
+    if load:
+        # Masked lanes are undefined per thread; zeros keep dry branches uniform.
+        update(2, "other", zero)
+
+
+def _dry_pass_one_trip(loop: ast.expr, live: str) -> None:
+    """Cut a ``tl.range`` loop to one trip when not ``live``: a single trip
+    runs every instruction, which is all the code warm-up needs."""
+    if not (
+        isinstance(loop, ast.Call)
+        and isinstance(loop.func, ast.Attribute)
+        and isinstance(loop.func.value, ast.Name)
+        and loop.func.value.id == "tl"
+        and loop.func.attr == "range"
+        and loop.args
+    ):
+        return
+    if len(loop.args) == 1:
+        loop.args[0] = cast(
+            "ast.expr",
+            expr_from_string(f"tl.where({live}, {{stop}}, 1)", stop=loop.args[0]),
+        )
+        return
+    step = loop.args[2] if len(loop.args) > 2 else expr_from_string("1")
+    loop.args[1] = cast(
+        "ast.expr",
+        expr_from_string(
+            f"tl.where({live}, {{stop}}, {{start}} + {{step}})",
+            stop=loop.args[1],
+            start=cast("ast.expr", _clone_ast_value(loop.args[0])),
+            step=cast("ast.expr", _clone_ast_value(step)),
+        ),
+    )
+
+
+def _dry_pass_rewrite(
+    body: list[ast.stmt],
+    live: str,
+    helpers: frozenset[str],
+    guards: list[ast.If],
+) -> list[ast.stmt]:
+    """Mask memory in ``body``; guard waits and unmaskable effects by ``live``."""
+    result: list[ast.stmt] = []
+    for statement in body:
+        compound = isinstance(statement, (ast.If, ast.For))
+        header = (
+            (statement.test if isinstance(statement, ast.If) else statement.iter)
+            if compound
+            else statement
+        )
+        calls = [node for node in ast.walk(header) if isinstance(node, ast.Call)]
+        kinds = [_dry_pass_call_kind(call, helpers) for call in calls]
+        if isinstance(statement, ast.While) or "skipped" in kinds:
+            # Helpers called under the guard still take the predicate.
+            for node in ast.walk(statement):
+                if (
+                    isinstance(node, ast.Call)
+                    and _dry_pass_call_kind(node, helpers) == "helper"
+                ):
+                    node.args.append(cast("ast.expr", expr_from_string(live)))
+            # Adjacent guarded statements share one guard so values flow.
+            if guards and result and result[-1] is guards[-1]:
+                guards[-1].body.append(statement)
+            else:
+                guards.append(
+                    create(
+                        ast.If, test=expr_from_string(live), body=[statement], orelse=[]
+                    )
+                )
+                result.append(guards[-1])
+            continue
+        for call, kind in zip(calls, kinds, strict=True):
+            if kind == "helper":
+                call.args.append(cast("ast.expr", expr_from_string(live)))
+            elif kind == "masked":
+                _dry_pass_mask(call, live)
+        if isinstance(statement, ast.For):
+            _dry_pass_one_trip(statement.iter, live)
+        if compound:
+            statement.body = _dry_pass_rewrite(statement.body, live, helpers, guards)
+            statement.orelse = _dry_pass_rewrite(
+                statement.orelse, live, helpers, guards
+            )
+        result.append(statement)
+    return result
+
+
+def _dry_pass_binds(
+    body: list[ast.stmt], guards: list[ast.If], bound: set[str]
+) -> bool:
+    """Whether every name a guard binds is read only under that guard."""
+    guard_ids = {id(guard) for guard in guards}
+    stores: dict[str, set[int]] = {name: {0} for name in bound}
+    loads: list[tuple[str, int]] = []
+
+    def visit(node: ast.AST, scope: int) -> None:
+        scope = id(node) if id(node) in guard_ids else scope
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                stores.setdefault(node.id, set()).add(scope)
+            else:
+                loads.append((node.id, scope))
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    for statement in body:
+        visit(statement, 0)
+    return all(name not in stores or stores[name] & {0, scope} for name, scope in loads)
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -1759,6 +1948,86 @@ def emit_cross_loop_schedule(
             raise exc.CrossLoopSchedulingError(
                 "because an inband scatter store must run once in every task"
             )
+
+    # Roots that poll in-band peer data wait on it in their bodies.
+    inband_consumer_roots = {
+        access.root
+        for access in dependency_graph.accesses
+        if dependency_graph.is_inband(access) and access.kind != "store"
+    }
+
+    def waits_on_dependency(root: int) -> bool:
+        return bool(
+            root_barrier_incoming.get(root)
+            or readiness_consumers_by_root.get(root)
+            or nested_loop_counters_by_consumer.get(root)
+            or any(consumer == root for _producer, consumer in peer_edges)
+            or root in inband_consumer_roots
+        )
+
+    def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
+        """Run a waiting task once with memory masked and waits skipped.
+
+        The dry pass warms the task's code while it would otherwise wait. Both
+        passes share one loop body; None if a skipped value would be read.
+        """
+        helpers = {
+            name: (arguments, body)
+            for name, arguments, body, _noinline in (
+                device_function.triton_outlined_helpers
+            )
+        }
+        reachable: list[str] = []
+        pending = [task_body]
+        while pending:
+            for node in (n for s in pending.pop() for n in ast.walk(s)):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in helpers
+                    and node.func.id not in reachable
+                ):
+                    reachable.append(node.func.id)
+                    pending.append(list(helpers[node.func.id][1]))
+        live = device_function.new_var("tile_dependency_live", dce=False)
+
+        def rewrite(body: Iterable[ast.stmt], bound: set[str]) -> list[ast.stmt] | None:
+            guards: list[ast.If] = []
+            rewritten = _dry_pass_rewrite(
+                [_clone_stmt(statement) for statement in body],
+                live,
+                frozenset(reachable),
+                guards,
+            )
+            return rewritten if _dry_pass_binds(rewritten, guards, bound) else None
+
+        helper_bodies = {
+            name: rewrite(helpers[name][1], set(helpers[name][0])) for name in reachable
+        }
+        branch_body = rewrite(task_body, set())
+        if branch_body is None or None in helper_bodies.values():
+            return None
+        outlined = device_function.triton_outlined_helpers
+        for index, (name, arguments, _body, noinline) in enumerate(outlined):
+            if (helper_body := helper_bodies.get(name)) is not None:
+                outlined[index] = (name, (*arguments, live), (*helper_body,), noinline)
+        dry_pass = device_function.new_var("tile_dependency_dry_pass", dce=False)
+        # A runtime zero start keeps ptxas from unrolling the two passes.
+        return [
+            create(
+                ast.For,
+                target=create(ast.Name, id=dry_pass, ctx=ast.Store()),
+                iter=expr_from_string(
+                    f"tl.range({dispatch_ticket} // {1 << 30}, 2, 1, num_stages=1)"
+                ),
+                body=[
+                    statement_from_string(f"{live} = {dry_pass} == 1"),
+                    *branch_body,
+                ],
+                orelse=[],
+                type_comment=None,
+            ),
+        ]
 
     def flat_task_coordinates(
         task: str,
@@ -2899,6 +3168,10 @@ def emit_cross_loop_schedule(
                 task_body.extend(_release_sync(device_function))
             task_body.extend(root_barrier_publication(root, synced=bool(publications)))
             task_body.extend(publications)
+            # Kernel-scoped tensor-memory roots get no dry pass: tl.range fails to
+            # compile around dot_scaled, and the while-loop form is slower.
+            if waits_on_dependency(root) and root not in kernel_scope_roots:
+                task_body = dry_pass_task(task_body) or task_body
             packet_branches.append(
                 (
                     packet_begin,
