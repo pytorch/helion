@@ -33,6 +33,7 @@ from .persistent_branch_vec import _pointer_integer_affine_form
 from .persistent_branch_vec import _range_extent
 from .persistent_branch_vec import _single_tensor_iterator_root
 from .scalar_integer import _integer_expression
+from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -381,7 +382,7 @@ def _accesses(
             # A predicate may not itself perform memory accesses or effects.
             if any(
                 isinstance(item, ast.Call)
-                and ast.unparse(item.func) not in _CASTS
+                and ast.unparse(item.func) not in _CASTS | PURE_HELPERS
                 and not (extra_pure_call is not None and extra_pure_call(item))
                 for item in ast.walk(node.test)
             ):
@@ -436,7 +437,7 @@ def _accesses(
                     visit(arg, statement, guards)
                 return
             name = ast.unparse(node.func)
-            if name not in _CASTS | _PURE and name not in (
+            if name not in _CASTS | _PURE | PURE_HELPERS and name not in (
                 "cute.arch.thread_idx",
                 "cute.arch.block_idx",
             ):

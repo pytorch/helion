@@ -43,6 +43,7 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .licm_profitability import repeated_work_is_profitable
+from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -838,6 +839,7 @@ _AST_PURE_CALLS = {
     "cutlass.Uint16",
     "cutlass.Uint32",
     "cute.arch.load",
+    *PURE_HELPERS,
 }
 _AST_PURE_OPERATOR_CALLS = {
     "operator.add",
@@ -863,7 +865,7 @@ _AST_PURE_OPERATOR_CALLS = {
     "operator.truediv",
     "operator.xor",
 }
-_AST_GLOBAL_NAMES = {"cutlass", "cute", "operator"}
+_AST_GLOBAL_NAMES = {"cutlass", "cute", "operator", *PURE_HELPERS}
 
 
 def _safe_invariant_expression(

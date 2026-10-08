@@ -30,6 +30,7 @@ from ..ast_extension import statement_from_string
 from .cutedsl_compat import L2_EVICT_LAST_STORE_ABI_VERSION
 from .cutedsl_compat import cp_async_supported
 from .cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .scalar_recipe import PURE_HELPERS
 
 
 class TensorMetadata(NamedTuple):
@@ -893,6 +894,8 @@ def _prefetch_overlap_call_is_safe(
 ) -> bool:
     path = _call_path(call.func)
     if path is not None:
+        if len(path) == 1 and path[0] in PURE_HELPERS:
+            return True
         if len(path) == 2 and path[0] == "cutlass":
             return path[1] in _PURE_CUTLASS_SCALAR_CALLS
         if len(path) == 3 and path[:2] == ("cute", "math"):

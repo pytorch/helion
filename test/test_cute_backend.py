@@ -192,6 +192,64 @@ def cute_sign(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_cancelling_math(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([4, *x.shape], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        out[0, tile] = torch.erfc(value)
+        out[1, tile] = torch.expm1(value)
+        out[2, tile] = torch.log1p(value)
+        out[3, tile] = torch.exp2(value)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_modulus(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([4, *x.shape], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        divisor = y[tile]
+        out[0, tile] = torch.remainder(value, divisor)
+        out[1, tile] = torch.fmod(value, divisor)
+        out[2, tile] = value % -3
+        out[3, tile] = torch.fmod(value, -3)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_frac(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.frac(x[tile])
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_hyperbolic(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([5, *x.shape], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        out[0, tile] = torch.sinh(value)
+        out[1, tile] = torch.cosh(value)
+        out[2, tile] = torch.asinh(value)
+        out[3, tile] = torch.acosh(value)
+        out[4, tile] = torch.atanh(value)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_rounding(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([4, *x.shape], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile(x.size()):
+        value = x[tile_m, tile_n]
+        out[0, tile_m, tile_n] = torch.floor(value)
+        out[1, tile_m, tile_n] = torch.ceil(value)
+        out[2, tile_m, tile_n] = torch.trunc(value)
+        out[3, tile_m, tile_n] = torch.round(value)
+    return out
+
+
 @helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
@@ -7566,6 +7624,132 @@ class TestCuteBackend(TestCase):
                 torch.testing.assert_close(out, torch.sign(x), rtol=0, atol=0)
                 if x.is_floating_point():
                     self.assertFalse(torch.signbit(out[out == 0]).any())
+
+    def test_pointwise_rounding(self) -> None:
+        special = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, float("nan"), float("inf")]
+        for dtype in (torch.float32, torch.bfloat16, torch.float16, torch.int32):
+            with self.subTest(dtype=str(dtype)):
+                if dtype.is_floating_point:
+                    x = torch.randn(65, 23, device=DEVICE) * 8
+                    x[0, : len(special)] = torch.tensor(special)
+                    x = x.to(dtype)
+                else:
+                    x = torch.randint(-100, 100, (65, 23), device=DEVICE, dtype=dtype)
+                code, out = code_and_output(cute_rounding, (x,))
+                expected = torch.stack(
+                    [torch.floor(x), torch.ceil(x), torch.trunc(x), torch.round(x)]
+                )
+                torch.testing.assert_close(
+                    out, expected, rtol=0, atol=0, equal_nan=True
+                )
+                if dtype.is_floating_point:
+                    # torch.round rounds half to even.
+                    for name in ("floor", "ceil", "trunc", "roundeven"):
+                        self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_hyperbolic(self) -> None:
+        # Domain edges: acosh(x < 1) and atanh(|x| > 1) are NaN, atanh(+-1) is
+        # +-inf, sinh/cosh overflow, and NaN/inf propagate.
+        special = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0, 1.0]
+        special += [-1.0, 0.5, 2.0, 1e-4, 100.0, -100.0, 12.0]
+        for dtype, tol in (
+            (torch.float32, 1e-5),
+            (torch.float16, 2e-3),
+            (torch.bfloat16, 2e-2),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                x = torch.cat(
+                    [
+                        torch.tensor(special, device=DEVICE),
+                        torch.rand(1000, device=DEVICE) * 2.2 - 1.1,
+                        torch.rand(1000, device=DEVICE) * 20 - 10,
+                    ]
+                ).to(dtype)
+                code, out = code_and_output(cute_hyperbolic, (x,))
+                expected = torch.stack(
+                    [
+                        torch.sinh(x),
+                        torch.cosh(x),
+                        torch.asinh(x),
+                        torch.acosh(x),
+                        torch.atanh(x),
+                    ]
+                )
+                torch.testing.assert_close(
+                    out, expected, rtol=tol, atol=tol, equal_nan=True
+                )
+                for name in ("sinh", "cosh", "asinh", "acosh", "atanh"):
+                    self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_math_without_cancellation(self) -> None:
+        # 1 - erf(x), exp(x) - 1 and log(1 + x) lose every digit for large x
+        # (erfc) and tiny x (expm1, log1p); exp(x * ln2) double-rounds exp2.
+        tiny = torch.logspace(-30, -2, 512, device=DEVICE)
+        x = torch.cat(
+            [
+                tiny,
+                -tiny,
+                torch.linspace(-30, 30, 2048, device=DEVICE),
+                torch.rand(512, device=DEVICE) - 1.0,
+                torch.randn(1024, device=DEVICE) * 3,
+            ]
+        )
+        code, out = code_and_output(cute_cancelling_math, (x,))
+        expected = torch.stack(
+            [torch.erfc(x), torch.expm1(x), torch.log1p(x), torch.exp2(x)]
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-6, atol=0, equal_nan=True)
+        for name in ("erfc", "expm1", "log1p", "exp2"):
+            self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_remainder_and_fmod(self) -> None:
+        # remainder takes the divisor's sign (Python), fmod the dividend's (C);
+        # CuTe DSL's % is the C one.
+        for dtype in (torch.float32, torch.int32, torch.int64):
+            with self.subTest(dtype=str(dtype)):
+                if dtype.is_floating_point:
+                    x = torch.randn(4096, device=DEVICE) * 8
+                    y = torch.randn(4096, device=DEVICE) * 3
+                    x[:4] = torch.tensor([6.0, -6.0, 0.0, -0.0])
+                    y[:4] = torch.tensor([-3.0, 3.0, -3.0, 3.0])
+                else:
+                    x = torch.randint(-50, 50, (4096,), device=DEVICE, dtype=dtype)
+                    y = torch.randint(1, 9, (4096,), device=DEVICE, dtype=dtype)
+                    y *= (
+                        torch.randint(0, 2, (4096,), device=DEVICE, dtype=dtype) * 2 - 1
+                    )
+                code, out = code_and_output(cute_modulus, (x, y))
+                expected = torch.stack(
+                    [
+                        torch.remainder(x, y),
+                        torch.fmod(x, y),
+                        x % -3,
+                        torch.fmod(x, -3),
+                    ]
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                if dtype.is_floating_point:
+                    self.assertTrue(
+                        torch.equal(torch.signbit(out), torch.signbit(expected))
+                    )
+                else:
+                    # Only the loaded divisors, which may be zero, are guarded.
+                    self.assertEqual(code.count(" != 0 else _cute_join_cast(1, "), 2)
+
+    def test_pointwise_frac(self) -> None:
+        # torch.frac decomposes to x - sign(x) * floor(abs(x)), or to
+        # x - trunc(x) in newer PyTorch.
+        special = [0.5, -2.5, 3.75, -3.75, -0.0, float("nan"), float("inf")]
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            with self.subTest(dtype=str(dtype)):
+                x = torch.randn(65, 23, device=DEVICE) * 8
+                x[0, : len(special)] = torch.tensor(special)
+                x = x.to(dtype)
+                code, out = code_and_output(cute_frac, (x,))
+                torch.testing.assert_close(
+                    out, torch.frac(x), rtol=0, atol=0, equal_nan=True
+                )
+                self.assertRegex(code, r"cute\.math\.(floor|trunc)\(")
 
     def test_rms_norm_uses_native_rsqrt(self) -> None:
         x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)

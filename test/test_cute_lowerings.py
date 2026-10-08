@@ -9082,9 +9082,9 @@ class TestCuteLowerings(unittest.TestCase):
         rather than creating a no-op ``tcgen05_chain_step_in`` vector
         alias before the GELU polynomial. Also pins that the constants
         are baked in as Python literals (``0.7978845608028654 =
-        sqrt(2/pi)`` and ``0.035677408136300125 = sqrt(2/pi) *
-        0.044715``) so a future refactor that re-derives them from a
-        different source cannot silently drift the rounded values.
+        sqrt(2/pi)`` and the cubic coefficient ``0.044715``) so a future
+        refactor that re-derives them from a different source cannot
+        silently drift the rounded values.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -9127,7 +9127,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("tcgen05_acc_loaded", code)
         self.assertIn("tcgen05_chain_step", code)
         self.assertIn("0.7978845608028654", code)
-        self.assertIn("0.035677408136300125", code)
+        self.assertIn("0.044715", code)
         self.assertNotIn("tcgen05_chain_step_in", code)
 
     def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected(

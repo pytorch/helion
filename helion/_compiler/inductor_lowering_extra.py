@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import math
 import threading
 from typing import Any
 from typing import Callable
@@ -11,7 +12,10 @@ import sympy
 import torch
 from torch._inductor import ir
 from torch._inductor.ir import TensorBox
+from torch._inductor.lowering import get_promoted_dtype
 from torch._inductor.lowering import to_dtype
+from torch._inductor.virtualized import V
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 
 from .. import exc
 
@@ -24,29 +28,65 @@ _patch_table: dict[Any, Any] | None = None
 _patch_entries: dict[Any, tuple[object, object]] = {}
 
 
-def create_fp16_to_fp32_unary_fallback_lowering(
+def keeps_negative_nan_literal(value: object) -> bool:
+    """Whether a constant ``value`` is a -nan literal whose sign eager reads.
+
+    Eager reads the sign of a NaN scalar only as copysign's sign operand;
+    arithmetic and clamp on a -nan scalar give a positive NaN, as a NaN
+    constant without its sign does.
+    """
+    node = V.current_node
+    return (
+        isinstance(value, float)
+        and math.isnan(value)
+        and math.copysign(1.0, value) < 0
+        and isinstance(node, torch.fx.Node)
+        and node.target is torch.ops.aten.copysign.Scalar
+    )
+
+
+def create_fp16_to_fp32_fallback_lowering(
     original_op: Callable[..., object],
 ) -> Callable[..., object]:
-    """Create a lowering that converts fp16/bfloat16 inputs to fp32 before calling the operation."""
+    """Create a lowering that computes an fp16/bfloat16 result in fp32.
+
+    The operands are converted to the result dtype and then to fp32 before
+    calling the operation, and the result is converted back, so the operation
+    never sees a 16-bit input.  Converting to the result dtype first rounds a
+    Python number or symbolic float operand the way eager kernels do
+    (remainder(x, 0.7) of an fp16 x divides by fp16(0.7) = 0.7002; a -nan
+    keeps its sign in fp16 but rounds to +NaN in bf16, which copysign reads).
+    """
+
+    def to_fp32(arg: object, result_dtype: torch.dtype) -> object:
+        if isinstance(arg, TensorBox):
+            if arg.get_dtype() != result_dtype:
+                arg = to_dtype(arg, result_dtype)
+            return to_dtype(arg, torch.float32)
+        if isinstance(arg, (int, float)) and not isinstance(arg, bool):
+            return torch.tensor(arg, dtype=result_dtype).item()
+        return arg
 
     @functools.wraps(original_op)
-    def fp32_fallback_lowering(x: object) -> object:
+    def fp32_fallback_lowering(*args: object) -> object:
         from .compile_environment import CompileEnvironment
 
         if (
             not CompileEnvironment.has_current()
             or CompileEnvironment.current().backend_name == "pallas"
         ):
-            return original_op(x)
-        if isinstance(x, TensorBox) and (original_dtype := x.get_dtype()) in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            x_fp32 = to_dtype(x, torch.float32)
-            result_fp32 = original_op(x_fp32)
-            assert isinstance(result_fp32, TensorBox)
-            return to_dtype(result_fp32, original_dtype)
-        return original_op(x)
+            return original_op(*args)
+        # Eager promotion: a 0-d operand (a symbolic float) or a Python
+        # number does not widen the dimensioned operands' dtype.
+        if not any(isinstance(arg, TensorBox) for arg in args) or (
+            result_dtype := get_promoted_dtype(
+                *args, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+            )
+        ) not in (torch.float16, torch.bfloat16):
+            return original_op(*args)
+        result_fp32 = original_op(*(to_fp32(arg, result_dtype) for arg in args))
+        assert isinstance(result_fp32, TensorBox)
+        return to_dtype(result_fp32, result_dtype)
 
     return fp32_fallback_lowering
 
@@ -87,17 +127,54 @@ def _restore_inductor_lowerings() -> None:
     _patch_table = None
 
 
-# Operations that need fp32 fallbacks due to libdevice/tl_math limitations
+# Operations that need fp32 fallbacks due to libdevice/tl_math limitations:
+# their Triton lowerings only accept fp32/fp64 operands (Inductor upcasts at
+# load time instead, see ``OpDtypeSupport``), so a 16-bit operand fails to
+# compile.  Only ops whose 16-bit result is the fp32 result rounded belong
+# here: ``nextafter`` steps one ulp of its operand's format, and an fp32 ulp
+# step rounds back to the 16-bit operand.
 FP32_FALLBACK_OPS_UNARY = [
-    torch.ops.aten.rsqrt.default,
-    torch.ops.aten.sqrt.default,
-    torch.ops.aten.sin.default,
+    torch.ops.aten.acos.default,
+    torch.ops.aten.acosh.default,
+    torch.ops.aten.asin.default,
+    torch.ops.aten.asinh.default,
+    torch.ops.aten.atan.default,
+    torch.ops.aten.atanh.default,
+    torch.ops.aten.ceil.default,
     torch.ops.aten.cos.default,
-    torch.ops.aten.log.default,
-    torch.ops.aten.tanh.default,
-    torch.ops.aten.log1p.default,
-    torch.ops.aten.expm1.default,
+    torch.ops.aten.cosh.default,
+    torch.ops.aten.erf.default,
+    torch.ops.aten.erfc.default,
+    torch.ops.aten.erfinv.default,
     torch.ops.aten.exp.default,
+    torch.ops.aten.exp2.default,
+    torch.ops.aten.expm1.default,
+    torch.ops.aten.floor.default,
+    torch.ops.aten.i0.default,
+    torch.ops.aten.lgamma.default,
+    torch.ops.aten.log.default,
+    torch.ops.aten.log10.default,
+    torch.ops.aten.log1p.default,
+    torch.ops.aten.log2.default,
+    torch.ops.aten.round.default,
+    torch.ops.aten.rsqrt.default,
+    torch.ops.aten.sin.default,
+    torch.ops.aten.sinh.default,
+    torch.ops.aten.sqrt.default,
+    torch.ops.aten.tan.default,
+    torch.ops.aten.tanh.default,
+    torch.ops.aten.trunc.default,
+]
+FP32_FALLBACK_OPS_BINARY = [
+    torch.ops.aten.atan2.default,
+    torch.ops.aten.copysign.Scalar,
+    torch.ops.aten.copysign.Tensor,
+    torch.ops.aten.fmod.Scalar,
+    torch.ops.aten.fmod.Tensor,
+    torch.ops.aten.hypot.default,
+    torch.ops.aten.remainder.Scalar,
+    torch.ops.aten.remainder.Scalar_Tensor,
+    torch.ops.aten.remainder.Tensor,
 ]
 
 
@@ -123,13 +200,13 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
                     installed = _compile_environment_lowering(op, patched, previous)
                     _patch_entries[op] = (previous, installed)
                     _patch_table[op] = installed
-                for op in FP32_FALLBACK_OPS_UNARY:
+                for op in [*FP32_FALLBACK_OPS_UNARY, *FP32_FALLBACK_OPS_BINARY]:
                     current = _patch_table.get(op, _MISSING_LOWERING)
                     if current is _MISSING_LOWERING or not callable(current):
                         raise KeyError(f"no Inductor lowering registered for {op!r}")
                     existing = _patch_entries.get(op)
                     previous = current if existing is None else existing[0]
-                    installed = create_fp16_to_fp32_unary_fallback_lowering(current)
+                    installed = create_fp16_to_fp32_fallback_lowering(current)
                     _patch_entries[op] = (previous, installed)
                     _patch_table[op] = installed
             except Exception:

@@ -48,6 +48,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
@@ -363,6 +364,9 @@ class TestMisc(RefEagerTestBase, TestCase):
             def get_dtype(self) -> torch.dtype:
                 return self.dtype
 
+            def get_size(self) -> list[int]:
+                return [4]
+
         value = FakeTensorBox(torch.bfloat16)
         fp32_value = FakeTensorBox(torch.float32)
         fp32_result = FakeTensorBox(torch.float32)
@@ -383,10 +387,8 @@ class TestMisc(RefEagerTestBase, TestCase):
                 side_effect=(fp32_value, final_result),
             ) as to_dtype,
         ):
-            fallback = (
-                inductor_lowering_extra.create_fp16_to_fp32_unary_fallback_lowering(
-                    original
-                )
+            fallback = inductor_lowering_extra.create_fp16_to_fp32_fallback_lowering(
+                original
             )
             self.assertIs(fallback(value), bypass_result)
             with (
@@ -407,6 +409,362 @@ class TestMisc(RefEagerTestBase, TestCase):
                 unittest.mock.call(fp32_result, torch.bfloat16),
             ],
         )
+
+    @skipIfTileIR("TileIR fails to compile the libdevice calls (PassManager::run)")
+    def test_half_precision_libdevice_math_computes_in_fp32(self):
+        # Triton's libdevice functions only take fp32/fp64 operands, so a 16-bit
+        # result of these ops is computed in fp32 (FP32_FALLBACK_OPS_*).
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def libdevice_math(
+            x: torch.Tensor, w: torch.Tensor, y: torch.Tensor, flag: bool
+        ) -> torch.Tensor:
+            out = torch.empty([19, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                v = x[tile]
+                u = w[tile]
+                out[0, tile] = torch.floor(u)
+                out[1, tile] = torch.ceil(u)
+                out[2, tile] = torch.trunc(u)
+                out[3, tile] = torch.round(u)
+                out[4, tile] = torch.exp2(u)
+                out[5, tile] = torch.tan(u)
+                out[6, tile] = torch.atan(u)
+                out[7, tile] = torch.sinh(u)
+                out[8, tile] = torch.cosh(u)
+                out[9, tile] = torch.asinh(u)
+                out[10, tile] = torch.erf(u)
+                out[11, tile] = torch.atan2(u, y[tile])
+                out[12, tile] = torch.erfc(v)
+                out[13, tile] = torch.log2(v)
+                out[14, tile] = torch.log10(v)
+                out[15, tile] = torch.asin(v)
+                out[16, tile] = torch.acos(v)
+                out[17, tile] = torch.atanh(v)
+                if flag:
+                    v = torch.log2(v)
+                out[18, tile] = v
+            return out
+
+        special = [0.5, 1.5, 2.5, -0.5, -2.5, -0.0, float("nan"), float("inf")]
+        for dtype in (torch.float16, torch.bfloat16):
+            x = (torch.rand(1000, device=DEVICE) * 0.8 + 0.1).to(dtype)
+            w = torch.randn(1000, device=DEVICE) * 8
+            w[: len(special)] = torch.tensor(special)
+            w = w.to(dtype)
+            y = (torch.randn(1000, device=DEVICE) * 8).to(dtype)
+            for flag in (True, False):
+                with self.subTest(dtype=str(dtype), flag=flag):
+                    _, result = code_and_output(libdevice_math, (x, w, y, flag))
+                    exact = [torch.floor(w), torch.ceil(w), torch.trunc(w)]
+                    exact.append(torch.round(w))
+                    torch.testing.assert_close(
+                        result[:4], torch.stack(exact), rtol=0, atol=0, equal_nan=True
+                    )
+                    expected = [
+                        *(
+                            op(w)
+                            for op in (
+                                torch.exp2,
+                                torch.tan,
+                                torch.atan,
+                                torch.sinh,
+                                torch.cosh,
+                                torch.asinh,
+                                torch.erf,
+                            )
+                        ),
+                        torch.atan2(w, y),
+                        *(
+                            op(x)
+                            for op in (
+                                torch.erfc,
+                                torch.log2,
+                                torch.log10,
+                                torch.asin,
+                                torch.acos,
+                                torch.atanh,
+                            )
+                        ),
+                        torch.log2(x) if flag else x,
+                    ]
+                    torch.testing.assert_close(
+                        result[4:],
+                        torch.stack(expected),
+                        rtol=1e-2,
+                        atol=1e-2,
+                        equal_nan=True,
+                    )
+
+    @skipIfTileIR("TileIR fails to compile libdevice.copysign (PassManager::run)")
+    @skipIfXPU("XPU results differ from XPU eager on inf and NaN signs")
+    @skipIfRocm("ROCm results differ from ROCm eager on zero and NaN signs")
+    def test_copysign_matches_eager(self):
+        # copysign is exact in any format, and moves the sign onto a NaN or
+        # reads it off one like off any other value.  Only copysign reads a
+        # -nan literal's sign: clamp and arithmetic on one give +NaN.
+        @helion.kernel(autotune_effort="none")
+        def copysign(x: torch.Tensor, y: torch.Tensor, s: float) -> torch.Tensor:
+            out = torch.empty([7, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                out[0, tile] = torch.copysign(x[tile], y[tile])
+                out[1, tile] = torch.copysign(x[tile], -2.0)
+                out[2, tile] = torch.copysign(x[tile], 0.0)
+                out[3, tile] = torch.copysign(x[tile], s)
+                out[4, tile] = torch.copysign(x[tile], -float("nan"))
+                out[5, tile] = torch.clamp(x[tile], min=-float("nan"))
+                out[6, tile] = x[tile] * 0 + -float("nan")
+            return out
+
+        nan = float("nan")
+        special = [0.0, -0.0, float("inf"), float("-inf"), 1.5, -1.5, nan, -nan]
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for s in (-0.0, 3.0):
+                with self.subTest(dtype=str(dtype), s=s):
+                    x = torch.randn(1000, device=DEVICE) * 4
+                    y = torch.randn(1000, device=DEVICE) * 4
+                    x[: len(special)] = torch.tensor(special)
+                    y[: len(special)] = torch.tensor(special[::-1])
+                    x, y = x.to(dtype), y.to(dtype)
+                    _, result = code_and_output(copysign, (x, y, s))
+                    expected = torch.stack(
+                        [
+                            torch.copysign(x, y),
+                            torch.copysign(x, -2.0),
+                            torch.copysign(x, 0.0),
+                            torch.copysign(x, s),
+                            torch.copysign(x, -nan),
+                            torch.clamp(x, min=-nan),
+                            x * 0 + -nan,
+                        ]
+                    )
+                    torch.testing.assert_close(
+                        result, expected, rtol=0, atol=0, equal_nan=True
+                    )
+                    signed = torch.ones_like(expected, dtype=torch.bool)
+                    if dtype != torch.float32:
+                        # Helion computes 16-bit copysign in fp32, and rounding
+                        # a NaN to bf16 drops the sign eager's bitwise 16-bit
+                        # copysign keeps.
+                        signed = ~torch.isnan(expected)
+                    # Triton's clamp returns a NaN input with its own sign.
+                    signed[5:, torch.isnan(x)] = False
+                    self.assertTrue(
+                        torch.equal(
+                            torch.signbit(result)[signed],
+                            torch.signbit(expected)[signed],
+                        )
+                    )
+
+    @skipIfCute("CuTe lowers none of hypot, erfinv, lgamma or i0")
+    @skipIfTileIR("TileIR fails to compile the libdevice calls (PassManager::run)")
+    def test_half_precision_libdevice_special_functions_compute_in_fp32(self):
+        @helion.kernel(autotune_effort="none")
+        def special_functions(
+            x: torch.Tensor, y: torch.Tensor, p: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([6, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                u = x[tile]
+                out[0, tile] = torch.fmod(u, y[tile])
+                out[1, tile] = torch.copysign(u, y[tile])
+                out[2, tile] = torch.hypot(u, y[tile])
+                out[3, tile] = torch.erfinv(p[tile])
+                out[4, tile] = torch.lgamma(u)
+                out[5, tile] = torch.i0(u)
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=str(dtype)):
+                x = (torch.randn(1000, device=DEVICE) * 4).to(dtype)
+                y = (torch.randn(1000, device=DEVICE) * 4).to(dtype)
+                p = torch.tanh(torch.randn(1000, device=DEVICE) * 2).to(dtype)
+                _, result = code_and_output(special_functions, (x, y, p))
+                # fmod and copysign are exact in any format.
+                torch.testing.assert_close(
+                    result[:2],
+                    torch.stack([torch.fmod(x, y), torch.copysign(x, y)]),
+                    rtol=0,
+                    atol=0,
+                    equal_nan=True,
+                )
+                torch.testing.assert_close(
+                    result[2:],
+                    torch.stack(
+                        [
+                            torch.hypot(x, y),
+                            torch.erfinv(p),
+                            torch.lgamma(x),
+                            torch.i0(x),
+                        ]
+                    ),
+                    rtol=1e-2,
+                    atol=1e-2,
+                    equal_nan=True,
+                )
+
+    @skipIfTileIR("TileIR fails to compile libdevice.fmod (PassManager::run)")
+    @skipIfXPU("XPU 16-bit remainder results differ from XPU eager")
+    def test_remainder_and_fmod_match_eager_bit_exactly(self):
+        # Eager converts a Python number operand to the tensor's dtype, computes
+        # in fp32, and takes the divisor's sign (remainder) or the dividend's
+        # (fmod), keeping the sign of an exact zero.
+        @helion.kernel(autotune_effort="none")
+        def modulus(x: torch.Tensor, y: torch.Tensor, s: float) -> torch.Tensor:
+            out = torch.empty([8, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                u = x[tile]
+                v = y[tile]
+                out[0, tile] = torch.remainder(u, v)
+                out[1, tile] = torch.remainder(u, 0.7)
+                out[2, tile] = u % -0.7
+                out[3, tile] = torch.remainder(u, s)
+                out[4, tile] = torch.fmod(u, v)
+                out[5, tile] = torch.fmod(u, 0.7)
+                out[6, tile] = torch.fmod(u, s)
+                out[7, tile] = torch.remainder(1.3, v)
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for s in (1.3, -1.3):
+                with self.subTest(dtype=str(dtype), s=s):
+                    x = torch.randn(4096, device=DEVICE) * 4
+                    y = torch.randn(4096, device=DEVICE) * 2
+                    # Exact multiples, whose remainder is a signed zero.
+                    x[:4] = torch.tensor([-1.5, 1.5, -2.0, 0.0])
+                    y[:4] = torch.tensor([0.5, -0.5, 0.25, -1.0])
+                    x, y = x.to(dtype), y.to(dtype)
+                    _, result = code_and_output(modulus, (x, y, s))
+                    expected = torch.stack(
+                        [
+                            torch.remainder(x, y),
+                            torch.remainder(x, 0.7),
+                            x % -0.7,
+                            torch.remainder(x, s),
+                            torch.fmod(x, y),
+                            torch.fmod(x, 0.7),
+                            torch.fmod(x, s),
+                            torch.remainder(1.3, y),
+                        ]
+                    )
+                    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                    self.assertTrue(
+                        torch.equal(torch.signbit(result), torch.signbit(expected))
+                    )
+
+    @skipIfXPU("one wrapped 8-bit result differs from XPU eager by 256")
+    def test_narrow_integer_math_wraps_like_eager(self):
+        # Eager wraps every 8- and 16-bit integer result, and converts a
+        # Python number operand to the tensor's dtype first (x_uint8 % -7
+        # divides by 249).
+        @helion.kernel(autotune_effort="none")
+        def narrow_math(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([8, x.size(0)], dtype=torch.float32, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                u = x[tile]
+                out[0, tile] = (u * 3 + 100).to(torch.float32)
+                out[1, tile] = ((u << 4) >> 4).to(torch.float32)
+                out[2, tile] = (u * 2).to(torch.float32)
+                out[3, tile] = ((u + 90) % -7).to(torch.float32)
+                out[4, tile] = ((u * 3) // -5).to(torch.float32)
+                out[5, tile] = torch.fmod(u * 3, -7).to(torch.float32)
+                out[6, tile] = torch.div(u * 3, -7, rounding_mode="trunc").to(
+                    torch.float32
+                )
+                out[7, tile] = torch.abs(u * 3).to(torch.float32)
+            return out
+
+        for dtype in (torch.int8, torch.int16, torch.uint8):
+            with self.subTest(dtype=str(dtype)):
+                info = torch.iinfo(dtype)
+                x = torch.randint(
+                    info.min, info.max + 1, (1000,), device=DEVICE, dtype=torch.int32
+                ).to(dtype)
+                _, result = code_and_output(narrow_math, (x,))
+                expected = torch.stack(
+                    [
+                        u.to(torch.float32)
+                        for u in (
+                            x * 3 + 100,
+                            (x << 4) >> 4,
+                            x * 2,
+                            (x + 90) % -7,
+                            (x * 3) // -5,
+                            torch.fmod(x * 3, -7),
+                            torch.div(x * 3, -7, rounding_mode="trunc"),
+                            torch.abs(x * 3),
+                        )
+                    ]
+                )
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    @skipIfTileIR("TileIR's integer remainder of a partial tile stores out of bounds")
+    def test_integer_division_of_a_partial_tile_stays_in_bounds(self):
+        # A masked-off lane divides by its load's zero fill.  Integer
+        # division by zero is undefined behavior, which let the compiler drop
+        # that lane's masks and store past the end of the tensor and of each
+        # row.  The output is a view into a sentinel-filled buffer.
+        @helion.kernel(autotune_effort="none")
+        def divide_1d(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor, op: str):
+            for tile in hl.tile(x.size(0)):
+                if op == "remainder":
+                    out[tile] = x[tile] % y[tile]
+                elif op == "fmod":
+                    out[tile] = torch.fmod(x[tile], y[tile])
+                elif op == "floor":
+                    out[tile] = x[tile] // y[tile]
+                else:
+                    out[tile] = torch.div(x[tile], y[tile], rounding_mode="trunc")
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def divide_2d(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor, op: str):
+            for tile in hl.tile(x.size(0)):
+                if op == "remainder":
+                    out[tile, :] = x[tile, :] % y[tile, :]
+                elif op == "fmod":
+                    out[tile, :] = torch.fmod(x[tile, :], y[tile, :])
+                elif op == "floor":
+                    out[tile, :] = x[tile, :] // y[tile, :]
+                else:
+                    out[tile, :] = torch.div(
+                        x[tile, :], y[tile, :], rounding_mode="trunc"
+                    )
+            return out
+
+        eager = {
+            "remainder": torch.remainder,
+            "fmod": torch.fmod,
+            "floor": torch.floor_divide,
+            "trunc": lambda x, y: torch.div(x, y, rounding_mode="trunc"),
+        }
+        sentinel = 12345
+        for kernel, shape, block_size in (
+            (divide_1d, (1000,), 128),
+            (divide_2d, (100, 200), 16),
+        ):
+            for dtype in (torch.int32, torch.int64):
+                x = torch.randint(-1000, 1000, shape, device=DEVICE, dtype=dtype)
+                # Includes zero divisors in valid lanes, whose results eager
+                # leaves undefined on CUDA.
+                y = torch.randint(-30, 30, shape, device=DEVICE, dtype=dtype)
+                valid = y != 0
+                region = tuple(slice(0, size) for size in shape)
+                for op, reference in eager.items():
+                    with self.subTest(shape=shape, dtype=str(dtype), op=op):
+                        buffer = torch.full(
+                            [size + 256 for size in shape],
+                            sentinel,
+                            device=DEVICE,
+                            dtype=dtype,
+                        )
+                        _, result = code_and_output(
+                            kernel, (x, y, buffer[region], op), block_sizes=[block_size]
+                        )
+                        expected = reference(x, y)
+                        torch.testing.assert_close(result[valid], expected[valid])
+                        # Nothing past the output's rows or end was written.
+                        buffer[region] = sentinel
+                        self.assertTrue(torch.all(buffer == sentinel))
 
     @skipIfRefEager("Inductor config tests not applicable in ref eager mode")
     def test_patched_inductor_config(self):
@@ -1387,6 +1745,43 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("libdevice.tanh", code)
         self.assertIn("tl.float32", code)
         self.assertIn("tl.bfloat16", code)
+
+    @skipIfXPU("XPU 16-bit tanh GELU differs from XPU eager by an ulp")
+    @skipIfRocm("ROCm 16-bit tanh GELU differs from ROCm eager by an ulp")
+    def test_gelu_rounds_like_eager(self):
+        # Eager computes GELU in fp32 and rounds it to the input dtype before
+        # the next op.  The tanh form, associated as in eager's kernel, is
+        # bit-exact once rounded to 16 bits; in fp32, Triton's tanh can differ
+        # from eager's by an ulp on some GPUs.  erf differs from eager's by up
+        # to 1 fp32 ulp, which moves a few rounded results (mostly where
+        # 1 + erf cancels).
+        @helion.kernel(autotune_effort="none")
+        def gelu_then_mul(
+            x: torch.Tensor, w: torch.Tensor, approximate: str
+        ) -> torch.Tensor:
+            out = torch.empty([2, x.size(0)], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                g = torch.nn.functional.gelu(x[tile], approximate=approximate)
+                out[0, tile] = g
+                out[1, tile] = g * w[tile]
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            x = (torch.randn(4096, device=DEVICE) * 3).to(dtype)
+            w = torch.randn(4096, device=DEVICE).to(dtype)
+            for approximate in ("tanh", "none"):
+                with self.subTest(dtype=str(dtype), approximate=approximate):
+                    _, result = code_and_output(gelu_then_mul, (x, w, approximate))
+                    gelu = torch.nn.functional.gelu(x, approximate=approximate)
+                    expected = torch.stack([gelu, gelu * w])
+                    if dtype == torch.float32:
+                        torch.testing.assert_close(result, expected)
+                    elif approximate == "tanh":
+                        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                    else:
+                        # An unrounded GELU moved about a quarter of gelu * w.
+                        mismatched = (result != expected).float().mean().item()
+                        self.assertLess(mismatched, 0.05)
 
     @skipIfNotCUDA()
     @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
