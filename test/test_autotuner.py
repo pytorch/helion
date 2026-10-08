@@ -341,6 +341,60 @@ class TestMismatchTolerance(TestCase):
                 max_mismatched_abs_diff=5.0,
             )
 
+    def test_assert_close_with_mismatch_tolerance_non_finite(self) -> None:
+        # Matching infinities (e.g. -inf outside an attention window) are not
+        # mismatches, so only the 1.5 counts against the 30% budget here ...
+        inf = float("inf")
+        expected = torch.tensor([-inf, 1.0, 1.0, 1.0], device=DEVICE)
+        assert_close_with_mismatch_tolerance(
+            torch.tensor([-inf, 1.0, 1.0, 1.5], device=DEVICE),
+            expected,
+            max_mismatch_pct=0.3,
+            max_mismatched_abs_diff=1.0,
+        )
+        # ... while a one-sided inf or NaN is a mismatch with infinite diff.
+        for bad in (-inf, inf, float("nan")):
+            with self.assertRaisesRegex(
+                AssertionError, "Mismatched absolute diff too large"
+            ):
+                assert_close_with_mismatch_tolerance(
+                    torch.tensor([-inf, 1.0, 1.0, bad], device=DEVICE),
+                    expected,
+                    max_mismatch_pct=0.3,
+                    max_mismatched_abs_diff=1.0,
+                )
+        # A matching pair of infinities (or NaNs) has a NaN raw difference,
+        # which must not hide the 0.5 miss from the whole-tensor bounds.
+        for pad in (-inf, float("nan")):
+            actual = torch.tensor([pad, 1.0, 1.0, 1.5], device=DEVICE)
+            expected = torch.tensor([pad, 1.0, 1.0, 1.0], device=DEVICE)
+            assert_close_with_mismatch_tolerance(
+                actual,
+                expected,
+                max_mismatch_pct=0.3,
+                max_abs_diff=0.5,
+                max_rel_diff=0.5,
+            )
+            with self.assertRaisesRegex(AssertionError, "Absolute diff too large"):
+                assert_close_with_mismatch_tolerance(
+                    actual, expected, max_mismatch_pct=0.3, max_abs_diff=0.25
+                )
+            with self.assertRaisesRegex(AssertionError, "Relative diff too large"):
+                assert_close_with_mismatch_tolerance(
+                    actual, expected, max_mismatch_pct=0.3, max_rel_diff=0.25
+                )
+
+    def test_assert_close_with_mismatch_tolerance_mixed_dtypes(self) -> None:
+        # torch.isclose rejects differing dtypes; the helper must still judge
+        # such inputs numerically and raise only AssertionError, which is all
+        # the autotuner's accuracy check catches.
+        # CPU tensors: MPS has no float64, and the helper is device-agnostic.
+        actual = torch.tensor([1.0, 1.0, 1.0, 1.5])
+        expected = torch.ones(4, dtype=torch.float64)
+        assert_close_with_mismatch_tolerance(actual, expected, max_mismatch_pct=0.3)
+        with self.assertRaisesRegex(AssertionError, "Too many mismatches"):
+            assert_close_with_mismatch_tolerance(actual, expected, max_mismatch_pct=0.1)
+
     def test_accuracy_scaled_atol_tolerates_reduction_noise(self) -> None:
         from helion.autotuner.accuracy import assert_close
 

@@ -38,6 +38,9 @@ class Case:
     # single-tensor result, not an allowed set shared by every implementation.
     output_dtypes: dict[str, torch.dtype] = dataclasses.field(default_factory=dict)
     reference_note: str = ""
+    # Only read when check == "mismatch_budget"; see run_example's knobs.
+    max_mismatch_pct: float | None = None
+    max_mismatched_abs_diff: float | None = None
 
 
 # Three deliberately different workload sizes for every operation. Dimensions
@@ -213,8 +216,11 @@ def collect(module: str, shape_index: int) -> list[Case]:
         kernel_name: str = "helion",
         baseline_name: str = "aten",
         bwd: bool = False,
+        bwd_relative_l2: float | None = None,
         rtol: float = 1e-2,
         atol: float = 1e-1,
+        max_mismatch_pct: float | None = None,
+        max_mismatched_abs_diff: float | None = None,
         output_dtypes: dict[str, torch.dtype] | None = None,
         reference_note: str = "",
         **kwargs: Any,
@@ -227,6 +233,15 @@ def collect(module: str, shape_index: int) -> list[Case]:
         )
         mode = "backward" if bwd else "forward"
         name = f"{len(cases):02d}_{mode}"
+        # Mirror run_example's comparison policy so the catalogue judges each
+        # case the way the example itself does: gradients by relative L2 when
+        # the example asks for it, forward outputs by a mismatch budget when
+        # the example bounds the mismatch fraction instead of a global atol.
+        check = "close"
+        if bwd and bwd_relative_l2 is not None:
+            check, rtol, atol = "relative_l2", bwd_relative_l2, 0.0
+        elif not bwd and max_mismatch_pct is not None:
+            check = "mismatch_budget"
         cases.append(
             Case(
                 module,
@@ -237,9 +252,12 @@ def collect(module: str, shape_index: int) -> list[Case]:
                 mode,
                 rtol,
                 atol,
+                check,
                 description=description,
                 output_dtypes={} if output_dtypes is None else output_dtypes,
                 reference_note=reference_note,
+                max_mismatch_pct=max_mismatch_pct,
+                max_mismatched_abs_diff=max_mismatched_abs_diff,
             )
         )
         return dict.fromkeys([*kernels, *baselines], 1.0)
