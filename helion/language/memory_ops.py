@@ -7169,7 +7169,12 @@ def _(
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
+    from ..runtime.ref_mode import DEVICE_LOAD_NAME
+    from ..runtime.ref_mode import is_device_load
     from .ref_tile import RefTile
+
+    if is_device_load(tensor):
+        raise exc.DeviceTensorSubscriptAssignmentNotAllowed(DEVICE_LOAD_NAME)
 
     # Normalize indices and identify tensor indices
     indices = []
@@ -7363,6 +7368,7 @@ def _(
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
 ) -> torch.Tensor:
+    from ..runtime.ref_mode import device_load
     from .ref_tile import RefTile
 
     if extra_mask is None:
@@ -7377,8 +7383,11 @@ def _(
             grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
             for i, grid in zip(tensor_idxs, grids, strict=False):
                 indices[i] = grid
-        # pyrefly: ignore [bad-argument-type, bad-index]
-        return tensor[tuple(indices)]
+        # Integer and slice indices give a view.
+        return device_load(
+            # pyrefly: ignore [bad-argument-type, bad-index]
+            tensor[tuple(indices)]
+        )
 
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
