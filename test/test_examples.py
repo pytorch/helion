@@ -816,6 +816,60 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_rope_fwd(self):
+        batch, q_heads, k_heads, seq_len, head_dim = 1, 4, 2, 128, 64
+        q = torch.randn(
+            [batch, q_heads, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            [batch, k_heads, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        angles = torch.randn(
+            [batch, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        cos, sin = angles.cos(), angles.sin()
+        mod = import_path(EXAMPLES_DIR / "rope.py")
+        check_example(
+            "rope",
+            (q, k, cos, sin),
+            mod.rope_pytorch(q, k, cos, sin),
+            fn_name="rope_fwd",
+            block_sizes=[1, 32],
+        )
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_rope_bwd(self):
+        batch, q_heads, k_heads, seq_len, head_dim = 1, 4, 2, 128, 64
+        q = torch.randn(
+            [batch, q_heads, seq_len, head_dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        k = torch.randn(
+            [batch, k_heads, seq_len, head_dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        angles = torch.randn(
+            [batch, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        cos, sin = angles.cos(), angles.sin()
+        mod = import_path(EXAMPLES_DIR / "rope.py")
+        q_out, k_out = mod.rope_pytorch(q, k, cos, sin)
+        grad_q_out = torch.randn_like(q_out)
+        grad_k_out = torch.randn_like(k_out)
+        torch.autograd.backward((q_out, k_out), (grad_q_out, grad_k_out))
+        check_example(
+            "rope",
+            (grad_q_out, grad_k_out, cos, sin),
+            (q.grad, k.grad),
+            fn_name="rope_bwd",
+            block_sizes=[1, 32],
+        )
+
     def test_swiglu_bwd(self):
         """Test backward pass for swiglu."""
         x1, x2 = [

@@ -25,6 +25,12 @@ HELION_VEC_LANE_OF_ATTR = "_helion_vec_lane_of"
 # ``_cute_access_regions``); the lane-loop distribution's barrier analysis
 # needs no barrier between accesses whose regions are apart.
 HELION_ACCESS_REGIONS_ATTR = "_helion_access_regions"
+# On a CuTe statement: the tensors whose accesses across the lanes of one lane
+# loop the emitter has already proven ordered as the program reads them (the
+# staging buffer of an ``hl.split`` exchange, ``cute/split_exchange.py``); the
+# lane-loop distribution's barrier analysis does not pair two such statements
+# on those tensors at the lane level.
+HELION_LANE_ORDERED_ATTR = "_helion_lane_ordered"
 
 # Accessing these tensor attributes only reads host-side metadata, not tensor
 # storage.  Keep counting them as ordinary reads for liveness, but identify them

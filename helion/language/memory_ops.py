@@ -6960,7 +6960,7 @@ def _codegen_cute_store_permute_lane_loops(
 ) -> ast.AST | None:
     from .._compiler.cute.cute_reshape import _coords_from_flat_index
     from .._compiler.cute.cute_reshape import _flat_index_from_coords
-    from .._compiler.cute.cute_reshape import _get_dim_local_coord
+    from .._compiler.cute.cute_reshape import _get_node_dim_local_coord
     from .._compiler.cute.cute_reshape import _get_tile_shape
     from .._compiler.cute.cute_reshape import _permute_reorders_active_dims
     from .._compiler.cute.cute_reshape import _shape_op_needs_materialization
@@ -7063,7 +7063,7 @@ def _codegen_cute_store_permute_lane_loops(
         input_shape = _get_tile_shape(input_val, env, df.config)
         output_shape = _get_tile_shape(output_val, env, df.config)
         src_coords = [
-            _get_dim_local_coord(state.codegen, input_val, i)
+            _get_node_dim_local_coord(state.codegen, input_node, input_val, i)
             for i in range(len(input_shape))
         ]
         current_flat = _flat_index_from_coords(src_coords, input_shape)
@@ -7093,13 +7093,16 @@ def _codegen_cute_store_permute_lane_loops(
         output_non_unit = [s for s in output_shape if s != 1]
         if input_non_unit == output_non_unit:
             return None
+        # Split-view dims carry their coordinates as node metadata; honoring
+        # it keeps a merge of such dims a relabel instead of a zero-coordinate
+        # shuffle that collapses the row.
         src_coords = [
-            _get_dim_local_coord(state.codegen, input_val, i)
+            _get_node_dim_local_coord(state.codegen, input_node, input_val, i)
             for i in range(len(input_shape))
         ]
         current_flat = _flat_index_from_coords(src_coords, input_shape)
         output_coords = [
-            _get_dim_local_coord(state.codegen, output_val, i)
+            _get_node_dim_local_coord(state.codegen, value_node, output_val, i)
             for i in range(len(output_shape))
         ]
         read_flat = _flat_index_from_coords(output_coords, output_shape)
