@@ -561,6 +561,24 @@ def _add_kernel(x, y):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _ragged_grouped_matmul_kernel(lhs, weights, offsets):
+    output = torch.empty(
+        (lhs.size(0), weights.size(2)), dtype=lhs.dtype, device=lhs.device
+    )
+    for group in hl.grid(offsets.size(0) - 1):
+        start = offsets[group]
+        end = offsets[group + 1]
+        for tile_m in hl.tile(start, end):
+            accumulator = hl.dot(
+                lhs[tile_m, :],
+                weights[group, :, :],
+                out_dtype=torch.float32,
+            )
+            output[tile_m, :] = accumulator.to(output.dtype)
+    return output
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _nested_tile_no_grid_kernel(x, y):
     """Nested ``hl.tile(..., block_size=)`` + ``hl.tile(mb_cta.begin, mb_cta.end)``,
     no ``hl.grid``. Mirrors ``examples/rms_norm.py::rms_norm_bwd``: the config
@@ -1915,7 +1933,7 @@ class TestWorklistLoopDispatch(unittest.TestCase):
                 code = kernel.bind(args).to_triton_code(
                     _worklist_config([8, 8], loop_type="emit_pipeline")
                 )
-                self.assertIn("_ds_pad_dims=[(2, 0, 8, 7)]", code)
+                self.assertIn("_ds_pad_dims=[(3, 0, 8, 7)]", code)
                 if kernel is _nested_ordered_load_kernel:
                     self.assertIn("lax.cond", code)
                     self.assertNotIn("_region_clean", code)
@@ -2212,6 +2230,41 @@ class TestWorklistNumerics(unittest.TestCase):
     (verified: large abs error vs eager), so interpret is not a sound oracle for
     it. On real TPU, worklist flattening matches eager to bf16-matmul roundoff.
     """
+
+    @skipIfPallasInterpret("device-built packed worklists require a real TPU")
+    def test_ragged_grouped_matmul_matches_eager(self):
+        """Empty and unaligned groups preserve every packed output row."""
+        group_sizes = [5, 0, 19, 125, 11]
+        offsets = _offsets(group_sizes)
+        rows, contracting_size, output_size = int(offsets[-1]), 128, 128
+        torch.manual_seed(0)
+        lhs = torch.randn(
+            rows,
+            contracting_size,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        weights = torch.randn(
+            len(group_sizes),
+            contracting_size,
+            output_size,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        reference = torch.empty(rows, output_size, dtype=torch.bfloat16)
+        lhs_cpu = lhs.cpu()
+        weights_cpu = weights.cpu()
+        for group, size in enumerate(group_sizes):
+            start, end = int(offsets[group]), int(offsets[group + 1])
+            if size:
+                reference[start:end] = lhs_cpu[start:end] @ weights_cpu[group]
+
+        _, output = code_and_output(
+            _ragged_grouped_matmul_kernel,
+            (lhs, weights, offsets.to(DEVICE)),
+            **_worklist_config([32], grouping=1),
+        )
+        torch.testing.assert_close(output.cpu(), reference, rtol=2e-2, atol=2e-2)
 
     def test_dense_kv_unaligned_matches_eager(self):
         # Unaligned offsets + partial last tiles => the store-overlap case that
@@ -3202,7 +3255,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         # The logical end can exceed the backing K/V extent, so shortening the
         # DMA would leave a lane that the loop mask considers valid stale.
         # Pin the block extent used by the padding assertion below.
-        self.assertIn("_ds_pad_dims=[(3, 0, 128, 127), (4, 0, 128, 127)]", code)
+        self.assertIn("_ds_pad_dims=[(4, 0, 128, 127), (5, 0, 128, 127)]", code)
         self.assertNotIn("jnp.clip(50 -", code)
 
     def test_unpacked_ordered_bound_rejects_resident_unroll(self):

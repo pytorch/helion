@@ -2532,6 +2532,7 @@ def default_pallas_launcher(
     _compact_aligned_arg_indices: list[int] | None = None,
     _compact_tile_start_ref_pos: int = 1,
     _compact_block: int = 1,
+    _compact_build_on_device: bool = False,
     # Resident-cache (owner-cache) params: the backstop below reads all of them
     # every call; the three compile-relevant ones are threaded to the install path.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
@@ -2610,6 +2611,7 @@ def default_pallas_launcher(
                 _compact_aligned_arg_indices=_compact_aligned_arg_indices,
                 _compact_tile_start_ref_pos=_compact_tile_start_ref_pos,
                 _compact_block=_compact_block,
+                _compact_build_on_device=_compact_build_on_device,
                 _compact_ordered_aligned_arg_indices=_compact_ordered_aligned_arg_indices,
                 _compact_range_start_ref_pos=_compact_range_start_ref_pos,
                 _compact_ordered_window=_compact_ordered_window,
@@ -2702,6 +2704,36 @@ def _compact_window_block_spec(
     return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
 
 
+def _compact_sublane_window_block_spec(
+    t: object,
+    window: int,
+    start_ref_pos: int,
+    extent_ref_pos: int,
+    scalar_refs: tuple[object, ...],
+    *,
+    sublane: int,
+) -> object:
+    """Aligned physical view of one logical 2-D compact row window."""
+    from jax.experimental import pallas as pl
+    import jax.numpy as jnp
+
+    rows, width = (int(dim) for dim in t.shape)  # type: ignore[attr-defined]
+    physical_rows = (rows + sublane - 1) // sublane
+    physical_window = (window + sublane - 1) // sublane
+    block_shape = (pl.BoundedSlice(physical_window), sublane, width)  # type: ignore[union-attr]
+
+    def index_map(wid: object) -> tuple[object, ...]:
+        start = scalar_refs[start_ref_pos][wid]  # type: ignore[index]
+        extent = scalar_refs[extent_ref_pos][wid]  # type: ignore[index]
+        physical_start = start // sublane
+        local_start = start % sublane
+        size = (local_start + extent + sublane - 1) // sublane
+        size = jnp.clip(size, 0, physical_rows - physical_start)
+        return (pl.ds(physical_start, size), jnp.int32(0), jnp.int32(0))
+
+    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+
+
 def _pallas_compact_in_out_specs(
     pl: object,
     jnp: object,
@@ -2716,6 +2748,7 @@ def _pallas_compact_in_out_specs(
     scalar_refs: tuple[object, ...],
     aligned_set: set[int] | None = None,
     tile_start_ref_pos: int = 1,
+    tile_extent_ref_pos: int = 2,
     compact_block: int = 1,
     ordered_aligned_set: set[int] | None = None,
     range_start_ref_pos: int = -1,
@@ -2748,8 +2781,21 @@ def _pallas_compact_in_out_specs(
             # the load and the store write-back across work items.  Window
             # sizing and the tensor-end hazard: _compact_window_block_spec.
             # Windowed on dim 0 only: emit_pipeline rejects it on the lane dim.
+            if int(t.ndim) == 2:  # type: ignore[attr-defined]
+                itemsize = int(t.dtype.itemsize)  # type: ignore[attr-defined]
+                return _compact_sublane_window_block_spec(
+                    t,
+                    compact_block,
+                    tile_start_ref_pos,
+                    tile_extent_ref_pos,
+                    scalar_refs,
+                    sublane=32 // min(itemsize, 4),
+                )
             return _compact_window_block_spec(
-                t, compact_block, tile_start_ref_pos, scalar_refs
+                t,
+                compact_block,
+                tile_start_ref_pos,
+                scalar_refs,
             )
         if idx in ordered_aligned_set:
             # Resident caching: per-range resident window sized ``ordered_window``
@@ -2759,7 +2805,10 @@ def _pallas_compact_in_out_specs(
             assert ordered_window > 0
             assert range_start_ref_pos >= 0
             return _compact_window_block_spec(
-                t, ordered_window, range_start_ref_pos, scalar_refs
+                t,
+                ordered_window,
+                range_start_ref_pos,
+                scalar_refs,
             )
         entry = block_spec_info[arg_to_tpos[idx]] if block_spec_info else None
         if entry is not None:
@@ -2782,7 +2831,11 @@ def _pallas_compact_in_out_specs(
                     )
 
                 mem = pltpu.SMEM if idx in smem_set else None  # type: ignore[union-attr]
-                return pl.BlockSpec(block_shape, index_map, memory_space=mem)  # type: ignore[union-attr]
+                return pl.BlockSpec(  # type: ignore[union-attr]
+                    block_shape,
+                    index_map,
+                    memory_space=mem,
+                )
         return _pallas_make_block_spec(pl, jnp, pltpu, t, entry, idx in smem_set)
 
     in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
@@ -2826,6 +2879,60 @@ def _pallas_make_compact_reordered_kernel(
     return reordered_kernel
 
 
+def _pallas_fill_packed_worklist(
+    lax: object,
+    offsets_ref: object,
+    num_work_ref: object,
+    owner_ids_ref: object,
+    tile_starts_ref: object,
+    tile_extents_ref: object,
+    *,
+    block: int,
+    alignment: int = 1,
+) -> None:
+    """Build compact metadata from packed offsets in TPU scalar memory."""
+
+    def fill_owner(owner: object, work_begin: object) -> object:
+        start = offsets_ref[owner]  # type: ignore[index]
+        end = offsets_ref[owner + 1]  # type: ignore[index,operator]
+        length = end - start
+        local_start = start % alignment
+        first_extent = lax.min(block - local_start, length)  # type: ignore[union-attr]
+        count = lax.select(  # type: ignore[union-attr]
+            length == 0,
+            0,
+            (local_start + length + block - 1) // block,
+        )
+
+        def fill_tile(tile: object, unused: object) -> object:
+            work = work_begin + tile  # type: ignore[operator]
+            tile_start = lax.select(  # type: ignore[union-attr]
+                tile == 0,
+                start,
+                start + first_extent + (tile - 1) * block,  # type: ignore[operator]
+            )
+            tile_extent = lax.select(  # type: ignore[union-attr]
+                tile == 0,
+                first_extent,
+                lax.min(block, end - tile_start),  # type: ignore[union-attr]
+            )
+            owner_ids_ref[work] = owner  # type: ignore[index]
+            tile_starts_ref[work] = tile_start  # type: ignore[index]
+            tile_extents_ref[work] = tile_extent  # type: ignore[index]
+            return unused
+
+        lax.fori_loop(0, count, fill_tile, None)  # type: ignore[union-attr]
+        return work_begin + count  # type: ignore[operator]
+
+    num_owners = offsets_ref.shape[0] - 1  # type: ignore[union-attr]
+    num_work_ref[0] = lax.fori_loop(  # type: ignore[index,union-attr]
+        0,
+        num_owners,
+        fill_owner,
+        0,
+    )
+
+
 def _pallas_compile_compact_jit_fn(
     pallas_kernel: object,
     args: tuple[object, ...],
@@ -2843,16 +2950,20 @@ def _pallas_compile_compact_jit_fn(
     num_scalar_prefetch: int,
     aligned_arg_indices: list[int] | None = None,
     tile_start_ref_pos: int = 1,
+    tile_extent_ref_pos: int = 2,
     compact_block: int = 1,
     ordered_aligned_arg_indices: list[int] | None = None,
     range_start_ref_pos: int = -1,
     ordered_window: int = 0,
+    compact_upper: int = 1,
+    build_on_device: bool = False,
     interpret: bool = False,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
     """Build the compact-worklist jit_fn: build metadata in-jit -> dynamic grid."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
+    import jax.lax as lax
     import jax.numpy as jnp
 
     (
@@ -2903,9 +3014,202 @@ def _pallas_compile_compact_jit_fn(
     n_io = n_inputs + n_outputs
     pass_positions = hbm_in_positions | {n_inputs + p for p in hbm_out_positions}
     pipe_positions = [p for p in range(n_io) if p not in pass_positions]
+    io_arg_indices = [*tensor_arg_indices, *_output_indices]
+    io_args = [cast("_TorchTensorOrJaxArray", args[index]) for index in io_arg_indices]
+    sublane_by_position = {
+        position: 32 // min(int(getattr(arg.dtype, "itemsize", 4)), 4)
+        for position, (arg_index, arg) in enumerate(
+            zip(io_arg_indices, io_args, strict=True)
+        )
+        if arg_index in aligned_set and int(arg.ndim) == 2
+    }
+    carried_output_positions = {
+        position
+        for position in sublane_by_position
+        if position >= n_inputs and position in pipe_positions
+    }
+    sublane_sizes = set(sublane_by_position.values())
+    if len(sublane_sizes) > 1:
+        raise ValueError(
+            "compact row windows with different TPU sublane sizes are unsupported"
+        )
+    compact_alignment = next(iter(sublane_sizes), 1)
     num_launch_scalar_prefetch = num_scalar_prefetch + 1
+    use_device_worklist = (
+        build_on_device
+        and not interpret
+        and metadata_fields == ["owner_ids", "tile_starts", "tile_extents"]
+        and len(offset_tpos) == 1
+    )
 
     def jit_fn(*jax_inputs: object) -> object:
+        if use_device_worklist:
+            offset_input = cast("_TorchTensorOrJaxArray", jax_inputs[offset_tpos[0]])
+            device_metadata_types = [
+                pltpu.SMEM((compact_upper,), jnp.int32)  # type: ignore[union-attr]
+                for _ in metadata_fields
+            ]
+            device_worklist_scratch: list[object] = [
+                pltpu.SMEM(tuple(offset_input.shape), offset_input.dtype),  # type: ignore[union-attr]
+                pltpu.SMEM((1,), jnp.int32),  # type: ignore[union-attr]
+                *device_metadata_types,
+            ]
+            carry_types = [
+                pltpu.VMEM(  # type: ignore[union-attr]
+                    (
+                        sublane_by_position[position],
+                        int(io_args[position].shape[1]),
+                    ),
+                    _pallas_jnp_dtype_map()[
+                        f"jnp.{str(io_args[position].dtype).split('.')[-1]}"
+                    ],
+                )
+                for position in sorted(carried_output_positions)
+            ]
+            all_scratch = [
+                *scratch_shapes,
+                *device_worklist_scratch,
+                *carry_types,
+            ]
+
+            def kernel_body(*refs: object) -> None:
+                io_any = refs[:n_io]
+                rest = refs[n_io:]
+                kernel_scratch = rest[:n_kernel_scratch]
+                worklist_end = n_kernel_scratch + 2 + len(metadata_fields)
+                worklist_scratch = rest[n_kernel_scratch:worklist_end]
+                carry_scratch = rest[worklist_end:]
+                offsets_smem = worklist_scratch[0]
+                num_work_smem = worklist_scratch[1]
+                metadata_smem = worklist_scratch[2:]
+                pltpu.sync_copy(  # type: ignore[union-attr]
+                    io_any[offset_tpos[0]], offsets_smem
+                )
+                _pallas_fill_packed_worklist(
+                    lax,
+                    offsets_smem,
+                    num_work_smem,
+                    *metadata_smem,
+                    block=compact_block,
+                    alignment=compact_alignment,
+                )
+
+                in_specs, out_specs = _pallas_compact_in_out_specs(
+                    pl,
+                    jnp,
+                    pltpu,
+                    args,
+                    tensor_arg_indices,
+                    _output_indices,
+                    _block_spec_info,
+                    smem_set,
+                    hbm_set,
+                    owner_ref_pos,
+                    tuple(metadata_smem),
+                    aligned_set,
+                    tile_start_ref_pos,
+                    tile_extent_ref_pos,
+                    compact_block,
+                    ordered_set,
+                    range_start_ref_pos,
+                    ordered_window,
+                )
+                out_specs_seq = (
+                    list(out_specs)
+                    if isinstance(out_specs, (list, tuple))
+                    else [out_specs]
+                )
+                all_specs = list(in_specs) + out_specs_seq
+                pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
+                pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
+
+                pipe_any = []
+                for position in pipe_positions:
+                    ref = io_any[position]
+                    sublane = sublane_by_position.get(position)
+                    if sublane is not None:
+                        shape = io_args[position].shape
+                        if int(shape[0]) % sublane:
+                            raise ValueError(
+                                "compact sublane windows require a padded row "
+                                f"dimension, got shape {tuple(shape)}"
+                            )
+                        ref = ref.reshape(  # type: ignore[union-attr]
+                            int(shape[0]) // sublane,
+                            sublane,
+                            int(shape[1]),
+                        )
+                    pipe_any.append(ref)
+
+                carry_by_position = dict(
+                    zip(
+                        sorted(carried_output_positions),
+                        carry_scratch,
+                        strict=True,
+                    )
+                )
+                for carry_ref in carry_scratch:
+                    carry_ref[...] = jnp.zeros_like(carry_ref[...])  # type: ignore[index]
+
+                def pipeline_body(*block_refs: object) -> None:
+                    merged = list(io_any)
+                    physical_blocks = dict(zip(pipe_positions, block_refs, strict=True))
+                    wid = pl.program_id(0)  # type: ignore[union-attr]
+                    start = metadata_smem[tile_start_ref_pos][wid]  # type: ignore[index]
+                    extent = metadata_smem[tile_extent_ref_pos][wid]  # type: ignore[index]
+                    for p, block_ref in zip(pipe_positions, block_refs, strict=True):
+                        sublane = sublane_by_position.get(p)
+                        if sublane is None:
+                            merged[p] = block_ref
+                            continue
+                        width = int(io_args[p].shape[1])
+                        merged[p] = block_ref.reshape(-1, width)  # type: ignore[union-attr]
+                    reordered_kernel(  # type: ignore[operator]
+                        *metadata_smem, *merged, *kernel_scratch
+                    )
+                    for p, carry_ref in carry_by_position.items():
+                        sublane = sublane_by_position[p]
+                        carry_value = carry_ref[...]  # type: ignore[index]
+                        local_start = start % sublane
+                        physical_count = (local_start + extent + sublane - 1) // sublane
+                        block_ref = physical_blocks[p]
+                        head_rows = (
+                            (jnp.arange(sublane) < local_start)
+                            & (local_start != 0)
+                            & (wid != 0)
+                        ).astype(carry_ref.dtype)  # pyrefly: ignore[missing-attribute]
+                        head_mask = head_rows[:, None]
+                        block_ref[0, :, :] = (  # type: ignore[index]
+                            carry_value * head_mask
+                            + block_ref[0, :, :] * (1 - head_mask)  # type: ignore[index]
+                        )
+                        next_carry = jnp.where(
+                            (local_start + extent) % sublane != 0,
+                            block_ref[physical_count - 1, :, :],  # type: ignore[index]
+                            carry_value,
+                        )
+                        carry_ref[...] = next_carry  # type: ignore[index]
+
+                pltpu.emit_pipeline(  # type: ignore[union-attr]
+                    pipeline_body,
+                    grid=(num_work_smem[0],),  # type: ignore[index]
+                    in_specs=pipe_in_specs,
+                    out_specs=pipe_out_specs,
+                )(*pipe_any)
+
+            call = pl.kernel(  # type: ignore[union-attr]
+                kernel_body,
+                out_shape_arg,
+                mesh=pltpu.create_tensorcore_mesh(  # type: ignore[union-attr]
+                    "_helion_core", num_cores=1
+                ),
+                **{_pallas_kernel_scratch_kwarg(pl): all_scratch},  # pyrefly: ignore[bad-argument-type]
+                compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                    vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
+                ),
+            )
+            return call(*jax_inputs)
+
         offsets = [jax_inputs[tp] for tp in offset_tpos]
         metadata = build_worklist(*offsets)
         # Keep the dynamic grid bound explicit rather than closing over the
@@ -2955,6 +3259,7 @@ def _pallas_compile_compact_jit_fn(
                 tuple(metadata_smem),
                 aligned_set,
                 tile_start_ref_pos,
+                tile_extent_ref_pos,
                 compact_block,
                 ordered_set,
                 range_start_ref_pos,
@@ -3040,6 +3345,7 @@ def _pallas_install_compact_launcher_cache(
     _compact_aligned_arg_indices: list[int] | None,
     _compact_tile_start_ref_pos: int,
     _compact_block: int,
+    _compact_build_on_device: bool,
     # Resident-cache (owner-cache) compile params; default to inactive so a
     # non-resident compact kernel compiles unchanged.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
@@ -3093,6 +3399,8 @@ def _pallas_install_compact_launcher_cache(
         ordered_aligned_arg_indices=_compact_ordered_aligned_arg_indices or [],
         range_start_ref_pos=_compact_range_start_ref_pos,
         ordered_window=_compact_ordered_window,
+        compact_upper=int(grid[0]),
+        build_on_device=_compact_build_on_device,
         interpret=interpret,
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret

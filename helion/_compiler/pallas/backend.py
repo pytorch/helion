@@ -1690,6 +1690,7 @@ class PallasBackend(Backend):
             f"_compact_aligned_arg_indices={aligned_indices!r}",
             f"_compact_tile_start_ref_pos={fields.index('tile_starts')}",
             f"_compact_block={env.compact_worklist_block * plan.grouping}",
+            f"_compact_build_on_device={env.compact_worklist_device_builder!r}",
             f"_compact_ordered_aligned_arg_indices={ordered_indices!r}",
             f"_compact_range_start_ref_pos={range_start_ref_pos}",
             f"_compact_ordered_offset_arg_index={ordered_offset_arg_index}",
@@ -1781,6 +1782,7 @@ class PallasBackend(Backend):
         env.compact_worklist_upper = 1
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
+        env.compact_worklist_device_builder = False
         env.compact_worklist_offset_params = []
 
         if grouping in (1, 2):
@@ -1837,7 +1839,42 @@ class PallasBackend(Backend):
         )
         env.compact_worklist_plan = plan
 
+        packed_offsets = plan.compact_axis.packed_offset_arg
+        params = dict(host_fn.params.arguments)
+        env.compact_worklist_device_builder = (
+            plan.ordered_axis is None
+            and packed_offsets is not None
+            and packed_offsets in params
+            and self._compact_worklist_num_owners(plan, host_fn)
+            == int(params[packed_offsets].shape[0]) - 1
+        )
+
         device_fn = DeviceFunction.current()
+        # The compact launcher gives each tensor policy an exact BlockSpec
+        # window.  These arguments therefore arrive as local VMEM refs; retain
+        # neither the earlier dynamic-range HBM classification nor its
+        # per-access copy path inside the generated kernel.
+        from ..device_function import PallasMemorySpace
+
+        windowed_args = {
+            policy.arg_name
+            for policy in plan.tensor_policies
+            if policy.kind
+            in (
+                "compact_aligned_load",
+                "compact_exact_store",
+                "owner_indexed",
+            )
+        }
+        if env.compact_worklist_device_builder:
+            for graph_info in graphs:
+                for node in graph_info.graph.nodes:
+                    fake = node.meta.get("val")
+                    if not isinstance(fake, torch.Tensor):
+                        continue
+                    origin = host_fn.tensor_to_origin.get(fake)
+                    if origin is not None and origin.host_str() in windowed_args:
+                        device_fn.pallas_memory_space[id(fake)] = PallasMemorySpace.VMEM
         for name in metadata_arg_names(plan):
             ref = f"{name}_ref"
             if ref not in device_fn.wrapper_only_params:
@@ -1903,18 +1940,7 @@ class PallasBackend(Backend):
         from ..compile_environment import CompileEnvironment
 
         params = dict(host_fn.params.arguments)
-        # Owner count from the captured grid bound (e.g. offsets.shape[0] - 1).
-        # num_owners_expr is a codegen-derived host expression; if it references a
-        # name not in params (a source shape we failed to inline), surface it as
-        # an autotuner-skippable InvalidConfig rather than a bare exception that
-        # would abort the whole search.
-        try:
-            num_owners = int(eval(plan.num_owners_expr, {}, params))
-        except Exception as e:
-            raise exc.InvalidConfig(
-                f"compact_worklist: could not evaluate owner-count expression "
-                f"{plan.num_owners_expr!r}: {e}"
-            ) from e
+        num_owners = self._compact_worklist_num_owners(plan, host_fn)
         # total_compact = padded leading dim of the compact_aligned_load tensor.
         compact_arg = next(
             p.arg_name for p in plan.tensor_policies if p.kind == "compact_aligned_load"
@@ -1923,6 +1949,20 @@ class PallasBackend(Backend):
         block = CompileEnvironment.current().compact_worklist_block * plan.grouping
         # Single source of the tight megablocks bound (also unit-tested).
         return packed_upper_bound(total, num_owners, block)
+
+    @staticmethod
+    def _compact_worklist_num_owners(
+        plan: CompactWorklistPlan, host_fn: HostFunction
+    ) -> int:
+        """Evaluate the captured owner-grid bound for one static-shape kernel."""
+        params = dict(host_fn.params.arguments)
+        try:
+            return int(eval(plan.num_owners_expr, {}, params))
+        except Exception as error:
+            raise exc.InvalidConfig(
+                "compact_worklist: could not evaluate owner-count expression "
+                f"{plan.num_owners_expr!r}: {error}"
+            ) from error
 
 
 # Launcher kwargs that mark a kernel using a Pallas feature the pure-JAX

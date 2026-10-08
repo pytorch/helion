@@ -1658,12 +1658,20 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
                 }
 
             fn_name = state.device_function.new_var(f"_compact_group_{factor}")
+            start_ref, _ = compact_ref_names(plan)
+            sublane = state.device_function.aligned_tiles.get(
+                plan.compact_axis.block_id, 1
+            )
+            extent = f"{extent_ref}[_wid]"
+            physical_extent = (
+                extent
+                if sublane == 1
+                else f"(({start_ref}_ref[_wid] % {sublane}) + {extent})"
+            )
             comparison = "<=" if factor == 1 else ">"
+            predicate = f"{physical_extent} {comparison} {env.compact_worklist_block}"
             fn_def = statement_from_string(
-                f"@pl.when({extent_ref}[_wid] {comparison} "
-                f"{env.compact_worklist_block})\n"
-                f"def {fn_name}():\n"
-                f"    pass"
+                f"@pl.when({predicate})\ndef {fn_name}():\n    pass"
             )
             assert isinstance(fn_def, ast.FunctionDef)
             fn_def.body = cast("list[ast.stmt]", branch_body) or [ast.Pass()]
@@ -3302,6 +3310,12 @@ def _record_aligned_tiles(
             if addr is None or addr is SliceAddressing.DIRECT:
                 continue  # nothing slices the dim, or a clamped slice suffices
             if bid in written_bids:
+                plan = env.compact_worklist_plan
+                if plan is not None and bid == plan.compact_axis.block_id:
+                    # The compact launcher serializes packed row windows and
+                    # carries their shared sublane boundary in VMEM.
+                    state.device_function.aligned_tiles[bid] = sublane
+                    continue
                 # Some access rounded the window begin down, so every store on
                 # this dim writes the head rows [aligned_begin, begin), whether
                 # the store itself is DIRECT or ALIGNED.
@@ -4248,6 +4262,21 @@ def _classify_pipelined_tensors(
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
+    compact_plan = env.compact_worklist_plan
+    compact_outer_names = (
+        {
+            policy.arg_name
+            for policy in compact_plan.tensor_policies
+            if policy.kind
+            in (
+                "compact_aligned_load",
+                "compact_exact_store",
+                "owner_indexed",
+            )
+        }
+        if compact_plan is not None
+        else set()
+    )
     contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info,
@@ -4294,6 +4323,11 @@ def _classify_pipelined_tensors(
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        if (
+            compact_outer_names
+            and state.device_function.tensor_arg(fake).host_str() in compact_outer_names
+        ):
+            continue
         if state.device_function.pallas_internal_scratch_name(fake) is not None:
             # This tensor already names a VMEM allocation owned by the kernel.
             # Routing it through the inner-loop HBM DMA path would allocate a
@@ -4850,7 +4884,12 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         _compact_names = {
             p.arg_name
             for p in _compact_plan.tensor_policies
-            if p.kind in ("compact_aligned_load", "compact_exact_store")
+            if p.kind
+            in (
+                "compact_aligned_load",
+                "compact_exact_store",
+                "owner_indexed",
+            )
         }
         _fid_to_fake = {id(f): f for f, _s, _d in all_tensor_info}
         pipelined_tensor_ids = {
