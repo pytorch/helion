@@ -3736,14 +3736,8 @@ class ConfigSpec:
                 )
             config.pop(key, None)
 
-    def supported_config_keys(
-        self, config: Mapping[str, object] | None = None
-    ) -> frozenset[str]:
-        if config is None:
-            return frozenset(
-                key for key in VALID_KEYS if self.supports_config_key(key)
-            )
-        return VALID_KEYS - {*self.unsupported_config_keys(config)}
+    def supported_config_keys(self) -> frozenset[str]:
+        return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
     def _default_num_stages(self) -> int:
         return DEFAULT_NUM_STAGES
@@ -5124,10 +5118,11 @@ class ConfigSpec:
             )
 
         # Allow tunable parameter keys in addition to backend-supported keys.
-        allowed_keys = self.supported_config_keys(config) | {
+        unknown_keys = {*config} - VALID_KEYS
+        invalid_keys = (unknown_keys | {*self.unsupported_config_keys(config)}) - {
             *self.user_defined_tunables.keys()
         }
-        if invalid_keys := ({*config} - allowed_keys):
+        if invalid_keys:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def raise_grid_block_minimums(self) -> None:
