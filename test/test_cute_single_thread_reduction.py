@@ -129,6 +129,23 @@ def _row_sums_then_doubled(
     return sums, doubled
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _full_slice_matmul_grads(
+    grad_out: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, _k = x.size()
+    grad_x = torch.empty_like(x)
+    block_m = hl.register_block_size(m)
+    grad_w_parts = torch.zeros(
+        [(m + block_m - 1) // block_m, *w.shape], dtype=torch.float32, device=w.device
+    )
+    for tile_m in hl.tile(m, block_size=block_m):
+        g = grad_out[tile_m, :]
+        grad_x[tile_m, :] = g @ w[:, :].T
+        grad_w_parts[tile_m.id, :, :] = x[tile_m, :].T @ g
+    return grad_x, grad_w_parts
+
+
 def _root_launch_threads(code: str) -> tuple[int, int]:
     """The launch's thread count on the root tile's axis and the root block size."""
     axis = re.search(
@@ -412,6 +429,24 @@ class TestCuteSingleThreadReduction(TestCase):
         code, out = code_and_output(_softmax_full_slice_matmul, (x, w))
         expected = torch.softmax(x, dim=-1) @ w + x.sum(-1, keepdim=True)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        launched, rows = _root_launch_threads(code)
+        self.assertEqual(launched, rows, code)
+
+    def test_full_slice_matmul_grads_launch_every_row(self) -> None:
+        # The shape of helion.experimental.backward's kernel for
+        # ``out[tile_m, :] = x[tile_m, :] @ w[:, :]``: two contractions over
+        # transposed full slices, one of them shrunk to a single thread.
+        torch.manual_seed(0)
+        x = torch.randn(64, 48, device=DEVICE)
+        w = torch.randn(48, 32, device=DEVICE)
+        grad_out = torch.randn(64, 32, device=DEVICE)
+        code, (grad_x, grad_w_parts) = code_and_output(
+            _full_slice_matmul_grads, (grad_out, x, w), block_sizes=[32]
+        )
+        torch.testing.assert_close(grad_x, grad_out @ w.T, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            grad_w_parts.sum(0), x.T @ grad_out, rtol=1e-4, atol=1e-4
+        )
         launched, rows = _root_launch_threads(code)
         self.assertEqual(launched, rows, code)
 

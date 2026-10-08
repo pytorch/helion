@@ -169,6 +169,8 @@ class HostFunction:
         self.compiler_state: CompilerState = CompilerState()
         self._device_ir: DeviceIR | None = None
         self.local_types: dict[str, TypeInfo] | None = None
+        # Whether Backend.customize_ast rewrote the kernel body.
+        self.backend_rewrote_ast = False
 
     # Backward-compatible accessors
 
