@@ -462,7 +462,7 @@ def get_device_name(device: torch.device | None = None) -> str | None:
     if device is None:
         if torch.cuda.is_available():
             device = torch.device("cuda", torch.cuda.current_device())
-        elif getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+        elif hasattr(torch, "tpu") and torch.accelerator.is_available():
             # torch_tpu (PrivateUse1) exposes no per-chip name; report the
             # generation so dashboard rows land on the "tpu" platform instead of
             # "unknown" (matches benchmarks/run_tpu.py).
