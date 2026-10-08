@@ -162,7 +162,9 @@ def test_packed_collective_preserves_input_alias_rejection(
     a = torch.empty((73, 78), dtype=dtype)
     inputs = (a, torch.empty((39, 41), dtype=torch.int8), a[:, :41], 2, False)
     bound = _cpu_bind(_expanded_matmul, inputs)
-    with pytest.raises(BackendUnsupported, match="operand loads may alias"):
+    # The output aliases an operand: the thread-race check sees the store race
+    # the operand loads before the collective lowering sees the aliasing.
+    with pytest.raises(BackendUnsupported, match="a body a later pass rewrites"):
         bound.to_code(_config(n_first=n_first))
 
 

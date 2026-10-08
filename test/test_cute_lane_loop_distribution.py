@@ -10,7 +10,8 @@ accesses of its tensor is rejected instead.  Whether an access repeats is
 decided by the values it reads, not by the loops the structure places it in: a
 partial tile's masks tie every access to every loop, and a device loop's lane
 loops are built around its body before the body exists (that nest is checked
-the same way, never redistributed).  A placement is checked like the nest it
+the same way, and redistributed like a root body when it is inexact).  A
+placement is checked like the nest it
 replaces: an inner loop nested inside an outer one (by its hoisted packets, or
 because a statement needs both and each loop is materialized once) runs its
 statements inside the outer loop whether or not their values change with it.
@@ -938,18 +939,24 @@ _INNER_LANES_CONFIG = {
 }
 
 
-def test_tile_uniform_store_in_an_inner_loops_lane_nest_is_checked() -> None:
+def test_tile_uniform_store_in_an_inner_loops_lane_nest_is_placed() -> None:
     # A device loop's lane loops are built around its body before the body
-    # exists and are never redistributed, so the nest must be the tile
-    # program.  The zeroing store ignores the column lane: before the copy it
-    # would be re-applied after the first lane's copy of the same element ...
+    # exists.  The zeroing store ignores the column lane: before the copy it
+    # would be re-applied after the first lane's copy of the same element, so
+    # the inexact nest is redistributed: the store runs once, before the lane
+    # loop, and a barrier orders it before the other threads' copies ...
     args = (torch.empty((8, 512)), torch.empty((8, 512)))
-    with pytest.raises(
-        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
-    ):
-        _generate(
-            _zero_first_column_then_copy_in_inner_tile, args, **_INNER_LANES_CONFIG
-        )
+    code = _generate(
+        _zero_first_column_then_copy_in_inner_tile, args, **_INNER_LANES_CONFIG
+    )
+    function = _kernel_function(code)
+    (lane_loop,) = _loops(function, "lane_1")
+    (tile_loop,) = _loops(function, "tile_offset_1")
+    position = tile_loop.body.index(lane_loop)
+    before = ast.unparse(tile_loop.body[:position])
+    assert _accesses(tile_loop.body[0], "out"), code
+    assert "cute.arch.sync_threads()" in before, code
+    assert _accesses(lane_loop, "out") and _accesses(lane_loop, "x"), code
     # ... and after every lane's copy it is exact, inside the inner loop's
     # lane loop.
     code = _generate(
@@ -1112,6 +1119,41 @@ def _first_column_then_update_all(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_column_then_overwrite_beside_row_sums(
+    x: torch.Tensor, out: torch.Tensor, sums: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        first = out[tile0, tile1.begin]
+        sums[tile0] = x[tile0, tile1].sum(-1)
+        out[tile0, tile1] = x[tile0, tile1] + first[:, None]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sum_then_normalized_overwrite(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        v = x[tile0, tile1]
+        s = v.sum(-1)
+        out[tile0, tile1.begin] = s
+        out[tile0, tile1] = v / s[:, None]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sum_stored_twice(
+    x: torch.Tensor, out: torch.Tensor, sums: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        v = x[tile0, tile1]
+        out[tile0, tile1] = v * 2.0
+        sums[tile0] = v.sum(-1)
+        sums[tile0] = v.sum(-1) * 2.0
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _first_column_then_update_all_3d(x: torch.Tensor) -> torch.Tensor:
     for tile0, tile1, tile2 in hl.tile(x.shape):
         first = x[tile0, tile1, tile2.begin]
@@ -1269,6 +1311,56 @@ def test_uniform_read_before_per_lane_stores_on_a_shared_axis_gets_a_barrier(
     load = _index_of(row_loop.body, "tile_offset_1")
     barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
     assert load < barrier < row_loop.body.index(column_loop), code
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_racing_accesses_beside_a_lane_reduction_reject_the_config(
+    config: dict[str, object],
+) -> None:
+    # As in ``_first_column_then_update_all``, every thread of the column axis
+    # reads the first column that thread 0 overwrites in the column loop.  The
+    # row sum's ``_helion_lane_reduce`` leaves the body to the reduction split,
+    # which would carry no barrier between the read and the stores: the race
+    # is refused instead of left open.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)), torch.empty(8))
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match=r"race on a tensor in a body a later pass rewrites "
+        r"\(_helion_lane_reduce\)",
+    ):
+        _generate(_first_column_then_overwrite_beside_row_sums, args, **config)
+
+
+def test_lane_reduction_without_a_shared_thread_axis_keeps_the_config() -> None:
+    # One thread per row: no other thread reads the first column, nothing to
+    # order.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)), torch.empty(8))
+    code = _generate(
+        _first_column_then_overwrite_beside_row_sums, args, **_ONE_THREAD_CONFIG
+    )
+    assert not _barriers(_kernel_function(code)), code
+
+
+def test_reduced_stores_beside_a_lane_reduction_need_no_barrier() -> None:
+    # Every thread of the column axis stores the row sum, which the split
+    # combines over those threads before either store: each thread writes the
+    # same two values in program order, so the last one stands whatever the
+    # threads' order.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)), torch.empty(8))
+    code = _generate(_row_sum_stored_twice, args, **_NESTED_SCALAR_CONFIG)
+    assert not _barriers(_kernel_function(code)), code
+
+
+def test_reduced_store_then_per_element_overwrite_rejects_the_config() -> None:
+    # The first column's per-element value must replace the row sum every
+    # thread of the column axis stores there first; a thread still storing
+    # the sum after thread 0's overwrite leaves the wrong value, and the
+    # barrier between the stores cannot sit in the body the split rewrites.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)))
+    with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
+        _generate(_row_sum_then_normalized_overwrite, args, **_NESTED_SCALAR_CONFIG)
 
 
 def test_no_barrier_when_every_axis_has_one_thread() -> None:

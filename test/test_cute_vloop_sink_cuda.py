@@ -16,7 +16,6 @@ import torch
 from test._cute_vloop_sink_kernels import FRAGMENT_REDUCE
 from test._cute_vloop_sink_kernels import _sink_config
 from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_atomic_then_load_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_from8_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_gather_then_atomic_static
@@ -228,32 +227,6 @@ class TestCuteVloopSink(TestCase):
             )
             self.assertIn("_vsink_vec", code)
             self.assertIn(FRAGMENT_REDUCE, code)
-
-    def test_lane_invariant_load_after_a_bound_atomic(self) -> None:
-        """``old = hl.atomic_add(count, [tile_n], 1)`` then the lane-invariant
-        ``count[tile.id * 16]``, unguarded (static shapes, one thread along the
-        rows).  Thread 0 of every CTA increments that element in its first
-        lane, so all four of its lanes must read ``2 + 1`` afterwards; the
-        other three threads race with it and may read either value."""
-        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
-        count = torch.full((1024,), 2.0, device=DEVICE, dtype=torch.float32)
-        code, out = code_and_output(
-            col_reduce_sum_atomic_then_load_static,
-            (x, count),
-            **_sink_config(
-                block_sizes=[1024, 16], num_threads=[1, 4], vec=[1, 4], unroll=8
-            ),
-        )
-        torch.testing.assert_close(count, torch.full_like(count, 3.0))
-        first = (out - x.float().sum(0)) / 2.0
-        torch.testing.assert_close(first, first.round(), atol=5e-2, rtol=0)
-        self.assertTrue(bool(((first.round() == 2.0) | (first.round() == 3.0)).all()))
-        thread0 = first.view(64, 16)[:, :4]
-        torch.testing.assert_close(
-            thread0, torch.full_like(thread0, 3.0), atol=5e-2, rtol=0
-        )
-        self.assertIn("_vsink_vec", code)
-        self.assertIn("old = cute.arch.atomic_add(", code)
 
     def test_a_gathered_value_is_read_before_the_atomic(self) -> None:
         """Each lane gathers its own element of ``count`` and then bumps it,

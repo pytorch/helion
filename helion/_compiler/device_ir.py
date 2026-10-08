@@ -396,6 +396,10 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             device_loop = state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
             )
+            if CompileEnvironment.current().backend_name == "cute":
+                from .cute.lane_merged_carries import check_lane_merged_carries
+
+                check_lane_merged_carries(state, self)
             if state.fx_node is not None:
                 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
                 from .tile_dependency import TILE_DEPENDENCY_SITE_IDS_META
@@ -408,7 +412,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             from .cute.integer_loop_reduction import prepare
 
             device_loop.integer_reduction_hoist = prepare(self, state, device_loop)
-            joins = self._cute_carried_type_joins(state)
+            initials = self._carried_initials(state)
+            joins = self._cute_carried_type_joins(state, initials)
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
@@ -423,9 +428,10 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                 hoist = device_loop.integer_reduction_hoist
                 if hoist is not None and hoist.final_call is not None:
                     # The CTA collective after the loop finalizes the carry
-                    # from the per-thread partial the body carries.
+                    # from the per-thread partial the body carries, which
+                    # keeps its type.
                     hoist.finish(outputs)
-                    return outputs
+                    joins = {}
                 device_function = state.device_function
                 for index, initial in joins.items():
                     value = cast("ast.AST", outputs[index])
@@ -450,12 +456,39 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                         )
                     )
                     outputs[index] = expr_from_string(joined)
+                # The phi after the loop merges each carried output with its
+                # initial value; the lane loop nest check reads the body's
+                # carries through them (``check_lane_loop_nest``).
+                device_loop.carried_names = {
+                    value.id: initials[index]
+                    for index, value in enumerate(outputs)
+                    if index in initials and isinstance(value, ast.Name)
+                }
                 return outputs
         finally:
             # pyrefly: ignore [missing-attribute]
             state.codegen._cute_active_graph_info = previous_active_graph_info
 
-    def _cute_carried_type_joins(self, state: CodegenState) -> dict[int, str]:
+    def _carried_initials(self, state: CodegenState) -> dict[int, str]:
+        """The initial variable of each loop output, per output index, that
+        the phi after the loop merges the output with (the carried values)."""
+        if state.fx_node is None:
+            return {}
+        initials: dict[int, str] = {}
+        for user in state.fx_node.users:
+            if user.target is not operator.getitem:
+                continue
+            for phi in user.users:
+                if phi.target is not _tracing_ops._phi or phi.args[1] is not user:
+                    continue
+                initial = state.env.get(cast("torch.fx.Node", phi.args[0]))
+                if isinstance(initial, ast.Name):
+                    initials[cast("int", user.args[1])] = initial.id
+        return initials
+
+    def _cute_carried_type_joins(
+        self, state: CodegenState, initials: dict[int, str]
+    ) -> dict[int, str]:
         """The initial variable of each carried value CuTe DSL may retype.
 
         CuTe DSL requires a loop-carried variable to keep the type it had
@@ -480,12 +513,9 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                 torch.float64,
             ):
                 continue
-            for phi in user.users:
-                if phi.target is not _tracing_ops._phi or phi.args[1] is not user:
-                    continue
-                initial = state.env.get(cast("torch.fx.Node", phi.args[0]))
-                if isinstance(initial, ast.Name):
-                    joins[cast("int", user.args[1])] = initial.id
+            index = cast("int", user.args[1])
+            if index in initials:
+                joins[index] = initials[index]
         return joins
 
 

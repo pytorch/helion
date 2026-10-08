@@ -2444,7 +2444,7 @@ def test_bounded_store_loop_context_drops_backedge_and_else_facts(carry_name, he
         observed.append(kwargs["scalar_definitions"])
         return body
 
-    with patch.object(lanes, "split_lane_loop_reductions", side_effect=observe):
+    with patch.object(lanes, "_split_lane_loop_reductions", side_effect=observe):
         lanes._split_stmt_lane_reductions(
             loop, set(), set(), {}, {}, definitions, rename_groups
         )

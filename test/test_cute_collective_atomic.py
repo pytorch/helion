@@ -15,6 +15,7 @@ from helion import exc
 from helion._compiler.cute.collective_matmul import _region_write_roots
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
+import helion.language as hl
 
 CUDA_DEVICE = "cuda"
 
@@ -192,3 +193,130 @@ def test_collective_atomic_tails_and_mutated_graphs(
         b.uniform_(-0.05, 0.05)
         torch.testing.assert_close(run(), expected(), atol=2e-3, rtol=1e-2)
         torch.testing.assert_close(replay(), expected(), atol=2e-3, rtol=1e-2)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _matmul_counting_tiles(
+    a: torch.Tensor, b: torch.Tensor, tiles: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+        hl.atomic_add(tiles, [0], 1)
+        hl.atomic_add(rows, [tile_m], 1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _matmul_counting_into_its_output(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.zeros((m, n), dtype=torch.float32, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+        hl.atomic_add(out, [0, 0], 1.0)
+    return out
+
+
+def _counting_config(compute: str) -> helion.Config:
+    return helion.Config(
+        block_sizes=[64, 64, 32],
+        num_threads=[2, 64, 1],
+        cute_collective_mma=True,
+        cute_collective_compute=compute,
+        cute_collective_copy="async_cached",
+        cute_collective_stages=2,
+    )
+
+
+def _atomic_guards(code: str) -> dict[str, str]:
+    """The guard of each atomic call, by the tensor it updates."""
+    guards: dict[str, str] = {}
+    for node in ast.walk(ast.parse(code)):
+        if isinstance(node, ast.If):
+            for call in ast.walk(node.body[0]):
+                if isinstance(call, ast.Call) and ast.unparse(call.func) == (
+                    "cute.arch.atomic_add"
+                ):
+                    tensor = ast.unparse(call.args[0]).split(".iterator")[0]
+                    guards[tensor.strip("(")] = ast.unparse(node.test)
+    return guards
+
+
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+@skipUnlessBackends(["cute"])
+def test_tile_counter_beside_a_collective_matmul_runs_at_the_first_lane(
+    compute: str,
+) -> None:
+    # The epilogue runs the rows of the output tile a thread holds in a lane
+    # loop.  The collective matmul's placeholder leaves the body to its later
+    # lowering, undistributed; the tile counter covers no tile axis, so it is
+    # pinned to the first lane of that loop.  The row counter varies with the
+    # loop and keeps every lane.
+    inputs = (
+        torch.empty((256, 512), dtype=torch.float16),
+        torch.empty((512, 256), dtype=torch.float16),
+        torch.zeros((1,), dtype=torch.int32),
+        torch.zeros((256,), dtype=torch.int32),
+    )
+    with _mock_cuda_unavailable(), _cpu_target():
+        bound = _matmul_counting_tiles._bind_isolated(inputs)
+        code = bound.to_code(_counting_config(compute))
+    assert "cute.gemm(" in code
+    guards = _atomic_guards(code)
+    assert "and lane_0 == 0" in guards["tiles"], code
+    assert "lane_0" not in guards["rows"], code
+
+
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+@skipUnlessBackends(["cute"])
+def test_tile_counter_into_the_collective_output_rejects_the_config(
+    compute: str,
+) -> None:
+    # Issued at the first lane only, the counter would run before the other
+    # lanes' stores of the output it adds into.
+    inputs = (
+        torch.empty((256, 512), dtype=torch.float16),
+        torch.empty((512, 256), dtype=torch.float16),
+    )
+    with _mock_cuda_unavailable(), _cpu_target():
+        bound = _matmul_counting_into_its_output._bind_isolated(inputs)
+        with pytest.raises(
+            exc.BackendUnsupported,
+            match="lane-invariant atomic on out issued at the first lane_0 would "
+            "run beside another access of its tensors",
+        ):
+            bound.to_code(_counting_config(compute))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+@skipUnlessBackends(["cute"])
+def test_tile_counter_beside_a_collective_matmul_counts_each_tile_once(
+    compute: str,
+) -> None:
+    if compute == "tcgen05" and torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family")
+    torch.manual_seed(5203)
+    a = torch.randn((256, 512), device=CUDA_DEVICE, dtype=torch.float16)
+    b = torch.randn((512, 256), device=CUDA_DEVICE, dtype=torch.float16)
+    tiles = torch.zeros((1,), device=CUDA_DEVICE, dtype=torch.int32)
+    rows = torch.zeros((256,), device=CUDA_DEVICE, dtype=torch.int32)
+    args = (a, b, tiles, rows)
+    bound = _matmul_counting_tiles._bind_isolated(args)
+    config = _counting_config(compute)
+    assert "cute.gemm(" in bound.to_code(config)
+    bound.set_config(config)
+    out = bound(*args)
+    torch.testing.assert_close(out, a.float() @ b.float(), atol=1e-1, rtol=1e-2)
+    # 64 x 64 tiles of a 256 x 256 output.
+    assert tiles.item() == 16
+    assert rows.tolist() == [4] * 256

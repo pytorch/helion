@@ -24,6 +24,7 @@ from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
 from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from .compile_environment import CompileEnvironment
@@ -829,8 +830,41 @@ def split_lane_loop_reductions(
 
     Operates bottom-up so nested lane loops are handled before their parents.
     Lane loops without markers are returned unchanged (their inner statements
-    are still recursed into so nested markers are processed).
+    are still recursed into so nested markers are processed).  The split
+    hoists the statements that read no lane out of its per-lane passes; an
+    atomic left inside a lane loop it is uniform along is then issued at the
+    loop's first lane (``pin_atomics_left_in_lane_loops``), as the lane-loop
+    distribution, which leaves a body with markers to this pass, did not.
     """
+    if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
+        return body
+    from .cute.lane_loop_distribution import pin_atomics_left_in_lane_loops
+
+    result = _split_lane_loop_reductions(
+        body,
+        uniform_names=uniform_names,
+        proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+        proven_tensor_stride_values=proven_tensor_stride_values,
+        thread_axis_names=thread_axis_names,
+        scalar_definitions=scalar_definitions,
+        rename_groups=rename_groups,
+        running_sums=running_sums,
+    )
+    pin_atomics_left_in_lane_loops(result)
+    return result
+
+
+def _split_lane_loop_reductions(
+    body: list[ast.AST],
+    *,
+    uniform_names: set[str] | None = None,
+    proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
+    proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
+    thread_axis_names: dict[str, frozenset[int]] | None = None,
+    scalar_definitions: dict[str, ast.AST] | None = None,
+    rename_groups: dict[str, str] | None = None,
+    running_sums: set[str] | None = None,
+) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
 
@@ -921,7 +955,7 @@ def _split_stmt_lane_reductions(
             setattr(
                 stmt,
                 field,
-                split_lane_loop_reductions(
+                _split_lane_loop_reductions(
                     old,
                     uniform_names=set(uniform_names),
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
@@ -1241,7 +1275,7 @@ def _split_one_lane_loop(
         # state slot before performing several reductions over a free arange.
         lifted = _lift_lane_invariant_if(loop, lane_var, uniform_names, rename_groups)
         if lifted is not None:
-            return split_lane_loop_reductions(
+            return _split_lane_loop_reductions(
                 lifted,
                 uniform_names=set(uniform_names),
                 proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
@@ -4953,8 +4987,23 @@ def _clone_stmt(stmt: ast.AST) -> ast.AST:
     both re-run the shared (side-effect-free) producers. Splicing the same node
     objects into two places in the tree breaks AST walking, so each reused
     statement is rebuilt from its source text into a fresh ExtendedAST node.
+    The atomics keep the lane loops they are uniform along
+    (``HELION_ATOMIC_UNIFORM_LANES_ATTR``) and the lane loops inside keep
+    their lane variable (``HELION_LANE_LOOP_VAR_ATTR``) for the pins of
+    ``pin_atomics_left_in_lane_loops``.
     """
-    return statement_from_string(ast.unparse(stmt))
+    clone = statement_from_string(ast.unparse(stmt))
+    for kind, attr in (
+        (ast.Call, HELION_ATOMIC_UNIFORM_LANES_ATTR),
+        (ast.For, HELION_LANE_LOOP_VAR_ATTR),
+    ):
+        copies = [node for node in ast.walk(clone) if isinstance(node, kind)]
+        originals = [node for node in ast.walk(stmt) if isinstance(node, kind)]
+        for original, copy in zip(originals, copies, strict=True):
+            value = getattr(original, attr, None)
+            if value is not None:
+                setattr(copy, attr, value)
+    return clone
 
 
 def _clone_expr(node: ast.AST) -> ast.AST:
@@ -6501,8 +6550,8 @@ class DeviceLoopState(DeviceLoopOrGridState):
     # the blocks each distributes, the vec partitions among them and the
     # per-lane index / mask definitions at the top of the innermost body.
     # Unlike a grid's (``DeviceGridState.wrap_body``) the nest is built
-    # around the body before the body exists and is never redistributed;
-    # ``check_lane_loop_nest`` rejects it unless it is the tile program.
+    # around the body before the body exists; ``check_lane_loop_nest`` keeps
+    # it when it is the tile program and redistributes or rejects it otherwise.
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_loop_block_ids: dict[str, frozenset[int]] = dataclasses.field(
         default_factory=dict
@@ -6516,6 +6565,10 @@ class DeviceLoopState(DeviceLoopOrGridState):
     # Run once the loop body is complete (CuTe: restore the tile-vector stores
     # whose deferred flush a later access of their tensor would observe).
     body_finalizers: list[Callable[[], None]] = dataclasses.field(default_factory=list)
+    # Each carried output of the body mapped to its initial value, the two
+    # names the phi after the loop merges into one variable (set once the
+    # body is complete, before ``check_lane_loop_nest``).
+    carried_names: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def lane_index_definitions(self) -> tuple[list[ast.AST], frozenset[str]]:
         return _lane_index_definitions(
@@ -6590,9 +6643,13 @@ class DeviceLoopState(DeviceLoopOrGridState):
         Every statement of the body runs inside every lane loop, so one whose
         values ignore a loop repeats once per iteration.  The full-nest check
         of the lane-loop distribution accepts the nest when every repetition
-        is idempotent, pins an atomic that is uniform along a loop's tile axis
-        to the loop's first lane and rejects the rest
-        (``cute/lane_loop_distribution.py``).  Only the live loops are
+        is idempotent and pins an atomic that is uniform along a loop's tile
+        axis to the loop's first lane (``cute/lane_loop_distribution.py``);
+        the body's carries count as the variables the phis after the loop
+        make them (``carried_names``).  An inexact nest (a carry beside the
+        per-K-lane products of the scalar matmul fallback updated once per
+        lane) is redistributed like a grid body, each statement inside only
+        the loops it depends on, or rejected.  Only the live loops are
         checked: a loop none of whose names the body reads (a tile indexed
         only by its ``begin``) is spliced away by the dead-code elimination
         and repeats nothing, as in ``DeviceGridState.wrap_body``, and a pin
@@ -6609,7 +6666,9 @@ class DeviceLoopState(DeviceLoopOrGridState):
         from .ast_read_writes import ReadWrites
         from .cute.lane_loop_distribution import LanePlacement
         from .cute.lane_loop_distribution import add_thread_barriers
-        from .cute.lane_loop_distribution import check_full_nest
+        from .cute.lane_loop_distribution import distribute_lane_loops
+        from .cute.lane_loop_distribution import full_nest_inexactness
+        from .cute.lane_loop_distribution import inexact_nest_error
 
         setup = {id(statement) for statement in self.lane_setup_statements}
         body = [
@@ -6646,18 +6705,37 @@ class DeviceLoopState(DeviceLoopOrGridState):
             self.tile_masks,
         )
         rename_groups = _current_rename_groups()
+        # The repetition checks read a carry as the one variable the phi
+        # after the loop makes of it.
+        carried_groups = _merge_carried_names(rename_groups, self.carried_names)
+        placement: list[ast.AST | LanePlacement] | None = None
         if live_loops:
-            check_full_nest(body, scopes, rename_groups=rename_groups)
-        # The nest as emitted: the body inside every live loop.
+            reason = full_nest_inexactness(body, scopes, rename_groups=carried_groups)
+            if reason is not None:
+                # A statement whose values ignore a loop repeats once per
+                # iteration of the nest built around the body (a carry beside
+                # the per-K-lane products of the scalar matmul fallback).
+                # Place each statement inside only the loops it depends on, as
+                # for a grid body (``DeviceGridState.wrap_body``), or reject.
+                placement = distribute_lane_loops(
+                    body, scopes, rename_groups=carried_groups
+                )
+                if placement is None:
+                    raise inexact_nest_error(reason)
+        # The nest as emitted: the body inside every live loop, or the placement.
         items: list[ast.AST | LanePlacement] = list(body)
         loops = [LanePlacement(lane_var, items) for lane_var, _extent in live_loops]
         for outer, inner in itertools.pairwise(loops):
             outer.items = [inner]
+        nest: list[ast.AST | LanePlacement] = [loops[0]] if loops else items
+        loop_body = items
+        if placement is not None:
+            nest = loop_body = placement
         axis_sizes, definitions, masks, constants, enclosing = _thread_barrier_context(
             self
         )
         add_thread_barriers(
-            [loops[0]] if loops else items,
+            nest,
             scopes,
             rename_groups=rename_groups,
             axis_sizes=axis_sizes,
@@ -6668,11 +6746,14 @@ class DeviceLoopState(DeviceLoopOrGridState):
             # a branch some threads skip would deadlock.
             allow_barriers=not _in_divergent_control_flow(),
             loop_variables=self.loop_variables(),
-            loop_body=items,
+            loop_body=loop_body,
             loop_shifts=self.tile_begin_shifts(),
             # The loops around the body: those around this loop, then its own.
             loop_headers=[*enclosing, *self.loop_headers()],
         )
+        if placement is not None:
+            self._emit_lane_placement(placement, setup_by_lane)
+            return
         for loop in loops:
             _apply_wrapper_barriers(
                 self.vec_lane_wrappers.get(loop.lane_var), loop.barriers
@@ -6709,6 +6790,62 @@ class DeviceLoopState(DeviceLoopOrGridState):
             *statements,
         ]
         self._splice_lane_loops(dead)
+
+    def _emit_lane_placement(
+        self,
+        placement: list[ast.AST | LanePlacement],
+        setup_by_lane: dict[str, list[ast.AST]],
+    ) -> None:
+        """Replace the lane loop nest around the body with ``placement``.
+
+        Each loop instance reuses its loop of the nest (for a vec wrapper, the
+        outer loop with its attached statements, the instance in its V-loop)
+        with the loop's setup at the top.  The dead loops leave with the
+        nest, and the statements outside every loop join the body of the
+        innermost device loop, which becomes ``inner_statements``.
+        """
+        from .cute.lane_loop_distribution import LanePlacement
+
+        def enclosing_child(loop: ast.For) -> ast.For:
+            return next(
+                child
+                for child in loop.body
+                if isinstance(child, ast.For)
+                and _encloses(child, self.inner_statements)
+            )
+
+        parent = self.for_node
+        nest = enclosing_child(parent)
+        while getattr(nest, HELION_LANE_LOOP_VAR_ATTR, None) is None:
+            parent, nest = nest, enclosing_child(nest)
+        lane_loops: dict[str, ast.For] = {}
+        loop = nest
+        while True:
+            if (lane_var := getattr(loop, HELION_LANE_LOOP_VAR_ATTR, None)) is not None:
+                lane_loops[lane_var] = loop
+            if loop.body is self.inner_statements:
+                break
+            loop = enclosing_child(loop)
+
+        def materialize(items: list[ast.AST | LanePlacement]) -> list[ast.AST]:
+            result: list[ast.AST] = []
+            for item in items:
+                if not isinstance(item, LanePlacement):
+                    result.append(item)
+                    continue
+                wrapper = self.vec_lane_wrappers.get(item.lane_var)
+                _apply_wrapper_barriers(wrapper, item.barriers)
+                inner = [*setup_by_lane[item.lane_var], *materialize(item.items)]
+                if wrapper is None:
+                    lane_loops[item.lane_var].body = inner  # type: ignore[assignment]
+                else:
+                    wrapper.vloop.body = inner  # type: ignore[assignment]
+                result.append(lane_loops[item.lane_var])
+            return result
+
+        position = parent.body.index(nest)
+        parent.body[position : position + 1] = materialize(placement)  # type: ignore[assignment]
+        self.inner_statements = cast("list[ast.AST]", parent.body)
 
     def _splice_lane_loops(self, lane_vars: set[str]) -> None:
         """Take the lane loops of ``lane_vars`` out of the nest around the body, their bodies in their place.
@@ -6931,6 +7068,30 @@ def _current_rename_groups() -> dict[str, str]:
             )
             if owner != arg.name:
                 groups.setdefault(arg.name, owner)
+    return groups
+
+
+def _merge_carried_names(
+    rename_groups: Mapping[str, str], carried_names: Mapping[str, str]
+) -> dict[str, str]:
+    """``rename_groups`` with each carried output and its initial value
+    mapped to one canonical name.
+
+    The phi after a device loop merges the two only once the loop statement
+    is complete; the repetition checks of its body need them as one variable
+    already (``DeviceLoopState.carried_names``).
+    """
+    groups = dict(rename_groups)
+    for output, initial in carried_names.items():
+        old = groups.get(output, output)
+        new = groups.get(initial, initial)
+        if old == new:
+            continue
+        for name, canonical in list(groups.items()):
+            if canonical == old:
+                groups[name] = new
+        groups[old] = new
+        groups[output] = new
     return groups
 
 
