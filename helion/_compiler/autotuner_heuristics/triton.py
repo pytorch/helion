@@ -4823,8 +4823,6 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         ]
         slot_of = {block.block_id: index for index, block in enumerate(specs)}
         floors = {block.block_id: cls._block_floor(block) for block in specs}
-        # size_hint is the full axis. max_size is the tile cap, which
-        # register_block_size can set below that axis.
         maximums = {
             block.block_id: min(block.max_size, _np2(max(1, block.size_hint)))
             for block in specs
@@ -5101,7 +5099,6 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         persistence_tunable = primary_block_id in rolled_ids or (
             primary_block_id in slot_of
             and pd.category is ReductionCategory.USER_TILE
-            # The full axis is not a legal tile when the declared cap is smaller.
             and primary_full_width <= maximums[primary_block_id]
         )
         if (

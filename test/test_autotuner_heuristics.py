@@ -5310,9 +5310,6 @@ class TestTritonReductionHeuristicUnit(TestCase):
         self.assertEqual(seed.config["num_stages"], 1)
 
     def test_user_tile_seed_respects_register_block_size_cap(self) -> None:
-        # register_block_size(32, 512) on a 4096-long axis: size_hint stays
-        # 4096, max_size is 512. The seed must not treat the axis length as a
-        # legal tile, including the full-row reread probe.
         spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(
             BlockSizeSpec(
