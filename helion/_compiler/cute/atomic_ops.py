@@ -35,6 +35,8 @@ from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..variable_origin import GridOrigin
 from ..variable_origin import NameOrigin
+from .cute_reshape import describe_rebound_block_dims
+from .cute_reshape import subscript_rebound_block_dims
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -154,6 +156,26 @@ def _codegen_common_cute(
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
         raise exc.AtomicOnDeviceTensor(cute_func)
+    # The established slice / axis diagnostics first ("atomic slice and
+    # update value use distinct tile axes"), then the operands between the
+    # index and the memory order: ``val`` (and ``expected`` for atomic_cas).
+    # A tile whose dim the subscript binds to another block id
+    # (``hl.atomic_add(out, [tile_m, tile_n], x[...].T)``, or a lower-rank
+    # value right-aligned to the index as ``tl.atomic_*`` receives it) would
+    # need another thread's element; the per-thread RMW has no exchange.
+    indexed_block_ids = _cute_atomic_indexed_blocks(state, index)
+    for position in range(2, len(state.ast_args) - 1):
+        operand = state.proxy_arg(position)
+        if not isinstance(operand, torch.Tensor) or operand.ndim == 0:
+            continue
+        rebound = subscript_rebound_block_dims(state, target, index, operand)
+        if rebound:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{cute_func} of {list(operand.shape)} re-binds "
+                f"{describe_rebound_block_dims(rebound)}; the value must be "
+                "held by the thread that owns the destination lane",
+            )
 
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(target.dtype)
@@ -235,12 +257,23 @@ def _codegen_common_cute(
             index_exprs,
             cast_value_exprs[0],
             atomic_expr,
-            _cute_atomic_predicates(state, index, extra_predicates, atomic_expr)[0],
+            _cute_atomic_predicates(
+                state,
+                index,
+                extra_predicates,
+                atomic_expr,
+                indexed_block_ids=indexed_block_ids,
+            )[0],
         )
     ):
         return ast.Constant(value=None)
     return _guard_cute_atomic_expr(
-        state, index, target_dtype, atomic_expr, extra_predicates=extra_predicates
+        state,
+        index,
+        target_dtype,
+        atomic_expr,
+        extra_predicates=extra_predicates,
+        indexed_block_ids=indexed_block_ids,
     )
 
 
@@ -249,12 +282,15 @@ def _cute_atomic_predicates(
     index: list[object],
     extra_predicates: list[str] | None,
     atomic_expr: ast.AST | None = None,
+    *,
+    indexed_block_ids: set[int] | None,
 ) -> tuple[list[str], set[int]]:
     """The guards of an atomic at this site (bounds masks of the covered
     axes, leader threads of the uncovered ones, and any caller-supplied
     predicate) and the leader axes; records the lanes the atomic is uniform
-    along on ``atomic_expr`` for the lane-loop placement."""
-    indexed_block_ids = _cute_atomic_indexed_blocks(state, index)
+    along on ``atomic_expr`` for the lane-loop placement.
+    ``indexed_block_ids`` is the caller's ``_cute_atomic_indexed_blocks(state,
+    index)`` (``None`` when the coverage is unknown)."""
     leader_axes = _cute_unindexed_leader_axes(state, indexed_block_ids)
     if indexed_block_ids is None:
         # Without a known coverage, a tile attribute in the index
@@ -516,8 +552,12 @@ def _cute_vector_atomic_site(
     # An atomic that is uniform along a live lane loop must stay a scalar
     # atomic: the lane-loop placement pass pins that form to the loop's
     # first lane (or rejects it), whereas the flush protocol below would
-    # re-issue the reduction once per iteration of that loop.
-    if _cute_uniform_lane_vars(state, _cute_atomic_indexed_blocks(state, index)):
+    # re-issue the reduction once per iteration of that loop.  So does one
+    # adding a lane-split matmul's per-lane partials, whose K lane loop is
+    # not the vectorized axis's.
+    if _cute_per_lane_atomic_lane_vars(state) or _cute_uniform_lane_vars(
+        state, _cute_atomic_indexed_blocks(state, index)
+    ):
         return False
     lane_axes = [
         (pos, block_id)
@@ -652,9 +692,14 @@ def _guard_cute_atomic_expr(
     atomic_expr: ast.AST,
     *,
     extra_predicates: list[str] | None = None,
+    indexed_block_ids: set[int] | None,
 ) -> ast.AST:
     predicates, leader_axes = _cute_atomic_predicates(
-        state, index, extra_predicates, atomic_expr
+        state,
+        index,
+        extra_predicates,
+        atomic_expr,
+        indexed_block_ids=indexed_block_ids,
     )
     if not predicates:
         return atomic_expr
@@ -1175,12 +1220,19 @@ def _cute_uniform_lane_vars(
     axis under every lane layout, instead of repeating it once per iteration.
     Empty when the coverage is unknown: the atomic then runs on every thread
     under every mask, as it always has.
+
+    An atomic whose value is the per-K-lane partial sum of a lane-split
+    scalar matmul (``cute/matmul_fallback.py``) varies along that K lane
+    loop although its index does not cover the K block: each lane adds its
+    own partial, and the loop is left out
+    (``CuteDeviceFunctionState.per_lane_atomic_lane_vars``).
     """
     from ..compile_environment import CompileEnvironment
     from ..tile_strategy import DeviceLoopState
 
     if indexed_block_ids is None:
         return frozenset()
+    per_lane_vars = _cute_per_lane_atomic_lane_vars(state)
     lane_loop_block_ids: dict[str, frozenset[int]] = {}
     grid_state = state.codegen.current_grid_state
     if grid_state is not None:
@@ -1194,12 +1246,22 @@ def _cute_uniform_lane_vars(
     return frozenset(
         lane_var
         for lane_var, block_ids in lane_loop_block_ids.items()
-        if not any(
+        if lane_var not in per_lane_vars
+        and not any(
             block_id >= 0
             and env.resolve_codegen_block_id(block_id, state.codegen, fx_graph)
             in indexed_block_ids
             for block_id in block_ids
         )
+    )
+
+
+def _cute_per_lane_atomic_lane_vars(state: CodegenState) -> set[str]:
+    """The K lane loops whose per-lane matmul partials this atomic adds."""
+    if state.fx_node is None:
+        return set()
+    return state.device_function.cute_state.per_lane_atomic_lane_vars.get(
+        state.fx_node, set()
     )
 
 
@@ -1477,6 +1539,7 @@ def _codegen_tensor_index_common_cute(
         target_dtype,
         atomic_expr,
         extra_predicates=site_predicates,
+        indexed_block_ids=_cute_atomic_indexed_blocks(state, index),
     )
 
 

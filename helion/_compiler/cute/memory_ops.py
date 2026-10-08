@@ -35,7 +35,7 @@ from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import CuteTileVecStoreSite
-from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
+from ...language.memory_ops import _codegen_cute_store_reshape_lane_loops
 from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
 from ...language.memory_ops import _cute_access_regions
 from ...language.memory_ops import _cute_active_index_var
@@ -65,9 +65,18 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import RuntimeInputSpecialization
 from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _to_sympy
+from ..indexing_strategy import _get_tile_with_offset_info
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
+from .cute_reshape import check_memory_mask_rebound
+from .cute_reshape import codegen_cute_store_rebound_value
+from .cute_reshape import describe_rebound_block_dims
+from .cute_reshape import run_deferred_rebound_checks
+from .cute_reshape import store_rebound_dims
+from .cute_reshape import tcgen05_rebound_store_error
+from .indexing import CUTE_SCALAR_LOAD_SITE_META
+from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
 from .indexing import is_cute_unit_stride_iota_index
 from .indexing import match_cute_shifted_tile_index
@@ -80,6 +89,7 @@ if TYPE_CHECKING:
 
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
+    from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import LoopedReductionStrategy
     from ..tile_strategy import DeviceGridState
@@ -2680,6 +2690,24 @@ def _try_splice_tcgen05_grouped_tail_epilogue(
 
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
+    def drain_deferred_rebound_checks() -> None:
+        # The pointwise checks deferred to the epilogue classifier, for this
+        # chain's ancestors only: another chain's store keeps the first word.
+        run_deferred_rebound_checks(
+            state.codegen,
+            _pure_epilogue_ancestors(value_node)
+            if isinstance(value_node, torch.fx.Node)
+            else (),
+        )
+
+    def finish_tcgen05_store() -> None:
+        # A tcgen05 store path accepted the chain: a re-bound value has no
+        # per-thread element to exchange, and the pointwise checks deferred
+        # to the classifier run now.
+        if rebound_tcgen05:
+            raise tcgen05_rebound_store_error(state, rebound)
+        drain_deferred_rebound_checks()
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -2688,19 +2716,61 @@ def _(state: CodegenState) -> ast.AST:
     raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
-    if (
-        planned := _try_codegen_tcgen05_fragment_epilogue(
-            state, tensor, subscript, ast_subscript, extra_mask
-        )
-    ) is not None:
-        return planned
     value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         maybe_value_node = state.fx_node.args[2]
         if isinstance(maybe_value_node, torch.fx.Node):
             value_node = maybe_value_node
 
+    # Before any store path: a subscript that binds a value dim to another
+    # block id needs the exchanged value, whichever path stores it.  On a
+    # tcgen05 epilogue chain there is no per-thread value to exchange (the
+    # value may still be the deferred fragment-epilogue marker here): the
+    # chain is refused where a tcgen05 store path would accept it, and the
+    # classifier's own diagnostic wins where it rejects the chain.
+    rebound: list[tuple[int, int, int]] = []
+    rebound_tcgen05 = False
+    exchanged: ast.AST | None = None
     if isinstance(tensor, torch.Tensor):
+        rebound = store_rebound_dims(state, tensor, subscript)
+    elif isinstance(tensor, tuple):
+        # A stack tensor store writes ``value`` through the pointer table's
+        # dims and ``tensor_like[subscript]``; it has no exchange, so a
+        # re-bound value is refused.
+        tensor_like, dev_ptrs = tensor
+        rebound = store_rebound_dims(
+            state, tensor_like, subscript, leading_sizes=dev_ptrs.shape
+        )
+        if rebound:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"stack tensor store re-binds {describe_rebound_block_dims(rebound)}; "
+                "the value must be held by the thread that owns the destination lane",
+            )
+    if rebound:
+        rebound_tcgen05 = bool(
+            value_node is not None
+            and state.device_function.cute_state.matmul_fx_nodes
+            and reach_tcgen05_matmul_anchors(state, value_node)
+        )
+        if not rebound_tcgen05:
+            assert isinstance(tensor, torch.Tensor)
+            exchanged = codegen_cute_store_rebound_value(
+                state, tensor, subscript, state.ast_arg(2), rebound
+            )
+            raw_value = exchanged
+    if (
+        planned := _try_codegen_tcgen05_fragment_epilogue(
+            state, tensor, subscript, ast_subscript, extra_mask
+        )
+    ) is not None:
+        finish_tcgen05_store()
+        return planned
+
+    if isinstance(tensor, torch.Tensor):
+        # An exchanged value must not be rebuilt from its FX node: the paths
+        # below see no node for it and store ``raw_value`` (= the exchange).
+        store_value_node = value_node if exchanged is None else None
         affine_range_store = _codegen_cute_affine_range_store(
             state,
             tensor,
@@ -2708,18 +2778,24 @@ def _(state: CodegenState) -> ast.AST:
             ast_subscript,
             raw_value,
             extra_mask,
-            value_node,
+            store_value_node,
         )
         if affine_range_store is not None:
             state.add_statement(affine_range_store)
             return ast.Constant(value=None)
-        affine_reshape_store = _codegen_cute_affine_reshape_store(
-            state,
-            tensor,
-            subscript,
-            ast_subscript,
-            extra_mask,
-            value_node,
+        # The paths below rebuild the value from its FX node; an exchanged
+        # value must take the generic store, which writes ``exchanged``.
+        affine_reshape_store = (
+            None
+            if exchanged is not None
+            else _codegen_cute_affine_reshape_store(
+                state,
+                tensor,
+                subscript,
+                ast_subscript,
+                extra_mask,
+                value_node,
+            )
         )
         if affine_reshape_store is not None:
             state.add_statement(affine_reshape_store)
@@ -2730,15 +2806,15 @@ def _(state: CodegenState) -> ast.AST:
             subscript,
             raw_value,
             extra_mask,
-            value_node,
+            store_value_node,
         )
         if strided_slice_store is not None:
             state.add_statement(strided_slice_store)
             return ast.Constant(value=None)
 
-    value = state.ast_arg(2)
+    value = exchanged if exchanged is not None else state.ast_arg(2)
 
-    if value_node is not None:
+    if value_node is not None and exchanged is None:
         if value_node.op == "call_function":
             if isinstance(tensor, torch.Tensor):
                 rewritten_stmt = _codegen_cute_store_stack_load(
@@ -2773,7 +2849,7 @@ def _(state: CodegenState) -> ast.AST:
                 )
                 if rewritten_stmt is not None:
                     return rewritten_stmt
-                rewritten_stmt = _codegen_cute_store_permute_lane_loops(
+                rewritten_stmt = _codegen_cute_store_reshape_lane_loops(
                     state,
                     tensor,
                     subscript,
@@ -2784,11 +2860,6 @@ def _(state: CodegenState) -> ast.AST:
                 )
                 if rewritten_stmt is not None:
                     return rewritten_stmt
-            from .cute_reshape import codegen_cute_store_permute
-
-            rewritten = codegen_cute_store_permute(state, value, value_node)
-            if rewritten is not None:
-                value = rewritten
 
     if isinstance(tensor, tuple):
         stack_tensor_ast = state.ast_args[0]
@@ -2855,6 +2926,7 @@ def _(state: CodegenState) -> ast.AST:
             stmts = (
                 rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
             )
+            finish_tcgen05_store()
             for stmt in stmts:
                 state.add_statement(stmt)
             return ast.Constant(value=None)
@@ -2870,11 +2942,13 @@ def _(state: CodegenState) -> ast.AST:
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
     if spliced is not None:
+        finish_tcgen05_store()
         return spliced
     spliced = _try_splice_tcgen05_grouped_tail_epilogue(
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
     if spliced is not None:
+        finish_tcgen05_store()
         return spliced
 
     # Loud-failure backstop for fused-epilogue stores that follow a
@@ -2923,6 +2997,8 @@ def _(state: CodegenState) -> ast.AST:
             "`.unsqueeze(-1)`.",
         )
 
+    drain_deferred_rebound_checks()
+
     tensor_name = state.device_function.tensor_arg(tensor).name
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(tensor.dtype)
@@ -2938,7 +3014,16 @@ def _(state: CodegenState) -> ast.AST:
         tensor=tensor,
         inactive_singleton_slice_expr="0",
     )
+    # Regions come from the subscript as written: a re-addressed full-slice
+    # dim (below) stays inside the slice's extent, so they remain an
+    # over-approximation of the elements this store touches.
     regions = _cute_access_regions(state, subscript, tensor)
+    mask_subscript: list[object] | tuple[object, ...] = subscript
+    if state.fx_node is not None and len(state.fx_node.args) > 2:
+        mask_subscript = _apply_cute_value_coord_meta(
+            state, tensor, subscript, index_exprs, state.fx_node.args[2]
+        )
+    value_readdressed = mask_subscript != list(subscript)
     topk_lane_expr: object | None = None
     topk_k: object | None = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
@@ -2954,7 +3039,7 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
         index_exprs[-1] = topk_lane_expr
     store_uses_pointer = "None" not in index_exprs
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
+    mask_expr = _cute_combined_mask(state, mask_subscript, extra_mask, tensor=tensor)
     branch_vec_store_candidate: tuple[int, int] | None = None
 
     # Vectorized store: when this store's stride-1 axis is a vec-partitioned
@@ -2965,6 +3050,7 @@ def _(state: CodegenState) -> ast.AST:
     if (
         store_uses_pointer
         and topk_lane_expr is None
+        and not value_readdressed
         and extra_mask is None
         and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
     ):
@@ -4963,6 +5049,227 @@ def _cute_resolved_load_mask(
     )
 
 
+def _cute_load_output_dims(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    index_exprs: Sequence[str],
+) -> tuple[tuple[int, int | None] | None, ...] | None:
+    """Map each load-output dim to ``(tensor_dim, block_id)``.
+
+    Mirrors ``SubscriptIndexing.compute_shape``: ``None`` adds a unit axis,
+    ints and scalar SymInts drop a dim, tiles and slices keep one. Returns
+    ``None`` for tensor (gather) indices.
+    """
+    env = CompileEnvironment.current()
+    result: list[tuple[int, int | None] | None] = []
+    tensor_dim = 0
+    for pos, idx in enumerate(subscript):
+        if idx is None:
+            result.append(None)
+            continue
+        if isinstance(idx, torch.Tensor) or tensor_dim >= tensor.ndim:
+            return None
+        block_id: int | None = None
+        keeps_dim = False
+        tile_info = _get_tile_with_offset_info(idx, state.fx_node, pos)
+        if tile_info is not None and tile_info.block_size is not None:
+            keeps_dim = True
+            block_id = tile_info.block_id
+        elif isinstance(idx, torch.SymInt):
+            block_id = env.get_block_id(idx)
+            keeps_dim = block_id is not None
+        elif isinstance(idx, slice):
+            keeps_dim = True
+            for candidate in _matching_block_ids(env, tensor.shape[tensor_dim]):
+                if _cute_active_index_var(state, candidate) == index_exprs[tensor_dim]:
+                    block_id = candidate
+                    break
+        elif not isinstance(idx, int):
+            return None
+        if env.known_equal(tensor.shape[tensor_dim], 1):
+            # ``_cute_index_exprs`` addresses size-1 tensor dims with a literal
+            # ``0``; there is no block coordinate to swap there.
+            block_id = None
+        if keeps_dim:
+            result.append((tensor_dim, block_id))
+        tensor_dim += 1
+    return tuple(result)
+
+
+def _record_cute_scalar_load_site(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    tensor_name: str,
+    index_exprs: Sequence[str],
+    mask_expr: str | None,
+    has_extra_mask: bool,
+    eviction_suffix: str,
+) -> None:
+    """Remember the scalar address so ``hl.split`` can re-read this tile."""
+    assert state.fx_node is not None
+    value = state.fx_node.meta.get("val")
+    if "None" in index_exprs or not isinstance(value, torch.Tensor):
+        return
+    output_dims = _cute_load_output_dims(state, tensor, subscript, index_exprs)
+    if output_dims is None or len(output_dims) != value.ndim:
+        return
+    state.fx_node.meta[CUTE_SCALAR_LOAD_SITE_META] = CuteScalarLoadSite(
+        tensor_name=tensor_name,
+        index_exprs=tuple(index_exprs),
+        mask_expr=mask_expr,
+        has_extra_mask=has_extra_mask,
+        eviction_suffix=eviction_suffix,
+        output_dims=output_dims,
+    )
+
+
+def _apply_cute_value_coord_meta(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    index_exprs: list[str],
+    value_node: object,
+) -> list[object]:
+    """Address store dims by the stored value's subtile coordinates.
+
+    Dims created by a split view (``x[tile, :].view(..., 2, half)`` feeding
+    ``hl.split``) are not owned by a block; their per-thread coordinate lives
+    in ``CUTE_DIM_LOCAL_COORD_META``. A full-slice store of such a value would
+    otherwise be addressed by an unrelated reduction dim of the same size, so
+    substitute the value's coordinate. Returns the subscript to build the
+    mask from: re-addressed dims are always in bounds and drop their block
+    mask.
+    """
+    from .cute_reshape import CUTE_DIM_LOCAL_COORD_META
+    from .cute_reshape import _get_block_local_coord
+    from .cute_reshape import _subtile_coord_expr
+
+    mask_subscript = list(subscript)
+    if not isinstance(value_node, torch.fx.Node):
+        return mask_subscript
+    meta = value_node.meta.get(CUTE_DIM_LOCAL_COORD_META)
+    value = value_node.meta.get("val")
+    if (
+        not isinstance(meta, (list, tuple))
+        or not isinstance(value, torch.Tensor)
+        or len(meta) != value.ndim
+        or not any(isinstance(info, dict) for info in meta)
+    ):
+        return mask_subscript
+    output_dims = _cute_load_output_dims(state, tensor, subscript, index_exprs)
+    if output_dims is None or len(output_dims) != value.ndim:
+        return mask_subscript
+    from ..generate_ast import GenerateAST
+
+    cg = state.codegen
+    assert isinstance(cg, GenerateAST)
+    positions = [pos for pos, idx in enumerate(subscript) if idx is not None]
+    for info, mapping in zip(meta, output_dims, strict=True):
+        if not isinstance(info, dict) or mapping is None:
+            continue
+        tensor_dim, block_id = mapping
+        idx = subscript[positions[tensor_dim]]
+        if not (isinstance(idx, slice) and idx == slice(None)):
+            continue
+        coord = _subtile_coord_expr(cg, info)
+        if coord is None:
+            continue
+        own_coord = (
+            _get_block_local_coord(cg, block_id) if block_id is not None else None
+        )
+        if own_coord is None:
+            index_exprs[tensor_dim] = coord
+        else:
+            # Keep the slice's tile base, swap in the value's coordinate.
+            index_exprs[tensor_dim] = (
+                f"({index_exprs[tensor_dim]}) - ({own_coord}) + ({coord})"
+            )
+        mask_subscript[positions[tensor_dim]] = 0
+    return mask_subscript
+
+
+def cute_reindexed_scalar_load_expr(
+    cg: GenerateAST,
+    load_node: torch.fx.Node,
+    flat_index: str,
+) -> ast.AST | None:
+    """Re-read ``load_node``'s tile at row-major ``flat_index`` of its tile shape.
+
+    ``hl.split`` uses this to fetch both pair elements of a loaded tile with
+    fresh scalar loads (the register-layout equivalent of ``tl.split``) rather
+    than exchanging the whole tile through shared memory. Only dims addressed
+    by a block index are re-coordinated. The original mask is kept (a thread
+    whose own element is out of bounds has its outputs masked too) and, on a
+    dim whose tile does not provably span the tensor, the partner's own bound
+    check is added so an element past a partial edge tile reads as 0, exactly
+    as ``tl.split`` sees the zero-filled tail of a masked tile load.  A load
+    with ``extra_mask`` is not re-read: its mask is a per-thread value that
+    cannot be re-evaluated at the partner's coordinates, so the partner would
+    read raw memory where ``tl.split`` sees a zero.
+    """
+    from .cute_reshape import _coords_from_flat_index
+    from .cute_reshape import _get_block_local_coord
+    from .cute_reshape import _get_tile_shape
+
+    site = load_node.meta.get(CUTE_SCALAR_LOAD_SITE_META)
+    value = load_node.meta.get("val")
+    tensor_node = load_node.args[0]
+    tensor = (
+        tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+    )
+    if (
+        not isinstance(site, CuteScalarLoadSite)
+        or site.has_extra_mask
+        or not isinstance(value, torch.Tensor)
+        or not isinstance(tensor, torch.Tensor)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    shape = _get_tile_shape(value, env, cg.device_function.config)
+    flat_var = cg.lift(expr_from_string(flat_index), dce=True, prefix="split_index")
+    coords = _coords_from_flat_index(flat_var.id, shape)
+    index_exprs = list(site.index_exprs)
+    mask_terms = [] if site.mask_expr is None else [site.mask_expr]
+    for dim, mapping in enumerate(site.output_dims):
+        if shape[dim] == 1 or mapping is None:
+            continue
+        tensor_dim, block_id = mapping
+        if block_id is None:
+            return None
+        own_coord = _get_block_local_coord(cg, block_id)
+        if own_coord is None:
+            return None
+        # The emitted index is ``tile base + this thread's local coordinate``;
+        # keep the base and substitute the requested coordinate.
+        partner = f"({index_exprs[tensor_dim]}) - ({own_coord}) + ({coords[dim]})"
+        index_exprs[tensor_dim] = partner
+        dim_size = tensor.size(tensor_dim)
+        if not env.known_equal(dim_size, shape[dim]):
+            size_expr = (
+                str(dim_size)
+                if isinstance(dim_size, int)
+                else cg.device_function.sympy_expr(dim_size._sympy_())
+            )
+            mask_terms.append(f"(({partner}) < {size_expr})")
+    load_expr = _cute_scalar_load_expr(
+        site.tensor_name,
+        index_exprs,
+        value.dtype,
+        eviction_suffix=site.eviction_suffix,
+    )
+    if value.dtype is torch.bool:
+        load_expr = f"({load_expr} != cutlass.Uint8(0))"
+        zero = "cutlass.Boolean"
+    else:
+        zero = _cute_scalar_storage_dtype(value.dtype)
+    if not mask_terms:
+        return expr_from_string(load_expr)
+    mask_expr = " and ".join(mask_terms)
+    return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
+
+
 @_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
     # A store to this tensor earlier in the same loop body followed by this
@@ -4985,6 +5292,22 @@ def _(state: CodegenState) -> object:
     assert isinstance(ast_subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    if isinstance(tensor, torch.Tensor):
+        check_memory_mask_rebound(
+            state, tensor, subscript, state.proxy_arg(2), what="load"
+        )
+    elif isinstance(tensor, tuple):
+        # A stack tensor load ANDs the mask through _cute_stack_tensor_mask_expr
+        # over the pointer table's dims and tensor_like[subscript].
+        stack_tensor_like, stack_dev_ptrs = tensor
+        check_memory_mask_rebound(
+            state,
+            stack_tensor_like,
+            subscript,
+            state.proxy_arg(2),
+            what="stack tensor load",
+            leading_sizes=stack_dev_ptrs.shape,
+        )
 
     if isinstance(tensor, tuple):
         stack_tensor_ast = state.ast_args[0]
@@ -5111,6 +5434,17 @@ def _(state: CodegenState) -> object:
                 eviction_suffix = f"__{policy}__"
             elif mapped := _CUTE_EVICTION_POLICY_MAP.get(policy, ""):
                 eviction_suffix = f", level1_eviction_priority={mapped!r}"
+    if state.fx_node is not None:
+        _record_cute_scalar_load_site(
+            state,
+            tensor,
+            subscript,
+            tensor_name,
+            index_exprs,
+            mask_expr,
+            extra_mask is not None,
+            eviction_suffix,
+        )
     load_expr: str | None = None
     load_placeholders: dict[str, ast.AST] = {}
     branch_vec_candidate: tuple[int, int] | None = None

@@ -6949,7 +6949,7 @@ def _codegen_cute_store_tcgen05_tile(
     return [*main_stmts, *post_loop_stmts]
 
 
-def _codegen_cute_store_permute_lane_loops(
+def _codegen_cute_store_reshape_lane_loops(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
@@ -6958,13 +6958,10 @@ def _codegen_cute_store_permute_lane_loops(
     extra_mask: ast.AST | None,
     value_node: torch.fx.Node,
 ) -> ast.AST | None:
-    from .._compiler.cute.cute_reshape import _coords_from_flat_index
     from .._compiler.cute.cute_reshape import _flat_index_from_coords
-    from .._compiler.cute.cute_reshape import _get_dim_local_coord
+    from .._compiler.cute.cute_reshape import _get_node_dim_local_coord
     from .._compiler.cute.cute_reshape import _get_tile_shape
-    from .._compiler.cute.cute_reshape import _permute_reorders_active_dims
     from .._compiler.cute.cute_reshape import _shape_op_needs_materialization
-    from .._compiler.cute.cute_reshape import _store_permute_info
     from .._compiler.generate_ast import GenerateAST
     from .._compiler.tile_strategy import DeviceGridState
 
@@ -6985,92 +6982,13 @@ def _codegen_cute_store_permute_lane_loops(
     )
     index_tuple = _cute_index_tuple(index_exprs)
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
-    tensor_name = state.device_function.tensor_arg(tensor).name
 
     input_node: torch.fx.Node
     output_val = value_node.meta.get("val")
     read_flat: str
     input_shape: list[int]
 
-    info = _store_permute_info(value_node)
-    if info is not None:
-        input_node, perm = info
-        input_val = input_node.meta.get("val")
-        if not isinstance(input_val, torch.Tensor) or not isinstance(
-            output_val, torch.Tensor
-        ):
-            return None
-        if not _permute_reorders_active_dims(state.codegen, input_val, perm):
-            return None
-        source_tensor_node = input_node.args[0] if input_node.args else None
-        source_extra_mask = input_node.args[2] if len(input_node.args) > 2 else None
-        if (
-            input_node.op == "call_function"
-            and input_node.target is load
-            and isinstance(source_tensor_node, torch.fx.Node)
-            and source_extra_mask is None
-        ):
-            source_tensor = source_tensor_node.meta.get("val")
-            if isinstance(source_tensor, torch.Tensor):
-                reordered_subscript = [
-                    subscript[perm.index(i)] for i in range(len(perm))
-                ]
-                reordered_ast_subscript = (
-                    [ast_subscript[perm.index(i)] for i in range(len(perm))]
-                    if isinstance(ast_subscript, (list, tuple))
-                    else None
-                )
-                source_index_exprs = _cute_index_exprs(
-                    state,
-                    reordered_subscript,
-                    ast_subscript=reordered_ast_subscript,
-                    tensor=source_tensor,
-                    inactive_singleton_slice_expr="0",
-                )
-                source_index_tuple = _cute_index_tuple(source_index_exprs)
-                source_name = state.device_function.tensor_arg(source_tensor).name
-                source_mask = _cute_combined_mask(
-                    state,
-                    reordered_subscript,
-                    None,
-                    tensor=source_tensor,
-                )
-                source_dtype = CompileEnvironment.current().backend.dtype_str(
-                    source_tensor.dtype
-                )
-                return expr_from_string(
-                    (
-                        f"({tensor_name}.__setitem__({index_tuple}, "
-                        f"({source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))) "
-                        f"if {mask_expr} else None)"
-                    )
-                    if source_mask is not None and mask_expr is not None
-                    else (
-                        f"{tensor_name}.__setitem__({index_tuple}, "
-                        f"{source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))"
-                        if source_mask is not None
-                        else (
-                            f"({tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}]) "
-                            f"if {mask_expr} else None)"
-                            if mask_expr is not None
-                            else f"{tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}])"
-                        )
-                    )
-                )
-            raise exc.BackendUnsupported("cute", "permute lane-loop source tensor")
-        env = CompileEnvironment.current()
-        df = state.device_function
-        input_shape = _get_tile_shape(input_val, env, df.config)
-        output_shape = _get_tile_shape(output_val, env, df.config)
-        src_coords = [
-            _get_dim_local_coord(state.codegen, input_val, i)
-            for i in range(len(input_shape))
-        ]
-        current_flat = _flat_index_from_coords(src_coords, input_shape)
-        output_coords = _coords_from_flat_index(current_flat, output_shape)
-        read_coords = [output_coords[perm.index(i)] for i in range(len(perm))]
-        read_flat = _flat_index_from_coords(read_coords, input_shape)
-    elif value_node.target in {
+    if value_node.target in {
         torch.ops.aten.view.default,
         torch.ops.aten.reshape.default,
     }:
@@ -7093,13 +7011,16 @@ def _codegen_cute_store_permute_lane_loops(
         output_non_unit = [s for s in output_shape if s != 1]
         if input_non_unit == output_non_unit:
             return None
+        # Split-view dims carry their coordinates as node metadata; honoring
+        # it keeps a merge of such dims a relabel instead of a zero-coordinate
+        # shuffle that collapses the row.
         src_coords = [
-            _get_dim_local_coord(state.codegen, input_val, i)
+            _get_node_dim_local_coord(state.codegen, input_node, input_val, i)
             for i in range(len(input_shape))
         ]
         current_flat = _flat_index_from_coords(src_coords, input_shape)
         output_coords = [
-            _get_dim_local_coord(state.codegen, output_val, i)
+            _get_node_dim_local_coord(state.codegen, value_node, output_val, i)
             for i in range(len(output_shape))
         ]
         read_flat = _flat_index_from_coords(output_coords, output_shape)

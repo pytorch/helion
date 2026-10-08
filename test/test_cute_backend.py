@@ -1162,7 +1162,11 @@ def cute_permuted_store_batched_dot_tcgen05(
                 y[tile_b, tile_k, tile_n],
                 acc=acc,
             )
-        out[tile_b, tile_n, tile_m] = acc.to(torch.bfloat16)
+        # The transposed accumulator stored to the transposed slot: each dim
+        # keeps its block id (a bare ``out[tile_b, tile_n, tile_m] = acc``
+        # would bind the M lane to the N axis, a ShapeMismatch for M != N on
+        # every backend).
+        out[tile_b, tile_n, tile_m] = acc.to(torch.bfloat16).transpose(1, 2)
     return out
 
 
@@ -7139,35 +7143,36 @@ class TestCuteBackend(TestCase):
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
     def test_permute_transposes_tile_values(self) -> None:
-        """Permute should shuffle scalar values between threads."""
+        """The slot re-binds the transposed tile's dims: the store exchanges
+        the elements between threads (one element per thread here)."""
 
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
-        _, out = code_and_output(cute_permute_transpose, (x,), block_sizes=[4, 4])
+        code, out = code_and_output(cute_permute_transpose, (x,), block_sizes=[4, 4])
         torch.testing.assert_close(out, x.transpose(0, 1))
+        self.assertIn("rebind_smem", code)
 
     def test_permute_transposes_tile_values_with_lane_loops(self) -> None:
+        # The within-tile transpose stores another thread's element; with two
+        # elements per thread the exchange would need every lane iteration
+        # staged before one barrier, so the store is refused.
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
-        code, out = code_and_output(
-            cute_permute_transpose,
-            (x,),
-            block_sizes=[4, 4],
-            num_threads=[2, 2],
-        )
-        torch.testing.assert_close(out, x.transpose(0, 1))
-        self.assertIn("for lane_", code)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "re-binds"):
+            code_and_output(
+                cute_permute_transpose,
+                (x,),
+                block_sizes=[4, 4],
+                num_threads=[2, 2],
+            )
 
-    def test_permute_store_then_read_preserves_program_order_with_lane_loops(
-        self,
-    ) -> None:
+    def test_permute_store_then_read_with_lane_loops_rejected(self) -> None:
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
-        code, out = code_and_output(
-            cute_permute_store_then_read,
-            (x,),
-            block_sizes=[4, 4],
-            num_threads=[2, 2],
-        )
-        torch.testing.assert_close(out, x.transpose(0, 1) + 1)
-        self.assertIn("x[indices_1, indices_0]", code)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "re-binds"):
+            code_and_output(
+                cute_permute_store_then_read,
+                (x,),
+                block_sizes=[4, 4],
+                num_threads=[2, 2],
+            )
 
     def test_matmul_mma(self) -> None:
         """Test MMA tensor core matmul with float16 inputs."""

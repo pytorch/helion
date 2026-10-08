@@ -237,6 +237,33 @@ def cute_free_arange_indexed_dim_key(
     return None
 
 
+def cute_free_arange_memory_index_positions(
+    source_node: Node,
+    *,
+    _visited: set[Node] | None = None,
+) -> list[tuple[Node, int]]:
+    """Every ``(load/store node, index position)`` a free arange addresses."""
+    visited = set() if _visited is None else _visited
+    if source_node in visited:
+        return []
+    visited.add(source_node)
+    positions: list[tuple[Node, int]] = []
+    for user in source_node.users:
+        if _is_memory_op_index_user(source_node, user):
+            index_arg = user.args[1]
+            assert isinstance(index_arg, (list, tuple))
+            positions.extend(
+                (user, position)
+                for position, entry in enumerate(index_arg)
+                if entry is source_node
+            )
+        elif user.op == "call_function" and _iota_index_passthrough_target(user.target):
+            positions.extend(
+                cute_free_arange_memory_index_positions(user, _visited=visited)
+            )
+    return positions
+
+
 def _memory_op_indexed_dim_key(source_node: Node, user: Node) -> object | None:
     import torch
     from torch.fx.node import Node as FxNode

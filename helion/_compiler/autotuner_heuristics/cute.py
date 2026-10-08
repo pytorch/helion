@@ -6208,10 +6208,12 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
         # The flat-role / FFI direct-entry seed hard-requires the TMA A/B
-        # pipeline, which codegen enables only when both matmul operands pass
-        # the TensorMap alignment proof; an unaligned input keeps the scalar
-        # SMEM producers and the seed config fails to compile. Decide that
-        # here, before any seed or the search surface consults
+        # pipeline and the TMA store epilogue, which codegen enables only when
+        # both matmul operands and the output destination pass the TensorMap
+        # alignment proof; an unaligned input keeps the scalar SMEM producers,
+        # an under-aligned or N-major output takes the SIMT store body, and
+        # either way the seed config fails to compile. Decide that here,
+        # before any seed or the search surface consults
         # ``full_tile_direct_entry_seed_eligible``, and even when heuristic
         # seeds are disabled, because the default projection reads it too.
         host_function = device_ir.host_function

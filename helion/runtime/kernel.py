@@ -65,6 +65,12 @@ from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
+from .._compiler.cute.aux_tensor import host_function_has_tcgen05_aux_kernel_pattern
+from .._compiler.cute.aux_tensor import (
+    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
+)
+from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
+from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
@@ -2412,6 +2418,46 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     zip(self.kernel.signature.parameters, args, strict=False)
                 )
                 self.env.snapshot_tensor_descriptor_alignments(runtime_args)
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                # The exact-shape detector is narrower: it gates the
+                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
+                # The compiler seeds below read these facts (the FFI
+                # direct-entry gate consults the non-tcgen05 operand
+                # flag, the cluster_m=2 seeds and the search projection
+                # the aux facts), so they are recorded before
+                # ``compiler_seed_configs`` runs; they depend only on the
+                # traced host function, not on the runtime arguments.
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self._host_function)
+                )
+                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+                        self._host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
+                    host_function_matmul_has_non_tcgen05_operand(self._host_function)
+                )
+                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
+                    host_function_tcgen05_rowvec_aux_facts(self._host_function)
+                )
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                         self.env,
@@ -2452,52 +2498,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         )
                     )
 
-                # Post-compile FX-graph scan to detect kernels
-                # whose tcgen05 matmul is followed by an
-                # aux-fused store
-                # (``out[tile] = (acc + residual[tile]).to(...)``
-                # and variants — see
-                # ``host_function_has_tcgen05_aux_kernel_pattern``
-                # for the accepted shapes). When detected, the
-                # autotune surface widens to admit
-                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
-                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
-                # productive C-input warp lift is reachable from
-                # the normal autotune path. For pure-matmul
-                # kernels the detector returns False and the
-                # autotune surface keeps the narrow
-                # ``MONOLITHIC + c_input_warps=0`` shape so
-                # autotune cannot sample the strictly-worse
-                # inert C-input warp configuration.
-                # The exact-shape detector is narrower: it gates the
-                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_aux_kernel_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_matmul_has_non_tcgen05_operand,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_tcgen05_rowvec_aux_facts,
-                )
-
-                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    host_function_has_tcgen05_aux_kernel_pattern(self._host_function)
-                )
-                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
-                        self._host_function
-                    )
-                )
-                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
-                    host_function_matmul_has_non_tcgen05_operand(self._host_function)
-                )
-                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
-                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
-                )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
