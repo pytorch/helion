@@ -59,21 +59,26 @@ def _source(body: list[ast.stmt]) -> str:
 
 
 @pytest.mark.parametrize("expression", [_FUSED, _UNFUSED], ids=["fma", "subtraction"])
-@pytest.mark.parametrize("fast_math", [False, True])
-def test_pair_preserves_the_matched_arithmetic_and_frame(
-    expression: str, fast_math: bool
-) -> None:
+def test_cached_pair_needs_fast_math(expression: str) -> None:
+    """Rescaling cached exponentials rounds each output differently, so it
+    needs fast_math; the exact pair does not match a distributed scale."""
     body = _body(expression)
     before = _source(body)
-    rewritten = fuse_cluster_online_pair(body, {}, fast_math=fast_math)
-    after = _source(rewritten)
+    assert _source(fuse_cluster_online_pair(body, {}, fast_math=False)) == before
+
+
+@pytest.mark.parametrize("expression", [_FUSED, _UNFUSED], ids=["fma", "subtraction"])
+def test_pair_preserves_the_matched_arithmetic_and_frame(expression: str) -> None:
+    body = _body(expression)
+    before = _source(body)
+    after = _source(fuse_cluster_online_pair(body, {}, fast_math=True))
     assert after.count("_cute_grouped_reduce_cluster_online_pair(") == 1
     assert "_cute_grouped_reduce_cluster(" not in after
     assert "_cute_grouped_reduce_block(" in after
     assert "mi = _pair_gmax_0" in after
     assert "_pair_negative_inf_0" in after
     assert "_pair_rescale_0" in after
-    assert f"fastmath={fast_math}" in after
+    assert "fastmath=True" in after
     expected_exp = expression.replace("SCALED", "scaled0")
     assert before.count(expected_exp) == 2
     assert after.count(expected_exp) == 1
@@ -89,7 +94,7 @@ def test_raw_half_cache_keeps_fp32_fma_after_bitcast(dtype: str) -> None:
             f"cutlass.Float32(cutlass.Uint16(cache[lane]).bitcast(cutlass.{dtype}))",
         )
     ).body
-    after = _source(fuse_cluster_online_pair(body, {}))
+    after = _source(fuse_cluster_online_pair(body, {}, fast_math=True))
     assert after.count("_cute_grouped_reduce_cluster_online_pair(") == 1
     assert _FUSED.replace("SCALED", "scaled0") in after
 
@@ -99,7 +104,7 @@ def test_different_rounding_between_sweeps_keeps_two_exchanges(reverse: bool) ->
     pair = (_UNFUSED, _FUSED) if reverse else (_FUSED, _UNFUSED)
     body = _body(*pair)
     before = _source(body)
-    assert _source(fuse_cluster_online_pair(body, {})) == before
+    assert _source(fuse_cluster_online_pair(body, {}, fast_math=True)) == before
 
 
 @pytest.mark.parametrize(
@@ -123,7 +128,7 @@ def test_different_rounding_between_sweeps_keeps_two_exchanges(reverse: bool) ->
 def test_unmodelled_fma_keeps_original_exchanges(fma: str) -> None:
     body = _body(f"cute.math.exp2({fma})")
     before = _source(body)
-    assert _source(fuse_cluster_online_pair(body, {})) == before
+    assert _source(fuse_cluster_online_pair(body, {}, fast_math=True)) == before
 
 
 @pytest.mark.parametrize(
@@ -146,7 +151,7 @@ def test_new_fma_path_requires_one_fp32_cache_read(value: str) -> None:
         .replace("SCALED", "scaled0")
     ).body
     before = _source(body)
-    assert _source(fuse_cluster_online_pair(body, {})) == before
+    assert _source(fuse_cluster_online_pair(body, {}, fast_math=True)) == before
 
 
 def test_scaled_max_hidden_by_a_local_index_alias_keeps_original_exchanges() -> None:
@@ -158,4 +163,4 @@ def test_scaled_max_hidden_by_a_local_index_alias_keeps_original_exchanges() -> 
         )
     ).body
     before = _source(body)
-    assert _source(fuse_cluster_online_pair(body, {})) == before
+    assert _source(fuse_cluster_online_pair(body, {}, fast_math=True)) == before

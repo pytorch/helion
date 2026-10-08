@@ -73,10 +73,17 @@ def test_cluster_fma_frames_fresh_pointers_and_mutated_graphs(
         source = bound.to_code(config)
         assert source.count("_cute_grouped_reduce_cluster_online_pair(") == 1
         assert "_cute_grouped_reduce_cluster(" not in source
-        assert "cute.math.exp2(cute.math.fma(" in source
-        assert "_pair_negative_inf_0" in source and "_pair_rescale_0" in source
         assert f"fastmath={fast_math}" in source
         assert source.index("operator.eq(mi,") > source.index("mi = _pair_gmax_0")
+        if fast_math:
+            assert "cute.math.exp2(cute.math.fma(" in source
+            assert "_pair_negative_inf_0" in source and "_pair_rescale_0" in source
+        else:
+            # Exact exponentials: no distributed scale, no cached and
+            # rescaled values, sweep B in the zero-guarded CTA frame.
+            assert "_pair_frame_0" in source
+            for absent in ("_helion_scaled_", "_pair_exp_cache_", "_pair_rescale_"):
+                assert absent not in source
         bound.set_config(config)
 
         invoke = partial(bound, x)

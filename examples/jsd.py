@@ -46,7 +46,8 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+# fast_math: approximate exp and log.
+@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper], fast_math=True)
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
     target: Tensor,  # teacher targets in log-space

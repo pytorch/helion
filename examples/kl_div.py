@@ -50,7 +50,8 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+# fast_math: approximate log.
+@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper], fast_math=True)
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)

@@ -49,7 +49,13 @@ def _marked_body(source):
 @pytest.mark.parametrize("reverse", [False, True])
 def test_existing_scaled_sub_rewrite_contracts_explicit_fp32_only(reverse):
     source = SOURCE.replace("value - offset", "offset - value") if reverse else SOURCE
-    body = hoist_loop_invariant_recips(ast.parse(source).body)
+    # Distributing the scale rounds differently, and only in loops, so
+    # without fast_math the product keeps its exact form.
+    exact = hoist_loop_invariant_recips(ast.parse(source).body, fast_math=False)
+    assert ast.dump(ast.Module(body=exact, type_ignores=[])) == ast.dump(
+        ast.parse(source)
+    )
+    body = hoist_loop_invariant_recips(ast.parse(source).body, fast_math=True)
     assert _count_fmas(body) == 0
     marked = [
         node
@@ -300,7 +306,18 @@ def test_actual_masked_and_vector_sources_follow_the_same_fusion_policy(
         if isinstance(node, ast.FunctionDef) and node.name == "_helion_row_softmax"
     )
     assert ast.dump(original) == ast.dump(functions["_helion_row_softmax"])
-    assert _count_fmas(original.body) >= 2
-    assert _count_fmas(functions["_helion_row_softmax_bounded"].body) >= 2
+    # The distributed scale (and so its contraction) needs fast_math.
+    scaled = sum(
+        isinstance(node, ast.Name) and node.id.startswith("_helion_scaled_")
+        for node in ast.walk(original)
+    )
+    assert bool(scaled) is fast_math
+    if fast_math:
+        assert _count_fmas(original.body) >= 2
+        assert _count_fmas(functions["_helion_row_softmax_bounded"].body) >= 2
+    else:
+        assert _count_fmas(original.body) == _count_fmas(
+            functions["_helion_row_softmax_bounded"].body
+        )
     assert ("cute.arch.load(" in scalar) is aligned
     assert ("cute.arch.load(" in generated) is aligned
