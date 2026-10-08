@@ -165,7 +165,7 @@ HELION_IMPLS = ("helion-cute", "helion-tileir", "helion-triton")
 _STRICT_FINAL_CORRECTNESS_LAUNCHES = 64
 _DEFAULT_MEASURE_COOLDOWN_MARGIN_C = 3.0
 _COOLDOWN_MAX_WAIT_S = 300.0
-_CUTE_FLASH_LANE_POLICY_VERSION = 14
+_CUTE_FLASH_LANE_POLICY_VERSION = 16
 _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION = 2
 _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION = 2
 _FLASH_TERMINAL_COORDINATE_POLICY = "same_leaf_full_surface_normalized_coordinate_v2"
@@ -2206,6 +2206,13 @@ def _flash_normalization_context(config_spec: ConfigSpec) -> dict[str, object]:
         "small_biased_candidate": config_spec._cute_flash_small_biased_candidate,
         "standard_dense_output": config_spec._cute_flash_standard_dense_output,
         "standard_causal_output": config_spec._cute_flash_standard_causal_output,
+        "tmem_rowmax_compatible": config_spec._cute_flash_tmem_rowmax_compatible,
+        "causal_resident_compatible": config_spec._cute_flash_causal_resident_compatible,
+        "target_device_capability": (
+            list(config_spec.target_device_capability)
+            if config_spec.target_device_capability is not None
+            else None
+        ),
         "output_requires_tma": config_spec._cute_flash_output_requires_tma,
         "supports_tensor_4d_tma": config_spec._cute_flash_supports_tensor_4d_tma,
         "block_size_targets": [
@@ -3611,7 +3618,9 @@ def _validate_required_full_autotune(provenance: dict[str, object]) -> None:
                         for config in coverage_configs[:qualification_prefix_count]
                     )
                     < min(
-                        2,
+                        # Compound leaves start with one witness and receive
+                        # measured top-K transfers during qualification.
+                        1 if leaf["compound_packet"] is not None else 2,
                         sum(
                             _flash_structural_leaf_dict(config) == leaf
                             for config in coverage_configs
@@ -4268,6 +4277,304 @@ def _measurement_snapshot_matches(
     )
 
 
+def _replay_flash_conditional_random_proposals(
+    generation: ConfigGeneration,
+    base: list[object],
+    *,
+    radius: int,
+    count: int,
+    raw_state: object,
+    fail: Callable[[str], NoReturn],
+) -> list[list[object]]:
+    """Replay every fallback draw without touching the validator's RNG."""
+    if not count:
+        if raw_state is not None:
+            fail("RNG state without random proposals")
+        return []
+    if (
+        not isinstance(raw_state, (list, tuple))
+        or len(raw_state) != 3
+        or type(raw_state[0]) is not int
+        or raw_state[0] != 3
+        or not isinstance(raw_state[1], (list, tuple))
+        or len(raw_state[1]) != 625
+        or any(type(value) is not int for value in raw_state[1])
+        or any(not 0 <= value < 2**32 for value in raw_state[1][:-1])
+        or not 0 <= raw_state[1][-1] <= 624
+        or (
+            raw_state[2] is not None
+            and (type(raw_state[2]) is not float or not math.isfinite(raw_state[2]))
+        )
+    ):
+        fail("malformed random proposal state")
+    rng = random.Random()
+    rng.setstate((raw_state[0], tuple(raw_state[1]), raw_state[2]))
+    frozen = generation.overridden_flat_indices
+    blocks = [index for index in generation.block_size_indices if index not in frozen]
+    warp_index = generation.num_warps_index
+    result: list[list[object]] = []
+    for _ in range(count):
+        raw = copy.deepcopy(base)
+        modified = set()
+        if blocks:
+            index = rng.choice(blocks)
+            modified.add(index)
+            values = generation.flat_spec[index].pattern_neighbors(base[index], radius)
+            if values:
+                raw[index] = rng.choice(values)
+        if warp_index >= 0 and warp_index not in frozen:
+            modified.add(warp_index)
+            values = generation.flat_spec[warp_index].pattern_neighbors(
+                base[warp_index], radius
+            )
+            if values:
+                raw[warp_index] = rng.choice(values)
+        remaining = []
+        for index, spec in enumerate(generation.flat_spec):
+            if index not in modified and index not in frozen:
+                values = spec.pattern_neighbors(base[index])
+                if values:
+                    remaining.append((index, values))
+        if remaining:
+            count_to_change = rng.randint(0, min(radius, len(remaining)))
+            if count_to_change:
+                for index, values in rng.sample(remaining, count_to_change):
+                    raw[index] = rng.choice(values)
+        result.append(raw)
+    return result
+
+
+def _validate_flash_conditional_parent_search(
+    raw_search: object,
+    *,
+    config_generation: ConfigGeneration,
+    ranked_parent_ids: list[str],
+    manifest_configs: dict[str, dict[str, object]],
+    known_config_ids: set[str],
+    leaf: dict[str, object],
+    lane: _FlashPipelineLane,
+    neighbor_limit: int,
+    radius: int,
+    selected_parent_id: object,
+    generated_ids: list[str],
+    trial_index: int,
+    template_owned_coordinates: bool = False,
+) -> None:
+    """Replay bounded v23/v24 conditional proposals under their recorded policy."""
+    from helion.autotuner.search_space_logger import canonical_config_id
+    from helion.exc import InvalidConfig
+    from helion.runtime.config import Config
+
+    def fail(detail: str) -> NoReturn:
+        raise RuntimeError(
+            f"required full autotune trial {trial_index} recorded "
+            f"an invalid conditional parent search: {detail}"
+        )
+
+    def same(left: object, right: object) -> bool:
+        # Do not accept bool/int substitutions in raw JSON projections.
+        return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+    if not isinstance(raw_search, dict) or set(raw_search) != {
+        "schema_version",
+        "neighbor_limit",
+        "radius",
+        "known_config_ids",
+        "allocations",
+        "attempts",
+        "consumed",
+        "selected_parent_config_id",
+        "selected_child_config_id",
+    }:
+        fail("malformed ledger")
+    search = cast("dict[str, object]", raw_search)
+    parent_count = min(len(ranked_parent_ids), max(0, neighbor_limit))
+    allocations = [
+        {
+            "parent_config_id": ranked_parent_ids[index],
+            "limit": (index + 1) * neighbor_limit // parent_count
+            - index * neighbor_limit // parent_count,
+        }
+        for index in range(parent_count)
+    ]
+    if (
+        type(search["schema_version"]) is not int
+        or search["schema_version"] != (2 if template_owned_coordinates else 1)
+        or type(search["neighbor_limit"]) is not int
+        or search["neighbor_limit"] != neighbor_limit
+        or type(search["radius"]) is not int
+        or search["radius"] != radius
+        or not same(search["allocations"], allocations)
+        or search["known_config_ids"] != sorted(known_config_ids)
+        or type(search["consumed"]) is not int
+        or not isinstance(search["attempts"], list)
+    ):
+        fail("bounds, ranked allocation, or known-set mismatch")
+    attempts = cast("list[object]", search["attempts"])
+    if len(attempts) > parent_count:
+        fail("too many parent attempts")
+    overrides = dict(config_generation._override_values)
+    overrides["cute_flash_pipeline_family"] = leaf["family"]
+    overrides["cute_flash_softmax_disc"] = leaf["softmax_disc"]
+    if leaf["compound_packet"] is not None:
+        overrides["cute_flash_exp2_packet"] = leaf["compound_packet"]
+    overrides[lane[0]] = lane[1]
+    generation = config_generation.config_spec.create_config_generation(
+        overrides=overrides,
+        advanced_controls_files=config_generation._advanced_controls_files,
+        process_group_name=config_generation.process_group_name,
+    )
+    consumed = 0
+    expected_parent: str | None = None
+    selected_child: str | None = None
+    for attempt_index, raw_attempt in enumerate(attempts):
+        expected_attempt_keys = {
+            "parent_config_id",
+            "allocated",
+            "consumed",
+            "proposals",
+            "novel_config_ids",
+            "random_state",
+        }
+        if template_owned_coordinates:
+            expected_attempt_keys.add("owned_coordinate_indices")
+        if (
+            not isinstance(raw_attempt, dict)
+            or set(raw_attempt) != expected_attempt_keys
+        ):
+            fail("malformed parent attempt")
+        attempt = cast("dict[str, object]", raw_attempt)
+        allocation = allocations[attempt_index]
+        parent_id = allocation["parent_config_id"]
+        limit = allocation["limit"]
+        if (
+            attempt["parent_config_id"] != parent_id
+            or type(attempt["allocated"]) is not int
+            or attempt["allocated"] != limit
+            or type(attempt["consumed"]) is not int
+            or attempt["consumed"] != limit
+            or not isinstance(attempt["proposals"], list)
+            or len(cast("list[object]", attempt["proposals"])) != limit
+        ):
+            fail("parent order or attempt allocation mismatch")
+        parent = Config.from_dict(manifest_configs[parent_id])
+        base, parent_config = generation.canonicalize_flat(generation.flatten(parent))
+        owned_indices = (
+            generation.flash_owned_coordinate_indices(parent_config)
+            if template_owned_coordinates
+            else []
+        )
+        if template_owned_coordinates and not same(
+            attempt["owned_coordinate_indices"], owned_indices
+        ):
+            fail("implementation-owned coordinate mismatch")
+        projections = generation.coordinate_neighbor_projections(
+            base, radius=radius, limit=limit, frozen_indices=owned_indices
+        )
+        expected_coordinates = []
+        for projection in projections:
+            raw = copy.deepcopy(base)
+            raw[projection.flat_index] = copy.deepcopy(projection.to_value)
+            expected_coordinates.append(raw)
+        expected_random = _replay_flash_conditional_random_proposals(
+            generation,
+            base,
+            radius=radius,
+            count=limit - len(expected_coordinates),
+            raw_state=attempt["random_state"],
+            fail=fail,
+        )
+
+        novel_ids: list[str] = []
+        proposed_configs: set[Config] = set()
+        for proposal_index, raw_proposal in enumerate(
+            cast("list[object]", attempt["proposals"])
+        ):
+            if not isinstance(raw_proposal, dict) or set(raw_proposal) != {
+                "kind",
+                "raw_flat_values",
+                "config",
+                "config_id",
+                "outcome",
+            }:
+                fail("malformed raw proposal")
+            proposal = cast("dict[str, object]", raw_proposal)
+            raw_values = proposal["raw_flat_values"]
+            if not isinstance(raw_values, list) or len(raw_values) != len(base):
+                fail("malformed raw flat values")
+            raw_values = cast("list[object]", raw_values)
+            if proposal_index < len(expected_coordinates):
+                if proposal["kind"] != "coordinate" or not same(
+                    raw_values, expected_coordinates[proposal_index]
+                ):
+                    fail("coordinate prefix or lineage mismatch")
+            elif proposal["kind"] != "random" or not same(
+                raw_values, expected_random[proposal_index - len(expected_coordinates)]
+            ):
+                fail("random proposal replay mismatch")
+            projected: Config | None = None
+            outcome = "invalid"
+            try:
+                _, local = generation.canonicalize_flat(raw_values)
+                _, projected = config_generation.canonicalize_flat(
+                    config_generation.flatten(local)
+                )
+            except InvalidConfig:
+                pass
+            projected_id = None if projected is None else canonical_config_id(projected)
+            if projected is not None:
+                if (
+                    _flash_structural_leaf_dict(dict(projected.config)) != leaf
+                    or projected.config.get(lane[0]) != lane[1]
+                ):
+                    outcome = "constraint_mismatch"
+                elif (
+                    not config_generation.config_spec.backend.autotune_config_is_viable(
+                        config_generation.config_spec, projected
+                    )
+                ):
+                    outcome = "backend_invalid"
+                elif projected_id in known_config_ids:
+                    outcome = "known"
+                elif projected in proposed_configs:
+                    outcome = "duplicate"
+                else:
+                    outcome = "novel"
+                    proposed_configs.add(projected)
+                    assert projected_id is not None
+                    novel_ids.append(projected_id)
+            if (
+                proposal["config_id"] != projected_id
+                or not same(
+                    proposal["config"],
+                    None if projected is None else dict(projected.config),
+                )
+                or proposal["outcome"] != outcome
+            ):
+                fail("proposal normalization or novelty mismatch")
+        consumed += limit
+        if attempt["novel_config_ids"] != novel_ids:
+            fail("novel candidate pool mismatch")
+        if novel_ids:
+            if attempt_index != len(attempts) - 1:
+                fail("skipped a productive parent")
+            if len(generated_ids) != 1 or generated_ids[0] not in novel_ids:
+                fail("child outside the first productive parent pool")
+            expected_parent = parent_id
+            selected_child = generated_ids[0]
+    if expected_parent is None and len(attempts) != parent_count:
+        fail("stopped before the allocated parent prefix ended")
+    if (
+        consumed != search["consumed"]
+        or consumed > neighbor_limit
+        or search["selected_parent_config_id"] != expected_parent
+        or selected_parent_id != expected_parent
+        or search["selected_child_config_id"] != selected_child
+        or generated_ids != ([] if selected_child is None else [selected_child])
+    ):
+        fail("selected parent, child, or total consumption mismatch")
+
+
 def _validate_flash_structural_qualification_phase(
     provenance: dict[str, object],
     phase: dict[str, object],
@@ -4320,14 +4627,29 @@ def _validate_flash_structural_qualification_phase(
         encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()[:16]
 
+    template_owned_coordinates = (
+        phase.get("phase") == "cute_flash_structural_qualification_v24"
+        and phase.get("cute_flash_lane_policy_version") == 16
+    )
+    ranked_conditional_parents = template_owned_coordinates or (
+        phase.get("phase") == "cute_flash_structural_qualification_v23"
+        and phase.get("cute_flash_lane_policy_version") == 15
+    )
+    legacy_conditional_parents = (
+        phase.get("phase") == "cute_flash_structural_qualification_v22"
+        and phase.get("cute_flash_lane_policy_version") == 14
+    )
     if (
-        phase.get("phase") != "cute_flash_structural_qualification_v22"
-        or phase.get("cute_flash_lane_policy_version")
-        != _CUTE_FLASH_LANE_POLICY_VERSION
+        not (ranked_conditional_parents or legacy_conditional_parents)
         or phase.get("completed") is not True
         or phase.get("budget_exhausted") is not False
     ):
-        fail("an incomplete or non-v22 structural qualification phase")
+        fail("an incomplete or unsupported structural qualification phase")
+    recorded_policy = provenance.get("flash_terminal_coordinate_refinement_policy")
+    if not isinstance(recorded_policy, dict) or phase.get(
+        "cute_flash_lane_policy_version"
+    ) != recorded_policy.get("lane_policy_version"):
+        fail("a qualification phase inconsistent with its recorded policy")
     if (
         phase.get("conditional_candidates_per_pipeline_lane") != 1
         or phase.get("qualification_failure_retries") != 1
@@ -7516,6 +7838,8 @@ def _validate_flash_structural_qualification_phase(
                 }
                 if kind == "failure_repair":
                     expected_decision_keys.add("repair_index")
+                elif kind == "conditional" and ranked_conditional_parents:
+                    expected_decision_keys.add("conditional_parent_search")
                 if set(decision) != expected_decision_keys:
                     fail("an invalid immutable pipeline parent decision")
                 expected_lane_metric = _flash_pipeline_lane_metric(lane)
@@ -7551,8 +7875,11 @@ def _validate_flash_structural_qualification_phase(
                     or decision.get("repair_index") != repair_index
                     or decision.get("selection_kind") not in expected_selection_kinds
                     or (selected_id is not None and not valid_config_id(selected_id))
-                    or selected_id
-                    != (candidates[0]["config_id"] if candidates else None)
+                    or (
+                        (kind != "conditional" or not ranked_conditional_parents)
+                        and selected_id
+                        != (candidates[0]["config_id"] if candidates else None)
+                    )
                     or (not candidates and generated_ids)
                     or (
                         kind == "witness"
@@ -7578,6 +7905,43 @@ def _validate_flash_structural_qualification_phase(
                     for config_id in [*decision_ids, *generated_ids]
                 ):
                     fail("an invalid immutable pipeline parent decision")
+                if kind == "conditional" and ranked_conditional_parents:
+                    assert lane is not None
+                    known_ids = initial_id_set | set(expected_anchor_ids)
+                    for scheduled_ids in scheduled_ids_by_completion_pass[
+                        : schedule_anchor_pass_count + pass_index + 1
+                    ]:
+                        known_ids.update(scheduled_ids)
+                    # Production queues leaves and jobs in order, before the
+                    # common pass measurement. Earlier queued children count
+                    # as known even though they have no measurement yet.
+                    for earlier_result in leaf_results[: ordinary_catalog.index(leaf)]:
+                        known_ids.update(
+                            cast("dict[str, Any]", earlier_result)["rounds"][
+                                pass_index
+                            ]["candidate_config_ids"]
+                        )
+                    known_ids.update(emitted_ids)
+                    lane_round = cast(
+                        "list[dict[str, object]]", lane_records[lane]["rounds"]
+                    )[pass_index]
+                    _validate_flash_conditional_parent_search(
+                        decision["conditional_parent_search"],
+                        config_generation=config_generation,
+                        ranked_parent_ids=decision_ids,
+                        manifest_configs=manifest_configs,
+                        known_config_ids=known_ids,
+                        leaf=leaf,
+                        lane=lane,
+                        neighbor_limit=cast(
+                            "int", lane_round["neighbor_generation_limit"]
+                        ),
+                        radius=_FLASH_TERMINAL_COORDINATE_RADIUS,
+                        selected_parent_id=selected_id,
+                        generated_ids=generated_ids,
+                        trial_index=trial_index,
+                        template_owned_coordinates=template_owned_coordinates,
+                    )
                 if kind == "witness":
                     emitted_ids.extend(generated_ids)
                 else:

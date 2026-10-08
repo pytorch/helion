@@ -16,6 +16,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
+from unittest.mock import patch
 
 from benchmarks.cute import compare_attention_backends
 import pytest
@@ -1094,7 +1095,7 @@ def _full_autotune_provenance(**overrides):
     terminal_policy = {
         "schema_version": 2,
         "policy_version": 2,
-        "lane_policy_version": 14,
+        "lane_policy_version": 16,
         "coordinate_policy": "same_leaf_full_surface_normalized_coordinate_v2",
         "measurement_policy": "mirrored_rotating_batched_wall_v2",
         "rounds": 2,
@@ -2721,6 +2722,11 @@ def _full_autotune_trial_provenance_base():
 
 def _full_autotune_trial_provenance(**overrides):
     provenance = copy.deepcopy(_full_autotune_trial_provenance_base())
+    policy = provenance["flash_terminal_coordinate_refinement_policy"]
+    policy["lane_policy_version"] = 14
+    provenance["flash_terminal_coordinate_refinement_policy_sha256"] = (
+        compare_attention_backends._canonical_json_sha256(policy)
+    )
     provenance.update(overrides)
     return provenance
 
@@ -4111,15 +4117,20 @@ def _validate_full_autotune_trials(provenance, trials, *, expected_fixture_trial
     )
     provenance["compiler_seed_config_count"] = compiler_seed_policy["raw_config_count"]
     provenance["compiler_seed_policy"] = compiler_seed_policy
-    return compare_attention_backends._validate_required_full_autotune_trials(
-        provenance,
-        trials,
-        config_spec=config_spec,
-        expected_input_shapes=repr([(2, 32, 65536, 64)] * 3),
-        expected_dtypes=repr(["torch.float16"] * 3),
-        expected_hardware="NVIDIA B200",
-        config_generation=fixture_generation,
-    )
+    # These fabricated v22 transcripts retain the original rank-zero contract.
+    # A v24 label would require the actual bounded conditional proposal ledger.
+    with patch.object(
+        compare_attention_backends, "_CUTE_FLASH_LANE_POLICY_VERSION", 14
+    ):
+        return compare_attention_backends._validate_required_full_autotune_trials(
+            provenance,
+            trials,
+            config_spec=config_spec,
+            expected_input_shapes=repr([(2, 32, 65536, 64)] * 3),
+            expected_dtypes=repr(["torch.float16"] * 3),
+            expected_hardware="NVIDIA B200",
+            config_generation=fixture_generation,
+        )
 
 
 @pytest.mark.parametrize(
@@ -4817,7 +4828,7 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
     assert terminal_policy == {
         "schema_version": 2,
         "policy_version": 2,
-        "lane_policy_version": 14,
+        "lane_policy_version": 16,
         "coordinate_policy": "same_leaf_full_surface_normalized_coordinate_v2",
         "measurement_policy": "mirrored_rotating_batched_wall_v2",
         "rounds": 2,
@@ -6161,9 +6172,9 @@ def test_attention_required_full_autotune_recomputes_starting_path_lane():
     (
         (
             {"phase": "cute_flash_structural_qualification_v12"},
-            "incomplete or non-v22",
+            "incomplete or unsupported",
         ),
-        ({"cute_flash_lane_policy_version": 2}, "incomplete or non-v22"),
+        ({"cute_flash_lane_policy_version": 2}, "incomplete or unsupported"),
         (
             {"pipeline_qualification_keys": ["cute_flash_s_stage"]},
             "qualification bounds",
@@ -6177,7 +6188,7 @@ def test_attention_required_full_autotune_recomputes_starting_path_lane():
             "qualification pass accounting",
         ),
         ({"qualification_failure_retries": 0}, "qualification pass accounting"),
-        ({"budget_exhausted": True}, "incomplete or non-v22"),
+        ({"budget_exhausted": True}, "incomplete or unsupported"),
         ({"pipeline_candidate_limit_per_leaf_per_round": 3}, "qualification bounds"),
         ({"neighbor_generation_limit_per_leaf_per_round": 0}, "qualification bounds"),
         (
@@ -10097,6 +10108,7 @@ def _strict_report_result(shape, source_hash):
     terminal_policy = copy.deepcopy(
         fixture_provenance["flash_terminal_coordinate_refinement_policy"]
     )
+    terminal_policy["lane_policy_version"] = 14  # Legacy report metadata fixture.
     terminal_surface = copy.deepcopy(
         fixture_provenance["flash_terminal_coordinate_surface_catalog"]
     )
