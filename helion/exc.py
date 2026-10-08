@@ -136,6 +136,10 @@ class PdlStateWithoutWait(BaseError):
     )
 
 
+class InvalidPrefetchRegion(BaseError):
+    message = "hl.prefetch: {0}."
+
+
 class BarrierRequiresPersistent(BaseError):
     message = "hl.barrier() requires pid_type to be persistent (got '{0}')."
 
