@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import DeviceLoopOrGridState
 
 # Lane counts of the ``red.global.add.v{N}.f32`` forms (8 and 16 bytes).
 _CUTE_VECTOR_ATOMIC_WIDTHS = (2, 4)
@@ -1064,9 +1065,22 @@ def _cute_unindexed_leader_axes(
     fx_graph = state.fx_node.graph if state.fx_node is not None else None
     leader_axes: set[int] = set()
     active_thread_axes: set[int] = set()
+    loop_states = _cute_loop_states(state)
 
     def collect(thread_axes: dict[int, int]) -> None:
         for candidate_block_id, thread_axis in thread_axes.items():
+            if (
+                _cute_block_thread_extent(loop_states, candidate_block_id, thread_axis)
+                == 1
+            ):
+                # The block spans one thread along the axis (a slice walked
+                # entirely by its per-thread lane loop, recorded on the grid
+                # state as well as on its own): the axis's threads are
+                # another block's elements, and that block decides whether
+                # the atomic varies along them, so it neither claims nor
+                # decides the axis.  The lane loop is the lane placement's
+                # business (``_cute_uniform_lane_vars``).
+                continue
             active_thread_axes.add(thread_axis)
             if indexed_block_ids is None or fx_graph is None:
                 # Without a known coverage there is no reliable mapping from
@@ -1081,12 +1095,8 @@ def _cute_unindexed_leader_axes(
                 continue
             leader_axes.add(thread_axis)
 
-    grid_state = state.codegen.current_grid_state
-    if grid_state is not None:
-        collect(grid_state.block_thread_axes)
-    for loops in state.codegen.active_device_loops.values():
-        for loop_state in loops:
-            collect(loop_state.block_thread_axes)
+    for loop_state in loop_states:
+        collect(loop_state.block_thread_axes)
 
     # Ghost-axis leaders: any CTA-resident thread axis (size > 1) that
     # no active loop currently owns. ``max_thread_block_dims`` tracks the
@@ -1106,6 +1116,39 @@ def _cute_unindexed_leader_axes(
         if axis not in active_thread_axes:
             leader_axes.add(axis)
     return leader_axes
+
+
+def _cute_loop_states(state: CodegenState) -> list[DeviceLoopOrGridState]:
+    """The grid state and every active device loop state, each once."""
+    states: list[DeviceLoopOrGridState] = []
+    grid_state = state.codegen.current_grid_state
+    if grid_state is not None:
+        states.append(grid_state)
+    for loops in state.codegen.active_device_loops.values():
+        for loop_state in loops:
+            if not any(loop_state is seen for seen in states):
+                states.append(loop_state)
+    return states
+
+
+def _cute_block_thread_extent(
+    loop_states: list[DeviceLoopOrGridState], block_id: int, thread_axis: int
+) -> int | None:
+    """The threads ``block_id`` spans along ``thread_axis``, or None when no
+    state records a size for the axis.
+
+    A state's ``thread_axis_sizes`` is the widest block on the axis among
+    those it records: a persistent reduction records its block on the grid
+    state too, where the axis may belong to a tile block, so the smallest
+    size any state recording the block gives is the block's own.
+    """
+    sizes = [
+        size
+        for loop_state in loop_states
+        if loop_state.block_thread_axes.get(block_id) == thread_axis
+        and (size := loop_state.thread_axis_sizes.get(thread_axis)) is not None
+    ]
+    return min(sizes, default=None)
 
 
 def _cute_leader_predicate(axes: set[int]) -> str | None:
