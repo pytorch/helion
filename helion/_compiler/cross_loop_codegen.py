@@ -3306,4 +3306,5 @@ def emit_cross_loop_schedule(
         raise AssertionError(
             "tile-dependency lowering mutated an opaque source tile body"
         )
-    return result
+    # Megakernel text outgrows the launch prefetch, so the kernel L2-warms it.
+    return [statement_from_string("helion_cache_hints.code_warm()"), *result]
