@@ -245,6 +245,35 @@ def _inner_lane_k_addmm_atomic(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _lane_k_online_softmax_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    # examples/attention.py without the batch dim.  head_dim takes the first
+    # thread axis, so each score is a warp reduction; the key tile is threads
+    # x serial lanes, and the running max, the running sum and the ``p @ v``
+    # contribution each reduce across its lane loop.
+    m_dim = q.size(0)
+    n_dim = k.size(0)
+    head_dim = hl.specialize(q.size(1))
+    out = torch.empty_like(q)
+    for tile_m in hl.tile(m_dim):
+        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        l_i = hl.zeros([tile_m], dtype=torch.float32)
+        acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+        q_i = q[tile_m, :]
+        for tile_n in hl.tile(n_dim):
+            qk = torch.mm(q_i, k[tile_n, :].T)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            p = torch.exp(qk - m_ij[:, None])
+            alpha = torch.exp(m_i - m_ij)
+            l_i = l_i * alpha + torch.sum(p, -1)
+            acc = torch.addmm(acc * alpha[:, None], p, v[tile_n, :])
+            m_i = m_ij
+        out[tile_m, :] = acc / l_i[:, None]
+    return out
+
+
 def _lane_loop_count(code: str) -> int:
     return sum(
         1
@@ -374,3 +403,18 @@ class TestCuteMatmulLaneKConsumers(TestCase):
             code_and_output(
                 _inner_lane_k_addmm_atomic, (q, k, bias), block_sizes=[32, 32]
             )
+
+    def test_warp_reduced_scores_feed_lane_k_softmax_and_product(self) -> None:
+        # The score's warp reduction runs once per key lane into a register
+        # stash; the max, sum and ``p @ v`` passes read the stash.
+        torch.manual_seed(0)
+        q, k, v = (
+            torch.randn(64, 32, device=DEVICE, dtype=torch.float32) for _ in range(3)
+        )
+        code, out = code_and_output(
+            _lane_k_online_softmax_attention, (q, k, v), block_sizes=[16, 16]
+        )
+        self.assertIn("warp_reduction_sum", code)
+        self.assertIn("_lane_stash", code)
+        expected = torch.softmax(q @ k.T, -1) @ v
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)

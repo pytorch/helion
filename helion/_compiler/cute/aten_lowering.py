@@ -74,6 +74,7 @@ from .matmul_utils import cute_static_k_invariant_extent
 from .matmul_utils import cute_static_mn_collapse_n_block_id
 from .matmul_utils import cute_static_serial_matmul_k_extent
 from .matmul_utils import cute_synthetic_lane_k_extent
+from .matmul_utils import emit_cute_serial_mm_from_load_views
 from .matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .matmul_utils import emit_cute_synthetic_lane_fold_mm
 from .strategies import is_pure_matmul_role_lifecycle_config
@@ -83,8 +84,8 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
 _SYNTHETIC_LANE_FOLD_UNSUPPORTED = (
-    "CuTe synthetic-lane K matmul fold only supports direct-load "
-    "operands whose contraction axis is the load's trailing dim"
+    "CuTe synthetic-lane K matmul fold only supports scaled or permuted "
+    "direct-load operands"
 )
 
 
@@ -106,6 +107,45 @@ def _reject_tcgen05_flat_role_coordinates_fallback() -> None:
         f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
         "active-K-loop tcgen05 MMA lowering",
     )
+
+
+def _serial_mm_from_load_views(
+    ctx: LoweringContext,
+    node: Node,
+    out_dtype: torch.dtype | None,
+    *,
+    acc: ast.AST | None = None,
+) -> ast.AST | None:
+    """Serial-K matmul over load views; an addmm/baddbmm passes its ``acc``."""
+    acc_dtype = None
+    if acc is None:
+        lhs_node, rhs_node = node.args[:2]
+    else:
+        acc_node, lhs_node, rhs_node = node.args[:3]
+        assert isinstance(acc_node, Node)
+        acc_dtype = acc_node.meta["val"].dtype
+    assert isinstance(lhs_node, Node)
+    assert isinstance(rhs_node, Node)
+    result = emit_cute_serial_mm_from_load_views(
+        ctx.cg,
+        ctx.env,
+        node,
+        lhs_node,
+        rhs_node,
+        acc=acc,
+        acc_dtype=acc_dtype,
+        out_dtype=out_dtype,
+    )
+    if result is not None:
+        if _requested_tcgen05_flat_role_coordinates(ctx):
+            _reject_tcgen05_flat_role_coordinates_fallback()
+        if _requested_pure_matmul_role_lifecycle(ctx):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
+                "active-K-loop tcgen05 matmul lowering, not serial scalar fallback",
+            )
+    return result
 
 
 @where_lowering.register_codegen("cute")
@@ -405,16 +445,6 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         hinted(lhs_node.meta["val"].shape[-1]) == 1
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
-    if (
-        static_k_extent is None
-        and serial_k_extent is None
-        and k_block_id is None
-        and not k_is_one
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
     outer_acc_dtype = cute_outer_accumulator_dtype(node, is_acc_none=True)
     effective_out_dtype = (
@@ -422,6 +452,19 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if out_dtype is not None
         else None
     )
+    if (
+        static_k_extent is None
+        and serial_k_extent is None
+        and k_block_id is None
+        and not k_is_one
+    ):
+        view_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
+        if view_result is not None:
+            return view_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
+        )
     if node.target in (torch.ops.aten.bmm.default, torch.ops.aten.bmm.dtype):
         mma_result = codegen_cute_mma(ctx, node, with_acc=False)
         if mma_result is not None:
@@ -464,6 +507,9 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             )
         return serial_result
     if serial_k_extent is not None:
+        view_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
+        if view_result is not None:
+            return view_result
         raise exc.BackendUnsupported(
             "cute",
             "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
@@ -491,6 +537,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             lhs_dtype=lhs_node.meta["val"].dtype,
             rhs_dtype=rhs_node.meta["val"].dtype,
         )
+        if fold_result is None:
+            # Operands the fold cannot re-read (a scalar-indexed load view)
+            # still fold their full K through the serial load-view lowering.
+            fold_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
         if fold_result is not None:
             return fold_result
         raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
@@ -579,6 +629,11 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
     if static_k_extent is None and k_block_id is None and not k_is_one:
+        view_result = _serial_mm_from_load_views(
+            ctx, node, node.meta["val"].dtype, acc=acc
+        )
+        if view_result is not None:
+            return view_result
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
@@ -598,6 +653,10 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             lhs_dtype=lhs_node.meta["val"].dtype,
             rhs_dtype=rhs_node.meta["val"].dtype,
         )
+        if fold_result is None:
+            fold_result = _serial_mm_from_load_views(
+                ctx, node, node.meta["val"].dtype, acc=acc
+            )
         if fold_result is not None:
             return fold_result
         raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
@@ -838,6 +897,11 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
     if static_k_extent is None and k_block_id is None and not k_is_one:
+        view_result = _serial_mm_from_load_views(
+            ctx, node, node.meta["val"].dtype, acc=acc
+        )
+        if view_result is not None:
+            return view_result
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
@@ -870,6 +934,10 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             lhs_dtype=lhs_node.meta["val"].dtype,
             rhs_dtype=rhs_node.meta["val"].dtype,
         )
+        if fold_result is None:
+            fold_result = _serial_mm_from_load_views(
+                ctx, node, node.meta["val"].dtype, acc=acc
+            )
         if fold_result is not None:
             return fold_result
         raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)

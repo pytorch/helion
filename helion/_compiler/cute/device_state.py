@@ -676,6 +676,11 @@ class CuteDeviceFunctionState:
         # ``cute/hoist_warp_reduce.py`` must not fold the lanes into one
         # accumulator before the cross-thread reduce.
         self.unfoldable_vec_lanes: set[str] = set()
+        # Matmul ``dot_acc`` running sums whose K-loop carry is only exact
+        # once ``hoist_lane_invariant_chunk_recurrence`` restructures it to
+        # update once per tile (``cute/matmul_fallback.py``); a nest the pass
+        # does not recognize is rejected rather than summed across tiles.
+        self.chunk_recurrence_running_sums: set[str] = set()
         # Rolled reductions over a symbolic extent expose their trip count as
         # a host-computed ``cutlass.Constexpr`` kernel parameter so the
         # two-pass load fuser can size a per-thread register cache that is
@@ -771,7 +776,7 @@ class CuteDeviceFunctionState:
         ] = {}
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
-        self._collective_handled_loads: set[str] = set()
+        self._collective_handled_load_ids: set[int] = set()
         self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
@@ -1155,24 +1160,25 @@ class CuteDeviceFunctionState:
 
     def register_collective_handled_load(
         self,
-        name: str,
+        load_node: Node,
         *,
         dependency_nodes: Sequence[Node] = (),
     ) -> None:
         """Register collective operand-load state for later codegen decisions.
 
-        Load names drive regular load suppression. FX node object identities
-        drive statement-ownership marking for load/dependency scaffolding; this
-        is scoped to one codegen pass where the FX graph and AST lists retain
-        the same objects.
+        FX node object identities drive both regular load suppression and
+        statement-ownership marking for load/dependency scaffolding; this is
+        scoped to one codegen pass where the FX graph and AST lists retain the
+        same objects.  Node names are only unique within one graph: the root
+        graph's first load is ``load`` like the K loop's operand load.
         """
-        self._collective_handled_loads.add(name)
+        self._collective_handled_load_ids.add(id(load_node))
         self._collective_handled_load_or_dependency_node_ids.update(
             id(node) for node in dependency_nodes
         )
 
-    def is_collective_handled_load(self, name: str) -> bool:
-        return name in self._collective_handled_loads
+    def is_collective_handled_load(self, load_node: Node) -> bool:
+        return id(load_node) in self._collective_handled_load_ids
 
     def is_collective_handled_load_or_dependency_node(self, node: Node) -> bool:
         return id(node) in self._collective_handled_load_or_dependency_node_ids

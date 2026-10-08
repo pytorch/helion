@@ -696,13 +696,20 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         self.assertTrue(state.consume_root_lane_loop_suppression())
         self.assertFalse(state.consume_root_lane_loop_suppression())
 
-    def test_collective_handled_load_names_stay_for_load_suppression(self) -> None:
+    def test_collective_handled_loads_are_keyed_by_node(self) -> None:
+        # FX names are unique only within a graph: the root graph's first load
+        # is ``load`` like the K loop's operand load, and must not be taken for
+        # it (a scalar load beside the matmul then read 0).
         state = CuteDeviceFunctionState()
+        k_loop, root = Graph(), Graph()
+        operand_load = k_loop.call_function(operator.pos, (k_loop.placeholder("a"),))
+        root_load = root.call_function(operator.pos, (root.placeholder("a"),))
+        operand_load.name = root_load.name = "load"
 
-        state.register_collective_handled_load("operand_load")
+        state.register_collective_handled_load(operand_load)
 
-        self.assertTrue(state.is_collective_handled_load("operand_load"))
-        self.assertFalse(state.is_collective_handled_load("indices"))
+        self.assertTrue(state.is_collective_handled_load(operand_load))
+        self.assertFalse(state.is_collective_handled_load(root_load))
 
     def test_collective_load_dependency_names_keeps_pair_shared_ancestors(
         self,

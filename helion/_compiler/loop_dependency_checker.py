@@ -27,27 +27,183 @@ def canonical_host_tensor_name(name: str, aliases: dict[str, str]) -> str:
     return _canonical_alias(name, aliases)
 
 
+# A root shared by every kernel argument: the caller may pass one tensor twice
+# or overlapping views, so two arguments are never provably distinct storage.
+HOST_ARGUMENT_ROOT = "<argument>"
+# A value whose storage cannot be traced (e.g. computed from globals only).
+HOST_UNKNOWN_ROOT = "<unknown>"
+
+# Calls that return a new tensor sharing storage with nothing else.
+_FRESH_TORCH_FUNCTIONS = frozenset(
+    {
+        "arange",
+        "clone",
+        "empty",
+        "empty_like",
+        "empty_strided",
+        "eye",
+        "full",
+        "full_like",
+        "linspace",
+        "ones",
+        "ones_like",
+        "rand",
+        "rand_like",
+        "randint",
+        "randint_like",
+        "randn",
+        "randn_like",
+        "randperm",
+        "tensor",
+        "zeros",
+        "zeros_like",
+    }
+)
+_FRESH_TENSOR_METHODS = frozenset(
+    {"clone", "new_empty", "new_full", "new_ones", "new_tensor", "new_zeros"}
+)
+
+
+def collect_host_tensor_roots(
+    body: list[ast.stmt], arg_names: set[str]
+) -> dict[str, frozenset[str]]:
+    """Conservative storage roots of every name the host code binds.
+
+    A root is :data:`HOST_ARGUMENT_ROOT`, an allocation site (a call listed in
+    ``_FRESH_TORCH_FUNCTIONS`` / ``_FRESH_TENSOR_METHODS``), or
+    :data:`HOST_UNKNOWN_ROOT`.  Any other value is assumed to alias every
+    tensor it is computed from: a view, a no-op conversion or an unknown op
+    may return its input.  Every binding of a name anywhere in the host code
+    (nested ``if`` / ``with`` / ``for`` blocks too) contributes, so the roots
+    hold whichever binding runs.  Two host tensors are provably distinct only
+    if neither has the unknown root and their roots are disjoint.
+    """
+    bindings: list[tuple[str, ast.expr]] = []
+
+    def bind(target: ast.expr, value: ast.expr) -> None:
+        # ``x[i] = v`` copies into x's storage and does not rebind x, but an
+        # attribute store may (``x.data = v``), so it counts as a binding.
+        if isinstance(target, ast.Name):
+            bindings.append((target.id, value))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                bind(element, value)
+        elif isinstance(target, (ast.Starred, ast.Attribute)):
+            bind(target.value, value)
+
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind(target, node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            if node.value is not None:
+                bind(node.target, node.value)
+        elif isinstance(node, (ast.For, ast.comprehension)):
+            bind(node.target, node.iter)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            bind(node.optional_vars, node.context_expr)
+
+    roots: dict[str, frozenset[str]] = {
+        name: frozenset({HOST_ARGUMENT_ROOT}) for name in arg_names
+    }
+    for name, _value in bindings:
+        roots.setdefault(name, frozenset())
+
+    def expr_roots(expr: ast.expr) -> frozenset[str]:
+        if isinstance(expr, ast.Call) and _is_fresh_allocation(expr):
+            return frozenset({f"<allocation {expr.lineno}:{expr.col_offset}>"})
+        result: frozenset[str] = frozenset()
+        for child in ast.iter_child_nodes(expr):
+            if isinstance(child, ast.Name):
+                result |= roots.get(child.id, frozenset())
+            elif isinstance(child, ast.expr):
+                result |= expr_roots(child)
+        return result
+
+    changed = True
+    while changed:
+        changed = False
+        for name, value in bindings:
+            value_roots = (
+                roots.get(value.id, frozenset())
+                if isinstance(value, ast.Name)
+                else expr_roots(value)
+            )
+            merged = roots[name] | value_roots
+            if merged != roots[name]:
+                roots[name] = merged
+                changed = True
+    return {
+        name: name_roots or frozenset({HOST_UNKNOWN_ROOT})
+        for name, name_roots in roots.items()
+    }
+
+
+def _is_fresh_allocation(call: ast.Call) -> bool:
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if isinstance(func.value, ast.Name) and func.value.id == "torch":
+        return func.attr in _FRESH_TORCH_FUNCTIONS
+    return func.attr in _FRESH_TENSOR_METHODS
+
+
+# Methods (and ``torch.*`` functions) whose result may share its input's
+# storage: views, and conversions that return the input itself when they have
+# nothing to do (``contiguous`` of a contiguous tensor, ``to``/``float`` to the
+# same dtype/device).  In-place methods (``x.mul_(2)``) return their receiver.
 _ALIAS_PRESERVING_METHODS = frozenset(
     {
         "as_strided",
+        "bfloat16",
+        "bool",
+        "byte",
+        "char",
+        "chunk",
+        "contiguous",
+        "cpu",
+        "cuda",
         "detach",
+        "diagonal",
+        "double",
         "expand",
+        "expand_as",
         "flatten",
+        "float",
+        "half",
+        "int",
+        "long",
         "movedim",
         "narrow",
         "permute",
         "reshape",
+        "reshape_as",
         "select",
+        "short",
+        "split",
         "squeeze",
         "swapaxes",
         "swapdims",
+        "t",
+        "tensor_split",
+        "to",
         "transpose",
+        "type",
+        "type_as",
         "unbind",
         "unflatten",
+        "unfold",
         "unsqueeze",
         "view",
+        "view_as",
     }
 )
+
+
+def _is_alias_preserving_method(name: str) -> bool:
+    return name in _ALIAS_PRESERVING_METHODS or (
+        name.endswith("_") and not name.startswith("_")
+    )
 
 
 def _canonical_alias(name: str, aliases: dict[str, str]) -> str:
@@ -72,20 +228,19 @@ def _alias_base_name(expr: ast.expr, aliases: dict[str, str]) -> str | None:
         return _canonical_alias(expr.id, aliases)
     if isinstance(expr, ast.Subscript):
         return _alias_base_name(expr.value, aliases)
-    if isinstance(expr, ast.Attribute) and expr.attr in {"T", "mT", "data"}:
+    if isinstance(expr, ast.Attribute) and expr.attr in {"T", "mT", "H", "mH", "data"}:
         return _alias_base_name(expr.value, aliases)
     if isinstance(expr, ast.Call):
         if (
             isinstance(expr.func, ast.Attribute)
             and isinstance(expr.func.value, ast.Name)
             and expr.func.value.id == "torch"
-            and expr.func.attr in _ALIAS_PRESERVING_METHODS
+            and _is_alias_preserving_method(expr.func.attr)
             and expr.args
         ):
             return _alias_base_name(expr.args[0], aliases)
-        if (
-            isinstance(expr.func, ast.Attribute)
-            and expr.func.attr in _ALIAS_PRESERVING_METHODS
+        if isinstance(expr.func, ast.Attribute) and _is_alias_preserving_method(
+            expr.func.attr
         ):
             return _alias_base_name(expr.func.value, aliases)
     return None

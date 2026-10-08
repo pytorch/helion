@@ -93,6 +93,38 @@ def halves_loaded(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True)
+def halves_loaded_through_alias(x: torch.Tensor) -> torch.Tensor:
+    """``halves_loaded`` read through a host view of ``x`` that the kernel
+    then overwrites: the split may not re-read the zeros."""
+    y = x.view_as(x)
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = y[tile_n, tile_d].reshape([tile_n, 2, tile_d.block_size // 2])
+        x[tile_n, tile_d] = hl.zeros([tile_n, tile_d], dtype=x.dtype)
+        lo, hi = hl.split(pair.permute(0, 2, 1))
+        out[tile_n, tile_d] = hl.join(hi, lo).permute(0, 2, 1).reshape([tile_n, tile_d])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def halves_loaded_through_nested_alias(x: torch.Tensor) -> torch.Tensor:
+    """As ``halves_loaded_through_alias``, with the alias the result of an op
+    the host alias analysis does not know, bound in a nested ``if``."""
+    y = x.clone()
+    if x.size(0) > 1:
+        y = torch.ops.aten.alias.default(x)
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = y[tile_n, tile_d].reshape([tile_n, 2, tile_d.block_size // 2])
+        x[tile_n, tile_d] = hl.zeros([tile_n, tile_d], dtype=x.dtype)
+        lo, hi = hl.split(pair.permute(0, 2, 1))
+        out[tile_n, tile_d] = hl.join(hi, lo).permute(0, 2, 1).reshape([tile_n, tile_d])
+    return out
+
+
+@helion.kernel(static_shapes=True)
 def join_then_split(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """The pair dim of ``hl.join`` belongs to no block."""
     n, d = x.size()
@@ -263,6 +295,22 @@ class TestCuteSplitExchange(TestCase):
             (x[:, 16:32], x[:, :16], torch.zeros_like(x[:, 32:48])), dim=1
         )
         torch.testing.assert_close(result, expected)
+
+    def test_loaded_alias_written_later_exchanges(self) -> None:
+        # The loaded y may share x's storage (``x.view_as(x)``, or an unknown
+        # op's result bound in a nested ``if``), so the store to x makes the
+        # load of y written: the split must exchange the loaded values rather
+        # than re-read y after the store.
+        for kernel in (halves_loaded_through_alias, halves_loaded_through_nested_alias):
+            with self.subTest(kernel=kernel.name):
+                x = torch.randn([64, 32], device=DEVICE)
+                expected = torch.cat(
+                    (x[:, 8:16], x[:, :8], x[:, 24:32], x[:, 16:24]), 1
+                )
+                code, result = code_and_output(kernel, (x,), block_sizes=[8, 16])
+                self.assertIn("split_smem", code)
+                torch.testing.assert_close(result, expected)
+                self.assertEqual(int(torch.count_nonzero(x)), 0)
 
     def test_unowned_pair_dim_rejected(self) -> None:
         # Selecting data by the coordinate of a dim no thread or lane owns

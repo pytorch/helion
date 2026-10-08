@@ -7,6 +7,7 @@ import math
 import operator
 import re
 import tempfile
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 from typing import Callable
@@ -255,6 +256,9 @@ from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
 from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.host_function import HostFunction
+from helion._compiler.loop_dependency_checker import HOST_ARGUMENT_ROOT
+from helion._compiler.loop_dependency_checker import HOST_UNKNOWN_ROOT
+from helion._compiler.loop_dependency_checker import collect_host_tensor_roots
 from helion._compiler.reduction_strategy import BlockReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.tile_strategy import DeviceGridState
@@ -13777,7 +13781,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=8,
             ),
             patch(
-                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops.cute_f32_mma_matches_dot",
                 return_value=False,
             ),
             patch(
@@ -13839,7 +13843,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=8,
             ),
             patch(
-                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops.cute_f32_mma_matches_dot",
                 return_value=False,
             ),
             patch(
@@ -13897,7 +13901,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=8,
             ),
             patch(
-                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops.cute_f32_mma_matches_dot",
                 return_value=False,
             ),
             patch(
@@ -13960,7 +13964,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=8,
             ),
             patch(
-                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops.cute_f32_mma_matches_dot",
                 return_value=False,
             ),
             patch(
@@ -14029,7 +14033,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=16,
             ),
             patch(
-                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops.cute_f32_mma_matches_dot",
                 return_value=False,
             ),
             patch(
@@ -14100,7 +14104,7 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops.cute_f32_mma_matches_dot",
                 return_value=False,
             ),
             patch(
@@ -24446,11 +24450,12 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
             out, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
         )
 
-    def test_dot_with_k_equal_m_block_inner_load_is_rejected(self) -> None:
+    def test_dot_with_k_equal_m_block_inner_load_reads_serially(self) -> None:
         """Loading ``T`` next to the ``hl.dot`` exempts it from the load check
-        (a matmul operand), so the ``lhs_m_size`` branch of
-        ``cute_resolve_active_matmul_k_block_id`` is what refuses the M == K
-        contraction; the scalar fallback then finds no K block.
+        (a matmul operand).  The ``lhs_m_size`` branch of
+        ``cute_resolve_active_matmul_k_block_id`` refuses the M == K
+        contraction across threads, so each thread loops over K and re-reads
+        ``T`` and ``kt`` (through its cast) at its own (batch, M, N).
         """
 
         @helion.kernel(
@@ -24479,19 +24484,254 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
             atol=1e-4,
         )
         t_square = torch.randn(4, 16, 16, device=DEVICE)
-        with (
-            patch(
-                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
-                return_value=False,
-            ),
-            self.assertRaisesRegex(exc.BackendUnsupported, "requires an active K tile"),
+        with patch(
+            "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+            return_value=False,
         ):
-            dot_t_k_inner(t_square, k)
+            code, result = code_and_output(dot_t_k_inner, (t_square, k))
+        self.assertIn("serial_k", code)
+        torch.testing.assert_close(
+            result, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
+        )
+        # Drop the serial-K binary cached under the same config.
+        dot_t_k_inner.reset()
         code, out = code_and_output(dot_t_k_inner, (t_square, k), block_sizes=[1, 8])
         self.assertIn("fragment_buffer", code)
         torch.testing.assert_close(
             out, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
         )
+
+    def test_mm_with_k_equal_free_block_reads_load_views_serially(self) -> None:
+        """A square ``carry[:, :]`` (M == N, both full slices on one block)
+        contracted with transposed loads, as in the autodiff scan backward of
+        a square matmul: K is M's block in the first product and N's in the
+        second, so both lower as serial K loops over the permuted loads.
+        """
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def square_carry_mm(
+            carry: torch.Tensor, xa: torch.Tensor, xb: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            steps = xa.size(0)
+            ya = torch.empty([steps, carry.size(0), xb.size(1)], device=carry.device)
+            yb = torch.empty([steps, xa.size(2), carry.size(1)], device=carry.device)
+            for tile in hl.tile(steps, block_size=1):
+                c = carry[:, :]
+                ya[tile.id, :, :] = torch.mm(
+                    c, xb[tile.id, :, :].permute([1, 0]).contiguous()
+                )
+                yb[tile.id, :, :] = torch.mm(xa[tile.id, :, :].permute([1, 0]), c)
+            return ya, yb
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def square_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([a.size(0), a.size(1), b.size(2)], device=a.device)
+            for tile_b in hl.tile(a.size(0)):
+                out[tile_b, :, :] = torch.bmm(a[tile_b, :, :], b[tile_b, :, :])
+            return out
+
+        carry = torch.randn(32, 32, device=DEVICE)
+        xa = torch.randn(4, 32, 16, device=DEVICE)
+        xb = torch.randn(4, 16, 32, device=DEVICE)
+        ya, yb = square_carry_mm(carry, xa, xb)
+        torch.testing.assert_close(ya, carry @ xb.transpose(1, 2), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(yb, xa.transpose(1, 2) @ carry, rtol=1e-4, atol=1e-4)
+        # A non-power-of-two square block is masked on its padded lanes.
+        a = torch.randn(3, 24, 24, device=DEVICE)
+        b = torch.randn(3, 24, 40, device=DEVICE)
+        torch.testing.assert_close(square_bmm(a, b), a @ b, rtol=1e-4, atol=1e-4)
+
+    def test_addmm_with_k_equal_free_block_reads_load_views_serially(self) -> None:
+        """addmm/baddbmm run the same serial K loop as mm/bmm when K shares the
+        square operand's block, starting from their accumulator."""
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def square_addmm(c: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
+            out = torch.empty([c.size(0), w.size(1)], device=c.device)
+            for _ in hl.grid(1):
+                out[:, :] = torch.addmm(b[:, :], c[:, :], w[:, :])
+            return out
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def square_baddbmm(c: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
+            out = torch.empty([c.size(0), c.size(1), w.size(2)], device=c.device)
+            for tile_b in hl.tile(c.size(0)):
+                out[tile_b, :, :] = torch.baddbmm(
+                    b[tile_b, :, :], c[tile_b, :, :], w[tile_b, :, :]
+                )
+            return out
+
+        c = torch.randn(32, 32, device=DEVICE)
+        w = torch.randn(32, 16, device=DEVICE)
+        b = torch.randn(32, 16, device=DEVICE)
+        code, out = code_and_output(square_addmm, (c, w, b))
+        self.assertIn("serial_k", code)
+        torch.testing.assert_close(out, torch.addmm(b, c, w), rtol=1e-4, atol=1e-4)
+        c3 = torch.randn(3, 24, 24, device=DEVICE)
+        w3 = torch.randn(3, 24, 40, device=DEVICE)
+        b3 = torch.randn(3, 24, 40, device=DEVICE)
+        code, out = code_and_output(square_baddbmm, (c3, w3, b3))
+        self.assertIn("serial_k", code)
+        torch.testing.assert_close(out, torch.baddbmm(b3, c3, w3), rtol=1e-4, atol=1e-4)
+
+    def test_synthetic_lane_k_addmm_of_grid_indexed_loads(self) -> None:
+        """K split across synthetic lanes with grid-indexed operand loads: the
+        synthetic-lane fold cannot re-read the rank-reducing loads, the serial
+        load-view lowering folds the full K instead."""
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def grid_addmm(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor):
+            out = torch.empty([x.size(0), x.size(1), y.size(2)], device=x.device)
+            for i in hl.grid(x.size(0)):
+                out[i, :, :] = torch.addmm(c[i, :, :], x[i, :, :], y[i, :, :])
+            return out
+
+        x = torch.randn(2, 32, 256, device=DEVICE)
+        y = torch.randn(2, 256, 64, device=DEVICE)
+        c = torch.randn(2, 32, 64, device=DEVICE)
+        code, out = code_and_output(grid_addmm, (x, y, c))
+        self.assertIn("synthetic_lane", code)
+        self.assertIn("serial_k", code)
+        torch.testing.assert_close(out, c + x @ y, rtol=1e-4, atol=1e-4)
+
+    def test_serial_k_mm_stops_at_a_non_power_of_two_k(self) -> None:
+        """``y[:, :]`` with K == N puts K on N's reduction block, so the mm
+        runs a serial K loop.  Its extent is the block's true size, not the
+        padded power of two the block symbol's hint carries: rows past K of
+        ``y``'s buffer must not be read.
+        """
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def mm_square_rhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0), y.size(1)], device=x.device)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, :] @ y[:, :]
+            return out
+
+        for k in (24, 48):
+            with self.subTest(k=k):
+                x = torch.randn(64, k, device=DEVICE)
+                # Garbage rows follow y in its buffer.
+                y = torch.randn(2 * k, k, device=DEVICE)[:k]
+                code, out = code_and_output(mm_square_rhs, (x, y), block_sizes=[16])
+                self.assertIn(f"in range(1, {k})", code)
+                torch.testing.assert_close(out, x @ y, rtol=1e-4, atol=1e-4)
+
+    def test_serial_k_mm_refuses_a_written_operand_tensor(self) -> None:
+        """The serial K loop re-reads its operands at the matmul, at elements
+        other threads loaded, so a store to an operand's tensor anywhere in
+        the kernel keeps the refusal: the re-read could see stored values.
+        """
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def write_between(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([a.size(0), a.size(1), b.size(2)], device=a.device)
+            for tile in hl.tile(a.size(0), block_size=1):
+                sq = a[tile.id, :, :]
+                rhs = b[tile.id, :, :]
+                b[tile.id, :, :] = rhs * 2.0
+                out[tile.id, :, :] = torch.mm(sq, rhs)
+            return out
+
+        a = torch.randn(3, 32, 32, device=DEVICE)
+        b = torch.randn(3, 32, 16, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "without an active K tile"):
+            write_between(a, b)
+
+    def test_serial_k_refuses_operands_a_host_alias_may_write(self) -> None:
+        """Default-deny: the serial K loop re-reads ``b`` after ``bb`` is
+        stored, so a write to any host tensor that is not provably distinct
+        storage from ``b`` refuses the re-read, at the bmm and the hl.dot call
+        sites alike: a ``view_as`` view, an alias bound in a nested ``if``, the
+        result of an op the analysis does not know.  A fresh ``empty_like``
+        buffer is distinct and keeps the serial loop.
+        """
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def bmm_view_as(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            bb = b.view_as(b)
+            out = torch.empty([a.size(0), a.size(1), b.size(2)], device=a.device)
+            for tile in hl.tile(a.size(0)):
+                rhs = b[tile, :, :]
+                bb[tile, :, :] = rhs * 2.0
+                out[tile, :, :] = torch.bmm(a[tile, :, :], rhs)
+            return out
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def bmm_unknown_op(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            bb = torch.ops.aten.alias.default(b)
+            out = torch.empty([a.size(0), a.size(1), b.size(2)], device=a.device)
+            for tile in hl.tile(a.size(0)):
+                rhs = b[tile, :, :]
+                bb[tile, :, :] = rhs * 2.0
+                out[tile, :, :] = torch.bmm(a[tile, :, :], rhs)
+            return out
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def dot_nested_if(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            bb = torch.empty_like(b)
+            if a.size(0) > 1:
+                bb = b.unflatten(0, [b.size(0), 1]).squeeze(1)
+            out = torch.empty([a.size(0), a.size(1), b.size(2)], device=a.device)
+            for tile in hl.tile(a.size(0), block_size=1):
+                rhs = b[tile, :, :]
+                bb[tile, :, :] = rhs * 2.0
+                out[tile, :, :] = hl.dot(a[tile, :, :], rhs)
+            return out
+
+        @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
+        def dot_fresh(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            bb = torch.empty_like(b)
+            out = torch.empty([a.size(0), a.size(1), b.size(2)], device=a.device)
+            for tile in hl.tile(a.size(0), block_size=1):
+                rhs = b[tile, :, :]
+                bb[tile, :, :] = rhs * 2.0
+                out[tile, :, :] = hl.dot(a[tile, :, :], rhs)
+            return out
+
+        a = torch.randn(2, 24, 24, device=DEVICE)
+        b = torch.randn(2, 24, 40, device=DEVICE)
+        # The computed-fragment lowering stages ``b`` in shared memory first;
+        # disable it to reach the serial K loop.
+        no_fragment = patch(
+            "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+            return_value=False,
+        )
+        for kernel in (bmm_view_as, bmm_unknown_op, dot_nested_if):
+            with (
+                self.subTest(kernel=kernel.name),
+                no_fragment,
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "requires an active K tile"
+                ),
+            ):
+                kernel(a, b.clone())
+        with no_fragment:
+            code, out = code_and_output(dot_fresh, (a, b.clone()))
+        self.assertIn("serial_k", code)
+        torch.testing.assert_close(out, a @ b, rtol=1e-4, atol=1e-4)
+
+    def test_direct_load_serial_mm_refuses_a_written_operand(self) -> None:
+        """``x[tile, :] @ y[:, :]`` with K == N takes the 2-D direct-load serial
+        K loop, which re-reads whole rows and columns of x and y at the mm; a
+        store through a view of y before it must keep the refusal.
+        """
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def mm_written_rhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            yy = y.view_as(y)
+            out = torch.empty([x.size(0), y.size(1)], device=x.device)
+            for tile in hl.tile(x.size(0)):
+                xt = x[tile, :]
+                yt = y[:, :]
+                yy[tile, :] = xt * 0.0
+                out[tile, :] = xt @ yt
+            return out
+
+        x = torch.randn(32, 32, device=DEVICE)
+        y = torch.randn(32, 32, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "without an active K tile"):
+            code_and_output(mm_written_rhs, (x, y), block_sizes=[32])
 
     def test_equal_free_aranges_on_two_dims_of_one_store_are_rejected(
         self,
@@ -24639,6 +24879,52 @@ def _cute_bmm_leading_permute_fold(q: torch.Tensor, k: torch.Tensor) -> torch.Te
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def _cute_bmm_sliced_k_fold(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    L = q.size(0)
+    H = hl.specialize(q.size(1))
+    hl.specialize(q.size(2))
+    out = torch.empty([H, L, L], dtype=q.dtype, device=q.device)
+    for tile_q in hl.tile(L):
+        # The contraction reads D[8:40]: the fold must add the slice start.
+        q_blk = q[tile_q, :, 8:40].transpose(0, 1)
+        for tile_kv in hl.tile(L):
+            k_blk = k[tile_kv, :, 8:40].transpose(0, 1)
+            out[:, tile_q, tile_kv] = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_bmm_fold_written(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    qq = q.view_as(q)
+    L = q.size(0)
+    H = hl.specialize(q.size(1))
+    hl.specialize(q.size(2))
+    out = torch.empty([H, L, L], dtype=q.dtype, device=q.device)
+    for tile_q in hl.tile(L):
+        q_blk = q[tile_q, :, :].transpose(0, 1)
+        # The fold would re-read q after this store through its view.
+        qq[tile_q, :, :] = q[tile_q, :, :] * 0.0
+        for tile_kv in hl.tile(L):
+            k_blk = k[tile_kv, :, :].transpose(0, 1)
+            out[:, tile_q, tile_kv] = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, index_dtype=torch.int64)
+def _cute_bmm_fold_int64(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    L = q.size(0)
+    H = hl.specialize(q.size(1))
+    hl.specialize(q.size(2))
+    out = torch.empty([H, L, L], dtype=torch.float32, device=q.device)
+    for tile_q in hl.tile(L):
+        q_blk = q[tile_q, :, :].transpose(0, 1)
+        for tile_kv in hl.tile(L):
+            k_blk = k[tile_kv, :, :].transpose(0, 1)
+            out[:, tile_q, tile_kv] = torch.bmm(q_blk, k_blk.transpose(-2, -1)).float()
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
     G, B, C, D, E = x.shape
     out = torch.empty_like(x)
@@ -24651,6 +24937,50 @@ def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
                             x[g, tile_b, tile_c, tile_d, tile_e] * 2
                         )
     return out
+
+
+class TestHostTensorRoots(unittest.TestCase):
+    """``collect_host_tensor_roots``: the storage a host name may share."""
+
+    @staticmethod
+    def _roots(source: str) -> dict[str, frozenset[str]]:
+        body = ast.parse(textwrap.dedent(source)).body
+        return collect_host_tensor_roots(body, {"x", "y"})
+
+    def test_bindings_in_nested_blocks_and_unknown_ops_alias_their_inputs(
+        self,
+    ) -> None:
+        roots = self._roots(
+            """
+            fresh = torch.empty_like(x)
+            if x.size(0) > 1:
+                fresh = x.unflatten(0, [x.size(0), 1])
+            with ctx() as managed:
+                opaque = torch.ops.aten.alias.default(y)
+            other = torch.zeros(4)
+            derived = torch.flip(other, [0])
+            from_globals = some_module.buffer
+            """
+        )
+        self.assertEqual(roots["x"], roots["y"])
+        self.assertIn(HOST_ARGUMENT_ROOT, roots["fresh"])
+        self.assertEqual(roots["opaque"], frozenset({HOST_ARGUMENT_ROOT}))
+        self.assertNotIn(HOST_ARGUMENT_ROOT, roots["derived"])
+        self.assertEqual(roots["derived"], roots["other"])
+        self.assertEqual(roots["from_globals"], frozenset({HOST_UNKNOWN_ROOT}))
+        self.assertEqual(roots["managed"], frozenset({HOST_UNKNOWN_ROOT}))
+
+    def test_subscript_stores_do_not_rebind_but_attribute_stores_may(self) -> None:
+        roots = self._roots(
+            """
+            out = torch.empty_like(x)
+            out[0] = x[0]
+            swapped = torch.empty_like(x)
+            swapped.data = y
+            """
+        )
+        self.assertNotIn(HOST_ARGUMENT_ROOT, roots["out"])
+        self.assertIn(HOST_ARGUMENT_ROOT, roots["swapped"])
 
 
 @onlyBackends(["cute"])
@@ -24695,6 +25025,54 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         torch.testing.assert_close(
             out, torch.einsum("qhd,khd->hqk", q, k), rtol=1e-4, atol=1e-4
         )
+
+    def test_bmm_fold_reads_sliced_contraction_at_its_start(self) -> None:
+        torch.manual_seed(0)
+        q = torch.randn(64, 4, 48, device=DEVICE)
+        k = torch.randn(64, 4, 48, device=DEVICE)
+        code, out = code_and_output(
+            _cute_bmm_sliced_k_fold, (q, k), block_sizes=[32, 32]
+        )
+        self.assertIn("mm_fold_k", code)
+        torch.testing.assert_close(
+            out,
+            torch.einsum("qhd,khd->hqk", q[:, :, 8:40], k[:, :, 8:40]),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+    def test_bmm_fold_forms_offsets_in_the_kernel_index_type(self) -> None:
+        # The last q rows start past 2**31 elements of a strided view, so
+        # every re-read offset must be formed in Int64 (an Int32 product
+        # wraps negative: an illegal memory access).
+        L, H, D = 64, 4, 32
+        row_stride = 2**31 // (L - 2) + 1
+        numel = (L - 1) * row_stride + H * D
+        free, _total = torch.cuda.mem_get_info()
+        if free < 2 * numel + (1 << 30):
+            self.skipTest(f"needs {(2 * numel) >> 30} GiB of free device memory")
+        torch.manual_seed(0)
+        storage = torch.zeros(numel, dtype=torch.bfloat16, device=DEVICE)
+        q = storage.as_strided((L, H, D), (row_stride, D, 1))
+        q.copy_(torch.randn(L, H, D, device=DEVICE))
+        k = torch.randn(L, H, D, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(_cute_bmm_fold_int64, (q, k), block_sizes=[32, 32])
+        self.assertIn("mm_fold_k", code)
+        # The bf16 bmm rounds its result to bf16 before the float cast.
+        torch.testing.assert_close(
+            out,
+            torch.einsum("qhd,khd->hqk", q.float(), k.float()),
+            rtol=2e-2,
+            atol=2e-1,
+        )
+
+    def test_bmm_fold_refuses_a_written_operand(self) -> None:
+        q = torch.randn(64, 4, 32, device=DEVICE)
+        k = torch.randn(64, 4, 32, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "synthetic-lane K matmul fold"
+        ):
+            code_and_output(_cute_bmm_fold_written, (q, k), block_sizes=[32, 32])
 
     def test_fourth_tile_block_demotes_to_lane_loop(self) -> None:
         torch.manual_seed(0)

@@ -1141,6 +1141,19 @@ def _int_argument_symbol(numel: object) -> str | None:
     return None
 
 
+def _cute_is_folded_matmul_contraction(block_index: int) -> bool:
+    """Whether ``block_index`` is the contraction of a matmul the scalar
+    fallback lowers (no 16-bit operand a warp-MMA plan may take)."""
+    from .cute.matmul_utils import cute_kernel_has_half_precision_matmul
+    from .cute.matmul_utils import cute_matmul_contraction_block_ids
+
+    env = CompileEnvironment.current()
+    return (
+        env.canonical_block_id(block_index) in cute_matmul_contraction_block_ids()
+        and not cute_kernel_has_half_precision_matmul()
+    )
+
+
 class PersistentReductionStrategy(ReductionStrategy):
     def __init__(
         self,
@@ -1238,6 +1251,18 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 if isinstance(requested, int) and 0 < requested < self._thread_count:
                     self._thread_count = requested
+                elif (
+                    requested == 0
+                    and size_hint > max_threads
+                    and _cute_is_folded_matmul_contraction(block_index)
+                ):
+                    # A matmul contraction longer than the CTA's threads is
+                    # split into synthetic lanes, which the scalar fallback
+                    # folds serially per output element
+                    # (``emit_cute_synthetic_lane_fold_mm``): more threads on
+                    # it would only repeat that fold.  The free tile axes take
+                    # them instead.
+                    self._thread_count = 1
         else:
             self._thread_count = 0
         # On cute, the launch block dim is capped at MAX_THREADS_PER_BLOCK.
