@@ -1012,6 +1012,16 @@ class Backend(abc.ABC):
             x=x,
         )
 
+    def join_cast_template(self) -> str | None:
+        """An ``expr_from_string`` template casting ``{x}`` to ``{like}``'s type.
+
+        A dynamic if whose branch reassigns a variable joins the new value
+        with the old one, which must have one type.  Backends whose emitted
+        values can carry a type other than their FX dtype return a cast here;
+        ``None`` emits no join (CuTe joins in its own if codegen).
+        """
+        return None
+
     def cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         """Cast a plain scalar (e.g. a bare number lifted from an index expr) to
         ``target_dtype``.

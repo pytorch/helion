@@ -680,6 +680,18 @@ class DeviceFunction:
             return None
         return bool(resolved)
 
+    def constexpr_taken_graph_id(self, if_node: torch.fx.Node) -> int | None:
+        """The graph id of the side an ``_if`` node takes when its test is a
+        constant for this config (``evaluate_constexpr_condition``), or
+        ``None`` when the test is decided at runtime."""
+        test, if_graph_id, else_graph_id, *_ = if_node.args
+        taken = self.evaluate_constexpr_condition(
+            test.meta["val"] if isinstance(test, torch.fx.Node) else test
+        )
+        if taken is None:
+            return None
+        return cast("int", if_graph_id if taken else else_graph_id)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 

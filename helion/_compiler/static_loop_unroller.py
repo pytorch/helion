@@ -23,12 +23,12 @@ class StaticLoopUnroller(ast.NodeTransformer):
     TODO(oulgen): This pass is primitive, does not handle for.orelse, break, continue etc
     """
 
+    # visit_For, visit_While and visit_If visit each nested statement once,
+    # through ``_visit_statements``.
+
     def visit_For(self, node: ast.For) -> ast.AST | list[ast.AST]:
-        # Generic visit to handle nested loops
-        # pyrefly: ignore [bad-assignment]
-        node = self.generic_visit(node)
-        node.body = self.unroll_counted_whiles(node.body)
-        node.orelse = self.unroll_counted_whiles(node.orelse)
+        node.body = self._visit_statements(node.body)
+        node.orelse = self._visit_statements(node.orelse)
 
         # Check if this is a static loop that can be unrolled
         if static_values := self._extract_static_values(node.iter):
@@ -43,20 +43,22 @@ class StaticLoopUnroller(ast.NodeTransformer):
         raise CannotUnrollLoop
 
     def visit_While(self, node: ast.While) -> ast.AST | list[ast.AST]:
-        visited = self.generic_visit(node)
-        assert isinstance(visited, ast.While)
-        node = visited
-        node.body = self.unroll_counted_whiles(node.body)
-        node.orelse = self.unroll_counted_whiles(node.orelse)
+        node.body = self._visit_statements(node.body)
+        node.orelse = self._visit_statements(node.orelse)
         return node
 
     def visit_If(self, node: ast.If) -> ast.AST | list[ast.AST]:
-        visited = self.generic_visit(node)
-        assert isinstance(visited, ast.If)
-        node = visited
-        node.body = self.unroll_counted_whiles(node.body)
-        node.orelse = self.unroll_counted_whiles(node.orelse)
+        node.body = self._visit_statements(node.body)
+        node.orelse = self._visit_statements(node.orelse)
         return node
+
+    def _visit_statements(self, statements: list[ast.stmt]) -> list[ast.stmt]:
+        """Visit a nested statement list and unroll its counted whiles.
+
+        Unlike ``unroll_counted_whiles``, a ``break`` or ``continue`` inside
+        propagates ``CannotUnrollLoop``, so the enclosing loop stays rolled.
+        """
+        return self.unroll_counted_whiles(statements, propagate=True)
 
     def _extract_static_values(self, iter_node: ast.expr) -> list[ast.expr] | None:
         """
@@ -89,7 +91,11 @@ class StaticLoopUnroller(ast.NodeTransformer):
         return unrolled_statements  # pyrefly: ignore[bad-return]
 
     def unroll_counted_whiles(
-        self, statements: list[ast.stmt], known_scalars: dict[str, int] | None = None
+        self,
+        statements: list[ast.stmt],
+        known_scalars: dict[str, int] | None = None,
+        *,
+        propagate: bool = False,
     ) -> list[ast.stmt]:
         env = {} if known_scalars is None else known_scalars
         result: list[ast.stmt] = []
@@ -97,6 +103,8 @@ class StaticLoopUnroller(ast.NodeTransformer):
             try:
                 transformed = self.visit(stmt)
             except CannotUnrollLoop:
+                if propagate:
+                    raise
                 transformed = stmt
             stmt_list = transformed if isinstance(transformed, list) else [transformed]
             for item in stmt_list:

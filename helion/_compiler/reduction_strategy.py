@@ -50,6 +50,7 @@ from .tile_strategy import _to_sympy
 if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
+    from .tile_dispatch import TileStrategyDispatch
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +192,7 @@ def cute_live_reduction_threads(max_threads: int) -> int:
 
 
 def _strategies_concurrent_with_block(
-    tile_dispatch: object,
+    tile_dispatch: TileStrategyDispatch,
     block_index: int,
 ) -> list[TileStrategy]:
     """Return strategies that can co-execute with reduction ``block_index``.
@@ -202,11 +203,9 @@ def _strategies_concurrent_with_block(
     branch paths) this returns every strategy unchanged.
     """
     from .device_ir import DeviceIR
-    from .host_function import HostFunction
 
-    strategies = list(getattr(tile_dispatch, "strategies", []))
-    device_ir = HostFunction.current().device_ir
-    red_paths = device_ir.reduction_block_id_branch_paths()
+    strategies = list(tile_dispatch.strategies)
+    red_paths = tile_dispatch.reduction_branch_paths()
     own_paths = red_paths.get(block_index)
     if not own_paths:
         return strategies

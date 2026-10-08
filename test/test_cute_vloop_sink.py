@@ -569,12 +569,13 @@ def test_a_lane_invariant_scalar_redefined_inside_the_segment_stays_per_lane(
     assert statements[0] == definition
     assert "v_2 = acc_frag[vec_lane_1] * s" in statements
     (conditional,) = [stmt for stmt in epilogue.body if isinstance(stmt, ast.If)]
-    assert "s = s_copy_0 * v_5" in ast.unparse(conditional)
-    assert "v_7 = acc_frag[vec_lane_1] * s" in statements
+    assert "s = _cute_join_cast(v_6, s_before_if)" in ast.unparse(conditional)
+    assert "v_8 = acc_frag[vec_lane_1] * s" in statements
     assert (
         statements.index("v_2 = acc_frag[vec_lane_1] * s")
+        < statements.index("s_before_if = s")
         < epilogue.body.index(conditional)
-        < statements.index("v_7 = acc_frag[vec_lane_1] * s")
+        < statements.index("v_8 = acc_frag[vec_lane_1] * s")
     )
     # The pure single-definition constant of the ``!= 0`` test is hoisted.
     assert "v_3 = 0" not in statements

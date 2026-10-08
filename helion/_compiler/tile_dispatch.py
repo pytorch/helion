@@ -72,14 +72,21 @@ class TileStrategyDispatch:
         config: Config,
     ) -> None:
         super().__init__()
+        self._device_function = fn
         self.strategies: list[TileStrategy] = []
         self.block_id_to_strategy = BlockIDStrategyMapping()
         self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        self._constexpr_live_graph_ids: frozenset[int] | None = None
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.loop_nesting import constexpr_live_graph_ids
             from .cute.loop_nesting import tile_loop_paths
 
+            device_ir = HostFunction.current().device_ir
             self._cute_tile_loop_paths = tile_loop_paths(
-                HostFunction.current().device_ir, fn.codegen.codegen_graphs
+                device_ir, fn.codegen.codegen_graphs
+            )
+            self._constexpr_live_graph_ids = constexpr_live_graph_ids(
+                device_ir, fn.codegen.codegen_graphs, fn
             )
         self._add_loop_strategies(fn, config)
         if CompileEnvironment.current().backend.name == "cute":
@@ -131,6 +138,10 @@ class TileStrategyDispatch:
                 isinstance(graph, ForLoopGraphInfo)
                 and not isinstance(graph, ReductionLoopGraphInfo)
                 and graph.block_ids
+                and (
+                    self._constexpr_live_graph_ids is None
+                    or graph.graph_id in self._constexpr_live_graph_ids
+                )
             ):
                 block_ids = [*graph.block_ids]
                 self._add_loop_strategy(block_ids, fn, config)
@@ -156,6 +167,28 @@ class TileStrategyDispatch:
         max_threads = env.backend.max_reduction_threads()
         active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
         inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
+
+        if self._constexpr_live_graph_ids is not None:
+            from .cute.active_blocks import active_block_ids as live_block_ids
+
+            # A reduction dim used only on the untaken side of a constant
+            # branch is never emitted; its strategy would only claim an axis.
+            live = live_block_ids(
+                [
+                    graph
+                    for graph in fn.codegen.codegen_graphs
+                    if graph.graph_id in self._constexpr_live_graph_ids
+                ],
+                (
+                    block_id
+                    for ids in HostFunction.current().device_ir.grid_block_ids
+                    for block_id in ids
+                ),
+                env,
+            )
+            active_block_ids = (
+                live if active_block_ids is None else active_block_ids & live
+            )
         rdims = [
             bs.block_id
             for bs in env.block_sizes
@@ -512,8 +545,7 @@ class TileStrategyDispatch:
 
         if CompileEnvironment.current().backend.name != "cute":
             return None
-        device_ir = HostFunction.current().device_ir
-        red_paths = device_ir.reduction_block_id_branch_paths()
+        red_paths = self.reduction_branch_paths()
         if len(red_paths) < 2:
             return None
 
@@ -556,6 +588,12 @@ class TileStrategyDispatch:
             if not placed:
                 groups.append([candidate])
         return [[*shared, *group] for group in groups]
+
+    def reduction_branch_paths(self) -> dict[int, list[list[tuple[int, int]]]]:
+        """``DeviceIR.reduction_block_id_branch_paths`` for this config."""
+        return HostFunction.current().device_ir.reduction_block_id_branch_paths(
+            self._device_function
+        )
 
     def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
         """Return the starting thread-axis index for a strategy in its branch.

@@ -14,7 +14,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -132,6 +131,46 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_true, x + 1.0)
         _, result_false = code_and_output(fn, (x, False), block_sizes=[32])
         torch.testing.assert_close(result_false, x + 2.0)
+
+    def test_constexpr_in_device_loop_tracks_the_value(self):
+        """`hl.constexpr(k)` called inside the device loop is `k` itself.  The
+        NamedTuple wrapper's bool() guarded on the first call's `k`, so the
+        kernel bound for k=0 ran for k=1."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                if not hl.constexpr(k):
+                    out[tile] = x[tile] + 1.0
+                else:
+                    out[tile] = x[tile] + 2.0
+            return out
+
+        x = torch.zeros([64], device=DEVICE)
+        for k in (0, 1, 0):
+            _, result = code_and_output(fn, (x, k), block_sizes=[32])
+            torch.testing.assert_close(result, x + (1.0 if k == 0 else 2.0))
+
+    @skipIfRefEager("ref eager compares the hl.constexpr NamedTuple itself with 0")
+    def test_constexpr_in_device_loop_compares_by_value(self):
+        """The NamedTuple wrapper compared as a tuple: `hl.constexpr(k) == 0`
+        was always False."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                if hl.constexpr(k) == 0:
+                    out[tile] = x[tile] + 1.0
+                else:
+                    out[tile] = x[tile] + 2.0
+            return out
+
+        x = torch.zeros([64], device=DEVICE)
+        for k in (0, 1, 0):
+            _, result = code_and_output(fn, (x, k), block_sizes=[32])
+            torch.testing.assert_close(result, x + (1.0 if k == 0 else 2.0))
 
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
     @skipIfMTIA('Not supported on MTIA. Error: "Expected IntList but got GenericList"')
@@ -279,7 +318,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
-    @skipIfCute("cute backend does not support ConstExpr launcher scalar arguments")
     def test_block_size_constexpr_branch_selects_per_config(self):
         """A branch whose condition depends on a block size must pick the branch
         per-config, not freeze one branch during the single frontend pass
@@ -306,7 +344,6 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected)
 
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
-    @skipIfCute("cute backend does not support mixed tcgen05 matmul collective plans")
     def test_block_size_constexpr_branch_divergent_shapes(self):
         """Branches selected by a block-size constexpr may use variables with
         different shapes -- e.g. a swap-AB GEMM that transposes its accumulator
@@ -373,16 +410,107 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         # Both swap (block_m < 64 <= block_n) and non-swap configs must compile
         # and produce correct results.  The swap branches are mathematically
         # equivalent (A @ B == (B.T @ A.T).T), so also assert on the generated
-        # code that the condition folds to the correct branch per config: the
-        # taken branch becomes `if True:` and the dead one `if False:`.
+        # code that the condition folds to the correct branch per config.
         for bm, bn in [(32, 128), (64, 64), (128, 32)]:
             config = helion.Config(block_sizes=[bm, bn, 64])
             code = bound.to_triton_code(config)
+            # The condition sees the normalized block sizes: CuTe's tcgen05
+            # matmul raises every M tile below 64 to 64, so on CuTe each config
+            # here (and any config of this kernel) takes the non-swap branch
+            # and only Triton exercises the swap branch.
+            bm, bn, _ = bound.env.config_spec.normalized_config(config).block_sizes
             swap = bm < 64 <= bn
-            self.assertEqual(code.count("if True:"), 1 if swap else 0)
-            self.assertEqual(code.count("if False:"), 0 if swap else 1)
+            if _get_backend() == "cute":
+                # Only the taken branch is emitted.
+                self.assertEqual(
+                    re.search(r"^\s*acc_swap = ", code, re.MULTILINE) is not None,
+                    swap,
+                )
+            else:
+                # The taken branch becomes `if True:` and the dead one `if False:`.
+                self.assertEqual(code.count("if True:"), 1 if swap else 0)
+                self.assertEqual(code.count("if False:"), 0 if swap else 1)
             result = bound.compile_config(config)(a, b)
             torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_dead_side_rolled_reduction(self):
+        """The untaken side's full-slice reduction must not claim threads
+        through the rolled copy of its graph, which nothing references."""
+
+        @helion.kernel(static_shapes=True)
+        def row_sums(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            bm = hl.register_block_size(m)
+            bn = hl.register_block_size(n)
+            looped = hl.constexpr(bm >= 8)
+            for tm in hl.tile(m, block_size=bm):
+                if looped:
+                    acc = hl.zeros([tm], dtype=torch.float32)
+                    for tn in hl.tile(n, block_size=bn):
+                        acc += x[tm, tn].sum(-1)
+                    out[tm] = acc
+                else:
+                    out[tm] = x[tm, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 256, device=DEVICE)
+        bound = row_sums.bind((x,))
+        for block_sizes in ([16, 32], [4, 32]):
+            result = bound.compile_config(helion.Config(block_sizes=block_sizes))(x)
+            torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_dead_side_branch_paths(self):
+        """Reductions on the untaken side of a folded branch must not make the
+        live side's reductions look mutually exclusive with each other: the
+        256- and 128-wide sums of the else-else side then shared a thread axis
+        and the narrower one ran unmasked on the wider launch."""
+
+        @helion.kernel(static_shapes=True)
+        def nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            bm = hl.register_block_size(m)
+            bn = hl.register_block_size(n)
+            outer = hl.constexpr(bm >= 8)
+            inner = hl.constexpr(bn >= 64)
+            for tm in hl.tile(m, block_size=bm):
+                if outer:
+                    out[tm] = x[tm, :].amax(-1)
+                else:
+                    if inner:
+                        acc = hl.zeros([tm], dtype=torch.float32)
+                        for tn in hl.tile(n, block_size=bn):
+                            acc += x[tm, tn].sum(-1)
+                        out[tm] = acc
+                    else:
+                        out[tm] = x[tm, :].sum(-1) + y[tm, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 256, device=DEVICE)
+        y = torch.randn(64, 128, device=DEVICE)
+        bound = nested.bind((x, y))
+        for bm, bn in ((8, 32), (4, 64), (4, 32), (2, 32)):
+            if bm >= 8:
+                expected = x.amax(-1)
+            elif bn >= 64:
+                expected = x.sum(-1)
+            else:
+                expected = x.sum(-1) + y.sum(-1)
+            try:
+                result = bound.compile_config(helion.Config(block_sizes=[bm, bn]))(x, y)
+            except helion.exc.BackendUnsupported:
+                # The else-else side's two sums of different widths under
+                # narrow row tiles are refused on CuTe as they are without the
+                # branch; never wrong.
+                if _get_backend() != "cute" or bm >= 8 or bn >= 64:
+                    raise
+                continue
+            torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")

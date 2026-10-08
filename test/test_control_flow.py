@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.device_ir import IfGraphInfo
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -17,6 +18,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -496,6 +498,156 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         # Verify that optional_indices IS used in the tensor case
         self.assertIn("optional_indices", code_tensor.split("def fn_with_optional")[0])
 
+    def test_if_not_symbolic_condition(self):
+        """``not`` of a tile-dependent condition is traced, not decided at trace time."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0), block_size=8):
+                if not (tile_m.begin < 8):
+                    out[tile_m, :] = x[tile_m, :] + 1
+                if not (tile_m.begin < 16):
+                    out[tile_m, :] = out[tile_m, :] * 2
+                else:
+                    out[tile_m, :] = out[tile_m, :] - 1
+                if not tile_m.id:
+                    out[tile_m, :] = out[tile_m, :] + 10
+                ends_early = not (tile_m.end > 24)
+                if not ends_early:
+                    out[tile_m, :] = out[tile_m, :] + 100
+            return out
+
+        x = torch.randn([32, 16], device=DEVICE)
+        expected = torch.zeros_like(x)
+        expected[8:] = x[8:] + 1
+        expected[16:] *= 2
+        expected[:16] -= 1
+        expected[:8] += 10
+        expected[24:] += 100
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, expected)
+
+    def test_if_not_in_bool_op(self):
+        """A traced ``not`` combines with ``and`` instead of folding the branch away."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0), block_size=8):
+                if tile_m.begin >= 8 and tile_m.id != k and not (tile_m.end > 24):
+                    out[tile_m, :] = x[tile_m, :] + 1
+            return out
+
+        x = torch.randn([32, 16], device=DEVICE)
+        for k, rows in ((1, slice(16, 24)), (2, slice(8, 16))):
+            expected = torch.zeros_like(x)
+            expected[rows] = x[rows] + 1
+            _, result = code_and_output(fn, (x, k))
+            torch.testing.assert_close(result, expected)
+
+    def test_if_not_loaded_scalar(self):
+        """``not`` of a loaded integer scalar is ``== 0``."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0), block_size=8):
+                if not flags[tile_m.id]:
+                    out[tile_m, :] = x[tile_m, :] + 1
+            return out
+
+        x = torch.randn([32, 16], device=DEVICE)
+        flags = torch.tensor([1, 0, 2, 0], device=DEVICE, dtype=torch.int32)
+        expected = torch.zeros_like(x)
+        expected[8:16] = x[8:16] + 1
+        expected[24:] = x[24:] + 1
+        _, result = code_and_output(fn, (x, flags))
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfPallas(
+        "Pallas lowers only statically counted while loops (StaticLoopUnroller)"
+    )
+    def test_while_not_condition(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                acc = torch.zeros_like(x[tile])
+                steps = torch.zeros([], device=x.device, dtype=torch.int32)
+                while not (steps >= 4):
+                    acc = acc + 1
+                    steps = steps + 1
+                out[tile] = acc
+            return out
+
+        x = torch.zeros(16, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, torch.full_like(x, 4.0))
+
+    @skipIfRefEager("ref eager mode evaluates the conditional expression in Python")
+    def test_conditional_expression_not_symbolic_condition_is_rejected(self):
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0), block_size=8):
+                scale = 2.0 if not (tile_m.begin < 8) else 3.0
+                out[tile_m, :] = x[tile_m, :] * scale
+            return out
+
+        x = torch.randn([32, 16], device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.StatementNotSupported, "dynamic conditional expression"
+        ):
+            fn.bind((x,))
+
+    @skipIfRefEager("ref eager raises PyTorch's RuntimeError")
+    def test_not_of_tile_is_ambiguous(self):
+        # As in PyTorch, a tensor of many elements has no single truth value;
+        # ``not v`` must not silently become the elementwise ``v == 0``.
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                v = x[tile_m]
+                out[tile_m] = v + (not v)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.TypeInferenceError, "more than one value is ambiguous"
+        ):
+            fn.bind((x,))
+
+    @skipIfRefEager("checks the device IR")
+    def test_if_not_tile_keeps_tensor_predicate(self):
+        # ``if not v:`` is ``if v:`` with the branches swapped, so each backend
+        # lowers (or rejects) the tile predicate as it does for ``if v:``.
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                v = x[tile_m]
+                if not v:
+                    out[tile_m] = v + 1
+                else:
+                    out[tile_m] = v - 1
+            return out
+
+        graphs = fn.bind(
+            (torch.randn([64], device=DEVICE),)
+        ).host_function.device_ir.graphs
+        [if_graph] = [graph for graph in graphs if isinstance(graph, IfGraphInfo)]
+        self.assertTrue(if_graph.predicate_is_tensor)
+        else_branch = if_graph.else_branch
+        assert isinstance(else_branch, int)
+
+        def targets(graph: torch.fx.Graph) -> set[object]:
+            return {node.target for node in graph.nodes}
+
+        self.assertIn(torch.ops.aten.sub.Tensor, targets(if_graph.graph))
+        self.assertIn(torch.ops.aten.add.Tensor, targets(graphs[else_branch].graph))
+
 
 @onlyBackends(["triton", "cute"])
 class TestUniformBranchBarriers(RefEagerTestBase, TestCase):
@@ -564,6 +716,156 @@ class TestUniformBranchBarriers(RefEagerTestBase, TestCase):
                         ),
                         code,
                     )
+
+
+# Triton and CuTe emit Python ``if``/``for`` statements that assign the
+# variables the phi after them merges (Pallas returns branch and loop values
+# from ``lax.cond``/``fori_loop`` instead).
+@onlyBackends(["triton", "cute"])
+class TestControlFlowJoins(RefEagerTestBase, TestCase):
+    def test_loop_keeps_fp32_accumulators_as_emitted(self):
+        # Only values whose DSL type can drift are joined; an fp32 accumulator
+        # of a reduction or matmul loop keeps the loop exactly as emitted.
+        @helion.kernel(static_shapes=False)
+        def row_sums(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=16):
+                    acc = acc + x[tile_m, tile_n].to(torch.float32).sum(-1)
+                out[tile_m] = acc
+            return out
+
+        @helion.kernel(static_shapes=False)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            n = y.size(1)
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k, block_size=16):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(64, 32, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(row_sums, (x,))
+        torch.testing.assert_close(result, x.float().sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertNotIn("_cute_join_cast", code)
+        code, result = code_and_output(matmul, (x, y))
+        torch.testing.assert_close(result, x.float() @ y.float(), rtol=1e-2, atol=1e-2)
+        self.assertNotIn("_cute_join_cast", code)
+
+    @skipIfTileIR("TileIR's mul keeps x_bf16 * 0.5 in fp32, changing the carry's type")
+    def test_loop_carries_half_precision_value(self):
+        # The body's ``value * 0.5`` is Float32 in CuTe DSL; the carried value
+        # keeps the type it had before the loop.
+        @helion.kernel(static_shapes=False)
+        def halve_per_tile(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                value = x[tile_m, 0]
+                for _tile_n in hl.tile(n, block_size=16):
+                    value = value * 0.5
+                out[tile_m] = value
+            return out
+
+        @helion.kernel(static_shapes=False)
+        def count_tiles(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.int32, device=x.device)
+            for tile_m in hl.tile(m):
+                index = tile_m.index + 0
+                for _tile_n in hl.tile(n, block_size=16):
+                    index = index + 1
+                out[tile_m] = index
+            return out
+
+        for dtype in (torch.bfloat16, torch.float16):
+            x = torch.randn(10, 64, device=DEVICE, dtype=dtype)
+            # Four 16-column tiles halve each row's first element exactly.
+            _, result = code_and_output(halve_per_tile, (x,))
+            torch.testing.assert_close(result, x[:, 0] * 0.0625, rtol=0, atol=0)
+        _, result = code_and_output(count_tiles, (x,))
+        torch.testing.assert_close(
+            result, torch.arange(10, device=DEVICE, dtype=torch.int32) + 4
+        )
+
+    def test_if_branch_output_names_outer_value(self):
+        # ``tile_n.index`` names a value defined before the if; the other
+        # branch's value must not overwrite it for later uses of tile_n.
+        @helion.kernel(static_shapes=False)
+        def fn(x: torch.Tensor, flag: bool) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros([m, n], dtype=torch.int32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+                if flag:
+                    idx = tile_n.index
+                else:
+                    idx = tile_n.index + 100
+                out[tile_m, tile_n] = idx[None, :] + x[tile_m, tile_n]
+            return out
+
+        x = torch.zeros(3, 40, device=DEVICE, dtype=torch.int32)
+        expected = torch.arange(40, device=DEVICE, dtype=torch.int32).expand(3, 40)
+        for flag, offset in ((True, 0), (False, 100)):
+            _, result = code_and_output(fn, (x, flag))
+            torch.testing.assert_close(result, expected + offset)
+
+    def test_if_branch_reassigns_half_precision_quotient(self):
+        # A 16-bit true division stays fp32 on Triton until a consumer casts,
+        # while torch.exp of a 16-bit value is computed in fp32 and rounded.
+        @helion.kernel(static_shapes=False)
+        def fn(x: torch.Tensor, y: torch.Tensor, flag: bool) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                value = x[tile] / y[tile]
+                if flag:
+                    value = torch.exp(value)
+                out[tile] = value
+            return out
+
+        x = torch.rand(1000, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.rand(1000, device=DEVICE, dtype=torch.bfloat16) + 1.0
+        for flag in (True, False):
+            _, result = code_and_output(fn, (x, y, flag))
+            expected = torch.exp(x / y) if flag else x / y
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_if_branch_reassigns_half_precision_value(self):
+        @helion.kernel(static_shapes=False)
+        def fn(x: torch.Tensor, flag: bool) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                value = x[tile]
+                if flag:
+                    value = value * 2.0
+                out[tile] = value
+            return out
+
+        @helion.kernel(static_shapes=False)
+        def carried(x: torch.Tensor, flag: bool) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                value = x[tile_m, 0] * 0.5
+                for _tile_n in hl.tile(n):
+                    if flag:
+                        value = value * 0.5
+                out[tile_m] = value
+            return out
+
+        x = torch.randn(1000, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(8, 64, device=DEVICE, dtype=torch.bfloat16)
+        for flag in (True, False):
+            _, result = code_and_output(fn, (x, flag))
+            torch.testing.assert_close(result, x * 2.0 if flag else x)
+            # One 64-column tile: the branch scales once, exactly.
+            _, result = code_and_output(carried, (y, flag), block_sizes=[8, 64])
+            torch.testing.assert_close(result, y[:, 0] * (0.25 if flag else 0.5))
 
 
 if __name__ == "__main__":
