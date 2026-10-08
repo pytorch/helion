@@ -5103,7 +5103,7 @@ class ConfigSpec:
             )
 
         # Allow tunable parameter keys in addition to backend-supported keys.
-        allowed_keys = self.supported_config_keys() | {
+        allowed_keys = (VALID_KEYS - {*self.unsupported_config_keys(config)}) | {
             *self.user_defined_tunables.keys()
         }
         if invalid_keys := ({*config} - allowed_keys):

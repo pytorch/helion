@@ -177,6 +177,13 @@ def _validate_subscript_indices(index: list[object]) -> int:
     return narrowed
 
 
+@functools.cache
+def _backend_specific_keys() -> frozenset[str]:
+    from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+
+    return BACKEND_SPECIFIC_KEYS
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -493,9 +500,7 @@ class Backend(abc.ABC):
         return None
 
     def supports_config_key(self, key: str) -> bool:
-        from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
-
-        return key not in BACKEND_SPECIFIC_KEYS
+        return key not in _backend_specific_keys()
 
     def supports_block_ptr_indexing(self) -> bool:
         return True
