@@ -71,8 +71,11 @@ from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
 from .cute_reshape import check_memory_mask_rebound
+from .cute_reshape import codegen_cute_load_mask_rebound
 from .cute_reshape import codegen_cute_store_rebound_value
 from .cute_reshape import describe_rebound_block_dims
+from .cute_reshape import flattened_tile_partner
+from .cute_reshape import flattened_tile_strategy
 from .cute_reshape import run_deferred_rebound_checks
 from .cute_reshape import store_rebound_dims
 from .cute_reshape import tcgen05_rebound_store_error
@@ -5203,6 +5206,7 @@ def _apply_cute_value_coord_meta(
     """
     from .cute_reshape import CUTE_DIM_LOCAL_COORD_META
     from .cute_reshape import _get_block_local_coord
+    from .cute_reshape import _get_tile_shape
     from .cute_reshape import _subtile_coord_expr
 
     mask_subscript = list(subscript)
@@ -5224,17 +5228,33 @@ def _apply_cute_value_coord_meta(
 
     cg = state.codegen
     assert isinstance(cg, GenerateAST)
+    env = CompileEnvironment.current()
+    value_shape = _get_tile_shape(value, env, cg.device_function.config)
     positions = [pos for pos, idx in enumerate(subscript) if idx is not None]
-    for info, mapping in zip(meta, output_dims, strict=True):
+    for info, mapping, extent in zip(meta, output_dims, value_shape, strict=True):
         if not isinstance(info, dict) or mapping is None:
             continue
         tensor_dim, block_id = mapping
         idx = subscript[positions[tensor_dim]]
         if not (isinstance(idx, slice) and idx == slice(None)):
             continue
+        size = tensor.shape[tensor_dim]
+        if not env.known_equal(size, extent):
+            # The coordinate counts the view dim's elements from the slice's
+            # start with no mask: a narrower dim leaves the rest of the slice
+            # to every tile at once, a wider one writes past it.
+            raise exc.BackendUnsupported(
+                "cute",
+                f"store of {value_node.name}: its hl.split view dim of {extent} "
+                f"elements fills a slice of {size}",
+            )
         coord = _subtile_coord_expr(cg, info)
         if coord is None:
-            continue
+            raise exc.BackendUnsupported(
+                "cute",
+                f"store of {value_node.name}: its hl.split view dim has no lane "
+                "coordinate here",
+            )
         own_coord = (
             _get_block_local_coord(cg, block_id) if block_id is not None else None
         )
@@ -5291,12 +5311,20 @@ def cute_reindexed_scalar_load_expr(
     coords = _coords_from_flat_index(flat_var.id, shape)
     index_exprs = list(site.index_exprs)
     mask_terms = [] if site.mask_expr is None else [site.mask_expr]
+    flattened: PerThreadFlattenedTileStrategy | None = None
+    # block id -> (value dim, tensor dim)
+    flattened_dims: dict[int, tuple[int, int]] = {}
     for dim, mapping in enumerate(site.output_dims):
         if shape[dim] == 1 or mapping is None:
             continue
         tensor_dim, block_id = mapping
         if block_id is None:
             return None
+        if (strategy := flattened_tile_strategy(cg, block_id)) is not None:
+            # No uniform tile base per block there; see below.
+            flattened = strategy
+            flattened_dims[block_id] = (dim, tensor_dim)
+            continue
         own_coord = _get_block_local_coord(cg, block_id)
         if own_coord is None:
             return None
@@ -5312,6 +5340,24 @@ def cute_reindexed_scalar_load_expr(
                 else cg.device_function.sympy_expr(dim_size._sympy_())
             )
             mask_terms.append(f"(({partner}) < {size_expr})")
+    if flattened is not None:
+        # A flattened tile is a range of the flattened iteration space: move
+        # the flat position and decode each block's index from it.
+        partner_indices = flattened_tile_partner(
+            cg,
+            flattened,
+            {block_id: coords[dim] for block_id, (dim, _) in flattened_dims.items()},
+        )
+        if partner_indices is None:
+            return None
+        indices, in_bounds = partner_indices
+        for block_id, (_, tensor_dim) in flattened_dims.items():
+            index_exprs[tensor_dim] = (
+                f"({index_exprs[tensor_dim]}) - ({flattened.index_var(block_id)})"
+                f" + ({indices[block_id]})"
+            )
+        if in_bounds is not None:
+            mask_terms.append(f"({in_bounds})")
     load_expr = _cute_scalar_load_expr(
         site.tensor_name,
         index_exprs,
@@ -5444,8 +5490,8 @@ def _(state: CodegenState) -> object:
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
     if isinstance(tensor, torch.Tensor):
-        check_memory_mask_rebound(
-            state, tensor, subscript, state.proxy_arg(2), what="load"
+        extra_mask = codegen_cute_load_mask_rebound(
+            state, tensor, subscript, extra_mask
         )
     elif isinstance(tensor, tuple):
         # A stack tensor load ANDs the mask through _cute_stack_tensor_mask_expr

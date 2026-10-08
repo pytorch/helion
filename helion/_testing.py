@@ -412,6 +412,13 @@ def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "cute", reason)
 
 
+# The torch.chunk / torch.unbind device lowering (view_ops._check_split_backend).
+skipUnlessChunkLowering = skipIfFn(
+    lambda: _get_backend() not in ("triton", "cute"),
+    "torch.chunk/torch.unbind device lowering exists on Triton and CuTe only",
+)
+
+
 def matchesBackends(backends: Sequence[str]) -> bool:
     """Return whether `_get_backend() in backends`, matching onlyBackends."""
     backend = _get_backend()

@@ -1210,7 +1210,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
     def test_release_atomic_in_branch(self):
-        """A release atomic inside a branch needs a barrier there; CuTe refuses one."""
+        """A release atomic inside a branch needs a barrier there."""
 
         @helion.kernel(config=helion.Config(block_sizes=[128]), static_shapes=True)
         def release_in_branch(
@@ -1228,18 +1228,27 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         args = (torch.empty_like(x), x, count, flag)
         if _get_backend() == "cute":
             # A CuTe branch condition may differ between threads, and a
-            # block-wide barrier some threads skip deadlocks.
+            # block-wide barrier some threads skip deadlocks: a flag the
+            # kernel's atomic may change (it aliases ``count``) is refused.
+            aliased = torch.zeros(1, device=DEVICE, dtype=torch.int32)
             with self.assertRaisesRegex(
                 helion.exc.BackendUnsupported, "inside a branch or while loop"
             ):
-                code_and_output(release_in_branch, args)
-            return
+                code_and_output(
+                    release_in_branch,
+                    (torch.empty_like(x), x, aliased, aliased.view(-1)),
+                )
         code, result = code_and_output(release_in_branch, args)
         torch.testing.assert_close(result, x * 2.0)
         self.assertEqual(int(count.item()), 4)
-        self.assertGreater(
-            code.rfind("tl.debug_barrier()", 0, code.index("tl.atomic_add(")), -1
+        # Nothing writes ``flag`` here, so CuTe proves the branch uniform and
+        # places its barrier inside it too.
+        barrier, atomic = (
+            ("cute.arch.sync_threads()", "cute.arch.atomic_add(")
+            if _get_backend() == "cute"
+            else ("tl.debug_barrier()", "tl.atomic_add(")
         )
+        self.assertGreater(code.rfind(barrier, 0, code.index(atomic)), -1)
 
     @skipIfNotTriton("checks the drain of a Triton TMA store before a release")
     @skipIfRocm("Tensor descriptor not supported on ROCm")

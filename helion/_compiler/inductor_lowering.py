@@ -57,6 +57,7 @@ from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
 from .cute.cute_reshape import REBOUND_CHECK_TARGETS
 from .cute.cute_reshape import check_pointwise_rebound_block_ids
+from .cute.view_subtile import check_view_coord_consumers
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -1690,6 +1691,8 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
+                    # Operands exchanged between threads for this node only.
+                    exchanged: dict[torch.fx.Node, ast.AST] = {}
                     # ``has_current``: test_cute_fx_replay replays ``run_node``
                     # with no CompileEnvironment.
                     if (
@@ -1704,13 +1707,22 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         from .cute.repeated_block_ids import check_repeated_block_ids
 
                         check_repeated_block_ids(self.cg, n)
+                        check_view_coord_consumers(self.cg, n)
                         if (
                             isinstance(n.meta["lowering"], PointwiseLowering)
                             or n.target in REBOUND_CHECK_TARGETS
                         ):
-                            check_pointwise_rebound_block_ids(self.cg, n)
+                            exchanged = check_pointwise_rebound_block_ids(
+                                self.cg, n, operand_env=self.env
+                            )
                     lowering: Lowering = n.meta["lowering"]
-                    result = lowering.codegen(self, n)
+                    own_values = {operand: self.env[operand] for operand in exchanged}
+                    # pyrefly: ignore [no-matching-overload]
+                    self.env.update(exchanged)
+                    try:
+                        result = lowering.codegen(self, n)
+                    finally:
+                        self.env.update(own_values)
                     n.meta["codegen"] = result
 
                     # Generic handling for operations with multiple outputs

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import gc
 import itertools
 import re
 import textwrap
@@ -1406,10 +1407,17 @@ def test_device_loop_body_gets_a_barrier_for_its_own_thread_axis() -> None:
     _one_barrier_between(device_loop.body, "tile_offset_1) *", ".store(")
 
 
+def _flags_aliasing(x: torch.Tensor) -> torch.Tensor:
+    """Flags that are a view of ``x``, which the kernels write in place."""
+    return x.view(-1)[: x.size(0)]
+
+
 def test_racing_accesses_inside_a_branch_reject_the_config() -> None:
-    # A branch condition may vary per thread, and a block-wide barrier inside
-    # a branch some threads skip would deadlock: fail closed.
-    args = (torch.empty((8, 256)), torch.empty(8))
+    # A branch condition may vary per thread (here a flag the kernel itself
+    # overwrites, passed aliased to ``x``), and a block-wide barrier inside a
+    # branch some threads skip would deadlock: fail closed.
+    x = torch.empty((8, 256))
+    args = (x, _flags_aliasing(x))
     with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
         _generate(
             _flagged_inner_first_column_then_update_all,
@@ -1571,12 +1579,15 @@ def test_racing_accesses_in_a_grid_body_branch_reject_the_config(
     kernel: object,
 ) -> None:
     # A ``hl.if`` body is emitted inside the lane nest without passing
-    # through it; the pass reads its statements as a block of their own where
-    # no barrier can go, and threads taking different branches cannot be
-    # ordered at all.
-    args = (torch.empty((8, 256)), torch.empty(8))
-    with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
-        _generate(kernel, args, **_NESTED_CONFIG)
+    # through it, so each lane's pass re-reads the first column the column
+    # loop's lane 0 stored: the exactness check rejects the nest before the
+    # barrier pass would find the branch divergent (the flag aliases ``x``,
+    # which the kernel writes) and the threads' race unorderable.
+    x = torch.empty((8, 256))
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant load of x .* inside a branch"
+    ):
+        _generate(kernel, (x, _flags_aliasing(x)), **_NESTED_CONFIG)
 
 
 def test_racing_access_before_a_branch_gets_a_barrier_before_the_branch() -> None:
@@ -1702,6 +1713,59 @@ _ROWS_PER_THREAD_THREADED_COLUMNS_CONFIG = {
 }
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flagged_first_column_update_of_a_fresh_output(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0, tile1] = x[tile0, tile1]
+        if flags[tile0.begin] > 0:
+            first = out[tile0, tile1.begin]
+            out[tile0, tile1] = out[tile0, tile1] + first[:, None] + 1.0
+    return out
+
+
+def test_racing_accesses_in_an_unwritten_flag_branch_get_a_barrier_inside_it() -> None:
+    # Every thread loads ``flags`` at the tile's begin and nothing in the
+    # kernel can write it (only the fresh ``out`` is written), so the flag is
+    # one value per CTA and the first column's race gets its barrier in the
+    # branch.
+    code = _generate(
+        _flagged_first_column_update_of_a_fresh_output,
+        (torch.empty((8, 256)), torch.empty(8)),
+        **_ELEMENTWISE_THREADS_CONFIG,
+    )
+    function = _kernel_function(code)
+    (branch,) = _branches(function)
+    assert len(_barriers(branch)) == 1, code
+    _one_barrier_between(branch.body, "tile_offset_1) *", ".store(")
+
+
+def test_argument_flag_proof_survives_the_bind_tensors_being_freed() -> None:
+    # ``flags`` and the in-place ``x`` are both arguments: only the bound
+    # kernel's cache-keyed storage-disjointness fact proves the flag
+    # unwritten.  The bound kernel holds the bind's tensors weakly; a second
+    # config compiled after they are freed must reach the decision the first
+    # did, from the recorded fact.
+    x = torch.empty((8, 256))
+    flags = torch.empty(8)
+    configs = (
+        _ELEMENTWISE_THREADS_CONFIG,
+        {**_ELEMENTWISE_THREADS_CONFIG, "block_sizes": [2, 64], "num_threads": [2, 64]},
+    )
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(_flagged_first_column_then_update_all, (x, flags))
+        first = bound.to_code(helion.Config.from_dict(configs[0]))
+        del x, flags
+        gc.collect()
+        assert all(ref() is None for ref in bound._runtime_tensor_refs_by_name.values())
+        second = bound.to_code(helion.Config.from_dict(configs[1]))
+    for code in (first, second):
+        (branch,) = _branches(_kernel_function(code))
+        assert _barriers(branch), code
+
+
 def test_uniform_branch_inside_a_lane_loop_gets_its_barrier() -> None:
     # Each row lane's pass runs the branch whole; the first column's load
     # reads the row lane, so it repeats nothing, and the column threads'
@@ -1719,12 +1783,13 @@ def test_uniform_branch_inside_a_lane_loop_gets_its_barrier() -> None:
 
 
 def test_loaded_branch_inside_a_uniform_one_still_rejects_its_race() -> None:
-    # A loaded flag is a per-thread value, so its branch stays divergent
-    # inside a uniform one.
-    with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
+    # A flag the kernel may overwrite (it aliases ``x``) is a per-thread value,
+    # so its branch stays divergent inside a uniform one.
+    x = torch.empty((8, 256))
+    with pytest.raises(exc.BackendUnsupported, match="race on x inside a branch"):
         _generate(
             _bounded_then_flagged_first_column_then_update_all,
-            (torch.empty((8, 256)), torch.empty(8), 4),
+            (x, _flags_aliasing(x), 4),
             **_ELEMENTWISE_THREADS_CONFIG,
         )
 
@@ -1920,6 +1985,17 @@ def _if_device_loop_tile(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _if_loaded_flag_into_fresh_output(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0 in hl.tile(x.size(0)):
+        if flags[tile0.begin] > 0:
+            out[tile0, :] = x[tile0, :] + 1.0
+    return out
+
+
 @pytest.mark.parametrize(
     ("kernel", "args", "uniform"),
     [
@@ -1927,10 +2003,22 @@ def _if_device_loop_tile(x: torch.Tensor) -> torch.Tensor:
             _if_tile_id_and_end, (torch.empty(8, 256), 1), True, id="grid_tile"
         ),
         pytest.param(
+            _if_loaded_flag_into_fresh_output,
+            (torch.empty(8, 256), torch.empty(8)),
+            True,
+            id="unwritten_loaded_value",
+        ),
+        pytest.param(
             _if_loaded_flag,
             (torch.empty(8, 256), torch.empty(8)),
+            True,
+            id="argument_flag_proven_apart_at_runtime",
+        ),
+        pytest.param(
+            _if_loaded_flag,
+            (_aliased := torch.empty(8, 256), _flags_aliasing(_aliased)),
             False,
-            id="loaded_value",
+            id="flag_aliasing_a_written_argument",
         ),
         pytest.param(
             _if_device_loop_tile, (torch.empty(8, 256),), False, id="device_loop_tile"
@@ -1941,8 +2029,12 @@ def test_block_uniform_proves_only_cta_uniform_conditions(
     kernel: object, args: tuple[object, ...], uniform: bool
 ) -> None:
     # A grid tile's id and end against a kernel argument and a tensor size
-    # are one value per CTA.  A loaded value is a per-thread load, and a
-    # device loop's tile is outside the proof (it fails closed).
+    # are one value per CTA, and so is a load of ``flags`` at the tile's
+    # begin while the kernel writes only a fresh allocation, or writes the
+    # argument ``x`` that this launch's storages (the bound kernel's
+    # cache-keyed disjointness fact) keep apart from ``flags``.  Passed as a
+    # view of ``x`` the flag may change under the threads; a device loop's
+    # tile is outside the proof (it fails closed).
     with _mock_cuda_unavailable():
         bound = _cpu_bind(kernel, args)
     host_function = bound.host_function

@@ -8,9 +8,11 @@ same eager timing as before.
 
 from __future__ import annotations
 
+import ast
 import math
 import re
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -29,8 +31,6 @@ from ..loop_dependency_checker import HOST_UNKNOWN_ROOT
 from ..loop_dependency_checker import collect_host_tensor_roots
 
 if TYPE_CHECKING:
-    import ast
-
     from ..aten_lowering import LoweringContext
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
@@ -207,6 +207,48 @@ def _check_split_smem_exchange(
     return True
 
 
+def _unbound_stack_operands(
+    state: CodegenState, input_node: torch.fx.Node
+) -> list[ast.AST] | None:
+    """``hl.split`` of ``torch.unbind(torch.stack((a, b), d), d)`` is ``(a, b)``.
+
+    Each thread holds the split's outputs at the coordinates the stack's
+    operands have (``annotate_view_subtiles`` carries them through the stack),
+    so the operands' own values are the pair, with no data movement.
+    """
+    from .view_subtile import unbound_stack
+
+    stack = unbound_stack(input_node)
+    if stack is None:
+        return None
+    tensors = stack.args[0]
+    assert isinstance(tensors, (list, tuple))
+    values = [
+        state.env[tensor] for tensor in tensors if isinstance(tensor, torch.fx.Node)
+    ]
+    if len(values) != 2 or not all(isinstance(value, ast.AST) for value in values):
+        return None
+    return cast("list[ast.AST]", values)
+
+
+def _pair_coord_info(cg: GenerateAST, node: torch.fx.Node) -> dict[object, object]:
+    """The split-view coordinate of ``node``'s last (pair) dim; the whole
+    block coordinate when the dim is a block's own."""
+    from .cute_reshape import CUTE_DIM_LOCAL_COORD_META
+    from .cute_reshape import _resolve_dim_block_id
+
+    value = node.meta["val"]
+    assert isinstance(value, torch.Tensor)
+    meta = node.meta.get(CUTE_DIM_LOCAL_COORD_META)
+    if (
+        isinstance(meta, (list, tuple))
+        and len(meta) == value.ndim
+        and isinstance(meta[-1], dict)
+    ):
+        return meta[-1]
+    return {"block_id": _resolve_dim_block_id(cg, value, value.ndim - 1)}
+
+
 @_decorators.codegen(split, "cute")
 def _(state: CodegenState) -> list[ast.AST]:
     from ..ast_extension import statement_from_string
@@ -214,6 +256,9 @@ def _(state: CodegenState) -> list[ast.AST]:
     from .cute_reshape import _flat_index_from_coords
     from .cute_reshape import _get_node_dim_local_coord
     from .cute_reshape import _get_tile_shape
+    from .cute_reshape import check_flattened_view_coord
+    from .cute_reshape import resolve_cute_shape_chain_value_at
+    from .indexing import CuteShapeChainView
 
     fx_node = state.fx_node
     assert fx_node is not None
@@ -238,7 +283,12 @@ def _(state: CodegenState) -> list[ast.AST]:
 
     lo_var = df.new_var("split_lo")
     hi_var = df.new_var("split_hi")
-    halves = _fold_split_halves(state, input_node, input_shape, output_coords)
+    halves = _unbound_stack_operands(state, input_node)
+    if halves is None:
+        # The re-read and the exchange both reach the pair element by moving
+        # the pair dim's coordinate.
+        check_flattened_view_coord(cg, _pair_coord_info(cg, input_node), "hl.split")
+        halves = _fold_split_halves(state, input_node, input_shape, output_coords)
     if halves is not None:
         for var, half in zip((lo_var, hi_var), halves, strict=True):
             cg.add_statement(statement_from_string(f"{var} = {{half}}", half=half))
@@ -279,9 +329,15 @@ def _(state: CodegenState) -> list[ast.AST]:
             f"{smem} = cute.make_tensor({smem_ptr}, ({input_numel},))"
         )
     )
-    stage = statement_from_string(
-        f"{smem}[{src_flat}] = {{_inp}}", _inp=state.ast_arg(0)
-    )
+    staged = state.env[input_node]
+    if isinstance(staged, CuteShapeChainView):
+        # A view chain kept virtual for the split: this thread's element.
+        staged = resolve_cute_shape_chain_value_at(state, input_node, src_flat)
+    if not isinstance(staged, ast.AST):
+        raise exc.BackendUnsupported(
+            "cute", f"hl.split of an unresolved view chain: {input_node.name}"
+        )
+    stage = statement_from_string(f"{smem}[{src_flat}] = {{_inp}}", _inp=staged)
     reads = [
         statement_from_string(f"{lo_var} = {smem}[{lo_flat}]"),
         statement_from_string(f"{hi_var} = {smem}[{hi_flat}]"),
@@ -309,6 +365,7 @@ def _(state: CodegenState) -> list[ast.AST]:
 def _(state: CodegenState) -> ast.AST:
     from ..generate_ast import GenerateAST
     from .cute_reshape import _get_node_dim_local_coord
+    from .cute_reshape import check_flattened_view_coord
 
     fx_node = state.fx_node
     assert fx_node is not None
@@ -317,6 +374,9 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(state.codegen, GenerateAST)
 
     new_dim = output_val.ndim - 1
+    check_flattened_view_coord(
+        state.codegen, _pair_coord_info(state.codegen, fx_node), "hl.join"
+    )
     # The selector picks data, so an unowned pair dim must fail loudly instead
     # of folding to a constant that silently keeps one operand.
     selector = _get_node_dim_local_coord(

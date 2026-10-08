@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import math
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import cast
@@ -34,26 +35,33 @@ from ...language.memory_ops import _cute_resolve_active_slice_block_id
 from ...language.reduce_ops import _reduce
 from ...language.scan_ops import _associative_scan
 from ...language.view_ops import join
+from ...language.view_ops import split
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..ast_read_writes import ast_rename
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..indexing_strategy import _get_tile_with_offset_info
 from ..indexing_strategy import compute_slice_size
+from ..tile_strategy import DeviceGridState
 from ..tile_strategy import DeviceLoopState
+from ..tile_strategy import PerThreadFlattenedTileStrategy
 from ..variable_origin import BlockSizeOrigin
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
 from .indexing import CuteShapeChainView
 from .indexing import is_cute_shape_chain_target
+from .split_exchange import emitted_definitions
 
 if TYPE_CHECKING:
     from collections.abc import Collection
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..aten_lowering import LoweringContext
     from ..compile_environment import Config
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..helper_function import CodegenInterface
     from ..inductor_lowering import CodegenState
@@ -70,10 +78,17 @@ def _env_arg(ctx: LoweringContext, node: Node) -> object:
 
 
 def _shape_chain_only_users(node: Node) -> bool:
+    """Whether every user resolves ``node`` through its shape chain.
+
+    ``hl.split`` does: it re-reads a loaded leaf at each pair element, takes
+    the operands of an unbound stack, and materializes the chain itself
+    before an exchange.
+    """
     if not node.users:
         return False
     return all(
-        user.op == "call_function" and is_cute_shape_chain_target(user.target)
+        user.op == "call_function"
+        and (is_cute_shape_chain_target(user.target) or user.target is split)
         for user in node.users
     )
 
@@ -298,10 +313,200 @@ def _subtile_coord_expr(cg: GenerateAST, info: dict[object, object]) -> str | No
     return expr
 
 
+def _flattened_block_local_coord(
+    cg: GenerateAST, strategy: TileStrategy, block_id: int
+) -> str | None:
+    """``block_id``'s tile-local coordinate on a multi-block flattened tile.
+
+    The tile is one block-aligned run of flat elements, so an element's place
+    in it is ``offsets % BLOCK``.  That place splits into one digit per block
+    by the block sizes, innermost first as the strategy splits the flat index
+    into its block indices; the digits compose back to the place over the
+    tile shape.  ``index - offset`` would subtract the flat index itself.
+    """
+    if (
+        not isinstance(strategy, PerThreadFlattenedTileStrategy)
+        or len(strategy.block_ids) < 2
+        or block_id not in strategy.block_ids
+    ):
+        return None
+    coord = f"({strategy.offset_var(block_id)}) % ({strategy.block_size_var(block_id)})"
+    inner = 1
+    for candidate in strategy._reorder(strategy.block_ids):
+        size = cg.device_function.resolved_block_size(candidate)
+        if not isinstance(size, int):
+            return None
+        if candidate == block_id:
+            if inner != 1:
+                coord = f"({coord}) // cutlass.Int32({inner})"
+            return f"({coord}) % cutlass.Int32({size})"
+        inner *= size
+    return None
+
+
+def _flattened_coord_period(
+    cg: GenerateAST, strategy: PerThreadFlattenedTileStrategy, block_id: int
+) -> int:
+    """The period modulo which ``block_id``'s flattened coordinate is the
+    element's coordinate in its unflattened ``block_id`` tile.
+
+    The tile is a run of the flat iteration space, not a rectangle.  The
+    digit ``_flattened_block_local_coord`` takes from it counts ``block_id``
+    steps only when the blocks iterated faster hold as many elements as
+    their trip counts multiply to (a run then holds whole rows of them).  It
+    is then the tile coordinate if ``block_id`` iterates slowest, else only
+    modulo what the block size shares with the trip count (where a row
+    ends).  1 when nothing agrees: a 2 x 4 run of an 8-row tensor iterated
+    rows fastest is one column, whose ``block_id=1`` digits count row pairs.
+    """
+    order = strategy._reorder(strategy.block_ids)
+    faster_block_sizes = 1
+    faster_trip_counts = 1
+    for candidate in order:
+        size = cg.device_function.resolved_block_size(candidate)
+        trip_count = strategy.trip_counts.get(candidate)
+        if not isinstance(size, int) or not isinstance(
+            trip_count, (int, sympy.Integer)
+        ):
+            return 1
+        if candidate == block_id:
+            if faster_block_sizes != faster_trip_counts:
+                return 1
+            if candidate == order[-1]:
+                return size
+            return math.gcd(size, int(trip_count))
+        faster_block_sizes *= size
+        faster_trip_counts *= int(trip_count)
+    return 1
+
+
+def check_flattened_view_coord(
+    cg: GenerateAST, info: Mapping[object, object], description: str
+) -> None:
+    """Refuse moving a split-view coordinate a flattened tile does not keep.
+
+    ``info`` is a split-view coordinate ``(coord(block) // divisor) %
+    modulus`` that picks data: the ``hl.split`` pair dim (the re-read and
+    the exchange both reach the partner by changing it) or the ``hl.join``
+    selector.  On a multi-block flattened tile the change reaches the
+    unflattened tile's partner only within ``_flattened_coord_period``.
+    The other dims only label an element, which any coordinate does.
+    """
+    block_id = info.get("block_id")
+    if not isinstance(block_id, int):
+        return
+    strategy = flattened_tile_strategy(cg, block_id)
+    if strategy is None:
+        return
+    divisor = info.get("divisor", 1)
+    modulus = info.get("modulus")
+    if modulus is None:
+        modulus = cg.device_function.resolved_block_size(block_id)
+    period = _flattened_coord_period(cg, strategy, block_id)
+    if (
+        isinstance(divisor, int)
+        and isinstance(modulus, int)
+        and period % (divisor * modulus) == 0
+    ):
+        return
+    raise exc.BackendUnsupported(
+        "cute",
+        f"{description} over a flattened tile (flatten_loops) pairs elements "
+        f"within groups of {divisor} x {modulus} along block {block_id}, but "
+        "the tile's run of the flat iteration space keeps that block's "
+        f"coordinate only modulo {period}: the blocks iterated faster must "
+        "cover their dims exactly, and the group must divide the dim unless "
+        "the block iterates slowest",
+    )
+
+
+def flattened_tile_strategy(
+    cg: GenerateAST, block_id: int
+) -> PerThreadFlattenedTileStrategy | None:
+    """The multi-block flattened tile ``block_id`` iterates in, if any."""
+    loops = cg.active_device_loops.get(block_id)
+    grid_state = cg.current_grid_state
+    if loops:
+        strategy = loops[-1].strategy
+    elif grid_state is not None:
+        strategy = grid_state.strategy
+    else:
+        return None
+    if (
+        isinstance(strategy, PerThreadFlattenedTileStrategy)
+        and len(strategy.block_ids) > 1
+        and block_id in strategy.block_ids
+    ):
+        return strategy
+    return None
+
+
+def flattened_tile_partner(
+    cg: GenerateAST,
+    strategy: PerThreadFlattenedTileStrategy,
+    coords: dict[int, str],
+) -> tuple[dict[int, str], str | None] | None:
+    """Indices of the element of a flattened tile at other coordinates.
+
+    ``coords`` maps some of the tile's blocks to the requested coordinate
+    (the others keep this thread's).  The element's place in the tile moves
+    by the coordinate deltas in the radix of ``_flattened_block_local_coord``
+    (there is no uniform base per block to add a coordinate to), and the
+    strategy's own index and mask definitions, evaluated at the moved
+    flat offset, give each block's index and whether the element exists (a
+    partial last tile).  ``None`` when a coordinate or a definition is
+    unavailable.
+    """
+    grid_state = cg.current_grid_state
+    if not isinstance(grid_state, DeviceGridState):
+        return None
+    env = CompileEnvironment.current()
+    config = cg.device_function.config
+    deltas: list[str] = []
+    radix = 1
+    for block_id in strategy._reorder(strategy.block_ids):
+        extent = env.block_sizes[block_id].from_config(config)
+        own = _flattened_block_local_coord(cg, strategy, block_id)
+        if not isinstance(extent, int) or own is None:
+            return None
+        if block_id in coords:
+            deltas.append(f"(({coords[block_id]}) - ({own})) * cutlass.Int32({radix})")
+        radix *= extent
+    offsets = strategy.offset_var(strategy.block_ids[0])
+    partner = cg.lift(
+        expr_from_string(" + ".join([offsets, *deltas])),
+        dce=True,
+        prefix="partner_offsets",
+    )
+    definitions = emitted_definitions(cg, grid_state)
+    renames = {offsets: partner.id}
+    indices: dict[int, str] = {}
+    for block_id in coords:
+        definition = definitions.get(strategy.index_var(block_id))
+        if definition is None:
+            return None
+        indices[block_id] = _renamed_expr(definition, renames)
+    mask_var = strategy.mask_var(strategy.block_ids[0])
+    if mask_var is None:
+        return indices, None
+    mask = definitions.get(mask_var)
+    if mask is None:
+        return None
+    return indices, _renamed_expr(mask, renames)
+
+
+def _renamed_expr(expr: ast.expr, renames: dict[str, str]) -> str:
+    return ast.unparse(ast_rename(ast.parse(ast.unparse(expr), mode="eval"), renames))
+
+
 def _get_block_local_coord(cg: GenerateAST, block_id: int) -> str | None:
     loops = cg.active_device_loops.get(block_id)
     if loops:
         loop_state = loops[-1]
+        if (
+            coord := _flattened_block_local_coord(cg, loop_state.strategy, block_id)
+        ) is not None:
+            return coord
         if _strategy_aliases_index_and_offset(loop_state.strategy, block_id):
             thread_axis = loop_state.block_thread_axes.get(block_id)
             if thread_axis is not None:
@@ -316,6 +521,12 @@ def _get_block_local_coord(cg: GenerateAST, block_id: int) -> str | None:
         return f"(({cg.index_var(block_id)}) - ({offset_var}))"
 
     if cg.current_grid_state is not None:
+        if (
+            coord := _flattened_block_local_coord(
+                cg, cg.current_grid_state.strategy, block_id
+            )
+        ) is not None:
+            return coord
         thread_axis = cg.current_grid_state.block_thread_axes.get(block_id)
         if thread_axis is not None:
             return _grid_local_coord_expr(cg, block_id, thread_axis)
@@ -1035,7 +1246,7 @@ def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
 
 def rebound_block_dims(
     env: CompileEnvironment,
-    config: Config,
+    config: Config | None,
     value: torch.Tensor,
     consumer_sizes: Sequence[int | torch.SymInt],
     consumer_block_ids: Sequence[int | None],
@@ -1065,68 +1276,97 @@ def rebound_block_dims(
     Dims that are not block ids (static extents; a reduction dim is a block
     id here, cute pads factory tensors so every slice gets one) or that
     broadcast (stride 0, or a block whose extent under ``config`` is 1, on
-    either side) bind nothing.  A dim bound to a block id already on another
-    axis of the same tensor is rejected earlier (``check_repeated_block_ids``).
+    either side) bind nothing; without a ``config`` every block may be wider
+    than 1.  A dim bound to a block id already on another axis of the same
+    tensor is rejected earlier (``check_repeated_block_ids``).
     """
     consumer_canonical = [
         None if block_id is None else env.canonical_block_id(block_id)
         for block_id in consumer_block_ids
     ]
-    offset = len(consumer_block_ids) - value.ndim
-    positions = [dim + offset for dim in range(value.ndim)]
-    if lower_rank_by_block_id and 0 < value.ndim < len(consumer_block_ids):
-        matched: list[int] = []
-        used: set[int] = set()
-        for size in value.shape:
-            block_id = env.get_block_id(size)
-            canonical = None if block_id is None else env.canonical_block_id(block_id)
-            match = None
-            if canonical is not None:
-                match = next(
-                    (
-                        position
-                        for position, candidate in enumerate(consumer_canonical)
-                        if position not in used and candidate == canonical
-                    ),
-                    None,
-                )
-            else:
-                match = next(
-                    (
-                        position
-                        for position, candidate in enumerate(consumer_canonical)
-                        if position not in used
-                        and candidate is None
-                        and env.known_equal(size, consumer_sizes[position])
-                    ),
-                    None,
-                )
-            if match is None:
-                match = max(
-                    position
-                    for position in range(len(consumer_block_ids))
-                    if position not in used
-                )
-            matched.append(match)
-            used.add(match)
-        positions = sorted(matched)
+    positions = operand_positions(
+        env,
+        value,
+        consumer_sizes,
+        consumer_block_ids,
+        lower_rank_by_block_id=lower_rank_by_block_id,
+    )
     rebound: list[tuple[int, int, int]] = []
     for dim, size in enumerate(value.shape):
         position = positions[dim]
         if position < 0 or value.stride(dim) == 0:
             continue
         block_id = env.get_block_id(size)
-        if block_id is None or _resolve_tile_extent(size, env, config) == 1:
+        if block_id is None or (
+            config is not None and _resolve_tile_extent(size, env, config) == 1
+        ):
             continue
         consumer_block_id = consumer_block_ids[position]
-        if (
-            consumer_block_id is None
-            or block_extent(env, config, consumer_block_id) == 1
+        if consumer_block_id is None or (
+            config is not None and block_extent(env, config, consumer_block_id) == 1
         ):
             continue
         if env.canonical_block_id(block_id) != consumer_canonical[position]:
             rebound.append((dim, block_id, consumer_block_id))
     return rebound
+
+
+def operand_positions(
+    env: CompileEnvironment,
+    value: torch.Tensor,
+    consumer_sizes: Sequence[int | torch.SymInt],
+    consumer_block_ids: Sequence[int | None],
+    *,
+    lower_rank_by_block_id: bool,
+) -> list[int]:
+    """The consumer dim each dim of ``value`` meets (see ``rebound_block_dims``).
+
+    Right-aligned, so a negative position is a dim the consumer does not have;
+    a lower-rank pointwise operand is placed as
+    ``TileDispatch.broadcast_expand_dims`` places it.
+    """
+    offset = len(consumer_block_ids) - value.ndim
+    if not (lower_rank_by_block_id and 0 < value.ndim < len(consumer_block_ids)):
+        return [dim + offset for dim in range(value.ndim)]
+    consumer_canonical = [
+        None if block_id is None else env.canonical_block_id(block_id)
+        for block_id in consumer_block_ids
+    ]
+    matched: list[int] = []
+    used: set[int] = set()
+    for size in value.shape:
+        block_id = env.get_block_id(size)
+        canonical = None if block_id is None else env.canonical_block_id(block_id)
+        match = None
+        if canonical is not None:
+            match = next(
+                (
+                    position
+                    for position, candidate in enumerate(consumer_canonical)
+                    if position not in used and candidate == canonical
+                ),
+                None,
+            )
+        else:
+            match = next(
+                (
+                    position
+                    for position, candidate in enumerate(consumer_canonical)
+                    if position not in used
+                    and candidate is None
+                    and env.known_equal(size, consumer_sizes[position])
+                ),
+                None,
+            )
+        if match is None:
+            match = max(
+                position
+                for position in range(len(consumer_block_ids))
+                if position not in used
+            )
+        matched.append(match)
+        used.add(match)
+    return sorted(matched)
 
 
 def block_extent(env: CompileEnvironment, config: Config, block_id: int) -> int | None:
@@ -1374,18 +1614,130 @@ def _rebound_consumer_dims(
     return [*value.shape], True
 
 
+def _fx_subscript_dims(
+    tensor: torch.Tensor, index: Sequence[object]
+) -> tuple[list[int | torch.SymInt], list[int | None]]:
+    """The dims of ``tensor[index]`` and the block id of each tile dim, from
+    the traced index alone (a slice's block is only resolved at codegen)."""
+    env = CompileEnvironment.current()
+    sizes: list[int | torch.SymInt] = []
+    block_ids: list[int | None] = []
+    tensor_dim = 0
+    for idx in index:
+        if idx is None:
+            sizes.append(1)
+            block_ids.append(None)
+            continue
+        if isinstance(idx, torch.SymInt):
+            if (block_id := env.get_block_id(idx)) is not None:
+                sizes.append(idx)
+                block_ids.append(block_id)
+        elif isinstance(idx, torch.Tensor):
+            sizes.extend(idx.shape)
+            block_ids.extend(tensor_dim_block_ids(env, idx.shape))
+        elif isinstance(idx, slice) and tensor_dim < tensor.ndim:
+            sizes.append(compute_slice_size(idx, tensor.shape[tensor_dim]))
+            block_ids.append(None)
+        tensor_dim += 1
+    return sizes, block_ids
+
+
+def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:
+    """Whether some consumer in ``graphs`` may bind an operand dim to another
+    block id (an exchange, ``rebound_block_dims``), whatever the config: a
+    pointwise op or one of ``REBOUND_CHECK_TARGETS`` against its operands, a
+    store or atomic against its value, a load or store against its mask."""
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ...language.memory_ops import load
+    from ...language.memory_ops import store
+
+    env = CompileEnvironment.current()
+
+    def rebinds(
+        value: object,
+        sizes: Sequence[int | torch.SymInt],
+        block_ids: Sequence[int | None],
+        lower_rank_by_block_id: bool,
+    ) -> bool:
+        return (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and bool(
+                rebound_block_dims(
+                    env,
+                    None,
+                    value,
+                    sizes,
+                    block_ids,
+                    lower_rank_by_block_id=lower_rank_by_block_id,
+                )
+            )
+        )
+
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            target = node.target
+            args = map_arg(node.args, lambda arg: arg.meta.get("val"))
+            if target is load or target is store or target in ATOMIC_OPS:
+                tensor, index = args[0], args[1]
+                if not isinstance(tensor, torch.Tensor) or not isinstance(
+                    index, (list, tuple)
+                ):
+                    continue
+                sizes, block_ids = _fx_subscript_dims(tensor, index)
+                checked = (args[2],) if target is load else args[2:4]
+                if any(rebinds(arg, sizes, block_ids, False) for arg in checked):
+                    return True
+                continue
+            if not (
+                target in REBOUND_CHECK_TARGETS
+                or (
+                    isinstance(target, torch._ops.OpOverload)
+                    and torch.Tag.pointwise in target.tags
+                )
+            ):
+                continue
+            consumer = _rebound_consumer_dims(node)
+            if consumer is None or not consumer[0]:
+                continue
+            sizes, lower_rank_by_block_id = consumer
+            block_ids = tensor_dim_block_ids(env, sizes)
+            if target is torch.ops.aten.gather.default:
+                gather_dim = node.args[1] if len(node.args) > 1 else node.kwargs["dim"]
+                assert isinstance(gather_dim, int)
+                block_ids[gather_dim % len(block_ids)] = None
+            if any(
+                rebinds(
+                    operand.meta.get("val"), sizes, block_ids, lower_rank_by_block_id
+                )
+                for operand in _rebound_operands(node)
+            ):
+                return True
+    return False
+
+
 def check_pointwise_rebound_block_ids(
-    cg: CodegenInterface, node: Node, *, defer_tcgen05_epilogues: bool = True
-) -> None:
-    """Refuse an element-wise op that binds an operand dim to another block id
+    cg: CodegenInterface,
+    node: Node,
+    *,
+    defer_tcgen05_epilogues: bool = True,
+    operand_env: Mapping[Node, object] | None = None,
+) -> dict[Node, ast.AST]:
+    """Handle an element-wise op that binds an operand dim to another block id
     than the dims it is combined with (``t + t.T`` with equal block sizes,
     ``torch.where(c, t, t.T)``, ``hl.join(t, t.T)``, an inline asm or tuple
     reduce over ``t`` and ``t.T``, ``torch.gather(t, 1, idx.T)``, or a
     lower-rank pointwise operand whose tile dims are in another order than
     the result's).
 
-    The op would need the operand element held by another thread; the SIMT
-    lowering combines each thread's own scalars.  Unequal extents are the
+    The op needs the operand element held by another thread; the SIMT
+    lowering combines each thread's own scalars.  For a PointwiseLowering
+    and ``torch.where`` with the operands' per-thread values in
+    ``operand_env``, the re-bound operands are exchanged between threads
+    (``codegen_cute_rebound_exchange``) and returned for the lowering to
+    read instead; the other combiners are refused.  Unequal extents are the
     ``ShapeMismatch`` the Triton backend raises.  An op on a tcgen05 matmul's
     epilogue chain is checked from the store instead
     (``run_deferred_rebound_checks``), after the epilogue classifier has had
@@ -1395,7 +1747,7 @@ def check_pointwise_rebound_block_ids(
 
     consumer = _rebound_consumer_dims(node)
     if consumer is None or not consumer[0]:
-        return
+        return {}
     consumer_sizes, lower_rank_by_block_id = consumer
     df = cg.device_function
     env = CompileEnvironment.current()
@@ -1407,6 +1759,15 @@ def check_pointwise_rebound_block_ids(
         gather_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
         assert isinstance(gather_dim, int)
         result_block_ids[gather_dim % len(result_block_ids)] = None
+    exchangeable = (
+        operand_env is not None
+        and isinstance(cg, GenerateAST)
+        and (
+            node.target is torch.ops.aten.where.self
+            or node.target not in REBOUND_CHECK_TARGETS
+        )
+    )
+    pending: list[tuple[Node, torch.Tensor, list[tuple[int, int, int]]]] = []
     for operand in _rebound_operands(node):
         operand_val = operand.meta.get("val")
         if not isinstance(operand_val, torch.Tensor):
@@ -1437,7 +1798,7 @@ def check_pointwise_rebound_block_ids(
                 inner_outputs_by_graph_id=cute_state.rebound_inner_outputs_index,
             ):
                 cute_state.deferred_rebound_pointwise_nodes.append(node)
-                return
+                return {}
         for dim, _operand_block_id, result_block_id in rebound:
             operand_extent = _resolve_tile_extent(operand_val.shape[dim], env, config)
             result_extent = block_extent(env, config, result_block_id)
@@ -1446,13 +1807,32 @@ def check_pointwise_rebound_block_ids(
                     f"operand {operand.name} dim {dim} of extent {operand_extent}",
                     f"{node.target} result tile of extent {result_extent}",
                 )
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{node.target} reads operand {operand.name} (shape "
-            f"{list(operand_val.shape)}) at the position of another "
-            f"block's lane: {describe_rebound_block_dims(rebound)}; the "
-            "SIMT lowering combines each thread's own elements",
+        if not exchangeable or not isinstance(
+            operand_env.get(operand) if operand_env is not None else None, ast.AST
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{node.target} reads operand {operand.name} (shape "
+                f"{list(operand_val.shape)}) at the position of another "
+                f"block's lane: {describe_rebound_block_dims(rebound)}; the "
+                "SIMT lowering combines each thread's own elements",
+            )
+        pending.append((operand, operand_val, rebound))
+    exchanged: dict[Node, ast.AST] = {}
+    for operand, operand_val, rebound in pending:
+        assert isinstance(cg, GenerateAST) and operand_env is not None
+        value = operand_env[operand]
+        assert isinstance(value, ast.AST)
+        exchanged[operand] = codegen_cute_rebound_exchange(
+            cg,
+            operand_val,
+            value,
+            rebound,
+            result_block_ids,
+            what=f"{node.target} operand {operand.name} of {list(operand_val.shape)}",
+            value_node=operand,
         )
+    return exchanged
 
 
 def run_deferred_rebound_checks(
@@ -1513,6 +1893,50 @@ def check_memory_mask_rebound(
             f"{describe_rebound_block_dims(rebound)}; the mask must be held by "
             "the thread that owns the addressed lane",
         )
+
+
+def codegen_cute_load_mask_rebound(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    mask: ast.AST | None,
+) -> ast.AST | None:
+    """The load ``extra_mask`` each thread tests: Triton ANDs it positionally
+    into the index masks, so a mask bound to other block ids than the
+    subscript's dims (``m[tile_m, tile_n].T`` with equal block sizes) is
+    exchanged between threads (``codegen_cute_rebound_exchange``); unequal
+    extents are the ``ShapeMismatch`` the Triton backend raises."""
+    from ..generate_ast import GenerateAST
+
+    mask_val = state.proxy_arg(2)
+    if mask is None or not isinstance(mask_val, torch.Tensor) or mask_val.ndim == 0:
+        return mask
+    rebound = subscript_rebound_block_dims(state, tensor, subscript, mask_val)
+    if not rebound:
+        return mask
+    env = CompileEnvironment.current()
+    config = state.device_function.config
+    mask_shape = _get_tile_shape(mask_val, env, config)
+    for dim, _mask_block_id, slot_block_id in rebound:
+        slot_extent = block_extent(env, config, slot_block_id)
+        if mask_shape[dim] != slot_extent:
+            raise exc.ShapeMismatch(
+                f"load mask dim {dim} of extent {mask_shape[dim]}",
+                f"subscript tile of extent {slot_extent}",
+            )
+    cg = state.codegen
+    assert isinstance(cg, GenerateAST)
+    _slot_sizes, slot_block_ids = _subscript_slot_dims(state, tensor, subscript)
+    mask_node = state.fx_node.args[2] if state.fx_node is not None else None
+    return codegen_cute_rebound_exchange(
+        cg,
+        mask_val,
+        mask,
+        rebound,
+        slot_block_ids,
+        what=f"load mask of {list(mask_val.shape)}",
+        value_node=mask_node if isinstance(mask_node, Node) else None,
+    )
 
 
 def store_rebound_dims(
@@ -1586,98 +2010,186 @@ def codegen_cute_store_rebound_value(
 
     ``out[tile_m, tile_n] = x[tile_m, tile_n].T`` with equal block sizes
     stores, at position ``(i, j)`` of the slot, the value's element ``(i, j)``:
-    ``x[j, i]`` of the tile, held by the thread with the swapped coordinates.
-    Every thread stages its element at its position in the value's shape (its
-    coordinates by the value's block ids) and, after a barrier, reads the
-    element at its position in the slot (its coordinates by the subscript's
-    block ids).  Both accesses are predicated on the coordinates lying inside
-    the tile: a launch widened for a sibling root loop has surplus threads
-    whose coordinates exceed the extent (their masks keep them off the
-    store, but not off the buffer).  The whole tile must be resident across
-    the thread block at one barrier, so the exchange is refused inside lane
-    loops.
+    ``x[j, i]`` of the tile, held by the thread with the swapped coordinates
+    (see ``codegen_cute_rebound_exchange``).
     """
     from ..generate_ast import GenerateAST
 
     value_val = state.proxy_arg(2)
-    assert isinstance(value_val, torch.Tensor) and rebound
+    assert isinstance(value_val, torch.Tensor)
     cg = state.codegen
     assert isinstance(cg, GenerateAST)
+    _slot_sizes, slot_block_ids = _subscript_slot_dims(state, tensor, subscript)
+    value_node = state.fx_node.args[2] if state.fx_node is not None else None
+    return codegen_cute_rebound_exchange(
+        cg,
+        value_val,
+        value,
+        rebound,
+        slot_block_ids,
+        what=f"store of {list(value_val.shape)}",
+        value_node=value_node if isinstance(value_node, Node) else None,
+    )
+
+
+def codegen_cute_rebound_exchange(
+    cg: GenerateAST,
+    value_val: torch.Tensor,
+    value: ast.AST,
+    rebound: Sequence[tuple[int, int, int]],
+    consumer_block_ids: Sequence[int | None],
+    *,
+    what: str,
+    value_node: Node | None,
+) -> ast.AST:
+    """Exchange ``value`` (a tile held one element per thread at its own block
+    coordinates) through shared memory so that each thread gets the element a
+    consumer reads at the thread's position, when the consumer binds dims of
+    ``value`` to other block ids (``rebound``, from ``rebound_block_dims``;
+    ``consumer_block_ids`` are the consumer's dims).
+
+    Every thread stages its element at its position in the value's shape (its
+    coordinates by the value's block ids) and, after a barrier, reads the
+    element at the value position the consumer pairs with it (its coordinates
+    by the consumer's block ids for the re-bound dims).  Threads that hold the
+    same element (a lower-rank value is held along every consumer block it
+    does not use) stage it once, from coordinate 0 of those blocks.  Both
+    accesses are predicated on the coordinates lying inside the tile: a launch
+    widened for a sibling root loop has surplus threads whose coordinates
+    exceed the extent (their masks keep them off the consumer, but not off the
+    buffer).  The whole tile must be resident across the thread block at one
+    barrier that every thread reaches, so the exchange is refused inside lane
+    loops and inside branches or loops whose condition may differ between
+    threads, and for a value (``value_node``) whose elements sit at sub-tile
+    coordinates (``CUTE_DIM_LOCAL_COORD_META``).
+    """
     env = CompileEnvironment.current()
-    df = state.device_function
-    description = describe_rebound_block_dims(rebound)
-    value_shape = _get_tile_shape(value_val, env, df.config)
+    df = cg.device_function
+    description = f"{what} re-binds {describe_rebound_block_dims(rebound)}"
+    if value_node is not None and CUTE_DIM_LOCAL_COORD_META in value_node.meta:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{description}, but its elements are held at sub-tile coordinates; "
+            "the exchange stages one element per thread at its block coordinates",
+        )
     if cute_lane_loops_active(cg):
         raise exc.BackendUnsupported(
             "cute",
-            f"store of {list(value_val.shape)} re-binds {description} inside a "
-            "lane loop; the exchange needs the whole thread block at one barrier",
+            f"{description} inside a lane loop; the exchange needs the whole "
+            "thread block at one barrier",
+        )
+    if cg.divergent_control_flow_depth > 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{description} inside a branch or loop whose condition may differ "
+            "between threads; the exchange needs every thread at its barrier",
+        )
+    value_block_ids = tensor_dim_block_ids(env, value_val.shape)
+    if any(
+        block_id is not None and flattened_tile_strategy(cg, block_id) is not None
+        for block_id in (*value_block_ids, *consumer_block_ids)
+    ):
+        # A flattened tile is a run of the flat iteration space, not the
+        # per-block tile the positional consumer pairs elements within.
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{description} over a flattened tile (flatten_loops); the exchange "
+            "pairs elements within the unflattened per-block tile",
         )
 
+    value_shape = _get_tile_shape(value_val, env, df.config)
     own_coords = [
         _get_dim_local_coord(cg, value_val, dim, strict=True)
         for dim in range(value_val.ndim)
     ]
-    slot_coords = list(own_coords)
-    for dim, _value_block_id, slot_block_id in rebound:
-        coord = _get_block_local_coord(cg, slot_block_id)
+    read_coords = list(own_coords)
+    for dim, _value_block_id, consumer_block_id in rebound:
+        coord = _get_block_local_coord(cg, consumer_block_id)
         if coord is None:
             raise exc.BackendUnsupported(
                 "cute",
-                f"store re-binds {description} to a block without a thread coordinate",
+                f"{description} to a block without a thread coordinate",
             )
-        slot_coords[dim] = coord
+        read_coords[dim] = coord
+    value_blocks = {
+        env.canonical_block_id(block_id)
+        for size in value_val.shape
+        if (block_id := env.get_block_id(size)) is not None
+    }
+    stage_terms = [_in_tile_predicate(own_coords, value_shape)]
+    for block_id in dict.fromkeys(
+        env.canonical_block_id(block_id)
+        for block_id in consumer_block_ids
+        if block_id is not None
+    ):
+        if block_id in value_blocks:
+            continue
+        coord = _get_block_local_coord(cg, block_id)
+        if coord is not None:
+            stage_terms.append(f"({coord}) == cutlass.Int32(0)")
     numel = 1
     for extent in value_shape:
         numel *= extent
-    dtype_str = env.backend.dtype_str(value_val.dtype)
+    if value_val.dtype is torch.bool:
+        storage = "cutlass.Uint8"
+        staged_value = expr_from_string(
+            "cutlass.Uint8(1) if {value} else cutlass.Uint8(0)", value=value
+        )
+    else:
+        storage = env.backend.dtype_str(value_val.dtype)
+        staged_value = value
     smem_ptr = df.new_var("rebind_smem_ptr")
     smem = df.new_var("rebind_smem")
     staged = df.new_var("rebind_staged")
     reads = df.new_var("rebind_reads")
     result = df.new_var("rebound")
     cg.add_statement(
-        statement_from_string(
-            f"{smem_ptr} = cute.arch.alloc_smem({dtype_str}, {numel})"
-        )
+        statement_from_string(f"{smem_ptr} = cute.arch.alloc_smem({storage}, {numel})")
     )
     cg.add_statement(
         statement_from_string(f"{smem} = cute.make_tensor({smem_ptr}, ({numel},))")
     )
+    cg.add_statement(statement_from_string(f"{staged} = {' and '.join(stage_terms)}"))
     cg.add_statement(
         statement_from_string(
-            f"{staged} = {_in_tile_predicate(own_coords, value_shape)}"
-        )
-    )
-    cg.add_statement(
-        statement_from_string(
-            f"{reads} = {_in_tile_predicate(slot_coords, value_shape)}"
+            f"{reads} = {_in_tile_predicate(read_coords, value_shape)}"
         )
     )
     cg.add_statement(
         statement_from_string(
             f"if {staged}:\n"
             f"    {smem}[{_flat_index_from_coords(own_coords, value_shape)}] = {{value}}",
-            value=value,
+            value=staged_value,
         )
     )
     cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
-    cg.add_statement(
-        statement_from_string(
-            f"{result} = {smem}[{_flat_index_from_coords(slot_coords, value_shape)}]"
-            f" if {reads} else {dtype_str}(0)"
+    read = f"{smem}[{_flat_index_from_coords(read_coords, value_shape)}]"
+    if value_val.dtype is torch.bool:
+        cg.add_statement(
+            statement_from_string(
+                f"{result} = ({read} != cutlass.Uint8(0)) if {reads} "
+                "else cutlass.Boolean(False)"
+            )
         )
-    )
-    # Unconditional: an enclosing device or persistent loop runs the store
+    else:
+        # The element read has the buffer's DSL type only up to signedness
+        # (a Uint8 buffer reads Int8); both branches need the storage type.
+        cg.add_statement(
+            statement_from_string(
+                f"{result} = {storage}({read}) if {reads} else {storage}(0)"
+            )
+        )
+    # Unconditional: an enclosing device or persistent loop runs the consumer
     # again and must not overwrite the buffer before every read of it.
     cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
     return expr_from_string(result)
 
 
 def _in_tile_predicate(coords: Sequence[str], shape: Sequence[int]) -> str:
-    """``coords`` all below their extents (surplus threads of a widened launch
-    sit at or beyond the extent)."""
+    """``coords`` all inside their extents (surplus threads of a widened launch
+    sit at or beyond the extent; a negative coordinate is a lowering bug the
+    buffer must not see either)."""
     return " and ".join(
-        f"({coord}) < cutlass.Int32({extent})"
+        f"({coord}) >= cutlass.Int32(0) and ({coord}) < cutlass.Int32({extent})"
         for coord, extent in zip(coords, shape, strict=True)
     )

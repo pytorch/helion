@@ -108,6 +108,18 @@ def halves_loaded_through_alias(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True)
+def interleaved_loaded(x: torch.Tensor) -> torch.Tensor:
+    """Adjacent pairs of a loaded tile, swapped (re-read, no exchange)."""
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = x[tile_n, tile_d].reshape([tile_n, tile_d.block_size // 2, 2])
+        lo, hi = hl.split(pair)
+        out[tile_n, tile_d] = hl.join(hi, lo).reshape([tile_n, tile_d])
+    return out
+
+
+@helion.kernel(static_shapes=True)
 def halves_loaded_through_nested_alias(x: torch.Tensor) -> torch.Tensor:
     """As ``halves_loaded_through_alias``, with the alias the result of an op
     the host alias analysis does not know, bound in a nested ``if``."""
@@ -122,6 +134,61 @@ def halves_loaded_through_nested_alias(x: torch.Tensor) -> torch.Tensor:
         lo, hi = hl.split(pair.permute(0, 2, 1))
         out[tile_n, tile_d] = hl.join(hi, lo).permute(0, 2, 1).reshape([tile_n, tile_d])
     return out
+
+
+@helion.kernel(static_shapes=True)
+def trailing_pairs(x: torch.Tensor) -> torch.Tensor:
+    """A trailing size-two dim of a loaded 3-d tile, swapped."""
+    m, n, _ = x.size()
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        lo, hi = hl.split(x[tile_m, tile_n, :])
+        out[tile_m, tile_n, :] = hl.join(hi, lo)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def row_pairs_tiled(x: torch.Tensor) -> torch.Tensor:
+    """Adjacent rows of a tile, swapped (the pair dim is the row block's)."""
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = (
+            (x[tile_n, tile_d] * 2.0)
+            .reshape([tile_n.block_size // 2, 2, tile_d])
+            .permute(0, 2, 1)
+        )
+        lo, hi = hl.split(pair)
+        out[tile_n, tile_d] = hl.join(hi, lo).permute(0, 2, 1).reshape([tile_n, tile_d])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def interleaved_3d(x: torch.Tensor) -> torch.Tensor:
+    """Adjacent pairs of the last dim of a 3-d tile, swapped."""
+    a, b, c = x.size()
+    out = torch.empty_like(x)
+    for tile_a, tile_b, tile_c in hl.tile([a, b, c]):
+        pair = (x[tile_a, tile_b, tile_c] * 2.0).reshape(
+            [tile_a, tile_b, tile_c.block_size // 2, 2]
+        )
+        lo, hi = hl.split(pair)
+        out[tile_a, tile_b, tile_c] = hl.join(hi, lo).reshape([tile_a, tile_b, tile_c])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pair_slices(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pair halves of a loaded tile, each stored to a full slice."""
+    n, d = x.size()
+    lo_out = x.new_empty([n, d // 2])
+    hi_out = x.new_empty([n, d // 2])
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = x[tile_n, tile_d].reshape([tile_n, tile_d.block_size // 2, 2])
+        lo, hi = hl.split(pair)
+        lo_out[tile_n, :] = lo
+        hi_out[tile_n, :] = hi
+    return lo_out, hi_out
 
 
 @helion.kernel(static_shapes=True)
@@ -204,8 +271,8 @@ def unit_permuted_pairs(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _swapped_halves(x: torch.Tensor, block: int) -> torch.Tensor:
-    pairs = (x * 2.0).view(x.shape[0], x.shape[1] // block, 2, block // 2)
+def _swapped_halves(x: torch.Tensor, block: int, scale: float = 2.0) -> torch.Tensor:
+    pairs = (x * scale).view(x.shape[0], x.shape[1] // block, 2, block // 2)
     return torch.cat((pairs[:, :, 1:], pairs[:, :, :1]), dim=2).view(x.shape)
 
 
@@ -217,6 +284,19 @@ def _swapped_interleaved(x: torch.Tensor, scale: float = 2.0) -> torch.Tensor:
 def _swapped_transposed_pairs(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return _swapped_interleaved(x.t().contiguous(), scale)
 
+
+# Flattened [n, d] tiles: whole rows, half rows, runs crossing rows (48 and
+# 40 wide rows), a partial last tile, and lane loops of either layout.
+_FLATTENED_LAYOUTS = (
+    {"block_sizes": [2, 64]},
+    {"block_sizes": [4, 32]},
+    {"block_sizes": [4, 32], "num_threads": [1, 32]},
+    {
+        "block_sizes": [4, 32],
+        "num_threads": [1, 32],
+        "cute_lane_layouts": ["strided", "strided"],
+    },
+)
 
 # ``transposed_pairs`` layouts without lane loops.  The old position-keyed
 # permute shuffle returned the wrong pairs for every one of them (and the
@@ -243,6 +323,14 @@ class TestCuteSplitExchange(TestCase):
             exc.BackendUnsupported, "different iteration of an enclosing lane loop"
         ):
             code_and_output(kernel, (self.x,), **config)
+
+    def _assert_flattened_rejected(
+        self, kernel: object, x: torch.Tensor, **config: object
+    ) -> None:
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "keeps that block's coordinate only modulo"
+        ):
+            code_and_output(kernel, (x,), flatten_loops=[True], **config)
 
     def test_halves_blocked_lanes(self) -> None:
         # ``tid * EPT + lane``: the partner ``half`` columns away shares the
@@ -390,6 +478,166 @@ class TestCuteSplitExchange(TestCase):
                     block_sizes=block_sizes,
                     cute_lane_layouts=["blocked", "strided"],
                 )
+
+    def test_flattened_tiles_re_read(self) -> None:
+        # A flattened tile has no per-block tile base: the fold moves the
+        # flat position and decodes the partner's indices from it.  The run
+        # crosses rows when the column block does not divide the row, but a
+        # pair group that divides the row stays in it: adjacent pairs of the
+        # 48 and 40 wide rows are the unflattened tile's.  Halves of a 64 or
+        # 32 block there would pair across rows and are refused.
+        for shape in ([128, 64], [130, 48], [65, 40]):
+            x = torch.randn(shape, device=DEVICE)
+            for layout in _FLATTENED_LAYOUTS:
+                block = layout["block_sizes"][1]
+                halves = None if shape[1] % block else _swapped_halves(x, block, 1.0)
+                for kernel, expected in (
+                    (interleaved_loaded, _swapped_interleaved(x, 1.0)),
+                    (halves_loaded, halves),
+                ):
+                    with self.subTest(
+                        shape=shape, kernel=kernel.fn.__name__, layout=layout
+                    ):
+                        if expected is None:
+                            self._assert_flattened_rejected(kernel, x, **layout)
+                            continue
+                        code, result = code_and_output(
+                            kernel, (x,), flatten_loops=[True], **layout
+                        )
+                        self.assertNotIn("split_smem", code)
+                        torch.testing.assert_close(result, expected)
+
+    def test_flattened_tiles_exchange(self) -> None:
+        # The exchange keys a flattened tile by the same coordinates.  Under
+        # blocked lanes the interleaved partner is the next lane iteration.
+        for shape in ([130, 64], [130, 48]):
+            x = torch.randn(shape, device=DEVICE)
+            for layout in _FLATTENED_LAYOUTS:
+                block = layout["block_sizes"][1]
+                halves = None if shape[1] % block else _swapped_halves(x, block)
+                for kernel, expected in (
+                    (halves_tiled, halves),
+                    (interleaved_tiled, _swapped_interleaved(x)),
+                ):
+                    with self.subTest(
+                        shape=shape, kernel=kernel.fn.__name__, layout=layout
+                    ):
+                        if expected is None:
+                            self._assert_flattened_rejected(kernel, x, **layout)
+                            continue
+                        if (
+                            kernel is interleaved_tiled
+                            and layout == _FLATTENED_LAYOUTS[2]
+                        ):
+                            self._assert_rejected(
+                                kernel, flatten_loops=[True], **layout
+                            )
+                            continue
+                        code, result = code_and_output(
+                            kernel, (x,), flatten_loops=[True], **layout
+                        )
+                        self.assertIn("split_smem", code)
+                        torch.testing.assert_close(result, expected)
+
+    def test_flattened_tiles_follow_the_loop_order(self) -> None:
+        # A flattened tile's coordinates are the digits of its run in
+        # iteration order.  When the blocks iterated faster than the pair's
+        # block span their dims, the run is a rectangle along it and a
+        # reordered loop gives the same pairs as the unflattened tile.  Else
+        # the digits count across rows: 2 x 4 elements of 64 rows iterated
+        # rows fastest are one column, whose column pairs would be rows 0 and
+        # 2.  That is refused.
+        x = torch.randn([64, 32], device=DEVICE)
+        for kernel in (
+            halves_loaded,
+            interleaved_loaded,
+            halves_tiled,
+            interleaved_tiled,
+            row_pairs_tiled,
+        ):
+            for block_sizes, loop_order in (
+                ([64, 8], [1, 0]),
+                ([4, 32], [0, 1]),
+                ([2, 4], [1, 0]),
+                ([32, 8], [1, 0]),
+                ([4, 16], [0, 1]),
+            ):
+                with self.subTest(
+                    kernel=kernel.fn.__name__, block_sizes=block_sizes, order=loop_order
+                ):
+                    config = {"block_sizes": block_sizes, "loop_orders": [loop_order]}
+                    fastest = loop_order[-1]
+                    pair = 0 if kernel is row_pairs_tiled else 1
+                    if fastest != pair and block_sizes[fastest] != x.size(fastest):
+                        self._assert_flattened_rejected(kernel, x, **config)
+                        continue
+                    _code, expected = code_and_output(
+                        kernel, (x,), flatten_loops=[False], **config
+                    )
+                    _code, result = code_and_output(
+                        kernel, (x,), flatten_loops=[True], **config
+                    )
+                    torch.testing.assert_close(result, expected)
+
+    def test_flattened_3d_loop_orders(self) -> None:
+        # The blocks iterated faster than the pair's block must hold as many
+        # elements as their dims, not each span its own: block sizes 8 and 4
+        # over dims of 4 and 8 hold whole 32-element planes of the last dim.
+        # Iterated fastest, the last dim's pairs need only divide its 6.
+        x = torch.randn([4, 8, 6], device=DEVICE)
+        expected = (x * 2.0).view(4, 8, 3, 2).flip(-1).view(x.shape)
+        for loop_order, accepted in (
+            ([0, 1, 2], True),
+            ([0, 2, 1], False),
+            ([1, 0, 2], True),
+            ([1, 2, 0], False),
+            ([2, 0, 1], True),
+            ([2, 1, 0], True),
+        ):
+            with self.subTest(order=loop_order):
+                config = {"block_sizes": [8, 4, 2], "loop_orders": [loop_order]}
+                if not accepted:
+                    self._assert_flattened_rejected(interleaved_3d, x, **config)
+                    continue
+                _code, result = code_and_output(
+                    interleaved_3d, (x,), flatten_loops=[True], **config
+                )
+                torch.testing.assert_close(result, expected)
+
+    def test_flattened_trailing_pairs(self) -> None:
+        for shape in ([4, 8, 2], [5, 7, 2]):
+            x = torch.randn(shape, device=DEVICE)
+            for block_sizes in ([2, 8], [4, 4]):
+                with self.subTest(shape=shape, block_sizes=block_sizes):
+                    code, result = code_and_output(
+                        trailing_pairs,
+                        (x,),
+                        block_sizes=block_sizes,
+                        flatten_loops=[True],
+                    )
+                    self.assertNotIn("split_smem", code)
+                    torch.testing.assert_close(result, x.flip(-1))
+
+    def test_sliced_store_of_a_view_fills_the_slice(self) -> None:
+        # A view dim stored to a full slice is addressed by its coordinate
+        # from the slice's start, unmasked.  Only a view dim as wide as the
+        # slice writes it once, so the others are refused: the 4 wide halves
+        # of an 8 wide block would leave most of the 16 wide slice unwritten
+        # and the 32 wide halves of a 64 wide block would write past it
+        # (Triton fails the shape check).
+        x = torch.randn([64, 32], device=DEVICE)
+        _code, (lo, hi) = code_and_output(pair_slices, (x,), block_sizes=[2, 32])
+        torch.testing.assert_close(lo, x[:, 0::2])
+        torch.testing.assert_close(hi, x[:, 1::2])
+        for block_sizes, extent in (([2, 8], 4), ([2, 64], 32)):
+            with (
+                self.subTest(block_sizes=block_sizes),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    rf"view dim of {extent} elements fills a slice of 16",
+                ),
+            ):
+                code_and_output(pair_slices, (x,), block_sizes=block_sizes)
 
     def test_exchange_over_smem_budget_rejected(self) -> None:
         # A 64 x 256 fp32 tile needs 64 KiB of static shared memory.

@@ -71,8 +71,45 @@ class _PrefixClassifier:
         return self.prefix, tuple(values)
 
 
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    config=helion.Config(
+        block_sizes=[4, 64], num_threads=[4, 64], cute_vector_widths=[1, 1]
+    ),
+)
+def _flagged_first_column_update(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if flags[tile0.begin] > 0:
+            first = x[tile0, tile1.begin]
+            x[tile0, tile1] = x[tile0, tile1] + first[:, None] + 1.0
+    return x
+
+
 @onlyBackends(["cute"])
 class TestCuteRuntimeInputSpecialization(unittest.TestCase):
+    @skipIfRefEager("the disjointness fact keys compiled bound kernels")
+    def test_post_bind_alias_change_never_reuses_the_disjointness_proof(
+        self,
+    ) -> None:
+        # The branch is CTA-uniform only while ``flags`` and the in-place
+        # ``x`` are separate storages.  A later call whose aliasing differs
+        # reaches another bound kernel through the cache key, where the proof
+        # fails and the branch's race is refused; the first bound kernel and
+        # its proof serve only launches with the same storage overlaps.
+        x = torch.randn(8, 256, device=DEVICE)
+        flags = torch.ones(8, device=DEVICE)
+        separate = _flagged_first_column_update.bind((x, flags))
+        _flagged_first_column_update(x, flags)
+        aliased_x = torch.randn(8, 256, device=DEVICE)
+        aliased_flags = aliased_x.view(-1)[:8]
+        aliased = _flagged_first_column_update.bind((aliased_x, aliased_flags))
+        self.assertIsNot(aliased, separate)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "inside a branch"):
+            _flagged_first_column_update(aliased_x, aliased_flags)
+        again = (torch.randn(8, 256, device=DEVICE), torch.ones(8, device=DEVICE))
+        self.assertIs(_flagged_first_column_update.bind(again), separate)
+
     def test_conflicting_tcgen05_analysis_keys_still_publish_all_guards(self) -> None:
         first = sympy.Symbol("first")
         second = sympy.Symbol("second")

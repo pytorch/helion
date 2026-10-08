@@ -8440,6 +8440,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         self._mask_var: str | None = self.new_var("mask", dce=True)
         self._offsets_var = self.new_var("offsets", dce=True)
         self._grid_origin_vars: dict[int, str] = {}
+        # The trip count each block's index is decoded from the flat offset
+        # with, recorded by the codegen.
+        self.trip_counts: dict[int, sympy.Expr | str] = {}
 
         key = (*self.block_ids,)
         assert key not in fn.block_size_var_cache
@@ -8666,6 +8669,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 if cute_scalar_tile
                 else self._range_trip_count(begin, end, step)
             )
+            self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
@@ -11088,6 +11092,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             )
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
+            self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
@@ -11182,6 +11187,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
+            self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:

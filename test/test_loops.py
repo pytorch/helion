@@ -2220,11 +2220,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn(_thread_barrier(), code)
         torch.testing.assert_close(result, expected)
 
-    @skipIfNotTriton(
-        "Pallas/JAX emits no thread barrier; on CuTe `flag` may alias `x`, "
-        "which the kernel writes in place, so `if flag[0] > 0` cannot be "
-        "proven CTA-uniform and the barrier the store/reload pair needs "
-        "cannot be placed inside it (BackendUnsupported)"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "intra-loop barriers are Triton and CuTe codegen (Pallas/JAX emits no "
+        "thread barrier)",
     )
     def test_intra_loop_barrier_crosses_if_subgraph(self):
         @helion.kernel(autotune_effort="none")
@@ -2253,7 +2252,21 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=2,
         )
-        self.assertIn("tl.debug_barrier()", code)
+        if _get_backend() == "cute":
+            # ``flag`` and ``x`` are separate storages in this launch (the
+            # bound kernel's cache-keyed disjointness fact), so nothing writes
+            # the flag and the branch is CTA-uniform: its store/reload pair
+            # is ordered by a block-wide barrier inside it.
+            self.assertTrue(
+                any(
+                    "cute.arch.sync_threads()" in ast.unparse(node.body)
+                    for node in ast.walk(ast.parse(code))
+                    if isinstance(node, ast.If)
+                ),
+                code,
+            )
+        else:
+            self.assertIn("tl.debug_barrier()", code)
         torch.testing.assert_close(result, expected)
 
 
