@@ -534,6 +534,14 @@ def _get_block_local_coord(cg: GenerateAST, block_id: int) -> str | None:
             thread_axis = loop_state.block_thread_axes.get(block_id)
             if thread_axis is not None:
                 return _grid_local_coord_expr(cg, block_id, thread_axis)
+            strategy = loop_state.strategy
+            if (
+                isinstance(strategy, PerThreadFlattenedTileStrategy)
+                and (tile_base := strategy.cute_tile_base_expr(block_id)) is not None
+            ):
+                # One thread walks the whole tile in its lane loop, so no
+                # thread axis records the block.
+                return f"(({strategy.index_var(block_id)}) - ({tile_base}))"
         try:
             offset_var = cg.offset_var(block_id)
         except NotImplementedError:

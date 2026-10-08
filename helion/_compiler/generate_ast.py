@@ -509,6 +509,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def index_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
 
+    def rolled_reduction_index_var(self, size: object) -> str | None:
+        """Index of the rolled reduction loop over the dim of extent ``size``.
+
+        A value over a reduction dim holds every position of the dim.  Where
+        the roller moved it into the reduction loop, an iteration holds one
+        chunk of them, at the loop's index (``roffset + local``): neither the
+        full-extent range nor the chunk-local coordinate.  ``None`` unless
+        ``size`` is a reduction dim whose rolled loop is active.
+        """
+        env = CompileEnvironment.current()
+        block_id = env.resolve_block_id(size)
+        if (
+            block_id is None
+            or not env.block_sizes[block_id].reduction
+            or env.canonical_block_id(block_id) != block_id
+        ):
+            return None
+        loops = self.active_device_loops.get(block_id)
+        if not loops or not isinstance(loops[-1], DeviceLoopState):
+            # A persistent reduction covers the whole dim at once.
+            return None
+        return loops[-1].strategy.index_var(block_id)
+
     def mask_var(self, block_idx: int) -> str | None:
         if loops := self.active_device_loops[block_idx]:
             return loops[-1].strategy.mask_var(block_idx)
@@ -1558,17 +1581,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # it is referenced in the already-emitted setup statements, so scan
         # those to avoid handing a synthetic arange an axis the grid already
         # uses (which would mis-filter most lanes via the grid's bounds mask).
+        # The per-thread index definitions include a vec lane loop's base
+        # (``(lane * NT + thread_idx[0]) * V`` with one thread), which sits in
+        # the pre-built lane body rather than the setup statements.
         statement_groups: list[list[ast.AST]] = list(self.statements_stack)
         grid_state = self.current_grid_state
         if grid_state is not None:
-            statement_groups.extend(
-                (grid_state.outer_prefix, grid_state.lane_setup_statements)
-            )
+            statement_groups.append(grid_state.lane_index_definitions()[0])
         for loops in self.active_device_loops.values():
             for loop_state in loops:
-                outer_prefix = getattr(loop_state, "outer_prefix", None)
-                if isinstance(outer_prefix, list):
-                    statement_groups.append(outer_prefix)
+                statement_groups.append(loop_state.lane_index_definitions()[0])
         for statements in statement_groups:
             for stmt in statements:
                 axes.update(

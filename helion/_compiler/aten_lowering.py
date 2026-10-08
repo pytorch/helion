@@ -561,6 +561,19 @@ iota_lowering = register_lowering(torch.ops.prims.iota.default)
 arange_default_lowering = register_lowering(torch.ops.aten.arange.default)
 
 
+def rolled_reduction_iota_index(ctx: LoweringContext, node: Node) -> str | None:
+    """The rolled reduction loop's index, for an iota over its reduction dim.
+
+    ``torch.tril``'s column iota of an ``x[tile, :]`` row, or
+    ``hl.arange(row.size(1))``, spans the row's reduction dim, so inside the
+    rolled reduction loop it holds the positions of the current chunk.
+    """
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or val.ndim != 1:
+        return None
+    return ctx.cg.rolled_reduction_index_var(val.shape[0])
+
+
 def _node_dtype_kwarg(node: Node) -> torch.dtype | None:
     dtype = node.kwargs.get("dtype")
     return dtype if isinstance(dtype, torch.dtype) else None

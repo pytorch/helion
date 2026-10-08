@@ -500,6 +500,36 @@ def test_scan_sharing_a_lane_loop_with_a_reduction_keeps_serial_fallback(
     assert re.search(r"cute\.arch\.warp_reduction_(sum|max)\(", body)
 
 
+def _scan_of_centered_row(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for i in hl.tile(x.size(0)):
+        row = x[i, :]
+        out[i, :] = hl.cumsum(row - row.sum(-1, keepdim=True), dim=1)
+    return out
+
+
+def test_computed_scan_sharing_a_lane_reduction_is_refused() -> None:
+    # The scanned value is computed, so the serial fallback has no load to
+    # re-read; the refusal names the reduction that kept the register scan
+    # out, and putting the row on threads (no lane loop) lowers it.  The
+    # computed-fragment lowering, which stages the row in shared memory, is
+    # disabled to reach the register scan.
+    with patch(
+        "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+        return_value=False,
+    ):
+        with pytest.raises(
+            helion.exc.BackendUnsupported,
+            match=r"computed tile.*also hosts a reduction over a lane-looped block",
+        ):
+            _codegen(_scan_of_centered_row, _rows())
+        body = _codegen(
+            _scan_of_centered_row, _rows(), block_sizes=[1], num_threads=[0, 128]
+        )
+    assert "synthetic_lane" not in body
+    assert "cute.arch.shuffle_sync_up(" in body
+
+
 def test_scan_with_reduction_on_a_thread_split_axis_stays_parallel() -> None:
     # One row per block on 128 threads: no lane loop, so the reduction is a
     # plain cross-thread combine and the scan keeps the warp-shuffle path.
@@ -556,9 +586,7 @@ def test_reverse_tuple_fallback_walks_positions_descending() -> None:
     assert body.count(_SERIAL_RESCAN) == 1
     assert "scan_index = cutlass.Int32(31) - scan_i" in body
     assert "scan_include = scan_index >= scan_out_pos" in body
-    assert re.search(
-        r"scan_row = cutlass\.Int32\(.*\) \+ scan_index$", body, re.MULTILINE
-    )
+    assert "x[tile_offset_0 + scan_index, indices_1]" in body
     # The forward fallback is unchanged: ascending positions, no remapping.
     body = _codegen(
         _segment_scan,
@@ -577,10 +605,7 @@ def test_reverse_scalar_fallback_walks_positions_descending() -> None:
     assert body.count(_SERIAL_RESCAN) == 1
     assert "scan_index = cutlass.Int32(127) - scan_i" in body
     assert "scan_include = scan_index >= scan_out_pos" in body
-    assert re.search(
-        r"scan_row = cutlass\.Int32\(.*\) \+ scan_index$", body, re.MULTILINE
-    )
-    assert re.search(r"scan_value = .*x\[indices_0, scan_row\]", body)
+    assert re.search(r"scan_value = .*x\[indices_0, 0 \+ scan_index\]", body)
 
 
 def test_multi_tile_flat_fallback_scans_block_local_rows() -> None:
@@ -596,8 +621,7 @@ def test_multi_tile_flat_fallback_scans_block_local_rows() -> None:
     assert body.count(_SERIAL_RESCAN) == 1
     assert "for scan_i in range(cutlass.Int32(0), cutlass.Int32(128)" in body
     assert "scan_out_pos = cutlass.Int32(indices_0 - pid_flat * _BLOCK_SIZE_0)" in body
-    assert "scan_row = cutlass.Int32(pid_flat * _BLOCK_SIZE_0) + scan_i" in body
-    assert "x[scan_row]" in body
+    assert "x[pid_flat * _BLOCK_SIZE_0 + scan_i]" in body
     assert "x[scan_i]" not in body
 
 
@@ -650,7 +674,7 @@ def test_grid_vectorised_reverse_scan_keeps_serial_fallback() -> None:
     assert "scan_carry" not in body
     # The fallback rescans this tile's block-local rows, descending.
     assert "scan_out_pos = cutlass.Int32(indices_0 - pid_flat * _BLOCK_SIZE_0)" in body
-    assert "scan_row = cutlass.Int32(pid_flat * _BLOCK_SIZE_0) + scan_index" in body
+    assert "x[pid_flat * _BLOCK_SIZE_0 + scan_index]" in body
     # The forward scan keeps the pre-built vector partition (the vector-load
     # hoist then turns the plain ``range`` into a constexpr loop).
     body = _codegen(_flat_cumsum, x, **config)

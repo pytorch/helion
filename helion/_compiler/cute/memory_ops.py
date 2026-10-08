@@ -15,6 +15,7 @@ import functools
 import itertools
 import logging
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -93,6 +94,8 @@ from .indexing import is_cute_direct_iota_index
 from .indexing import is_cute_unit_stride_iota_index
 from .indexing import match_cute_shifted_tile_index
 from .iota_utils import cute_free_arange_lanes
+from .tile_ops import cute_masked_block_end
+from .tile_ops import cute_tile_begin_expr
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -2485,35 +2488,138 @@ def _cute_expand_broadcast_dim(value_node: torch.fx.Node) -> int | None:
 
 
 def _cute_block_tile_begin_expr(state: CodegenState, block_id: int) -> str | None:
-    """Return the *per-block* tile start for a tile mapped onto a thread axis.
+    """Return the *per-block* tile start of ``block_id``, uniform over the tile.
 
-    In the CuTe SIMT model a tile dimension is spread across a thread axis, so
-    the strategy's ``index_var`` is the per-*thread* global index
-    (``pid * block + thread_idx[axis]``). Subtracting the thread-local coordinate
-    yields the per-*block* tile base (``pid * block``), shared by every thread in
-    the tile — the correct anchor for a broadcast lane loop. Returns ``None`` when
-    the block id has no active thread axis in this scope.
+    In the CuTe SIMT model the strategy's ``index_var`` is this thread's (and
+    lane's) element of the tile, so the tile start is the anchor a broadcast
+    lane loop sweeps from, whether the tile is spread over a thread axis or
+    walked by one thread's lane loop (``num_threads=[1]``).  Returns ``None``
+    when the block is not active here, and for a flattened multi-dim tile,
+    a run of the flat iteration space with no per-dim tile start.
     """
-    from .cute_reshape import _grid_local_coord_expr
-    from .cute_reshape import _per_thread_nd_tile_offset
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
 
     loops = state.codegen.active_device_loops.get(block_id)
     if not loops:
         return None
-    loop_state = loops[-1]
-    thread_axis = loop_state.block_thread_axes.get(block_id)
-    global_index = loop_state.strategy.index_var(block_id)
-    if thread_axis is None or global_index is None:
+    strategy = loops[-1].strategy
+    if (
+        isinstance(strategy, PerThreadFlattenedTileStrategy)
+        and len(strategy.block_ids) > 1
+    ):
         return None
-    tile_offset = _per_thread_nd_tile_offset(loop_state.strategy, block_id)
-    if tile_offset is not None:
-        return tile_offset
-    local_coord = _grid_local_coord_expr(state.codegen, block_id, thread_axis)
-    return state.codegen.lift(
-        expr_from_string(f"({global_index}) - ({local_coord})"),
-        dce=True,
-        prefix="tile_begin",
-    ).id
+    return cute_tile_begin_expr(state.codegen, block_id)
+
+
+def _cute_affine_arange(node: object) -> tuple[int, int] | None:
+    """``(start, step)`` of an index that holds ``start + step * j`` at ``j``.
+
+    An ``hl.arange`` (``prims.iota``) and integer ``+``, ``-`` and ``*`` of it
+    (``hl.arange(4) * 2 + 3``, ``3 - hl.arange(4)``), with static constants.
+    """
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if node.target is torch.ops.prims.iota.default:
+        start = node.kwargs.get("start", 0)
+        step = node.kwargs.get("step", 1)
+        if isinstance(start, int) and isinstance(step, int):
+            return start, step
+        return None
+    if (
+        node.target
+        not in (
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.sub.Tensor,
+            torch.ops.aten.mul.Tensor,
+        )
+        or node.kwargs.get("alpha", 1) != 1
+    ):
+        return None
+    lhs, rhs = node.args
+    if isinstance(rhs, int) and (form := _cute_affine_arange(lhs)) is not None:
+        start, step = form
+        if node.target is torch.ops.aten.add.Tensor:
+            return start + rhs, step
+        if node.target is torch.ops.aten.sub.Tensor:
+            return start - rhs, step
+        return start * rhs, step * rhs
+    if isinstance(lhs, int) and (form := _cute_affine_arange(rhs)) is not None:
+        start, step = form
+        if node.target is torch.ops.aten.add.Tensor:
+            return lhs + start, step
+        if node.target is torch.ops.aten.sub.Tensor:
+            return lhs - start, -step
+        return lhs * start, lhs * step
+    return None
+
+
+def _cute_topk_store_index_exprs(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    index_exprs: list[str],
+    value_node: torch.fx.Node,
+    lane_expr: str,
+) -> tuple[list[str], str | None]:
+    """Address the stored ``torch.topk`` output at the lane that holds it.
+
+    The rank sort leaves output ``j`` on the lane at position ``j`` of the
+    sorted input dim (``lane_expr``), not on the output dim's own lane.  An
+    affine ``hl.arange`` index of the output dim (``hl.arange(4) * 2 + 3``)
+    holds ``start + step * j`` at ``j``, which is the address, bounded by the
+    tensor dim (returned) as the arange's own lane mask bounds it.  Otherwise
+    the store's last index is a function of one active block index variable
+    (``2 + indices_3`` for ``out[t, 2:6]``), which takes ``lane_expr`` rather
+    than the whole index being replaced: a slice's start and step are kept.
+    """
+    env = CompileEnvironment.current()
+    k = value_node.meta["val"].shape[-1]
+    assert state.fx_node is not None
+    store_index = state.fx_node.args[1]
+    assert isinstance(store_index, (list, tuple))
+    if (
+        len(store_index) == len(index_exprs)
+        and isinstance(arange := store_index[-1], torch.fx.Node)
+        and (form := _cute_affine_arange(arange)) is not None
+        and env.known_equal(arange.meta["val"].shape[0], k)
+    ):
+        start, step = form
+        address = (
+            f"({lane_expr})"
+            if (start, step) == (0, 1)
+            else f"{start} + {step} * ({lane_expr})"
+        )
+        size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 1)
+        return [*index_exprs[:-1], address], (
+            f"({address}) >= 0 and ({address}) < {size}"
+        )
+    codegen = state.codegen
+    block_ids = [*codegen.active_device_loops]
+    if codegen.current_grid_state is not None:
+        block_ids.extend(codegen.current_grid_state.block_ids)
+    index_vars = {
+        index_var
+        for block_id in block_ids
+        if (index_var := _cute_active_index_var(state, block_id)) is not None
+    }
+    patterns = [
+        pattern
+        for index_var in sorted(index_vars)
+        if (pattern := re.compile(rf"\b{re.escape(index_var)}\b")).search(
+            index_exprs[-1]
+        )
+    ]
+    if len(patterns) == 1:
+        index = patterns[0].sub(f"({lane_expr})", index_exprs[-1])
+        return [*index_exprs[:-1], index], None
+    if not patterns and env.known_equal(k, 1):
+        # One output: the store's own index addresses it; the ``lane < k``
+        # store mask leaves it to the first lane.
+        return index_exprs, None
+    raise exc.BackendUnsupported(
+        "cute",
+        "a store of torch.topk output whose last index is neither an affine "
+        "hl.arange nor follows one block index",
+    )
 
 
 def _cute_unsqueeze_expand_load_source(
@@ -2713,10 +2819,8 @@ def _codegen_cute_store_expand_broadcast_tile(
 
     # Replace the broadcast position's coordinate (currently the reused tile's
     # per-thread global index) with ``block_begin + lane`` so the lane loop sweeps
-    # the full tile block, identically for every thread in the tile. ``block_begin``
-    # is the *per-block* tile start (``global_index - local_coord``); in the CuTe
-    # SIMT model the tile is mapped onto a thread axis, so the bare offset var
-    # still carries the per-thread ``thread_idx`` lane and must be stripped.
+    # the full tile block, identically for every element of the tile.
+    # ``block_begin`` is the *per-block* tile start, not this element's index.
     block_begin = _cute_block_tile_begin_expr(state, broadcast_block_id)
     if block_begin is None:
         return None
@@ -2748,6 +2852,14 @@ def _codegen_cute_store_expand_broadcast_tile(
     )
     dim_size = _cute_tensor_dim_size_expr(state, tensor, broadcast_dim)
     lane_bound = f"({broadcast_coord}) < {dim_size}"
+    # A partial tile holds fewer indices than its block: lanes past the tile's
+    # end are no element of ``tile.index`` (an output dim wider than the tile
+    # range would take them).
+    block_end = cute_masked_block_end(
+        state.codegen, broadcast_block_id, "a broadcast tile store"
+    )
+    if block_end is not None:
+        lane_bound = f"{lane_bound} and ({broadcast_coord}) < ({block_end})"
     mask_expr = lane_bound if mask_expr is None else f"({mask_expr}) and {lane_bound}"
 
     from ..ast_extension import create
@@ -3325,6 +3437,7 @@ def _(state: CodegenState) -> ast.AST:
     value_readdressed = mask_subscript != list(subscript)
     topk_lane_expr: object | None = None
     topk_k: object | None = None
+    topk_bound: str | None = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         value_node = state.fx_node.args[2]
         if (
@@ -3336,7 +3449,10 @@ def _(state: CodegenState) -> ast.AST:
             topk_lane_expr = value_node.args[0].meta.get("cute_topk_lane_expr")
             topk_k = value_node.args[0].meta.get("cute_topk_k")
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
-        index_exprs[-1] = topk_lane_expr
+        assert isinstance(value_node, torch.fx.Node)
+        index_exprs, topk_bound = _cute_topk_store_index_exprs(
+            state, tensor, index_exprs, value_node, topk_lane_expr
+        )
     store_uses_pointer = "None" not in index_exprs
     mask_expr = _cute_combined_mask(
         state, mask_subscript, extra_mask, tensor=tensor, for_store=True
@@ -3518,6 +3634,8 @@ def _(state: CodegenState) -> ast.AST:
     _cute_tag_access_regions(assign_expr, tensor_name, regions)
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
         topk_mask = f"({topk_lane_expr}) < {topk_k}"
+        if topk_bound is not None:
+            topk_mask = f"{topk_mask} and {topk_bound}"
         mask_expr = topk_mask if mask_expr is None else f"({mask_expr}) and {topk_mask}"
     if mask_expr is None:
         return assign_expr
@@ -6195,17 +6313,8 @@ def _(state: CodegenState) -> object:
     if state.fx_node is not None and _cute_load_feeds_sort_or_scan(state.fx_node):
         from .indexing import CuteSortableLoad
 
-        tensor_dim = 0
-        sort_index_pos = -1
-        for idx in subscript:
-            if idx is None:
-                continue
-            if tensor_dim == tensor.ndim - 1:
-                sort_index_pos = tensor_dim
-                break
-            tensor_dim += 1
-        if sort_index_pos < 0:
-            raise exc.BackendUnsupported("cute", "sort/topk input rank")
+        extra_mask_value = state.proxy_arg(2)
+        assert isinstance(extra_mask_value, (torch.Tensor, type(None)))
         sortable_load = CuteSortableLoad(
             expr=expr_from_string(
                 load_expr
@@ -6213,9 +6322,11 @@ def _(state: CodegenState) -> object:
                 else f"({load_expr} if {mask_expr} else {_cute_scalar_storage_dtype(tensor.dtype)}(0))",
                 **load_placeholders,
             ),
+            tensor=tensor,
+            value=state.fx_node.meta["val"],
+            extra_mask=extra_mask_value,
             tensor_name=tensor_name,
             index_exprs=tuple(index_exprs),
-            sort_index_pos=sort_index_pos,
             mask_expr=mask_expr,
             dtype=tensor.dtype,
         )

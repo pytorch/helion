@@ -455,6 +455,37 @@ class ReductionRoller:
 
         return any(is_matmul_with_rdim(node) for node in graph.nodes)
 
+    def has_gather_along_rdim(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph gathers along the rdim.
+
+        ``torch.gather(row, dim, index)`` reads ``row`` at any position of
+        ``dim``, which one chunk of the rdim per loop iteration does not hold
+        (Triton's ``tl.gather`` would pick positions within the chunk).
+        """
+        env = CompileEnvironment.current()
+        for node in graph.nodes:
+            if node.target is not torch.ops.aten.gather.default:
+                continue
+            input_node, dim = node.args[0], node.args[1]
+            assert isinstance(input_node, torch.fx.Node)
+            assert isinstance(dim, int)
+            val = input_node.meta["val"]
+            assert isinstance(val, torch.Tensor)
+            if env.get_block_id(val.size(dim)) == self.rdim.block_id:
+                return True
+        return False
+
+    def has_pinned_rdim(self) -> bool:
+        """Check if a guard pinned the rdim's symbol to a constant.
+
+        A reshape to a literal size (``x[t, :].reshape(t, 1, 64)``) or
+        hl.specialize does: the rdim's dims then carry a plain int that
+        ``get_block_id`` cannot tell from other dims of that size, so the
+        roller would move only the nodes whose dims still name the symbol (a
+        store) into the loop and leave the loads they read outside it.
+        """
+        return not self.rdim.var._sympy_().free_symbols
+
     def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph reduces over the rdim along a non-tile axis.
 

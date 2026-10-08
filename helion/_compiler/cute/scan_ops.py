@@ -63,6 +63,7 @@ import ast
 import contextlib
 import dataclasses
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -79,6 +80,7 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import DeviceLoopState
+    from .indexing import CuteSortableLoad
 
 
 @_decorators.codegen(_associative_scan, "cute")
@@ -125,17 +127,19 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     parallel = _cute_try_parallel_scan(
         state, helper_graph_info, input_nodes, dim, reverse
     )
-    if parallel is not None:
+    if not isinstance(parallel, str):
         return parallel if is_tuple_input else parallel[0]
 
     if is_tuple_input:
-        return _cute_codegen_tuple_scan(state, combine_graph_id, dim, reverse)
+        return _cute_codegen_tuple_scan(
+            state, combine_graph_id, dim, reverse, parallel_declined=parallel
+        )
 
     input_node = fx_node.args[1]
     input_tensor = fx_node.meta["val"]
     if dim < 0:
         dim += input_tensor.ndim
-    sorted_source: tuple[CuteSortableLoad, bool] | None = None
+    sorted_source: tuple[CuteSortableLoad, bool, CuteSerialAxis] | None = None
     if (
         isinstance(input_node, Node)
         and input_node.target is operator.getitem
@@ -146,7 +150,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         load = sort_node.meta.get("cute_sort_load")
         descending = sort_node.meta.get("cute_sort_descending")
         if isinstance(load, CuteSortableLoad) and isinstance(descending, bool):
-            sorted_source = (load, descending)
+            sorted_source = (load, descending, sort_node.meta["cute_sort_axis"])
     if sorted_source is None or dim != input_tensor.ndim - 1:
         # The dim-agnostic serial scan folds the combine graph over the tile's
         # block-local rows and handles tile offsets and partial-tile masks, so
@@ -155,20 +159,22 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         # Only a scan over ``torch.sort`` output keeps the dedicated rescan
         # below, whose values come from the rank machinery rather than a load.
         (result,) = _cute_codegen_serial_scan(
-            state, helper_graph_info, [input_node], dim, reverse
+            state,
+            helper_graph_info,
+            [input_node],
+            dim,
+            reverse,
+            parallel_declined=parallel,
         )
         return result
 
     op = _scan_combine_operator(helper_graph_info)
     if op not in ("add", "max", "min", "mul"):
         raise exc.BackendUnsupported("cute", "associative_scan combine function")
-    load, descending = sorted_source
+    load, descending, axis = sorted_source
+    n_hint = axis.extent
 
     env = CompileEnvironment.current()
-    n = input_tensor.shape[-1]
-    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
-    if not isinstance(n_hint, int):
-        raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
 
     dtype_str = env.backend.dtype_str(input_tensor.dtype)
     index_dtype = env.backend.dtype_str(env.index_dtype)
@@ -180,9 +186,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     value = state.device_function.new_var("scan_value")
 
     state.codegen.add_statement(
-        statement_from_string(
-            f"{out_pos} = {index_dtype}({load.index_exprs[load.sort_index_pos]})"
-        )
+        statement_from_string(f"{out_pos} = {index_dtype}({axis.position})")
     )
     identity = "1" if op == "mul" else "0"
     state.codegen.add_statement(
@@ -204,9 +208,9 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     else:
         raise AssertionError(op)
     value_lines = _cute_sorted_value_lines(
-        state, load, descending, position, value, n_hint
+        state, load, axis, descending, position, value
     )
-    include_expr = f"{position} >= {out_pos}" if reverse else f"{position} <= {out_pos}"
+    include_expr = _cute_scan_include_expr(axis, position, out_pos, reverse)
     state.codegen.add_statement(
         statement_from_string(
             "\n".join(
@@ -222,6 +226,21 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         )
     )
     return expr_from_string(acc)
+
+
+def _cute_scan_include_expr(
+    axis: CuteSerialAxis, position: str, out_pos: str, reverse: bool
+) -> str:
+    """Whether the scan at ``out_pos`` folds in ``position``.
+
+    A reverse scan folds the positions after its own, which run past the
+    tile's last element on a masked block; those hold no element (a padded
+    zero would still fold into a product or a max).
+    """
+    include = f"{position} >= {out_pos}" if reverse else f"{position} <= {out_pos}"
+    if reverse and (valid := axis.valid(position)) is not None:
+        return f"({include}) and ({valid})"
+    return include
 
 
 def _cute_serial_scan_position(
@@ -281,10 +300,11 @@ def _cute_strip_mask_term(mask_expr: str, scan_mask_var: str | None) -> str | No
 
     The recovered load's mask is built per-lane and combines one boolean per
     indexed dimension (e.g. ``(mask_0) and (mask_1)``).  When re-loading at a
-    different scan position the scan-dim term is replaced by an explicit
-    ``scan_row < size`` check, so here we remove the original scan-dim mask
-    var and keep only the dimension-constant terms.  Returns the remaining
-    expression, or ``None`` if nothing is left.
+    different scan position the scan-dim term is replaced by bounds on the
+    re-read index (``cute_reread_index``: ``index >= 0``, ``index < size``)
+    and on the block's end (``CuteSerialAxis.valid``), so here we remove the
+    original scan-dim mask var and keep only the dimension-constant terms.
+    Returns the remaining expression, or ``None`` if nothing is left.
     """
     if scan_mask_var is None:
         return mask_expr
@@ -295,22 +315,176 @@ def _cute_strip_mask_term(mask_expr: str, scan_mask_var: str | None) -> str | No
     return " and ".join(kept)
 
 
-def _cute_scan_sort_index_pos(load: object, scan_index_var: str) -> int:
-    """Index position in ``load.index_exprs`` matching the scan dimension.
+@dataclasses.dataclass(frozen=True)
+class CuteSerialAxis:
+    """The walk of a serial re-read along one dim of a tile value.
 
-    ``scan_index_var`` is the per-lane index variable for the dimension being
-    scanned (e.g. ``indices_0``).  The position whose index expression equals
-    that variable is the one we sweep over during the serial scan.
+    The serial scan and the rank sort re-read a load at every position of the
+    dim: position ``p`` is the element whose block index variable is
+    ``base + p``, and this lane holds position ``position``.  The walk runs
+    over ``extent`` positions; with a masked block only those whose index is
+    below ``end`` hold an element (a partial tile, a slice shorter than its
+    block's lanes, a tile range shorter than the tensor).
     """
-    from .indexing import CuteSortableLoad
 
-    assert isinstance(load, CuteSortableLoad)
-    for pos, expr in enumerate(load.index_exprs):
-        if expr == scan_index_var:
-            return pos
-    # Fall back to the load's own recorded sort position (e.g. a 1D load whose
-    # sole index is the scan dimension but was renamed by an upstream cast).
-    return load.sort_index_pos
+    block_id: int
+    extent: int | str
+    position: str
+    base: str
+    index_var: str
+    end: str | None
+
+    def valid(self, position: str) -> str | None:
+        """Whether ``position`` holds an element, or None if every one does."""
+        if self.end is None:
+            return None
+        return f"(({self.base}) + ({position})) < ({self.end})"
+
+
+def cute_serial_axis(
+    state: CodegenState, value: torch.Tensor, dim: int, what: str
+) -> CuteSerialAxis:
+    """The serial walk of dim ``dim`` of ``value`` in the current scope."""
+    from ...language.memory_ops import _cute_active_index_var
+    from ..compile_environment import CompileEnvironment
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
+    from .cute_reshape import _get_dim_local_coord
+    from .cute_reshape import _resolve_dim_block_id
+    from .tile_ops import cute_masked_block_end
+
+    env = CompileEnvironment.current()
+    block_id = _resolve_dim_block_id(state.codegen, value, dim)
+    if block_id is None:
+        raise exc.BackendUnsupported("cute", f"{what} dim block id")
+    index_var = _cute_active_index_var(state, block_id)
+    if index_var is None:
+        raise exc.BackendUnsupported("cute", f"{what} dim is not active here")
+
+    # The walk covers the dim's block (tile): prefer the block size from
+    # config, keeping a symbolic host constexpr one symbolic (the fake
+    # tensor's dim may be a fresh symbol whose hint is not the tile size),
+    # falling back to the fake extent's size hint.
+    block_size = env.block_sizes[block_id].from_config(state.device_function.config)
+    extent: int | str
+    if isinstance(block_size, int):
+        extent = block_size
+    elif isinstance(block_size, torch.SymInt):
+        extent = state.device_function.literal_expr(block_size)
+    else:
+        size = value.shape[dim]
+        hint = env.size_hint(size) if isinstance(size, torch.SymInt) else size
+        if not isinstance(hint, int):
+            raise exc.BackendUnsupported("cute", f"dynamic {what} extent")
+        extent = hint
+    block = env.block_sizes[block_id]
+    if block.reduction and isinstance(block.size, int) and isinstance(extent, int):
+        # A reduction dim (a slice's) can launch more lanes than it has
+        # elements; the walk covers its elements only.
+        extent = min(extent, block.size)
+
+    # Prefer the strategy's uniform tile base: the generic local-coordinate
+    # helper reports the *thread* coordinate for a lane-looped flattened tile
+    # (and zero for its vectorised form), which is not the element's position.
+    # Without a known base fall back to the helper and derive the base as
+    # ``index - local_coord``.  A flattened multi-dim tile has neither: it is
+    # a run of the flat iteration space, whose ``offsets % BLOCK // ...``
+    # coordinate in a permuted loop order is no tile position at all (a
+    # re-read at it would address negative columns).
+    tile_base = _cute_scan_tile_base(state, block_id)
+    if tile_base is not None:
+        position = f"({index_var}) - ({tile_base})"
+    else:
+        loops = state.codegen.active_device_loops.get(block_id)
+        strategy = loops[-1].strategy if loops else None
+        if (
+            isinstance(strategy, PerThreadFlattenedTileStrategy)
+            and len(strategy.block_ids) > 1
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{what} along a dim of a flattened multi-dim tile, which has "
+                "no per-dim tile base for the serial walk",
+            )
+        position = _get_dim_local_coord(state.codegen, value, dim)
+        tile_base = f"({index_var}) - ({position})"
+    return CuteSerialAxis(
+        block_id,
+        extent,
+        position,
+        tile_base,
+        index_var,
+        cute_masked_block_end(state.codegen, block_id, what),
+    )
+
+
+def cute_reread_index(
+    state: CodegenState,
+    load: CuteSortableLoad,
+    axis: CuteSerialAxis,
+    position: str,
+) -> tuple[list[str], list[str]]:
+    """``load``'s index and mask terms at ``position`` of ``axis``.
+
+    The dim's index is a function of the axis' block index variable
+    (``x[t, 1::2]`` reads ``1 + 2 * indices_1``): the variable takes
+    ``base + position``, rather than the whole index being replaced, so a
+    slice's start and step are kept.  The mask bounds the position by the
+    block's own end (``CuteSerialAxis.valid``) and the address by the tensor
+    dim, and keeps the load's other terms.  Those are evaluated at this
+    lane's own element, which is right for the other dims' masks and the
+    lane-validity bounds, but not for an ``extra_mask`` that varies along
+    the walked dim: such a load is refused.
+    """
+    from ...language.memory_ops import _cute_tensor_dim_size_expr
+    from ..compile_environment import CompileEnvironment
+    from .cute_reshape import _resolve_dim_block_id
+
+    pattern = re.compile(rf"\b{re.escape(axis.index_var)}\b")
+    positions = [
+        pos for pos, expr in enumerate(load.index_exprs) if pattern.search(expr)
+    ]
+    if len(positions) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "a serial re-read of a load whose index does not follow the walked "
+            "dim through exactly one subscript",
+        )
+    if load.extra_mask is not None:
+        env = CompileEnvironment.current()
+        value = load.value
+        walked = [
+            dim
+            for dim in range(value.ndim)
+            if (block_id := _resolve_dim_block_id(state.codegen, value, dim))
+            is not None
+            and env.canonical_block_id(block_id)
+            == env.canonical_block_id(axis.block_id)
+        ]
+        mask = load.extra_mask
+        if len(walked) != 1 or (
+            (mask_dim := mask.ndim - value.ndim + walked[0]) >= 0
+            and not env.known_equal(mask.shape[mask_dim], 1)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "a serial re-read of a load whose extra_mask varies along the "
+                "walked dim; the mask is evaluated at this lane's own element",
+            )
+    (pos,) = positions
+    index_exprs = list(load.index_exprs)
+    index = pattern.sub(f"(({axis.base}) + ({position}))", index_exprs[pos])
+    index_exprs[pos] = index
+    size_expr = _cute_tensor_dim_size_expr(state, load.tensor, pos)
+    mask_terms = [f"({index}) >= 0", f"({index}) < cutlass.Int32({size_expr})"]
+    if (valid := axis.valid(position)) is not None:
+        mask_terms.append(valid)
+    if load.mask_expr is not None:
+        non_axis_mask = _cute_strip_mask_term(
+            load.mask_expr, state.codegen.mask_var(axis.block_id)
+        )
+        if non_axis_mask is not None:
+            mask_terms.append(non_axis_mask)
+    return index_exprs, mask_terms
 
 
 def _cute_inline_combine_graph(
@@ -446,6 +620,8 @@ def _cute_codegen_tuple_scan(
     combine_graph_id: int,
     dim: int,
     reverse: bool,
+    *,
+    parallel_declined: str,
 ) -> list[ast.AST]:
     """CuTe codegen for ``hl.associative_scan`` over a tuple of streams.
 
@@ -470,7 +646,12 @@ def _cute_codegen_tuple_scan(
         raise exc.BackendUnsupported("cute", "tuple associative_scan input")
 
     return _cute_codegen_serial_scan(
-        state, helper_graph_info, list(input_nodes), dim, reverse
+        state,
+        helper_graph_info,
+        list(input_nodes),
+        dim,
+        reverse,
+        parallel_declined=parallel_declined,
     )
 
 
@@ -480,22 +661,24 @@ def _cute_codegen_serial_scan(
     input_nodes: list[object],
     dim: int,
     reverse: bool,
+    *,
+    parallel_declined: str,
 ) -> list[ast.AST]:
     """Dim-agnostic serial per-lane inclusive scan shared by the scalar and
     tuple CuTe scan paths.
 
     ``input_nodes`` is one FX node per scanned stream (a single element for a
     scalar scan, multiple for a tuple scan).  For each output position along the
-    scan dimension this folds the user's combine graph over local positions
-    addressed relative to the tile's global origin, carrying one accumulator
-    per stream. Returns one output expression per stream.
+    scan dimension this folds the user's combine graph over the global rows
+    ``0..out_pos`` (inclusive), carrying one accumulator per stream, re-reading
+    each stream's load at every row.  Returns one output expression per stream.
+    ``parallel_declined`` is why ``_cute_try_parallel_scan`` passed on the scan,
+    for the refusal of a stream that is not a load.
     """
-    from torch.fx.node import Node
 
     from ..ast_extension import expr_from_string
     from ..ast_extension import statement_from_string
     from ..compile_environment import CompileEnvironment
-    from ..tile_strategy import DeviceGridState
     from .indexing import CuteSortableLoad
 
     # Fake-tensor metadata lives on the per-stream input nodes (the scan node
@@ -507,76 +690,26 @@ def _cute_codegen_serial_scan(
         dim += ndim
 
     env = CompileEnvironment.current()
-    from ...language.memory_ops import _cute_active_index_var
-    from ...language.memory_ops import _cute_remap_block_id
-    from ...language.memory_ops import _cute_tensor_dim_size_expr
-    from .cute_reshape import _get_dim_local_coord
-    from .cute_reshape import _resolve_dim_block_id
+    axis = cute_serial_axis(state, first_val, dim, "associative_scan")
 
-    scan_block_id = _resolve_dim_block_id(state.codegen, first_val, dim)
-    if scan_block_id is None:
-        raise exc.BackendUnsupported("cute", "associative_scan scan-dim block id")
-
-    # The scan loops over the *block-local* positions of the scan dimension; the
-    # loop bound is the scan dim's block (tile) size.  Prefer the concrete block
-    # size from config, preserving symbolic host constexpr values. The fake
-    # tensor's scan dim may be a fresh symbol whose hint is not the tile size.
-    # Fall back to its hint only when no configured extent is available.
-    block_size = env.block_sizes[scan_block_id].from_config(
-        state.device_function.config
-    )
-    if isinstance(block_size, (int, torch.SymInt)):
-        scan_extent_expr = state.device_function.literal_expr(block_size)
-    else:
-        extent = first_val.shape[dim]
-        n_hint = env.size_hint(extent) if isinstance(extent, torch.SymInt) else extent
-        if not isinstance(n_hint, int):
-            raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
-        scan_extent_expr = str(n_hint)
-
-    # The current lane's block-local position along the scan dim and the
-    # tile's global base, so a local position maps to the global row
-    # ``base + position``.  Prefer the strategy's uniform tile base: the
-    # generic local-coordinate helper reports the *thread* coordinate for a
-    # lane-looped flattened tile (and zero for its vectorised form), which is
-    # not the element's position.  Without a known base fall back to the
-    # helper and derive the base as ``global_index - local_coord``.
-    scan_global_index_var = _cute_active_index_var(state, scan_block_id)
-    tile_base = _cute_scan_tile_base(state, scan_block_id)
-    if tile_base is not None and scan_global_index_var is not None:
-        out_pos_expr = f"({scan_global_index_var}) - ({tile_base})"
-        offset_expr = tile_base
-    else:
-        out_pos_expr = _get_dim_local_coord(state.codegen, first_val, dim)
-        if scan_global_index_var is not None:
-            offset_expr = f"({scan_global_index_var}) - ({out_pos_expr})"
-        else:
-            offset_expr = state.codegen.offset_var(scan_block_id)
-
-    # Recover a scalar load per tuple element and the index position that
-    # corresponds to the scan dimension within that load.
+    # Recover a scalar load per tuple element.
     loads: list[CuteSortableLoad] = []
-    load_nodes: list[object] = []
-    sort_positions: list[int] = []
     for node in input_nodes:
         recovered = _cute_recover_scan_load(node)
         if recovered is None or not isinstance(recovered[0], CuteSortableLoad):
-            raise exc.BackendUnsupported("cute", "tuple associative_scan input load")
-        load, load_node = recovered
+            raise exc.BackendUnsupported(
+                "cute",
+                "hl.associative_scan / hl.cumsum of a computed tile (not a "
+                "load): the serial fallback re-reads loads only, and the "
+                f"register scan does not apply because {parallel_declined}",
+            )
+        load, _load_node = recovered
         assert isinstance(load, CuteSortableLoad)
         loads.append(load)
-        load_nodes.append(load_node)
-        if scan_global_index_var is not None:
-            sort_positions.append(
-                _cute_scan_sort_index_pos(load, scan_global_index_var)
-            )
-        else:
-            sort_positions.append(load.sort_index_pos)
 
     index_dtype = env.backend.dtype_str(env.index_dtype)
     out_pos = state.device_function.new_var("scan_out_pos")
     scan_i = state.device_function.new_var("scan_i")
-    scan_row = state.device_function.new_var("scan_row")
     include = state.device_function.new_var("scan_include")
     initialized = state.device_function.new_var("scan_initialized")
 
@@ -584,7 +717,7 @@ def _cute_codegen_serial_scan(
     value_vars = [state.device_function.new_var("scan_value") for _ in loads]
 
     state.codegen.add_statement(
-        statement_from_string(f"{out_pos} = {index_dtype}({out_pos_expr})")
+        statement_from_string(f"{out_pos} = {index_dtype}({axis.position})")
     )
     for acc_var, val in zip(acc_vars, vals, strict=True):
         dtype_str = env.backend.dtype_str(val.dtype)
@@ -593,89 +726,26 @@ def _cute_codegen_serial_scan(
         )
     state.codegen.add_statement(statement_from_string(f"{initialized} = False"))
     position, position_lines = _cute_serial_scan_position(
-        state,
-        scan_i,
-        block_size if isinstance(block_size, int) else scan_extent_expr,
-        reverse,
+        state, scan_i, axis.extent, reverse
     )
 
-    # Global scan row for this iteration: ``offset + position`` (the position
-    # runs backwards for a reverse scan, see ``_cute_serial_scan_position``).
-    row_line = f"    {scan_row} = cutlass.Int32({offset_expr}) + {position}"
-
-    # Per-iteration value loads (re-load each stream at the scanned global row).
+    # Per-iteration value loads (re-load each stream at the scanned position).
     # Cast each loaded scalar to the *scanned* element dtype (``vals[i].dtype``):
     # the recovered load may have a different storage dtype than the value
     # entering the scan (e.g. the index stream is ``indices`` int64 but scanned
     # as float32 after ``idxs.float()``).  Each load is guarded so an
-    # out-of-range scanned row (partial final tile) reads 0 instead of faulting.
+    # out-of-range position (partial final tile) reads 0 instead of faulting.
     value_lines: list[str] = []
-    scan_bounds: list[str] = []
-    active_block = _cute_remap_block_id(state, scan_block_id)
-    active_loops = state.codegen.active_device_loops.get(active_block)
-    owner = active_loops[-1] if active_loops else state.codegen.current_grid_state
-    if owner is None or active_block not in owner.block_id_to_info:
-        raise exc.BackendUnsupported("cute", "associative_scan logical tile owner")
-    info = owner.block_id_to_info[active_block]
-    if isinstance(owner, DeviceGridState):
-        end = (
-            state.device_function.literal_expr(info.grid_end_expr)
-            if info.grid_end_expr is not None
-            else None
-        )
-    else:
-        end = info.end_var_name
-        if end is None and info.end_expr is not None:
-            end = state.device_function.literal_expr(info.end_expr)
-    if end is None:
-        raise exc.BackendUnsupported("cute", "associative_scan logical tile end")
-    # The scan coordinate is global, and its tile can end before its source.
-    tile_bound = f"({scan_row}) < cutlass.Int32({end})"
-    scan_bounds.append(tile_bound)
-    for val_var, load, load_node, pos, val in zip(
-        value_vars, loads, load_nodes, sort_positions, vals, strict=True
-    ):
+    for val_var, load, val in zip(value_vars, loads, vals, strict=True):
         scan_dtype_str = env.backend.dtype_str(val.dtype)
         load_dtype_str = env.backend.dtype_str(load.dtype)
-        index_exprs = list(load.index_exprs)
-        index_exprs[pos] = scan_row
+        index_exprs, mask_terms = cute_reread_index(state, load, axis, position)
         load_expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
-        # Rebuild the mask for the scanned row: the scan-dim bound becomes
-        # ``scan_row < tensor_size``; any non-scan-dim masks (e.g. the feature
-        # column bound) are constant w.r.t. ``scan_i`` and reused as-is.
-        load_tensor = (
-            load_node.args[0].meta["val"]
-            if isinstance(load_node, Node)
-            and load_node.args
-            and isinstance(load_node.args[0], Node)
-            else None
-        )
-        scan_dim_mask: str | None = None
-        if isinstance(load_tensor, torch.Tensor):
-            size_expr = _cute_tensor_dim_size_expr(state, load_tensor, pos)
-            scan_dim_mask = f"({scan_row}) < cutlass.Int32({size_expr})"
-            scan_bounds.append(scan_dim_mask)
-        mask_terms: list[str] = []
-        mask_terms.append(tile_bound)
-        if scan_dim_mask is not None:
-            mask_terms.append(scan_dim_mask)
-        if load.mask_expr is not None and scan_global_index_var is not None:
-            scan_mask_var = state.codegen.mask_var(scan_block_id)
-            non_scan_mask = _cute_strip_mask_term(load.mask_expr, scan_mask_var)
-            if non_scan_mask is not None:
-                mask_terms.append(non_scan_mask)
-        if mask_terms:
-            mask_expr = " and ".join(f"({term})" for term in mask_terms)
-            load_expr = f"({load_expr} if {mask_expr} else {load_dtype_str}(0))"
+        mask_expr = " and ".join(f"({term})" for term in mask_terms)
+        load_expr = f"({load_expr} if {mask_expr} else {load_dtype_str}(0))"
         value_lines.append(f"    {val_var} = {scan_dtype_str}({load_expr})")
 
-    include_expr = f"{position} >= {out_pos}" if reverse else f"{position} <= {out_pos}"
-    if scan_bounds:
-        # Padded positions are absent from the logical input, rather than zero
-        # elements. In particular, reverse products/minima must not fold them.
-        include_expr = " and ".join(
-            f"({term})" for term in (include_expr, *dict.fromkeys(scan_bounds))
-        )
+    include_expr = _cute_scan_include_expr(axis, position, out_pos, reverse)
 
     # Inline the user's combine graph (one statement per node, 4-space
     # indented to sit inside the scan ``for`` loop).
@@ -703,9 +773,8 @@ def _cute_codegen_serial_scan(
         statement_from_string(
             "\n".join(
                 [
-                    f"for {scan_i} in range(cutlass.Int32(0), cutlass.Int32({scan_extent_expr}), cutlass.Int32(1)):",
+                    f"for {scan_i} in range(cutlass.Int32(0), cutlass.Int32({axis.extent}), cutlass.Int32(1)):",
                     *position_lines,
-                    row_line,
                     f"    {include} = {include_expr}",
                     *value_lines,
                     *combine_lines,
@@ -774,57 +843,85 @@ def _scan_combine_operator(helper_graph_info: HelperFunctionGraphInfo) -> str:
     raise exc.BackendUnsupported("cute", "associative_scan combine graph")
 
 
-def _cute_scan_load_expr(load: object, index: str) -> str:
-    from ..compile_environment import CompileEnvironment
-    from .indexing import CuteSortableLoad
+def cute_rank_sort_lines(
+    state: CodegenState,
+    load: CuteSortableLoad,
+    axis: CuteSerialAxis,
+    descending: bool,
+    out_pos: str,
+    indent: str = "",
+    select_if: str | None = None,
+) -> tuple[list[str], str, str]:
+    """A rank sort selecting the element of rank ``out_pos`` along ``axis``.
 
-    assert isinstance(load, CuteSortableLoad)
-    index_exprs = list(load.index_exprs)
-    index_exprs[load.sort_index_pos] = index
-    expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
-    if load.mask_expr is not None:
-        dtype_str = CompileEnvironment.current().backend.dtype_str(load.dtype)
-        return f"({expr} if {load.mask_expr} else {dtype_str}(0))"
-    return expr
+    Every candidate position is ranked against every probe position of the
+    re-read load (``cute_reread_index``); returns the statements (two
+    initializations, then the candidate loop), the selected value and the
+    selected position (0 where ``select_if`` is false).
+    """
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    dtype_str = env.backend.dtype_str(load.dtype)
+    index_dtype = env.backend.dtype_str(env.index_dtype)
+    new_var = state.device_function.new_var
+    sorted_value = new_var("sorted_vals")
+    sorted_index = new_var("sorted_indices")
+    candidate = new_var("sort_k")
+    probe = new_var("sort_j")
+    candidate_rank = new_var("sort_rank")
+    candidate_value = new_var("sort_candidate")
+    probe_value = new_var("sort_probe")
+    before = new_var("sort_before")
+    selected = new_var("sort_selected")
+
+    def reread(position: str) -> str:
+        index_exprs, mask_terms = cute_reread_index(state, load, axis, position)
+        expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
+        mask_expr = " and ".join(f"({term})" for term in mask_terms)
+        return f"({expr} if {mask_expr} else {dtype_str}(0))"
+
+    cmp_op = ">" if descending else "<"
+    # Positions past a masked block's end hold no element: they neither rank
+    # before a candidate nor take a rank (``x[t, n]`` of a partial tile).
+    probe_valid = "" if (valid := axis.valid(probe)) is None else f"({valid}) and "
+    candidate_valid = (
+        "" if (valid := axis.valid(candidate)) is None else f"({valid}) and "
+    )
+    loop = f"range(cutlass.Int32(0), cutlass.Int32({axis.extent}), cutlass.Int32(1))"
+    loop_lines = [
+        f"for {candidate} in {loop}:",
+        f"    {candidate_value} = {reread(candidate)}",
+        f"    {candidate_rank} = {index_dtype}(0)",
+        f"    for {probe} in {loop}:",
+        f"        {probe_value} = {reread(probe)}",
+        f"        {before} = {probe_valid}(({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate})))",
+        f"        {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
+        f"    {selected} = {candidate_valid}{candidate_rank} == {out_pos}"
+        + ("" if select_if is None else f" and {select_if}"),
+        f"    {sorted_value} = {candidate_value} if {selected} else {sorted_value}",
+        f"    {sorted_index} = {index_dtype}({candidate}) if {selected} else {sorted_index}",
+    ]
+    statements = [
+        f"{indent}{sorted_value} = {dtype_str}(0)",
+        f"{indent}{sorted_index} = {index_dtype}(0)",
+        "\n".join(f"{indent}{line}" for line in loop_lines),
+    ]
+    return statements, sorted_value, sorted_index
 
 
 def _cute_sorted_value_lines(
     state: CodegenState,
-    load: object,
+    load: CuteSortableLoad,
+    axis: CuteSerialAxis,
     descending: bool,
     out_pos: str,
     output_var: str,
-    n_hint: int,
 ) -> list[str]:
-    from ..compile_environment import CompileEnvironment
-    from .indexing import CuteSortableLoad
-
-    assert isinstance(load, CuteSortableLoad)
-    env = CompileEnvironment.current()
-    dtype_str = env.backend.dtype_str(load.dtype)
-    index_dtype = env.backend.dtype_str(env.index_dtype)
-    sorted_value = state.device_function.new_var("scan_sorted_value")
-    candidate = state.device_function.new_var("scan_sort_k")
-    probe = state.device_function.new_var("scan_sort_j")
-    candidate_rank = state.device_function.new_var("scan_sort_rank")
-    candidate_value = state.device_function.new_var("scan_sort_candidate")
-    probe_value = state.device_function.new_var("scan_sort_probe")
-    before = state.device_function.new_var("scan_sort_before")
-    selected = state.device_function.new_var("scan_sort_selected")
-    cmp_op = ">" if descending else "<"
-    return [
-        f"    {sorted_value} = {dtype_str}(0)",
-        f"    for {candidate} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
-        f"        {candidate_value} = {_cute_scan_load_expr(load, candidate)}",
-        f"        {candidate_rank} = {index_dtype}(0)",
-        f"        for {probe} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
-        f"            {probe_value} = {_cute_scan_load_expr(load, probe)}",
-        f"            {before} = ({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate}))",
-        f"            {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
-        f"        {selected} = {candidate_rank} == {out_pos}",
-        f"        {sorted_value} = {candidate_value} if {selected} else {sorted_value}",
-        f"    {output_var} = {sorted_value}",
-    ]
+    lines, sorted_value, _ = cute_rank_sort_lines(
+        state, load, axis, descending, out_pos, indent="    "
+    )
+    return [*lines, f"    {output_var} = {sorted_value}"]
 
 
 # ---------------------------------------------------------------------------
@@ -1668,11 +1765,12 @@ def _cute_try_parallel_scan(
     input_nodes: list[object],
     dim: int,
     reverse: bool,
-) -> list[ast.AST] | None:
+) -> list[ast.AST] | str:
     """Lower the scan on the already-loaded per-lane values when provable.
 
-    Returns one output expression per stream, or ``None`` to keep the serial
-    fallback.  See the module docstring for the shapes handled.
+    Returns one output expression per stream, or the reason the serial
+    fallback has to take the scan.  See the module docstring for the shapes
+    handled.
     """
     from torch.fx.node import Node
 
@@ -1680,23 +1778,23 @@ def _cute_try_parallel_scan(
     from .cute_reshape import _resolve_dim_block_id
 
     if not input_nodes or not all(isinstance(node, Node) for node in input_nodes):
-        return None
+        return "an input is not a traced tile"
     if any(_cute_scan_input_is_sorted(node) for node in input_nodes):
-        return None
+        return "an input is torch.sort output"
     fake_values = [cast("Node", node).meta.get("val") for node in input_nodes]
     if not all(isinstance(value, torch.Tensor) for value in fake_values):
-        return None
+        return "an input is not a tensor"
     first = cast("torch.Tensor", fake_values[0])
     if dim < 0:
         dim += first.ndim
     if not 0 <= dim < first.ndim:
-        return None
+        return f"scan dim {dim} is out of range"
     ast_arg = state.ast_args[1]
     args = list(ast_arg) if isinstance(ast_arg, (tuple, list)) else [ast_arg]
     if len(args) != len(fake_values) or not all(
         isinstance(arg, ast.AST) for arg in args
     ):
-        return None
+        return "an input has no per-lane value"
     passthrough = [expr_from_string(ast.unparse(cast("ast.AST", arg))) for arg in args]
     if _cute_scan_axis_is_unit(first.shape[dim]):
         # An inclusive scan over one element is the identity for any combine;
@@ -1704,24 +1802,31 @@ def _cute_try_parallel_scan(
         return passthrough
     block_id = _resolve_dim_block_id(state.codegen, first, dim)
     if block_id is None:
-        return None
+        return "the scan dim has no block"
     geometry = _cute_scan_geometry(state, block_id)
     if geometry is None:
-        return None
+        return (
+            "the scan axis layout is not a lane loop or a strided thread "
+            "split on thread axis 0"
+        )
     if geometry.threads > _CUTE_WARP_SIZE and any(
         cast("torch.Tensor", value).dtype is torch.bool for value in fake_values
     ):
-        return None
+        return "a bool stream spans more than one warp"
     if geometry.extent == 1:
         return passthrough
     if reverse and geometry.vec_lane_var is not None:
         # The constexpr vector loop over the scan axis cannot run backwards:
         # the vector store protocol appends the ``V`` results in loop order.
-        return None
+        return "a reverse scan cannot run a vectorized lane loop backwards"
     if _cute_scan_lane_hosts_reduction(state):
-        return None
+        return (
+            "a lane loop around it also hosts a reduction over a lane-looped "
+            "block, whose two-pass split cannot carry the scan prefix (a "
+            "config that puts the reduced block on threads avoids the lane loop)"
+        )
     if not _cute_scan_prepare_lane_direction(state, geometry, reverse):
-        return None
+        return "the lane loop cannot be visited in scan order"
     emitter = _CuteScanEmitter(state, geometry, helper_graph_info, reverse)
     streams = [
         emitter.stream(cast("ast.AST", arg), cast("torch.Tensor", value))

@@ -37,6 +37,7 @@ from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
+from ..aten_lowering import rolled_reduction_iota_index
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import stack_lowering
@@ -1153,6 +1154,11 @@ def _cute_iota_expr(
         else CompileEnvironment.current().index_dtype
     )
 
+    if (rolled := rolled_reduction_iota_index(ctx, source_node)) is not None:
+        # The thread's position in the whole reduction dim; its block-local
+        # coordinate would restart the range at every chunk.
+        return _wrap_iota_coord_expr(ctx, rolled, start, step, dtype)
+
     env = CompileEnvironment.current()
     length_hint: int | None = None
     if isinstance(length_arg, (int, torch.SymInt)):
@@ -1516,68 +1522,41 @@ def _sort_args(node: Node) -> tuple[int, bool]:
 
 def _emit_cute_rank_sort(
     ctx: LoweringContext,
+    node: Node,
     load: CuteSortableLoad,
     input_tensor: torch.Tensor,
     *,
     descending: bool,
     k: int | None = None,
 ) -> tuple[ast.AST, ast.AST]:
+    from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
+    from .scan_ops import cute_rank_sort_lines
+    from .scan_ops import cute_serial_axis
+
+    if not isinstance(ctx.cg, GenerateAST):
+        raise exc.NotAllowedInHelperFunction
     env = CompileEnvironment.current()
-    fn = ctx.cg.device_function
-    n = input_tensor.shape[-1]
-    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
-    if not isinstance(n_hint, int):
-        raise exc.BackendUnsupported("cute", "dynamic sort extent")
-    dtype_str = env.backend.dtype_str(load.dtype)
+    state = CodegenState(ctx.cg, fx_node=node, env=ctx.env)
+    axis = cute_serial_axis(state, input_tensor, input_tensor.ndim - 1, "sort")
+    # The lane's position along the sorted dim: the rank it selects, and for
+    # topk the output column it writes (``cute_topk_lane_expr``).
+    node.meta["cute_sort_axis"] = axis
+    out_pos = ctx.cg.device_function.new_var("sort_out_pos")
     index_dtype = env.backend.dtype_str(env.index_dtype)
-    out_pos = fn.new_var("sort_out_pos")
-    sorted_vals = fn.new_var("sorted_vals")
-    sorted_indices = fn.new_var("sorted_indices")
-    candidate = fn.new_var("sort_k")
-    probe = fn.new_var("sort_j")
-    candidate_rank = fn.new_var("sort_rank")
-    candidate_value = fn.new_var("sort_candidate")
-    probe_value = fn.new_var("sort_probe")
-    before = fn.new_var("sort_before")
-    selected = fn.new_var("sort_selected")
-
     ctx.cg.add_statement(
-        statement_from_string(
-            f"{out_pos} = {index_dtype}({load.index_exprs[load.sort_index_pos]})"
-        )
+        statement_from_string(f"{out_pos} = {index_dtype}({axis.position})")
     )
-    ctx.cg.add_statement(statement_from_string(f"{sorted_vals} = {dtype_str}(0)"))
-    ctx.cg.add_statement(statement_from_string(f"{sorted_indices} = {index_dtype}(0)"))
-
-    cmp_op = ">" if descending else "<"
-
-    def indexed_load(index: str) -> str:
-        index_exprs = list(load.index_exprs)
-        index_exprs[load.sort_index_pos] = index
-        expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
-        if load.mask_expr is not None:
-            return f"({expr} if {load.mask_expr} else {dtype_str}(0))"
-        return expr
-
-    mask_suffix = f" and {out_pos} < {k}" if k is not None else ""
-    ctx.cg.add_statement(
-        statement_from_string(
-            "\n".join(
-                [
-                    f"for {candidate} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
-                    f"    {candidate_value} = {indexed_load(candidate)}",
-                    f"    {candidate_rank} = {index_dtype}(0)",
-                    f"    for {probe} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
-                    f"        {probe_value} = {indexed_load(probe)}",
-                    f"        {before} = ({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate}))",
-                    f"        {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
-                    f"    {selected} = ({candidate_rank} == {out_pos}{mask_suffix})",
-                    f"    {sorted_vals} = {candidate_value} if {selected} else {sorted_vals}",
-                    f"    {sorted_indices} = {index_dtype}({candidate}) if {selected} else {sorted_indices}",
-                ]
-            )
-        )
+    statements, sorted_vals, sorted_indices = cute_rank_sort_lines(
+        state,
+        load,
+        axis,
+        descending,
+        out_pos,
+        select_if=None if k is None else f"{out_pos} < {k}",
     )
+    for statement in statements:
+        ctx.cg.add_statement(statement_from_string(statement))
     return expr_from_string(sorted_vals), expr_from_string(sorted_indices)
 
 
@@ -1594,7 +1573,7 @@ def codegen_sort_cute(ctx: LoweringContext, node: Node) -> object:
         raise exc.BackendUnsupported("cute", "torch.sort input")
     node.meta["cute_sort_load"] = load
     node.meta["cute_sort_descending"] = descending
-    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=descending)
+    return _emit_cute_rank_sort(ctx, node, load, input_tensor, descending=descending)
 
 
 @gather_lowering.register_codegen("cute")
@@ -1692,6 +1671,8 @@ def _topk_args(node: Node) -> tuple[int, int, bool]:
 
 @topk_lowering.register_codegen("cute")
 def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
+    from ...language import memory_ops
+
     k, _, largest = _topk_args(node)
     input_node = node.args[0]
     assert isinstance(input_node, Node)
@@ -1701,6 +1682,20 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
         load = input_node.meta.get("cute_sortable_load")
     if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.topk input")
-    node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
+    # Output ``j`` is held on the lane at position ``j`` of the sorted input
+    # dim, which only a store addresses (``_cute_topk_store_index_exprs``);
+    # any other consumer would read it on the output dim's own lanes.
+    for output in node.users:
+        for user in output.users:
+            if user.target is not memory_ops.store or user.args[2] is not output:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "torch.topk output that feeds anything but a store: its "
+                    "elements are held on the lanes of the sorted input dim",
+                )
+    result = _emit_cute_rank_sort(
+        ctx, node, load, input_tensor, descending=largest, k=k
+    )
+    node.meta["cute_topk_lane_expr"] = node.meta["cute_sort_axis"].position
     node.meta["cute_topk_k"] = k
-    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=largest, k=k)
+    return result

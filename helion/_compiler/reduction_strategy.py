@@ -1808,23 +1808,15 @@ class PersistentReductionStrategy(ReductionStrategy):
         return result_var
 
     def _live_thread_axis_sizes(self, state: CodegenState) -> dict[int, int]:
-        """Thread extent per launch axis over the active loops and the grid."""
-        axis_sizes: dict[int, int] = {}
-        codegen = state.codegen
-        seen: set[int] = set()
-        for loops in codegen.active_device_loops.values():
-            for loop_state in loops:
-                key = id(loop_state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                for axis, size in loop_state.thread_axis_sizes.items():
-                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
-        current_grid = codegen.current_grid_state
-        if current_grid is not None:
-            for axis, size in current_grid.thread_axis_sizes.items():
-                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
-        return axis_sizes
+        """Thread extent per launch axis.
+
+        The active loops and the grid, and the axes every strategy of the
+        kernel reserves: a sibling strategy whose loop is not active here
+        (``x[t, 1::2].argmax(-1)`` rolled over thread axis 0, then a
+        persistent ``x[t, 8:32].argmin(-1)`` on axis 1) still occupies its
+        launch axis, so it still interleaves this reduction's lanes.
+        """
+        return state.codegen._strategy_thread_axis_sizes()
 
     def _sibling_axis_group_params(
         self, state: CodegenState

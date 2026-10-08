@@ -768,6 +768,39 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[1](args[0], dim=-1))
 
+    @skipIfMetal("Metal has no aten.view lowering")
+    def test_reduction_dim_pinned_by_literal_reshape_stays_persistent(self):
+        """A reshape to a literal size guards the reduction dim's symbol to it.
+
+        ``x[tile, :].reshape(tile, 1, n)`` with ``n`` static turns the full
+        slice's reduction dim into the constant ``n``, which the reduction
+        roller cannot tell from other dims of that size: rolled, it moved only
+        the store into the loop and left the load outside, whose ``:`` then
+        resolved to the row tile when ``n`` equals the row extent.  Such a
+        reduction dim must stay persistent.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def unit_reshape(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            out = torch.empty([m, 1, n], device=x.device, dtype=x.dtype)
+            sums = torch.empty([m, 1], device=x.device, dtype=x.dtype)
+            for tile in hl.tile(m):
+                out[tile, :, :] = x[tile, :].reshape(tile, 1, n) * 2
+                sums[tile, :] = x[tile, :].reshape(tile, 1, n).sum(-1)
+            return out, sums
+
+        x = torch.randn([64, 64], device=DEVICE)
+        bound = unit_reshape.bind((x,))
+        self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
+        for block_size in (16, 32, 64):
+            with self.subTest(block_size=block_size):
+                _code, (out, sums) = code_and_output(
+                    unit_reshape, (x,), block_size=block_size
+                )
+                torch.testing.assert_close(out, x[:, None, :] * 2)
+                torch.testing.assert_close(sums, x.sum(-1, keepdim=True))
+
     def test_sum_looped(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(
@@ -809,6 +842,30 @@ class TestReductions(RefEagerTestBase, TestCase):
                 reduction_loop=16,
             )
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
+
+    @skipIfPallas("Pallas cannot lower the strided slice x[tile, 1::2]")
+    @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")
+    def test_rolled_and_persistent_reductions_of_two_slices(self):
+        """A rolled reduction's thread axis sits below a later persistent one
+        after its loop closes: the persistent reduction's lanes stay
+        interleaved with it."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def two_slices(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            hi = torch.zeros(m, device=x.device, dtype=torch.int64)
+            lo = torch.zeros(m, device=x.device, dtype=x.dtype)
+            for tile in hl.tile(m):
+                hi[tile] = torch.argmax(x[tile, 1::2], dim=-1)
+                lo[tile] = torch.amin(x[tile, 8:32], dim=-1)
+            return hi, lo
+
+        x = torch.randn([40, 64], device=DEVICE)
+        _code, (hi, lo) = code_and_output(
+            two_slices, (x,), block_sizes=[2], reduction_loops=[8]
+        )
+        torch.testing.assert_close(hi, torch.argmax(x[:, 1::2], dim=-1))
+        torch.testing.assert_close(lo, x[:, 8:32].amin(dim=-1))
 
     @skipIfRocm("ROCm Triton worker crashes while compiling this reduction kernel")
     def test_reduction_loops_integer_values(self):
