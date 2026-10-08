@@ -58,6 +58,12 @@ _ATOMIC_OPS: tuple[object, ...] = (
 )
 
 
+# Marks a reduction of values computed outside the loop from a free
+# ``hl.arange``: on CuTe it rolls for the computed-fragment lowering, and
+# ``LoopedReductionStrategy`` refuses it otherwise.
+FREE_IOTA_REDUCTION_META = "helion_free_iota_reduction"
+
+
 class ReductionRoller:
     """This does the opposite of unrolling, it takes persistent reductions and turns them into looped reductions."""
 
@@ -205,6 +211,14 @@ class ReductionRoller:
                         num_rdims = self._count_rdim_axes_in_subscript(
                             target, index_arg
                         )
+                elif num_rdims != self._count_rdim_axes_in_subscript(target, index_arg):
+                    # The value's rdim axis lands on positions another index
+                    # names (``loss[tile] = rows_over_rdim``): a chunk of the
+                    # rdim per iteration cannot fill them.
+                    raise NotImplementedError(
+                        "a value over the reduction dim is stored at positions "
+                        "another index names"
+                    )
             else:
                 # When the stored value is a Python scalar (broadcast across
                 # the indexed slice), it carries no shape, so the LHS
@@ -449,18 +463,27 @@ class ReductionRoller:
         A reduction can only be rolled into a loop when the dimension being
         reduced is indexed by a re-bindable block index var (e.g. a ``hl.tile``
         axis or a ``[..., :]`` slice), so the producing load can be re-indexed
-        in ``_REDUCTION_BLOCK``-sized chunks inside the loop. A dimension
-        indexed by ``hl.arange(n)`` instead carries a fixed full-extent
-        ``iota`` index that cannot be re-bound per loop iteration, so rolling
-        would leave the full-extent load outside the loop and emit a shape
-        mismatch (issue #2643). Such reductions must stay persistent.
+        in ``_REDUCTION_BLOCK``-sized chunks inside the loop.  An
+        ``hl.arange(n)`` over the rdim rolls when its value names the rdim's
+        symbol, so it moves into the loop and takes the chunk's positions,
+        and it does not index a load directly.  Otherwise it is a fixed
+        full-extent ``iota`` outside the loop, and any value inside the loop
+        computed from it is wrong: a shape mismatch on Triton (issue #2643),
+        an unrelated coordinate on CuTe.  Such reductions stay persistent.
 
-        Detected by walking back from each reduction over ``self.rdim`` to the
-        loads feeding it and checking whether any is indexed by an ``iota``
-        node sized to the rdim. The output-shape of the load is not a reliable
-        signal: when the arange size coincides with another reduction of the
-        same size, ``allocate_reduction_dimension`` unifies them and the load
-        axis surfaces as the rdim symbol rather than a concrete int.
+        On CuTe a free ``iota`` that only reductions read, through values
+        computed outside the loop, still rolls when the computed-fragment
+        lowering takes the reduction (``free_iota_reductions``): it re-reads
+        the iota per chunk, and any other lowering refuses a rolled reduction
+        of a value from outside its loop
+        (``LoopedReductionStrategy.codegen_reduction``).
+
+        Detected by walking back from each reduction over ``self.rdim`` and
+        checking each input ``iota`` node sized to the rdim. The output-shape
+        of a load is not a reliable signal: when the arange size coincides
+        with another reduction of the same size,
+        ``allocate_reduction_dimension`` unifies them and the load axis
+        surfaces as the rdim symbol rather than a concrete int.
         """
         env = CompileEnvironment.current()
         rdim_block_id = self.rdim.block_id
@@ -477,18 +500,48 @@ class ReductionRoller:
                 env.resolve_block_id(size) == rdim_block_id for size in val.size()
             )
 
-        def is_iota_indexed_load(node: torch.fx.Node) -> bool:
-            if node.target is not load:
-                return False
+        def indexes_load(node: torch.fx.Node) -> bool:
             # load(tensor, index_list, ...): an iota in the index list cannot
             # be re-indexed in chunks inside the reduction loop.
-            for arg in node.args:
-                entries = arg if isinstance(arg, (list, tuple)) else (arg,)
-                if any(is_rdim_iota(entry) for entry in entries):
+            return any(
+                user.target is load
+                and any(
+                    node in (arg if isinstance(arg, (list, tuple)) else (arg,))
+                    for arg in user.args
+                )
+                for user in node.users
+            )
+
+        def inside_loop(node: torch.fx.Node) -> bool:
+            if is_for_loop_target(node.target) or node.target is _if:
+                return True
+            try:
+                return self.should_go_in_inner_graph(node)
+            except NotImplementedError:
+                return True
+
+        def read_inside_loop(iota: torch.fx.Node) -> bool:
+            # Whether a value inside the loop is computed from ``iota``; a
+            # reduction of a value from outside the loop ends the walk.
+            seen: set[torch.fx.Node] = set()
+            stack = list(iota.users)
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if self.is_reduction(node):
+                    source = node.args[0]
+                    if isinstance(source, torch.fx.Node) and inside_loop(source):
+                        return True
+                    continue
+                if inside_loop(node):
                     return True
+                stack.extend(node.users)
             return False
 
-        def depends_on_iota_indexed_load(reduction: torch.fx.Node) -> bool:
+        def unrollable(reduction: torch.fx.Node) -> bool:
+            free_iota = False
             seen: set[torch.fx.Node] = set()
             stack = list(reduction.all_input_nodes)
             while stack:
@@ -496,15 +549,29 @@ class ReductionRoller:
                 if node in seen:
                     continue
                 seen.add(node)
-                if node.op == "call_function" and is_iota_indexed_load(node):
-                    return True
                 stack.extend(node.all_input_nodes)
+                if not is_rdim_iota(node) or (
+                    inside_loop(node) and not indexes_load(node)
+                ):
+                    continue
+                if (
+                    indexes_load(node)
+                    or env.backend_name != "cute"
+                    or read_inside_loop(node)
+                ):
+                    return True
+                free_iota = True
+            if free_iota:
+                # Only the reductions the computed-fragment lowering takes
+                # over roll; every other lowering would refuse them.
+                from .cute.free_iota_reduction import free_iota_reductions
+
+                if reduction not in free_iota_reductions(env, self.device_ir.graphs):
+                    return True
+                reduction.meta[FREE_IOTA_REDUCTION_META] = True
             return False
 
-        return any(
-            self.is_reduction(node) and depends_on_iota_indexed_load(node)
-            for node in graph.nodes
-        )
+        return any(self.is_reduction(node) and unrollable(node) for node in graph.nodes)
 
     def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains stack tensors with rdim inputs."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -69,6 +70,16 @@ def reduce_kernel(
     )
     for tile_n in hl.tile(n):
         out[tile_n] = fn(x[tile_n, :], dim=-1)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def tile_row_sums(x: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
+    """Stores the 64 row sums of ``buf[:, :]`` at the positions of a 64-wide
+    tile, so the row dim is a full slice that a store places at the tile."""
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0), block_size=64):
+        out[tile] = buf[:, :].sum(-1)
     return out
 
 
@@ -944,6 +955,119 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
     @skipIfMetal("hl.arange needs a Metal prims.iota lowering")
+    def test_reduction_of_arange_value_stays_persistent(self):
+        """Issue #2643 variant: an ``hl.arange()`` over the reduction axis
+        entering the reduction as a value, not as a load index.
+
+        The iota is a fixed full-extent tensor either way: a reduction loop
+        would leave it outside the loop (a shape mismatch on Triton, on CuTe
+        a per-thread coordinate of another axis and a silently wrong sum),
+        so the reduction must stay persistent.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def weighted_row_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :].to(torch.float32)
+                out[tile_m] = (row * hl.arange(n).to(torch.float32)[None, :]).sum(-1)
+            return out
+
+        x = torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE)
+        bound = weighted_row_sum.bind((x,))
+        self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
+
+        _code, output = code_and_output(weighted_row_sum, (x,), block_size=2)
+        weights = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        expected = (x.to(torch.float32) * weights).sum(-1)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    @skipIfRefEager("checks the offered reduction loops and a codegen refusal")
+    @skipUnlessBackends(["cute", "triton"])
+    def test_free_arange_reduction_rolls_only_through_fragments(self):
+        """A reduction of values computed outside the loop from a free
+        ``hl.arange`` (``part * chunk + hl.arange(chunk)``): only CuTe's
+        computed-fragment lowering re-reads them per chunk, so only CuTe
+        offers a reduction loop, and any other rolled lowering refuses it
+        instead of folding the same full-extent value every chunk."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def chunk_sums(x: torch.Tensor, chunk: hl.constexpr) -> torch.Tensor:
+            parts = (x.size(1) + chunk - 1) // chunk
+            out = torch.empty((x.size(0), parts), dtype=torch.int32, device=x.device)
+            for row, part in hl.grid((x.size(0), parts)):
+                columns = part * chunk + hl.arange(chunk)
+                valid = columns < x.size(1)
+                value = hl.load(x, [row, columns], extra_mask=valid)
+                out[row, part] = torch.where(valid, value, 0).sum(dtype=torch.int32)
+            return out
+
+        x = torch.arange(3 * 131, dtype=torch.int32, device=DEVICE).reshape(3, 131)
+        x = x % 13
+        expected = torch.stack(
+            [
+                x[:, start : start + 64].sum(-1, dtype=torch.int32)
+                for start in (0, 64, 128)
+            ],
+            dim=-1,
+        )
+        bound = chunk_sums.bind((x, 64))
+        rollable = bound.config_spec.reduction_loops.valid_block_ids()
+        config = bound.config_spec.default_config()
+        torch.testing.assert_close(bound.compile_config(config)(x, 64), expected)
+        if _get_backend() != "cute":
+            self.assertEqual(rollable, [])
+            return
+        self.assertNotEqual(rollable, [])
+        config.config["reduction_loops"] = [16]
+        torch.testing.assert_close(bound.compile_config(config)(x, 64), expected)
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(
+                helion.exc.BackendUnsupported, "computed outside its loop"
+            ),
+        ):
+            bound.to_code(config)
+
+    @skipIfRefEager("checks the offered reduction loops")
+    @skipUnlessBackends(["cute", "triton"])
+    def test_free_arange_row_reduction_stays_persistent(self):
+        """The computed-fragment lowering takes only complete rank-1 free
+        ``hl.arange`` reductions, so a row-wise one over a tile of rows offers
+        no reduction loop that every lowering would refuse."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def chunk_row_sums(x: torch.Tensor, chunk: hl.constexpr) -> torch.Tensor:
+            parts = (x.size(1) + chunk - 1) // chunk
+            out = torch.empty((x.size(0), parts), dtype=torch.int32, device=x.device)
+            for rows, part in hl.tile([x.size(0), parts], block_size=[None, 1]):
+                columns = part.begin * chunk + hl.arange(chunk)
+                valid = columns < x.size(1)
+                value = hl.load(x, [rows, columns], extra_mask=valid[None, :])
+                out[rows, part] = torch.where(valid[None, :], value, 0).sum(
+                    -1, keepdim=True, dtype=torch.int32
+                )
+            return out
+
+        x = torch.arange(8 * 131, dtype=torch.int32, device=DEVICE).reshape(8, 131)
+        x = x % 13
+        expected = torch.stack(
+            [
+                x[:, start : start + 64].sum(-1, dtype=torch.int32)
+                for start in (0, 64, 128)
+            ],
+            dim=-1,
+        )
+        bound = chunk_row_sums.bind((x, 64))
+        self.assertEqual(bound.config_spec.reduction_loops.valid_block_ids(), [])
+        config = bound.config_spec.default_config()
+        torch.testing.assert_close(bound.compile_config(config)(x, 64), expected)
+
+    @skipIfMetal("hl.arange needs a Metal prims.iota lowering")
     def test_arange_reduction_with_synthetic_lanes(self):
         """A persistent ``hl.arange()`` reduction whose extent exceeds the live
         thread count must accumulate across synthetic lanes.
@@ -1462,6 +1586,151 @@ class TestReductions(RefEagerTestBase, TestCase):
             torch.testing.assert_close(maxes, x.amax(-1))
             torch.testing.assert_close(positives, (x > 0).sum(-1))
             torch.testing.assert_close(argmaxes, x.argmax(-1))
+
+    @skipIfRefEager("compiles one config for two input shapes")
+    @skipIfPallas("Pallas does not pad tensor factories to a power of two")
+    @skipIfMetal("not verified on Metal")
+    def test_padded_factory_dim_keeps_dynamic_slice_dynamic(self) -> None:
+        """A padded factory dim of 48 is not the dynamic full slice that is 48
+        wide at bind time, whichever comes first: the slice must stay dynamic,
+        so one compiled kernel serves a 40-wide input too."""
+
+        @helion.kernel(static_shapes=False)
+        def slice_plus_factory(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1) + hl.full(
+                    [tile_m, 48], 1.0, dtype=torch.float32
+                ).sum(-1)
+            return out
+
+        @helion.kernel(static_shapes=False)
+        def factory_plus_slice(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.full([tile_m, 48], 1.0, dtype=torch.float32)
+                row_sum = x[tile_m, :].sum(-1)
+                out[tile_m] = row_sum + acc.sum(-1)
+            return out
+
+        x48 = torch.rand(32, 48, device=DEVICE)
+        for kernel in (slice_plus_factory, factory_plus_slice):
+            with self.subTest(kernel=kernel.name):
+                compiled = kernel.bind((x48,)).compile_config(
+                    helion.Config(block_sizes=[16])
+                )
+                for width in (48, 40):
+                    x = torch.rand(32, width, device=DEVICE)
+                    torch.testing.assert_close(
+                        compiled(x), x.sum(-1) + 48, rtol=1e-4, atol=1e-4
+                    )
+
+    @skipIfPallas("Pallas does not pad tensor factories to a power of two")
+    @skipIfMetal("not verified on Metal")
+    def test_reduce_over_padded_factory_dim(self) -> None:
+        """``hl.zeros([tile, 400])`` pads its 400 columns to 512; a reduction
+        over that dim must see only the 400 columns of the full slice it is
+        unified with, not the padding (whose centered value is -mean)."""
+
+        @helion.kernel(static_shapes=True)
+        def centered_square_sum(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            n = hl.specialize(x.size(1))
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, n], dtype=torch.float32)
+                acc = acc + x[tile_m, :]
+                centered = acc - acc.sum(-1, keepdim=True) / n
+                out[tile_m] = (centered * centered).sum(-1)
+            return out
+
+        x = torch.rand(32, 400, device=DEVICE) + 1.0
+        _, out = code_and_output(centered_square_sum, (x,), block_sizes=[16])
+        expected = ((x - x.mean(-1, keepdim=True)) ** 2).sum(-1)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+    @skipIfRefEager("inspects the reduction_loops config surface")
+    @skipIfPallas("Pallas lowers full slices without reduction loops")
+    @skipIfMetal("not verified on Metal")
+    def test_rows_stored_at_tile_positions_are_not_rolled(self) -> None:
+        """``out[tile] = buf[:, :].sum(-1)`` stores the 64 slice rows at the
+        tile's positions.  Rolling the row dim would hand each chunk of rows
+        to a store that names all 64 tile positions (and zero only one chunk
+        of a full-slice store), so only the reduced column dim is rollable."""
+
+        x = torch.randn(64, device=DEVICE)
+        buf = torch.randn(64, 128, device=DEVICE)
+        bound = tile_row_sums.bind((x, buf))
+        rollable = [
+            bound.env.block_sizes[spec.block_ids[0]].size
+            for spec in bound.config_spec.reduction_loops
+        ]
+        self.assertEqual(rollable, [128])
+        if _get_backend() == "cute":
+            # The rows still reach the tile's lanes through an exchange that
+            # CuTe cannot place inside the lane loop this layout needs: it
+            # must refuse, not return a partial result.
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                code_and_output(tile_row_sums, (x, buf))
+            return
+        _, out = code_and_output(tile_row_sums, (x, buf), reduction_loops=[32])
+        torch.testing.assert_close(out, buf.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipIfRefEager("reduction_loops only exists in compiled mode")
+    @skipIfPallas("Pallas lowers full slices without reduction loops")
+    @skipIfMetal("not verified on Metal")
+    def test_rolled_column_sum_beside_a_live_row_axis(self) -> None:
+        """``out[tile] = buf[:, :].sum(-1)`` with the column dim rolled: the
+        row dim stays persistent and, allocated first, takes the lowest thread
+        axis on CuTe, below the column chunk's lanes.  The chunk's finalize
+        must combine the column lanes of each row, not consecutive lanes
+        (which are rows); a plain 4-lane warp reduce summed 4 rows.  Covers
+        the grouped warp reduce and the two-stage shared reduce."""
+
+        @helion.kernel(static_shapes=True)
+        def row_sums(x: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+            for tile in hl.tile(x.size(0), block_size=x.size(0)):
+                out[tile] = buf[:, :].sum(-1)
+            return out
+
+        for rows, cols, chunk in (
+            (8, 16, 4),
+            (8, 64, 4),
+            (8, 64, 32),
+            (8, 256, 16),
+            (4, 512, 8),
+            (4, 512, 64),
+            (16, 128, 16),
+        ):
+            with self.subTest(rows=rows, cols=cols, chunk=chunk):
+                x = torch.randn(rows, device=DEVICE)
+                buf = torch.randn(rows, cols, device=DEVICE)
+                _, out = code_and_output(row_sums, (x, buf), reduction_loops=[chunk])
+                torch.testing.assert_close(out, buf.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipIfRefEager("reduction_loops only exists in compiled mode")
+    @skipIfPallas("Pallas lowers full slices without reduction loops")
+    @skipIfMetal("not verified on Metal")
+    def test_reduction_chunk_lookup_skips_an_unregistered_earlier_dim(self) -> None:
+        """``config.reduction_loops`` has a slot per *rollable* dim only.  The
+        row dim of ``buf[:, :].sum(-1)`` stored at tile positions is not
+        rollable, so the column dim allocated after it owns slot 0: a chunk
+        lookup by allocation order handed the column chunk to the rows."""
+
+        bound = tile_row_sums.bind(
+            (torch.randn(64, device=DEVICE), torch.randn(64, 128, device=DEVICE))
+        )
+        config = helion.Config(block_sizes=[64], reduction_loops=[32])
+        with bound.env:
+            chunks = {
+                info.size: info.from_config(config)
+                for info in bound.env.block_sizes
+                if info.reduction
+            }
+        self.assertEqual(chunks, {64: 64, 128: 32})
 
     @skipIfNotCUDA()
     @skipIfRefEager(

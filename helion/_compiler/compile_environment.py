@@ -1417,7 +1417,9 @@ class CompileEnvironment:
             )
         return idx
 
-    def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
+    def allocate_reduction_dimension(
+        self, size: torch.SymInt | int, *, guard: bool = True
+    ) -> BlockSizeInfo:
         # Check if this size is already a registered block size
         existing_block: BlockSizeInfo | None = None
         if isinstance(size, torch.SymInt):
@@ -1444,12 +1446,26 @@ class CompileEnvironment:
         # _maybe_evaluate_static (no new guards) and returns False when the
         # equality is undecidable. Backed sizes keep the guarding ``==`` so
         # distinct input symbols that are equal by hint (e.g. x.size(1) vs
-        # weight.size(0)) still unify into a single rdim.
+        # weight.size(0)) still unify into a single rdim, and so does a dynamic
+        # full slice with the dim of a specialized one (``weight[:]`` beside
+        # ``y[tile, :]`` of ``n = hl.specialize(y.size(1))``: the elementwise
+        # op between them needs the one dim).  A literal factory dim
+        # (``guard=False``, see ``BlockSizeInfo.literal_size``) matches and is
+        # matched only by sizes known equal: a padded ``hl.full([tile, 48])``
+        # must not specialize a dynamic full slice that is 48 at bind time.
         for rdim in self.block_sizes:
             if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
                 continue
-            if _has_unbacked(rdim.size) or _has_unbacked(size):
+            if (
+                not guard
+                or rdim.literal_size
+                or _has_unbacked(rdim.size)
+                or _has_unbacked(size)
+            ):
                 if self.known_equal(rdim.size, size):
+                    if guard:
+                        # A non-literal size joined it: it unifies as usual now.
+                        rdim.literal_size = False
                     return rdim
             elif rdim.size == size:
                 return rdim
@@ -1460,9 +1476,7 @@ class CompileEnvironment:
         rdim_idx = self.allocate_block_size(
             size,
             reduction=True,
-            source=ReductionLoopBlockSizeSource(
-                sum([int(bs.reduction) for bs in self.block_sizes])
-            ),
+            source=ReductionLoopBlockSizeSource(),
             # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
             # causes Inductor to see reduction_numel==1 and skip the reduction
             # instead of generating a masked reduction that yields the identity value.
@@ -1472,7 +1486,9 @@ class CompileEnvironment:
             else next_power_of_2(self.size_hint(size)),
             reuse_var=reuse_var,
         )
-        return self.block_sizes[rdim_idx]
+        info = self.block_sizes[rdim_idx]
+        info.literal_size = not guard
+        return info
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         source = _current_symbol_source()
@@ -2227,6 +2243,12 @@ class BlockSizeInfo:
     reduction: bool
     block_size_source: BlockSizeSource
     debug_names: set[str] = dataclasses.field(default_factory=set)
+    # A reduction dim allocated for a literal tensor-factory size
+    # (``allocate_reduction_dimension(..., guard=False)``): it unifies with
+    # another size only when they are known equal, never by guarding a dynamic
+    # input size to the literal.  Cleared once a known-equal non-literal size
+    # (a full slice of a specialized dim) joins it.
+    literal_size: bool = False
 
     def add_debug_name(self, name: str) -> None:
         if not name:
@@ -2361,19 +2383,22 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 
 @dataclasses.dataclass
 class ReductionLoopBlockSizeSource(BlockSizeSource):
-    reduction_loop: int
-
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
-        if (
-            len(config.reduction_loops) <= self.reduction_loop
-            or config.reduction_loops[self.reduction_loop] is None
-        ):
+        # ``config.reduction_loops`` holds one entry per *registered* rollable
+        # dim (``config_spec.reduction_loops``), so look the dim up by block id
+        # as the strategy selection does: an unregistered earlier dim would
+        # shift a positional index onto another dim's chunk.
+        env = CompileEnvironment.current()
+        chunk = env.config_spec.reduction_loops.config_get(
+            config.reduction_loops, block_size_info.block_id, None
+        )
+        if chunk is None:
             size = max(1, block_size_info.size_hint())
             # Backends override static_rdim_size to control whether the
             # persistent-reduction extent is rounded up to a power of two
             # (Triton/CuTe) or kept exact (Pallas).
-            return CompileEnvironment.current().backend.static_rdim_size(size)
-        return config.reduction_loops[self.reduction_loop]
+            return env.backend.static_rdim_size(size)
+        return chunk
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
