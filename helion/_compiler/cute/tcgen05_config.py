@@ -524,6 +524,13 @@ class CuteTcgen05Config:
         # for the SMEM tcgen05 MMA, so the dot lowers through the non-tcgen05
         # fallback and the FFI/flat-role direct-entry seed must stay ineligible.
         self.matmul_has_non_tcgen05_operand: bool = False
+        # False when a matmul A/B operand fails the TensorMap alignment proof
+        # the tcgen05 TMA pipeline needs (e.g. an input whose base pointer or
+        # outer byte stride is not a 16-byte multiple). Codegen then keeps the
+        # scalar SMEM producers, so the TMA-only flat-role / FFI direct-entry
+        # seed must stay ineligible. Decided in the compiler-facts phase by
+        # ``CuteTcgen05ClusterM2FfiHeuristic.register_facts``.
+        self.matmul_operands_tma_provable: bool = True
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -1858,6 +1865,10 @@ class CuteTcgen05Config:
         # bf16) forces the dot through the non-tcgen05 fallback, where the
         # flat-role / FFI seed config is rejected.
         if self.matmul_has_non_tcgen05_operand:
+            return False
+        # The flat-role launch path hard-requires the TMA A/B pipeline, which
+        # codegen disables when either operand's alignment is unprovable.
+        if not self.matmul_operands_tma_provable:
             return False
         constraints = self.cluster_m2_search_constraints
         if (

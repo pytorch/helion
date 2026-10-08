@@ -6204,6 +6204,41 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
     backend = "cute"
 
     @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # The flat-role / FFI direct-entry seed hard-requires the TMA A/B
+        # pipeline, which codegen enables only when both matmul operands pass
+        # the TensorMap alignment proof; an unaligned input keeps the scalar
+        # SMEM producers and the seed config fails to compile. Decide that
+        # here, before any seed or the search surface consults
+        # ``full_tile_direct_entry_seed_eligible``, and even when heuristic
+        # seeds are disabled, because the default projection reads it too.
+        host_function = device_ir.host_function
+        if host_function is None or not env.config_spec.cute_tcgen05_search_enabled:
+            return frozenset()
+        from ..cute.cute_mma import host_function_matmul_operands_tma_provable
+
+        # Codegen proves a pointer-preserving host view operand through its
+        # input's exact metadata (``input_view_copy_facts``), which this hook
+        # therefore requests (the static-shapes bind key already carries it);
+        # evaluate the proof under that registration so the bind-time and
+        # codegen answers agree.
+        facts: frozenset[CompilerHeuristicSpecializationFact] = (
+            frozenset({"input_tensor_metadata"})
+            if env.settings.static_shapes
+            else frozenset()
+        )
+        saved = env.compiler_fact_specialization_facts
+        env.compiler_fact_specialization_facts = saved | facts
+        try:
+            provable = host_function_matmul_operands_tma_provable(env, host_function)
+        finally:
+            env.compiler_fact_specialization_facts = saved
+        env.config_spec.cute_tcgen05_matmul_operands_tma_provable = provable
+        return facts
+
+    @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         return env.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
 

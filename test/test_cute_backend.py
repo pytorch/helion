@@ -10442,6 +10442,78 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
         self.assertNotIn("dot_serial_result", code)
 
+    def test_matmul_direct_grouped_n_rounds_to_declared_dtype(self) -> None:
+        # The direct warp-MMA path accumulates in fp32; a bf16 x bf16 matmul
+        # whose declared dtype is bf16 must still round before the user's
+        # widening cast observes it.
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = (x[tile_m, :] @ y[:, :]).to(torch.float32)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        self.assertIn("cute.gemm", code)
+        self.assertIn("cutlass.BFloat16(direct_mma_result", code)
+        self.assertEqual(out.dtype, torch.float32)
+        torch.testing.assert_close(
+            out, out.to(torch.bfloat16).to(torch.float32), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out, (args[0] @ args[1]).float(), atol=1e-1, rtol=1e-2
+        )
+
+    def test_matmul_m_major_lhs_non_pipelined_tma_kloop(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        # An M-major fp16 A (stride(-2) == 1, e.g. ``mat1.T`` in the matmul
+        # autograd backward) disables A-TMA while B stays TMA-eligible, so the
+        # K loop takes the non-pipelined branch under the default config.
+        @helion.kernel(backend="cute", static_shapes=True)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        m = n = k = 256
+        torch.manual_seed(0)
+        x = torch.randn(k, m, device=DEVICE, dtype=torch.float16).T
+        for transpose_rhs in (False, True):
+            with self.subTest(transpose_rhs=transpose_rhs):
+                y = (
+                    torch.randn(n, k, device=DEVICE, dtype=torch.float16).T
+                    if transpose_rhs
+                    else torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+                )
+                code, out = code_and_output(matmul, (x, y), block_sizes=[128, 16, 16])
+                self.assertIn("cute.gemm", code)
+                self.assertIn(
+                    "tcgen05_ab_consumer_try_token = "
+                    "tcgen05_ab_pipeline.consumer_try_wait(",
+                    code,
+                )
+                expected = (x.float() @ y.float()).to(out.dtype)
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+
     def test_matmul_direct_grouped_n_slice_operands_use_mma(self) -> None:
         @helion.kernel(
             backend="cute",
