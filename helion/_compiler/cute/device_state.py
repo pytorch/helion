@@ -650,6 +650,11 @@ class CuteDeviceFunctionState:
         # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
         # no V-loop is sunk after all, codegen restarts with the knob off.
         self.vloop_sink_layout_applied = False
+        # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
+        # matmul product sum or a lane-loop reduction marker) assumed for the
+        # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
+        # block shape that differs from them on any axis.
+        self.multi_phase_lane_reduce_layouts: list[tuple[str, dict[int, int]]] = []
         self.explicit_rng_seed_names: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
