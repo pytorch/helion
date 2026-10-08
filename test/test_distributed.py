@@ -6,6 +6,7 @@ import io
 import itertools
 import os
 import re
+from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 import warnings
@@ -35,6 +36,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -46,6 +48,9 @@ from helion.autotuner.effort_profile import DifferentialEvolutionConfig
 from helion.autotuner.effort_profile import PatternSearchConfig
 from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
 
 autotuner_names = ["fixed", *search_algorithms]
 
@@ -103,6 +108,15 @@ def _remote_views(
     t: torch.Tensor, group_name: hl.constexpr
 ) -> tuple[torch.Tensor, ...]:
     return torch.ops.symm_mem.get_remote_tensors(t, group_name)
+
+
+def _with_pipeline(
+    kernel: helion.Kernel, args: tuple[object, ...], pipeline: str
+) -> BoundKernel[object]:
+    bound = kernel.bind(args)
+    config = bound.config_spec.default_config().config
+    bound.set_config(helion.Config(**{**config, "cross_loop_pipeline": pipeline}))
+    return bound
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -311,6 +325,82 @@ def row_exchange_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def matrix_exchange_kernel(
+    symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        symm[tile_m, tile_n] = x[tile_m, tile_n]
+    for tile_m, tile_n in hl.tile(x.size()):
+        acc = hl.zeros([tile_m, tile_n], dtype=x.dtype)
+        for peer in peers:
+            acc = acc + peer[tile_m, tile_n]
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def scatter_exchange_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    half = symm.size(1) // 2
+    for tile_h, tile_t in hl.tile([2, x.size(0)], block_size=[1, 1]):
+        # Tasks past the count skip; a negative row writes nothing.
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            cols = tile_h.begin * half + hl.arange(half)
+            hl.store(
+                symm,
+                [row, cols],
+                x[tile_t.begin, :, cols],
+                extra_mask=(row >= 0)[:, None],
+            )
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[8, 32]):
+        acc = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            acc = acc + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def scatter_matmul_exchange_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    half = symm.size(1) // 2
+    for tile_h, tile_t in hl.tile([2, x.size(0)], block_size=[1, 1]):
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            cols = tile_h.begin * half + hl.arange(half)
+            acc = hl.zeros([row.size(0), half], dtype=torch.float32)
+            for tile_k in hl.tile(x.size(2)):
+                acc = hl.dot(x[tile_t.begin, :, tile_k], w[tile_k, cols], acc=acc)
+            hl.store(
+                symm, [row, cols], acc.to(symm.dtype), extra_mask=(row >= 0)[:, None]
+            )
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[128, 32]):
+        total = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            total = total + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = total
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -515,62 +605,194 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize("variant", ("inband", "R1"))
-    def test_pipelined_allreduce_replays(self, variant: str) -> None:
+    @parametrize("pipeline", ("static", "dynamic"))
+    @parametrize("dtype", (torch.float32, torch.bfloat16))
+    def test_pipelined_allreduce_replays(
+        self, variant: str, pipeline: str, dtype: torch.dtype
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
-        symm = symm_mem.empty(n, device=self.device)
+        symm = symm_mem.empty(n, device=self.device, dtype=dtype)
         symm_mem.rendezvous(symm, group=group)
-        x = torch.empty(n, device=self.device)
+        x = torch.empty(n, device=self.device, dtype=dtype)
+        # Distinct small integers per element stay exact in bf16 and catch lane
+        # mixups in packed words.
+        lane = torch.arange(n, device=self.device, dtype=dtype) % 16
         args = (symm, x, group.group_name, variant, world)
+        bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline)
         outs = []
 
         def launch(step: int, replay: bool = False) -> None:
             # Skewed ranks overwrite symm while peers may still read the last
             # launch's values, which the done barrier orders.
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
-            x.fill_(n * step + self.rank)
+            x.copy_(lane + 4 * step + self.rank)
             if replay:
                 graph.replay()
                 outs.append(graph_out.clone())
             else:
-                outs.append(pipelined_allreduce_kernel(*args).clone())
+                outs.append(bound(*args).clone())
 
         for step in range(4):
             launch(step)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_out = pipelined_allreduce_kernel(*args)
+            graph_out = bound(*args)
         # Alternate graph replays with eager launches.
         for step in range(4, 12):
             launch(step, replay=step % 2 == 0)
         torch.cuda.synchronize()
         for step, out in enumerate(outs):
-            expected = n * step * world + world * (world - 1) // 2
-            torch.testing.assert_close(out, torch.full_like(out, expected))
+            expected = world * (lane + 4 * step) + world * (world - 1) // 2
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
         self._cleanup_process()
 
     @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    @parametrize("moment_dtype", (torch.float32, torch.float64))
-    def test_chained_exchanges_replay(self, moment_dtype: torch.dtype) -> None:
+    def test_matrix_exchange_masked_rows(self) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        # 20 rows in 8-row tiles: the last tile masks rows, pairs pack columns.
+        symm = symm_mem.empty(20, 256, device=self.device, dtype=torch.bfloat16)
+        symm_mem.rendezvous(symm, group=group)
+        x = torch.empty(20, 256, device=self.device, dtype=torch.bfloat16)
+        bound = matrix_exchange_kernel.bind((symm, x, group.group_name))
+        config = bound.config_spec.default_config().config
+        bound.set_config(helion.Config(**{**config, "block_sizes": [8, 64, 8, 64]}))
+        lane = torch.arange(20 * 256, device=self.device).view(20, 256) % 16
+        for step in range(4):
+            torch.cuda._sleep(100_000 * ((self.rank + step) % self.world_size))
+            x.copy_(lane + 4 * step + self.rank)
+            out = bound(symm, x, group.group_name)
+            world = self.world_size
+            expected = world * (lane + 4 * step) + world * (world - 1) // 2
+            torch.testing.assert_close(out, expected.to(out.dtype), rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize("dtype", (torch.bfloat16, torch.float32))
+    def test_inband_scatter_reads_unwritten_rows(self, dtype: torch.dtype) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        world, tasks, lanes, cols = self.world_size, 4, 8, 64
+        symm = symm_mem.empty(tasks * lanes, cols, device=self.device, dtype=dtype)
+        symm_mem.rendezvous(symm, group=group)
+        # Every rank mirrors each rank's buffer; rows no task writes keep values.
+        index = torch.arange(tasks * lanes * cols).view(tasks, lanes, cols)
+        init = index.view(tasks * lanes, cols) % 5
+        mirror = torch.stack([200 + r + init for r in range(world)]).float()
+        symm.copy_(mirror[self.rank])
+        torch.cuda.synchronize()
+        dist.barrier()
+        x = torch.empty(tasks, lanes, cols, device=self.device, dtype=dtype)
+        rows = torch.empty(tasks, lanes, device=self.device, dtype=torch.int32)
+        count = torch.empty(1, device=self.device, dtype=torch.int32)
+        args = (symm, x, rows, count, group.group_name)
+        bound = scatter_exchange_kernel.bind(args)
+        for step in range(6):
+            generator = torch.Generator().manual_seed(step)
+            plans = []
+            for r in range(world):
+                # Odd steps skip the last task and every third lane of the rest.
+                row = torch.randperm(tasks * lanes, generator=generator)
+                row = row.view(tasks, lanes).to(torch.int32)
+                live = tasks - step % 2
+                if step % 2:
+                    row[:, ::3] = -1
+                values = ((index * (r + 1) + 3 * step) % 128).float()
+                for t in range(live):
+                    written = row[t] >= 0
+                    mirror[r, row[t][written].long()] = values[t][written]
+                plans.append((values, row, live))
+            values, row, live = plans[self.rank]
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            x.copy_(values)
+            rows.copy_(row)
+            count.fill_(live)
+            out = bound(*args)
+            expected = mirror.sum(0).to(self.device)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @skipIfCudaCapabilityLessThan((10, 0), reason="warp specialization needs sm100")
+    def test_inband_scatter_fallback_with_warp_specialized_producer(self) -> None:
+        # Reading unwritten rows must not hang while WS worker warps are parked.
+        self._init_process()
+        group = dist.group.WORLD
+        world, tasks, lanes, cols, k = self.world_size, 2, 128, 64, 64
+        dtype = torch.bfloat16
+        symm = symm_mem.empty(tasks * lanes, cols, device=self.device, dtype=dtype)
+        symm_mem.rendezvous(symm, group=group)
+        symm.fill_(self.rank + 1)
+        torch.cuda.synchronize()
+        dist.barrier()
+        x = torch.arange(tasks * lanes * k, device=self.device) % 2
+        x = x.view(tasks, lanes, k).to(dtype)
+        w = torch.ones(k, cols, device=self.device, dtype=dtype)
+        # Only task 0 runs, and every third of its lanes writes nothing.
+        rows = torch.arange(tasks * lanes, device=self.device, dtype=torch.int32)
+        rows = rows.view(tasks, lanes)
+        rows[:, ::3] = -1
+        count = torch.ones(1, device=self.device, dtype=torch.int32)
+        args = (symm, x, w, rows, count, group.group_name)
+        bound = scatter_matmul_exchange_kernel.bind(args)
+        config = bound.config_spec.default_config().config
+        ws = {"block_sizes": [32], "range_warp_specializes": [None, True, None]}
+        bound.set_config(helion.Config(**{**config, **ws}))
+        code = bound.to_triton_code()
+        self.assertIn("warp_specialize=True", code)
+        self.assertIn("_scatter_cover(", code)
+        written = torch.zeros(tasks * lanes, 1, device=self.device, dtype=torch.bool)
+        written[rows[0][rows[0] >= 0].long()] = True
+        # Each written element sums k // 2 ones; unwritten rows keep rank + 1.
+        expected = torch.where(
+            written, world * k // 2, world * (world + 1) // 2
+        ).expand(tasks * lanes, cols)
+        for step in range(3):
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            out = bound(*args)
+            torch.testing.assert_close(out, expected.float(), rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize(
+        "dtypes",
+        (
+            (torch.float32, torch.float32),
+            (torch.float32, torch.float64),
+            (torch.float64, torch.float32),
+        ),
+    )
+    @parametrize("pipeline", ("static", "dynamic"))
+    def test_chained_exchanges_replay(
+        self, dtypes: tuple[torch.dtype, torch.dtype], pipeline: str
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
-        # A float64 moment mixes in-band and peer-counter transports.
+        # An 8-byte buffer mixes in-band and peer-counter transports.
         symm, moment = (
-            symm_mem.empty(n, device=self.device),
-            symm_mem.empty(1, device=self.device, dtype=moment_dtype),
+            symm_mem.empty(n, device=self.device, dtype=dtypes[0]),
+            symm_mem.empty(1, device=self.device, dtype=dtypes[1]),
         )
         symm_mem.rendezvous(symm, group=group)
         symm_mem.rendezvous(moment, group=group)
-        x = torch.empty(n, device=self.device)
+        x = torch.empty(n, device=self.device, dtype=dtypes[0])
         args = (symm, moment, x, group.group_name)
-        chained_exchange_kernel(*args)
+        bound = _with_pipeline(chained_exchange_kernel, args, pipeline)
+        bound(*args)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_out = chained_exchange_kernel(*args)
+            graph_out = bound(*args)
         for step in range(8):
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
             x.fill_(step + self.rank)
@@ -578,7 +800,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 graph.replay()
                 out = graph_out
             else:
-                out = chained_exchange_kernel(*args)
+                out = bound(*args)
             # total = world * step + 6, plus each rank's copy of its mean.
             expected = (world + 1) * (world * step + world * (world - 1) // 2)
             torch.testing.assert_close(out, torch.full_like(out, expected))
@@ -1218,11 +1440,11 @@ class TestDistributedTileDependencies(TestCase):
             ("R3", torch.float32, "use peer_counter (R3:"),
             ("R4", torch.float32, "use peer_counter (R4:"),
             ("R6", torch.float32, "use peer_counter (R6:"),
-            # Exactly 1 MiB per rank stays inband; 2 ranks * 2**17 words does not.
+            # Exactly 32 MiB per rank stays inband; 2 ranks * 2**22 words does not.
             ("cap", torch.float32, "use inband"),
             ("R7", torch.float32, "use peer_counter (R7:"),
         ):
-            n = {"cap": (1 << 20) // (8 * world), "R7": 1 << 17}.get(broken_rule, 256)
+            n = {"cap": (1 << 25) // (8 * world), "R7": 1 << 22}.get(broken_rule, 256)
             symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
             with (
                 self.subTest(broken_rule=broken_rule, dtype=dtype),
@@ -1243,26 +1465,48 @@ class TestDistributedTileDependencies(TestCase):
         symm, x = torch.zeros(2, 256, device=DEVICE)
         group = self._world(world, inband_rule_kernel)
         bound = inband_rule_kernel.bind((symm, x, group, "R1", world))
-        # Only the dynamic pipeline carries cross-rank transports.
-        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("dynamic",))
-        config = bound.config_spec.default_config()
-        with self.assertRaisesRegex(helion.exc.InvalidConfig, "cross_loop_pipeline"):
-            bound.config_spec.normalize(
-                {**config.config, "cross_loop_pipeline": "static"}
-            )
-        code = bound.to_triton_code(
-            helion.Config(**{**config.config, "block_sizes": [64, 64, 64]})
+        # Peer counters and inband data order either pipeline.
+        self.assertEqual(
+            bound.config_spec.cross_loop_pipeline.choices, ("static", "dynamic")
         )
-        # Root 1 publishes to its slot and the done slot on every rank. Root 2
-        # waits for 256 / 64 tasks per rank, and the last ticket for roots 1 and 2.
+        config = bound.config_spec.default_config().config
         state = "tile_dependency_peer_state"
-        for expected in (
-            f"_add_on_every_rank({state}_ptrs, 0, {world}, {world})",
-            f"_add_on_every_rank({state}_ptrs, 16, {world}, {world})",
-            f"{state} + 0, tile_dependency_peer_epoch * {4 * world})",
-            f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
-        ):
-            self.assertIn(expected, code)
+        for pipeline in ("static", "dynamic"):
+            code = bound.to_triton_code(
+                helion.Config(
+                    **{
+                        **config,
+                        "block_sizes": [64, 64, 64],
+                        "cross_loop_pipeline": pipeline,
+                    }
+                )
+            )
+            # Root 1 adds its task's key on every rank and root 2 waits for its key
+            # from each rank. Both roots' 4 + 4 workers publish to the done slot.
+            keys = "tile_dependency_peer_keys"
+            for expected in (
+                f"_add_on_every_rank({keys}_ptrs, 0 + (",
+                f"{world}, {world}, 'release')",
+                f"tl.cast(tile_dependency_peer_epoch * {world}, tl.uint64)",
+                f"_add_on_every_rank({state}_ptrs, 16, {world}, {world})",
+                f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
+            ):
+                self.assertIn(expected, code)
+            # A static launch takes its epoch from the slot after the done slot,
+            # which worker 0 advances once every rank is done with the launch.
+            launch = (
+                f"tile_dependency_peer_epoch = tl.load({state} + 17) + 1",
+                f"tl.store({state} + 17, tile_dependency_peer_epoch)",
+            )
+            for expected in launch:
+                if pipeline == "static":
+                    self.assertIn(expected, code)
+                else:
+                    self.assertNotIn(expected, code)
+        bound = inband_rule_kernel.bind((symm, x, group, "", world))
+        self.assertEqual(
+            bound.config_spec.cross_loop_pipeline.choices, ("static", "dynamic")
+        )
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1287,16 +1531,23 @@ class TestDistributedTileDependencies(TestCase):
             self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
             self.assertIn("tl.store(symm + ", code)
             self.assertEqual(code.count("@p bra SPIN"), 1)
+            # Outside WS loops, every rank's words reload together on a CTA vote.
+            self.assertEqual(code.count("while inband_stale != 0:"), 1)
+            self.assertIn(f"bar.red.or.pred q, 0, {32 * num_warps}, p;", code)
             words = ", ".join(["tl.uint64"] * world)
             self.assertIn(f"dtype=({words}), is_pure=False, pack={pack})", code)
-            # Two parities of a word per rank and element, then the done slot.
-            self.assertIn(f"(x, {2 * world * 4000 + 1}, torch.uint64, True)", code)
+            # Two parities of a word per rank and element, the done and launch slots.
+            self.assertIn(f"(x, {2 * world * 4000 + 2}, torch.uint64, True)", code)
             self.assertNotIn("_wait_at_least", code)
             self.assertNotIn("_add_on_every_rank", code)
+        # Under dynamic tickets the poller waits only in band, yet still warms
+        # its code with a dry pass.
+        code = bound.to_triton_code({**config, "cross_loop_pipeline": "dynamic"})
+        self.assertEqual(code.count("for tile_dependency_dry_pass in"), 1)
         # A push may be the kernel's first tensor access.
         bound = pipelined_allreduce_kernel.bind((symm, x, group, "constant", world))
         code = bound.to_triton_code()
-        self.assertIn("st.relaxed.sys.global.u64", code)
+        self.assertIn("st.relaxed.sys.global", code)
         self.assertIn("tl.store(symm + ", code)
         # Debug output touches no memory, so it does not block the analysis.
         bound = pipelined_allreduce_kernel.bind((symm, x, group, "print", world))
@@ -1308,6 +1559,18 @@ class TestDistributedTileDependencies(TestCase):
         code = bound.to_triton_code({**config, "range_num_stages": [0, 0, 3]})
         self.assertIn("_BLOCK_SIZE_2, num_stages=1)", code)
         self.assertNotIn("num_stages=3", code)
+        # Aligned tiles pack two bf16 per word and push 16-byte word pairs; each
+        # reader polls whole words and unpacks both lanes in-thread.
+        symm, x = torch.zeros(2, 4096, device=DEVICE, dtype=torch.bfloat16)
+        code = pipelined_allreduce_kernel.bind(
+            (symm, x, group, "inband", world)
+        ).to_triton_code()
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertNotIn("st.relaxed.sys.global.u64", code)
+        self.assertIn("<< 16 | tile_dependency_peer_epoch << 32", code)
+        self.assertIn("tl.reshape(tl.join(tl.cast(tl.cast(inband_word", code)
+        self.assertNotIn("% 2, tl.uint64) * 16", code)
+        self.assertIn(f"(x, {2 * world * 2048 + 2}, torch.uint64, True)", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1316,11 +1579,33 @@ class TestDistributedTileDependencies(TestCase):
         moment = torch.zeros(1, device=DEVICE)
         group = self._world(world, chained_exchange_kernel)
         code = chained_exchange_kernel.bind((symm, moment, x, group)).to_triton_code()
-        # Both buffers go in band, each with its own push and poll.
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 2 * world)
+        # Both buffers go in band, each with its own push and poll. The even
+        # symm tiles push word pairs; the one-element moment pushes single words.
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
         self.assertEqual(code.count("@p bra SPIN"), 2)
         self.assertNotIn("_wait_at_least", code)
         self.assertNotIn("_add_on_every_rank", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_inband_pair_address_from_axis_vectors(self, world: int) -> None:
+        symm = torch.zeros(20, 256, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.zeros_like(symm)
+        group = self._world(world, matrix_exchange_kernel)
+        bound = matrix_exchange_kernel.bind((symm, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "block_sizes": [8, 64, 8, 64]})
+        # Pair addresses and the row mask come from per-axis vectors: only the
+        # column vector is split, never the full offset or mask tile.
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertIn("tl.reshape(indices_1, [_BLOCK_SIZE_1 // 4, 2, 2])", code)
+        self.assertIn("(indices_0[:, None] * 256 + inband_lane_10[None, :] * 1", code)
+        self.assertIn("tl.cast(mask_0[:, None], tl.int32), [_BLOCK_SIZE_0, ", code)
+        self.assertNotIn("tl.reshape(inband_offset", code)
+        # The masked poll reads the same words and unpacks them in-thread.
+        self.assertIn("tl.reshape(tl.join(", code)
+        self.assertNotIn("% 2, tl.uint64) * 16", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1335,9 +1620,30 @@ class TestDistributedTileDependencies(TestCase):
         # Only roots 2 and 3 publish to the done slot, and the last ticket waits
         # for their 1 + 4096 / 512 tasks, not also the in-band roots' 4 + 4.
         done = f"tile_dependency_peer_state + {2 * world * 4096 + 16}"
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
         self.assertEqual(code.count("_add_on_every_rank"), 3)
         self.assertIn(f"{done}, tile_dependency_peer_epoch * {9 * world})", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_done_barrier_skips_ended_roots(self, world: int) -> None:
+        symm, x = torch.zeros(2, 4096, device=DEVICE, dtype=torch.float64)
+        moment = torch.zeros(1, device=DEVICE)
+        group = self._world(world, chained_exchange_kernel)
+        bound = chained_exchange_kernel.bind((symm, moment, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "block_sizes": [1024, 1024, 1, 512]})
+        # R2 rejects the 8-byte symm, so root 1 waits on root 0's keyed counters.
+        # A barrier orders root 1 before root 2, whose in-band moment every rank
+        # polls in full, so root 1 ends before any launch and no root needs done.
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("_add_on_every_rank"), 1)
+        self.assertIn("_add_on_every_rank(tile_dependency_peer_keys_ptrs", code)
+        self.assertNotIn("_wait_at_least", code)
+        # Without a done barrier each static worker counts its own launches.
+        launch = "tile_dependency_peer_launch + tl.program_id(0)"
+        self.assertIn(f"tile_dependency_peer_epoch = tl.load({launch}) + 1", code)
+        self.assertIn(f"tl.store({launch}, tile_dependency_peer_epoch)", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1350,7 +1656,7 @@ class TestDistributedTileDependencies(TestCase):
         (line,) = logs.output
         self.assertIn("on peers/symm use inband", line)
         code = bound.to_triton_code()
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("st.relaxed.sys.global"), world)
         self.assertNotIn("_wait_at_least", code)
         # In a [2, N] buffer the same store fills only row 0, which R2 rejects.
         symm = torch.zeros(2, 256, device=DEVICE)
@@ -1358,6 +1664,36 @@ class TestDistributedTileDependencies(TestCase):
             row_exchange_kernel.bind((symm, x, dist.group.WORLD.group_name))
         (line,) = logs.output
         self.assertIn("on peers/symm use peer_counter (R2:", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_inband_scatter_records_rows(self, world: int) -> None:
+        symm = torch.zeros(32, 64, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.zeros(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+        rows = torch.zeros(4, 8, device=DEVICE, dtype=torch.int32)
+        count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        group = self._world(world, scatter_exchange_kernel)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            bound = scatter_exchange_kernel.bind((symm, x, rows, count, group))
+        (line,) = logs.output
+        self.assertIn("on peers/symm use inband", line)
+        # Only a static launch marks the guard-skipped tasks.
+        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("static",))
+        code = bound.to_triton_code()
+        # Each task records one tagged key per row, then pushes a done word to
+        # every rank; skipped tasks push all-ones done words instead.
+        self.assertEqual(code.count("inband_record = "), 1)
+        self.assertEqual(code.count("inband_done = "), 1)
+        self.assertIn("tl.cast(tl.sum(inband_record), tl.uint64)", code)
+        self.assertIn("tile_dependency_peer_epoch << 32 | 4294967295", code)
+        # After a long spin, readers scan each source's records and done words and
+        # copy rows no task wrote from the peer's buffer into the mailbox.
+        self.assertEqual(code.count("_scatter_cover("), world)
+        self.assertIn("tl.pointer_type(tl.uint32)) + inband_offset_", code)
+        self.assertIn("tl.store(inband_address_", code)
+        self.assertIn("_hold_after_fallback(tile_dependency_peer_state", code)
+        # The record key must index the row block the reader computes.
+        self.assertIn("% 64 // 32 * 1 + inband_offset_1 // 64 * 2", code)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:

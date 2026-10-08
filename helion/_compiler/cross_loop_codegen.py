@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -31,6 +32,7 @@ from .host_function import HostFunction
 from .program_id import _clone_ast_value
 from .program_id import _clone_stmt
 from .program_id import typed_program_id
+from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
@@ -40,6 +42,7 @@ from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
 from .tile_dependency import tile_dependency_site_id
 from .tile_strategy import L2GroupingProgramIDs
+from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -51,6 +54,7 @@ if TYPE_CHECKING:
     from .program_id import PersistentProgramIDs
     from .program_id import PIDInfo
     from .program_id import ProgramIDs
+    from .tile_dependency import TileDependencyGraph
 
 
 # Independent readiness counters occupy distinct cache lines so polling one
@@ -536,8 +540,46 @@ def _register_cross_loop_state(
 
 
 @dataclasses.dataclass(frozen=True)
+class ScatterRoot:
+    """Tasks of a root with inband scatter stores, each owing one done word."""
+
+    axis_order: tuple[int, ...]
+    counts: dict[int, int]
+    tasks: int
+    # [parity][source][task] words, pushed by the root's last scatter store.
+    done: int
+    last: int
+
+    def task(self, coordinates: Mapping[int, str]) -> str:
+        """Flat task index of per-axis tile coordinates."""
+        terms, multiplier = [], 1
+        for block_id in self.axis_order:
+            if self.counts[block_id] != 1:
+                terms.append(f"({coordinates[block_id]}) * {multiplier}")
+            multiplier *= self.counts[block_id]
+        return " + ".join(terms) or "0"
+
+
+@dataclasses.dataclass(frozen=True)
+class Scatter:
+    """An inband row scatter: which keys (aligned row blocks) each task wrote."""
+
+    root: int
+    position: int
+    lanes: int
+    shape: tuple[int, ...]
+    extents: tuple[int, ...]
+    key_strides: tuple[int, ...]
+    keys: int
+    # Producer-local [parity][task][lane] records; consumer-local [source][key].
+    records: int
+    cover: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PeerState:
-    """Symmetric uint64 state: inband mailboxes, peer counters, a done slot.
+    """Symmetric uint64 state: inband mailboxes, peer counters, a done slot and
+    the static pipeline's launch epoch.
 
     Laid out from the dependency graph alone, so body codegen and the
     schedule agree on it whichever registers it first.
@@ -548,17 +590,26 @@ class PeerState:
     ptrs: str
     rank: str
     bases: tuple[str, ...]
-    # allocation id -> (first word, elements per slot)
-    mailboxes: dict[int, tuple[int, int]]
+    # allocation id -> (first word, words per slot, elements per word, whether
+    # stores may write 16-byte word pairs)
+    mailboxes: dict[int, tuple[int, int, int, bool]]
     slots: dict[int, int]
     done: int
+    launch: int
+    scatters: dict[int, Scatter] = dataclasses.field(default_factory=dict)
+    scatter_roots: dict[int, ScatterRoot] = dataclasses.field(default_factory=dict)
+    # Set by a consumer that read an unwritten row of this rank; launch starts.
+    flag: int = 0
+    started: int = 0
+    # One word per worker for CTA votes in noinline helpers.
+    votes: int = 0
 
     def mailbox(self, allocation_id: int, source: object) -> str:
         """Word offset of ``source``'s slot for this launch's parity."""
-        offset, numel = self.mailboxes[allocation_id]
+        offset, words, _, _ = self.mailboxes[allocation_id]
         return (
             f"{offset} + tl.cast({self.epoch} & 1, tl.int64) * "
-            f"{len(self.bases) * numel} + {source} * {numel}"
+            f"{len(self.bases) * words} + {source} * {words}"
         )
 
 
@@ -574,12 +625,30 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     world_size = torch.distributed.get_world_size(
         _resolve_process_group(process_group_name)
     )
-    mailboxes: dict[int, tuple[int, int]] = {}
+    env = CompileEnvironment.current()
+    config = device_function.config
+
+    def block_size(block_id: int) -> int:
+        return env.size_hint(env.block_sizes[block_id].from_config_assert(config))
+
+    mailboxes: dict[int, tuple[int, int, int, bool]] = {}
     words = 0
     for allocation_id in sorted(graph.inband_allocation_ids):
-        numel = graph.inband_numel(allocation_id)
-        mailboxes[allocation_id] = (words, numel)
-        words += 2 * world_size * numel
+        # Sub-word elements share a tagged word when tile rows align to it.
+        store = graph.inband_store(allocation_id)
+        assert store.dtype is not None
+        row = graph.inband_row(store, block_size)
+        lanes = 4 // store.dtype.itemsize
+        lanes = lanes if row % lanes == 0 else 1
+        size = graph.inband_numel(allocation_id) // lanes
+        pair = row % (2 * lanes) == 0 and size % 2 == 0
+        mailboxes[allocation_id] = (words, size, lanes, pair)
+        words += 2 * world_size * size
+    scatters, scatter_roots, flag = _scatter_layout(
+        graph, block_size, world_size, words
+    )
+    workers = _worker_count(device_function)
+    words = flag + (1 + world_size + workers if scatters else 0)
     words = -(-words // _PEER_SLOT_WORDS) * _PEER_SLOT_WORDS
     producers = sorted(
         {
@@ -594,7 +663,7 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     state = _register_cross_loop_state(
         device_function,
         name_hint="tile_dependency_peer_state",
-        numel=str(done + 1),
+        numel=str(done + 2),
         dtype=torch.uint64,
         symmetric=True,
     )
@@ -625,8 +694,111 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
         mailboxes=mailboxes,
         slots=slots,
         done=done,
+        launch=done + 1,
+        scatters=scatters,
+        scatter_roots=scatter_roots,
+        flag=flag,
+        started=flag + 1,
+        votes=flag + 1 + world_size,
     )
     return device_function.peer_state
+
+
+def _worker_count(device_function: DeviceFunction) -> int:
+    return CompileEnvironment.current().config_spec.num_sm * cast(
+        "int", device_function.config.get("num_sm_multiplier", 1)
+    )
+
+
+def _scatter_layout(
+    graph: TileDependencyGraph,
+    block_size: Callable[[int], int],
+    world_size: int,
+    words: int,
+) -> tuple[dict[int, Scatter], dict[int, ScatterRoot], int]:
+    """Records, cover tables and done words of the inband scatters from ``words``,
+    and the first word after them."""
+    env = CompileEnvironment.current()
+    device_ir = HostFunction.current().device_ir
+    stores = {
+        allocation_id: graph.inband_store(allocation_id)
+        for allocation_id in sorted(graph.inband_allocation_ids)
+        if graph.scatter_position(allocation_id) is not None
+    }
+    scatter_roots: dict[int, ScatterRoot] = {}
+    for root in sorted({store.root for store in stores.values()}):
+        family = graph.task_families[root]
+        counts = {
+            # The R1 scatter check admitted only integer extents.
+            axis.block_id: -(
+                -int(cast("sympy.Integer", axis.extent)) // block_size(axis.block_id)
+            )
+            for axis in family.axes
+        }
+        mine = [store for store in stores.values() if store.root == root]
+        if len({store.graph_id for store in mine}) != 1:
+            raise exc.CrossLoopSchedulingError(
+                "because a root's inband scatter stores must share one block"
+            )
+        last = max(mine, key=lambda store: store.graph_node_index)
+        scatter_roots[root] = ScatterRoot(
+            axis_order=family.logical_axis_order,
+            counts=counts,
+            tasks=math.prod(counts.values()),
+            done=0,
+            last=last.access_id,
+        )
+    scatters: dict[int, Scatter] = {}
+    for allocation_id, store in stores.items():
+        position = graph.scatter_position(allocation_id)
+        assert position is not None
+        node = next(
+            node
+            for node in device_ir.graphs[store.graph_id].graph.nodes
+            if store.access_id in node.meta.get(TILE_ACCESS_META, ())
+        )
+        index = node.args[1][position]
+        assert isinstance(index, torch.fx.Node)
+        rows = index.meta["val"]
+        if rows.ndim > 1:
+            raise exc.CrossLoopSchedulingError(
+                "because an inband scatter's row index must be a vector"
+            )
+        lanes = 1
+        if rows.ndim == 1:
+            size = rows.size(0)
+            block_id = None if isinstance(size, int) else env.get_block_id(size)
+            lanes = block_size(block_id) if block_id is not None else int(size)
+        shape = tuple(int(extent) for extent in store.tensor_shape)
+        extents = []
+        for dim in range(len(shape)):
+            extent = (
+                1 if dim == position else graph.inband_extent(store, dim, block_size)
+            )
+            if extent is None:
+                raise exc.CrossLoopSchedulingError(
+                    "because an inband scatter must write aligned row blocks"
+                )
+            extents.append(extent)
+        counts = [-(-n // extent) for n, extent in zip(shape, extents, strict=True)]
+        strides = [math.prod(counts[dim + 1 :]) for dim in range(len(shape))]
+        tasks = scatter_roots[store.root].tasks
+        scatters[allocation_id] = Scatter(
+            root=store.root,
+            position=position,
+            lanes=lanes,
+            shape=shape,
+            extents=tuple(extents),
+            key_strides=tuple(strides),
+            keys=math.prod(counts),
+            records=words,
+            cover=words + 2 * tasks * lanes,
+        )
+        words += 2 * tasks * lanes + world_size * math.prod(counts)
+    for root, layout in scatter_roots.items():
+        scatter_roots[root] = dataclasses.replace(layout, done=words)
+        words += 2 * world_size * layout.tasks
+    return scatters, scatter_roots, words
 
 
 def _outline_cross_loop_region(
@@ -697,6 +869,435 @@ def _triton_root_requires_kernel_scope(
     )
 
 
+_PURE_TL_CALLS = frozenset(
+    {
+        "arange",
+        "associative_scan",
+        "broadcast_to",
+        "cast",
+        "cdiv",
+        "cumsum",
+        "expand_dims",
+        "full",
+        "join",
+        "load",
+        "max",
+        "maximum",
+        "min",
+        "minimum",
+        "permute",
+        "reduce",
+        "reshape",
+        "split",
+        "sum",
+        "where",
+        "zeros",
+    }
+)
+# Hoisting these from a persistent task loop saves memory traffic or a reduction.
+_HOIST_ANCHOR_CALLS = frozenset(
+    {"associative_scan", "cumsum", "load", "max", "min", "reduce", "sum"}
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GuardedExtent:
+    """A root whose slowest-axis guard against a task-invariant bound became a
+    dynamic task count, with the bound's slice hoisted out of the task loop."""
+
+    hoisted: list[ast.stmt]
+    body: list[ast.stmt]
+    hoisted_names: tuple[str, ...]
+    live_tasks: str
+
+
+def _is_tl_call(node: ast.AST, names: frozenset[str]) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr in names
+    )
+
+
+def _is_pure_call(node: ast.Call) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr == "to":
+        return True
+    return isinstance(func.value, ast.Name) and (
+        func.value.id in ("libdevice", "tl_math")
+        or (func.value.id == "tl" and func.attr in _PURE_TL_CALLS)
+    )
+
+
+def _guarded_extent(
+    body: list[ast.stmt],
+    *,
+    slowest: PIDInfo,
+    block_size: int,
+    inner_tasks: int,
+    variant_names: frozenset[str],
+    read_only_tensors: frozenset[str],
+    tensor_names: frozenset[str],
+) -> _GuardedExtent | None:
+    """Turn a trailing ``if offset < bound`` on the slowest PID axis into a task count.
+
+    Every other top-level statement must be a pure single assignment (or a rebase of
+    a task-variant PID), so tasks past the bound are no-ops. Invariant loads and
+    reductions are hoisted with the bound.
+    """
+    if not body or not isinstance(guard := body[-1], ast.If):
+        return None
+    prefix = body[:-1]
+    if not isinstance(guard.test, ast.Name) or not all(
+        isinstance(statement, ast.Pass) for statement in guard.orelse
+    ):
+        return None
+
+    def target(statement: ast.stmt) -> str | None:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            node = statement.targets[0]
+        elif isinstance(statement, ast.AugAssign):
+            node = statement.target
+        else:
+            return None
+        return node.id if isinstance(node, ast.Name) else None
+
+    if not all(
+        isinstance(statement, (ast.Assign, ast.AugAssign))
+        and (name := target(statement)) is not None
+        and (isinstance(statement, ast.Assign) or name in variant_names)
+        and all(
+            _is_pure_call(node)
+            for node in ast.walk(statement.value)
+            if isinstance(node, ast.Call)
+        )
+        for statement in prefix
+    ):
+        return None
+    stores: dict[str, int] = {}
+    loads: dict[str, int] = {}
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name):
+                counts = stores if isinstance(node.ctx, ast.Store) else loads
+                counts[node.id] = counts.get(node.id, 0) + 1
+    values = {
+        cast("str", target(statement)): statement.value
+        for statement in prefix
+        if isinstance(statement, ast.Assign)
+    }
+    test = guard.test.id
+    predicate = values.get(test)
+    if (
+        stores.get(test) != 1
+        or loads.get(test) != 1
+        or not isinstance(predicate, ast.Compare)
+        or len(predicate.ops) != 1
+    ):
+        return None
+    left, right = predicate.left, predicate.comparators[0]
+    if isinstance(predicate.ops[0], ast.Gt):
+        bound, offset = left, right
+    elif isinstance(predicate.ops[0], ast.Lt):
+        bound, offset = right, left
+    else:
+        return None
+    if not isinstance(bound, ast.Name) or not isinstance(offset, ast.Name):
+        return None
+    # The guarded offset must be the tile begin of the slowest axis.
+    pid = slowest.pid_var
+    offset_value = values.get(offset.id)
+    if (
+        stores.get(offset.id) != 1
+        or offset_value is None
+        or ast.unparse(offset_value)
+        not in (f"{pid} * {slowest.block_size_var}", *([pid] * (block_size == 1)))
+    ):
+        return None
+
+    def is_invariant(value: ast.expr, invariant: set[str]) -> bool:
+        for node in ast.walk(value):
+            if (
+                isinstance(node, ast.Name)
+                and node.id not in invariant
+                and (node.id in stores or node.id in variant_names)
+            ):
+                return False
+            if (
+                isinstance(node, ast.Call)
+                and _is_tl_call(node, frozenset({"load"}))
+                and (
+                    not node.args
+                    or any(keyword.arg == "volatile" for keyword in node.keywords)
+                    or any(
+                        pointer.id in tensor_names
+                        and pointer.id not in read_only_tensors
+                        for pointer in ast.walk(node.args[0])
+                        if isinstance(pointer, ast.Name)
+                    )
+                )
+            ):
+                return False
+        return True
+
+    invariant: set[str] = set()
+    for name, value in values.items():
+        if stores[name] == 1 and is_invariant(value, invariant):
+            invariant.add(name)
+    if bound.id not in invariant and (bound.id in stores or bound.id in variant_names):
+        return None
+
+    anchors = [
+        name
+        for name in invariant
+        if name == bound.id
+        or any(
+            _is_tl_call(node, _HOIST_ANCHOR_CALLS) for node in ast.walk(values[name])
+        )
+    ]
+    hoisted: set[str] = set()
+    while anchors:
+        name = anchors.pop()
+        if name in hoisted:
+            continue
+        hoisted.add(name)
+        anchors.extend(
+            node.id
+            for node in ast.walk(values[name])
+            if isinstance(node, ast.Name) and node.id in invariant
+        )
+    hoisted_statements = [
+        _clone_stmt(statement)
+        for statement in prefix
+        if isinstance(statement, ast.Assign) and target(statement) in hoisted
+    ]
+    remaining = [
+        _clone_stmt(statement)
+        for statement in prefix
+        if target(statement) not in {*hoisted, test}
+    ]
+    tiles = bound.id if block_size == 1 else f"tl.cdiv({bound.id}, {block_size})"
+    return _GuardedExtent(
+        hoisted=hoisted_statements,
+        body=[*remaining, *(_clone_stmt(statement) for statement in guard.body)],
+        hoisted_names=tuple(
+            cast("str", target(statement)) for statement in hoisted_statements
+        ),
+        live_tasks=tiles if inner_tasks == 1 else f"{inner_tasks} * {tiles}",
+    )
+
+
+def _stored_names(nodes: Iterable[ast.AST]) -> set[str]:
+    return {
+        node.id
+        for root in nodes
+        for node in ast.walk(root)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+
+
+def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
+    return {
+        node.id
+        for root in nodes
+        for node in ast.walk(root)
+        if isinstance(node, ast.Name)
+    }
+
+
+# Device modules a dry pass runs unchanged: memory goes through ``tl`` only.
+_DRY_PASS_PURE_MODULES = frozenset({"tl", "triton_helpers", "tl_math", "libdevice"})
+# Inductor helpers that only compute; the others load, spin, or publish.
+_DRY_PASS_PURE_HELPERS = frozenset(
+    {
+        *("maximum", "minimum", "max2", "min2", "prod", "any"),
+        *("promote_to_tensor", "div_floor_integer", "remainder_integer"),
+        *("max_with_index", "min_with_index"),
+        *("welford", "welford_reduce", "welford_combine"),
+    }
+)
+# Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
+_DRY_PASS_PURE_METHODS = frozenset(
+    {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}
+)
+
+
+def _dry_pass_call_kind(call: ast.Call, helpers: frozenset[str]) -> str:
+    """Classify a call as ``helper``, ``masked``, ``skipped``, or ``pure``."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return "helper" if func.id in helpers else "skipped"
+    if not isinstance(func, ast.Attribute):
+        return "skipped"
+    if not (
+        isinstance(func.value, ast.Name) and func.value.id in _DRY_PASS_PURE_MODULES
+    ):
+        return "pure" if func.attr in _DRY_PASS_PURE_METHODS else "skipped"
+    if func.value.id == "triton_helpers":
+        return "pure" if func.attr in _DRY_PASS_PURE_HELPERS else "skipped"
+    if func.value.id != "tl":
+        return "pure"
+    if func.attr == "inline_asm_elementwise":
+        # Impure asm, such as the compiler's own polls and syncs, may spin or publish.
+        pure = next((k.value for k in call.keywords if k.arg == "is_pure"), None)
+        pure = call.args[4] if pure is None else pure
+        if isinstance(pure, ast.Constant) and pure.value is True:
+            return "pure"
+        return "skipped"
+    if func.attr in ("load", "store") or (
+        func.attr.startswith("atomic_") and func.attr != "atomic_cas"
+    ):
+        # Block pointers take no mask.
+        if any(k.arg == "boundary_check" for k in call.keywords):
+            return "skipped"
+        return "masked"
+    if func.attr.startswith(
+        ("load", "store", "atomic_", "make_block_ptr", "advance", "device_")
+    ):
+        return "skipped"
+    return "pure"
+
+
+def _dry_pass_mask(call: ast.Call, live: str) -> None:
+    """AND the live predicate into a pointer load, store, or atomic mask."""
+    load = cast("ast.Attribute", call.func).attr == "load"
+
+    def update(slot: int, name: str, value: Callable[[ast.expr], ast.expr]) -> None:
+        if len(call.args) > slot:
+            call.args[slot] = value(call.args[slot])
+            return
+        keyword = next((k for k in call.keywords if k.arg == name), None)
+        if keyword is not None:
+            keyword.value = value(keyword.value)
+        else:
+            none = cast("ast.expr", expr_from_string("None"))
+            call.keywords.append(create(ast.keyword, arg=name, value=value(none)))
+
+    def masked(mask: ast.expr) -> ast.expr:
+        if isinstance(mask, ast.Constant) and mask.value is None:
+            return cast("ast.expr", expr_from_string(live))
+        return cast("ast.expr", expr_from_string(f"({{mask}}) & {live}", mask=mask))
+
+    def zero(other: ast.expr) -> ast.expr:
+        if isinstance(other, ast.Constant) and other.value is None:
+            return cast("ast.expr", expr_from_string("0.0"))
+        return other
+
+    update(1 if load else 2, "mask", masked)
+    if load:
+        # Masked lanes are undefined per thread; zeros keep dry branches uniform.
+        update(2, "other", zero)
+
+
+def _dry_pass_one_trip(loop: ast.expr, live: str) -> None:
+    """Cut a ``tl.range`` loop to one trip when not ``live``: a single trip
+    runs every instruction, which is all the code warm-up needs."""
+    if not (
+        isinstance(loop, ast.Call)
+        and isinstance(loop.func, ast.Attribute)
+        and isinstance(loop.func.value, ast.Name)
+        and loop.func.value.id == "tl"
+        and loop.func.attr == "range"
+        and loop.args
+    ):
+        return
+    if len(loop.args) == 1:
+        loop.args[0] = cast(
+            "ast.expr",
+            expr_from_string(f"tl.where({live}, {{stop}}, 1)", stop=loop.args[0]),
+        )
+        return
+    step = loop.args[2] if len(loop.args) > 2 else expr_from_string("1")
+    loop.args[1] = cast(
+        "ast.expr",
+        expr_from_string(
+            f"tl.where({live}, {{stop}}, {{start}} + {{step}})",
+            stop=loop.args[1],
+            start=cast("ast.expr", _clone_ast_value(loop.args[0])),
+            step=cast("ast.expr", _clone_ast_value(step)),
+        ),
+    )
+
+
+def _dry_pass_rewrite(
+    body: list[ast.stmt],
+    live: str,
+    helpers: frozenset[str],
+    guards: list[ast.If],
+) -> list[ast.stmt]:
+    """Mask memory in ``body``; guard waits and unmaskable effects by ``live``."""
+    result: list[ast.stmt] = []
+    for statement in body:
+        compound = isinstance(statement, (ast.If, ast.For))
+        header = (
+            (statement.test if isinstance(statement, ast.If) else statement.iter)
+            if compound
+            else statement
+        )
+        calls = [node for node in ast.walk(header) if isinstance(node, ast.Call)]
+        kinds = [_dry_pass_call_kind(call, helpers) for call in calls]
+        if isinstance(statement, ast.While) or "skipped" in kinds:
+            # Helpers called under the guard still take the predicate.
+            for node in ast.walk(statement):
+                if (
+                    isinstance(node, ast.Call)
+                    and _dry_pass_call_kind(node, helpers) == "helper"
+                ):
+                    node.args.append(cast("ast.expr", expr_from_string(live)))
+            # Adjacent guarded statements share one guard so values flow.
+            if guards and result and result[-1] is guards[-1]:
+                guards[-1].body.append(statement)
+            else:
+                guards.append(
+                    create(
+                        ast.If, test=expr_from_string(live), body=[statement], orelse=[]
+                    )
+                )
+                result.append(guards[-1])
+            continue
+        for call, kind in zip(calls, kinds, strict=True):
+            if kind == "helper":
+                call.args.append(cast("ast.expr", expr_from_string(live)))
+            elif kind == "masked":
+                _dry_pass_mask(call, live)
+        if isinstance(statement, ast.For):
+            _dry_pass_one_trip(statement.iter, live)
+        if compound:
+            statement.body = _dry_pass_rewrite(statement.body, live, helpers, guards)
+            statement.orelse = _dry_pass_rewrite(
+                statement.orelse, live, helpers, guards
+            )
+        result.append(statement)
+    return result
+
+
+def _dry_pass_binds(
+    body: list[ast.stmt], guards: list[ast.If], bound: set[str]
+) -> bool:
+    """Whether every name a guard binds is read only under that guard."""
+    guard_ids = {id(guard) for guard in guards}
+    stores: dict[str, set[int]] = {name: {0} for name in bound}
+    loads: list[tuple[str, int]] = []
+
+    def visit(node: ast.AST, scope: int) -> None:
+        scope = id(node) if id(node) in guard_ids else scope
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                stores.setdefault(node.id, set()).add(scope)
+            else:
+                loads.append((node.id, scope))
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    for statement in body:
+        visit(statement, 0)
+    return all(name not in stores or stores[name] & {0, scope} for name, scope in loads)
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -712,11 +1313,8 @@ def emit_cross_loop_schedule(
     pipeline = device_function.config.cross_loop_pipeline
     dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
     assert dependency_graph is not None
-    # Only the dynamic pipeline emits peer transports; R5 offers no other choice.
-    if pipeline != "dynamic" and dependency_graph.crosses_ranks():
-        raise AssertionError(
-            "cross-rank tile dependencies require cross_loop_pipeline='dynamic'"
-        )
+    if dependency_graph.crosses_ranks() and pipeline == "barrier":
+        raise AssertionError("cross-rank tile dependencies cannot use 'barrier'")
     if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
@@ -781,9 +1379,7 @@ def emit_cross_loop_schedule(
         if unpublishable_site_ids
         else None
     )
-    configured_worker_count = CompileEnvironment.current().config_spec.num_sm * cast(
-        "int", device_function.config.get("num_sm_multiplier", 1)
-    )
+    configured_worker_count = _worker_count(device_function)
     root_axis_geometry: dict[int, tuple[int | sympy.Expr, int]] = {}
     for _axis_order, axis_counts, block_sizes in case_geometries:
         for block_id, task_count in axis_counts.items():
@@ -962,12 +1558,15 @@ def emit_cross_loop_schedule(
     ):
         raise AssertionError("an inband access was not emitted as a push or poll")
 
+    def peer_arrivals(root: int) -> int:
+        # Dynamic tasks publish one by one, static workers once per root.
+        tasks = int(static_pipeline_plan.execution_orders[root].task_count)
+        return tasks if pipeline == "dynamic" else min(tasks, launch_worker_count)
+
     def peer_target(roots: Iterable[int]) -> str:
         assert peer is not None
-        tasks = sum(
-            static_pipeline_plan.execution_orders[root].task_count for root in roots
-        )
-        return f"{peer.epoch} * {int(tasks) * world_size}"
+        arrivals = sum(peer_arrivals(root) for root in roots)
+        return f"{peer.epoch} * {arrivals * world_size}"
 
     def peer_waits(root: int) -> list[ast.stmt]:
         producers = sorted(
@@ -988,13 +1587,14 @@ def emit_cross_loop_schedule(
             *device_function.async_load_fence(),
         ]
 
+    lanes = 1 << (world_size - 1).bit_length()
+
     def peer_publications(root: int) -> list[ast.stmt]:
         if peer is None:
             return []
-        slots = [peer.slots[root]] if root in peer.slots else []
+        slots = [peer.slots[root]] if any(p == root for p, _ in peer_edges) else []
         if root in done_roots:
             slots.append(peer.done)
-        lanes = 1 << (world_size - 1).bit_length()
         return [
             statement_from_string(
                 f"helion_dist_utils._add_on_every_rank({peer.ptrs}, {slot}, "
@@ -1003,12 +1603,149 @@ def emit_cross_loop_schedule(
             for slot in slots
         ]
 
+    # Keyed peer counters: one uint64 line per key on every rank, which each
+    # producer task (live or skipped) bumps once per launch.
+    peer_counter_plans = static_pipeline_plan.peer_counters
+    peer_key_offsets: dict[ReadinessCounterPlan, int] = {}
+    peer_key_words = 0
+    for plan in peer_counter_plans:
+        peer_key_offsets[plan] = peer_key_words
+        peer_key_words += plan.readiness_key_domain.size * _PEER_SLOT_WORDS
+    peer_keys = peer_key_ptrs = ""
+    if peer_counter_plans:
+        peer_keys = _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_peer_keys",
+            numel=str(peer_key_words),
+            dtype=torch.uint64,
+            symmetric=True,
+        )
+        peer_key_ptrs = device_function.triton_persistent_state_args[-1]
+
+    def peer_key_word(plan: ReadinessCounterPlan, key: str) -> str:
+        return f"{peer_key_offsets[plan]} + ({key}) * {_PEER_SLOT_WORDS}"
+
+    def peer_counter_publications(
+        root: int, coordinates: dict[int, str], sem: str
+    ) -> list[ast.stmt]:
+        result: list[ast.stmt] = []
+        for plan in peer_counter_plans:
+            publication = plan.producers[0].incidence.keys_by_item
+            if plan.producers[0].producer_root != root or publication is None:
+                continue
+            key, membership = relation_flat_target(
+                publication,
+                coordinates,
+                trusted_single_valued=True,
+                trusted_total_point_map=publication.is_total_function(),
+            )
+            # Scalar ptrs table only: outlined noinline tasks take no vectors.
+            add = statement_from_string(
+                f"helion_dist_utils._add_on_every_rank({peer_key_ptrs}, "
+                f"{peer_key_word(plan, key)}, {world_size}, {lanes}, '{sem}')"
+            )
+            result.append(
+                add
+                if membership == "True"
+                else create(
+                    ast.If, test=expr_from_string(membership), body=[add], orelse=[]
+                )
+            )
+        return result
+
+    def peer_counter_waits(
+        root: int, coordinates: dict[int, str]
+    ) -> tuple[list[ast.stmt], list[str]]:
+        """Per-task acquire spins whose zero results gate the task's PID."""
+        statements: list[ast.stmt] = []
+        tokens: list[str] = []
+        fence = (
+            "fence.proxy.async.global; "
+            if device_function.uses_async_proxy_global
+            else ""
+        )
+        for plan in peer_counter_plans:
+            arrivals = cast("int", plan.uniform_arrival_count()) * world_size
+            for consumer in plan.consumers:
+                if consumer.consumer_root != root:
+                    continue
+                assert peer is not None
+                key, membership = relation_flat_target(
+                    consumer.keys_by_consumer, coordinates
+                )
+                target = f"{peer.epoch} * {arrivals}"
+                if membership != "True":
+                    key = f"tl.where({membership}, {key}, 0)"
+                    target = f"tl.where({membership}, {target}, 0)"
+                token = device_function.new_var("tile_dependency_peer_token", dce=False)
+                statements.append(
+                    statement_from_string(
+                        f"{token} = tl.inline_asm_elementwise("
+                        "asm='{ .reg .pred p; .reg .b64 v; PEER_WAIT: "
+                        "ld.acquire.sys.global.u64 v, [$1]; setp.lt.u64 p, v, $2; "
+                        "@p bra PEER_WAIT; bar.warp.sync 0xffffffff; "
+                        f"{fence}mov.u32 $0, 0; }}', constraints='=r,l,l', "
+                        f"args=[{peer_keys} + {peer_key_word(plan, key)}, "
+                        f"tl.cast({target}, tl.uint64)], dtype=tl.int32, "
+                        "is_pure=False, pack=1)"
+                    )
+                )
+                tokens.append(token)
+        return statements, tokens
+
     dispatch_ticket: str | None = None
+    peer_launch = ""
+    entry_gate: list[ast.stmt] = []
     if not uses_packet_dispatch:
         assert state_arg is not None
         result: list[ast.stmt] = [
             statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
         ]
+        if peer is not None:
+            # uint64 so peer targets never wrap. Worker 0 advances it after the
+            # done barrier, or else every worker counts its own launches.
+            peer_launch = f"{peer.state} + {peer.launch}"
+            if not done_roots:
+                launches = _register_cross_loop_state(
+                    device_function,
+                    name_hint="tile_dependency_peer_launch",
+                    numel=str(launch_worker_count),
+                    dtype=torch.uint64,
+                )
+                peer_launch = f"{launches} + {worker}"
+            result.append(
+                statement_from_string(f"{peer.epoch} = tl.load({peer_launch}) + 1")
+            )
+            if peer.scatters:
+                # Read the hold flag now; its wait runs once the first loop's
+                # prologue loads are in flight.
+                held = device_function.new_var("tile_dependency_peer_held", dce=False)
+                result.append(
+                    statement_from_string(
+                        f"{held} = tl.load({peer.state} + {peer.flag}, volatile=True)"
+                        f" == {peer.epoch}"
+                    )
+                )
+                # Announce this launch, then wait out last launch's reads of rows
+                # no task wrote, which this launch may now overwrite.
+                entry_gate = [
+                    create(
+                        ast.If,
+                        test=expr_from_string(f"{worker} == 0"),
+                        body=[
+                            statement_from_string(
+                                "helion_dist_utils._store_on_every_rank("
+                                f"{peer.ptrs}, {peer.started} + {peer.rank}, "
+                                f"{peer.epoch}, {world_size}, {lanes})"
+                            )
+                        ],
+                        orelse=[],
+                    ),
+                    statement_from_string(
+                        f"helion_dist_utils._hold_after_fallback({peer.state}, "
+                        f"{peer.started}, {world_size}, {peer.epoch}, {held})"
+                    ),
+                ]
     else:
         assert dispatch_ticket_arg is not None
         raw_dispatch_ticket = device_function.new_var(
@@ -1156,6 +1893,141 @@ def emit_cross_loop_schedule(
             nested_loop_counters_by_consumer.setdefault(
                 readiness_consumer.consumer_root, []
             ).append((plan, readiness_consumer))
+    # A skipped task must not owe a per-task publication or reorder body PIDs.
+    written_allocations = {
+        access.allocation_id
+        for access in dependency_graph.accesses
+        if access.kind == "store"
+    }
+    access_names = {
+        written: frozenset(
+            access.tensor_name
+            for access in dependency_graph.accesses
+            if access.tensor_name is not None
+            and (access.allocation_id in written_allocations) == written
+        )
+        for written in (False, True)
+    }
+    guarded_extents: dict[int, _GuardedExtent] = {}
+    for root in () if uses_packet_dispatch else static_pipeline_plan.resident_roots:
+        axis_order, axis_counts, block_sizes = case_geometries[root]
+        inner_counts = [axis_counts[block_id] for block_id in axis_order[:-1]]
+        if (
+            root in scheduled_task_roots
+            or root in root_counters_by_producer
+            or root in nested_producer_roots
+            or root in nested_loop_counters_by_consumer
+            or isinstance(owner.cases[root], L2GroupingProgramIDs)
+            or not all(isinstance(count, int) for count in inner_counts)
+        ):
+            continue
+        extent = _guarded_extent(
+            case_bodies[root],
+            slowest=_case_pid_info(owner.cases[root])[-1],
+            block_size=block_sizes[axis_order[-1]],
+            inner_tasks=math.prod(cast("list[int]", inner_counts)),
+            variant_names=frozenset({owner.shared_pid_var, strategy.virtual_pid_var}),
+            read_only_tensors=access_names[False] - access_names[True],
+            tensor_names=frozenset(
+                argument.name
+                for argument in device_function.arguments
+                if isinstance(argument, TensorArg)
+            ),
+        )
+        if extent is not None:
+            guarded_extents[root] = extent
+    # Consumers wait on one done word per scatter task (or skip mark) per launch.
+    for root in {} if peer is None else peer.scatter_roots:
+        extent = guarded_extents.get(root)
+        done = device_function.inband_scatter_done.get(root)
+        if done is None or done not in _stored_names(
+            statement
+            for statement in (case_bodies[root] if extent is None else extent.body)
+            if isinstance(statement, ast.Assign)
+        ):
+            raise exc.CrossLoopSchedulingError(
+                "because an inband scatter store must run once in every task"
+            )
+
+    # Roots that poll in-band peer data wait on it in their bodies.
+    inband_consumer_roots = {
+        access.root
+        for access in dependency_graph.accesses
+        if dependency_graph.is_inband(access) and access.kind != "store"
+    }
+
+    def waits_on_dependency(root: int) -> bool:
+        return bool(
+            root_barrier_incoming.get(root)
+            or readiness_consumers_by_root.get(root)
+            or nested_loop_counters_by_consumer.get(root)
+            or any(consumer == root for _producer, consumer in peer_edges)
+            or root in inband_consumer_roots
+        )
+
+    def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
+        """Run a waiting task once with memory masked and waits skipped.
+
+        The dry pass warms the task's code while it would otherwise wait. Both
+        passes share one loop body; None if a skipped value would be read.
+        """
+        helpers = {
+            name: (arguments, body)
+            for name, arguments, body, _noinline in (
+                device_function.triton_outlined_helpers
+            )
+        }
+        reachable: list[str] = []
+        pending = [task_body]
+        while pending:
+            for node in (n for s in pending.pop() for n in ast.walk(s)):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in helpers
+                    and node.func.id not in reachable
+                ):
+                    reachable.append(node.func.id)
+                    pending.append(list(helpers[node.func.id][1]))
+        live = device_function.new_var("tile_dependency_live", dce=False)
+
+        def rewrite(body: Iterable[ast.stmt], bound: set[str]) -> list[ast.stmt] | None:
+            guards: list[ast.If] = []
+            rewritten = _dry_pass_rewrite(
+                [_clone_stmt(statement) for statement in body],
+                live,
+                frozenset(reachable),
+                guards,
+            )
+            return rewritten if _dry_pass_binds(rewritten, guards, bound) else None
+
+        helper_bodies = {
+            name: rewrite(helpers[name][1], set(helpers[name][0])) for name in reachable
+        }
+        branch_body = rewrite(task_body, set())
+        if branch_body is None or None in helper_bodies.values():
+            return None
+        outlined = device_function.triton_outlined_helpers
+        for index, (name, arguments, _body, noinline) in enumerate(outlined):
+            if (helper_body := helper_bodies.get(name)) is not None:
+                outlined[index] = (name, (*arguments, live), (*helper_body,), noinline)
+        dry_pass = device_function.new_var("tile_dependency_dry_pass", dce=False)
+        # A runtime zero start keeps ptxas from unrolling the two passes.
+        return [
+            create(
+                ast.For,
+                target=create(ast.Name, id=dry_pass, ctx=ast.Store()),
+                iter=expr_from_string(
+                    f"tl.range({dispatch_ticket} // {1 << 30}, 2, 1, num_stages=1)"
+                ),
+                body=[
+                    statement_from_string(f"{live} = {dry_pass} == 1"),
+                    *branch_body,
+                ],
+                orelse=[],
+                type_comment=None,
+            ),
+        ]
 
     def flat_task_coordinates(
         task: str,
@@ -1876,6 +2748,21 @@ def emit_cross_loop_schedule(
             raise AssertionError(f"missing nested producer sites {missing}")
         return result
 
+    def execution_coordinates(root: int, local_task: str) -> dict[int, str]:
+        execution = static_pipeline_plan.execution_orders[root].tasks_by_ordinal
+        coordinates, membership = relation_point_coordinates(
+            execution,
+            flat_task_coordinates(
+                local_task,
+                execution.source_domain.axis_order,
+                execution.source_domain.axis_count_expressions,
+            ),
+            trusted_total_point_map=True,
+        )
+        if membership != "True":
+            raise AssertionError("proved root execution order is not total")
+        return coordinates
+
     def scheduled_root_task_body(
         root: int,
         root_local_pid_task: str,
@@ -1885,22 +2772,12 @@ def emit_cross_loop_schedule(
         force_noinline: bool = False,
     ) -> list[ast.stmt]:
         body: list[ast.stmt] = []
+        extent = guarded_extents.get(root)
+        root_body = case_bodies[root] if extent is None else extent.body
         has_task_scheduling = root in nested_loop_counters_by_consumer
         producer_counters = tuple(root_counters_by_producer.get(root, ()))
         scheduled_logical_pid = logical_pid
-        execution = static_pipeline_plan.execution_orders[root].tasks_by_ordinal
-        ordinal_coordinates = flat_task_coordinates(
-            root_local_pid_task,
-            execution.source_domain.axis_order,
-            execution.source_domain.axis_count_expressions,
-        )
-        scheduled_coordinates, execution_membership = relation_point_coordinates(
-            execution,
-            ordinal_coordinates,
-            trusted_total_point_map=True,
-        )
-        if execution_membership != "True":
-            raise AssertionError("proved root execution order is not total")
+        scheduled_coordinates = execution_coordinates(root, root_local_pid_task)
         if producer_counters or root in nested_producer_roots:
             has_task_scheduling = True
         if root in scheduled_task_roots:
@@ -1949,6 +2826,14 @@ def emit_cross_loop_schedule(
                 )
             else:
                 body.extend(wait)
+        peer_counter_spins, peer_tokens = peer_counter_waits(
+            root, scheduled_coordinates
+        )
+        if peer_tokens:
+            # Zero tokens make every PID-derived address depend on the spins.
+            has_task_scheduling = True
+            body.extend(peer_counter_spins)
+            scheduled_logical_pid = " + ".join([scheduled_logical_pid, *peer_tokens])
         nested_loop_consumers = nested_loop_counters_by_consumer.get(root, ())
         if nested_loop_consumers:
             # Instrument the original logical loop before segmentation.
@@ -1956,7 +2841,7 @@ def emit_cross_loop_schedule(
             # expression instead of rebasing publication IDs per segment.
             scheduled_root_body = body_with_nested_loop_publications(
                 root,
-                case_bodies[root],
+                root_body,
                 scheduled_coordinates,
             )
             for loop_plan, loop_consumer in sorted(
@@ -1987,7 +2872,7 @@ def emit_cross_loop_schedule(
                 *_clone_opaque_statements(
                     body_with_nested_loop_publications(
                         root,
-                        case_bodies[root],
+                        root_body,
                         scheduled_coordinates,
                     )
                 ),
@@ -2004,7 +2889,10 @@ def emit_cross_loop_schedule(
                     noinline=force_noinline,
                 )
             )
-        if producer_counters:
+        peer_counter_adds = peer_counter_publications(
+            root, scheduled_coordinates, "release"
+        )
+        if producer_counters or peer_counter_adds:
             has_task_scheduling = True
             body.extend(_release_sync(device_function))
         for producer_counter_plan, readiness_producer in producer_counters:
@@ -2015,6 +2903,7 @@ def emit_cross_loop_schedule(
                     scheduled_coordinates,
                 )
             )
+        body.extend(peer_counter_adds)
         if not has_task_scheduling or root in kernel_scope_roots:
             return body
         # Entry-only bookkeeping on a single-trip root may inline. Counter
@@ -2027,6 +2916,7 @@ def emit_cross_loop_schedule(
         scheduled_wrapper_noinline = (
             not is_single_trip_occurrence
             or bool(producer_counters)
+            or bool(peer_counter_adds)
             or root in nested_producer_roots
         )
         return [
@@ -2039,23 +2929,140 @@ def emit_cross_loop_schedule(
             )
         ]
 
+    # Live-task counts of guarded resident roots emitted at kernel scope.
+    resident_live_tasks: dict[int, tuple[str, int]] = {}
+
+    def root_lane(root: int) -> str:
+        # A trailing root begins mid-wave, where the earlier roots' live tasks end:
+        # rotate workers onto its lanes.
+        base = static_pipeline_plan.static_base(root)
+        skipped = [
+            f"({count} - tl.minimum({live}, {count}))"
+            for earlier, (live, count) in resident_live_tasks.items()
+            if static_pipeline_plan.static_base(earlier) < base
+        ]
+        if skipped:
+            # Whole waves keep the dividend nonnegative.
+            waves = base // launch_worker_count + 1
+            return (
+                f"(({worker}) + {waves * launch_worker_count - base} + "
+                f"{' + '.join(skipped)}) % {launch_worker_count}"
+            )
+        rotation = -base % launch_worker_count
+        return (
+            f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
+        )
+
+    def guarded_live_tasks(extent: _GuardedExtent) -> tuple[list[ast.stmt], str]:
+        live = device_function.new_var("tile_dependency_live_tasks", dce=False)
+        # redux.sync makes the bound provably warp-uniform, so tcgen05 issue
+        # inside the task loop stays a single elected thread.
+        return [
+            *extent.hoisted,
+            statement_from_string(
+                f"{live} = tl.inline_asm_elementwise('redux.sync.min.s32 $0, $1, "
+                f"0xffffffff;', '=r,r', [tl.cast({extent.live_tasks}, tl.int32)], "
+                "dtype=tl.int32, is_pure=True, pack=1)"
+            ),
+        ], live
+
+    def shared_captures(extent: _GuardedExtent, block_ids: list[int]) -> list[ast.stmt]:
+        specializes = CompileEnvironment.current().config_spec.range_warp_specialize
+        if not any(
+            specializes.config_get(
+                device_function.config.range_warp_specializes, block_id, None
+            )
+            for block_id in block_ids
+        ):
+            return []
+        # Partitions share hoisted reductions and loads instead of each
+        # recomputing them; cheap index math stays rematerialized.
+        costly: set[str] = set()
+        for statement in extent.hoisted:
+            if any(
+                _is_tl_call(node, _HOIST_ANCHOR_CALLS)
+                or (isinstance(node, ast.Name) and node.id in costly)
+                for node in ast.walk(statement)
+            ):
+                costly.update(_stored_names([statement]))
+        used = _all_names(extent.body)
+        return [
+            statement_from_string(f"{name} = helion_dist_utils._shared_capture({name})")
+            for name in extent.hoisted_names
+            if name in used and name in costly
+        ]
+
+    def skipped_task_dispatch(root: int, live: str) -> list[ast.stmt]:
+        scatter_root = None if peer is None else peer.scatter_roots.get(root)
+        if scatter_root is None and not any(
+            plan.producers[0].producer_root == root for plan in peer_counter_plans
+        ):
+            return []
+        # Guard-skipped tasks still count once per launch for keyed peers and
+        # mark their scatter done words.
+        segment_begin = static_pipeline_plan.static_base(root)
+        segment_end = (
+            segment_begin + static_pipeline_plan.execution_orders[root].task_count
+        )
+        lane = root_lane(root)
+        skipped = device_function.new_var("tile_dependency_skipped_task", dce=False)
+        first = (
+            f"{segment_begin} + ({lane}) + tl.maximum({live} - ({lane}) + "
+            f"{launch_worker_count - 1}, 0) // {launch_worker_count} * "
+            f"{launch_worker_count}"
+        )
+        coordinates = execution_coordinates(root, f"({skipped}) - {segment_begin}")
+        body = peer_counter_publications(root, coordinates, "relaxed")
+        if scatter_root is not None:
+            assert peer is not None
+            body.append(
+                statement_from_string(
+                    f"helion_dist_utils._store_on_every_rank({peer.ptrs}, "
+                    f"{scatter_root.done} + tl.cast({peer.epoch} & 1, tl.int64) * "
+                    f"{world_size * scatter_root.tasks} + {peer.rank} * "
+                    f"{scatter_root.tasks} + {scatter_root.task(coordinates)}, "
+                    f"({peer.epoch} << 32) | 0xFFFFFFFF, {world_size}, {lanes})"
+                )
+            )
+        return [
+            create(
+                ast.For,
+                target=create(ast.Name, id=skipped, ctx=ast.Store()),
+                iter=expr_from_string(
+                    f"range({first}, {segment_end}, {launch_worker_count})"
+                ),
+                body=body,
+                orelse=[],
+                type_comment=None,
+            )
+        ]
+
     def static_root_body(root: int) -> list[ast.stmt]:
         """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
         active_worker_count = min(launch_worker_count, task_count_value)
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
-        # A trailing root may begin mid-wave: rotate workers onto its lanes.
-        rotation = -segment_begin % launch_worker_count
-        lane = (
-            f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
-        )
+        lane = root_lane(root)
         segment_membership = (
             f"({lane}) == 0"
             if active_worker_count == 1
             else f"(({lane}) >= 0 and ({lane}) < {active_worker_count})"
         )
+        extent = guarded_extents.get(root)
+        block_ids = [info.block_id for info in _case_pid_info(owner.cases[root])]
+        hoisted: list[ast.stmt] = []
+        skipped_dispatch: list[ast.stmt] = []
+        segment_stop = f"({segment_end})"
+        live: str | None = None
+        if extent is not None:
+            hoisted, live = guarded_live_tasks(extent)
+            # Captures follow the whole hoisted block so MLIR CSE still sees it.
+            hoisted.extend(shared_captures(extent, block_ids))
+            segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
+            skipped_dispatch = skipped_task_dispatch(root, live)
         task_dispatch: list[ast.stmt] = [
+            *hoisted,
             create(
                 ast.For,
                 target=create(
@@ -2063,28 +3070,43 @@ def emit_cross_loop_schedule(
                     id=strategy.virtual_pid_var,
                     ctx=ast.Store(),
                 ),
+                # The root's range config (e.g. warp_specialize) applies here.
                 iter=expr_from_string(
-                    f"tl.range((({lane}) - 0) + ({segment_begin}), "
-                    f"({segment_end}), "
-                    f"{launch_worker_count})"
+                    TileStrategy.get_range_call_str(
+                        device_function.config,
+                        block_ids,
+                        begin=f"(({lane}) - 0) + ({segment_begin})",
+                        end=segment_stop,
+                        step=str(launch_worker_count),
+                    )
                 ),
                 body=scheduled_root_task_body(
                     root,
                     f"({strategy.virtual_pid_var}) - {segment_begin}",
                     f"{case_offsets[root]} + "
                     f"(({strategy.virtual_pid_var}) - {segment_begin})",
-                    (strategy.virtual_pid_var,),
+                    (
+                        strategy.virtual_pid_var,
+                        *(() if extent is None else extent.hoisted_names),
+                    ),
                 ),
                 orelse=[],
                 type_comment=None,
-            )
+            ),
+            *skipped_dispatch,
         ]
         incoming_roots = root_barrier_incoming.get(root, ())
+        waits = peer_waits(root)
+        publications = peer_publications(root)
         if (
             not incoming_roots
             and root not in root_barrier_indices
+            and not waits
+            and not publications
             and active_worker_count == launch_worker_count
         ):
+            if live is not None:
+                resident_live_tasks[root] = (live, task_count_value)
             return task_dispatch
 
         active_body = _wait_for_dependencies(
@@ -2092,9 +3114,12 @@ def emit_cross_loop_schedule(
             dependencies=root_barrier_input_dependencies(root),
             prefix="tile_dependency_root_barrier_wait",
         )
+        active_body.extend(waits)
         active_body.extend(task_dispatch)
-        if root in root_barrier_indices:
-            active_body.extend(root_barrier_publication(root))
+        if publications:
+            active_body.extend(_release_sync(device_function))
+        active_body.extend(root_barrier_publication(root, synced=bool(publications)))
+        active_body.extend(publications)
         return [
             create(
                 ast.If,
@@ -2107,10 +3132,38 @@ def emit_cross_loop_schedule(
     if not uses_packet_dispatch:
         assert state_arg is not None
         for root in static_pipeline_plan.resident_roots:
-            result.extend(static_root_body(root))
+            body = static_root_body(root)
+            # The gate precedes the first task loop, after its hoisted loads.
+            first = next(
+                (i for i, stmt in enumerate(body) if isinstance(stmt, ast.For)), 0
+            )
+            result.extend([*body[:first], *entry_gate, *body[first:]])
+            entry_gate = []
+        assert not entry_gate, "inband scatters need a resident root"
         result.append(
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
         )
+        if done_roots:
+            # Every worker that reads the epoch publishes to the done slot first.
+            assert peer is not None
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{worker} == 0"),
+                    body=[
+                        statement_from_string(
+                            f"helion_dist_utils._wait_at_least({peer.state} + "
+                            f"{peer.done}, {peer_target(done_roots)})"
+                        ),
+                        statement_from_string(f"tl.store({peer_launch}, {peer.epoch})"),
+                    ],
+                    orelse=[],
+                )
+            )
+        elif peer is not None:
+            result.append(
+                statement_from_string(f"tl.store({peer_launch}, {peer.epoch})")
+            )
     else:
         assert dispatch_ticket is not None
         packet_branches: list[tuple[int, bool, ast.stmt]] = []
@@ -2135,6 +3188,10 @@ def emit_cross_loop_schedule(
                 task_body.extend(_release_sync(device_function))
             task_body.extend(root_barrier_publication(root, synced=bool(publications)))
             task_body.extend(publications)
+            # Kernel-scoped tensor-memory roots get no dry pass: tl.range fails to
+            # compile around dot_scaled, and the while-loop form is slower.
+            if waits_on_dependency(root) and root not in kernel_scope_roots:
+                task_body = dry_pass_task(task_body) or task_body
             packet_branches.append(
                 (
                     packet_begin,

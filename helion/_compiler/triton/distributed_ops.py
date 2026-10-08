@@ -26,12 +26,15 @@ from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import peer_state
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
+from ..indexing_strategy import _in_warp_specialized_loop
 from ..tile_dependency import TILE_ACCESS_META
 from ..tile_strategy import DeviceLoopState
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ..cross_loop_codegen import PeerState
+    from ..cross_loop_codegen import Scatter
     from ..device_function import DeviceFunction
     from ..helper_function import CodegenInterface
     from ..inductor_lowering import CodegenState
@@ -611,6 +614,17 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @dataclass(frozen=True)
+class ScatterPoll:
+    """How a poll of an inband scatter reads a row no task of ``source`` wrote."""
+
+    allocation_id: int
+    source: str
+    key: str
+    # The tagged word, every lane of it, in the peer's own buffer.
+    word: str
+
+
+@dataclass(frozen=True)
 class InbandPoll:
     """A mailbox read whose wait is deferred to the first use of any poll."""
 
@@ -620,8 +634,18 @@ class InbandPoll:
     # Polls of one address shape share an asm; None polls alone.
     group: str | None
     pack: int
+    # Threads that may wait together on a CTA barrier; None in WS loops.
+    threads: int | None
     word: str
     result: ast.stmt
+    scatter: ScatterPoll | None = None
+
+    def load(self, epoch: str) -> ast.stmt:
+        # A plain volatile load vectorizes; masked lanes read as current.
+        mask = "" if self.mask is None else f", {self.mask}, {epoch} << 32"
+        return statement_from_string(
+            f"{self.word} = tl.load({self.address}{mask}, volatile=True)"
+        )
 
 
 def _inband_access(state: CodegenState) -> tuple[TileAccess, tuple[int, ...]] | None:
@@ -647,6 +671,115 @@ def _inline_asm(
         f"dtype={dtype}, is_pure=False, pack={pack})",
         asm=create(ast.Constant, value=asm),
     )
+
+
+def _lift(
+    state: CodegenState, template: str, x: ast.AST | str, prefix: str = "inband_lane"
+) -> str:
+    """Name ``template`` with ``{x}`` filled in, as a dead-code-eliminable var."""
+    if isinstance(x, str):
+        x = expr_from_string(x)
+    return state.codegen.lift(
+        expr_from_string(template.replace("{value}", "{x}"), x=x),
+        dce=True,
+        prefix=prefix,
+    ).id
+
+
+def _interleaved(
+    state: CodegenState, tensor: str, dims: list[str], count: int
+) -> list[str]:
+    """Split ``tensor``'s last axis into ``count`` parts; part i holds the
+    elements at i mod ``count``."""
+    if count == 1:
+        return [tensor]
+    levels = count.bit_length() - 1
+    shape = ", ".join([*dims[:-1], f"{dims[-1]} // {count}", *["2"] * levels])
+    parts = [_lift(state, f"tl.reshape({{x}}, [{shape}])", tensor)]
+    for _ in range(levels):
+        halves: list[str] = []
+        for part in parts:
+            lo = state.device_function.new_var("inband_lane")
+            hi = state.device_function.new_var("inband_lane")
+            state.add_statement(statement_from_string(f"{lo}, {hi} = tl.split({part})"))
+            halves += [lo, hi]
+        parts = halves
+    # Each split peels the lowest index bit, so parts come out bit-reversed.
+    return [parts[int(f"{i:0{levels}b}"[::-1], 2)] for i in range(count)]
+
+
+def _group_start(
+    state: CodegenState, term: str, output_size: list[int | torch.SymInt], count: int
+) -> str | None:
+    """A per-dim index or mask ``term`` at every ``count``-th last-axis element.
+
+    Splitting only the last axis' vector skips the layout conversions Triton
+    emits when it splits a full tile. None when ``term``'s shape is unknown.
+    """
+    tile_strategy = state.tile_strategy
+    dims = tile_strategy.shape_dims(output_size)
+    last = tile_strategy.expand_str(output_size, len(output_size) - 1)
+    if len(dims) != len(output_size) or len(dims) < 2:
+        return None
+    if term.endswith("None]"):
+        return term
+    if not term.endswith(last):
+        return None
+    return f"({_interleaved(state, term[: -len(last)], dims[-1:], count)[0]}){last}"
+
+
+def _start_offset(
+    state: CodegenState,
+    fake_tensor: torch.Tensor,
+    indexing: SubscriptIndexing,
+    output_size: list[int | torch.SymInt],
+    count: int,
+) -> str | None:
+    """The offset of every ``count``-th last-axis element, or None."""
+    terms = []
+    for dim, (term, block) in enumerate(
+        zip(indexing.dim_index_exprs, indexing.block_dims, strict=True)
+    ):
+        if CompileEnvironment.current().known_equal(fake_tensor.size(dim), 1):
+            continue
+        start = _group_start(state, term, output_size, count) if block else term
+        if start is None:
+            return None
+        stride = state.device_function.tensor_stride(fake_tensor, dim).name
+        terms.append(f"{start} * {stride}")
+    return " + ".join(terms) or None
+
+
+def _start_mask(
+    state: CodegenState,
+    indexing: SubscriptIndexing,
+    extra_mask: ast.AST | None,
+    output_size: list[int | torch.SymInt],
+    count: int,
+) -> str | None:
+    """The mask of every ``count``-th last-axis element, or None."""
+    assert state.fx_node is not None
+    terms, pending = [], [indexing.mask_expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+            pending += [node.left, node.right]
+            continue
+        term = ast.unparse(node)
+        if extra_mask is not None and term == ast.unparse(extra_mask):
+            # The extra mask broadcasts unchanged if it is constant on the last axis.
+            mask_node = state.fx_node.args[3]
+            assert isinstance(mask_node, torch.fx.Node)
+            fake = mask_node.meta["val"]
+            env = CompileEnvironment.current()
+            if fake.ndim and not env.known_equal(fake.size(-1), 1):
+                return None
+        else:
+            term = _group_start(state, term, output_size, count)
+            if term is None:
+                return None
+        terms.append(f"({term})")
+    return " & ".join(terms)
 
 
 def inband_store_codegen(
@@ -693,29 +826,74 @@ def inband_store_codegen(
             )
         offset = state.codegen.lift(offset, dce=True, prefix="inband_offset")
         dtype = fake_tensor.dtype
-        word = state.codegen.lift(
-            expr_from_string(
-                f"tl.cast(tl.cast(tl.cast({{value}}, {backend.dtype_str(dtype)}), "
-                f"{_bits(dtype)}, bitcast=True), tl.uint64) | ({peer.epoch} << 32)",
-                value=word_value,
-            ),
-            dce=True,
-            prefix="inband_word",
+        _, _, lanes, pair = peer.mailboxes[access.allocation_id]
+        bits = (
+            f"tl.cast(tl.cast({{value}}, {backend.dtype_str(dtype)}), "
+            f"{_bits(dtype)}, bitcast=True)"
         )
-        slot = peer.mailbox(access.allocation_id, peer.rank)
-        store = "st.relaxed.sys.global.u64 [$1], $2;"
-        mask = []
-        if indexing.has_mask():
-            mask = [
+        epoch = f"({peer.epoch} << 32)"
+        mask = indexing.mask_expr if indexing.has_mask() else None
+        if lanes == 1 and not pair:
+            words = [
                 state.codegen.lift(
                     expr_from_string(
-                        "tl.cast({mask}, tl.int32)", mask=indexing.mask_expr
+                        f"tl.cast({bits}, tl.uint64) | {epoch}", value=word_value
                     ),
                     dce=True,
-                    prefix="inband_mask",
+                    prefix="inband_word",
                 ).id
             ]
-            store = f"{{ .reg .pred p; setp.ne.b32 p, $3, 0; @p {store} }}"
+            address = offset.id
+            masks = []
+            if mask is not None:
+                masks = [_lift(state, "tl.cast({x}, tl.int32)", mask, "inband_mask")]
+        else:
+            # Pack row-adjacent elements into each word, then pair adjacent words.
+            assert indexing.block_shaped_offset
+            dims = state.tile_strategy.shape_dims(output_size)
+            shape = f"[{', '.join(dims)}]"
+            group = lanes * (2 if pair else 1)
+            full = _lift(state, backend.broadcast_to_expr(bits, shape), value)
+            payload = " | ".join(
+                f"(tl.cast({part}, tl.uint64) << {8 * dtype.itemsize * i})"
+                for i, part in enumerate(_interleaved(state, full, dims, lanes))
+            )
+            word = _lift(state, f"{{x}} | {epoch}", expr_from_string(payload))
+            row = [*dims[:-1], f"{dims[-1]} // {lanes}"]
+            words = _interleaved(state, word, row, 2) if pair else [word]
+            stored = f"[{', '.join([*row[:-1], f'{dims[-1]} // {group}'])}]"
+            first = _start_offset(state, fake_tensor, indexing, output_size, group)
+            if first is None:
+                first = _interleaved(state, offset.id, dims, group)[0]
+            else:
+                first = backend.broadcast_to_expr(f"({first})", stored)
+            address = _lift(state, f"{{x}} // {lanes}", expr_from_string(first))
+            masks = []
+            start_mask = None
+            if mask is not None:
+                start_mask = _start_mask(
+                    state, indexing, extra_mask, output_size, group
+                )
+            if start_mask is not None:
+                cast = f"tl.cast({start_mask}, tl.int32)"
+                cast = backend.broadcast_to_expr(cast, stored)
+                lifted = state.codegen.lift(
+                    expr_from_string(cast), dce=True, prefix="inband_mask"
+                )
+                masks = [lifted.id]
+            elif mask is not None:
+                cast = backend.broadcast_to_expr("tl.cast({x}, tl.int32)", shape)
+                masks = _interleaved(state, _lift(state, cast, mask), dims, group)[:1]
+        store = (
+            "st.relaxed.sys.global.v2.u64 [$1], {$2, $3};"
+            if pair
+            else "st.relaxed.sys.global.u64 [$1], $2;"
+        )
+        if masks:
+            store = (
+                f"{{ .reg .pred p; setp.ne.b32 p, ${2 + len(words)}, 0; @p {store} }}"
+            )
+        slot = peer.mailbox(access.allocation_id, peer.rank)
         # Each word is single-copy atomic and carries its epoch: no fence needed.
         # One asm per peer keeps that peer's stores adjacent, which is faster.
         for base in peer.bases:
@@ -723,20 +901,152 @@ def inband_store_codegen(
                 _inline_asm(
                     device_function.new_var("inband_push", dce=False),
                     f"{store} mov.u32 $0, 0;",
-                    "=r,l,l" + ",r" * len(mask),
-                    [f"{base} + ({slot}) + {offset.id}", word.id, *mask],
+                    "=r,l" + ",l" * len(words) + ",r" * len(masks),
+                    [f"{base} + ({slot}) + {address}", *words, *masks],
                     "tl.int32",
                     1,
                 )
             )
+        if access.allocation_id in peer.scatters:
+            group = lanes * (2 if pair else 1)
+            _record_scatter(state, access, indexing, output_size, group, words, masks)
         device_function.inband_access_ids.update(ids)
         return local_store
 
     return push
 
 
-def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> int:
-    """Words per asm lane: more than a thread's elements would fault."""
+def _record_scatter(
+    state: CodegenState,
+    access: TileAccess,
+    indexing: SubscriptIndexing,
+    output_size: list[int | torch.SymInt],
+    group: int,
+    words: list[str],
+    masks: list[str],
+) -> None:
+    """Record the row blocks (keys) each lane of this task wrote, tagged.
+
+    The root's last scatter store then pushes the task's done word to every
+    rank. It reduces the records first, so all threads have pushed by then.
+    """
+    device_function = state.device_function
+    peer = device_function.peer_state
+    assert peer is not None and state.fx_node is not None
+    env = CompileEnvironment.current()
+    scatter = peer.scatters[access.allocation_id]
+    root = peer.scatter_roots[scatter.root]
+    terms = [
+        _group_start(state, term, output_size, group) if block and group > 1 else term
+        for term, block in zip(
+            indexing.dim_index_exprs, indexing.block_dims, strict=True
+        )
+    ]
+    rows = terms[scatter.position]
+    if any(term is None for term in terms) or rows is None:
+        raise exc.CrossLoopSchedulingError("because an inband scatter tile is ragged")
+    # Each lane's first element of its block keys the block; masks are per row.
+    expand = rows[rows.rindex(")") + 1 :] if scatter.lanes > 1 else ""
+    lane = f"(tl.arange(0, {scatter.lanes})){expand}" if scatter.lanes > 1 else "0"
+    row_dim = None
+    if scatter.lanes > 1:
+        entries = (
+            [entry.strip() for entry in expand[1:-1].split(",")] if expand else [":"]
+        )
+        row_dim = entries.index(":")
+    extra = state.fx_node.args[3]
+    if isinstance(extra, torch.fx.Node):
+        fake = extra.meta["val"]
+        if any(
+            dim + len(output_size) - fake.ndim != row_dim
+            and not env.known_equal(size, 1)
+            for dim, size in enumerate(fake.shape)
+        ):
+            raise exc.CrossLoopSchedulingError(
+                "because an inband scatter's mask must depend on its row alone"
+            )
+    key = f"tl.cast({rows}, tl.int64) * {scatter.key_strides[scatter.position]}"
+    first = []
+    for dim, (term, extent, stride) in enumerate(
+        zip(terms, scatter.extents, scatter.key_strides, strict=True)
+    ):
+        if dim == scatter.position:
+            continue
+        if extent > 1:
+            first.append(f"((({term}) % {extent}) == 0)")
+        if extent < scatter.shape[dim]:
+            key += f" + tl.cast(({term}) // {extent}, tl.int64) * {stride}"
+    bit = f"tl.cast({masks[0]} != 0, tl.uint64)" if masks else "1"
+    task = root.task(
+        {
+            block_id: f"{state.codegen.offset_var(block_id)} // "
+            f"{env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))}"
+            for block_id in root.axis_order
+        }
+    )
+    parity = f"tl.cast({peer.epoch} & 1, tl.int64)"
+    address = (
+        f"{peer.state} + {scatter.records} + {parity} * "
+        f"{root.tasks * scatter.lanes} + ({task}) * {scatter.lanes} + {lane}"
+    )
+    # A masked row's key may be negative; 31 bits keep it out of the tag.
+    word = (
+        f"({peer.epoch} << 32) | ((tl.cast({key}, tl.uint64) & 0x7FFFFFFF) << 1)"
+        f" | {bit}"
+    )
+    predicate = " & ".join(first)
+    # The anchor operand keeps the record in the pushing WS partition.
+    store = "st.relaxed.sys.global.u64 [$1], $2;"
+    args = [address, word, words[0]]
+    if predicate:
+        store = f"setp.ne.b32 p, $4, 0; @p {store}"
+        args.append(f"tl.cast({predicate}, tl.int32)")
+    record = device_function.new_var("inband_record", dce=False)
+    state.add_statement(
+        _inline_asm(
+            record,
+            f"{{ .reg .pred p; .reg .b64 a; mov.b64 a, $3; {store} mov.u32 $0, 0; }}",
+            "=r,l,l,l" + (",r" if predicate else ""),
+            args,
+            "tl.int32",
+            1,
+        )
+    )
+    if access.access_id != root.last:
+        return
+    done = device_function.new_var("inband_done", dce=False)
+    predicate = " & ".join([*first, f"({lane} == 0)"])
+    stores = " ".join(
+        f"@p st.relaxed.sys.global.u64 [${i + 1}], ${len(peer.bases) + 1};"
+        for i in range(len(peer.bases))
+    )
+    world = len(peer.bases)
+    state.add_statement(
+        _inline_asm(
+            done,
+            f"{{ .reg .pred p; setp.ne.b32 p, ${world + 2}, 0; {stores} "
+            "mov.u32 $0, 0; }",
+            "=r" + ",l" * (world + 1) + ",r",
+            [
+                *(
+                    f"{base} + {root.done} + {parity} * {world * root.tasks} + "
+                    f"{peer.rank} * {root.tasks} + ({task})"
+                    for base in peer.bases
+                ),
+                f"({peer.epoch} << 32) | tl.cast(tl.sum({record}), tl.uint64)",
+                f"tl.cast({predicate}, tl.int32)",
+            ],
+            "tl.int32",
+            1,
+        )
+    )
+    device_function.inband_scatter_done[scatter.root] = done
+
+
+def _poll_pack(
+    state: CodegenState, output_size: list[int | torch.SymInt], lanes: int
+) -> int:
+    """Words per asm lane: more than a thread's words would fault."""
     env = CompileEnvironment.current()
     numel = 1
     for size in output_size:
@@ -749,8 +1059,69 @@ def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> in
         if not isinstance(size, int):
             return 1
         numel *= size
+    numel //= lanes
     threads = 32 * state.config.num_warps
     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
+
+
+def _joined(parts: list[str]) -> str:
+    """Invert ``_interleaved``: interleave the parts along a new last axis."""
+    while len(parts) > 1:
+        half = len(parts) // 2
+        parts = [f"tl.join({parts[i]}, {parts[i + half]})" for i in range(half)]
+    return parts[0]
+
+
+def _word_poll(
+    state: CodegenState,
+    fake_tensor: torch.Tensor,
+    indexing: SubscriptIndexing,
+    output_size: list[int | torch.SymInt],
+    extra_mask: ast.AST | None,
+    access: TileAccess,
+    lanes: int,
+) -> tuple[str, str | None, str] | None:
+    """Word offsets, mask and shape of a block poll whose last axis is aligned
+    runs of the mailbox's ``lanes``-element words, else None."""
+    env = CompileEnvironment.current()
+    graph = HostFunction.current().device_ir.tile_dependency_graph
+    assert graph is not None
+
+    def block_size(block_id: int) -> int:
+        return env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))
+
+    tile_strategy = state.tile_strategy
+    dims = tile_strategy.shape_dims(output_size)
+    if (
+        not indexing.block_shaped_offset
+        or indexing.needs_broadcast()
+        or len(dims) != len(output_size)
+        or graph.inband_row(access, block_size) % lanes
+    ):
+        return None
+    last = tile_strategy.expand_str(output_size, len(output_size) - 1)
+    *rest, (term, block) = zip(
+        indexing.dim_index_exprs, indexing.block_dims, strict=True
+    )
+    # Only the last dim may vary along the last axis.
+    if not block or not term.endswith(last):
+        return None
+    if any(block and not term.endswith("None]") for term, block in rest):
+        return None
+    mask = None
+    if indexing.has_mask():
+        mask = _start_mask(state, indexing, extra_mask, output_size, lanes)
+        if mask is None:
+            return None
+    vector = term[: len(term) - len(last)]
+    rest.append((f"({_interleaved(state, vector, dims[-1:], lanes)[0]}){last}", True))
+    terms = [
+        f"{term} * {state.device_function.tensor_stride(fake_tensor, dim).name}"
+        for dim, (term, _) in enumerate(rest)
+        if dim == len(rest) - 1 or not env.known_equal(fake_tensor.size(dim), 1)
+    ]
+    shape = ", ".join([*dims[:-1], f"{dims[-1]} // {lanes}"])
+    return f"({' + '.join(terms)}) // {lanes}", mask, f"[{shape}]"
 
 
 def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadCodegen:
@@ -783,6 +1154,27 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 offset=offset,
             )
         slot = peer.mailbox(access.allocation_id, access.owner_rank)
+        _, _, lanes, _ = peer.mailboxes[access.allocation_id]
+        dtype = fake_tensor.dtype
+        scatter = peer.scatters.get(access.allocation_id)
+        words = None
+        if lanes > 1 and scatter is None:
+            words = _word_poll(
+                state, fake_tensor, indexing, output_size, extra_mask, access, lanes
+            )
+        shift = ""
+        element = ""
+        if words is not None:
+            offset = expr_from_string(words[0])
+        elif lanes > 1 or scatter is not None:
+            element = state.codegen.lift(offset, dce=True, prefix="inband_offset").id
+            offset = expr_from_string(element)
+        if lanes > 1 and words is None:
+            # Each lane polls the word holding its element and shifts it out.
+            shift = (
+                f" >> (tl.cast({element} % {lanes}, tl.uint64) * {8 * dtype.itemsize})"
+            )
+            offset = expr_from_string(f"{element} // {lanes}")
         address = state.codegen.lift(
             expr_from_string(f"{peer.state} + ({slot}) + {{offset}}", offset=offset),
             dce=True,
@@ -790,15 +1182,24 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         )
         mask = None
         if indexing.has_mask():
-            mask = state.codegen.lift(
-                indexing.mask_expr, dce=True, prefix="inband_mask"
-            ).id
-        dtype = fake_tensor.dtype
+            mask_expr = indexing.mask_expr
+            if words is not None:
+                assert words[1] is not None
+                mask_expr = expr_from_string(words[1])
+            mask = state.codegen.lift(mask_expr, dce=True, prefix="inband_mask").id
         word = device_function.new_var("inband_word", dce=False)
         result = expr_from_string(
-            f"tl.cast(tl.cast({word}, {_bits(dtype)}), "
+            f"tl.cast(tl.cast({word}{shift}, {_bits(dtype)}), "
             f"{backend.dtype_str(dtype)}, bitcast=True)"
         )
+        if words is not None:
+            # A thread unpacks its whole words, keeping each row's lanes in-thread.
+            parts = [
+                f"tl.cast(tl.cast({word}{f' >> {8 * dtype.itemsize * i}' * (i > 0)}, "
+                f"{_bits(dtype)}), {backend.dtype_str(dtype)}, bitcast=True)"
+                for i in range(lanes)
+            ]
+            result = expr_from_string(f"tl.reshape({_joined(parts)}, {shape})")
         # Triton's pipeliner would make the first read an early, weak cp.async.
         for loops in state.codegen.active_device_loops.values():
             for loop in loops:
@@ -808,15 +1209,35 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                         *(kw for kw in call.keywords if kw.arg != "num_stages"),
                         create(ast.keyword, arg="num_stages", value=ast.Constant(1)),
                     ]
-        group, pack = None, 1
+        group, pack, threads = None, 1, None
         if indexing.needs_broadcast():
             result = expr_from_string(
                 backend.broadcast_to_expr("{value}", shape), value=result
             )
         elif indexing.block_shaped_offset or mask is not None:
-            group, pack = shape, _poll_pack(state, output_size)
+            group = shape if words is None else words[2]
+            pack = _poll_pack(state, output_size, 1 if words is None else lanes)
+            if not _in_warp_specialized_loop(state):
+                threads = 32 * state.config.num_warps
         else:
             group = "scalar"
+        fallback = None
+        if scatter is not None:
+            other = "" if mask is None else f", mask={mask}, other=0"
+            tensor = device_function.tensor_arg(fake_tensor).name
+            bits = (
+                f"tl.load({tensor}.to(tl.pointer_type(tl.uint32)) + {element} // {lanes}"
+                f"{other}, volatile=True)"
+                if lanes > 1
+                else f"tl.cast(tl.load({tensor} + {element}{other}, volatile=True), "
+                f"{_bits(dtype)}, bitcast=True)"
+            )
+            fallback = ScatterPoll(
+                allocation_id=access.allocation_id,
+                source=f"({access.owner_rank})",
+                key=_scatter_key(scatter, element),
+                word=f"({peer.epoch} << 32) | tl.cast({bits}, tl.uint64)",
+            )
         value = device_function.new_var("inband_value", dce=True)
         device_function.inband_polls.append(
             InbandPoll(
@@ -825,14 +1246,35 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 mask=mask,
                 group=group,
                 pack=pack,
+                threads=threads,
                 word=word,
                 result=statement_from_string(f"{value} = {{result}}", result=result),
+                scatter=fallback,
             )
         )
         device_function.inband_access_ids.update(ids)
         return create(ast.Name, id=value, ctx=ast.Load())
 
     return poll
+
+
+# Spins before a scatter read checks whether every source task is done.
+_SCATTER_SPINS = 256
+
+
+def _scatter_key(scatter: Scatter, element: str) -> str:
+    """The key (aligned row block) of a row-major element offset."""
+    terms = []
+    stride = 1
+    for dim in reversed(range(len(scatter.shape))):
+        size, extent = scatter.shape[dim], scatter.extents[dim]
+        if extent < size:
+            term = f"({element} // {stride})" if stride > 1 else element
+            term = f"({term} % {size})" if dim > 0 else term
+            term = f"({term} // {extent})" if extent > 1 else term
+            terms.append(f"{term} * {scatter.key_strides[dim]}")
+        stride *= size
+    return " + ".join(terms) or "0"
 
 
 def _poll_asm(polls: int, pack: int) -> tuple[str, str]:
@@ -859,10 +1301,102 @@ def _poll_asm(polls: int, pack: int) -> tuple[str, str]:
     return asm, ",".join(["=l"] * count + ["l"] * 2 * count + ["r"] * pack)
 
 
+def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
+    """Whether any thread of the CTA holds a stale word of a block poll."""
+    tag = f"tl.cast({peer_epoch}, tl.uint32)"
+    flags = " + ".join(
+        "tl.sum(("
+        + " | ".join(
+            f"((({poll.word} >> 32).to(tl.uint32)) != {tag})" for poll in group
+        )
+        + ").to(tl.int32))"
+        for group in _by_group(polls).values()
+    )
+    asm = (
+        "{ .reg .pred p, q; setp.ne.s32 p, $1, 0; "
+        f"bar.red.or.pred q, 0, {polls[0].threads}, p; selp.s32 $0, 1, 0, q; }}"
+    )
+    return (
+        f"tl.inline_asm_elementwise(asm={asm!r}, constraints='=r,r', args=[{flags}], "
+        "dtype=tl.int32, is_pure=False, pack=1)"
+    )
+
+
+def _scatter_fallback(
+    cg: CodegenInterface, peer: PeerState, scattered: list[InbandPoll]
+) -> list[ast.stmt]:
+    """After a long spin, copy rows no task wrote from the peer's own buffer.
+
+    A source's records and skip marks cover every key it wrote once ``ready``.
+    The copy lands in this rank's mailbox, so the loop's words keep one layout;
+    a consumer on the source flags the next launch to hold for every rank.
+    """
+    if not scattered:
+        return []
+    device_function = cg.device_function
+    spins = device_function.new_var("inband_spins", dce=False)
+    cg.add_statement(statement_from_string(f"{spins} = 0"))
+    ready: dict[tuple[int, str], str] = {}
+    cover: list[ast.stmt] = []
+    synthesize: list[ast.stmt] = []
+    for poll in scattered:
+        assert poll.scatter is not None
+        scatter = peer.scatters[poll.scatter.allocation_id]
+        source = poll.scatter.source
+        if (poll.scatter.allocation_id, source) not in ready:
+            flag = device_function.new_var("inband_ready", dce=False)
+            ready[poll.scatter.allocation_id, source] = flag
+            cg.add_statement(statement_from_string(f"{flag} = 0"))
+            root = peer.scatter_roots[scatter.root]
+            cover.append(
+                statement_from_string(
+                    f"{flag} = helion_dist_utils._scatter_cover({peer.state}, "
+                    f"{peer.ptrs}, {source}, {peer.epoch}, {scatter.records}, "
+                    f"{root.done}, {scatter.cover}, {peer.votes}, {root.tasks}, "
+                    f"{scatter.lanes}, {scatter.keys}, {len(peer.bases)}, "
+                    f"{poll.threads})"
+                )
+            )
+        key = poll.scatter.key
+        mask = "" if poll.mask is None else f", mask={poll.mask}, other=0"
+        uncovered = device_function.new_var("inband_uncovered", dce=False)
+        synthesize.extend(
+            [
+                statement_from_string(
+                    f"{uncovered} = ({ready[poll.scatter.allocation_id, source]} != 0)"
+                    f" & (tl.load({peer.state} + {scatter.cover} + {source} * "
+                    f"{scatter.keys} + {key}{mask}, volatile=True) != {peer.epoch})"
+                    + ("" if poll.mask is None else f" & {poll.mask}")
+                ),
+                statement_from_string(
+                    f"tl.store({poll.address}, {poll.scatter.word}, mask={uncovered})"
+                ),
+                statement_from_string(
+                    f"tl.store({peer.state} + {peer.flag} + ({key}) * 0, "
+                    f"{peer.epoch} + 1, mask={uncovered} & ({source} == {peer.rank}))"
+                ),
+            ]
+        )
+    check = statement_from_string(f"if {spins} % {_SCATTER_SPINS} == 0: pass")
+    fallback = statement_from_string(f"if {spins} >= {_SCATTER_SPINS}: pass")
+    assert isinstance(check, ast.If) and isinstance(fallback, ast.If)
+    check.body = cover
+    fallback.body = synthesize
+    return [statement_from_string(f"{spins} += 1"), check, fallback]
+
+
+def _by_group(polls: list[InbandPoll]) -> dict[str, list[InbandPoll]]:
+    groups: dict[str, list[InbandPoll]] = {}
+    for poll in polls:
+        groups.setdefault(poll.group or poll.word, []).append(poll)
+    return groups
+
+
 def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     """Wait on the pending polls of ``node``'s graph once ``node`` reads one.
 
-    The wait is per thread: a CTA-wide reduction would skip replicated lanes.
+    Outside WS loops, block polls first reload together until a CTA vote finds
+    them current. The per-thread spin then covers replicas the vote may skip.
     """
     device_function = cg.device_function
     polls = [
@@ -878,18 +1412,30 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     ]
     peer = device_function.peer_state
     assert peer is not None
-    groups: dict[str, list[InbandPoll]] = {}
+    scattered = [poll for poll in polls if poll.scatter is not None]
+    if any(poll.threads is None for poll in scattered):
+        raise exc.CrossLoopSchedulingError(
+            "because an inband scatter read must be a block outside WS loops"
+        )
+    # Issue every group's first loads before any spin so their latencies overlap.
     for poll in polls:
-        groups.setdefault(poll.group or poll.word, []).append(poll)
-    for group in groups.values():
-        # A plain volatile load vectorizes; masked lanes read as current.
-        for poll in group:
-            mask = "" if poll.mask is None else f", {poll.mask}, {peer.epoch} << 32"
-            cg.add_statement(
-                statement_from_string(
-                    f"{poll.word} = tl.load({poll.address}{mask}, volatile=True)"
-                )
-            )
+        cg.add_statement(poll.load(peer.epoch))
+    voting = [poll for poll in polls if poll.threads is not None]
+    if voting:
+        # A per-thread spin reloads one asm's words at a time; this reloads all.
+        stale = device_function.new_var("inband_stale", dce=False)
+        cg.add_statement(
+            statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}")
+        )
+        loop = statement_from_string(f"while {stale} != 0: pass")
+        assert isinstance(loop, ast.While)
+        loop.body = [
+            *(poll.load(peer.epoch) for poll in voting),
+            *_scatter_fallback(cg, peer, scattered),
+            statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}"),
+        ]
+        cg.add_statement(loop)
+    for group in _by_group(polls).values():
         words = [poll.word for poll in group]
         asm, constraints = _poll_asm(len(words), group[0].pack)
         cg.add_statement(

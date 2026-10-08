@@ -429,10 +429,12 @@ class DeviceFunction:
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
         # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
-        # awaiting their first use, and the inband accesses emitted so far.
+        # awaiting their first use, the inband accesses emitted so far, and the
+        # done-word asm of each root with inband scatter stores.
         self.peer_state: PeerState | None = None
         self.inband_polls: list[InbandPoll] = []
         self.inband_access_ids: set[int] = set()
+        self.inband_scatter_done: dict[int, str] = {}
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -1289,14 +1291,27 @@ class DeviceFunction:
                 dependent_launch = [
                     statement_from_string("cute.arch.griddepcontrol_wait()")
                 ]
+        env = CompileEnvironment.current()
+        if (
+            self.triton_persistent_state_specs
+            and env.pdl_exit + env.pdl_entry
+            and "wait" not in env.pdl_entry
+        ):
+            raise exc.PdlStateWithoutWait
+        pdl = {
+            "wait": "tl.extra.cuda.gdc_wait()",
+            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
+        }
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
                 *dependent_launch,
+                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
+                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
         if backend.name == "cute":

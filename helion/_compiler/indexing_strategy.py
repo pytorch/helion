@@ -1257,7 +1257,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
             # generated stores stay aligned and avoid misaligned-address errors.
-            return block_size * element_size >= 16
+            # Leading batch dims sit outside the 2D smem tile and need only fit.
+            batch = isinstance(stride, int) and any(
+                isinstance(s, int) and 1 < s < stride for s in fake_tensor.stride()
+            )
+            return batch or block_size * element_size >= 16
 
         # 4) Validate subscript forms and collect the descriptor block_shape in
         # tensor-dimension order. Scalar indices become block_shape=1, which is
@@ -1699,6 +1703,8 @@ class SubscriptIndexing(NamedTuple):
     # a size-1 dimension, since those terms are dropped from the offset sum and
     # what remains is scalar.
     block_shaped_offset: bool = True
+    # Whether each dim_index_exprs entry is block shaped rather than scalar.
+    block_dims: tuple[bool, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -2183,6 +2189,7 @@ class SubscriptIndexing(NamedTuple):
             per_dim.broadcast_dims,
             per_dim.dim_index_exprs,
             block_shaped,
+            per_dim.block_dims,
         )
 
 
