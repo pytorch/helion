@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -966,6 +967,189 @@ class TestViews(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x,))
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
+
+    @skipIfPallas("repeat_interleave reshapes are not verified on Pallas")
+    def test_repeat_interleave_reshape_times_tile(self):
+        """An expand + merge reshape (repeat_interleave) times a tile of the
+        merged layout: every output element reads a source element another
+        CuTe thread holds.  The computed-fragment lowering stages the values
+        in shared memory; without it the backend refuses rather than
+        miscompute."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[32]))
+        def fn(s: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                sf = s[tile_m, :]
+                se = sf[:, :, None].expand(tile_m, sf.size(1), 32).reshape(tile_m, k)
+                out[tile_m, :] = x[tile_m, :] * se
+            return out
+
+        s = torch.randn(64, 4, device=DEVICE)
+        x = torch.randn(64, 128, device=DEVICE)
+        if _get_backend() == "cute":
+            with (
+                patch(
+                    "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(
+                    helion.exc.BackendUnsupported, "moves elements between threads"
+                ),
+            ):
+                code_and_output(fn, (s, x))
+            fn.reset()
+        _, result = code_and_output(fn, (s, x))
+        torch.testing.assert_close(result, x * s.repeat_interleave(32, dim=1))
+
+    @skipIfPallas("repeat_interleave reshapes are not verified on Pallas")
+    def test_repeat_interleave_tile(self):
+        """``torch.repeat_interleave`` lowers to unsqueeze / expand / clone /
+        reshape, which on CuTe leaves each thread the element at its source
+        position.  The store re-reads the element its slot names from the
+        load; scaling it first would compute with the wrong element, which
+        CuTe refuses."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def scaled(a: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([a.size(0), a.size(1) * 2], device=a.device)
+            for t in hl.tile(a.size(0)):
+                out[t, :] = torch.repeat_interleave(a[t, :], 2, dim=1) * 2
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def bare(a: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([a.size(0), a.size(1) * 2], device=a.device)
+            for t in hl.tile(a.size(0)):
+                out[t, :] = torch.repeat_interleave(a[t, :], 2, dim=1)
+            return out
+
+        a = torch.randn(64, 16, device=DEVICE)
+        expected = torch.repeat_interleave(a, 2, dim=1)
+        for fn, scale in ((scaled, 2), (bare, 1)):
+            with self.subTest(fn=fn.fn.__name__):
+                if _get_backend() == "cute" and fn is scaled:
+                    with self.assertRaisesRegex(
+                        helion.exc.BackendUnsupported, "moves elements between threads"
+                    ):
+                        code_and_output(fn, (a,))
+                    continue
+                _, result = code_and_output(fn, (a,))
+                torch.testing.assert_close(result, expected * scale)
+
+    @skipIfPallas("consumers of merging reshapes are not verified on Pallas")
+    def test_thread_moving_reshape_consumers(self):
+        """Consumers of a merging reshape whose elements sit on other CuTe
+        threads: a cast before the store, a sum over a static merged dim
+        beside a slice of that size and a virtual view mixed with a tile,
+        which CuTe refuses, and a deinterleaving store, whose elements the
+        store re-reads from the load.  Elsewhere all match eager."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[8]))
+        def cast_store(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0), 128], device=x.device, dtype=torch.float16)
+            for t in hl.tile(x.size(0)):
+                out[t, :] = x[t, :, :].reshape(t, 128).to(torch.float16)
+            return out
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[8]))
+        def merged_sum(x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(z)
+            for t in hl.tile(x.size(0)):
+                r = x[t, :, :].reshape(t, 128)
+                out[t, :] = z[t, :] * r.sum(-1, keepdim=True)
+            return out
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def stacked_view(
+            a: torch.Tensor, b: torch.Tensor, z: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = a.size()
+            out = torch.empty_like(z)
+            for t in hl.tile(m):
+                s = torch.stack((a[t, :], b[t, :]), dim=2)
+                r = s.reshape(t, 2 * n).unsqueeze(0)
+                out[t, :] = (r * z[t, :]).squeeze(0)
+            return out
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[8]))
+        def deinterleave(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for t in hl.tile(x.size(0)):
+                out[t, :] = x[t, :].reshape(t, 64, 2).permute(0, 2, 1).reshape(t, 128)
+            return out
+
+        x3 = torch.randn(64, 4, 32, device=DEVICE)
+        x2 = torch.randn(64, 128, device=DEVICE)
+        z = torch.randn(64, 128, device=DEVICE)
+        a = torch.randn(64, 16, device=DEVICE)
+        b = torch.randn(64, 16, device=DEVICE)
+        z32 = torch.randn(64, 32, device=DEVICE)
+        cases = [
+            (cast_store, (x3,), x3.reshape(64, 128).half()),
+            (merged_sum, (x3, z), z * x3.reshape(64, 128).sum(-1, keepdim=True)),
+            (stacked_view, (a, b, z32), torch.stack((a, b), 2).reshape(64, 32) * z32),
+            (
+                deinterleave,
+                (x2,),
+                x2.reshape(64, 64, 2).permute(0, 2, 1).reshape(64, 128),
+            ),
+        ]
+        for fn, args, expected in cases:
+            with self.subTest(fn=fn.fn.__name__):
+                if _get_backend() == "cute" and fn is not deinterleave:
+                    with self.assertRaisesRegex(
+                        helion.exc.BackendUnsupported, "moves elements between threads"
+                    ):
+                        code_and_output(fn, args)
+                    continue
+                _, result = code_and_output(fn, args)
+                torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    @skipIfPallas("reshape round trips are not verified on Pallas")
+    def test_reshape_round_trip_consumers(self):
+        """A merge that a later reshape splits back: the restoring reshape is
+        proven to put every element back on its own CuTe thread, so any
+        consumer may read it (``x.reshape(-1).reshape(t, n) + y``, an
+        epilogue after a round trip of the accumulator)."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[4, 4]))
+        def round_trip_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile([m, n]):
+                flat = x[tm, tn].reshape(tm.block_size * tn.block_size)
+                out[tm, tn] = flat.reshape(tm, tn) + y[tm, tn]
+            return out
+
+        @helion.kernel(
+            static_shapes=True, config=helion.Config(block_sizes=[8, 16, 16])
+        )
+        def round_trip_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                r = acc.reshape(-1, tile_m.block_size * tile_n.block_size)
+                out[tile_m, tile_n] = r.reshape(tile_m, tile_n) * 2.0 + 1.0
+            return out
+
+        x = torch.randn(64, 32, device=DEVICE)
+        y = torch.randn(64, 32, device=DEVICE)
+        a = torch.randn(32, 16, device=DEVICE)
+        b = torch.randn(16, 32, device=DEVICE)
+        for fn, args, expected, tol in (
+            (round_trip_add, (x, y), x + y, 1e-3),
+            # tf32 dots on Triton
+            (round_trip_epilogue, (a, b), (a @ b) * 2 + 1, 1e-1),
+        ):
+            with self.subTest(fn=fn.fn.__name__):
+                _, result = code_and_output(fn, args)
+                torch.testing.assert_close(result, expected, rtol=tol, atol=tol)
 
     @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):

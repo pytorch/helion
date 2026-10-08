@@ -706,6 +706,13 @@ class CuteDeviceFunctionState:
         # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
         # matmul operand re-lowered under a block remap) keeps its slot.
         self.load_eviction_slots: dict[Node, int] = {}
+        # Merging / splitting reshapes lowered so far: True when each thread
+        # holds the element at its own coordinates (proven by
+        # ``cute_reshape._chain_keeps_thread_elements``), False when the
+        # elements sit on other threads; only a store path that re-reads them
+        # where they sit may store such a value, the generic store refuses
+        # (``cute_reshape.is_cute_thread_moving_reshape_value``).
+        self.reshape_elements_in_place: dict[Node, bool] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).

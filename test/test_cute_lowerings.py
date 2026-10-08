@@ -867,10 +867,14 @@ class _FakeDeviceFunction:
         self.config = object()
         self._counts: dict[str, int] = {}
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
+        self.cute_state = SimpleNamespace(reshape_elements_in_place={})
 
     def new_var(self, prefix: str, **kwargs: object) -> str:
         self._counts[prefix] = self._counts.get(prefix, 0) + 1
         return f"{prefix}_{self._counts[prefix]}"
+
+    def resolved_block_size(self, block_id: int) -> None:
+        return None
 
 
 class _FakeGenerateAST:
@@ -14201,7 +14205,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.ops.aten.reshape.default,
             args=(stack, [4, 8]),
         )
-        graph.output(reshape)
+        # A store reads the relabeled values (``_reshape_value_consumer``).
+        out = graph.placeholder("out")
+        graph.call_function(hl.store, args=(out, [], reshape, None))
+        graph.output(None)
         packed.meta["val"] = torch.empty(4, 4)
         stack.meta["val"] = torch.empty(4, 4, 2)
         reshape.meta["val"] = torch.empty(4, 8)
@@ -14312,7 +14319,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.ops.aten.reshape.default,
             args=(unsqueeze, [4, 8]),
         )
-        graph.output(reshape)
+        # A store reads the relabeled values (``_reshape_value_consumer``).
+        out = graph.placeholder("out")
+        graph.call_function(hl.store, args=(out, [], reshape, None))
+        graph.output(None)
         packed.meta["val"] = torch.empty(4, 4)
         stack.meta["val"] = torch.empty(4, 4, 2)
         unsqueeze.meta["val"] = torch.empty(4, 1, 4, 2)
@@ -14354,7 +14364,9 @@ class TestCuteLowerings(unittest.TestCase):
             args=(view, 0),
         )
         graph.call_function(torch.ops.aten.add.Tensor, args=(unsqueeze, unsqueeze))
-        graph.output(unsqueeze)
+        # The view's elements stay where the stack put them, which only a
+        # relabeling-blind consumer may read (``_reshape_value_consumer``).
+        graph.output(None)
         packed.meta["val"] = torch.empty(4, 4)
         stack.meta["val"] = torch.empty(4, 4, 2)
         view.meta["val"] = torch.empty(4, 8)
@@ -14395,7 +14407,10 @@ class TestCuteLowerings(unittest.TestCase):
             torch.ops.aten.reshape.default,
             args=(squeeze, [4, 8]),
         )
-        graph.output(reshape)
+        # A store reads the relabeled values (``_reshape_value_consumer``).
+        out = graph.placeholder("out")
+        graph.call_function(hl.store, args=(out, [], reshape, None))
+        graph.output(None)
         packed.meta["val"] = torch.empty(4, 4)
         stack.meta["val"] = torch.empty(4, 4, 2)
         squeeze.meta["val"] = torch.empty(4, 4, 2)

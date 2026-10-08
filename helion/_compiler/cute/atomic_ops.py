@@ -267,7 +267,9 @@ def _codegen_cute_atomic_rmw(
         operand = state.proxy_arg(position)
         if not isinstance(operand, torch.Tensor) or operand.ndim == 0:
             continue
-        rebound = subscript_rebound_block_dims(state, target, index, operand)
+        rebound = subscript_rebound_block_dims(
+            state, target, index, operand, value_index=position, what=cute_func
+        )
         if rebound:
             raise exc.BackendUnsupported(
                 "cute",

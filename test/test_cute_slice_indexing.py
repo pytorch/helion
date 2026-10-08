@@ -190,5 +190,7 @@ def test_atomic_slice_rejects_flattened_distinct_update_axes(partial: bool) -> N
     bound = _cpu_bind(
         atomic_slice, (torch.empty((8, 8)), torch.empty(66 if partial else 64), partial)
     )
-    with pytest.raises(BackendUnsupported, match="distinct tile axes"):
+    # The flattening reshape is refused before the atomic sees its value: an
+    # atomic reads each thread's own element, which the merge has moved.
+    with pytest.raises(BackendUnsupported, match="moves elements between threads"):
         bound.to_code(helion.Config())

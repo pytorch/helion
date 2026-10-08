@@ -30,13 +30,13 @@ from ... import exc
 from ...language import _decorators
 from ...language import _tracing_ops
 from ...language.atomic_ops import ATOMIC_OPS
+from ...language.creation_ops import full
 from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import CuteTileVecStoreSite
-from ...language.memory_ops import _codegen_cute_store_reshape_lane_loops
 from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
 from ...language.memory_ops import _cute_access_regions
 from ...language.memory_ops import _cute_active_index_var
@@ -65,17 +65,21 @@ from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import RuntimeInputSpecialization
 from ..compile_environment import _replay_tensor_input_source
+from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
+from .cute_reshape import _resolve_tile_extent
 from .cute_reshape import check_memory_mask_rebound
 from .cute_reshape import codegen_cute_load_mask_rebound
 from .cute_reshape import codegen_cute_store_rebound_value
+from .cute_reshape import cute_affine_rows_keep_thread_elements
 from .cute_reshape import describe_rebound_block_dims
 from .cute_reshape import flattened_tile_partner
 from .cute_reshape import flattened_tile_strategy
+from .cute_reshape import is_cute_thread_moving_reshape_value
 from .cute_reshape import run_deferred_rebound_checks
 from .cute_reshape import store_rebound_dims
 from .cute_reshape import tcgen05_rebound_store_error
@@ -91,6 +95,8 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from ...runtime.config import Config
+    from ..aten_lowering import LoweringContext
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
@@ -1777,6 +1783,16 @@ def _codegen_cute_affine_range_store(
         if value_expr is None:
             return None
     elif isinstance(value, ast.AST):
+        # Every row lane stores this thread's one value: only a constant
+        # tile is the same at all of them.
+        value_val = None if value_node is None else value_node.meta.get("val")
+        if (
+            isinstance(value_val, torch.Tensor)
+            and value_val.ndim > 0
+            and value_node is not None
+            and value_node.target is not full
+        ):
+            return None
         value_expr = ast.unparse(value)
     elif isinstance(value, (int, float, bool)):
         value_expr = repr(value)
@@ -1801,6 +1817,159 @@ def _codegen_cute_affine_range_store(
         orelse=[],
         type_comment=None,
     )
+
+
+def _cute_reread_moved_reshape(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    """A moved reshape's value (``is_cute_thread_moving_reshape_value``) at
+    the slot this thread stores, re-read from the loads its shape chain
+    bottoms out in (``_cute_reread_leaf``): each thread fetches the element
+    its slot names instead of storing the one it holds.  None unless every
+    value dim is addressed by its own block of the value's extent and every
+    leaf is a re-readable load.
+    """
+    from .cute_reshape import _flat_index_from_coords
+    from .cute_reshape import _get_block_local_coord
+    from .cute_reshape import _get_tile_shape
+    from .cute_reshape import _subscript_slot_dims
+    from .cute_reshape import resolve_cute_shape_chain_value_at
+
+    value = value_node.meta.get("val")
+    cg = state.codegen
+    if not isinstance(value, torch.Tensor) or not _cute_reread_extents_exact(
+        cg, value_node
+    ):
+        return None
+    df = cg.device_function
+    shape = _get_tile_shape(value, CompileEnvironment.current(), df.config)
+    _, slot_block_ids = _subscript_slot_dims(state, tensor, subscript)
+    if len(shape) > len(slot_block_ids):
+        return None
+    # A store value is right-aligned to its slot dims.
+    coords: list[str] = []
+    used: set[int] = set()
+    for extent, block_id in zip(
+        shape, slot_block_ids[len(slot_block_ids) - len(shape) :], strict=True
+    ):
+        if extent == 1:
+            coords.append("cutlass.Int32(0)")
+            continue
+        if block_id is None or block_id in used:
+            return None
+        local = _get_block_local_coord(cg, block_id)
+        if local is None or df.resolved_block_size(block_id) != extent:
+            return None
+        used.add(block_id)
+        coords.append(local)
+    return resolve_cute_shape_chain_value_at(
+        state,
+        value_node,
+        _flat_index_from_coords(coords, shape),
+        leaf_resolver=_cute_reread_leaf,
+    )
+
+
+def _cute_reread_extents_exact(cg: GenerateAST, value_node: torch.fx.Node) -> bool:
+    """Whether the re-read's index math (the flat position of the slot, split
+    up again through the shape chain to its loads) reads every dim at its
+    true size.
+
+    A tile dim is positional within its block.  Any other dim is laid out at
+    a size fixed at compile time, which must be its real one: a full slice
+    at its reduction block's extent, a padded power of two of a smaller slice
+    splitting the flat position up wrongly; and no runtime size, which a
+    dynamic-shape kernel reused at another size would not see (sizes fixed
+    by ``hl.specialize`` or the config are fine).
+    """
+    from .cute_reshape import _CHAIN_PROOF_VIEW_TARGETS
+    from .view_ops import _CAST_TARGETS
+
+    env = CompileEnvironment.current()
+    config = cg.device_function.config
+    pending = [value_node]
+    seen: set[torch.fx.Node] = set()
+    while pending:
+        node = pending.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            return False
+        for size in value.shape:
+            block_id = env.get_block_id(size)
+            if block_id is not None and not env.block_sizes[block_id].reduction:
+                continue
+            logical = size if block_id is None else env.block_sizes[block_id].size
+            static = _cute_static_size(env, config, logical)
+            if static is None or (
+                block_id is not None
+                and env.block_sizes[block_id].from_config(config) != static
+            ):
+                return False
+        if node.op != "call_function" or node.target is load:
+            continue
+        if node.target is torch.ops.aten.stack.default:
+            sources = node.args[0]
+        elif (
+            node.target in _CHAIN_PROOF_VIEW_TARGETS
+            or node.target in _CAST_TARGETS
+            or node.target is torch.ops.aten.clone.default
+        ):
+            sources = node.args[:1]
+        else:
+            continue
+        if not isinstance(sources, (list, tuple)):
+            return False
+        pending.extend(
+            source for source in sources if isinstance(source, torch.fx.Node)
+        )
+    return True
+
+
+def _cute_static_size(
+    env: CompileEnvironment, config: Config, size: object
+) -> int | None:
+    """``size`` once ``hl.specialize`` values and the config's block sizes are
+    substituted, or None if a runtime size remains."""
+    if isinstance(size, int):
+        return size
+    if not isinstance(size, torch.SymInt) or (expr := _symint_expr(size)) is None:
+        return None
+    return _resolve_tile_extent(env.specialize_expr(expr), env, config)
+
+
+def _cute_reread_leaf(
+    ctx: LoweringContext, node: torch.fx.Node, flat_index: str
+) -> ast.AST | None:
+    """Re-read a shape-chain leaf at ``flat_index``: a load of a tensor no
+    store can write (``_tensor_written_anywhere``) directly, a copy or a cast
+    through the chain below it."""
+    from .cute_reshape import _resolve_shape_chain_expr
+    from .view_ops import _CAST_TARGETS
+    from .view_ops import _tensor_written_anywhere
+
+    source = node.args[0] if node.args else None
+    value = node.meta.get("val")
+    if node.op != "call_function" or not isinstance(value, torch.Tensor):
+        return None
+    if isinstance(source, torch.fx.Node) and (
+        node.target is torch.ops.aten.clone.default or node.target in _CAST_TARGETS
+    ):
+        inner = _resolve_shape_chain_expr(ctx, source, flat_index, _cute_reread_leaf)
+        if inner is None or node.target is torch.ops.aten.clone.default:
+            return inner
+        return CompileEnvironment.current().backend.cast_ast(inner, value.dtype)
+    cg = cast("GenerateAST", ctx.cg)
+    if node.target is not load or _tensor_written_anywhere(cg, node):
+        return None
+    # The slot's element has nothing to do with the thread's own one: only
+    # its own bounds gate the read.
+    return cute_reindexed_scalar_load_expr(cg, node, flat_index, keep_own_mask=False)
 
 
 def _codegen_cute_affine_reshape_store(
@@ -1876,6 +2045,14 @@ def _codegen_cute_affine_reshape_store(
         return None
 
     factor = affine.factor
+    # Each lane resolves the chain at its own row; only a stack may select by
+    # the lane, every leaf must be read where this thread holds it.
+    if is_cute_thread_moving_reshape_value(
+        state.codegen, value_node
+    ) and not cute_affine_rows_keep_thread_elements(
+        state, value_node, block_id_m, factor, block_id_n
+    ):
+        return None
     lane_var = state.device_function.new_var("affine_lane", dce=True)
     row_local = f"cutlass.Int32({factor}) * ({m_local}) + cutlass.Int32({lane_var})"
     flat_index = (
@@ -2830,14 +3007,21 @@ def _(state: CodegenState) -> ast.AST:
         # An exchanged value must not be rebuilt from its FX node: the paths
         # below see no node for it and store ``raw_value`` (= the exchange).
         store_value_node = value_node if exchanged is None else None
-        affine_range_store = _codegen_cute_affine_range_store(
-            state,
-            tensor,
-            subscript,
-            ast_subscript,
-            raw_value,
-            extra_mask,
-            store_value_node,
+        # The 1-D affine store writes one per-thread value to each of its row
+        # lanes, which a moved reshape's elements are not.
+        affine_range_store = (
+            None
+            if value_node is not None
+            and is_cute_thread_moving_reshape_value(state.codegen, value_node)
+            else _codegen_cute_affine_range_store(
+                state,
+                tensor,
+                subscript,
+                ast_subscript,
+                raw_value,
+                extra_mask,
+                store_value_node,
+            )
         )
         if affine_range_store is not None:
             state.add_statement(affine_range_store)
@@ -2898,17 +3082,6 @@ def _(state: CodegenState) -> ast.AST:
                 if rewritten_stmt is not None:
                     return rewritten_stmt
                 rewritten_stmt = _codegen_cute_store_expand_broadcast_tile(
-                    state,
-                    tensor,
-                    subscript,
-                    ast_subscript,
-                    value,
-                    extra_mask,
-                    value_node,
-                )
-                if rewritten_stmt is not None:
-                    return rewritten_stmt
-                rewritten_stmt = _codegen_cute_store_reshape_lane_loops(
                     state,
                     tensor,
                     subscript,
@@ -3056,6 +3229,23 @@ def _(state: CodegenState) -> ast.AST:
             "written with `bias[tile_m][:, None]` / "
             "`.unsqueeze(-1)`.",
         )
+
+    if value_node is not None and is_cute_thread_moving_reshape_value(
+        state.codegen, value_node
+    ):
+        reread = (
+            None
+            if exchanged is not None
+            else _cute_reread_moved_reshape(state, tensor, subscript, value_node)
+        )
+        if reread is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "a store of a reshape that moves elements between threads: each "
+                "thread would store the element it holds, not the one at its "
+                "coordinates",
+            )
+        value = state.codegen.lift(reread, prefix="reread")
 
     drain_deferred_rebound_checks()
 
@@ -5273,6 +5463,8 @@ def cute_reindexed_scalar_load_expr(
     cg: GenerateAST,
     load_node: torch.fx.Node,
     flat_index: str,
+    *,
+    keep_own_mask: bool = True,
 ) -> ast.AST | None:
     """Re-read ``load_node``'s tile at row-major ``flat_index`` of its tile shape.
 
@@ -5287,6 +5479,10 @@ def cute_reindexed_scalar_load_expr(
     with ``extra_mask`` is not re-read: its mask is a per-thread value that
     cannot be re-evaluated at the partner's coordinates, so the partner would
     read raw memory where ``tl.split`` sees a zero.
+
+    Without ``keep_own_mask`` (a store re-reading the element its slot names,
+    which has nothing to do with the thread's own element) only the partner's
+    bounds gate the read, checked on every dim.
     """
     from .cute_reshape import _coords_from_flat_index
     from .cute_reshape import _get_block_local_coord
@@ -5310,11 +5506,15 @@ def cute_reindexed_scalar_load_expr(
     flat_var = cg.lift(expr_from_string(flat_index), dce=True, prefix="split_index")
     coords = _coords_from_flat_index(flat_var.id, shape)
     index_exprs = list(site.index_exprs)
-    mask_terms = [] if site.mask_expr is None else [site.mask_expr]
+    mask_terms = (
+        [site.mask_expr] if keep_own_mask and site.mask_expr is not None else []
+    )
     flattened: PerThreadFlattenedTileStrategy | None = None
     # block id -> (value dim, tensor dim)
     flattened_dims: dict[int, tuple[int, int]] = {}
     for dim, mapping in enumerate(site.output_dims):
+        if mapping is None and shape[dim] != 1 and not keep_own_mask:
+            return None
         if shape[dim] == 1 or mapping is None:
             continue
         tensor_dim, block_id = mapping
@@ -5333,7 +5533,7 @@ def cute_reindexed_scalar_load_expr(
         partner = f"({index_exprs[tensor_dim]}) - ({own_coord}) + ({coords[dim]})"
         index_exprs[tensor_dim] = partner
         dim_size = tensor.size(tensor_dim)
-        if not env.known_equal(dim_size, shape[dim]):
+        if not keep_own_mask or not env.known_equal(dim_size, shape[dim]):
             size_expr = (
                 str(dim_size)
                 if isinstance(dim_size, int)
@@ -5502,6 +5702,7 @@ def _(state: CodegenState) -> object:
             stack_tensor_like,
             subscript,
             state.proxy_arg(2),
+            mask_index=2,
             what="stack tensor load",
             leading_sizes=stack_dev_ptrs.shape,
         )

@@ -29,9 +29,11 @@ from torch.utils._sympy.functions import FloorDiv
 from ... import exc
 from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _for_loop_step
+from ...language._tracing_ops import _new_var
 from ...language.inline_asm_ops import inline_asm_elementwise
 from ...language.matmul_ops import dot as hl_dot
 from ...language.memory_ops import _cute_resolve_active_slice_block_id
+from ...language.memory_ops import store
 from ...language.reduce_ops import _reduce
 from ...language.scan_ops import _associative_scan
 from ...language.view_ops import join
@@ -111,8 +113,26 @@ def _get_tile_shape(
     return shape
 
 
+def _tile_shape_hint(
+    fake_tensor: torch.Tensor,
+    env: CompileEnvironment,
+    config: Config,
+) -> list[int]:
+    """``_get_tile_shape`` without specializing a runtime size to its hint.
+
+    An analysis that only compares tile shapes must not guard on a SymInt:
+    ``int(size)`` would bake it into the kernel (and recompile it per size).
+    """
+    return [
+        extent
+        if (extent := _resolve_tile_extent(size, env, config)) is not None
+        else env.size_hint(size)
+        for size in fake_tensor.shape
+    ]
+
+
 def _resolve_tile_extent(
-    size: int | torch.SymInt,
+    size: int | torch.SymInt | sympy.Expr,
     env: CompileEnvironment,
     config: Config,
 ) -> int | None:
@@ -123,11 +143,14 @@ def _resolve_tile_extent(
     """
     if isinstance(size, int):
         return size
-    block_id = env.get_block_id(size)
-    if block_id is not None:
-        value = env.block_sizes[block_id].from_config(config)
-        return value if isinstance(value, int) else None
-    expr = size.node._expr
+    if isinstance(size, sympy.Expr):
+        expr = size
+    else:
+        block_id = env.get_block_id(size)
+        if block_id is not None:
+            value = env.block_sizes[block_id].from_config(config)
+            return value if isinstance(value, int) else None
+        expr = size.node._expr
     if not isinstance(expr, sympy.Expr):
         return None
     replacements: dict[sympy.Symbol, sympy.Integer] = {}
@@ -1030,6 +1053,17 @@ def resolve_cute_shape_chain_value(
     )
 
 
+def _lowering_context(state: CodegenState) -> LoweringContext:
+    """The ``LoweringContext`` the shape-chain resolvers read (the codegen
+    object and the fx-node -> argument map) for a memory op's ``state``."""
+    from ..aten_lowering import LoweringContext
+
+    ctx = LoweringContext.__new__(LoweringContext)
+    ctx.cg = state.codegen
+    ctx.env = state.env
+    return ctx
+
+
 def resolve_cute_shape_chain_value_at(
     state: CodegenState,
     node: Node,
@@ -1043,11 +1077,7 @@ def resolve_cute_shape_chain_value_at(
     chain resolver only needs the ``GenerateAST`` codegen object and the
     fx-node -> argument map, both of which ``CodegenState`` already carries.
     """
-    from ..aten_lowering import LoweringContext
-
-    ctx = LoweringContext.__new__(LoweringContext)
-    ctx.cg = state.codegen
-    ctx.env = state.env
+    ctx = _lowering_context(state)
     return _resolve_shape_chain_expr(ctx, node, flat_index, leaf_resolver)
 
 
@@ -1078,6 +1108,518 @@ def codegen_cute_virtual_clone(
             "cute", "virtual shape-chain clone requires shape-only consumers"
         )
     return value
+
+
+def _reshape_keeps_thread_elements(node: Node) -> bool:
+    """Whether every element of the reshape stays on the thread and lane
+    holding it: a pair view whose split dimensions carry explicit per-thread
+    coordinates (``CUTE_DIM_LOCAL_COORD_META``, the ``hl.split`` / epilogue
+    subtile views ``cute/view_subtile.py`` annotates)."""
+    return CUTE_DIM_LOCAL_COORD_META in node.meta
+
+
+def _merged_block_dim(
+    node: Node, input_shape: list[int], output_shape: list[int]
+) -> int | None:
+    """The output dim merging the input's trailing dims, when its size is the
+    product of their sizes and each of those is a distinct block's.
+
+    A sum over such a dim reduces over exactly those blocks, whichever threads
+    hold the elements (``x[t0, t1, t2].reshape(t0, -1).sum(-1)``).  A merged
+    dim of static size is matched to a block by size instead
+    (``x[t, :, :].reshape(t, 128)`` beside a 128-wide slice), which leaves out
+    the threads holding the elements.
+    """
+    dim = len(output_shape) - 1
+    source = node.args[0]
+    if (
+        dim < 0
+        or output_shape[:dim] != input_shape[:dim]
+        or not isinstance(source, Node)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    sizes = source.meta["val"].shape[dim:]
+    block_ids = [env.get_block_id(size) for size in sizes]
+    if None in block_ids or len(set(block_ids)) != len(block_ids):
+        return None
+    product = sympy.Integer(1)
+    for size in sizes:
+        product *= sympy.sympify(size)
+    return dim if sympy.sympify(node.meta["val"].shape[dim]) == product else None
+
+
+# One digit of a thread's coordinate along a tile dim, ``(block_id, divisor,
+# modulus)``: ``block_local_coord(block_id) // divisor % modulus``.  A dim's
+# coordinate is a mixed-radix number of such digits, least significant first:
+# a dim merging the dims of several blocks has one digit per block.  ``()`` is
+# the coordinate of a unit dim.
+_Digit = tuple[int, int, int]
+_ThreadCoord = tuple[_Digit, ...]
+
+
+def _thread_digit(
+    cg: GenerateAST, block_id: object, divisor: object, modulus: object
+) -> _Digit | None:
+    """A digit over an active block, its modulus capped at the quotient's
+    range so equal coordinate functions compare equal; None if unknown."""
+    if (
+        not isinstance(block_id, int)
+        or not isinstance(divisor, int)
+        or divisor < 1
+        or not (modulus is None or isinstance(modulus, int))
+        or _get_block_local_coord(cg, block_id) is None
+    ):
+        return None
+    extent = cg.device_function.resolved_block_size(block_id)
+    if not isinstance(extent, int) or extent % divisor:
+        return None
+    span = extent // divisor
+    return (block_id, divisor, span if modulus is None else min(modulus, span))
+
+
+def _normalized_coord(digits: Sequence[_Digit]) -> _ThreadCoord:
+    """Drop always-zero digits and fuse a digit into the one below it when
+    both read consecutive quotients of the same block."""
+    result: list[_Digit] = []
+    for block_id, divisor, modulus in digits:
+        if modulus == 1:
+            continue
+        if result and result[-1][0] == block_id:
+            _, low_divisor, low_modulus = result[-1]
+            if low_divisor * low_modulus == divisor:
+                result[-1] = (block_id, low_divisor, low_modulus * modulus)
+                continue
+        result.append((block_id, divisor, modulus))
+    return tuple(result)
+
+
+def _coord_extent(coord: _ThreadCoord) -> int:
+    extent = 1
+    for _, _, modulus in coord:
+        extent *= modulus
+    return extent
+
+
+def _split_coord(
+    cg: GenerateAST, coord: _ThreadCoord, inner: int
+) -> tuple[_ThreadCoord, _ThreadCoord] | None:
+    """Split ``coord`` into its low digits spanning ``inner`` and the rest."""
+    low: list[_Digit] = []
+    rest = list(coord)
+    while inner > 1:
+        if not rest:
+            return None
+        block_id, divisor, modulus = rest.pop(0)
+        if modulus <= inner:
+            if inner % modulus:
+                return None
+            low.append((block_id, divisor, modulus))
+            inner //= modulus
+            continue
+        high = _thread_digit(cg, block_id, divisor * inner, modulus // inner)
+        if modulus % inner or high is None:
+            return None
+        low.append((block_id, divisor, inner))
+        rest.insert(0, high)
+        inner = 1
+    return _normalized_coord(low), _normalized_coord(rest)
+
+
+def _node_thread_coord(
+    cg: GenerateAST, node: Node, value: torch.Tensor, dim: int
+) -> _ThreadCoord | None:
+    """The coordinate ``_get_node_dim_local_coord`` gives a thread along ``dim``."""
+    coord_meta = node.meta.get(CUTE_DIM_LOCAL_COORD_META)
+    digit = None
+    if (
+        isinstance(coord_meta, (list, tuple))
+        and dim < len(coord_meta)
+        and isinstance(info := coord_meta[dim], dict)
+    ):
+        digit = _thread_digit(
+            cg, info.get("block_id"), info.get("divisor", 1), info.get("modulus")
+        )
+    elif (block_id := _resolve_dim_block_id(cg, value, dim)) is not None:
+        digit = _thread_digit(cg, block_id, 1, None)
+    elif isinstance(size := value.shape[dim], torch.SymInt) and isinstance(
+        size.node._expr, FloorDiv
+    ):
+        base, divisor = size.node._expr.args
+        if isinstance(divisor, sympy.Integer):
+            env = CompileEnvironment.current()
+            digit = _thread_digit(cg, env.get_block_id(base), int(divisor), None)
+    return None if digit is None else _normalized_coord([digit])
+
+
+def _reshape_source_thread_coords(
+    cg: GenerateAST,
+    coords: Sequence[_ThreadCoord | None],
+    shape: list[int],
+    source_shape: list[int],
+) -> list[_ThreadCoord | None] | None:
+    """Map a reshape's per-dim thread coordinates onto its input's dims.
+
+    Each group of output dims and input dims covering the same elements reads
+    one flat coordinate: the output dims' digits, innermost dim first, which
+    the input dims then split up by their extents.  Every output dim must be
+    covered exactly by its coordinate.
+    """
+    out_dims = [dim for dim, extent in enumerate(shape) if extent != 1]
+    in_dims = [dim for dim, extent in enumerate(source_shape) if extent != 1]
+    source_coords: list[_ThreadCoord | None] = [()] * len(source_shape)
+    while out_dims and in_dims:
+        group_out, group_in = [out_dims.pop(0)], [in_dims.pop(0)]
+        out_numel, in_numel = shape[group_out[0]], source_shape[group_in[0]]
+        while out_numel != in_numel:
+            if out_numel < in_numel and out_dims:
+                group_out.append(out_dims.pop(0))
+                out_numel *= shape[group_out[-1]]
+            elif in_numel < out_numel and in_dims:
+                group_in.append(in_dims.pop(0))
+                in_numel *= source_shape[group_in[-1]]
+            else:
+                return None
+        digits: list[_Digit] = []
+        for dim in reversed(group_out):
+            coord = coords[dim]
+            if coord is None or _coord_extent(coord) != shape[dim]:
+                return None
+            digits.extend(coord)
+        flat = _normalized_coord(digits)
+        for dim in reversed(group_in):
+            split = _split_coord(cg, flat, source_shape[dim])
+            if split is None:
+                return None
+            source_coords[dim], flat = split
+        if flat:
+            return None
+    if out_dims or in_dims:
+        return None
+    return source_coords
+
+
+# Reshape targets (``codegen_cute_reshape``).
+_VIEW_TARGETS = frozenset(
+    {
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.view.default,
+    }
+)
+
+
+# The views ``_resolve_shape_chain_expr`` maps a thread's coordinates through.
+_CHAIN_PROOF_VIEW_TARGETS = frozenset(
+    {
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.t.default,
+        torch.ops.aten.expand.default,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.squeeze.dim,
+    }
+)
+
+
+def _chain_keeps_thread_elements(
+    ctx: LoweringContext, node: Node, coords: Sequence[_ThreadCoord | None]
+) -> bool:
+    """Whether resolving the shape chain at ``node`` for a thread at ``coords``
+    (``_resolve_shape_chain_expr``) reads only elements that thread holds.
+
+    Follows the resolver's coordinate maps down to the chain's materialized
+    leaves and compares the coordinates reached with the ones each leaf was
+    computed at (``_node_thread_coord``).
+    """
+    cg = cast("GenerateAST", ctx.cg)
+    env = CompileEnvironment.current()
+    config = cg.device_function.config
+    value = node.meta.get("val")
+    if not isinstance(value, torch.Tensor) or len(coords) != value.ndim:
+        return False
+    shape = _tile_shape_hint(value, env, config)
+    target = node.target
+    if target is torch.ops.aten.stack.default:
+        tensors = node.args[0]
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if not isinstance(tensors, (list, tuple)) or not isinstance(dim, int):
+            return False
+        # The stack selects its input by this thread's own coordinate.
+        dim %= len(shape)
+        return coords[dim] is not None and all(
+            isinstance(tensor, Node)
+            and _chain_keeps_thread_elements(
+                ctx, tensor, [*coords[:dim], *coords[dim + 1 :]]
+            )
+            for tensor in tensors
+        )
+    source = node.args[0] if node.args else None
+    source_val = source.meta.get("val") if isinstance(source, Node) else None
+    source_coords: list[_ThreadCoord | None] | None = None
+    if (
+        isinstance(source, Node)
+        and isinstance(source_val, torch.Tensor)
+        and target in _CHAIN_PROOF_VIEW_TARGETS
+    ):
+        source_shape = _tile_shape_hint(source_val, env, config)
+        if target in _VIEW_TARGETS:
+            source_coords = _reshape_source_thread_coords(
+                cg, coords, shape, source_shape
+            )
+        elif target is torch.ops.aten.permute.default and isinstance(
+            perm := node.args[1], (list, tuple)
+        ):
+            source_coords = [()] * len(coords)
+            for out_dim, in_dim in enumerate(perm):
+                if not isinstance(in_dim, int):
+                    return False
+                source_coords[in_dim % len(coords)] = coords[out_dim]
+        elif target is torch.ops.aten.transpose.int:
+            dims = [dim % len(coords) for dim in node.args[1:] if isinstance(dim, int)]
+            if len(dims) != 2:
+                return False
+            source_coords = [*coords]
+            source_coords[dims[0]], source_coords[dims[1]] = (
+                coords[dims[1]],
+                coords[dims[0]],
+            )
+        elif target is torch.ops.aten.t.default:
+            source_coords = [*reversed(coords)]
+        elif target is torch.ops.aten.expand.default:
+            rank_delta = len(shape) - len(source_shape)
+            if any(
+                extent not in (1, shape[dim + rank_delta])
+                for dim, extent in enumerate(source_shape)
+            ):
+                return False
+            source_coords = [
+                () if extent == 1 else coords[dim + rank_delta]
+                for dim, extent in enumerate(source_shape)
+            ]
+        elif target is torch.ops.aten.unsqueeze.default and isinstance(
+            dim := node.args[1], int
+        ):
+            dim %= len(coords)
+            source_coords = [*coords[:dim], *coords[dim + 1 :]]
+        elif target is torch.ops.aten.squeeze.dim and isinstance(
+            dim := node.args[1], int
+        ):
+            dim %= len(source_shape)
+            source_coords = (
+                [*coords]
+                if source_shape[dim] != 1
+                else [*coords[:dim], (), *coords[dim:]]
+            )
+    if source_coords is not None:
+        assert isinstance(source, Node)
+        return _chain_keeps_thread_elements(ctx, source, source_coords)
+    resolved = ctx.env.get(node)
+    if isinstance(resolved, CuteShapeChainView) and resolved.node is not node:
+        return _chain_keeps_thread_elements(ctx, resolved.node, coords)
+    return isinstance(resolved, ast.AST) and all(
+        extent == 1
+        or (
+            coords[dim] is not None
+            and coords[dim] == _node_thread_coord(cg, node, value, dim)
+        )
+        for dim, extent in enumerate(shape)
+    )
+
+
+def _reshape_keeps_thread_elements_through_chain(
+    ctx: LoweringContext, node: Node, output_shape: list[int]
+) -> bool:
+    """Whether the fused shape chain hands every thread of the reshape the
+    element at its own output coordinates (``_chain_keeps_thread_elements``),
+    e.g. ``hl.join(...).reshape(...)`` undoing a pair split, or a stack of
+    ``x[k // 2]`` half tiles interleaved into ``k``."""
+    coords = cute_thread_coords(cast("GenerateAST", ctx.cg), node, output_shape)
+    return coords is not None and _chain_keeps_thread_elements(ctx, node, coords)
+
+
+def cute_thread_coords(
+    cg: GenerateAST, node: Node, shape: list[int]
+) -> list[_ThreadCoord] | None:
+    """Each dim's thread coordinate (``_node_thread_coord``), or None unless
+    every non-unit dim has one and no two dims read the same digits of a
+    block (two dims bound to one block would name one element twice)."""
+    value = node.meta["val"]
+    coords: list[_ThreadCoord] = []
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for dim, extent in enumerate(shape):
+        coord = () if extent == 1 else _node_thread_coord(cg, node, value, dim)
+        if coord is None:
+            return None
+        for block_id, divisor, modulus in coord:
+            low, high = divisor, divisor * modulus
+            taken = spans.setdefault(block_id, [])
+            if any(
+                low < other_high and other_low < high for other_low, other_high in taken
+            ):
+                return None
+            taken.append((low, high))
+        coords.append(coord)
+    return coords
+
+
+# The digit an affine store's row lane (``affine_lane in range(factor)``)
+# contributes to a row coordinate: no block's, so only a stack selects by it.
+_AFFINE_LANE_BLOCK = -1
+
+
+def cute_affine_rows_keep_thread_elements(
+    state: CodegenState, node: Node, m_block: int, factor: int, n_block: int
+) -> bool:
+    """Whether ``_codegen_cute_affine_reshape_store``'s reads of ``node`` at
+    row ``factor * m + lane`` and column ``n`` (``_chain_keeps_thread_elements``)
+    land on elements this thread holds for every lane: the chain may select a
+    stack input by the lane, but no leaf may be read at another row."""
+    cg = state.codegen
+    m_digit = _thread_digit(cg, m_block, 1, None)
+    n_digit = _thread_digit(cg, n_block, 1, None)
+    if m_digit is None or n_digit is None:
+        return False
+    coords: list[_ThreadCoord | None] = [
+        _normalized_coord([(_AFFINE_LANE_BLOCK, 1, factor), m_digit]),
+        _normalized_coord([n_digit]),
+    ]
+    return _chain_keeps_thread_elements(_lowering_context(state), node, coords)
+
+
+def _reshape_value_consumer(
+    ctx: LoweringContext, node: Node, input_shape: list[int], output_shape: list[int]
+) -> str | None:
+    """A consumer that reads the reshape's values at their reshaped positions
+    (named for the error); None when only relabeling-blind consumers and
+    stores of the reshape read them.
+
+    Each thread holds the element at its *source* position (the lowerings of
+    ``codegen_cute_reshape``).  That relabeling is invisible to a shape query,
+    further shape ops, pointwise ops whose every tensor operand carries the
+    same relabeling, and a sum over exactly the trailing block dims the
+    reshape merged (``_merged_block_dim``).  A store of the reshape itself (or
+    of a shape view of it) is left to the store, which refuses it unless one
+    of its paths re-reads the elements from the threads holding them
+    (``is_cute_thread_moving_reshape_value``), and a later reshape of a view
+    of it proven to put every element back on its own thread
+    (``_reshape_keeps_thread_elements_through_chain``) ends the walk.  Any
+    other consumer (a store of a value computed from the reshape, a pointwise
+    op mixing in a tensor of the reshaped layout, a mask, a matmul, an atomic,
+    another reduction, a value leaving the graph) reads elements another
+    thread or lane holds.
+    """
+    merged_dim = _merged_block_dim(node, input_shape, output_shape)
+    # The relabeled values, keyed to the node whose layout they share: the
+    # reshape itself for its pointwise descendants, a shape op for its own.
+    layout: dict[Node, Node] = {node: node}
+    # The relabeled values no op has computed with: the reshape and its views.
+    views = {node}
+    nodes = list(node.graph.nodes)
+    for user in nodes[nodes.index(node) + 1 :]:
+        relabeled = [arg for arg in user.all_input_nodes if arg in layout]
+        if not relabeled:
+            continue
+        if user.op != "call_function":
+            return "the graph's output"
+        target = user.target
+        if target is torch.ops.aten.sym_size.int:
+            continue
+        if target is store:
+            if (
+                relabeled != [value := user.args[2]]
+                or any(index is value for index in user.args[1])
+                or value not in views
+            ):
+                return "a store of a value computed from it"
+            continue
+        if (
+            target in _VIEW_TARGETS
+            and relabeled[0] in views
+            and _reshape_keeps_thread_elements_through_chain(
+                ctx,
+                user,
+                _tile_shape_hint(
+                    user.meta["val"],
+                    CompileEnvironment.current(),
+                    ctx.cg.device_function.config,
+                ),
+            )
+        ):
+            continue
+        if (
+            target is _new_var
+            or target is torch.ops.aten.clone.default
+            or is_cute_shape_chain_target(target)
+        ):
+            (source,) = relabeled
+            layout[user] = (
+                user if is_cute_shape_chain_target(target) else layout[source]
+            )
+            if source in views:
+                views.add(user)
+            continue
+        operands = [
+            arg
+            for arg in user.args
+            if isinstance(arg, Node)
+            and isinstance(arg.meta.get("val"), torch.Tensor)
+            and arg.meta["val"].ndim > 0
+        ]
+        if (
+            target in _LAYOUT_PRESERVING_POINTWISE_TARGETS
+            and all(arg in layout for arg in operands)
+            and len({layout[arg] for arg in operands}) == 1
+        ):
+            layout[user] = layout[operands[0]]
+            continue
+        if (
+            target is torch.ops.aten.sum.dim_IntList
+            and merged_dim is not None
+            and relabeled == [user.args[0]]
+            and layout[user.args[0]] is node
+            and isinstance(dims := user.args[1], (list, tuple))
+            and [dim % len(output_shape) for dim in dims] == [merged_dim]
+        ):
+            continue
+        return getattr(target, "__name__", str(target))
+    return None
+
+
+def is_cute_thread_moving_reshape_value(cg: GenerateAST, node: Node) -> bool:
+    """Whether a store value is (a view of) a reshape whose elements sit on
+    other threads than the ones its coordinates name: the nearest merging or
+    splitting reshape below the views was not proven to keep them in place
+    (``CuteDeviceState.reshape_elements_in_place``)."""
+    in_place = cg.device_function.cute_state.reshape_elements_in_place
+    while node not in in_place:
+        source = node.args[0] if node.args else None
+        if not (
+            node.op == "call_function"
+            and (
+                is_cute_shape_chain_target(node.target)
+                or node.target is _new_var
+                or node.target is torch.ops.aten.clone.default
+            )
+            and isinstance(source, Node)
+        ):
+            return False
+        node = source
+    return not in_place[node]
+
+
+def _thread_moving_reshape_error(
+    input_shape: list[int], output_shape: list[int], consumer: str
+) -> exc.BackendUnsupported:
+    return exc.BackendUnsupported(
+        "cute",
+        f"a reshape of tile shape {input_shape} to {output_shape} consumed by "
+        f"{consumer}: merging or splitting tile dimensions moves elements "
+        "between threads",
+    )
 
 
 def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
@@ -1112,6 +1654,27 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
         return tensor
 
     source_node = shape_chain.node if shape_chain is not None else node.args[0]
+    # Every lowering below hands a consumer the element a thread holds at its
+    # *source* position (the fused chain resolves to its leaves' own per-thread
+    # scalars, the lane-loop shortcut passes the input through, the
+    # shared-memory relayout writes only the elements a thread owns), and so
+    # does a view that later materializes this one, while a merge or split of
+    # tile dimensions moves elements between threads and lanes.  Unless the
+    # chain is proven to land every element on its own thread anyway, only
+    # consumers blind to that relabeling are accepted
+    # (``_reshape_value_consumer``); a store of the reshape is left to the
+    # store paths that re-read the moved elements, and the generic store
+    # refuses it (``is_cute_thread_moving_reshape_value``).
+    proven = False
+    if [extent for extent in input_shape if extent != 1] != [
+        extent for extent in output_shape if extent != 1
+    ] and not _reshape_keeps_thread_elements(node):
+        proven = _reshape_keeps_thread_elements_through_chain(ctx, node, output_shape)
+        if not proven:
+            consumer = _reshape_value_consumer(ctx, node, input_shape, output_shape)
+            if consumer is not None:
+                raise _thread_moving_reshape_error(input_shape, output_shape, consumer)
+        df.cute_state.reshape_elements_in_place[node] = proven
     if shape_chain is not None and _shape_chain_only_users(node):
         return CuteShapeChainView(node)
     if isinstance(source_node, Node):
@@ -1123,6 +1686,13 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
         fused_expr = _resolve_shape_chain_expr(ctx, source_node, output_flat)
         if fused_expr is not None:
             return fused_expr
+    if proven:
+        # Only the fused chain was proven to keep the elements in place.
+        raise exc.BackendUnsupported(
+            "cute",
+            f"a reshape of tile shape {input_shape} to {output_shape} whose "
+            "shape chain does not resolve",
+        )
 
     if (
         ctx.cg.current_grid_state is not None
@@ -1475,6 +2045,8 @@ def subscript_rebound_block_dims(
     subscript: Sequence[object],
     value: torch.Tensor,
     *,
+    value_index: int,
+    what: str,
     leading_sizes: Sequence[int | torch.SymInt] = (),
 ) -> list[tuple[int, int, int]]:
     """``rebound_block_dims`` of ``value`` written through ``tensor[subscript]``
@@ -1485,17 +2057,32 @@ def subscript_rebound_block_dims(
     address each dim with (``_subscript_slot_dims``), so an exchanged value is
     read at the slice's block coordinate (the load's reduction block for
     ``out[tile_m, :] = x[:, tile_m]``, ``tile_n`` for the second slice of
-    ``out[tile_m, :, :] = x[tile_m, :, tile_n]``).
+    ``out[tile_m, :, :] = x[tile_m, :, tile_n]``).  A literal dim of the
+    value (argument ``value_index`` of the op) is checked against the block
+    the subscript addresses it with (``check_literal_slot_dims``).
     """
+    # Local import: literal_dims imports this module.
+    from .literal_dims import check_literal_slot_dims
+
     env = CompileEnvironment.current()
+    config = state.device_function.config
     slot_sizes, slot_block_ids = _subscript_slot_dims(state, tensor, subscript)
     leading = [*leading_sizes]
+    block_ids = [*tensor_dim_block_ids(env, leading), *slot_block_ids]
+    fx_args = state.fx_node.args if state.fx_node is not None else ()
+    check_literal_slot_dims(
+        config,
+        fx_args[value_index] if value_index < len(fx_args) else None,
+        value,
+        block_ids,
+        what=what,
+    )
     return rebound_block_dims(
         env,
-        state.device_function.config,
+        config,
         value,
         [*leading, *slot_sizes],
-        [*tensor_dim_block_ids(env, leading), *slot_block_ids],
+        block_ids,
         lower_rank_by_block_id=False,
     )
 
@@ -1875,16 +2462,24 @@ def check_memory_mask_rebound(
     subscript: Sequence[object],
     mask_val: object,
     *,
+    mask_index: int,
     what: str,
     leading_sizes: Sequence[int | torch.SymInt] = (),
 ) -> None:
-    """Refuse a load or store ``extra_mask`` bound to another block id than
-    the subscript's dims: Triton ANDs it positionally into the index masks,
-    the per-thread lowering would test another lane's element."""
+    """Refuse a load or store ``extra_mask`` (argument ``mask_index`` of the
+    op) bound to another block id than the subscript's dims: Triton ANDs it
+    positionally into the index masks, the per-thread lowering would test
+    another lane's element."""
     if not isinstance(mask_val, torch.Tensor) or mask_val.ndim == 0:
         return
     rebound = subscript_rebound_block_dims(
-        state, tensor, subscript, mask_val, leading_sizes=leading_sizes
+        state,
+        tensor,
+        subscript,
+        mask_val,
+        value_index=mask_index,
+        what=f"{what} mask",
+        leading_sizes=leading_sizes,
     )
     if rebound:
         raise exc.BackendUnsupported(
@@ -1911,7 +2506,9 @@ def codegen_cute_load_mask_rebound(
     mask_val = state.proxy_arg(2)
     if mask is None or not isinstance(mask_val, torch.Tensor) or mask_val.ndim == 0:
         return mask
-    rebound = subscript_rebound_block_dims(state, tensor, subscript, mask_val)
+    rebound = subscript_rebound_block_dims(
+        state, tensor, subscript, mask_val, value_index=2, what="load mask"
+    )
     if not rebound:
         return mask
     env = CompileEnvironment.current()
@@ -1957,6 +2554,7 @@ def store_rebound_dims(
         tensor,
         subscript,
         state.proxy_arg(3),
+        mask_index=3,
         what="store",
         leading_sizes=leading_sizes,
     )
@@ -1964,7 +2562,13 @@ def store_rebound_dims(
     if not isinstance(value_val, torch.Tensor) or value_val.ndim == 0:
         return []
     rebound = subscript_rebound_block_dims(
-        state, tensor, subscript, value_val, leading_sizes=leading_sizes
+        state,
+        tensor,
+        subscript,
+        value_val,
+        value_index=2,
+        what="store",
+        leading_sizes=leading_sizes,
     )
     if not rebound:
         return []
