@@ -1109,6 +1109,52 @@ def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
     }
 
 
+def _is_prefetch(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(call := node.value, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "helion_cache_hints"
+        and call.func.attr == "prefetch_l2"
+    )
+
+
+def _is_pure(node: ast.AST) -> bool:
+    return all(
+        _is_pure_call(call)
+        and not any(keyword.arg == "volatile" for keyword in call.keywords)
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    )
+
+
+def _split_prefetches(body: list[ast.stmt]) -> tuple[list[ast.stmt], list[ast.stmt]]:
+    """Split a task body's top-level prefetches, with the scalar math they read,
+    from the body; nothing moves unless that math is pure and can run twice."""
+    kept: list[ast.stmt] = []
+    needed: set[str] = set()
+    for statement in reversed(body):
+        if not _is_prefetch(statement):
+            if not _stored_names([statement]) & needed:
+                continue
+            if not isinstance(statement, (ast.Assign, ast.AugAssign)) or not _is_pure(
+                statement
+            ):
+                return [], body
+        kept.append(statement)
+        needed |= _all_names([statement])
+    kept.reverse()
+    # The copy runs ahead of the body, so it must not update a value it reads.
+    written: set[str] = set()
+    for statement in kept:
+        reads = statement.value if isinstance(statement, ast.Assign) else statement
+        if (_all_names([reads]) - written) & _stored_names(kept):
+            return [], body
+        written |= _stored_names([statement])
+    return kept, [statement for statement in body if not _is_prefetch(statement)]
+
+
 # Device modules a dry pass runs unchanged: memory goes through ``tl`` only.
 _DRY_PASS_PURE_MODULES = frozenset({"tl", "triton_helpers", "tl_math", "libdevice"})
 # Inductor helpers that only compute; the others load, spin, or publish.
@@ -3155,7 +3201,7 @@ def emit_cross_loop_schedule(
                 prefix="tile_dependency_root_barrier_wait",
             )
             task_body.extend(peer_waits(root))
-            task_body.extend(
+            prefetches, root_task = _split_prefetches(
                 scheduled_root_task_body(
                     root,
                     local_task,
@@ -3163,6 +3209,7 @@ def emit_cross_loop_schedule(
                     (dispatch_ticket,),
                 )
             )
+            task_body.extend(root_task)
             publications = peer_publications(root)
             if publications:
                 task_body.extend(_release_sync(device_function))
@@ -3172,6 +3219,8 @@ def emit_cross_loop_schedule(
             # compile around dot_scaled, and the while-loop form is slower.
             if waits_on_dependency(root) and root not in kernel_scope_roots:
                 task_body = dry_pass_task(task_body) or task_body
+            # A task's own prefetches go ahead of its waits, which they overlap.
+            task_body = [*prefetches, *task_body]
             packet_branches.append(
                 (
                     packet_begin,

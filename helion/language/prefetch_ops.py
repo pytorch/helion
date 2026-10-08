@@ -21,8 +21,9 @@ def prefetch(tensor: torch.Tensor, index: list[object]) -> None:
     """Prefetch ``tensor[index]`` into L2 with one bulk prefetch from one thread.
 
     Scalar indices select leading dimensions; the remaining suffix must be one
-    dense byte range of static size. It is issued in place. Prefetching never
-    changes values.
+    dense byte range of static size. It is issued in place, except that a
+    dynamically dispatched megakernel task issues it before waiting on its
+    producers when its index is pure scalar math. Prefetching never changes values.
 
     Args:
         tensor: The tensor to prefetch from
