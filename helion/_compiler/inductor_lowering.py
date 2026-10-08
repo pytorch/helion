@@ -1618,6 +1618,15 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
+                    # ``has_current``: test_cute_fx_replay replays ``run_node``
+                    # with no CompileEnvironment.
+                    if (
+                        CompileEnvironment.has_current()
+                        and CompileEnvironment.current().backend.name == "cute"
+                    ):
+                        from .cute.repeated_block_ids import check_repeated_block_ids
+
+                        check_repeated_block_ids(self.cg, n)
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result

@@ -846,6 +846,8 @@ def cute_resolve_active_matmul_k_block_id(
     lhs_k_size: int | torch.SymInt,
     rhs_k_size: int | torch.SymInt,
     rhs_n_size: int | torch.SymInt,
+    *,
+    lhs_m_size: int | torch.SymInt | None = None,
 ) -> int | None:
     env = CompileEnvironment.current()
     canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
@@ -855,11 +857,19 @@ def cute_resolve_active_matmul_k_block_id(
         return None
     if canonical_block_id(lhs_k_block_id) != canonical_block_id(rhs_k_block_id):
         return None
-    rhs_n_block_id = cute_resolve_active_block_id(cg, rhs_n_size)
-    if rhs_n_block_id is not None and canonical_block_id(
-        rhs_n_block_id
-    ) == canonical_block_id(lhs_k_block_id):
-        return None
+    # K must be a block of its own: a free (M or N) axis bound to the same
+    # block would make the cross-thread K reduction sum the free axis too
+    # (one lane coordinate per block id), broadcasting one value per row.
+    k_canonical = canonical_block_id(lhs_k_block_id)
+    for free_size in (rhs_n_size, lhs_m_size):
+        if free_size is None:
+            continue
+        free_block_id = cute_resolve_active_block_id(cg, free_size)
+        if (
+            free_block_id is not None
+            and canonical_block_id(free_block_id) == k_canonical
+        ):
+            return None
     return lhs_k_block_id
 
 

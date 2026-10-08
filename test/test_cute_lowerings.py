@@ -108,6 +108,7 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
+from helion._compiler.cute.repeated_block_ids import _is_matmul_operand_load
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -24492,6 +24493,256 @@ class TestReductionBlockClassifiers(unittest.TestCase):
     def test_block_has_live_thread_axis_false_when_only_serial_loop(self) -> None:
         strategy = self._make_strategy(active_device_loops={0: [self._serial_loop(0)]})
         self.assertFalse(strategy._reduction_block_has_live_thread_axis())
+
+
+@onlyBackends(["cute"])
+class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
+    """The SIMT lowering gives each block id one lane coordinate, so a tensor
+    that binds one block id to two of its axes collapses onto its diagonal.
+    Such kernels must fail loudly instead of returning wrong numbers; once the
+    lowering supports a repeated block id, the rejection tests below turn into
+    numerics tests against the torch references in their bodies.
+    """
+
+    def test_two_full_slice_dot_cc_tile_is_rejected(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1, 16]),
+            static_shapes=True,
+        )
+        def attn_cc(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            B = q.size(0)
+            C = hl.specialize(q.size(1))
+            D = q.size(2)
+            out = torch.empty([B, C, C], dtype=torch.float32, device=q.device)
+            for tile_b in hl.tile(B):
+                # Both ':' slices have size C and dedup onto one reduction
+                # block, so attn is [tile_b, C, C] with that block on both axes.
+                attn = hl.zeros([tile_b, C, C], dtype=torch.float32)
+                for tile_d in hl.tile(D):
+                    qt = q[tile_b, :, tile_d]
+                    kt = k[tile_b, :, tile_d]
+                    attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
+                out[tile_b, :, :] = attn
+            return out
+
+        q = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
+        # Reference once supported: q.float() @ k.float().transpose(-2, -1)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
+            attn_cc(q, k)
+
+    def test_arange_outer_compare_mask_is_rejected(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1]),
+            static_shapes=True,
+        )
+        def causal_mask(x: torch.Tensor) -> torch.Tensor:
+            B = x.size(0)
+            C = hl.specialize(x.size(1))
+            out = torch.empty([B, C, C], dtype=torch.float32, device=x.device)
+            for tile_b in hl.tile(B):
+                ar = hl.arange(C)
+                mask = ar[:, None] >= ar[None, :]
+                out[tile_b, :, :] = torch.where(mask, 1.0, 0.0)[None, :, :].to(
+                    torch.float32
+                ) + hl.zeros([tile_b, C, C], dtype=torch.float32)
+            return out
+
+        x = torch.randn(4, 64, 32, device=DEVICE)
+        # Reference once supported: tril(ones(C, C)) broadcast over B.
+        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
+            causal_mask(x)
+
+    def test_dot_with_k_equal_m_block_is_rejected(self) -> None:
+        """``T = t[tile_bhn, :, :]`` with M == K dedups both full slices onto
+        one C block; the outer-loop load is consumed by the inner ``_for_loop``
+        rather than by ``hl.dot`` itself, so ``check_repeated_block_ids``
+        rejects the load.  The same kernel with M != K is the positive control.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1, 8]),
+            static_shapes=True,
+        )
+        def dot_t_k(t: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = k.size(0)
+            M = hl.specialize(t.size(1))
+            D = k.size(2)
+            out = torch.empty([BHN, M, D], dtype=torch.float32, device=k.device)
+            for tile_bhn in hl.tile(BHN):
+                T = t[tile_bhn, :, :]
+                for tile_d in hl.tile(D):
+                    kt = k[tile_bhn, :, tile_d].to(torch.float32)
+                    # K (T.shape[-1]) and M (T.shape[-2]) share the C block
+                    # when M == C.
+                    out[tile_bhn, :, tile_d] = hl.dot(T, kt)
+            return out
+
+        k = torch.randn(4, 16, 16, device=DEVICE, dtype=torch.bfloat16)
+        t_rect = torch.randn(4, 8, 16, device=DEVICE)
+        torch.testing.assert_close(
+            dot_t_k(t_rect, k), torch.bmm(t_rect, k.float()), rtol=1e-4, atol=1e-4
+        )
+        t_square = torch.randn(4, 16, 16, device=DEVICE)
+        # Reference once supported: torch.bmm(t_square, k.float())
+        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
+            dot_t_k(t_square, k)
+
+    def test_dot_with_k_equal_m_block_inner_load_is_rejected(self) -> None:
+        """Loading ``T`` next to the ``hl.dot`` exempts it from the load check
+        (a matmul operand), so the ``lhs_m_size`` branch of
+        ``cute_resolve_active_matmul_k_block_id`` is what refuses the M == K
+        contraction; the scalar fallback then finds no K block.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1, 8]),
+            static_shapes=True,
+        )
+        def dot_t_k_inner(t: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = k.size(0)
+            M = hl.specialize(t.size(1))
+            D = k.size(2)
+            out = torch.empty([BHN, M, D], dtype=torch.float32, device=k.device)
+            for tile_bhn in hl.tile(BHN):
+                for tile_d in hl.tile(D):
+                    T = t[tile_bhn, :, :]
+                    kt = k[tile_bhn, :, tile_d].to(torch.float32)
+                    out[tile_bhn, :, tile_d] = hl.dot(T, kt)
+            return out
+
+        k = torch.randn(4, 16, 16, device=DEVICE, dtype=torch.bfloat16)
+        t_rect = torch.randn(4, 8, 16, device=DEVICE)
+        torch.testing.assert_close(
+            dot_t_k_inner(t_rect, k),
+            torch.bmm(t_rect, k.float()),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        t_square = torch.randn(4, 16, 16, device=DEVICE)
+        # Reference once supported: torch.bmm(t_square, k.float())
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "requires an active K tile"
+        ):
+            dot_t_k_inner(t_square, k)
+
+    def test_equal_free_aranges_on_two_dims_of_one_store_are_rejected(
+        self,
+    ) -> None:
+        """``rows``/``cols`` are distinct ``hl.arange(16)`` nodes loaded from
+        equal-sized dims, so they key onto one synthetic thread axis; using
+        both as index dims of one store would write only the diagonal.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[]),
+            static_shapes=True,
+        )
+        def dot_rows_cols(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = q.size(0)
+            C = hl.specialize(q.size(1))
+            out = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
+            for tile_bhn in hl.tile(BHN, block_size=1):
+                rows = hl.arange(16)
+                cols = hl.arange(16)
+                a = hl.dot(
+                    q[tile_bhn, rows, :].float(),
+                    k[tile_bhn, cols, :].float().transpose(-2, -1),
+                )
+                out[tile_bhn, rows, cols] = a
+            return out
+
+        q = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        # Reference once supported: bmm(q[:, :16], k[:, :16].T) in out[:, :16, :16]
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"):
+            dot_rows_cols(q, k)
+
+    def test_one_free_arange_on_two_dims_of_one_access_is_rejected(self) -> None:
+        """Helion indexes two tensor entries as a cartesian tile, so one
+        ``hl.arange(16)`` reaching both index dims of a load/store through
+        views or arithmetic spans a [16, 16] tile that its single synthetic
+        lane would collapse onto the diagonal.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1]),
+            static_shapes=True,
+        )
+        def outer_views(x: torch.Tensor) -> torch.Tensor:
+            B = x.size(0)
+            out = torch.zeros_like(x)
+            for tile_b in hl.tile(B):
+                r = hl.arange(16)
+                rows = r.unsqueeze(1)
+                cols = r.unsqueeze(0)
+                out[tile_b, rows, cols] = x[tile_b, rows, cols] * 2
+            return out
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1]),
+            static_shapes=True,
+        )
+        def outer_offsets(x: torch.Tensor) -> torch.Tensor:
+            B = x.size(0)
+            out = torch.zeros_like(x)
+            for tile_b in hl.tile(B):
+                r = hl.arange(16)
+                rows = r + 1
+                cols = r + 2
+                out[tile_b, rows, cols] = x[tile_b, rows, cols] * 2
+            return out
+
+        x = torch.randn(4, 20, 20, device=DEVICE)
+        # Reference once supported: out[:, :16, :16] = 2 * x[:, :16, :16] and
+        # out[:, 1:17, 2:18] = 2 * x[:, 1:17, 2:18] respectively.
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"):
+            outer_views(x)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"):
+            outer_offsets(x)
+
+    def test_matmul_operand_load_exemption_requires_lhs_rhs_slot(self) -> None:
+        graph = Graph()
+        x = graph.placeholder("x")
+        other = graph.placeholder("other")
+        lhs = graph.call_function(load, (x, [slice(None), slice(None)]))
+        graph.call_function(hl.dot, (lhs, other))
+        rhs = graph.call_function(load, (x, [slice(None), slice(None)]))
+        rhs_t = graph.call_function(torch.ops.aten.transpose.int, (rhs, -2, -1))
+        graph.call_function(hl.dot, (other, rhs_t))
+        acc = graph.call_function(load, (x, [slice(None), slice(None)]))
+        graph.call_function(hl.dot, (other, other, acc))
+        dead = graph.call_function(load, (x, [slice(None), slice(None)]))
+
+        self.assertTrue(_is_matmul_operand_load(lhs))
+        self.assertTrue(_is_matmul_operand_load(rhs))
+        self.assertTrue(_is_matmul_operand_load(rhs_t))
+        # ``acc`` is not re-read by the direct-load serial-K path.
+        self.assertFalse(_is_matmul_operand_load(acc))
+        self.assertFalse(_is_matmul_operand_load(dead))
+
+    def test_resolve_active_matmul_k_block_id_rejects_m_alias(self) -> None:
+        cg = SimpleNamespace(
+            current_grid_state=SimpleNamespace(block_ids=[7, 3]),
+            active_device_loops={},
+        )
+        env = _fake_env({128: 7, 32: 3})
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertEqual(
+                cute_resolve_active_matmul_k_block_id(cg, 128, 128, 32, lhs_m_size=64),
+                7,
+            )
+            self.assertIsNone(
+                cute_resolve_active_matmul_k_block_id(cg, 128, 128, 32, lhs_m_size=128)
+            )
 
 
 @helion.kernel(backend="cute", static_shapes=True)
