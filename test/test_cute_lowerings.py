@@ -24467,5 +24467,92 @@ class TestReductionBlockClassifiers(unittest.TestCase):
         self.assertFalse(strategy._reduction_block_has_live_thread_axis())
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_bmm_leading_permute_fold(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    L = q.size(0)
+    H = hl.specialize(q.size(1))
+    # Specialize D: the synthetic-lane K fold needs a static contraction extent.
+    hl.specialize(q.size(2))
+    out = torch.empty([H, L, L], dtype=q.dtype, device=q.device)
+    for tile_q in hl.tile(L):
+        # [tile_q, H, D] -> [H, tile_q, D]: a leading-dim permute that keeps the
+        # contraction axis (the full-slice D rdim) trailing, as in
+        # jagged_hstu_attn_2.
+        q_blk = q[tile_q, :, :].transpose(0, 1)
+        for tile_kv in hl.tile(L):
+            k_blk = k[tile_kv, :, :].transpose(0, 1)
+            out[:, tile_q, tile_kv] = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
+    G, B, C, D, E = x.shape
+    out = torch.empty_like(x)
+    for g in hl.grid(G):
+        for tile_b in hl.tile(B):
+            for tile_c in hl.tile(C):
+                for tile_d in hl.tile(D):
+                    for tile_e in hl.tile(E):
+                        out[g, tile_b, tile_c, tile_d, tile_e] = (
+                            x[g, tile_b, tile_c, tile_d, tile_e] * 2
+                        )
+    return out
+
+
+@onlyBackends(["cute"])
+class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
+    """Synthetic-lane K matmul fold through leading-dim permutes, and demotion
+    of tile blocks that would need a fourth CUDA thread axis."""
+
+    def test_bmm_leading_dim_permute_fold(self) -> None:
+        torch.manual_seed(0)
+        q = torch.randn(64, 4, 32, device=DEVICE)
+        k = torch.randn(64, 4, 32, device=DEVICE)
+        code, out = code_and_output(
+            _cute_bmm_leading_permute_fold, (q, k), block_sizes=[32, 32]
+        )
+        # D is split threads x synthetic lanes, so the bmm folds K itself by
+        # re-reading both (permuted) operands; tile_kv is the fourth
+        # thread-parallel dim and runs as a lane loop, not thread axis 3.
+        self.assertIn("mm_fold_k", code)
+        self.assertNotIn("thread_idx()[3]", code)
+        # The transposes only feed the bmm (the hoisted one through the loop
+        # argument), so neither is shuffled through shared memory inside the
+        # lane loops.
+        self.assertNotIn("permute_smem", code)
+        torch.testing.assert_close(
+            out, torch.einsum("qhd,khd->hqk", q, k), rtol=1e-4, atol=1e-4
+        )
+
+    def test_fourth_tile_block_demotes_to_lane_loop(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, 8, 8, 8, device=DEVICE)
+        code, out = code_and_output(
+            _cute_four_nested_tiles, (x,), block_sizes=[4, 4, 4, 4]
+        )
+        self.assertNotIn("thread_idx()[3]", code)
+        self.assertIn("block=(4, 4, 4)", code)
+        self.assertRegex(code, r"for lane_\d+ in range\(4\)")
+        torch.testing.assert_close(out, x * 2)
+
+    def test_thread_axis_beyond_launch_rejected(self) -> None:
+        backend = CuteBackend()
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.lane_index_expr("offset", 1, axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.thread_index_expr(axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.grid_index_expr("offset", "bs", "cutlass.Int32", axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.thread_in_tile_mask_expr("bs", axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.reduction_index_expr("bs", "cutlass.Int32", 0, axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.thread_linear_index_expr({0: 4, 3: 4})
+
+
 if __name__ == "__main__":
     unittest.main()

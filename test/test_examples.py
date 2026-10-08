@@ -1660,7 +1660,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             ("default", "medium", 1.5, 5e-2),
         ],
     )
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute"])
     def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
         torch.manual_seed(0)
         num_sequnces = 4
