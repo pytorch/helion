@@ -56,41 +56,59 @@ def check_carry_lowering(
     row_block_id: int,
     store: AccessLayout,
 ) -> None:
-    """Raise unless the carry can lower ``store`` on jagged ``row_block_id``."""
+    """Raise unless the carry can lower ``store`` on jagged ``row_block_id``.
+
+    Kernel-shape reasons no config can fix (grid, store rank) raise
+    ``BackendUnsupported``.  Reasons another config may fix (block sizes)
+    raise ``InvalidConfig`` so the autotuner keeps searching instead of
+    reporting a backend failure.
+    """
+    from helion import exc
+
+    reason = _unsupported_reason(row_block_id, store)
+    if reason is not None:
+        raise exc.BackendUnsupported("pallas", f"ordered carry: {reason}")
+    reason = _invalid_config_reason(env, config, row_block_id, store)
+    if reason is not None:
+        raise exc.InvalidConfig(f"Pallas ordered carry {reason}.")
+
+
+def _unsupported_reason(row_block_id: int, store: AccessLayout) -> str | None:
+    """Why no config can lower ``store`` with the carry, or None."""
     from helion._compiler.host_function import HostFunction
 
     # Fold guard counts groups with program_id(0), so the group is the only grid dim.
     # TODO(tcombes): thread the group's program id through CarryBoundaryTile for multi-grid.
     n_grid = sum(len(b) for b in HostFunction.current().device_ir.grid_block_ids)
     if n_grid != 1:
-        raise NotImplementedError(
-            "Pallas ordered carry assumes the group loop is the only grid "
-            f"dimension (program_id(0)); got {n_grid} grid dims."
+        return (
+            "assumes the group loop is the only grid dimension "
+            f"(program_id(0)); got {n_grid} grid dims"
         )
     if store.tensor.ndim != 2 or store.block_ids[0] != row_block_id:
-        raise NotImplementedError(
-            "Pallas ordered carry supports only a leading-row 2D store "
-            f"(got {store.block_ids})."
-        )
-    col_block_id = store.block_ids[1]
-    if col_block_id is None:
-        raise NotImplementedError(
-            "Pallas ordered carry: the column dim of a jagged store must be tiled."
-        )
-    block_row = env.block_sizes[row_block_id].from_config(config)
-    block_col = env.block_sizes[col_block_id].from_config(config)
-    if not (isinstance(block_row, int) and isinstance(block_col, int)):
-        raise NotImplementedError(
-            "Pallas ordered carry needs static block sizes "
-            f"(block_row={block_row!r}, block_col={block_col!r})."
-        )
+        return f"supports only leading-row 2D store (got {store.block_ids})"
+    if store.block_ids[1] is None:
+        return "the column dim of a jagged store must be tiled"
+    return None
+
+
+def _invalid_config_reason(
+    env: CompileEnvironment, config: Config, row_block_id: int, store: AccessLayout
+) -> str | None:
+    """Why ``config`` cannot lower ``store`` with the carry, or None."""
+    blocks: dict[int, int] = {}
+    for bid in store.block_ids:
+        if bid is None or bid in blocks:
+            continue
+        block = env.block_sizes[bid].from_config(config)
+        if type(block) is not int or block <= 0:
+            return f"needs static block sizes (block {bid} = {block!r})"
+        blocks[bid] = block
     sublane = aligned_window_sublane(env)
     assert sublane is not None
-    if block_row % sublane != 0:
-        raise NotImplementedError(
-            f"Pallas ordered carry: block_row ({block_row}) must be a multiple of the "
-            f"sublane tiling S ({sublane})."
-        )
+    if blocks[row_block_id] % sublane != 0:
+        return f"block_row ({blocks[row_block_id]}) must be a multiple of S ({sublane})"
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
