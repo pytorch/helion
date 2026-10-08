@@ -19,6 +19,7 @@ from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -33,20 +34,34 @@ class HandoffPolicy:
     """Stop at the first enabled trigger, or when the search completes.
 
     Trial/time limits are checked after complete benchmark batches, so they
-    may be exceeded by one batch. Final confirmation happens after stopping
-    and can extend the total run time beyond the limit.
+    may be exceeded by one batch. Automatic detection compares freshly timed
+    finalists after each ``patience`` new sources, following an initial
+    ``min_unique_sources`` exploration period. Searches defer automatic checks
+    until required initialization and qualification phases finish. Noisy
+    comparisons keep searching.
+    Time limits include automatic checkpoints; final confirmation happens after
+    stopping and can extend the total run time beyond the limit.
     """
 
     # Stop after this many search trials, including rejected candidates.
     # None disables this limit.
     after_trials: int | None = None
-    # Stop after this many elapsed search seconds.
+    # Stop after this many elapsed seconds, including automatic checkpoints.
     # None disables this limit.
     after_seconds: float | None = None
     # Optional predicate on batch progress; return True to request handoff.
     callback: Callable[[HandoffProgress], bool] | None = None
+    # Detect a performance plateau using repeated finalist measurements.
+    automatic: bool = False
+    # Minimum distinct, successfully measured sources before automatic checks.
+    min_unique_sources: int = 32
+    # Additional distinct sources to explore between automatic checks.
+    patience: int = 16
+    # Smallest relative gain that counts as progress (0.01 = 1%).
+    # Also bounds relative noise: 3 * median absolute deviation / median.
+    min_improvement: float = 0.01
     # Top candidates to remeasure, deduplicated by source when available.
-    # The returned config may add one extra candidate.
+    # The incumbent or returned config may add one extra candidate.
     finalists: int = 5
     # Fresh confirmation passes per finalist (at least 3); rank by their median.
     repetitions: int = 3
@@ -54,6 +69,8 @@ class HandoffPolicy:
     def __post_init__(self) -> None:
         for name, value in (
             ("after_trials", self.after_trials),
+            ("min_unique_sources", self.min_unique_sources),
+            ("patience", self.patience),
             ("finalists", self.finalists),
         ):
             if value is not None and (not isinstance(value, int) or value < 1):
@@ -62,6 +79,8 @@ class HandoffPolicy:
             not math.isfinite(self.after_seconds) or self.after_seconds <= 0
         ):
             raise ValueError("after_seconds must be finite and positive")
+        if not 0 < self.min_improvement < 1:
+            raise ValueError("min_improvement must be between 0 and 1")
         if not isinstance(self.repetitions, int) or self.repetitions < 3:
             raise ValueError("repetitions must be at least 3")
 
@@ -147,6 +166,19 @@ def _refresh_handoff(members: Sequence[PopulationMember]) -> None:
         session.refresh(members)
 
 
+@contextlib.contextmanager
+def _defer_automatic_handoff() -> Iterator[None]:
+    session = _active_handoff.get()
+    if session is None:
+        yield
+        return
+    session.automatic_deferrals += 1
+    try:
+        yield
+    finally:
+        session.automatic_deferrals -= 1
+
+
 class _HandoffSession:
     def __init__(self, search: BaseSearch, policy: HandoffPolicy) -> None:
         self.search = search
@@ -157,7 +189,12 @@ class _HandoffSession:
         self.measurements: list[HandoffMeasurement] = []
         self.candidates: dict[Config, HandoffMeasurement] = {}
         self.reason: str | None = None
+        self.incumbent: HandoffCandidate | None = None
+        self.checkpoint_sources = 0
+        self.finalists: tuple[HandoffCandidate, ...] = ()
+        self.reference_latencies: tuple[float, ...] | None = None
         self.callback_error: str | None = None
+        self.automatic_deferrals = 0
 
     def progress(self) -> HandoffProgress:
         values = [m.perf for m in self.candidates.values() if m.perf is not None]
@@ -284,6 +321,44 @@ class _HandoffSession:
             self.reason = reason
             raise _HandoffStop
 
+        check_plateau = (
+            self.policy.automatic
+            and self.automatic_deferrals == 0
+            and len(self.sources) >= self.policy.min_unique_sources
+            and (
+                self.checkpoint_sources == 0
+                or len(self.sources) - self.checkpoint_sources >= self.policy.patience
+            )
+        )
+        if sync_object(check_plateau, group):
+            finalists = self.confirm(self.incumbent.config if self.incumbent else None)
+            self.checkpoint_sources = len(self.sources)
+            if finalists:
+                best = finalists[0]
+                previous = next(
+                    (
+                        c
+                        for c in finalists
+                        if self.incumbent is not None
+                        and c.config == self.incumbent.config
+                    ),
+                    None,
+                )
+                stable = previous is not None and all(
+                    3 * c.noise <= self.policy.min_improvement * c.perf
+                    for c in (best, previous)
+                )
+                plateau = (
+                    stable
+                    and previous is not None
+                    and best.perf >= previous.perf * (1 - self.policy.min_improvement)
+                )
+                self.incumbent = best
+                if sync_object(plateau, group):
+                    self.reason = "plateau"
+                    self.finalists = finalists
+                    raise _HandoffStop
+
     def confirm(self, extra: Config | None = None) -> tuple[HandoffCandidate, ...]:
         from .benchmark_provider import MultiShapeBenchmarkProvider
         from .benchmark_provider import _MultiShapeAutotuneArgs
@@ -303,8 +378,8 @@ class _HandoffSession:
                 configs.append(measurement.config)
             if len(configs) == self.policy.finalists:
                 break
-        # Include the returned config even if its search timing did not place
-        # it in the top K.
+        # Include the returned config / previous incumbent even if its old
+        # search timing did not place it in the top K.
         if extra is not None and extra not in configs:
             configs.append(copy.deepcopy(extra))
         configs = sync_object(configs, search.kernel.env.process_group_name)
@@ -318,9 +393,13 @@ class _HandoffSession:
         # of adding more trials to the config search's CSV/dataset/trace.
         confirmation_log._log_sink = None
         confirmation_log._trace_sink = None
+        args = search.args
+        if isinstance(args, _MultiShapeAutotuneArgs):
+            # Confirmation failures must not invalidate the active search's results.
+            args = dataclasses.replace(args, measurements={})
         provider_cls = (
             MultiShapeBenchmarkProvider
-            if isinstance(search.args, _MultiShapeAutotuneArgs)
+            if isinstance(args, _MultiShapeAutotuneArgs)
             else search._benchmark_provider_cls
         )
         for repetition in range(self.policy.repetitions):
@@ -332,7 +411,7 @@ class _HandoffSession:
                 kernel=search.kernel,
                 settings=settings,
                 config_spec=search.config_spec,
-                args=search.args,
+                args=args,
                 log=confirmation_log,
                 autotune_metrics=AutotuneMetrics(),
             )
@@ -342,6 +421,8 @@ class _HandoffSession:
                     child.settings.autotune_accuracy_check = True
             try:
                 provider.setup()
+                if isinstance(provider, MultiShapeBenchmarkProvider):
+                    self.reference_latencies = provider.args.reference_latencies
                 for result in provider.benchmark(ordered, desc="Confirming handoff"):
                     measurement = self._measurement(search, result, "confirmation")
                     samples[result.config].append(measurement)
@@ -366,7 +447,7 @@ class _HandoffSession:
                 measurements[-1], perf=perf
             )
         # A finalist must succeed on every rank. Share one ranking so every
-        # rank selects the same kernel, even with noisy timers.
+        # rank takes the same next checkpoint/stop path, even with noisy timers.
         invalid_configs = set(configs) - {c.config for c in confirmed}
         group = search.kernel.env.process_group_name
         for invalid in all_gather_object(invalid_configs, group):
@@ -402,7 +483,6 @@ def find_handoff(
     those trials share this handoff session and can interfere with selection.
     """
     from .base_cache import AutotuneCacheBase
-    from .benchmark_provider import _MultiShapeAutotuneArgs
 
     search = (
         autotuner.autotuner if isinstance(autotuner, AutotuneCacheBase) else autotuner
@@ -417,7 +497,7 @@ def find_handoff(
             if session.callback_error is not None:
                 raise RuntimeError(session.callback_error)
             reason = session.reason or "completed"
-            finalists = session.confirm(returned)
+            finalists = session.finalists or session.confirm(returned)
             if not finalists:
                 raise exc.NoConfigFound
             best = finalists[0]
@@ -429,9 +509,7 @@ def find_handoff(
                 finalists,
                 tuple(session.measurements),
                 search.performance_unit,
-                search.args.reference_latencies
-                if isinstance(search.args, _MultiShapeAutotuneArgs)
-                else None,
+                session.reference_latencies,
             )
             search.log.record_handoff(point)
             return point

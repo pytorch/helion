@@ -630,72 +630,77 @@ class LFBOPatternSearch(PatternSearch):
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
         )
-        visited: set[Config] = set()
-        self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member is not None and member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
-        initial_population = list(self.population)
-        self.set_generation(0)
-        self.benchmark_initial_population(
-            self.population,
-            random_fallback_target=self._random_fallback_population_target(),
-            visited=visited,
-        )
-
-        # Compute adaptive compile timeout based on initial population compile times
-        self.set_adaptive_compile_timeout(
-            self.population,
-            min_seconds=self.compile_timeout_lower_bound,
-            quantile=self.compile_timeout_quantile,
-        )
-
-        # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Verifying initial results")
-        check_population_consistency(
-            self.population, process_group_name=self.kernel.env.process_group_name
-        )
-        # Snapshot compiler-seeded members so they survive the search-loop
-        # pruning into the final-pick verification candidate pool.
-        self.capture_compiler_seed_members(self.population)
-        self.population.sort(key=performance)
-        if not any(math.isfinite(member.perf) for member in self.population):
-            raise exc.NoConfigFound
-
-        # Save to training data
-        for member in self.population:
-            self._append_training_sample(
-                self.config_gen.encode_config(member.flat_values),
-                member.perf,
-                member.config,
-                member.fn,
-                member=member,
+        with self.defer_automatic_handoff():
+            visited: set[Config] = set()
+            self.population = []
+            for flat_config in self._generate_initial_population_flat():
+                member = self.make_unbenchmarked(flat_config)
+                if member is not None and member.config not in visited:
+                    visited.add(member.config)
+                    self.population.append(member)
+            initial_population = list(self.population)
+            self.set_generation(0)
+            self.benchmark_initial_population(
+                self.population,
+                random_fallback_target=self._random_fallback_population_target(),
+                visited=visited,
             )
 
-        # Fit model
-        self._fit_surrogate()
+            # Compute adaptive compile timeout based on initial population compile times
+            self.set_adaptive_compile_timeout(
+                self.population,
+                min_seconds=self.compile_timeout_lower_bound,
+                quantile=self.compile_timeout_quantile,
+            )
 
-        # Initial witnesses can underrate a family whose useful child settings
-        # are non-default. Full CuTe-flash tuning qualifies every ordinary leaf
-        # before transferring its best representatives to compound leaves and
-        # promoting parent families.
-        # Quick tuning keeps its historical generation budget.
-        qualification_generations = self._run_flash_structural_qualification(
-            visited,
-            initial_population=initial_population,
-        )
-        first_main_generation = 1 + qualification_generations
-        phase = self._autotune_metrics.search_phase_metrics
-        if (
-            phase is not None
-            and phase.get("family_probe_required") is True
-            and phase.get("family_probe_complete") is not True
-        ):
-            if self._autotune_budget_exceeded_across_ranks():
-                return self._finalize()
-            raise exc.AutotuneError("required CuTe flash family probe did not complete")
+            # again with higher accuracy
+            self.rebenchmark_population(
+                self.population, desc="Verifying initial results"
+            )
+            check_population_consistency(
+                self.population, process_group_name=self.kernel.env.process_group_name
+            )
+            # Snapshot compiler-seeded members so they survive the search-loop
+            # pruning into the final-pick verification candidate pool.
+            self.capture_compiler_seed_members(self.population)
+            self.population.sort(key=performance)
+            if not any(math.isfinite(member.perf) for member in self.population):
+                raise exc.NoConfigFound
+
+            # Save to training data
+            for member in self.population:
+                self._append_training_sample(
+                    self.config_gen.encode_config(member.flat_values),
+                    member.perf,
+                    member.config,
+                    member.fn,
+                    member=member,
+                )
+
+            # Fit model
+            self._fit_surrogate()
+
+            # Initial witnesses can underrate a family whose useful child settings
+            # are non-default. Full CuTe-flash tuning qualifies every ordinary leaf
+            # before transferring its best representatives to compound leaves and
+            # promoting parent families.
+            # Quick tuning keeps its historical generation budget.
+            qualification_generations = self._run_flash_structural_qualification(
+                visited,
+                initial_population=initial_population,
+            )
+            first_main_generation = 1 + qualification_generations
+            phase = self._autotune_metrics.search_phase_metrics
+            if (
+                phase is not None
+                and phase.get("family_probe_required") is True
+                and phase.get("family_probe_complete") is not True
+            ):
+                if self._autotune_budget_exceeded_across_ranks():
+                    return self._finalize()
+                raise exc.AutotuneError(
+                    "required CuTe flash family probe did not complete"
+                )
 
         starting_paths = self._select_starting_paths()
         starting_points = [member for member, _constraints in starting_paths]

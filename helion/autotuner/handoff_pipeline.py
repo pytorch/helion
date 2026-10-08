@@ -47,7 +47,10 @@ def autotune_with_handoff(
         else Path(tempfile.gettempdir()) / "helion-handoff"
     )
     directory = (root / uuid4().hex).resolve()
-    policy = HandoffPolicy(after_seconds=settings.autotune_budget_seconds)
+    policy = HandoffPolicy(
+        after_seconds=settings.autotune_budget_seconds,
+        automatic=settings.autotune_budget_seconds is None,
+    )
     token = _running.set(True)
     try:
         with search.log.autotune_tracing("autotune_handoff"):

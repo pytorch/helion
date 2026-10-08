@@ -8407,20 +8407,36 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
 
         def qualify(_visited, *, initial_population):
+            self.assertEqual(session.automatic_deferrals, 1)
             self.assertEqual(initial_population, generated)
             self.assertEqual(search.population, list(reversed(generated)))
             return 0
 
+        def starting_paths():
+            self.assertEqual(session.automatic_deferrals, 0)
+            return [(generated[1], ())]
+
+        session = SimpleNamespace(automatic_deferrals=0)
+        search.benchmark_population.side_effect = lambda *_args, **_kwargs: (
+            self.assertEqual(session.automatic_deferrals, 1)
+        )
         search._run_flash_structural_qualification = Mock(side_effect=qualify)
-        search._select_starting_paths = Mock(return_value=[(generated[1], ())])
+        search._select_starting_paths = Mock(side_effect=starting_paths)
         search._finalize = lambda: generated[1].config
 
-        with patch(
-            "helion.autotuner.surrogate_pattern_search.check_population_consistency"
+        with (
+            patch(
+                "helion.autotuner.surrogate_pattern_search.check_population_consistency"
+            ),
+            patch(
+                "helion.autotuner.handoff._active_handoff",
+                SimpleNamespace(get=lambda: session),
+            ),
         ):
             self.assertIs(search._autotune(), generated[1].config)
 
         search._run_flash_structural_qualification.assert_called_once()
+        self.assertEqual(session.automatic_deferrals, 0)
 
     def test_lfbo_retained_flash_paths_use_conditional_surfaces(self):
         def member(family: str, wait_hint: int) -> PopulationMember:
@@ -8539,6 +8555,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
 
         def incomplete_qualification(_visited, *, initial_population):
+            self.assertEqual(session.automatic_deferrals, 1)
             self.assertEqual(initial_population, [member])
             search._autotune_metrics.search_phase_metrics = {
                 "family_probe_required": True,
@@ -8546,18 +8563,40 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             }
             return 1
 
+        session = SimpleNamespace(automatic_deferrals=0)
+        budget_exhausted = True
+
+        def check_budget():
+            # Readiness must stay deferred through the mandatory-family gate,
+            # including its explicit wall-budget exception.
+            self.assertEqual(session.automatic_deferrals, 1)
+            return budget_exhausted
+
         search._run_flash_structural_qualification = incomplete_qualification
-        search._autotune_budget_exceeded_across_ranks = Mock(return_value=True)
+        search._autotune_budget_exceeded_across_ranks = check_budget
         search._select_starting_paths = Mock()
         search._finalize = Mock(return_value=config)
 
-        with patch(
-            "helion.autotuner.surrogate_pattern_search.check_population_consistency"
+        with (
+            patch(
+                "helion.autotuner.surrogate_pattern_search.check_population_consistency"
+            ),
+            patch(
+                "helion.autotuner.handoff._active_handoff",
+                SimpleNamespace(get=lambda: session),
+            ),
         ):
             self.assertEqual(search._autotune(), config)
+            self.assertEqual(session.automatic_deferrals, 0)
+            budget_exhausted = False
+            with self.assertRaisesRegex(
+                exc.AutotuneError, "required CuTe flash family probe did not complete"
+            ):
+                search._autotune()
 
         search._select_starting_paths.assert_not_called()
         search._finalize.assert_called_once_with()
+        self.assertEqual(session.automatic_deferrals, 0)
 
     def test_cute_flash_best_available_partial_and_zero_population(self):
         configs = {value: helion.Config(block_sizes=[value + 1]) for value in range(5)}

@@ -259,7 +259,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_handoff
 
-   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
+   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or automatic plateau detection, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
 
 .. autoattribute:: Settings.autotune_handoff_budget_seconds
 

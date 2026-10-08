@@ -299,7 +299,8 @@ class LLMSeededSearch(BaseSearch):
         llm_search = self._make_llm_search()
         llm_start = time.perf_counter()
         try:
-            llm_seed_config = llm_search.autotune(skip_cache=True)
+            with self.defer_automatic_handoff():
+                llm_seed_config = llm_search.autotune(skip_cache=True)
         except exc.NoConfigFound:
             if not isinstance(self.args, _MultiShapeAutotuneArgs):
                 raise

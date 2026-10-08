@@ -742,7 +742,7 @@ class Settings(_Settings):
         "autotune_handoff": (
             "Hand configuration search to a native-source agent automatically. "
             "Off by default; enable with HELION_AUTOTUNE_HANDOFF=1. "
-            "Uses the existing search budget or search completion, "
+            "Uses the existing search budget or automatic plateau detection, "
             "then saves validated standalone source beside the autotune logs."
         ),
         "autotune_handoff_budget_seconds": (
