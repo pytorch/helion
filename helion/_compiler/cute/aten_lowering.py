@@ -46,6 +46,7 @@ from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
 from ..aten_lowering import where_lowering
 from ..compile_environment import CompileEnvironment
+from ..dtype_utils import cast_ast
 from .argreduce import codegen_cute_tile_argreduce
 from .cute_mma import codegen_cute_mma
 from .cute_mma import codegen_cute_mma_direct_mm
@@ -430,6 +431,11 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
                 "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
                 "active-K-loop tcgen05 matmul lowering, not direct-mm fallback",
             )
+        # The direct warp-MMA path always yields its fp32 accumulator; round it
+        # to the declared (non-fp32) output dtype so a later widening cast
+        # observes the same bf16/fp16 result as every other matmul lowering.
+        if effective_out_dtype is not None and effective_out_dtype != torch.float32:
+            direct_mma_result = cast_ast(direct_mma_result, effective_out_dtype)
         return direct_mma_result
     serial_result = emit_cute_serial_scalar_mm_from_loads(
         ctx,

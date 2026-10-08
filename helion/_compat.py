@@ -734,6 +734,26 @@ def requires_cuda_version(min_version: str) -> bool:
 
 
 @functools.cache
+def torch_uses_template_producer_fusion() -> bool:
+    """Whether this PyTorch version provides the template producer-fusion API."""
+    # pytorch/pytorch#198809 first appears in the 2026-10-07 nightly.
+    # Keep the dev date: earlier 2.16 nightlies still use the prologue API.
+    if version.parse(torch.__version__.split("+")[0]) < version.parse(
+        "2.16.0.dev20261007"
+    ):
+        return False
+    try:
+        from torch._inductor.ir import TemplateBuffer
+    except ImportError:
+        return False
+    return (
+        hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_producer_fusion")
+        and "load_input_fusion_allowed_inputs"
+        in inspect.signature(TemplateBuffer.__init__).parameters
+    )
+
+
+@functools.cache
 def supports_torch_compile_fusion() -> bool:
     """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
     if torch.xpu.is_available():
@@ -749,7 +769,12 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
-        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
+        fusion_hook = (
+            "has_aliasing_or_mutation_for_producer_fusion"
+            if torch_uses_template_producer_fusion()
+            else "has_aliasing_or_mutation_for_prologue_fusion"
+        )
+        assert hasattr(TemplateBuffer, fusion_hook)
     except (ImportError, AttributeError, AssertionError):
         return False
     return True

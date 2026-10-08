@@ -13,6 +13,7 @@ import helion
 from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.cute import matmul_fallback
+from helion._compiler.cute.scalar_recipe import PURE_DECODE_HELPERS
 
 _RENAMES = {"next_high": "high", "next_mass": "mass", "next_total": "total"}
 
@@ -372,3 +373,47 @@ def test_product_marker_declines_unproved_thread_groups(
             k_block_id=7,
             owner_lane="contraction_lane",
         )
+
+
+@pytest.mark.parametrize("helper", sorted(PURE_DECODE_HELPERS))
+def test_quantized_decode_helpers_are_proven_relocatable(helper: str) -> None:
+    # The SIMT matmul fallback decodes raw fp8/fp4 operand bytes through these
+    # side-effect-free PTX helpers; staging must be allowed to move them.
+    stmt = ast.parse(f"decoded = cutlass.Float32({helper}(byte) * other)").body[0]
+    call = next(
+        node
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call) and lanes._qualified_name(node.func) == helper
+    )
+    assert lanes._is_proven_relocatable_call(call, allow_load=False)
+    assert lanes._is_proven_relocatable_assignment(stmt, allow_load=False)
+
+
+def test_unlisted_cute_helper_is_not_proven_relocatable() -> None:
+    stmt = ast.parse("decoded = _cute_inline_asm_elementwise(byte)").body[0]
+    assert not lanes._is_proven_relocatable_assignment(stmt, allow_load=False)
+
+
+def test_fp8_decoded_product_gets_a_complete_staged_schedule() -> None:
+    # Mirrors ``hl.dot(fp8, fp8)`` under a lane-varying rescale: the raw operand
+    # byte is decoded inside the product that feeds the owned product sum.
+    before = "cutlass.Float32(value))"
+    after = "_cute_fp8e4m3fn_to_float32(value))"
+    source = _body()
+    assert source.count(before) == 1
+    lowered = _lower(_loop(4, source.replace(before, after)))
+    values = np.array([2**24, 1, -(2**24), 3], np.float32)
+    actual, calls = _execute(
+        lowered,
+        _cute_fp8e4m3fn_to_float32=np.float32,
+        offset=0,
+        scores=np.zeros(4, np.float32),
+        values=values,
+        high=np.float32(0),
+        mass=np.float32(0),
+        total=np.float32(5),
+    )
+    assert calls == 4
+    assert actual["product_sum"] == np.float32(3)
+    assert actual["total"] == np.float32(8)
+    assert "_helion_lane_reduce" not in _source(lowered)

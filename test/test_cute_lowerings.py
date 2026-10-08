@@ -9,6 +9,7 @@ import re
 import tempfile
 from types import SimpleNamespace
 from typing import Any
+from typing import Callable
 from typing import Sequence
 from typing import cast
 import unittest
@@ -259,6 +260,7 @@ from helion._compiler.type_info import CallableType
 from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
 from helion._testing import DEVICE
+from helion._testing import code_and_output
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
@@ -9180,6 +9182,257 @@ class TestCuteLowerings(unittest.TestCase):
             "non-scalar binary ops",
             msg,
         )
+
+    def test_tcgen05_fused_symfloat_scalar_epilogue_runtime_correctness(
+        self,
+    ) -> None:
+        """``out[tile] = (alpha * acc).to(x.dtype)`` where ``alpha`` is a Python
+        float captured by the epilogue callable (``examples/matmul.py``
+        ``scale_by_alpha``). The float is lifted to a ``SymFloat`` kernel
+        argument, so FX carries ``mul(acc, _get_symnode)`` rather than a
+        literal; the chain renders it inline as a tile-uniform scalar and
+        splices the multiply into the tcgen05 T2R epilogue.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_epilogue(
+            x: torch.Tensor, y: torch.Tensor, epilogue: Callable[..., torch.Tensor]
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n)).to(x.dtype)
+            return out
+
+        alpha = 2.5
+
+        def scale_by_alpha(acc: torch.Tensor, tile: object) -> torch.Tensor:
+            return alpha * acc
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_epilogue.bind((x, y, scale_by_alpha))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertRegex(
+            code, r"tcgen05_acc_loaded_\d+ \* cutlass\.Float32\([A-Za-z_]\w*\)"
+        )
+        self.assertNotIn("non-whitelisted fused epilogues", code)
+        out = bound(x, y, scale_by_alpha)
+        expected = (alpha * (x @ y).to(torch.float32)).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_symfloat_bias_epilogue_runtime_correctness(
+        self,
+    ) -> None:
+        """``alpha * acc + beta * bias[tile_m, tile_n]`` with captured Python
+        floats (``examples/matmul.py`` ``addmm_epilogue``). Mixes two lifted
+        ``SymFloat`` scalars with an exact-shape aux load; the bf16 rounding
+        of ``beta * bias`` is kept as its own step like a literal scalar.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_epilogue(
+            x: torch.Tensor, y: torch.Tensor, epilogue: Callable[..., torch.Tensor]
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n)).to(x.dtype)
+            return out
+
+        alpha = 2.0
+        beta = 0.5
+        bias = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+
+        def addmm_epilogue(
+            acc: torch.Tensor, tile: tuple[object, object]
+        ) -> torch.Tensor:
+            return alpha * acc + beta * bias[tile[0], tile[1]]
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_epilogue.bind((x, y, addmm_epilogue))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        scalars = set(re.findall(r"cutlass\.Float32\(([A-Za-z_]\w*)\)", code))
+        self.assertEqual(len(scalars), 2, scalars)
+        out = bound(x, y, addmm_epilogue)
+        expected = (alpha * (x @ y).to(torch.float32) + beta * bias).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_rank0_scale_epilogue_runtime_correctness_bf16(
+        self,
+    ) -> None:
+        """``acc * scale_a[()] * scale_b[()]`` (``examples/fp8_gemm.py``) on a
+        bf16 tcgen05 matmul. Each rank-0 load is a tile-uniform scalar read
+        through the tensor's base pointer inline in the chain; the launcher
+        marshals the 0-d tensors as one-element views.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_scaled(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                acc = acc * scale_a[()] * scale_b[()]
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        scale_a = torch.tensor(0.5, device=DEVICE)
+        scale_b = torch.tensor(3.0, device=DEVICE)
+        bound = cute_matmul_scaled.bind((x, y, scale_a, scale_b))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("* cutlass.Float32(scale_b.iterator.load())", code)
+        out = bound(x, y, scale_a, scale_b)
+        expected = ((x @ y).to(torch.float32) * scale_a * scale_b).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=4e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_rank0_scale_epilogue_runtime_correctness_fp8(
+        self,
+    ) -> None:
+        """The ``examples/fp8_gemm.py`` dequantization epilogue on the fp8
+        tcgen05 MMA: ``acc * scale_a[()] * scale_b[()]`` with 0-d fp32 scales.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_fp8_matmul_scaled(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[()] * scale_b[()]
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_a = torch.tensor(0.5, device=DEVICE)
+        scale_b = torch.tensor(0.25, device=DEVICE)
+        bound = cute_fp8_matmul_scaled.bind((x, y, scale_a, scale_b))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 128],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        out = bound(x, y, scale_a, scale_b)
+        expected = (x.float() @ y.float() * scale_a * scale_b).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+
+    def test_cute_rank0_scalar_load_simt(self) -> None:
+        """``x[tile] * s[()]`` on the plain SIMT path: a rank-0 load renders
+        as a base-pointer read (no empty ``+`` join) and the launcher accepts
+        the 0-d tensor argument.
+        """
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def cute_scale_by_rank0(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * s[()]
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        for s in (
+            torch.tensor(2.0, device=DEVICE),
+            torch.tensor(0.5, device=DEVICE, dtype=torch.bfloat16),
+        ):
+            bound = cute_scale_by_rank0.bind((x, s))
+            config = helion.Config(block_sizes=[32, 32])
+            bound.set_config(config)
+            code = bound.to_triton_code(config)
+            self.assertIn("s.iterator.load()", code)
+            self.assertNotIn(".iterator + )", code)
+            out = bound(x, s)
+            torch.testing.assert_close(out, x * s)
+
+    def test_cute_rank0_scalar_store_simt(self) -> None:
+        """``out[()] = x[tile].sum()`` on the plain SIMT path: a rank-0 store
+        target renders as a base-pointer write (no empty ``+`` join) and the
+        launcher accepts the 0-d output tensor.
+        """
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def cute_store_rank0(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(x.size(0)):
+                out[()] = x[tile_n].sum()
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        code, out = code_and_output(cute_store_rank0, (x,), block_sizes=[64])
+        self.assertIn("out.iterator.store(", code)
+        self.assertNotIn(".iterator + )", code)
+        torch.testing.assert_close(out, x.sum())
 
     def test_tcgen05_fused_silu_epilogue_runtime_correctness_bf16(self) -> None:
         """``out[tile] = F.silu(acc).to(x.dtype)`` after a bf16 tcgen05

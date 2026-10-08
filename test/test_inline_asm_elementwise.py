@@ -11,10 +11,22 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 import helion.language as hl
+
+# Two f32 lanes per asm invocation, the same PTX examples/blackwell_attention.py uses.
+_MUL_F32X2_ASM = """
+{
+    .reg .b64 ra, rb, rc;
+    mov.b64 ra, { $2, $3 };
+    mov.b64 rb, { $4, $5 };
+    mul.f32x2 rc, ra, rb;
+    mov.b64 { $0, $1 }, rc;
+}
+"""
 
 
 @onlyBackends(["triton"])
@@ -137,40 +149,6 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result_c, expected_c)
         torch.testing.assert_close(result_d, expected_d)
 
-    @pytest.mark.skipif(
-        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
-    )
-    @skipIfRocm("only works on cuda")
-    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
-    def test_inline_asm_packed(self):
-        """Test inline_asm_elementwise with pack > 1"""
-
-        @helion.kernel(autotune_effort="none")
-        def kernel_packed_asm(x: torch.Tensor) -> torch.Tensor:
-            result = torch.empty_like(x)
-            for tile in hl.tile(x.shape):
-                val = x[tile]
-                # Shift 4x8bit values together, pack=4
-                result_val = hl.inline_asm_elementwise(
-                    "and.b32 $0, $1, 0x1F1F1F1F; shl.b32 $0, $0, 3;",
-                    "=r,r",
-                    [val],
-                    dtype=torch.int8,
-                    is_pure=True,
-                    pack=4,
-                )
-                result[tile] = result_val
-            return result
-
-        shape = [512]
-        x = torch.randint(0, 256, shape, device=DEVICE, dtype=torch.uint8)
-
-        code, result = code_and_output(kernel_packed_asm, (x,))
-
-        # Expected: x shifted left by 3 (x << 3)
-        expected = x << 3
-        torch.testing.assert_close(result, expected)
-
     def test_inline_asm_error_cases(self):
         """Test error cases for inline_asm_elementwise"""
 
@@ -253,6 +231,109 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         code, result = code_and_output(kernel_basic, (x,))
 
 
+@onlyBackends(["triton", "cute"])
+class TestInlineAsmElementwisePacked(RefEagerTestDisabled, TestCase):
+    """``pack > 1`` lowerings shared by the Triton and CuTe backends."""
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_packed(self):
+        """Test inline_asm_elementwise with pack > 1"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_packed_asm(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                val = x[tile]
+                # Shift 4x8bit values together, pack=4
+                result_val = hl.inline_asm_elementwise(
+                    "and.b32 $0, $1, 0x1F1F1F1F; shl.b32 $0, $0, 3;",
+                    "=r,r",
+                    [val],
+                    dtype=torch.int8,
+                    is_pure=True,
+                    pack=4,
+                )
+                result[tile] = result_val
+            return result
+
+        shape = [512]
+        x = torch.randint(0, 256, shape, device=DEVICE, dtype=torch.uint8)
+
+        code, result = code_and_output(kernel_packed_asm, (x,))
+
+        # Expected: x shifted left by 3 (x << 3)
+        expected = x << 3
+        torch.testing.assert_close(result, expected)
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    @skipIfCudaCapabilityLessThan((10, 0), reason="mul.f32x2 requires sm_100")
+    def test_inline_asm_packed_f32x2_broadcast(self):
+        """pack=2 f32x2 PTX with a broadcast second operand (blackwell_attention)."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_mul_f32x2(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                a = x[tile_m, tile_n]
+                b = alpha[tile_m]
+                result[tile_m, tile_n] = hl.inline_asm_elementwise(
+                    _MUL_F32X2_ASM,
+                    "=r,=r,r,r,r,r",
+                    [a, b[:, None]],
+                    dtype=torch.float32,
+                    is_pure=True,
+                    pack=2,
+                )
+            return result
+
+        x = torch.randn([64, 128], device=DEVICE, dtype=torch.float32)
+        alpha = torch.randn([64], device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(kernel_mul_f32x2, (x, alpha))
+        torch.testing.assert_close(result, x * alpha[:, None])
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_packed_multiple_outputs(self):
+        """pack=2 over 16-bit lanes with two packed outputs."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_packed_outputs(
+            a: torch.Tensor, b: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result_c = torch.empty_like(a)
+            result_d = torch.empty_like(a)
+            for tile in hl.tile(a.shape):
+                # Two f16x2 registers in, swapped out: C = B, D = A
+                c_val, d_val = hl.inline_asm_elementwise(
+                    "mov.b32 $0, $3; mov.b32 $1, $2;",
+                    "=r,=r,r,r",
+                    [a[tile], b[tile]],
+                    dtype=(torch.float16, torch.float16),
+                    is_pure=True,
+                    pack=2,
+                )
+                result_c[tile] = c_val
+                result_d[tile] = d_val
+            return result_c, result_d
+
+        a = torch.randn([256], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([256], device=DEVICE, dtype=torch.float16)
+        _code, (result_c, result_d) = code_and_output(kernel_packed_outputs, (a, b))
+        torch.testing.assert_close(result_c, b)
+        torch.testing.assert_close(result_d, a)
+
+
 @onlyBackends(["cute"])
 class TestCuteInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     @pytest.mark.skipif(
@@ -316,25 +397,75 @@ class TestCuteInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result_c, a - b)
         torch.testing.assert_close(result_d, b - a)
 
-    def test_pack_error(self):
-        @helion.kernel(autotune_effort="none")
-        def kernel_packed_asm(x: torch.Tensor) -> torch.Tensor:
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    @skipIfCudaCapabilityLessThan((10, 0), reason="mul.f32x2 requires sm_100")
+    def test_inline_asm_packed_vector_width(self):
+        """pack=2 under a vectorized lane layout: the extra ``pack=`` keyword must
+        make the pure-lane-packet matcher decline the call, not miscompile it."""
+
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[1024],
+                num_threads=[128],
+                cute_vector_widths=[4],
+                cute_lane_layouts=["blocked"],
+                cute_cluster_n=1,
+            ),
+        )
+        def kernel_mul_f32x2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
-            for tile in hl.tile(x.size(0), block_size=16):
-                result_val = hl.inline_asm_elementwise(
-                    "mov.u32 $0, $1;",
-                    "=r,r",
-                    [x[tile]],
-                    dtype=torch.int32,
+            for tile in hl.tile(x.numel()):
+                result[tile] = hl.inline_asm_elementwise(
+                    _MUL_F32X2_ASM,
+                    "=r,=r,r,r,r,r",
+                    [x[tile], y[tile]],
+                    dtype=torch.float32,
                     is_pure=True,
                     pack=2,
                 )
-                result[tile] = result_val
             return result
 
-        x = torch.randint(0, 100, [16], device=DEVICE, dtype=torch.int32)
-        with self.assertRaises(helion.exc.BackendUnsupported):
-            code_and_output(kernel_packed_asm, (x,))
+        x = torch.randn([4093], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([4093], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(kernel_mul_f32x2, (x, y))
+        torch.testing.assert_close(result, x * y)
+        self.assertIn("pack=2", code)
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_pack_impure_error(self):
+        """``pack > 1`` with ``is_pure=False`` is rejected: the per-lane lowering
+        would replay the asm's side effects ``pack`` times per element."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_impure_packed(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0), block_size=16):
+                result[tile] = hl.inline_asm_elementwise(
+                    "mov.b32 $0, $1;",
+                    "=r,r",
+                    [x[tile]],
+                    dtype=torch.float16,
+                    is_pure=False,
+                    pack=2,
+                )
+            return result
+
+        x = torch.randn([16], device=DEVICE, dtype=torch.float16)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"hl\.inline_asm_elementwise with pack != 1 and is_pure=False",
+        ):
+            code_and_output(kernel_impure_packed, (x,))
 
 
 if __name__ == "__main__":

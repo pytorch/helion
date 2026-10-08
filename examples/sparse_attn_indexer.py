@@ -27,6 +27,18 @@ from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
+# %%
+# Kernel and reference both round each head's bf16 score before the weighted
+# sum, so they agree exactly except where a different fp32 accumulation order
+# lands a score on the other side of a bf16 rounding boundary (about fifteen
+# outputs per million on CuTe; the Triton configs the tests use happened to
+# match exactly, but no backend promises cuBLAS's order). One flip moves the
+# output by one bf16 ulp of the score (<= 0.25) times |w| (<= ~4), so bound
+# the mismatch fraction and the worst mismatched element instead of loosening
+# atol for every element.
+MAX_MISMATCH_PCT = 0.002
+MAX_MISMATCHED_ABS_DIFF = 1.5
+
 
 # %%
 @helion.kernel(static_shapes=True)
@@ -147,6 +159,8 @@ def check(num_tokens: int, kv_len: int) -> None:
         args,
         atol=1e-2,
         rtol=1e-2,
+        max_mismatch_pct=MAX_MISMATCH_PCT,
+        max_mismatched_abs_diff=MAX_MISMATCHED_ABS_DIFF,
     )
 
 
