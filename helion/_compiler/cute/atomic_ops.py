@@ -1579,6 +1579,37 @@ def _index_derives_from_iota(state: CodegenState, node: torch.fx.Node) -> bool:
     return False
 
 
+def _active_reduction_axis_of_iota(
+    state: CodegenState, node: torch.fx.Node
+) -> int | None:
+    """The active reduction axis a bare ``hl.arange`` index spans, if any.
+
+    Such a range is allocated its own reduction axis, and every thread holds
+    its coordinate along that axis: the index addresses one element per
+    thread, as the slice it spans does (``hl.arange(0, k)`` is ``[:k]``), and
+    the atomic varies along that axis rather than repeating across it.
+    """
+    from ...language.memory_ops import _cute_active_index_var
+    from ..compile_environment import CompileEnvironment
+
+    iota_node = _resolve_tensor_index_iota_node(state, node)
+    if iota_node is None or state.fx_node is None:
+        return None
+    iota_val = iota_node.meta.get("val")
+    if not isinstance(iota_val, torch.Tensor) or iota_val.ndim != 1:
+        return None
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(iota_val.shape[0])
+    if block_id is None or not env.block_sizes[block_id].reduction:
+        return None
+    block_id = env.resolve_codegen_block_id(
+        block_id, state.codegen, state.fx_node.graph
+    )
+    if _cute_active_index_var(state, block_id) is None:
+        return None
+    return block_id
+
+
 def _codegen_tensor_index_common_cute(
     cute_func: str,
     state: CodegenState,
@@ -1603,12 +1634,18 @@ def _codegen_tensor_index_common_cute(
     if len(index) != 1 or len(fx_index) != 1:
         # A second component beside an arange keeps the generic per-thread
         # form from here, whose iota is the matcher's per-thread fold: not a
-        # lowering of the tile-uniform index.
+        # lowering of the tile-uniform index, unless each arange spans its
+        # own active reduction axis (``_active_reduction_axis_of_iota``).
+        axis_blocks: list[int] = []
         for component in fx_index:
-            if isinstance(component, torch.fx.Node) and _index_derives_from_iota(
+            if not isinstance(component, torch.fx.Node) or not _index_derives_from_iota(
                 state, component
             ):
+                continue
+            block_id = _active_reduction_axis_of_iota(state, component)
+            if block_id is None or block_id in axis_blocks:
                 raise exc.BackendUnsupported("cute", _DERIVED_ARANGE_INDEX)
+            axis_blocks.append(block_id)
         return None
     tensor_index = index[0] if isinstance(index[0], torch.Tensor) else None
     index_node = fx_index[0]

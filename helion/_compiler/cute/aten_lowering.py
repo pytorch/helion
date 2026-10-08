@@ -57,6 +57,7 @@ from .indexing import CuteSortableLoad
 from .indexing import is_cute_shape_chain_target
 from .indexing import match_cute_affine_range_iota
 from .iota_utils import cute_free_arange_indexed_dim_key
+from .iota_utils import cute_free_arange_lanes
 from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
@@ -1010,25 +1011,33 @@ def _cute_free_arange_axis_expr(
         return None
     if not cute_iota_is_free_memory_index(source_node, cg):
         return None
-    # The synthetic axis is keyed by the size of the tensor dimension this
-    # arange indexes. Two arange dims that address the same logical dimension (the
-    # load and store ``hl.arange(k)`` over a K-sized axis) share one axis so a
-    # value loaded on a lane is stored back on that lane, while a cartesian
-    # ``row``/``col`` pair addressing differently-sized dims gets distinct axes.
-    # ``length``/``start``/``step`` round out the key so two distinct arange dims
-    # that happen to index equal-sized dims still separate.
-    dim_key = cute_free_arange_indexed_dim_key(source_node, cg)
-    if dim_key is None:
-        return None
-    key = (
-        dim_key,
-        length_hint,
-        _arange_endpoint_key(start),
-        _arange_endpoint_key(step),
-    )
-    # The key is taken from the arange's *first* memory-op user, so two
-    # distinct hl.arange() dims can still land on one axis (``rows``/``cols`` both
-    # loaded from equal-sized dims).  Within a single load/store that would
+    # The synthetic axis is keyed by the arange dim's positional lane class
+    # (``FreeArangeLanes``): the dims that meet in the kernel's values share
+    # one axis whatever their start and step, so a value loaded on a lane is
+    # stored back at the same position (``out[t, hl.arange(2, 7)] =
+    # x[t, hl.arange(1, 6)]``), while the dims of one value stay distinct.
+    root = cute_free_arange_lanes(cg).root(source_node)
+    if root is not None:
+        key: tuple[object, ...] = (root, length_hint)
+    else:
+        # Outside the modeled ops, the key is the size of the tensor dimension
+        # this arange indexes: the load and store ``hl.arange(k)`` over a
+        # K-sized axis share one axis, while a cartesian ``row``/``col`` pair
+        # addressing differently-sized dims gets distinct axes.
+        # ``length``/``start``/``step`` round out the key so two distinct arange
+        # dims that happen to index equal-sized dims still separate.
+        dim_key = cute_free_arange_indexed_dim_key(source_node, cg)
+        if dim_key is None:
+            return None
+        key = (
+            dim_key,
+            length_hint,
+            _arange_endpoint_key(start),
+            _arange_endpoint_key(step),
+        )
+    # Two distinct hl.arange() dims can still land on one axis: the dim-size
+    # key is taken from the arange's *first* memory-op user (``rows``/``cols``
+    # both loaded from equal-sized dims).  Within a single load/store that would
     # address only the diagonal: refuse it rather than silently drop lanes.
     # One arange reaching two index dims of a single access is the same
     # collapse: Helion indexes two tensor entries as a cartesian tile, so
@@ -1096,6 +1105,7 @@ def _cute_iota_expr(
 ) -> object:
     from ..device_ir import ForLoopGraphInfo
     from ..generate_ast import GenerateAST
+    from .cute_reshape import _get_block_local_coord
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _grid_local_coord_expr
     from .cute_reshape import _resolve_tile_extent
@@ -1189,15 +1199,11 @@ def _cute_iota_expr(
 
         matched: list[tuple[int, str]] = []
         for candidate in active_block_ids:
-            loops = cg.active_device_loops.get(candidate)
-            if loops:
-                expr = loops[-1].strategy.index_var(candidate)
-            elif (
-                cg.current_grid_state is not None
-                and candidate in cg.current_grid_state.block_ids
-            ):
-                expr = cg.current_grid_state.strategy.index_var(candidate)
-            else:
+            # The range counts from 0 along an axis matched by its block size,
+            # so it is the axis' block-local coordinate: the axis index would
+            # add the offset of this program's (or loop iteration's) block.
+            expr = _get_block_local_coord(cg, candidate)
+            if expr is None:
                 continue
 
             candidate_size = cg.device_function.resolved_block_size(candidate)
@@ -1262,6 +1268,27 @@ def _cute_iota_expr(
             length_hint = _resolve_tile_extent(
                 fake_val.shape[0], env, cg.device_function.config
             )
+            if length_hint == 1:
+                # A one-element range holds only ``start``.  Matching an active
+                # axis of extent one would read that axis' global index.
+                return _wrap_iota_coord_expr(
+                    ctx, "cutlass.Int32(0)", start, step, dtype
+                )
+            if (
+                block_id is None
+                and cute_free_arange_lanes(cg).root(source_node) is not None
+                and (
+                    synthetic := _cute_free_arange_axis_expr(
+                        cg, source_node, length_hint, start, step
+                    )
+                )
+                is not None
+            ):
+                # The range's dims meet no tile axis in the kernel's values
+                # (FreeArangeLanes): an active axis whose block size matches or
+                # is a multiple of its length is another dim of those values
+                # (``x[tile_m, hl.arange(4)]``), so it takes its own lane.
+                return _wrap_iota_coord_expr(ctx, synthetic, start, step, dtype)
             local_coord = _get_dim_local_coord(cg, fake_val, 0)
             if local_coord != "cutlass.Int32(0)":
                 expr = local_coord
@@ -1340,15 +1367,21 @@ def _cute_iota_expr(
         loops = cg.active_device_loops.get(candidate_block_id)
         if loops:
             expr = loops[-1].strategy.index_var(candidate_block_id)
-            active_block_id = candidate_block_id
-            break
-        if (
+        elif (
             cg.current_grid_state is not None
             and candidate_block_id in cg.current_grid_state.block_ids
         ):
             expr = cg.current_grid_state.strategy.index_var(candidate_block_id)
-            active_block_id = candidate_block_id
-            break
+        else:
+            continue
+        if not env.block_sizes[candidate_block_id].reduction:
+            # A reduction axis allocated for the range's extent walks all of
+            # it (a rolled loop included), so its index is the range.  A tile
+            # axis holds one block of a larger space: the range counts from
+            # the block's first element, its block-local coordinate.
+            expr = _get_block_local_coord(cg, candidate_block_id)
+        active_block_id = candidate_block_id
+        break
     block_id = resolved_block_id if active_block_id is None else active_block_id
 
     if expr is None:

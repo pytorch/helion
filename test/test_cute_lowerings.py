@@ -894,6 +894,7 @@ class _FakeGenerateAST:
             for block_id in active_block_ids
         }
         self.current_grid_state = current_grid_state
+        self.cute_free_arange_lanes = None
         self.statements: list[ast.AST] = []
 
     def add_statement(self, stmt: ast.AST) -> None:

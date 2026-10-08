@@ -557,10 +557,19 @@ class TensorType(TypeInfo):
                     details=f"rank {self.fake_value.dim()} != {other.fake_value.dim()}",
                 )
             if self.fake_value.size() != other.fake_value.size():
-                raise exc.ControlFlowTensorMismatch(
-                    var=var_name,
-                    details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
-                )
+                # A static size and the reduction dimension allocated for it
+                # later (e.g. by a ``:`` slice) name the same dim; compare the
+                # shapes in their block-variable form.
+                env = CompileEnvironment.current()
+                shape = env._normalize_shape_to_block_vars([*self.fake_value.size()])
+                if shape != env._normalize_shape_to_block_vars(
+                    [*other.fake_value.size()]
+                ):
+                    raise exc.ControlFlowTensorMismatch(
+                        var=var_name,
+                        details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
+                    )
+                return TensorType(other.origin, self.fake_value.new_empty(shape))
             # TODO(jansel): handle symbolic shapes
             # TODO(jansel): stride check?
             return TensorType(other.origin, torch.empty_like(self.fake_value))
