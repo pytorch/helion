@@ -358,6 +358,50 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = torch.bmm(A, B, out_dtype=torch.float32)
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @skipIfNotTriton("Singleton batch lowering targets Triton")
+    def test_chained_dot_singleton_batch(self):
+        @helion.kernel(
+            config=helion.Config(num_warps=4, num_stages=1),
+            static_shapes=True,
+        )
+        def chained(
+            a: torch.Tensor, b: torch.Tensor, batch_block: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            left = torch.empty_like(a, dtype=torch.float32)
+            right = torch.empty_like(a, dtype=torch.float32)
+            for tile_b in hl.tile(a.size(0), block_size=batch_block):
+                x = a[tile_b, :, :]
+                y = b[tile_b, :, :]
+                left[tile_b, :, :] = hl.dot(hl.dot(x, y).to(a.dtype), x)
+                right[tile_b, :, :] = hl.dot(x, hl.dot(y, x).to(a.dtype))
+            return left, right
+
+        a = torch.randn([2, 64, 64], device=DEVICE, dtype=torch.bfloat16) * 0.1
+        b = torch.randn_like(a) * 0.1
+        for batch_block in (1, 2):
+            with self.subTest(batch_block=batch_block):
+                code, (left, right) = code_and_output(chained, (a, b, batch_block))
+                ab = torch.bmm(a, b, out_dtype=torch.float32).to(a.dtype)
+                ba = torch.bmm(b, a, out_dtype=torch.float32).to(a.dtype)
+                torch.testing.assert_close(
+                    left,
+                    torch.bmm(ab, a, out_dtype=torch.float32),
+                    atol=1e-2,
+                    rtol=1e-2,
+                )
+                torch.testing.assert_close(
+                    right,
+                    torch.bmm(a, ba, out_dtype=torch.float32),
+                    atol=1e-2,
+                    rtol=1e-2,
+                )
+                if not self._in_ref_eager_mode:
+                    # Both operand positions use 2D dots for unit batches;
+                    # larger batches retain their leading dimension.
+                    self.assertEqual(
+                        code.count("tl.reshape(tl.dot("), 4 if batch_block == 1 else 0
+                    )
+
     def _assert_warning_in_stderr(
         self, kernel, args, expected_result, warning_str, *, atol=1e-2, rtol=1e-2
     ):

@@ -29,6 +29,7 @@ from helion._compiler.backend import CuteBackend
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 
@@ -285,10 +286,11 @@ def test_fused_row_epilogue_surfaces_have_complete_structural_coverage(
 
 
 def test_target_seed_round_trips_under_the_fused_row_body() -> None:
-    # The GB300 hd64 fp16 tuning policy carries whole-row-only values.  The
-    # plain body seeds them verbatim; a fused row epilogue cannot take them,
-    # so its seed must already equal its normalized form (the seed round-trip
-    # check runs under the same flags as normalization).
+    # The GB300 hd64 fp16 target carries whole-row-only values. The exact
+    # template legality check excludes it from the fused surface rather than
+    # silently changing its family/packet. Generic raw seeds still carry
+    # inactive aliases; their actual transfer must preserve resolved behavior
+    # and every compatible paired-family seed.
     common = {
         "dtype": torch.float16,
         "num_bh": 8,
@@ -307,36 +309,78 @@ def test_target_seed_round_trips_under_the_fused_row_body() -> None:
     assert fused.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] is True
     assert fused.config[cute_flash.FLASH_SP_ROW_SUM_KEY] == "fragment"
     assert fused.config[cute_flash.FLASH_KV_TILE_N_KEY] == 128
-    # The measured structure (family, schedule, transport) is kept.
-    for key in (
-        cute_flash.FLASH_PIPELINE_FAMILY_KEY,
-        cute_flash.FLASH_E2E_SCHEDULE_KEY,
-        cute_flash.FLASH_STAT_TRANSPORT_KEY,
-        cute_flash.FLASH_KV_STAGE_KEY,
-    ):
-        assert fused.config[key] == plain.config[key]
-    effective = cute_flash.flash_effective_config_values(
-        cute_flash.resolve_flash_config(
-            64,
-            256,
-            fused.config,
-            dtype=torch.float16,
-            num_bh=8,
-            standard_dense_output=True,
-            has_row_epilogue=True,
-            plain_row_body=False,
-        )
-    )
-    assert all(
-        effective[key] == value
-        for key, value in fused.config.items()
-        if key in effective
-    )
-    # The fused seeds of the search population are canonical as well.
+    assert plain.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta"
+    assert fused.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+    assert fused.config[cute_flash.FLASH_PERSISTENT_KEY] is True
     seeds = cute_flash.flash_attention_seed_configs(
         64, 256, has_row_epilogue=True, plain_row_body=False, **common
     )
     assert fused in seeds
+    assert plain not in seeds
+    spec = ConfigSpec(
+        backend=CuteBackend(),
+        target_device_capability=(10, 3),
+        device=torch.device("cpu"),
+        num_sm=152,
+    )
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=256,
+        num_bh=8,
+        dtype=torch.float16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        is_causal=False,
+        standard_dense_output=True,
+        has_row_epilogue=True,
+        plain_row_body=False,
+    )
+    spec.compiler_seed_configs = seeds
+    generation = ConfigGeneration(spec)
+    normalized = []
+    for seed in seeds:
+        flat, config = generation.canonicalize_flat(generation.flatten(seed))
+        assert spec.normalized_config(config) == config
+        assert generation.unflatten(flat) == config
+        assert cute_flash.resolve_flash_config(
+            64,
+            256,
+            config.config,
+            has_row_epilogue=True,
+            plain_row_body=False,
+            **common,
+        ) == cute_flash.resolve_flash_config(
+            64,
+            256,
+            seed.config,
+            has_row_epilogue=True,
+            plain_row_body=False,
+            **common,
+        )
+        normalized.append(config)
+    messages = []
+    transferred = [
+        config for _, config in generation.seed_flat_config_pairs(messages.append)
+    ]
+    assert not messages
+    assert transferred == list(dict.fromkeys(normalized))
+    # Preserve both canonical paired families and all four paired schedules.
+    assert {
+        (
+            config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY],
+            config.config[cute_flash.FLASH_E2E_SCHEDULE_KEY],
+        )
+        for config in transferred
+        if config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+        in ("fa4_2cta", "fa4_2cta_tma_4d")
+    } == {
+        ("fa4_2cta", "16/4"),
+        ("fa4_2cta", "16/6"),
+        ("fa4_2cta", "16/8"),
+        ("fa4_2cta", "8/2"),
+        ("fa4_2cta_tma_4d", "16/4"),
+    }
 
 
 @onlyBackends(["cute"])

@@ -80,6 +80,8 @@ class FlashSearchSurface(NamedTuple):
     has_row_epilogue: bool
     plain_row_body: bool
     has_score_modifiers: bool
+    tmem_rowmax_compatible: bool = False
+    causal_resident_compatible: bool = False
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3124,6 +3126,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         from .cute.cute_flash import (
             flash_attention_graph_tensor_4d_batch_heads_from_graphs,
         )
+        from .cute.cute_flash import flash_tmem_rowmax_score_plan_supported
 
         if not flash_attention_graph_lse_plan_valid_from_graphs(
             device_ir.graphs,
@@ -3241,6 +3244,11 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 ),
                 # The row programs take a fused row epilogue but no modifier.
                 has_score_modifiers=bool(pattern.score_plan.modifiers),
+                # Equality and full 128-row coverage were established above.
+                causal_resident_compatible=q_seq % 256 == 0,
+                tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(
+                    pattern.score_plan
+                ),
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(
