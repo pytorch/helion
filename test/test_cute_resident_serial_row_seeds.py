@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from copy import deepcopy
 import random
+import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -371,3 +372,21 @@ def test_structural_family_without_host_sum_has_only_ordinary_producer() -> None
     family = _family(bound)
     assert len(family) == 1 and KEY not in family[0]
     assert "_cute_try_single_sum_cast(" not in bound.to_code(family[0])
+
+
+def test_narrow_seed_keeps_the_row_mean_collective_in_the_consume_pass() -> None:
+    bound, _args = _bind(17, 32)
+    code = bound.to_code(_family(bound)[-1])
+    assert "_cute_try_single_sum_cast(" in code
+    assert "block=(32, 1, 1)" in code
+    # The grad_weight lane sum over the four resident rows splits into an
+    # accumulate pass and a consume pass.  The per-row thread-group mean is
+    # outside the reduction slice, so it runs once per row in the consume pass
+    # instead of declining the owned reduction as a duplicated collective.
+    lane_loops = [
+        match.start() for match in re.finditer(r"for lane_\d+ in range\(4\):", code)
+    ]
+    assert len(lane_loops) == 2
+    assert code.count("cute.arch.warp_reduction_sum(") == 1
+    assert code.index("cute.arch.warp_reduction_sum(") > lane_loops[-1]
+    assert "_helion_lane_reduce" not in code

@@ -391,7 +391,8 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfFn(
         lambda: _get_backend() == "cute",
-        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
+        "CuTe lane reduction over a dynamic-shape full-slice N (400) is nested in "
+        "a different lane owner (BackendUnsupported); static shapes are covered",
     )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
@@ -476,7 +477,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm_scaled(self):
         # Match TritonBench: non-unit tensor-wise scales and a column-major B
@@ -815,6 +816,60 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_rope_fwd(self):
+        batch, q_heads, k_heads, seq_len, head_dim = 1, 4, 2, 128, 64
+        q = torch.randn(
+            [batch, q_heads, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            [batch, k_heads, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        angles = torch.randn(
+            [batch, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        cos, sin = angles.cos(), angles.sin()
+        mod = import_path(EXAMPLES_DIR / "rope.py")
+        check_example(
+            "rope",
+            (q, k, cos, sin),
+            mod.rope_pytorch(q, k, cos, sin),
+            fn_name="rope_fwd",
+            block_sizes=[1, 32],
+        )
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_rope_bwd(self):
+        batch, q_heads, k_heads, seq_len, head_dim = 1, 4, 2, 128, 64
+        q = torch.randn(
+            [batch, q_heads, seq_len, head_dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        k = torch.randn(
+            [batch, k_heads, seq_len, head_dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        angles = torch.randn(
+            [batch, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        cos, sin = angles.cos(), angles.sin()
+        mod = import_path(EXAMPLES_DIR / "rope.py")
+        q_out, k_out = mod.rope_pytorch(q, k, cos, sin)
+        grad_q_out = torch.randn_like(q_out)
+        grad_k_out = torch.randn_like(k_out)
+        torch.autograd.backward((q_out, k_out), (grad_q_out, grad_k_out))
+        check_example(
+            "rope",
+            (grad_q_out, grad_k_out, cos, sin),
+            (q.grad, k.grad),
+            fn_name="rope_bwd",
+            block_sizes=[1, 32],
+        )
+
     def test_swiglu_bwd(self):
         """Test backward pass for swiglu."""
         x1, x2 = [
@@ -1052,31 +1107,39 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_sparse_attn_indexer(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        torch.manual_seed(0)
         args = mod.indexer_inputs(num_tokens=128, kv_len=512)
-        # The reference einsum runs in bf16, so kernel-vs-reference diffs are
-        # pure schedule noise: one head's O(11) score rounds by ~11*2^-8 and
-        # the 32-head sum random-walks to ~sqrt(32) of that (~0.25 abs).
+        # Kernel and reference both round each head's bf16 score before the
+        # weighted sum, so they agree exactly except where a different fp32
+        # accumulation order lands a score on the other side of a bf16 rounding
+        # boundary; see MAX_MISMATCH_PCT in the example. Positions outside the
+        # window are -inf on both sides and compare equal.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits",
             block_sizes=[16, 128],
-            atol=0.3,
+            atol=1e-2,
+            max_mismatch_pct=mod.MAX_MISMATCH_PCT,
+            max_mismatched_abs_diff=mod.MAX_MISMATCHED_ABS_DIFF,
         )
 
     @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        torch.manual_seed(0)
         args = mod.indexer_inputs(num_tokens=1, kv_len=512)
-        # Same schedule-noise bound as test_sparse_attn_indexer above.
+        # Same rounding-boundary budget as test_sparse_attn_indexer above.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits_decode",
             block_sizes=[1, 128],
-            atol=0.3,
+            atol=1e-2,
+            max_mismatch_pct=mod.MAX_MISMATCH_PCT,
+            max_mismatched_abs_diff=mod.MAX_MISMATCHED_ABS_DIFF,
         )
 
     @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
@@ -1343,11 +1406,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
-    )
-    @onlyBackends(["triton", "pallas"])
+    @onlyBackends(["triton", "pallas", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @xfailIfPallasInterpret("unsupported torch.float8_e4m3fn dtype")
     def test_fp8_attention(self):
@@ -1656,7 +1715,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             ("default", "medium", 1.5, 5e-2),
         ],
     )
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute"])
     def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
         torch.manual_seed(0)
         num_sequnces = 4
@@ -2255,6 +2314,41 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             fn_name="jagged_layer_norm_kernel",
             block_sizes=[4, 8, 8, 8, 8, 8, 8],
+        )
+
+    @skipIfFn(
+        lambda: _get_backend() != "cute",
+        "CuTe lane-reduction coverage for the example's default shape",
+    )
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_layer_norm_lane_split(self):
+        # M=32 features over 16-wide tiles gives a 16-lane / 1-thread lane
+        # loop whose per-lane row sums are updated by the inner jagged loop
+        # under an SSA alias before the lane reduction feeds the carried mean.
+        num_rows, max_cols, M = 16, 32, 32
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        eps = 1e-6
+        args = (x_data, x_offsets, eps)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
+        expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
+
+        check_example(
+            "jagged_layer_norm",
+            args,
+            expected,
+            fn_name="jagged_layer_norm_kernel",
+            block_sizes=[16] * 7,
+            atol=1e-3,
+            rtol=1e-3,
         )
 
     def test_exp_fwd(self):
@@ -2980,70 +3074,90 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(
+        "repeated full-slice block id / static-K register dot unsupported on cute"
+    )
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
 

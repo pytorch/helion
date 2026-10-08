@@ -276,6 +276,7 @@ from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from ..ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ..ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ..ast_read_writes import ReadWrites
 from ..tile_strategy import _is_proven_relocatable_call
 from ..tile_strategy import _memory_write_calls
@@ -1110,6 +1111,13 @@ class _Statement:
     # codegen recorded one for every mention of the tensor
     # (``_access_regions``).
     regions: Mapping[str, tuple[_Region, ...]] = dataclasses.field(default_factory=dict)
+    # The tensors whose accesses across the lanes of one lane loop the
+    # emitter proved ordered as the program reads them
+    # (``HELION_LANE_ORDERED_ATTR``: the staging buffer of an ``hl.split``
+    # exchange, checked numerically over the thread block and every lane
+    # iteration).  Two statements both ordered on a tensor are not paired on
+    # it at the lane level; the thread-axis and device-loop pairs still are.
+    lane_ordered: frozenset[str] = frozenset()
     # For an attached statement (``index`` is -1): the indices of the body
     # statements it belongs to, which give it its place in program order.
     sites: tuple[int, ...] = ()
@@ -1181,6 +1189,7 @@ def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statemen
             renames.get(tensor, tensor): regions
             for tensor, regions in _access_regions(node).items()
         },
+        lane_ordered=canonical(getattr(node, HELION_LANE_ORDERED_ATTR, ())),
     )
 
 
@@ -3260,9 +3269,12 @@ def add_thread_barriers(
                         )
                     }
                 else:
+                    ordered = (
+                        first.statement.lane_ordered & second.statement.lane_ordered
+                    )
                     tensors = {
                         tensor
-                        for tensor in shared_tensors
+                        for tensor in shared_tensors - ordered
                         if conflicting(first.statement, second.statement, tensor, {})
                         and (
                             gathered(first.statement, tensor)
