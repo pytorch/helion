@@ -6,8 +6,8 @@ points for common kernel patterns while also being runnable examples for people
 who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
-autotuning.  Each entry lists the NVIDIA architecture it supports (currently
-H100, B200, or both), and Helion picks the matching file at runtime.  Treat the
+autotuning.  Each entry lists the NVIDIA architecture it supports (H100, B200,
+or GB300), and Helion picks the matching file at runtime.  Treat the
 files as kernel recipes: copy the kernel and its local `_helion_aot_*` heuristic
 into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
@@ -25,6 +25,7 @@ pretuned_kernels/
 │   ├── _helion_aot_vector_add_cuda_sm100.py   # B200 heuristic
 │   └── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
 ├── softmax/
+├── attention/                       # GB300 sm103 output-only dense/causal BHND
 ├── layer_norm/
 ├── rms_norm/
 ├── cross_entropy/
@@ -59,6 +60,7 @@ At runtime Helion picks the file matching the current GPU.
 |---|---|---|
 | `vector_add` | `2**i for i in range(19, 29)` | `x + y` |
 | `softmax` | Triton tutorial `M=4096, N=128*i for i in range(2, 100)` + realistic long-context shapes | `F.softmax` |
+| `attention` | Twelve exact contiguous BHND FP16/BF16 dense/causal workloads, D64/D128 (GB300 sm103 CuTe only) | output-only cuDNN SDPA |
 | `layer_norm` | Triton tutorial `M=4096, N=512*i for i in range(2, 32)` + realistic hidden-size shapes | `F.layer_norm` |
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
@@ -140,6 +142,25 @@ contracts; `gdn_decode` currently targets `H=2` because larger recurrent-state
 tiles exceed Helion's current aligned indirect-DMA VMEM plan.
 
 ## Scope
+
+`attention` preserves the output-only dense and causal frontend bodies from
+`examples/attention.py`. Its local sm103 heuristic stores the twelve actual
+returned FULL-search configurations, selected by exact batch/head/sequence/D,
+dtype and causal mode. It rejects unsupported shapes, layouts, mismatched Q/K/V
+inputs and other GPU capabilities; the configs are not B200/sm100 recipes or
+new compiler dispatch rules. `main()` checks every output against cuDNN SDPA
+before timing, including when called by `run.py`. FP16 uses `atol=rtol=1e-3`;
+BF16 uses `atol=rtol=5e-3`. Every element must pass and outputs must be finite.
+The same dtype-aware check is registered for autotuning these recipes.
+The convenience sweep uses CUDA events with graphs off; it does not reproduce
+the separate-process qualification protocol or its archived performance results.
+The ordinary AOT heuristic remains a Helion runtime recipe. Optional standalone
+CuTe export still requires Helion's CuTe launcher.
+
+```bash
+python -m pretuned_kernels.attention.attention
+python pretuned_kernels/run.py --kernels attention
+```
 
 Use this directory as a collection of pretuned kernels and runnable examples.
 For production code, copy the relevant kernel pattern into the application.  If
