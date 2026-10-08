@@ -2975,9 +2975,26 @@ def emit_cross_loop_schedule(
             )
         ]
 
+    # Live-task counts of guarded resident roots emitted at kernel scope.
+    resident_live_tasks: dict[int, tuple[str, int]] = {}
+
     def root_lane(root: int) -> str:
-        # A trailing root may begin mid-wave: rotate workers onto its lanes.
-        rotation = -static_pipeline_plan.static_base(root) % launch_worker_count
+        # A trailing root begins mid-wave, where the earlier roots' live tasks end:
+        # rotate workers onto its lanes.
+        base = static_pipeline_plan.static_base(root)
+        skipped = [
+            f"({count} - tl.minimum({live}, {count}))"
+            for earlier, (live, count) in resident_live_tasks.items()
+            if static_pipeline_plan.static_base(earlier) < base
+        ]
+        if skipped:
+            # Whole waves keep the dividend nonnegative.
+            waves = base // launch_worker_count + 1
+            return (
+                f"(({worker}) + {waves * launch_worker_count - base} + "
+                f"{' + '.join(skipped)}) % {launch_worker_count}"
+            )
+        rotation = -base % launch_worker_count
         return (
             f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
         )
@@ -3133,6 +3150,8 @@ def emit_cross_loop_schedule(
             and not publications
             and active_worker_count == launch_worker_count
         ):
+            if extent is not None:
+                resident_live_tasks[root] = (live, task_count_value)
             return task_dispatch
 
         active_body = _wait_for_dependencies(

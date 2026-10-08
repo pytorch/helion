@@ -1061,6 +1061,27 @@ class TestCrossLoopCodegenHelpers(TestCase):
         )
 
 
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def guarded_row_pair(
+    x: torch.Tensor, flags1: torch.Tensor, flags2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows, cols = x.size()
+    out1 = torch.zeros_like(x)
+    out2 = torch.zeros_like(x)
+    total = torch.zeros([cols], dtype=x.dtype, device=x.device)
+    for tile_r in hl.tile(rows, block_size=1):
+        live = torch.sum((flags1[:] > 0).to(torch.int32))
+        if tile_r.begin < live:
+            out1[tile_r, :] = x[tile_r, :] + 1
+    for tile_r in hl.tile(rows, block_size=1):
+        live2 = torch.sum((flags2[:] > 0).to(torch.int32))
+        if tile_r.begin < live2:
+            out2[tile_r, :] = x[tile_r, :] * 2
+    for tile_c in hl.tile(cols, block_size=1):
+        total[tile_c] = torch.sum(out2[:, tile_c], dim=0)
+    return out1, out2, total
+
+
 @onlyBackends(["triton"])
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     def assertUsesExactReadiness(self, code: str) -> None:
@@ -2087,6 +2108,38 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, live.sum(dim=-1))
                 self.assertIn("tile_dependency_continuation_previous", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_trailing_root_starts_after_the_live_tasks_before_it(self) -> None:
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        rows = 2 * workers
+        x = torch.randn((rows, 64), device=DEVICE, dtype=torch.float32)
+        index = torch.arange(rows, device=DEVICE)
+        for live, live2 in ((0, 0), (5, rows), (rows, 3), (workers + 7, workers - 1)):
+            with self.subTest(live=live, live2=live2):
+                code, (out1, out2, total) = code_and_output(
+                    guarded_row_pair,
+                    (
+                        x,
+                        (index < live).to(torch.int32),
+                        (index < live2).to(torch.int32),
+                    ),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                torch.testing.assert_close(
+                    out1, torch.where(index[:, None] < live, x + 1, 0)
+                )
+                expected2 = torch.where(index[:, None] < live2, x * 2, 0)
+                torch.testing.assert_close(out2, expected2)
+                torch.testing.assert_close(total, expected2.sum(0))
+        # The second root's lanes start past the first root's live tasks.
+        self.assertIn(
+            f"({rows} - tl.minimum(tile_dependency_live_tasks, {rows}))", code
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
