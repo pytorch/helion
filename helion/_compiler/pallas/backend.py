@@ -1188,8 +1188,35 @@ class PallasBackend(Backend):
                         if isinstance(bs, int) and bs > 1:
                             result.append((i, dim, bs, extra_pad))
 
+        result.extend(self._compact_worklist_sublane_pad_info(sorted_args))
         result.extend(self._zero_row_resident_pad_info(sorted_args))
         return result or None
+
+    def _compact_worklist_sublane_pad_info(
+        self, sorted_args: list[Argument]
+    ) -> list[tuple[int, int, int, int]]:
+        """Pad compact row windows to the TPU's physical sublane width."""
+        from ..compile_environment import CompileEnvironment
+        from ..device_function import TensorArg
+
+        plan = CompileEnvironment.current().compact_worklist_plan
+        if plan is None:
+            return []
+        aligned_names = {
+            policy.arg_name
+            for policy in plan.tensor_policies
+            if policy.kind in ("compact_aligned_load", "compact_exact_store")
+        }
+        result = []
+        for index, argument in enumerate(sorted_args):
+            if not isinstance(argument, TensorArg):
+                continue
+            value = argument.fake_value
+            if argument.host_str() not in aligned_names or value.ndim != 2:
+                continue
+            itemsize = int(value.dtype.itemsize)
+            result.append((index, 0, 32 // min(itemsize, 4), 0))
+        return result
 
     def _zero_row_resident_pad_info(
         self, sorted_args: list[Argument]

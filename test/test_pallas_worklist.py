@@ -2234,7 +2234,7 @@ class TestWorklistNumerics(unittest.TestCase):
     @skipIfPallasInterpret("device-built packed worklists require a real TPU")
     def test_ragged_grouped_matmul_matches_eager(self):
         """Empty and unaligned groups preserve every packed output row."""
-        group_sizes = [5, 0, 19, 125, 11]
+        group_sizes = [5, 0, 19, 124, 11]
         offsets = _offsets(group_sizes)
         rows, contracting_size, output_size = int(offsets[-1]), 128, 128
         torch.manual_seed(0)
