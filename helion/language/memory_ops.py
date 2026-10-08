@@ -703,6 +703,19 @@ def _cute_index_exprs(
             ast_idx = ast_subscript[pos]
         if idx is None:
             continue
+        tile_info = _get_tile_with_offset_info(
+            idx, getattr(state, "fx_node", None), pos
+        )
+        if tensor is not None and tensor_dim < tensor.ndim:
+            if tile_info is not None:
+                env.resolve_broadcast_dim(
+                    tensor.shape[tensor_dim], tile_info.block_id, tile_info.offset
+                )
+            elif (
+                isinstance(idx, torch.SymInt)
+                and (block_id := env.get_block_id(idx)) is not None
+            ):
+                env.resolve_broadcast_dim(tensor.shape[tensor_dim], block_id)
         if (
             tensor is not None
             and tensor_dim < tensor.ndim
@@ -712,11 +725,7 @@ def _cute_index_exprs(
             result.append("0")
             tensor_dim += 1
             continue
-        if (
-            tile_info := _get_tile_with_offset_info(
-                idx, getattr(state, "fx_node", None), pos
-            )
-        ) is not None and tile_info.block_size is not None:
+        if tile_info is not None and tile_info.block_size is not None:
             used_block_ids.add(tile_info.block_id)
             result.append(tile_with_offset_index_expr(tile_info))
             tensor_dim += 1

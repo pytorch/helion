@@ -1974,6 +1974,9 @@ class SubscriptIndexing(NamedTuple):
                 full_block_size = env.block_sizes[env.canonical_block_id(block_id)].var
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 i = len(index_values)
+                env.resolve_broadcast_dim(
+                    fake_value.size(i), block_id, tile_info.offset
+                )
                 block_dims.append(True)
                 if tile_info.block_size is not None and not env.known_equal(
                     tile_info.block_size, full_block_size
@@ -2016,6 +2019,7 @@ class SubscriptIndexing(NamedTuple):
                     index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
+                    env.resolve_broadcast_dim(fake_value.size(i), block_id)
                     block_dims.append(True)
                     index_values.append(f"({index_var}){expand}")
                     if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(

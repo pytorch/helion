@@ -375,9 +375,11 @@ class _PureExpressionVisitor(ast.NodeVisitor):
             and node.func.value.id == "triton"
             and node.func.attr in {"cdiv", "next_power_of_2"}
         )
+        # ``max`` clamps a dynamic reduction block to 1 (dynamic_rdim_size_expr).
         is_backend_shape_helper = isinstance(node.func, ast.Name) and node.func.id in {
             "_cdiv",
             "_next_power_of_2",
+            "max",
         }
         is_compiler_shape_helper = (
             is_triton_shape_helper or is_backend_shape_helper
