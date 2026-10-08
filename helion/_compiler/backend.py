@@ -509,6 +509,16 @@ class Backend(abc.ABC):
 
         return key not in BACKEND_SPECIFIC_KEYS
 
+    def cross_loop_pipelines(self) -> tuple[str, ...]:
+        """``cross_loop_pipeline`` values this backend can lower.
+
+        Consulted only when the backend supports the ``cross_loop_pipeline``
+        config key.
+        """
+        from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
+
+        return VALID_CROSS_LOOP_PIPELINES
+
     def supports_block_ptr_indexing(self) -> bool:
         return True
 

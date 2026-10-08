@@ -3325,11 +3325,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRocm("ROCm exposes an unrelated cross-loop dependency in this codegen test")
     @skipIfTileIR("TileIR does not support cross-loop persistent synchronization")
     @skipIfXPU("XPU exposes an unrelated cross-loop dependency in this codegen test")
-    @skipIfRefEager("Test checks generated Triton code")
+    @skipIfRefEager("Test checks generated code")
     def test_dynamic_internal_strides_remain_literal(self):
         @helion.kernel(
             autotune_effort="none",
@@ -3349,11 +3349,14 @@ class TestIndexing(RefEagerTestBase, TestCase):
         x = torch.randn([2, 32], device=DEVICE)
         code, result = code_and_output(two_stage, (x,))
         torch.testing.assert_close(result, x + 1)
-        # User-input layout remains generic, while compiler-owned contiguous
-        # layouts must not pollute Triton's do-not-specialize set.
-        self.assertIn("'x_stride_0'", code)
-        self.assertNotIn("'tmp_stride_", code)
-        self.assertNotIn("'out_stride_", code)
+        # The implicit dependency defaults to the grid-barrier pipeline.
+        self.assertIn("grid_barrier(", code)
+        if _get_backend() == "triton":
+            # User-input layout remains generic, while compiler-owned contiguous
+            # layouts must not pollute Triton's do-not-specialize set.
+            self.assertIn("'x_stride_0'", code)
+            self.assertNotIn("'tmp_stride_", code)
+            self.assertNotIn("'out_stride_", code)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Test checks generated Triton code")

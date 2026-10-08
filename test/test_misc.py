@@ -1427,7 +1427,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_device_size_local_does_not_rename_host_size(self):
         """``m = x.size(0)`` in an earlier root's device code must not replace
         the host origin of ``x.size(0)`` with the device-only name ``m``."""

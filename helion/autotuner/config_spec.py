@@ -1493,8 +1493,12 @@ class ConfigSpec:
         self.pallas_indirect_dma_requires_fori: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         # Populated only after DeviceIR proves that this kernel contains an
-        # implicit cross-root dependency supported by the CUDA Triton backend.
+        # implicit cross-root dependency the backend can lower (CuTe offers
+        # the barrier pipeline only).
         self.cross_loop_pipeline: EnumFragment | None = None
+        # Whether the kernel runs several phases in one persistent launch
+        # (``hl.barrier()`` or an implicit cross-root dependency).
+        self.multi_phase: bool = False
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -5654,6 +5658,23 @@ class ConfigSpec:
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
             self._normalize_cute_flash_gated(config, fix_invalid=_fix_invalid)
 
+        if (
+            self.backend_name == "cute"
+            and self.multi_phase
+            and config.get("num_sm_multiplier", 1) != 1
+        ):
+            # The grid barrier between the phases waits for every CTA, and the
+            # CuTe launcher has no cooperative launch to reject a grid larger
+            # than the GPU holds at once: such a launch would hang.
+            if _fix_invalid:
+                config.pop("num_sm_multiplier", None)
+            else:
+                raise InvalidConfig(
+                    "CuTe multi-phase kernels (hl.barrier() or a cross-loop "
+                    "dependency) require num_sm_multiplier=1: their grid "
+                    "barrier needs every CTA resident at once"
+                )
+
         if self.supports_config_key("num_sm_multiplier"):
             # The default autotuning domain remains powers of two, while an
             # explicitly selected configuration may use an intermediate worker
@@ -6788,6 +6809,8 @@ class ConfigSpec:
                 # Barriers require a persistent launch in the reference and in
                 # every candidate, including after a flatten/unflatten round trip.
                 fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+            if self.cross_loop_pipeline is not None:
+                fields["cross_loop_pipeline"] = self.cross_loop_pipeline
             fields.update(self.user_defined_tunables)
             return fields
 

@@ -350,6 +350,37 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         expected = x * 2 + 1
         torch.testing.assert_close(out, expected)
 
+    @skipIfRefEager("config normalization is only enforced in compiled mode")
+    def test_multi_phase_requires_one_cta_per_sm(self) -> None:
+        """The grid barrier waits for every CTA, and the CuTe launcher has no
+        cooperative launch to reject a grid the GPU cannot hold at once: an
+        oversubscribed persistent grid would hang instead of failing."""
+
+        @helion.kernel(autotune_effort="none")
+        def implicit_dependency(x: torch.Tensor) -> torch.Tensor:
+            tmp = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for t in hl.tile(x.size(0)):
+                tmp[t] = x[t] * 2
+            for t in hl.tile(x.size(0)):
+                out[t] = tmp[t] + 1
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        config = helion.Config(
+            block_sizes=[8, 8], pid_type="persistent_blocked", num_sm_multiplier=2
+        )
+        for kernel in (barrier_dep_single, implicit_dependency):
+            with self.subTest(kernel=kernel.name):
+                bound = kernel.bind((x,))
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig, "multi-phase kernels .* num_sm_multiplier=1"
+                ):
+                    bound.to_code(config)
+                fixed = helion.Config(**config.config)
+                bound.config_spec.normalize(fixed, _fix_invalid=True)
+                self.assertEqual(fixed.config.get("num_sm_multiplier", 1), 1)
+
     @skipIfRefEager("CuTe lane-loop lowering is unavailable in ref eager mode")
     def test_tile_reduction_preserves_lane_loop_metadata(self) -> None:
         @helion.kernel(backend="cute", autotune_effort="none")

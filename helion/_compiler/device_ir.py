@@ -3783,15 +3783,27 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 # Peer transports order static and dynamic schedules alike; only
                 # static ones mark guard-skipped tasks for inband scatters.
                 graph = device_ir.tile_dependency_graph
-                choices = ("static", "dynamic") if cross_rank else None
+                allowed = (
+                    ("static", "dynamic") if cross_rank else VALID_CROSS_LOOP_PIPELINES
+                )
                 if any(
                     graph.scatter_position(allocation_id) is not None
                     for allocation_id in graph.inband_allocation_ids
                 ):
-                    choices = ("static",)
-                config_spec.enable_cross_loop_pipeline(
-                    choices=choices or VALID_CROSS_LOOP_PIPELINES
+                    allowed = ("static",)
+                choices = tuple(
+                    pipeline
+                    for pipeline in env.backend.cross_loop_pipelines()
+                    if pipeline in allowed
                 )
+                if not choices:
+                    raise exc.BackendUnsupported(
+                        env.backend.name,
+                        "tile dependencies that require cross_loop_pipeline in "
+                        f"{allowed}",
+                    )
+                config_spec.enable_cross_loop_pipeline(choices=choices)
+        config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
