@@ -300,6 +300,7 @@ from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityCla
 from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1278,6 +1279,8 @@ class TestAutotunerHeuristic(TestCase):
             )
             self.assertEqual(hardware_info.call_count, 4)
 
+    # Drives the backend-independent rebinding through a kernel pinned to
+    # backend="triton", so a cute run would only repeat the Triton job.
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler seed specialization is not used in ref eager mode")
     def test_compiler_seed_specialization_rebinds_only_eligible_kernels(
@@ -4134,6 +4137,12 @@ class TestAutotunerHeuristic(TestCase):
                     self.assertIsNone(spec.compiler_default_config)
 
 
+# Matmul and pointwise facts come from backend-independent device IR analysis:
+# collect them with CuTe under HELION_BACKEND=cute and with Triton otherwise
+# (incl. tileir).
+_FACTS_BACKEND = "cute" if _get_backend() == "cute" else "triton"
+
+
 class TestMatmulFacts(TestCase):
     def test_rank_reduction_scaled_accumulator_fact(self) -> None:
         from operator import eq
@@ -4173,11 +4182,11 @@ class TestMatmulFacts(TestCase):
         reduction.meta["val"] = torch.empty(1, 64, 1)
         self.assertIsNone(_rank_reduction_scaled_baddbmm_batch_block_id(output, env))
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_facts_record_kernel_structure(self) -> None:
-        @helion.kernel(backend="triton")
-        def triton_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
             out = torch.empty([m, n], dtype=x.dtype, device=x.device)
@@ -4188,8 +4197,8 @@ class TestMatmulFacts(TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        @helion.kernel(backend="triton")
-        def triton_matmul_epilogue(
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def matmul_epilogue(
             x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
         ) -> torch.Tensor:
             m, k = x.size()
@@ -4202,8 +4211,8 @@ class TestMatmulFacts(TestCase):
                 out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
             return out
 
-        @helion.kernel(backend="triton")
-        def triton_two_matmuls(
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def two_matmuls(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
         ) -> torch.Tensor:
             m, k = x.size()
@@ -4218,8 +4227,8 @@ class TestMatmulFacts(TestCase):
                 out[tile_m, tile_n] = (acc0 + acc1).to(x.dtype)
             return out
 
-        @helion.kernel(backend="triton")
-        def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m = x.size(0)
             out = torch.empty_like(x)
             for tile_m in hl.tile(m):
@@ -4234,10 +4243,10 @@ class TestMatmulFacts(TestCase):
         add_y = torch.empty([1024], device=DEVICE, dtype=HALF_DTYPE)
 
         cases = (
-            ("gemm", triton_matmul, (x, y), 1),
-            ("gemm_epilogue", triton_matmul_epilogue, (x, y, bias), 1),
-            ("gemm_gemm", triton_two_matmuls, (x, y, z), 2),
-            ("add", triton_add, (add_x, add_y), 0),
+            ("gemm", matmul, (x, y), 1),
+            ("gemm_epilogue", matmul_epilogue, (x, y, bias), 1),
+            ("gemm_gemm", two_matmuls, (x, y, z), 2),
+            ("add", add, (add_x, add_y), 0),
         )
 
         for name, kernel, args, expected_facts in cases:
@@ -4252,13 +4261,21 @@ class TestMatmulFacts(TestCase):
 
             self.assertEqual(len(bound.config_spec.matmul_facts), expected_facts)
             if expected_facts == 0:
-                # No matmul fact: a pure-pointwise kernel (triton_add) is instead seeded by
-                # TritonPointwiseSeedHeuristic. Assert it routes there (one seed config), not
-                # the pre-pointwise-heuristic expectation of no seed at all.
+                # No matmul fact: a pure-pointwise kernel (add) is instead seeded by
+                # the backend's pointwise heuristic. Assert it routes there (and is
+                # seeded), not the pre-pointwise-heuristic expectation of no seed at all.
+                pointwise_heuristic = {
+                    "triton": "triton_pointwise",
+                    "cute": "cute_pointwise_vec",
+                }[_FACTS_BACKEND]
                 self.assertEqual(
-                    bound.config_spec.autotuner_heuristics, ["triton_pointwise"]
+                    bound.config_spec.autotuner_heuristics, [pointwise_heuristic]
                 )
-                self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
+                if _FACTS_BACKEND == "triton":
+                    self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
+                else:
+                    # cute_pointwise_vec seeds several layout variants.
+                    self.assertTrue(bound.config_spec.compiler_seed_configs)
             for fact in bound.config_spec.matmul_facts:
                 self.assertEqual(fact.lhs_ndim, 2)
                 self.assertEqual(fact.rhs_ndim, 2)
@@ -4272,12 +4289,12 @@ class TestMatmulFacts(TestCase):
                 self.assertEqual(fact.lhs_dtype, HALF_DTYPE)
                 self.assertEqual(fact.rhs_dtype, HALF_DTYPE)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_fact_identity_does_not_depend_on_graph_walk_order(self) -> None:
         from helion._compiler.device_ir_analysis import DeviceIRAnalysis
 
-        @helion.kernel(backend="triton", static_shapes=True)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=True)
         def two_matmuls(
             x0: torch.Tensor,
             y0: torch.Tensor,
@@ -4333,10 +4350,10 @@ class TestMatmulFacts(TestCase):
             [(64, 96), (128, 160)],
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_bmm_dtype_and_nested_loop_ancestry(self) -> None:
-        @helion.kernel(backend="triton", static_shapes=True)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=True)
         def nested_attention(
             q: torch.Tensor,
             k: torch.Tensor,
@@ -4409,10 +4426,10 @@ class TestMatmulFacts(TestCase):
             any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_symbolic_loop_bound_retains_expression_and_origins(self) -> None:
-        @helion.kernel(backend="triton", static_shapes=True)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=True)
         def prefix_matmul(
             lhs: torch.Tensor,
             rhs: torch.Tensor,
@@ -4995,14 +5012,16 @@ class TestPointwiseComputeItemsize(TestCase):
         assert len(facts) == 1, facts
         return facts[0]
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_int64_indexing_does_not_inflate_compute_itemsize(self) -> None:
         # int64-INDEXED but half-precision DATA (promoting to fp32 -> 4).
         # The SCALED subscript is load-bearing: a plain ``x[tile]`` lowers to a
         # ``_get_symnode`` with no tensor val, so no int64 node exists and the test
         # would pass even with the fix reverted.
-        @helion.kernel(backend="triton", index_dtype=torch.int64, static_shapes=False)
+        @helion.kernel(
+            backend=_FACTS_BACKEND, index_dtype=torch.int64, static_shapes=False
+        )
         def add_int64_index(x: torch.Tensor) -> torch.Tensor:
             m, n2 = x.shape
             n2 = hl.specialize(n2)
@@ -5033,12 +5052,12 @@ class TestPointwiseComputeItemsize(TestCase):
         # 4 = the fp32 compute promotion, not 8 = the int64 index arithmetic.
         self.assertEqual(fact.compute_itemsize, 4)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_integer_compute_kernel_reports_its_data_width(self) -> None:
         # Guards against filtering to float dtypes: this DATA is genuinely int64, so
         # 8 is correct and a float-only walk would report 1 and emit a spilling tile.
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def add_int64_data(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -5051,12 +5070,12 @@ class TestPointwiseComputeItemsize(TestCase):
         self.assertEqual(fact.storage_itemsize, 8)
         self.assertEqual(fact.compute_itemsize, 8)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_gather_index_tensor_does_not_inflate_compute_itemsize(self) -> None:
         # A gather whose index was itself loaded as int64: the cut at loads means the
         # walk never reaches it, so the data width stays half-precision.
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_m, tile_n in hl.tile(x.size()):
@@ -5068,13 +5087,13 @@ class TestPointwiseComputeItemsize(TestCase):
         fact = self._fact(gather_rows, (x, idx))
         self.assertEqual(fact.compute_itemsize, 2)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_intermediate_wider_than_every_buffer_is_counted(self) -> None:
         # Why the walk cannot just read buffer dtypes: every buffer is half-precision
         # but an fp64 intermediate is register-resident, and under-reporting it
         # over-estimates ``reg_cap``. ``storage_itemsize`` already covers buffers.
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def fp64_intermediate(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -5104,10 +5123,10 @@ class TestPointwiseGatherStride(TestCase):
         assert len(facts) == 1, facts
         return facts[0]
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_interleaved_and_contiguous_halves_differ(self) -> None:
-        @helion.kernel(backend="triton", static_shapes=False)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=False)
         def interleaved(x: torch.Tensor) -> torch.Tensor:
             m, n2 = x.shape
             n2 = hl.specialize(n2)
@@ -5119,7 +5138,7 @@ class TestPointwiseGatherStride(TestCase):
                 out[tile_m, tile_n] = a * b
             return out
 
-        @helion.kernel(backend="triton", static_shapes=False)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=False)
         def halves(x: torch.Tensor) -> torch.Tensor:
             m, n2 = x.shape
             n2 = hl.specialize(n2)
@@ -5148,10 +5167,10 @@ class TestPointwiseGatherStride(TestCase):
             ]
             self.assertTrue(all(s == 1 for s in inner), inner)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_plain_elementwise_is_stride_one(self) -> None:
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):

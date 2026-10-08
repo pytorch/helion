@@ -2709,6 +2709,9 @@ class CuteBackend(Backend):
                     )
             launcher_args = [block_arg]
             compile_options: list[str] = []
+            # One --ptxas-options flag carries them all (a second would
+            # replace the first).
+            ptxas_options: list[str] = []
             recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
             if recurrence_register_cap is not None:
                 recurrence_plan = device_function.cute_state.chunk_recurrence_plan
@@ -2724,17 +2727,21 @@ class CuteBackend(Backend):
                         "register caps are unsafe for the TMEM DV2 recurrence "
                         "schedule's dynamic register allocation",
                     )
-                compile_options.append(
-                    "--ptxas-options='--override-directive-values "
-                    f"--maxrregcount={recurrence_register_cap}'"
+                ptxas_options.append(
+                    "--override-directive-values "
+                    f"--maxrregcount={recurrence_register_cap}"
                 )
             prepare_plan = device_function.cute_state.chunk_prepare_plan
             if prepare_plan is not None and prepare_plan.schedule.startswith(
                 "split_alias_cpc"
             ):
-                compile_options.append(
-                    "--ptxas-options='--override-directive-values --maxrregcount=48'"
+                ptxas_options.append("--override-directive-values --maxrregcount=48")
+            if config.advanced_controls_file:
+                ptxas_options.append(
+                    f"--apply-controls {config.advanced_controls_file}"
                 )
+            if ptxas_options:
+                compile_options.append(f"--ptxas-options='{' '.join(ptxas_options)}'")
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
                 compile_options.append("--generate-line-info")
             # ``--enable-tvm-ffi`` is emitted in codegen only when the
@@ -3389,8 +3396,6 @@ class CuteBackend(Backend):
         has_barrier: bool,
         sorted_args: list[Argument] | None = None,
     ) -> list[str]:
-        if not tensor_host_args:
-            raise exc.BackendUnsupported(self.name, "kernel launch without tensor args")
         out = [*args]
         if has_rng_ops:
             out.append("_rng_seed_buffer")

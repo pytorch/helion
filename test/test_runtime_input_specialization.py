@@ -939,12 +939,11 @@ class TestLayoutProvenance(unittest.TestCase):
             for dim in range(tensor.ndim)
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
     def test_kernel_trace_does_not_mark_torch_empty_out_as_fresh(self) -> None:
         @helion.kernel(
             autotune_effort="none",
-            backend="triton",
             static_shapes=True,
         )
         def empty_out(x: torch.Tensor) -> torch.Tensor:

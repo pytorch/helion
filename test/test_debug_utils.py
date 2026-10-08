@@ -37,7 +37,7 @@ def _store_caplog_on_class(request, caplog):
         request.cls._caplog = caplog
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestDebugUtils(RefEagerTestDisabled, TestCase):
     @contextlib.contextmanager
     def _with_print_repro_enabled(self):

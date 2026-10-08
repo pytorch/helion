@@ -407,6 +407,10 @@ class BaseSearch(BaseAutotuner):
                 "dictionary for the already selected config schema."
             )
         self.config_spec: ConfigSpec = kernel.config_spec
+        if not self.config_spec.backend.supports_precompile():
+            # Backend.autotune() does this too, but a search can also be
+            # constructed directly on a bound kernel.
+            self.settings.autotune_precompile = None
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
