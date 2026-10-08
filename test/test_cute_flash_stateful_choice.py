@@ -296,8 +296,9 @@ def test_stateful_seed_routes_and_round_trip(head_dim: int, dtype: torch.dtype) 
             for s in seeds
             if s.config.get(flash.FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
         ]
-        assert len(stateful) == 4
-        assert [seed.config[flash.FLASH_ROWMAX_KEY] for seed in stateful] == [
+        assert len(stateful) == 8
+        historical = stateful[:4]
+        assert [seed.config[flash.FLASH_ROWMAX_KEY] for seed in historical] == [
             "software",
             "tmem",
             "software",
@@ -305,7 +306,7 @@ def test_stateful_seed_routes_and_round_trip(head_dim: int, dtype: torch.dtype) 
         ]
         assert [
             seed.config.get(flash.FLASH_ROW_SUM_SCHEDULE_KEY, "post_acquire")
-            for seed in stateful
+            for seed in historical
         ] == ["post_acquire", "post_acquire", "pre_acquire", "pre_acquire"]
         spec.compiler_seed_configs = seeds
         generation = ConfigGeneration(spec)
@@ -442,10 +443,16 @@ def test_stateful_detector_proof_reaches_real_codegen(
             assert not stateful
             return
         expected_variants = {
-            (width, schedule, rowmax)
+            (width, schedule, rowmax, depth, softmax_regs)
             for width in (1, 2)
             for schedule in ("post_acquire", "pre_acquire")
-            for rowmax in ("software", "tmem")
+            for rowmax, depth, softmax_regs in (
+                ("software", 2, 200),
+                ("tmem", 2, 200),
+                ("tmem", 3, 200),
+                # Joint seeds include the expanded domain's low endpoint.
+                ("tmem", 3, 152),
+            )
         }
         assert len(stateful) == len(expected_variants)
         assert {
@@ -453,6 +460,8 @@ def test_stateful_detector_proof_reaches_real_codegen(
                 seed.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY],
                 seed.config.get(flash.FLASH_ROW_SUM_SCHEDULE_KEY, "post_acquire"),
                 seed.config[flash.FLASH_ROWMAX_KEY],
+                seed.config[flash.FLASH_KV_STAGE_KEY],
+                seed.config[flash.FLASH_SOFTMAX_REGS_KEY],
             )
             for seed in stateful
         } == expected_variants

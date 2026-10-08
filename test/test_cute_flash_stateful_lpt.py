@@ -358,7 +358,10 @@ def test_generic_seed_widths_use_captured_geometry(
 def test_compiler_seed_routes_share_sm_count_and_preserve_old_prefix() -> None:
     spec = _spec(64)
     spec.num_sm = 32
-    with patch.object(flash, "_flash_stateful_lpt_seed_widths", return_value=(1,)):
+    with (
+        patch.object(flash, "_flash_stateful_lpt_seed_widths", return_value=(1,)),
+        patch.object(flash, "_flash_stateful_joint_seed_configs", return_value=()),
+    ):
         old = spec.autotune_seed_configs()
     seeds = spec.autotune_seed_configs()
     assert seeds[: len(old)] == old
