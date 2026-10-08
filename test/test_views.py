@@ -18,7 +18,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1006,9 +1005,6 @@ class TestViews(RefEagerTestBase, TestCase):
             self.assertIn("tl.reshape", code)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfPallasTpu(
-        "Mosaic does not support reshaping a 1D vector to [..., 2] on TPU"
-    )
     def test_view_blocksize_constexpr_pairsum(self):
         # The split-over-view + compacted-store machinery exercised by
         # ``test_view_blocksize_constexpr`` (which only checks codegen shape)
