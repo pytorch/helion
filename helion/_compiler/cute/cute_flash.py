@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import functools
+from functools import partial
 import itertools
 import math
 import operator
@@ -5605,6 +5606,73 @@ def flash_attention_seed_config(
     return _flash_config_with_values(block_sizes, values)
 
 
+def _flash_stateful_joint_seed_configs(
+    seeds: Sequence[Config],
+    fragments: Mapping[str, ConfigSpecFragment],
+    resolve_seed: Callable[[Mapping[str, object]], FlashAttentionConfig],
+) -> tuple[Config, ...]:
+    """Append legal depth/register endpoints to the existing stateful templates."""
+    parents = [
+        seed
+        for seed in seeds
+        if seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4"
+        and seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
+        and seed.config.get(FLASH_ROWMAX_KEY) == "tmem"
+    ]
+    depths = cast("EnumFragment", fragments[FLASH_KV_STAGE_KEY])._active_choices()
+    registers = cast(
+        "EnumFragment", fragments[FLASH_SOFTMAX_REGS_KEY]
+    )._active_choices()
+    if not parents or not registers:
+        return ()
+    resolved_parents = [(seed, resolve_seed(seed.config)) for seed in parents]
+    seen = {
+        _flash_config_with_values(
+            cast("Sequence[int]", seed.config["block_sizes"]),
+            flash_effective_config_values(resolved),
+        )
+        for seed, resolved in resolved_parents
+    }
+    result: list[Config] = []
+    for seed, parent in resolved_parents:
+        values = flash_effective_config_values(parent)
+        low_registers = min(cast("Sequence[int]", registers))
+        register_endpoints = (parent.softmax_regs,)
+        if low_registers < parent.softmax_regs:
+            register_endpoints += (low_registers,)
+        for depth in sorted(
+            (
+                value
+                for value in cast("Sequence[int]", depths)
+                if parent.kv_stage < value <= 2 * parent.kv_stage
+            ),
+            reverse=True,
+        ):
+            deeper = {**values, FLASH_KV_STAGE_KEY: depth}
+            # The family domain can exceed this parent's output-storage cap.
+            # Try the next depth when normalization clamps or changes its graph.
+            if not _flash_config_matches_tuning_values(resolve_seed(deeper), deeper):
+                continue
+            for softmax_regs in register_endpoints:
+                if softmax_regs not in registers:
+                    continue
+                candidate_values = {**deeper, FLASH_SOFTMAX_REGS_KEY: softmax_regs}
+                if 2 * softmax_regs + parent.corr_regs + parent.other_regs > 512:
+                    continue
+                if not _flash_config_matches_tuning_values(
+                    resolve_seed(candidate_values), candidate_values
+                ):
+                    continue
+                candidate = _flash_config_with_values(
+                    cast("Sequence[int]", seed.config["block_sizes"]), candidate_values
+                )
+                if candidate not in seen:
+                    seen.add(candidate)
+                    result.append(candidate)
+            break
+    return tuple(result)
+
+
 def flash_attention_seed_configs(
     head_dim: int,
     num_kv: int | None,
@@ -5948,6 +6016,28 @@ def flash_attention_seed_configs(
                 )
                 if candidate not in unique:
                     unique.append(candidate)
+    # Preserve the complete old prefix, including row-sum and LPT coverage.
+    if any(
+        seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4"
+        and seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
+        and seed.config.get(FLASH_ROWMAX_KEY) == "tmem"
+        for seed in unique
+    ):
+        joint_fragments = flash_autotune_fragments(
+            head_dim, num_kv, pipeline_family_override="fa4", **common
+        )
+
+        # Head count is fragment-only; all resolver context is already shared.
+        resolve_seed = partial(
+            resolve_flash_config,
+            head_dim,
+            num_kv,
+            **{key: value for key, value in common.items() if key != "tensor_4d_heads"},
+        )
+
+        unique.extend(
+            _flash_stateful_joint_seed_configs(unique, joint_fragments, resolve_seed)
+        )
     return tuple(unique)
 
 
