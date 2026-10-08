@@ -3080,12 +3080,18 @@ def _pallas_compile_compact_jit_fn(
     def jit_fn(*jax_inputs: object) -> object:
         if use_device_worklist:
             offset_input = cast("_TorchTensorOrJaxArray", jax_inputs[offset_tpos[0]])
+            offset_input = pltpu.with_memory_space_constraint(  # type: ignore[union-attr]
+                offset_input,
+                pltpu.SMEM,  # type: ignore[union-attr]
+            )
+            device_pipe_positions = [
+                position for position in pipe_positions if position not in offset_tpos
+            ]
             device_metadata_types = [
                 pltpu.SMEM((compact_upper,), jnp.int32)  # type: ignore[union-attr]
                 for _ in metadata_fields
             ]
             device_worklist_scratch: list[object] = [
-                pltpu.SMEM(tuple(offset_input.shape), offset_input.dtype),  # type: ignore[union-attr]
                 pltpu.SMEM((1,), jnp.int32),  # type: ignore[union-attr]
                 *device_metadata_types,
             ]
@@ -3111,15 +3117,12 @@ def _pallas_compile_compact_jit_fn(
                 io_any = refs[:n_io]
                 rest = refs[n_io:]
                 kernel_scratch = rest[:n_kernel_scratch]
-                worklist_end = n_kernel_scratch + 2 + len(metadata_fields)
+                worklist_end = n_kernel_scratch + 1 + len(metadata_fields)
                 worklist_scratch = rest[n_kernel_scratch:worklist_end]
                 carry_scratch = rest[worklist_end:]
-                offsets_smem = worklist_scratch[0]
-                num_work_smem = worklist_scratch[1]
-                metadata_smem = worklist_scratch[2:]
-                pltpu.sync_copy(  # type: ignore[union-attr]
-                    io_any[offset_tpos[0]], offsets_smem
-                )
+                offsets_smem = io_any[offset_tpos[0]]
+                num_work_smem = worklist_scratch[0]
+                metadata_smem = worklist_scratch[1:]
                 _pallas_fill_packed_worklist(
                     lax,
                     offsets_smem,
@@ -3156,11 +3159,15 @@ def _pallas_compile_compact_jit_fn(
                     else [out_specs]
                 )
                 all_specs = list(in_specs) + out_specs_seq
-                pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
-                pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
+                pipe_in_specs = [
+                    all_specs[p] for p in device_pipe_positions if p < n_inputs
+                ]
+                pipe_out_specs = [
+                    all_specs[p] for p in device_pipe_positions if p >= n_inputs
+                ]
 
                 pipe_any = []
-                for position in pipe_positions:
+                for position in device_pipe_positions:
                     ref = io_any[position]
                     sublane = sublane_by_position.get(position)
                     if sublane is not None:
@@ -3189,11 +3196,16 @@ def _pallas_compile_compact_jit_fn(
 
                 def pipeline_body(*block_refs: object) -> None:
                     merged = list(io_any)
-                    physical_blocks = dict(zip(pipe_positions, block_refs, strict=True))
+                    merged[offset_tpos[0]] = offsets_smem
+                    physical_blocks = dict(
+                        zip(device_pipe_positions, block_refs, strict=True)
+                    )
                     wid = pl.program_id(0)  # type: ignore[union-attr]
                     start = metadata_smem[tile_start_ref_pos][wid]  # type: ignore[index]
                     extent = metadata_smem[tile_extent_ref_pos][wid]  # type: ignore[index]
-                    for p, block_ref in zip(pipe_positions, block_refs, strict=True):
+                    for p, block_ref in zip(
+                        device_pipe_positions, block_refs, strict=True
+                    ):
                         sublane = sublane_by_position.get(p)
                         if sublane is None:
                             merged[p] = block_ref
@@ -3244,7 +3256,9 @@ def _pallas_compile_compact_jit_fn(
                     vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
                 ),
             )
-            return call(*jax_inputs)
+            call_inputs = list(jax_inputs)
+            call_inputs[offset_tpos[0]] = offset_input
+            return call(*call_inputs)
 
         offsets = [jax_inputs[tp] for tp in offset_tpos]
         metadata = build_worklist(*offsets)

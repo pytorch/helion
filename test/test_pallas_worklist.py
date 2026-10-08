@@ -574,7 +574,11 @@ def _ragged_grouped_matmul_kernel(lhs, weights, offsets):
                 weights[group, :, :],
                 out_dtype=torch.float32,
             )
-            output[tile_m, :] = accumulator.to(output.dtype)
+            # Exercise offsets both as loop bounds and as values used by the
+            # compact body after the device worklist has been built.
+            output[tile_m, :] = torch.where(end > start, accumulator, -accumulator).to(
+                output.dtype
+            )
     return output
 
 
