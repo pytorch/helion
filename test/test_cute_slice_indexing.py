@@ -130,6 +130,9 @@ def test_concatenate_separates_grid_and_full_slice_thread_axes(
         in code
     )
     assert "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0])" in code
+    # The eight slice threads take axis 0 and the rows axis 1.
+    assert "cutlass.Int32(synthetic_lane_2) * 8" in code
+    assert "block=(8, 128, 1)" in code
 
 
 @skipUnlessBackends(["cute"])

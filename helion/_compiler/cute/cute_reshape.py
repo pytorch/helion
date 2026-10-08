@@ -139,6 +139,10 @@ def _resolve_dim_block_id(
 
     Falls back to searching ``env.block_sizes`` for matches with the same
     extent when ``env.get_block_id`` cannot resolve a static int dim directly.
+    Several matches leave the dim unowned.  A single match owns it only if
+    one tile of it spans that extent: a tile narrower than its loop's extent
+    never has a dim of the full extent (an ``hl.arange(64)`` beside a row
+    tile of 1 over 64 rows is not the tile).
     """
     env = CompileEnvironment.current()
     dim_size = fake_tensor.shape[dim]
@@ -158,9 +162,17 @@ def _resolve_dim_block_id(
         bid = info.block_id
         if cg.active_device_loops.get(bid) or bid in grid_axes:
             candidates.append(bid)
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+    if len(candidates) != 1:
+        return None
+    (bid,) = candidates
+    block_size = cg.device_function.resolved_block_size(bid)
+    if (
+        isinstance(block_size, int)
+        and isinstance(dim_size, int)
+        and block_size < dim_size
+    ):
+        return None
+    return bid
 
 
 def _strategy_aliases_index_and_offset(strategy: object, block_id: int) -> bool:

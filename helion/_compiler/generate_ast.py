@@ -31,6 +31,7 @@ from .compile_environment import CompileEnvironment
 from .cute.cute_reshape import run_deferred_rebound_checks
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.thread_budget import thread_idx_axis
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
 from .cute.unroll_lane_loads import lane_unroll_off_config
 from .device_function import ConstExprArg
@@ -169,6 +170,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.current_root_graph_info: GraphInfo | None = None
         self.max_thread_block_dims = [1, 1, 1]
         self.root_thread_block_dims = [1, 1, 1]
+        # Per root loop: the thread extent of each launch axis the root's own
+        # statements (index setup, body, lane loops) read.  A launch narrower
+        # than one of them drops that root's threads; a root's axis no
+        # statement reads needs one thread (``_launcher_block_arg``).
+        self.root_read_axis_sizes: list[dict[int, int]] = []
         self.referenced_thread_block_dims = [1, 1, 1]
         # CuTe only: synthetic per-thread axes allocated for free/unbound
         # ``hl.arange`` index dims that are not bound to any tile/reduction/grid
@@ -1430,6 +1436,34 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 )
         return axes
 
+    def _record_root_read_axes(
+        self, grid_state: DeviceGridState, body: list[ast.AST]
+    ) -> None:
+        """Record the launch axes the root loop ``grid_state`` reads with their
+        thread extents (``root_read_axis_sizes``): its index setup in the
+        statement list that receives the body, the body, the lane setup and
+        the prefix and suffix around the lane loops."""
+        statements: list[ast.AST] = [
+            *(grid_state.hoist_parent_statements or ()),
+            *grid_state.outer_prefix,
+            *grid_state.lane_setup_statements,
+            *body,
+            *grid_state.outer_suffix,
+        ]
+        read_axes = {
+            axis
+            for stmt in statements
+            for node in ast.walk(stmt)
+            if (axis := thread_idx_axis(node)) is not None
+        }
+        self.root_read_axis_sizes.append(
+            {
+                axis: size
+                for axis, size in grid_state.root_axis_sizes.items()
+                if axis in read_axes
+            }
+        )
+
     def _record_statement_thread_references(
         self,
         statements: list[ast.AST],
@@ -1564,11 +1598,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
         if isinstance(device_grid, DeviceGridState):
-            for axis, size in device_grid.thread_axis_sizes.items():
-                if 0 <= axis < 3:
-                    self.root_thread_block_dims[axis] = max(
-                        self.root_thread_block_dims[axis], size
-                    )
+            # The root's own axes: reductions lowered in the body add theirs
+            # to ``thread_axis_sizes`` later, and a reduction axis may launch
+            # fewer threads than it records (MMA fallbacks, collectives).
+            device_grid.root_axis_sizes = {
+                axis: size
+                for axis, size in device_grid.thread_axis_sizes.items()
+                if 0 <= axis < 3
+            }
+            for axis, size in device_grid.root_axis_sizes.items():
+                self.root_thread_block_dims[axis] = max(
+                    self.root_thread_block_dims[axis], size
+                )
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
@@ -1717,6 +1758,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             wrapped_body: list[ast.AST] = []
                             with self.set_statements(wrapped_body):
                                 codegen_call_with_graph(self, root, [])
+                            if CompileEnvironment.current().backend_name == "cute":
+                                self._record_root_read_axes(grid_state, wrapped_body)
                             if self._try_lower_direct_affine_root(
                                 grid_state, wrapped_body
                             ):
