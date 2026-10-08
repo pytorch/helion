@@ -1815,7 +1815,7 @@ class PallasBackend(Backend):
         env.compact_worklist_load_buffer_count = 2
         env.compact_worklist_offset_params = []
 
-        if grouping in (1, 2):
+        if grouping:
             self._setup_compact_worklist(graphs, config)
 
         from .tracing_ops import plan_grid_indirect_accesses

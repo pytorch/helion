@@ -1088,7 +1088,7 @@ VALID_KEYS: frozenset[str] = frozenset(
 # Loop types the autotuner searches by default for every Pallas inner loop.
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
-VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2, 4)
 VALID_PALLAS_WORKLIST_LOAD_BUFFER_COUNTS = (2, 3, 4)
 VALID_PID_TYPES = (
     "flat",

@@ -251,7 +251,7 @@ def _(state: CodegenState) -> object:
         if _is_compact_tile_loop(state):
             plan = CompileEnvironment.current().compact_worklist_plan
             assert plan is not None
-            if plan.grouping == 2:
+            if plan.grouping > 1:
                 return _codegen_grouped_compact_tile(state)
         return _codegen_fori_loop(state)
     if pallas_loop_type == "emit_pipeline":
@@ -286,7 +286,7 @@ def _(state: CodegenState) -> None:
         if _is_compact_tile_loop(state):
             plan = CompileEnvironment.current().compact_worklist_plan
             assert plan is not None
-            if plan.grouping == 2:
+            if plan.grouping > 1:
                 _codegen_grouped_compact_tile(state)
                 return None
         _codegen_fori_loop(state)
@@ -1316,7 +1316,7 @@ def _compact_block_variant(state: CodegenState, factor: int) -> Iterator[None]:
 
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
-    assert plan is not None and factor == 2
+    assert plan is not None and 1 < factor <= plan.grouping
     block_id = plan.compact_axis.block_id
     fn = state.device_function
 
@@ -1595,7 +1595,7 @@ def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
     from ..device_function import TensorArg
 
     plan = CompileEnvironment.current().compact_worklist_plan
-    assert plan is not None and plan.grouping == 2
+    assert plan is not None and plan.grouping > 1
     output_hosts = {
         policy.arg_name
         for policy in plan.tensor_policies
@@ -1616,12 +1616,12 @@ def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
 
 
 def _codegen_grouped_compact_tile(state: CodegenState) -> None:
-    """Emit static base-block and double-block compact-body variants."""
+    """Emit one compact-body variant for each grouped tile width."""
     from .compact_worklist import compact_ref_names
 
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
-    assert plan is not None and plan.grouping == 2
+    assert plan is not None and plan.grouping > 1
     assert _is_compact_tile_loop(state)
 
     codegen = state.codegen
@@ -1640,7 +1640,7 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
     assert not codegen.grouped_fori_dma_resource_cache
     codegen.grouped_compact_common_statements = common_statements
     try:
-        for factor in (1, 2):
+        for factor in range(1, plan.grouping + 1):
             for name, value in initial_counters.items():
                 setattr(state.device_function, name, value)
             branch_body: list[ast.AST] = []
@@ -1650,8 +1650,9 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
             ):
                 result = _codegen_fori_loop(state)
             assert result is None
-            if factor == 1:
+            if factor < plan.grouping:
                 branch_body[:0] = _compact_output_initializers(state)
+            if factor == 1:
                 final_counters = {
                     name: getattr(state.device_function, name)
                     for name in _CODEGEN_VARIANT_COUNTERS
@@ -1668,8 +1669,15 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
                 if sublane == 1
                 else f"(({start_ref}_ref[_wid] % {sublane}) + {extent})"
             )
-            comparison = "<=" if factor == 1 else ">"
-            predicate = f"{physical_extent} {comparison} {env.compact_worklist_block}"
+            if factor == 1:
+                predicate = f"{physical_extent} <= {env.compact_worklist_block}"
+            else:
+                lower = (factor - 1) * env.compact_worklist_block
+                upper = factor * env.compact_worklist_block
+                predicate = (
+                    f"jnp.logical_and({physical_extent} > {lower}, "
+                    f"{physical_extent} <= {upper})"
+                )
             fn_def = statement_from_string(
                 f"@pl.when({predicate})\ndef {fn_name}():\n    pass"
             )

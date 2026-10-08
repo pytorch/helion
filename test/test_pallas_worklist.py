@@ -1116,7 +1116,7 @@ class TestDetectAndGating(unittest.TestCase):
         self.assertIsInstance(grouping_field, EnumFragment)
         choices = loop_type_field.choices
         self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
-        self.assertEqual(grouping_field.choices, (0, 1, 2))
+        self.assertEqual(grouping_field.choices, (0, 1, 2, 4))
         self.assertEqual(load_buffer_field.choices, (2, 3, 4))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
 
@@ -1820,7 +1820,11 @@ class TestWorklistLoopDispatch(unittest.TestCase):
 
         self.assertIn("grouping=2", code)
         self.assertIn("@pl.when(q_extent_ref[_wid] <= 8)", code)
-        self.assertIn("@pl.when(q_extent_ref[_wid] > 8)", code)
+        self.assertIn(
+            "@pl.when(jnp.logical_and(q_extent_ref[_wid] > 8, "
+            "q_extent_ref[_wid] <= 16))",
+            code,
+        )
         self.assertIn("_BLOCK_SIZE_1 = int(8)", code)
         self.assertIn("_BLOCK_SIZE_2 = int(16)", code)
         self.assertIn("q[pl.ds(0, _BLOCK_SIZE_1)", code)
@@ -1838,7 +1842,11 @@ class TestWorklistLoopDispatch(unittest.TestCase):
                     _worklist_config([8, 8], loop_type=loop_type, grouping=2)
                 )
                 self.assertIn("@pl.when(q_extent_ref[_wid] <= 8)", code)
-                self.assertIn("@pl.when(q_extent_ref[_wid] > 8)", code)
+                self.assertIn(
+                    "@pl.when(jnp.logical_and(q_extent_ref[_wid] > 8, "
+                    "q_extent_ref[_wid] <= 16))",
+                    code,
+                )
                 if loop_type == "unroll":
                     self.assertEqual(code.count("def _rc_prep_refill():"), 1)
                     self.assertNotIn("k_prep_1", code)
@@ -2280,6 +2288,14 @@ class TestWorklistNumerics(unittest.TestCase):
                 torch.testing.assert_close(
                     output.cpu(), reference, rtol=2e-2, atol=2e-2
                 )
+        _, grouped_output = code_and_output(
+            _ragged_grouped_matmul_kernel,
+            (lhs, weights, offsets.to(DEVICE)),
+            **_worklist_config([32], grouping=4, load_buffer_count=3),
+        )
+        torch.testing.assert_close(
+            grouped_output.cpu(), reference, rtol=2e-2, atol=2e-2
+        )
 
     def test_dense_kv_unaligned_matches_eager(self):
         # Unaligned offsets + partial last tiles => the store-overlap case that
