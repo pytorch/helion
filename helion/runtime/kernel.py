@@ -2696,6 +2696,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 cache_extra = repr(self._base_spec_key)
             if self.kernel.cute_structural_policy is not None:
                 cache_extra += self.extra_cache_key()
+            if os.environ.get("HELION_CODE_PATCH"):  # SCRATCH
+                import importlib.util
+
+                spec = importlib.util.spec_from_file_location(
+                    "helion_code_patch", os.environ["HELION_CODE_PATCH"]
+                )
+                patch_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(patch_mod)
+                triton_code = patch_mod.patch(self.kernel.name, triton_code)
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code, extra=cache_extra)
             self.env.backend.annotate_compiled_module(
