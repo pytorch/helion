@@ -476,7 +476,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm_scaled(self):
         # Match TritonBench: non-unit tensor-wise scales and a column-major B

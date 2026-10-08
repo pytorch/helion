@@ -33,6 +33,10 @@ expression for two cases:
   exact-shape rank-2 form (``residual[tile_m, tile_n]``) and the
   rank-1 trailing-axis (rowvec) broadcast form (``bias[tile_n]``).
   See :class:`_AuxiliaryTensorLoadExpr` for the canonical contract.
+- Tile-uniform scalars: a host scalar lifted into the kernel
+  (``alpha * acc`` with a captured Python float) or a rank-0 aux load
+  (``acc * scale[()]``) is a :class:`_RuntimeScalarExpr` leaf rendered
+  inline as one ``cutlass.Float32`` value.
   Forms outside these two — 3-D underlying tensors with a static
   collapse, mismatched indices, leading-axis rank-1
   (``bias[tile_m]``), kwargs — are rejected to the loud-failure
@@ -61,6 +65,7 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from ...language import _tracing_ops
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
@@ -160,9 +165,20 @@ class Tcgen05GroupedTailEpilogueMatch:
 
 @dataclasses.dataclass(frozen=True)
 class _RuntimeScalarExpr:
-    """A host scalar lifted into the kernel, never a per-lane coordinate."""
+    """A tile-uniform scalar, never a per-lane coordinate.
 
-    expr: sympy.Expr
+    ``source`` is the sympy expression of a host scalar lifted into the
+    kernel (``alpha * acc`` with a float kernel argument) or the rank-0
+    ``helion.language.load`` node of a device scalar (``acc * scale[()]``).
+    Either renders inline as one ``cutlass.Float32`` value shared by the
+    whole output tile; the splice site never binds or partitions it.
+    """
+
+    source: sympy.Expr | torch.fx.Node
+
+    @property
+    def is_host_scalar(self) -> bool:
+        return isinstance(self.source, sympy.Expr)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -549,17 +565,12 @@ def _extract_scalar(arg: object) -> float | None:
     can pass it through an aux-tensor lambda where the value is
     materialized as a tensor element.
 
-    Helion's host-tensor guard
-    (:class:`exc.HostTensorDirectUsage`) prevents 0-d tensor scalars
-    from reaching the analyzer through the normal store path — a user
-    writing ``acc + scalar_t`` against a 0-d host tensor is rejected
-    upstream before this analyzer runs. Inside-kernel 0-d tensors are
-    rare and would require explicit ``hl.zeros([])`` or similar; if a
-    workload appears that materializes a fold-time-constant 0-d
-    tensor mid-chain, this function can be extended to accept FX
-    nodes whose ``meta['val']`` is a 0-d tensor with a constant
-    backing storage. Until then, restricting to Python scalars is
-    correct and removes a dead-code branch.
+    Lifted ``SymFloat`` / ``SymInt`` kernel arguments and rank-0 aux
+    loads (``scale[()]``) are not literals: they are classified as
+    :class:`_RuntimeScalarExpr` leaves and rendered inline.
+    Helion's host-tensor guard (:class:`exc.HostTensorDirectUsage`)
+    still rejects ``acc + scalar_t`` against a bare 0-d host tensor
+    upstream of this analyzer.
     """
     if isinstance(arg, bool):
         return None  # Boolean scalars are not whitelisted.
@@ -704,6 +715,10 @@ def _runtime_scalar(node: torch.fx.Node) -> _RuntimeScalarExpr | None:
     return _RuntimeScalarExpr(expr)
 
 
+def _is_host_scalar_expr(expr: _TensorExpr) -> bool:
+    return isinstance(expr, _RuntimeScalarExpr) and expr.is_host_scalar
+
+
 def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
     """Return whether ``node`` is structurally an aux-only expression."""
     if depth >= 32:
@@ -765,6 +780,23 @@ def _auxiliary_tensor_expr_operands(
     raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
 
 
+def _runtime_scalar_operands(
+    expr: _TensorExpr,
+) -> tuple[_RuntimeScalarExpr, ...]:
+    if isinstance(expr, (_CurrentTensorExpr, _AuxiliaryTensorLoadExpr)):
+        return ()
+    if isinstance(expr, _RuntimeScalarExpr):
+        return (expr,)
+    if isinstance(expr, _UnaryTensorExpr):
+        return _runtime_scalar_operands(expr.operand)
+    if isinstance(expr, _BinaryTensorExpr):
+        return (
+            *_runtime_scalar_operands(expr.lhs),
+            *_runtime_scalar_operands(expr.rhs),
+        )
+    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
+
+
 def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
     if isinstance(expr, _CurrentTensorExpr):
         return True
@@ -779,6 +811,28 @@ def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
     raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
 
 
+def _render_runtime_scalar(expr: _RuntimeScalarExpr) -> str:
+    """Render one tile-uniform scalar as an inline ``cutlass.Float32`` value."""
+    from ..device_function import DeviceFunction
+
+    df = DeviceFunction.current()
+    if isinstance(expr.source, torch.fx.Node):
+        from ...language.memory_ops import _cute_scalar_load_expr
+
+        tensor_node = expr.source.args[0]
+        assert isinstance(tensor_node, torch.fx.Node)
+        tensor = tensor_node.meta["val"]
+        assert isinstance(tensor, torch.Tensor)
+        tensor_name = df.tensor_arg(tensor).name
+        # The chain is spliced as source text, so the argument pruner never
+        # sees this read; pin the tensor like the per-subtile aux operands.
+        df.placeholder_args.add(tensor_name)
+        value = _cute_scalar_load_expr(tensor_name, [], tensor.dtype)
+    else:
+        value = df.sympy_expr(expr.source)
+    return f"cutlass.Float32({value})"
+
+
 def _render_auxiliary_tensor_expr(
     expr: _TensorExpr,
     carrier_name: str,
@@ -788,10 +842,7 @@ def _render_auxiliary_tensor_expr(
 ) -> tuple[str, str]:
     """Render an expression tree into bound TensorSSA locals."""
     if isinstance(expr, _RuntimeScalarExpr):
-        from ..device_function import DeviceFunction
-
-        scalar = DeviceFunction.current().sympy_expr(expr.expr)
-        return "", f"cutlass.Float32({scalar})"
+        return "", _render_runtime_scalar(expr)
     if isinstance(expr, _CurrentTensorExpr):
         return "", carrier_name
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
@@ -897,6 +948,20 @@ class Tcgen05UnaryEpilogueChain:
         the per-subtile chain rendering).
         """
         return tuple(operand for step in self.steps for operand in step.operands)
+
+    @property
+    def runtime_scalars(self) -> tuple[_RuntimeScalarExpr, ...]:
+        """All tile-uniform scalar leaves in application order.
+
+        Each renders inline from the current device function, so epilogue
+        layouts that emit the chain into a separate helper module must reject
+        chains that have any. Planners that enumerate memory operands (TMA aux
+        descriptors, fanout aliasing, SMEM staging) use
+        :attr:`auxiliary_tensor_loads`, which never includes these leaves.
+        """
+        return tuple(
+            leaf for step in self.steps for leaf in _runtime_scalar_operands(step.expr)
+        )
 
     def render_prelude_and_expr(
         self,
@@ -1268,7 +1333,14 @@ def _classify_auxiliary_tensor_expr_impl(
         carrier_tile_index_nodes=carrier_tile_index_nodes,
         carrier_global_shape=carrier_global_shape,
     )
-    if kind is not None:
+    if kind == ("scalar", None):
+        # Rank-0 aux (``scale[()]``) is one tile-uniform device scalar. Only
+        # the bare load is a leaf; casts and literal factors around it stay
+        # ordinary chain steps, so the dtype must be one whose rounding the
+        # chain models.
+        if load_node is node and _node_tensor_dtype(node) in _FLOAT_CAST_TYPES:
+            return _RuntimeScalarExpr(node)
+    elif kind is not None:
         broadcast_axis = kind[1] if kind[0] == "broadcast" else None
         return _AuxiliaryTensorLoadExpr(
             load_node=load_node,
@@ -1351,14 +1423,17 @@ def _classify_auxiliary_tensor_expr_impl(
     if lhs_expr is not None and rhs_expr is not None:
         assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
         result_dtype = _node_tensor_dtype(node)
+        # A host scalar is weakly typed: torch promotes it to the tensor
+        # operand's dtype like a literal. A rank-0 load is a tensor operand
+        # and must already carry the result dtype.
         if (
             result_dtype is None
             or (
-                not isinstance(lhs_expr, _RuntimeScalarExpr)
+                not _is_host_scalar_expr(lhs_expr)
                 and _node_tensor_dtype(lhs) != result_dtype
             )
             or (
-                not isinstance(rhs_expr, _RuntimeScalarExpr)
+                not _is_host_scalar_expr(rhs_expr)
                 and _node_tensor_dtype(rhs) != result_dtype
             )
         ):
@@ -1457,10 +1532,6 @@ def _carrier_tile_index_nodes(
     chain ops — none of which produces a load node along the
     carrier side.
     """
-    import operator
-
-    from ...language import _tracing_ops
-
     cur: torch.fx.Node | None = cast_input
     visited: set[torch.fx.Node] = set()
     # Walk through identity-shape passthroughs to the loop entry,
@@ -1532,7 +1603,9 @@ def analyze_tcgen05_unary_epilogue_chain(
     / ``log`` / ``sqrt`` / ``abs`` / ``neg``), scalar binary
     (``add`` / ``sub`` / ``mul`` / ``div`` against a compile-time
     Python literal), and carrier binary ops whose other operand is
-    a whitelisted elementwise expression over auxiliary loads. The
+    a whitelisted elementwise expression over auxiliary loads and
+    tile-uniform scalars (lifted ``SymFloat`` / ``SymInt`` kernel
+    arguments and rank-0 ``scale[()]`` loads). The
     auxiliary leaves accept exact-shape
     (``residual[tile_m, tile_n]``, rank-2 matching the carrier tile)
     and rank-1 trailing-axis (rowvec) broadcast forms
@@ -2262,7 +2335,6 @@ def find_tcgen05_grouped_tail_epilogue_for_mma(
 ) -> Tcgen05GroupedTailEpilogueMatch | None:
     """Find the unique semantic grouped tail preserve-output store."""
 
-    from ...language import _tracing_ops
     from ...language import memory_ops
 
     graph_infos = list(graphs)

@@ -1010,6 +1010,9 @@ def _cute_index_tuple(index_exprs: list[str]) -> str:
 
 
 def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    if not index_exprs:
+        # Rank-0 tensor (``scale[()]``): the base pointer is the element.
+        return f"({tensor_name}.iterator)"
     env = CompileEnvironment.current()
     index_dtype = env.index_type()
     offset = " + ".join(
@@ -5667,10 +5670,13 @@ def _codegen_cute_store_tcgen05_tile(
             or diagnose_module_helper_store_tail
             or diagnose_split_first_t2r
             or diagnose_split_acc_t2r_store_tail
-        ) and aux_steps_in_chain:
+        ) and (
+            aux_steps_in_chain
+            or (epilogue_chain is not None and epilogue_chain.runtime_scalars)
+        ):
             raise exc.BackendUnsupported(
                 "cute",
-                "auxiliary-tensor epilogue (e.g. "
+                "auxiliary-tensor or runtime-scalar epilogue (e.g. "
                 "`out[tile] = (acc + residual[tile]).to(dtype)`) is "
                 f"not plumbed through {TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}="
                 f"{epilogue_layout!r}. Drop the layout config to use the "
