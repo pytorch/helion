@@ -199,9 +199,9 @@ def _pure(expr: ast.AST, vectors: set[str]) -> bool:
             return (
                 len(expr.args) == 2
                 and all(_pure(arg, vectors) for arg in expr.args)
-                and len(expr.keywords) <= (1 if name == "cute.math.max" else 0)
+                and len(expr.keywords) <= 1
                 and all(
-                    kw.arg == "propagate_nan"
+                    kw.arg == ("nan" if name == "cute.arch.fmax" else "propagate_nan")
                     and isinstance(kw.value, ast.Constant)
                     and type(kw.value.value) is bool
                     for kw in expr.keywords
@@ -458,7 +458,12 @@ def _fold(
                         and isinstance(value, ast.Call)
                         and ast.unparse(value.func) == "cute.arch.fmax"
                         and len(value.args) == 2
-                        and not value.keywords
+                        and all(
+                            kw.arg == "nan"
+                            and isinstance(kw.value, ast.Constant)
+                            and type(kw.value.value) is bool
+                            for kw in value.keywords
+                        )
                         and isinstance(value.args[0], ast.Name)
                         and value.args[0].id == accumulator
                         and loops
@@ -478,7 +483,9 @@ def _fold(
                             initial,
                             stmt,
                             tuple(domain),
-                            ast.dump(contribution),
+                            # The NaN mode is part of the combine.
+                            ast.dump(contribution)
+                            + repr([ast.dump(kw) for kw in value.keywords]),
                         )
                     )
                 if name in vectors and _raw_vector_load(value):

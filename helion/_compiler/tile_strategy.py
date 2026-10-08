@@ -572,15 +572,24 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
         visit(statement, ())
 
 
-def _combine_expr(reduction_type: str, acc: str, val: str) -> str:
+def _combine_expr(
+    reduction_type: str, acc: str, val: str, dtype_ctor: str | None = None
+) -> str:
+    """Combine ``val`` into ``acc``; ``dtype_ctor`` is the accumulator's type
+    constructor (``_dtype_ctor_from_identity``), when known."""
     if reduction_type == "sum":
         return f"({acc}) + ({val})"
     if reduction_type == "prod":
         return f"({acc}) * ({val})"
-    if reduction_type == "max":
-        return f"({acc}) if ({acc}) > ({val}) else ({val})"
-    if reduction_type == "min":
-        return f"({acc}) if ({acc}) < ({val}) else ({val})"
+    if reduction_type in ("max", "min"):
+        from .cute.math_templates import nan_extremum_expr
+
+        return nan_extremum_expr(
+            reduction_type,
+            f"({acc})",
+            f"({val})",
+            float32=dtype_ctor == "cutlass.Float32",
+        )
     raise NotImplementedError(f"lane reduce combine {reduction_type!r}")
 
 
@@ -756,9 +765,9 @@ def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> s
     if reduction_type == "sum":
         return f"cute.arch.warp_reduction_sum({acc}{tg})"
     if reduction_type == "max":
-        return f"cute.arch.warp_reduction_max({acc}{tg})"
+        return f"cute.arch.warp_reduction_max({acc}, op=_cute_nan_max{tg})"
     if reduction_type == "min":
-        return f"cute.arch.warp_reduction(({acc}), lambda a, b: a if a < b else b{tg})"
+        return f"cute.arch.warp_reduction(({acc}), _cute_nan_min{tg})"
     if reduction_type == "prod":
         return f"cute.arch.warp_reduction(({acc}), lambda a, b: (a * b){tg})"
     raise NotImplementedError(f"lane warp reduce {reduction_type!r}")
@@ -1509,7 +1518,7 @@ def _split_one_lane_loop(
         ctor = _dtype_ctor_from_identity(m.identity_expr)
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         update = statement_from_string(
-            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
         )
         accumulate_body.append(update)
         marker_updates[marker_index] = update
@@ -1919,7 +1928,7 @@ def _validate_owned_lane_carry_schedule(
             expected.append(
                 statement_from_string(
                     f"{accumulator} = "
-                    f"{_combine_expr(marker.reduction_type, accumulator, value)}"
+                    f"{_combine_expr(marker.reduction_type, accumulator, value, ctor)}"
                 )
             )
         if not (
@@ -2455,7 +2464,7 @@ def _split_dependent_lane_reductions(
         acc_body.append(
             statement_from_string(
                 f"{acc_var} = "
-                f"{_combine_expr(marker.reduction_type, acc_var, combine_val)}"
+                f"{_combine_expr(marker.reduction_type, acc_var, combine_val, ctor)}"
             )
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
@@ -2949,7 +2958,7 @@ def _split_lane_loop_with_register_stash(
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         acc_body.append(
             statement_from_string(
-                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
             )
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
@@ -4507,7 +4516,7 @@ def _rereduce_restored_lane_markers(
         value = f"{ctor}({share})" if ctor is not None else share
         loop_body.append(
             statement_from_string(
-                f"{total} = {_combine_expr(marker.reduction_type, total, value)}"
+                f"{total} = {_combine_expr(marker.reduction_type, total, value, ctor)}"
             )
         )
         finalized.append(
@@ -5502,6 +5511,8 @@ def _is_proven_relocatable_call(
     if name in {
         "cute.arch.block_dim",
         "cute.arch.block_idx",
+        "cute.arch.fmax",
+        "cute.arch.fmin",
         "cute.arch.grid_dim",
         "cute.arch.lane_idx",
         "cute.arch.thread_idx",

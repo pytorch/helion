@@ -1509,6 +1509,7 @@ class DeviceFunction:
                 kernel_body,
                 running_sum_accumulators=self.cute_matmul_running_sums,
                 rename_groups=rename_groups,
+                unfoldable_vec_lanes=self.cute_state.unfoldable_vec_lanes,
             )
             if self.cute_state.simt_cluster_n > 1:
                 from .cute.duplicate_reduction_carries import (

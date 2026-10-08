@@ -404,6 +404,7 @@ class TritonBackend(Backend):
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
+            "helion_triton_helpers": "from helion.runtime.triton import helpers as helion_triton_helpers",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
@@ -443,11 +444,35 @@ class TritonBackend(Backend):
         threads_in_group: int | None = None,
         dtype: torch.dtype | None = None,
     ) -> str:
-        if reduction_type in {"sum", "max", "min"}:
-            return f"tl.{reduction_type}({input_name}, {dim})"
+        if dtype is not None and reduction_type in {"sum", "prod"}:
+            # Accumulate in the computation dtype (fp32 for fp16/bf16) as torch
+            # does; tl.sum of an fp16 tensor adds in fp16.
+            input_name = f"{input_name}.to({self.dtype_str(dtype)})"
+        if reduction_type == "sum":
+            return f"tl.sum({input_name}, {dim})"
+        if reduction_type in {"max", "min"}:
+            # tl.max/tl.min drop NaN; torch.amax/amin propagate it.
+            return (
+                f"helion_triton_helpers.{reduction_type}_propagate_nan"
+                f"({input_name}, {dim})"
+            )
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        if reduction_type == "prod":
+            # Inductor's ops.mul casts the product to the reduction's output
+            # dtype; for an fp16 prod that would turn the fp32 loop-carried
+            # accumulator into fp16, which Triton rejects.
+            return f"{acc} * {val}.to({self.dtype_str(dtype)})"
+        return super().reduction_combine_expr(reduction_type, acc, val, dtype)
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         return reduction_type in {"argmin", "argmax"}

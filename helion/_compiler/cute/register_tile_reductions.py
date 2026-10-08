@@ -665,7 +665,7 @@ def lower_register_tile_lane_loop(
             ctor = lanes._dtype_ctor_from_identity(marker.identity_expr)
             value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
             combined = lanes._combine_expr(
-                marker.reduction_type, f"{acc}[{position}]", value
+                marker.reduction_type, f"{acc}[{position}]", value, ctor
             )
             return [statement_from_string(f"{acc}[{position}] = {combined}")]
         if leaf.index not in phase1:

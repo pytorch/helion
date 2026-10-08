@@ -1127,7 +1127,15 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
             "cute": SimpleNamespace(
-                math=SimpleNamespace(min=np.minimum, max=np.maximum, tanh=np.tanh),
+                math=SimpleNamespace(
+                    min=lambda a, b, propagate_nan=False: (
+                        np.minimum(a, b) if propagate_nan else np.fmin(a, b)
+                    ),
+                    max=lambda a, b, propagate_nan=False: (
+                        np.maximum(a, b) if propagate_nan else np.fmax(a, b)
+                    ),
+                    tanh=np.tanh,
+                ),
                 make_layout=lambda shape: shape,
                 make_rmem_tensor=lambda layout, dtype: Shared(dtype, layout),
                 make_tensor=lambda iterator, layout: SimpleNamespace(
@@ -1140,6 +1148,12 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
                     thread_idx=lambda: (0, 0, 0),
                     block_idx=lambda block=block: (block, 0, 0),
                     sync_threads=lambda: None,
+                    fmax=lambda a, b, nan=False: (
+                        np.maximum(a, b) if nan else np.fmax(a, b)
+                    ),
+                    fmin=lambda a, b, nan=False: (
+                        np.minimum(a, b) if nan else np.fmin(a, b)
+                    ),
                 ),
             ),
         }
@@ -1925,12 +1939,25 @@ def _simulate_fragment_warp_reduction(
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
             "cute": SimpleNamespace(
-                math=SimpleNamespace(min=np.minimum, max=np.maximum),
+                math=SimpleNamespace(
+                    min=lambda a, b, propagate_nan=False: (
+                        np.minimum(a, b) if propagate_nan else np.fmin(a, b)
+                    ),
+                    max=lambda a, b, propagate_nan=False: (
+                        np.maximum(a, b) if propagate_nan else np.fmax(a, b)
+                    ),
+                ),
                 make_layout=lambda shape: shape,
                 arch=SimpleNamespace(
                     thread_idx=lambda: (0, 0, 0),
                     block_idx=lambda block=block: (block, 0, 0),
                     sync_threads=lambda: None,
+                    fmax=lambda a, b, nan=False: (
+                        np.maximum(a, b) if nan else np.fmax(a, b)
+                    ),
+                    fmin=lambda a, b, nan=False: (
+                        np.minimum(a, b) if nan else np.fmin(a, b)
+                    ),
                 ),
             ),
         }

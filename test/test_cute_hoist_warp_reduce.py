@@ -65,8 +65,64 @@ def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _row_sum_and_max(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    m = x.size(0)
+    s = x.new_empty(m)
+    mx = x.new_empty(m)
+    for tile in hl.tile(m):
+        v = x[tile, :]
+        s[tile] = v.sum(-1)
+        mx[tile] = v.amax(-1)
+    return s, mx
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _column_sums(x: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty(x.size(1))
+    for tile in hl.tile(x.size(1)):
+        out[tile] = x[:, tile].sum(0)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteHoistWarpReduce(TestCase):
+    def test_tile_vector_lanes_over_another_blocks_reduction_stay_separate(
+        self,
+    ) -> None:
+        """A vector width on the tile of a reduction over the full-slice dim
+        gives each V lane its own output element (a row of ``x[tile, :]``, a
+        column of ``x[:, tile]``), so each lane reduces on its own rather than
+        being folded with the others before the warp reduce."""
+        x = torch.randn(40, 16, device=DEVICE)
+        for block_size, threads, widths in (
+            (16, [8, 0], [4, 2]),
+            (16, [8, 0], [2, 2]),
+            (16, [4, 0], [4, 2]),
+            (8, [4, 0], [2, 2]),
+        ):
+            with self.subTest(block_size=block_size, widths=widths):
+                code, (s, mx) = code_and_output(
+                    _row_sum_and_max,
+                    (x,),
+                    block_sizes=[block_size],
+                    num_threads=threads,
+                    cute_vector_widths=widths,
+                )
+                self.assertNotIn("_helion_vfold_acc_", code)
+                torch.testing.assert_close(s, x.sum(-1))
+                torch.testing.assert_close(mx, x.amax(-1))
+        xt = torch.randn(16, 64, device=DEVICE)
+        code, out = code_and_output(
+            _column_sums,
+            (xt,),
+            block_sizes=[16],
+            num_threads=[8, 0],
+            cute_vector_widths=[1, 2],
+        )
+        self.assertNotIn("_helion_vfold_acc_", code)
+        torch.testing.assert_close(out, xt.sum(0))
+
     def test_warp_reduce_hoisted_out_of_v_loop(self) -> None:
         """The pass must remove the ``cute.arch.warp_reduction_max`` and
         ``cute.arch.warp_reduction_sum`` calls from inside the

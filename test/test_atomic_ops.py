@@ -1860,6 +1860,12 @@ def _simulate_local_atomic_program(source, x, shape):
                     block_idx=lambda row=row: (row, 0, 0),
                     sync_threads=lambda: None,
                     atomic_add=atomic_add,
+                    fmin=lambda a, b, *, nan=False: (
+                        np.minimum(a, b) if nan else np.fmin(a, b)
+                    ),
+                    fmax=lambda a, b, *, nan=False: (
+                        np.maximum(a, b) if nan else np.fmax(a, b)
+                    ),
                 ),
             ),
         }
@@ -2349,6 +2355,12 @@ def _simulate_register_load_program(
                 atomic_add=atomic_add,
                 lanemask_lt=lambda: np.uint32((1 << (state["lane"] % 32)) - 1),
                 fence_acq_rel_gpu=fence,
+                fmin=lambda a, b, *, nan=False: (
+                    np.minimum(a, b) if nan else np.fmin(a, b)
+                ),
+                fmax=lambda a, b, *, nan=False: (
+                    np.maximum(a, b) if nan else np.fmax(a, b)
+                ),
             ),
         ),
     }

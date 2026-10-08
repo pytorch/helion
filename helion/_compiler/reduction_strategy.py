@@ -23,6 +23,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.layout import LayoutTag as _CuteLayoutTag
 from .cute.layout_propagation import META_KEY as _CUTE_LAYOUT_META_KEY
+from .cute.math_templates import argreduce_candidate_expr
 from .cute.matmul_fallback import _widen_lane_layout_for_barrier_phases
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
@@ -57,19 +58,18 @@ def _dtype_str(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
 
 
-def _reduction_computation_dtype(
+def reduction_acc_dtype(
     reduction_type: str, fake_input: torch.Tensor, fake_output: torch.Tensor
 ) -> torch.dtype:
-    # Indexed reductions return indices but compare input values. Ordinary
-    # reductions honor Torch's result dtype, including integer promotion and
-    # explicit dtype=; Inductor has already converted their scalar operands.
-    backend = CompileEnvironment.current().backend
-    dtype = (
-        fake_input.dtype
-        if backend.is_indexed_reduction(reduction_type)
-        else fake_output.dtype
-    )
-    return get_computation_dtype(dtype)
+    """The dtype a reduction accumulates and combines in.
+
+    The reduction input already carries torch's promotion (a bool or integer
+    sum arrives as Int64), so a value reduction accumulates in the output's
+    computation dtype; argmin/argmax track the input's values.
+    """
+    if CompileEnvironment.current().backend.is_indexed_reduction(reduction_type):
+        return get_computation_dtype(fake_input.dtype)
+    return get_computation_dtype(fake_output.dtype)
 
 
 def _cute_shared_memory_budget_bytes() -> int:
@@ -296,6 +296,41 @@ def _block_has_indexed_reduction(fn: DeviceFunction, block_index: int) -> bool:
     """
     env = CompileEnvironment.current()
     return block_index in env.config_spec.cute_indexed_reduction_block_ids
+
+
+def cute_mark_cross_block_vec_lanes(state: CodegenState, block_id: int) -> None:
+    """Record the constexpr V-loops that enclose a reduction over ``block_id``
+    but iterate another block (``CuteDeviceFunctionState.unfoldable_vec_lanes``).
+
+    The V-fold of ``cute/hoist_warp_reduce.py`` combines a V-loop's lanes
+    before the cross-thread reduce, which is the reduction itself only when
+    the lanes are elements of the reduced block.  A vector width on the tile
+    of ``s[tile] = x[tile, :].sum(-1)`` gives each lane its own row, so those
+    lanes must each reduce on their own and feed one element of the vector
+    store.
+    """
+    from .tile_strategy import PerThreadFlattenedTileStrategy
+    from .tile_strategy import PerThreadNDTileStrategy
+
+    env = CompileEnvironment.current()
+    if env.backend.name != "cute":
+        return
+    codegen = state.codegen
+    active_block_ids = {
+        block for block, loops in codegen.active_device_loops.items() if loops
+    }
+    if codegen.current_grid_state is not None:
+        active_block_ids.update(codegen.current_grid_state.block_ids)
+    reduced = env.canonical_block_id(block_id)
+    unfoldable = state.device_function.cute_state.unfoldable_vec_lanes
+    for strategy in state.device_function.tile_strategy.strategies:
+        if not isinstance(
+            strategy, (PerThreadNDTileStrategy, PerThreadFlattenedTileStrategy)
+        ):
+            continue
+        for other, vec_lane_var in strategy._cute_vec_lane_var_by_block.items():
+            if other in active_block_ids and env.canonical_block_id(other) != reduced:
+                unfoldable.add(vec_lane_var)
 
 
 class ReductionStrategy(TileStrategy):
@@ -976,14 +1011,11 @@ class ReductionStrategy(TileStrategy):
         fake_output: torch.Tensor,
     ) -> str:
         backend = CompileEnvironment.current().backend
-        acc_dtype = _reduction_computation_dtype(
-            reduction_type, fake_input, fake_output
-        )
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         if backend.is_indexed_reduction(reduction_type):
-            index_var = self._indexed_reduction_index()
             return self.call_indexed_reduction(
                 input_name,
-                self.broadcast_str(index_var, fake_input, dim),
+                self.broadcast_str(self.argreduce_position_var(), fake_input, dim),
                 reduction_type,
                 dim,
                 fake_output,
@@ -996,9 +1028,6 @@ class ReductionStrategy(TileStrategy):
             block_size_var=self.block_size_var(self.block_index),
             dtype=acc_dtype,
         )
-
-    def _indexed_reduction_index(self) -> str:
-        return self.index_var(self.block_index)
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
@@ -1027,6 +1056,14 @@ class ReductionStrategy(TileStrategy):
         return backend.reduction_index_expr(
             block_size_var, dtype, block_idx, axis=self._get_thread_axis()
         )
+
+    def argreduce_position_var(self) -> str:
+        """Positions along the reduced dim, as argmin/argmax return them.
+
+        A reduction dim walks its whole extent from 0, so its index is the
+        position.
+        """
+        return self.index_var(self.block_index)
 
     def call_indexed_reduction(
         self,
@@ -1661,8 +1698,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
         )
-        # The two-stage shared reduce infers the accumulation dtype from
-        # ``type(identity)``.
+        # The two-stage shared reduce takes ``dtype`` (the accumulation dtype,
+        # ``reduction_acc_dtype``) from ``type(identity)``.
         # Upcast the (possibly fp16/bf16) masked input to that same dtype so the
         # helper's ``input if mask else identity`` selection unifies cleanly and
         # the reduction still accumulates in the wider accumulation dtype.
@@ -1906,10 +1943,8 @@ class PersistentReductionStrategy(ReductionStrategy):
             return result_var
 
         indexed = backend.is_indexed_reduction(reduction_type)
-        # The input already carries the reduction promotion (bool sum ->
-        # Int64), so non-indexed combines run in the output's dtype.
         dtype_str = _dtype_str(
-            get_computation_dtype((fake_input if indexed else fake_output).dtype)
+            reduction_acc_dtype(reduction_type, fake_input, fake_output)
         )
         identity_expr = backend.cast_expr(constant_repr(default_value), dtype_str)
         input_expr = backend.cast_expr(input_name, dtype_str)
@@ -1929,8 +1964,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         max_index = backend.cast_expr(
             repr(torch.iinfo(env.index_dtype).max), index_dtype_str
         )
-        index = self.broadcast_str(self.index_var(self.block_index), fake_input, dim)
-        candidate = f"({index}) if (({input_expr}) == ({value_var})) else ({max_index})"
+        index = self.broadcast_str(self.argreduce_position_var(), fake_input, dim)
+        candidate = argreduce_candidate_expr(index, input_expr, value_var, max_index)
         return backend.cast_expr(
             grouped_reduce(candidate, "min", max_index),
             backend.dtype_str(fake_output.dtype),
@@ -1958,16 +1993,14 @@ class PersistentReductionStrategy(ReductionStrategy):
         if isinstance(numel, sympy.Integer) and numel == 0:
             default = ir.Reduction.default_accumulator(
                 reduction_type,
-                _reduction_computation_dtype(reduction_type, fake_input, fake_output),
+                reduction_acc_dtype(reduction_type, fake_input, fake_output),
             )
             assert isinstance(default, (float, int, bool))
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
             return expr_from_string(
                 backend.full_expr(shape_dims, constant_repr(default), fake_output.dtype)
             )
-        acc_dtype = _reduction_computation_dtype(
-            reduction_type, fake_input, fake_output
-        )
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
             self._synthetic_cute_lane_var is not None
@@ -1982,15 +2015,8 @@ class PersistentReductionStrategy(ReductionStrategy):
             # warp-combine across ``threads`` -> consume) structure.
             from .tile_strategy import _lane_reduce_marker_expr
 
-            # The input already carries the reduction promotion (bool sum ->
-            # Int64), which the accumulator dtype (the identity's) must match.
-            marker_dtype = (
-                acc_dtype
-                if backend.is_indexed_reduction(reduction_type)
-                else get_computation_dtype(fake_output.dtype)
-            )
             identity_expr = backend.cast_expr(
-                constant_repr(default), _dtype_str(marker_dtype)
+                constant_repr(default), _dtype_str(acc_dtype)
             )
             group_params = self._reshape_merged_reduction_group_params()
             physical_group = self._reshape_physical_reduction_group_params(state)
@@ -2071,8 +2097,8 @@ class PersistentReductionStrategy(ReductionStrategy):
                 input_expr = backend.cast_expr(input_name, _dtype_str(acc_dtype))
                 candidate_var = self.fn.new_var("lane_reduce_index", dce=True)
                 state.add_statement(
-                    f"{candidate_var} = ({index}) if (({input_expr}) == "
-                    f"({value_var})) else ({max_index})"
+                    f"{candidate_var} = "
+                    + argreduce_candidate_expr(index, input_expr, value_var, max_index)
                 )
                 expr = backend.cast_expr(
                     marker(candidate_var, "min", max_index),
@@ -2991,9 +3017,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
             assert isinstance(device_loop, DeviceLoopState)
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
-            acc_dtype = _reduction_computation_dtype(
-                reduction_type, fake_input, fake_output
-            )
+            acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
@@ -3155,28 +3179,14 @@ class BlockReductionStrategy(ReductionStrategy):
         # instead of the newly created one from TileStrategy.__init__
         return self._codegen.index_var(block_idx)
 
-    def _indexed_reduction_index(self) -> str:
-        index = self.index_var(self.block_index)
-        env = CompileEnvironment.current()
-        if env.codegen_name == "triton":
-            block_size = self.block_size_var(self.block_index)
-            assert block_size is not None
-            return env.backend.reduction_index_expr(
-                block_size, env.index_type(), self.block_index, axis=0
-            )
-        if env.backend.name == "cute":
-            strategy = self._codegen.active_device_loops[self.block_index][-1].strategy
-            if isinstance(strategy, PerThreadFlattenedTileStrategy):
-                # Flattened offsets already include the lane, but precede
-                # applying the iteration range's begin and step.
-                offset = strategy.offset_var(self.block_index)
-                block_size = strategy.block_size_var(self.block_index)
-                return f"({offset}) % ({block_size})"
-            offset = self._codegen.offset_var(self.block_index)
-            # torch.argmin/argmax return offsets within the current tile.
-            # Memory indexing still uses the global coordinate above.
-            return f"({index}) - ({offset})"
-        return index
+    def argreduce_position_var(self) -> str:
+        # argmax over ``x[tm, tn]`` counts positions from the tile's first
+        # element, as torch does on the tile; the index holds tile.begin +
+        # position.
+        return (
+            f"(({self.index_var(self.block_index)}) - "
+            f"({self._codegen.tile_begin_var(self.block_index)}))"
+        )
 
     def _reduction_thread_count(self) -> int:
         """Return the live thread extent of the reduced tile block.
@@ -3559,9 +3569,6 @@ class BlockReductionStrategy(ReductionStrategy):
         if backend.name != "cute":
             debug("skip backend", backend.name)
             return None
-        if backend.is_indexed_reduction(reduction_type):
-            debug("skip indexed", reduction_type)
-            return None
         if self._reduction_block_is_serial():
             debug("skip serial", self.block_index)
             return None
@@ -3877,7 +3884,6 @@ class BlockReductionStrategy(ReductionStrategy):
                 f"num_threads ({num_threads}) must be divisible by "
                 f"group_span ({group_span})"
             )
-            smem_budget_bytes = _cute_shared_memory_budget_bytes()
             group_count = num_threads // group_span
             lane_var = self.fn.new_var("strided_lane", dce=True)
             lane_in_group_var = self.fn.new_var("strided_lane_in_group", dce=True)
@@ -3885,12 +3891,31 @@ class BlockReductionStrategy(ReductionStrategy):
             state.add_statement(f"{lane_var} = {lane_expr}")
             state.add_statement(f"{lane_in_group_var} = ({lane_var}) % {group_span}")
             state.add_statement(f"{lane_mod_pre_var} = ({lane_in_group_var}) % {pre}")
+        elif self._lane_reduce_cluster_n() > 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_cluster_n > 1 requires a cross-warp reduce group; "
+                "this config reduces within single warps",
+            )
+
+        def grouped_reduce(
+            value: str, combine: str, identity: str, value_dtype: torch.dtype
+        ) -> str:
+            if group_span <= 32:
+                return (
+                    "_cute_grouped_reduce_warp("
+                    f"{value}, {combine!r}, {identity}, {lane_expr}, "
+                    f"pre={pre}, group_span={group_span})"
+                )
+            smem_budget_bytes = _cute_shared_memory_budget_bytes()
             if group_span % 32 == 0:
                 warps_per_group = group_span // 32
                 partials_size = group_count * pre * warps_per_group
                 results_size = group_count * pre
                 if (
-                    _cute_reduction_smem_bytes(partials_size + results_size, acc_dtype)
+                    _cute_reduction_smem_bytes(
+                        partials_size + results_size, value_dtype
+                    )
                     > smem_budget_bytes
                 ):
                     raise exc.BackendUnsupported(
@@ -3908,10 +3933,10 @@ class BlockReductionStrategy(ReductionStrategy):
                     )
                 return self._strided_thread_reduction_expr_shared_two_stage(
                     state=state,
-                    input_name=input_expr,
-                    reduction_type=reduction_type,
-                    acc_dtype=acc_dtype,
-                    identity_expr=identity_expr,
+                    input_name=value,
+                    reduction_type=combine,
+                    acc_dtype=value_dtype,
+                    identity_expr=identity,
                     lane_var=lane_var,
                     lane_in_group_var=lane_in_group_var,
                     lane_mod_pre_var=lane_mod_pre_var,
@@ -3920,7 +3945,7 @@ class BlockReductionStrategy(ReductionStrategy):
                     group_count=group_count,
                 )
             if (
-                _cute_reduction_smem_bytes(num_threads + group_count * pre, acc_dtype)
+                _cute_reduction_smem_bytes(num_threads + group_count * pre, value_dtype)
                 > smem_budget_bytes
             ):
                 raise exc.BackendUnsupported(
@@ -3934,10 +3959,10 @@ class BlockReductionStrategy(ReductionStrategy):
                 )
             return self._strided_thread_reduction_expr_shared_tree(
                 state=state,
-                input_name=input_expr,
-                reduction_type=reduction_type,
+                input_name=value,
+                reduction_type=combine,
                 fake_input=fake_input,
-                identity_expr=identity_expr,
+                identity_expr=identity,
                 lane_var=lane_var,
                 lane_in_group_var=lane_in_group_var,
                 lane_mod_pre_var=lane_mod_pre_var,
@@ -3947,16 +3972,30 @@ class BlockReductionStrategy(ReductionStrategy):
                 group_count=group_count,
             )
 
-        if self._lane_reduce_cluster_n() > 1:
-            raise exc.BackendUnsupported(
-                "cute",
-                "cute_cluster_n > 1 requires a cross-warp reduce group; "
-                "this config reduces within single warps",
+        if not backend.is_indexed_reduction(reduction_type):
+            return grouped_reduce(input_expr, reduction_type, identity_expr, acc_dtype)
+        # argmin/argmax: the winning value, then the lowest index holding it,
+        # as the persistent strategy's grouped combine does.
+        value_var = self.fn.new_var("strided_reduce_value", dce=True)
+        state.add_statement(
+            f"{value_var} = "
+            + grouped_reduce(
+                input_expr,
+                "min" if reduction_type == "argmin" else "max",
+                identity_expr,
+                acc_dtype,
             )
-        return (
-            "_cute_grouped_reduce_warp("
-            f"{input_expr}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
-            f"pre={pre}, group_span={group_span})"
+        )
+        index_dtype = env.index_dtype
+        index_dtype_str = backend.index_type_str(index_dtype)
+        max_index = backend.cast_expr(
+            repr(torch.iinfo(index_dtype).max), index_dtype_str
+        )
+        index = self.broadcast_str(self.argreduce_position_var(), fake_input, dim)
+        candidate = argreduce_candidate_expr(index, input_expr, value_var, max_index)
+        return backend.cast_expr(
+            grouped_reduce(candidate, "min", max_index, index_dtype),
+            backend.dtype_str(torch.int64),
         )
 
     def _lane_loop_marker_expr(
@@ -3964,11 +4003,10 @@ class BlockReductionStrategy(ReductionStrategy):
         state: CodegenState,
         input_name: str,
         reduction_type: str,
-        fake_input: torch.Tensor,
+        acc_dtype: torch.dtype,
         default: float | bool,
         threads: int,
         *,
-        acc_dtype: torch.dtype,
         strided_restore: bool = False,
     ) -> str:
         """Emit the two-pass lane-reduction marker for a lane-looped block.
@@ -4041,10 +4079,10 @@ class BlockReductionStrategy(ReductionStrategy):
         state: CodegenState,
         input_name: str,
         reduction_type: str,
+        dim: int,
         fake_input: torch.Tensor,
-        default: float | bool,
-        *,
         acc_dtype: torch.dtype,
+        default: float | bool,
     ) -> str | None:
         """Two-pass marker for a block distributed by a ``DeviceLoopState``
         lane loop, or ``None`` when this reduction is not lane-looped.
@@ -4058,7 +4096,6 @@ class BlockReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         if (
             env.backend.name != "cute"
-            or env.backend.is_indexed_reduction(reduction_type)
             or not isinstance(default, (float, int, bool))
             or not self._reduction_block_in_device_lane_loop()
             or self._lane_reduce_marker_unsupported(state)
@@ -4087,15 +4124,84 @@ class BlockReductionStrategy(ReductionStrategy):
         # split is unsafe the marker is finalized per lane, which is complete
         # for lane-carry consumers, and the shares are totalled over the lanes
         # for any other lane-invariant consumer (``_restore_lane_markers``).
-        return self._lane_loop_marker_expr(
+        return self._lane_loop_reduction_expr(
             state,
             input_name,
             reduction_type,
+            dim,
             fake_input,
+            acc_dtype,
             default,
             threads,
-            acc_dtype=acc_dtype,
             strided_restore=True,
+        )
+
+    def _lane_loop_reduction_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        acc_dtype: torch.dtype,
+        default: float | bool,
+        threads: int,
+        *,
+        strided_restore: bool = False,
+    ) -> str:
+        """The lane-loop marker of a value reduction, or for argmin/argmax
+        the winning value across the lanes and then the lowest index holding
+        it, as two dependent lane reductions (as the persistent strategy's
+        synthetic lanes do)."""
+        backend = CompileEnvironment.current().backend
+        if not backend.is_indexed_reduction(reduction_type):
+            return self._lane_loop_marker_expr(
+                state,
+                input_name,
+                reduction_type,
+                acc_dtype,
+                default,
+                threads,
+                strided_restore=strided_restore,
+            )
+        index_dtype = CompileEnvironment.current().index_dtype
+        value_var = self.fn.new_var("lane_reduce_value", dce=True)
+        state.add_statement(
+            f"{value_var} = "
+            + self._lane_loop_marker_expr(
+                state,
+                input_name,
+                "min" if reduction_type == "argmin" else "max",
+                acc_dtype,
+                default,
+                threads,
+                strided_restore=strided_restore,
+            )
+        )
+        max_index = torch.iinfo(index_dtype).max
+        index = self.broadcast_str(self.argreduce_position_var(), fake_input, dim)
+        input_expr = backend.cast_expr(input_name, _dtype_str(acc_dtype))
+        # The post-pass slices each marker's input by name, so the candidate
+        # stays a plain variable.
+        candidate_var = self.fn.new_var("lane_reduce_index", dce=True)
+        max_index_expr = backend.cast_expr(
+            repr(max_index), backend.index_type_str(index_dtype)
+        )
+        state.add_statement(
+            f"{candidate_var} = "
+            + argreduce_candidate_expr(index, input_expr, value_var, max_index_expr)
+        )
+        return backend.cast_expr(
+            self._lane_loop_marker_expr(
+                state,
+                candidate_var,
+                "min",
+                index_dtype,
+                max_index,
+                threads,
+                strided_restore=strided_restore,
+            ),
+            backend.dtype_str(torch.int64),
         )
 
     def _strided_thread_reduction_expr_shared_two_stage(
@@ -4195,13 +4301,8 @@ class BlockReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         _log_cute_reduction_layout(state)
-        acc_dtype = _reduction_computation_dtype(
-            reduction_type, fake_input, fake_output
-        )
-        default = ir.Reduction.default_accumulator(
-            reduction_type,
-            acc_dtype,
-        )
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
+        default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         assert isinstance(default, (float, int, bool))
         env = CompileEnvironment.current()
         dim_size = fake_input.size(dim)
@@ -4266,15 +4367,21 @@ class BlockReductionStrategy(ReductionStrategy):
             expr = sequence_expr
         elif (
             lane_marker_expr := self._device_lane_loop_marker_expr(
-                state,
-                input_name,
-                reduction_type,
-                fake_input,
-                default,
-                acc_dtype=acc_dtype,
+                state, input_name, reduction_type, dim, fake_input, acc_dtype, default
             )
         ) is not None:
             expr = lane_marker_expr
+        elif (
+            env.backend.is_indexed_reduction(reduction_type)
+            and self._reduction_block_in_device_lane_loop()
+        ):
+            # The per-element combine below would leave each lane's own
+            # winner; only the two-pass lane marker sees every lane.
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"{reduction_type} over tile dim {self.block_index} split across "
+                "a lane loop the two-pass lane reduction cannot place",
+            )
         elif (
             strided_expr := self._strided_thread_reduction_expr(
                 state,
@@ -4302,14 +4409,15 @@ class BlockReductionStrategy(ReductionStrategy):
                 # that the ``split_lane_loop_reductions`` post-pass rewrites
                 # into a two-pass (accumulate across lanes -> combine across
                 # ``threads`` -> consume) lane structure.
-                expr = self._lane_loop_marker_expr(
+                expr = self._lane_loop_reduction_expr(
                     state,
                     input_name,
                     reduction_type,
+                    dim,
                     fake_input,
+                    acc_dtype,
                     default,
                     threads,
-                    acc_dtype=acc_dtype,
                 )
             else:
                 # A serial device loop (or no thread axis at all). A warp-level
@@ -4318,6 +4426,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 # the surrounding loop-carried accumulator performs the real
                 # reduction.
                 expr = input_name
+                if env.backend.is_indexed_reduction(reduction_type):
+                    # That one element wins at its own position, not its value.
+                    expr = env.backend.cast_expr(
+                        self.argreduce_position_var(),
+                        env.backend.dtype_str(torch.int64),
+                    )
         else:
             expr = self.call_reduction_function(
                 input_name,
