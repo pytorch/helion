@@ -286,6 +286,26 @@ def _alias_sensitive_persistent_sweeps(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _alias_sensitive_persistent_sweeps_views(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    # The device code reads host-side views; they alias exactly when the
+    # storages of the original arguments do.
+    rows, width = x.shape
+    x = x.view(rows, width)
+    y = y.view(rows, width)
+    out = torch.empty([rows], dtype=torch.float32, device=x.device)
+    for tile_rows in hl.tile(rows):
+        cols = hl.arange(width)
+        first = x[tile_rows, cols].float().sum(-1)
+        y[tile_rows, cols] = first[:, None]
+        second = (x[tile_rows, cols].float() + first[:, None]).sum(-1)
+        out[tile_rows] = first + second
+    return out
+
+
 @onlyBackends(["cute"])
 def test_seed_uses_block_ids_with_permuted_specs() -> None:
     args = (
@@ -1346,15 +1366,22 @@ def test_normal_persistent_store_requires_runtime_alignment() -> None:
     )
 
 
+@pytest.mark.parametrize("host_views", (False, True))
 @pytest.mark.parametrize("storage_relation", ("distinct", "overlap", "same"))
 @onlyBackends(["cute"])
 def test_external_tensor_runtime_alias_proof_is_cache_safe(
     monkeypatch: Any,
     storage_relation: str,
+    host_views: bool,
 ) -> None:
     from helion._compiler.device_function import DeviceFunction
 
-    _alias_sensitive_persistent_sweeps.reset()
+    kernel = (
+        _alias_sensitive_persistent_sweeps_views
+        if host_views
+        else _alias_sensitive_persistent_sweeps
+    )
+    kernel.reset()
     if storage_relation == "overlap":
         storage = torch.randn(16 * 128 + 1, dtype=torch.float32)
         x = torch.as_strided(storage, (16, 128), (128, 1))
@@ -1371,7 +1398,7 @@ def test_external_tensor_runtime_alias_proof_is_cache_safe(
         return result
 
     monkeypatch.setattr(DeviceFunction, "proven_disjoint_tensor_pairs", capture)
-    bound = _alias_sensitive_persistent_sweeps.bind((x, y))
+    bound = kernel.bind((x, y))
     host_function = bound.host_function
     assert host_function is not None
     seed = CutePersistentSubwarpRowsHeuristic.get_seed_config(

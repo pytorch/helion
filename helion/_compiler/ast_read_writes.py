@@ -17,6 +17,12 @@ HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
 # whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
 # distribution pins the atomic to their first lane when it runs inside them.
 HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
+# On a CuTe ``cute.arch.sync_threads()`` statement: the barrier ordering every
+# thread's accesses around a release / acquire atomic (``cute/atomic_ops.py``),
+# ``"release"`` before the atomic or ``"acquire"`` after it.  The lane-loop
+# distribution places it in that atomic's lane loops, as a fence of its own,
+# instead of pinning it inside every lane loop.
+HELION_FENCE_BARRIER_ATTR = "_helion_fence_barrier"
 # Set on a VecLaneWrapper's constexpr V-loop: the lane variable it is nested in.
 HELION_VEC_LANE_OF_ATTR = "_helion_vec_lane_of"
 # On a CuTe load or store call: the elements the tile program's access covers,
@@ -31,6 +37,10 @@ HELION_ACCESS_REGIONS_ATTR = "_helion_access_regions"
 # lane-loop distribution's barrier analysis does not pair two such statements
 # on those tensors at the lane level.
 HELION_LANE_ORDERED_ATTR = "_helion_lane_ordered"
+# On a CuTe ``if`` statement: its condition is the same for every thread of the
+# CTA (``cute/block_uniform.py``), so a block-wide barrier may be placed inside
+# either side.
+HELION_BLOCK_UNIFORM_ATTR = "_helion_block_uniform"
 
 # Accessing these tensor attributes only reads host-side metadata, not tensor
 # storage.  Keep counting them as ordinary reads for liveness, but identify them

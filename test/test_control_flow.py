@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
@@ -493,6 +495,56 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_tensor, expected)
         # Verify that optional_indices IS used in the tensor case
         self.assertIn("optional_indices", code_tensor.split("def fn_with_optional")[0])
+
+
+@onlyBackends(["triton", "cute"])
+class TestUniformBranchBarriers(RefEagerTestBase, TestCase):
+    @skipIfRefEager("checks the barrier placement in the generated code")
+    @skipIfTileIR("TileIR emits no tl.debug_barrier to order the racing accesses")
+    def test_uniform_branch_orders_racing_accesses(self):
+        # Inside the branch, the full-row store and the per-column update
+        # address ``out`` through different threads.  The condition (a grid
+        # tile's begin or an ``hl.grid`` index against a kernel argument) is
+        # one value per CTA, so CuTe can order them with a block-wide barrier
+        # inside the branch instead of rejecting the kernel.
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def by_tile(x: torch.Tensor, rows: int) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(m, block_size=8):
+                if tile_m.begin < rows:
+                    out[tile_m, :] = x[tile_m, :] + 1
+                    for tile_n in hl.tile(n, block_size=8):
+                        out[tile_m, tile_n] += x[tile_m, tile_n]
+            return out
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def by_grid(x: torch.Tensor, rows: int) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.zeros_like(x)
+            for i in hl.grid(m):
+                if i < rows:
+                    out[i, :] = x[i, :] + 1
+                    for tile_n in hl.tile(n, block_size=8):
+                        out[i, tile_n] += x[i, tile_n]
+            return out
+
+        x = torch.randn(32, 16, device=DEVICE)
+        expected = torch.zeros_like(x)
+        expected[:16] = 2 * x[:16] + 1
+        for kernel in (by_tile, by_grid):
+            with self.subTest(kernel=kernel.name):
+                code, result = code_and_output(kernel, (x, 16))
+                torch.testing.assert_close(result, expected)
+                if _get_backend() == "cute":
+                    self.assertTrue(
+                        any(
+                            "cute.arch.sync_threads()" in ast.unparse(node.body)
+                            for node in ast.walk(ast.parse(code))
+                            if isinstance(node, ast.If)
+                        ),
+                        code,
+                    )
 
 
 if __name__ == "__main__":

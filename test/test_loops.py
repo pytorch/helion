@@ -187,6 +187,13 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
         hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
+def _thread_barrier() -> str:
+    """The block-wide barrier the backend emits between racing accesses."""
+    if _get_backend() == "cute":
+        return "cute.arch.sync_threads()"
+    return "tl.debug_barrier()"
+
+
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
     @skipIfRefEager(
@@ -1985,8 +1992,9 @@ class TestLoops(RefEagerTestBase, TestCase):
                 self.assertTrue(rendered, f"no rendered bound in:\n{code}")
                 self.assertIn(fragment, rendered[0])
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
     )
     @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
@@ -2031,7 +2039,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 num_stages=2,
             )
             torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
-            self.assertIn("tl.debug_barrier()", code)
+            self.assertIn(_thread_barrier(), code)
 
     @skipIfRefEager("reduction rolling is a codegen-time transformation")
     @skipIfFn(
@@ -2080,9 +2088,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is Triton codegen-specific; "
-        "the negative assertion is trivially true on non-Triton backends"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier, so the negative assertion is trivial",
     )
     @skipIfSharedMemoryLessThan(
         65536, reason="block sizes exceed device shared memory limit"
@@ -2111,10 +2119,11 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, x + 1)
-        self.assertNotIn("tl.debug_barrier()", code)
+        self.assertNotIn(_thread_barrier(), code)
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
     )
     def test_intra_loop_store_then_load_barrier(self):
         """A store to a tensor followed by a load of the same tensor *within one
@@ -2150,12 +2159,12 @@ class TestLoops(RefEagerTestBase, TestCase):
                 num_warps=num_warps,
                 num_stages=2,
             )
-            self.assertIn("tl.debug_barrier()", code)
+            self.assertIn(_thread_barrier(), code)
             torch.testing.assert_close(result, expected)
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is Triton codegen-specific; "
-        "the negative assertion is trivially true on non-Triton backends"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier, so the negative assertion is trivial",
     )
     def test_intra_loop_load_before_store_no_barrier(self):
         """A load that precedes the store (read-modify-write) is not a hazard and
@@ -2178,9 +2187,12 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, x + 1.0)
-        self.assertNotIn("tl.debug_barrier()", code)
+        self.assertNotIn(_thread_barrier(), code)
 
-    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
+    )
     def test_intra_loop_barrier_tracks_storage_aliases(self):
         @helion.kernel(autotune_effort="none")
         def store_then_load_view(x: torch.Tensor) -> torch.Tensor:
@@ -2205,10 +2217,15 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=2,
         )
-        self.assertIn("tl.debug_barrier()", code)
+        self.assertIn(_thread_barrier(), code)
         torch.testing.assert_close(result, expected)
 
-    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    @skipIfNotTriton(
+        "Pallas/JAX emits no thread barrier; on CuTe `flag` may alias `x`, "
+        "which the kernel writes in place, so `if flag[0] > 0` cannot be "
+        "proven CTA-uniform and the barrier the store/reload pair needs "
+        "cannot be placed inside it (BackendUnsupported)"
+    )
     def test_intra_loop_barrier_crosses_if_subgraph(self):
         @helion.kernel(autotune_effort="none")
         def store_then_load_in_branch(
