@@ -336,7 +336,39 @@ def _cute_active_thread_layout(
         for axis, size in current_grid_state.thread_axis_sizes.items():
             axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         block_axes.update(current_grid_state.block_thread_axes)
+    # Free ``hl.arange`` dims live on synthetic thread axes outside the
+    # strategy loop states, but they are launched thread rows all the same.
+    for axis, size in cg.cute_synthetic_arange_axis_sizes.items():
+        axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
     return axis_sizes, block_axes
+
+
+def _cute_launch_layout_matches(
+    cg: CodegenInterface,
+    axis_sizes: dict[int, int],
+    *,
+    thread_axis: int,
+    group_span: int,
+) -> bool:
+    """Whether the active thread layout accounts for every launched thread.
+
+    The grouped reductions key lanes by their linear thread index.  A warp
+    group (``group_span <= 32``) only needs the axes up to the contraction axis
+    to match the launch block, but the shared-memory stages index partials by
+    ``lane // group_span`` over the whole CTA, so any launch axis the layout
+    omits (a free ``hl.arange`` row, a wider axis recorded by a sibling loop)
+    makes distinct rows share one partial slot and silently sum together.
+    """
+    launch_dims = tuple(getattr(cg, "max_thread_block_dims", ()))
+    if not launch_dims:
+        return True
+    launch = {axis: size for axis, size in enumerate(launch_dims) if size > 1}
+    active = {axis: size for axis, size in axis_sizes.items() if size > 1}
+    if group_span > 32:
+        return active == launch
+    return all(
+        active.get(axis, 1) == launch.get(axis, 1) for axis in range(thread_axis + 1)
+    )
 
 
 def _emit_cute_grouped_sum_reduction_shared_two_stage(
@@ -453,6 +485,14 @@ def _emit_cute_grouped_sum_reduction(
             "CuTe scalar matmul fallback cannot reduce a >32-thread contraction "
             "when the planned thread count exceeds the launch block",
         )
+    if not _cute_launch_layout_matches(
+        cg, axis_sizes, thread_axis=thread_axis, group_span=group_span
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback cannot reduce a multi-warp contraction "
+            "when the launch block has thread rows outside the contraction layout",
+        )
 
     identity_expr = f"{backend.dtype_str(value_dtype)}(0)"
     if group_span <= 32:
@@ -517,43 +557,84 @@ def _emit_cute_owned_product_sum(
     thread_axis = block_axes.get(k_block_id)
     if thread_axis is None and isinstance(loop_block_axes, dict):
         thread_axis = loop_block_axes.get(k_block_id)
-    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
-    pre = 1
-    for axis in range(thread_axis or 0):
-        pre *= axis_sizes.get(axis, 1)
-    group_span = pre * reduce_extent
-    group_count = 1
-    lane_expr = ""
-    if reduce_extent > 1 and (pre > 1 or reduce_extent > 32):
-        lane_expr = backend.thread_linear_index_expr(axis_sizes)
-        num_threads = 1
-        for size in axis_sizes.values():
-            num_threads *= size
-        actual_threads = 1
-        for size in getattr(cg, "max_thread_block_dims", ()):
-            actual_threads *= max(size, 1)
-        if (
-            lane_expr is None
-            or num_threads > actual_threads
-            or num_threads % group_span
-            or (group_span > 32 and group_span % 32)
-        ):
-            raise exc.BackendUnsupported(
-                "cute", "staged matmul sum has no proved physical thread group"
-            )
-        group_count = num_threads // group_span
+    reduce_extent, pre, group_span, group_count, lane_expr = (
+        _cute_lane_reduce_thread_group(
+            cg,
+            axis_sizes,
+            thread_axis,
+            subject="staged matmul sum",
+        )
+    )
+    # The grouped (shared-memory / multi-warp) reduce must see exactly the
+    # launch layout, or rows on the other thread axes collide in the
+    # two-stage buffer.
+    if group_span and not _cute_launch_layout_matches(
+        cg, axis_sizes, thread_axis=thread_axis or 0, group_span=group_span
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "staged matmul sum has no proved physical thread group"
+        )
     return _lane_reduce_marker_expr(
         input_name,
         "sum",
         f"{backend.dtype_str(value_dtype)}(0)",
         reduce_extent,
         group_pre=pre,
-        group_span=group_span if lane_expr else 0,
+        group_span=group_span,
         group_lane_expr=lane_expr,
         group_count=group_count,
         owner_lane=owner_lane,
         matmul_contribution=True,
     )
+
+
+def _cute_lane_reduce_thread_group(
+    cg: CodegenInterface,
+    axis_sizes: dict[int, int],
+    thread_axis: int | None,
+    *,
+    subject: str,
+) -> tuple[int, int, int, int, str]:
+    """Physical thread group of a ``_helion_lane_reduce`` marker whose live
+    thread axis is ``thread_axis``.
+
+    Returns ``(reduce_extent, pre, group_span, group_count, lane_expr)``.
+    ``axis_sizes`` must be the FULL launch layout (every live thread axis,
+    including the ones a persistent reduction owns): ``pre`` is the product of
+    the sibling extents below ``thread_axis``, so the finalize folds exactly
+    the threads that share this lane's sibling coordinates instead of
+    consecutive warp lanes. ``group_span`` is 0 (and ``lane_expr`` empty)
+    when a plain consecutive-lane warp reduce is already correct.  The
+    reduction-op markers over the same lane loop derive their group from the
+    same launch layout (``BlockReductionStrategy._lane_loop_group_params``),
+    so the matmul contribution's finalize folds exactly the threads the
+    reduction finalizes.
+    """
+    backend = CompileEnvironment.current().backend
+    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
+    pre = 1
+    for axis in range(thread_axis or 0):
+        pre *= axis_sizes.get(axis, 1)
+    group_span = pre * reduce_extent
+    if reduce_extent <= 1 or (pre <= 1 and reduce_extent <= 32):
+        return reduce_extent, pre, 0, 1, ""
+    lane_expr = backend.thread_linear_index_expr(axis_sizes)
+    num_threads = 1
+    for size in axis_sizes.values():
+        num_threads *= size
+    actual_threads = 1
+    for size in getattr(cg, "max_thread_block_dims", ()):
+        actual_threads *= max(size, 1)
+    if (
+        lane_expr is None
+        or num_threads > actual_threads
+        or num_threads % group_span
+        or (group_span > 32 and group_span % 32)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", f"{subject} has no proved physical thread group"
+        )
+    return reduce_extent, pre, group_span, num_threads // group_span, lane_expr
 
 
 def _emit_cute_matmul_n_collapse(

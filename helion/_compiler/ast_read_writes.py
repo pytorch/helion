@@ -17,6 +17,8 @@ HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
 # whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
 # distribution pins the atomic to their first lane when it runs inside them.
 HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
+# Set on a VecLaneWrapper's constexpr V-loop: the lane variable it is nested in.
+HELION_VEC_LANE_OF_ATTR = "_helion_vec_lane_of"
 # On a CuTe load or store call: the elements the tile program's access covers,
 # per tensor dimension, as ``(begin, end)`` SymPy bounds or None for a
 # dimension without a known interval (``language/memory_ops.py``,
