@@ -123,6 +123,20 @@ def _relu_residual_gemm(
     return out
 
 
+def _rank0_scaled_gemm(
+    a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc * scale_a[()] * scale_b[()]).to(out.dtype)
+    return out
+
+
 def _extra_root_store_after(
     a: torch.Tensor, b: torch.Tensor, other: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

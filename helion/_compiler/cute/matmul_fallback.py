@@ -10,10 +10,15 @@ from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..device_function import DeviceFunction
 from ..dtype_utils import cast_ast
+from ..generate_ast import GenerateAST
 from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
+from .matmul_utils import CuteAtomicLaneRoute
+from .matmul_utils import cute_atomic_consumer_lane_route
+from .matmul_utils import cute_per_lane_atomic_consumer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -336,7 +341,39 @@ def _cute_active_thread_layout(
         for axis, size in current_grid_state.thread_axis_sizes.items():
             axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         block_axes.update(current_grid_state.block_thread_axes)
+    # Free ``hl.arange`` dims live on synthetic thread axes outside the
+    # strategy loop states, but they are launched thread rows all the same.
+    for axis, size in cg.cute_synthetic_arange_axis_sizes.items():
+        axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
     return axis_sizes, block_axes
+
+
+def _cute_launch_layout_matches(
+    cg: CodegenInterface,
+    axis_sizes: dict[int, int],
+    *,
+    thread_axis: int,
+    group_span: int,
+) -> bool:
+    """Whether the active thread layout accounts for every launched thread.
+
+    The grouped reductions key lanes by their linear thread index.  A warp
+    group (``group_span <= 32``) only needs the axes up to the contraction axis
+    to match the launch block, but the shared-memory stages index partials by
+    ``lane // group_span`` over the whole CTA, so any launch axis the layout
+    omits (a free ``hl.arange`` row, a wider axis recorded by a sibling loop)
+    makes distinct rows share one partial slot and silently sum together.
+    """
+    launch_dims = tuple(getattr(cg, "max_thread_block_dims", ()))
+    if not launch_dims:
+        return True
+    launch = {axis: size for axis, size in enumerate(launch_dims) if size > 1}
+    active = {axis: size for axis, size in axis_sizes.items() if size > 1}
+    if group_span > 32:
+        return active == launch
+    return all(
+        active.get(axis, 1) == launch.get(axis, 1) for axis in range(thread_axis + 1)
+    )
 
 
 def _emit_cute_grouped_sum_reduction_shared_two_stage(
@@ -385,6 +422,37 @@ def _emit_cute_grouped_sum_reduction_shared_tree(
     return result_var
 
 
+def _widen_lane_layout_for_barrier_phases(
+    cg: CodegenInterface, axis_sizes: dict[int, int], *, subject: str
+) -> None:
+    """Widen a cross-lane reduce's thread layout to the ``hl.barrier()`` launch.
+
+    The phases of a barrier kernel share one launch block (the elementwise
+    max of their thread extents), so another phase may run more lanes on the
+    axes around this reduce.  Surplus lanes on the reduce axis load the
+    identity through the tile/K bounds masks, so folding them in keeps every
+    lane's result complete; surplus rows on the other axes form extra
+    (redundant) groups.  ``axis_sizes`` is widened in place on all three axes
+    so the linear lane index and group count cover the whole launch, and the
+    assumed layout is recorded under ``subject`` so the launcher
+    (``backend._multi_phase_block_dims``) rejects a final block shape that
+    differs from it on any axis.  Single-phase kernels are left alone.
+    """
+    # Unit tests drive these emitters with a bare namespace; only a real
+    # ``GenerateAST`` carries the host function whose phases matter here.
+    host_function = getattr(cg, "host_function", None)
+    if host_function is None or len(host_function.device_ir.phases) <= 1:
+        return
+    device_function = DeviceFunction.current()
+    launch_dims = device_function.tile_strategy.thread_block_dims()
+    for axis in range(3):
+        if launch_dims[axis] > axis_sizes.get(axis, 1):
+            axis_sizes[axis] = launch_dims[axis]
+    device_function.cute_state.multi_phase_lane_reduce_layouts.append(
+        (subject, {axis: axis_sizes.get(axis, 1) for axis in range(3)})
+    )
+
+
 def _emit_cute_grouped_sum_reduction(
     cg: CodegenInterface,
     input_name: str,
@@ -404,6 +472,9 @@ def _emit_cute_grouped_sum_reduction(
         thread_axis = loop_block_axes.get(k_block_id)
     if thread_axis is None:
         return input_name
+    _widen_lane_layout_for_barrier_phases(
+        cg, axis_sizes, subject="staged matmul product sum"
+    )
 
     reduce_extent = axis_sizes.get(thread_axis, 1)
     if reduce_extent <= 1:
@@ -452,6 +523,14 @@ def _emit_cute_grouped_sum_reduction(
             "cute",
             "CuTe scalar matmul fallback cannot reduce a >32-thread contraction "
             "when the planned thread count exceeds the launch block",
+        )
+    if not _cute_launch_layout_matches(
+        cg, axis_sizes, thread_axis=thread_axis, group_span=group_span
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback cannot reduce a multi-warp contraction "
+            "when the launch block has thread rows outside the contraction layout",
         )
 
     identity_expr = f"{backend.dtype_str(value_dtype)}(0)"
@@ -517,43 +596,88 @@ def _emit_cute_owned_product_sum(
     thread_axis = block_axes.get(k_block_id)
     if thread_axis is None and isinstance(loop_block_axes, dict):
         thread_axis = loop_block_axes.get(k_block_id)
-    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
-    pre = 1
-    for axis in range(thread_axis or 0):
-        pre *= axis_sizes.get(axis, 1)
-    group_span = pre * reduce_extent
-    group_count = 1
-    lane_expr = ""
-    if reduce_extent > 1 and (pre > 1 or reduce_extent > 32):
-        lane_expr = backend.thread_linear_index_expr(axis_sizes)
-        num_threads = 1
-        for size in axis_sizes.values():
-            num_threads *= size
-        actual_threads = 1
-        for size in getattr(cg, "max_thread_block_dims", ()):
-            actual_threads *= max(size, 1)
-        if (
-            lane_expr is None
-            or num_threads > actual_threads
-            or num_threads % group_span
-            or (group_span > 32 and group_span % 32)
-        ):
-            raise exc.BackendUnsupported(
-                "cute", "staged matmul sum has no proved physical thread group"
-            )
-        group_count = num_threads // group_span
+    if thread_axis is not None:
+        _widen_lane_layout_for_barrier_phases(
+            cg, axis_sizes, subject="staged matmul product sum"
+        )
+    reduce_extent, pre, group_span, group_count, lane_expr = (
+        _cute_lane_reduce_thread_group(
+            cg,
+            axis_sizes,
+            thread_axis,
+            subject="staged matmul sum",
+        )
+    )
+    # The grouped (shared-memory / multi-warp) reduce must see exactly the
+    # launch layout, or rows on the other thread axes collide in the
+    # two-stage buffer.
+    if group_span and not _cute_launch_layout_matches(
+        cg, axis_sizes, thread_axis=thread_axis or 0, group_span=group_span
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "staged matmul sum has no proved physical thread group"
+        )
     return _lane_reduce_marker_expr(
         input_name,
         "sum",
         f"{backend.dtype_str(value_dtype)}(0)",
         reduce_extent,
         group_pre=pre,
-        group_span=group_span if lane_expr else 0,
+        group_span=group_span,
         group_lane_expr=lane_expr,
         group_count=group_count,
         owner_lane=owner_lane,
         matmul_contribution=True,
     )
+
+
+def _cute_lane_reduce_thread_group(
+    cg: CodegenInterface,
+    axis_sizes: dict[int, int],
+    thread_axis: int | None,
+    *,
+    subject: str,
+) -> tuple[int, int, int, int, str]:
+    """Physical thread group of a ``_helion_lane_reduce`` marker whose live
+    thread axis is ``thread_axis``.
+
+    Returns ``(reduce_extent, pre, group_span, group_count, lane_expr)``.
+    ``axis_sizes`` must be the FULL launch layout (every live thread axis,
+    including the ones a persistent reduction owns): ``pre`` is the product of
+    the sibling extents below ``thread_axis``, so the finalize folds exactly
+    the threads that share this lane's sibling coordinates instead of
+    consecutive warp lanes. ``group_span`` is 0 (and ``lane_expr`` empty)
+    when a plain consecutive-lane warp reduce is already correct.  The
+    reduction-op markers over the same lane loop derive their group from the
+    same launch layout (``BlockReductionStrategy._lane_loop_group_params``),
+    so the matmul contribution's finalize folds exactly the threads the
+    reduction finalizes.
+    """
+    backend = CompileEnvironment.current().backend
+    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
+    pre = 1
+    for axis in range(thread_axis or 0):
+        pre *= axis_sizes.get(axis, 1)
+    group_span = pre * reduce_extent
+    if reduce_extent <= 1 or (pre <= 1 and reduce_extent <= 32):
+        return reduce_extent, pre, 0, 1, ""
+    lane_expr = backend.thread_linear_index_expr(axis_sizes)
+    num_threads = 1
+    for size in axis_sizes.values():
+        num_threads *= size
+    actual_threads = 1
+    for size in getattr(cg, "max_thread_block_dims", ()):
+        actual_threads *= max(size, 1)
+    if (
+        lane_expr is None
+        or num_threads > actual_threads
+        or num_threads % group_span
+        or (group_span > 32 and group_span % 32)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", f"{subject} has no proved physical thread group"
+        )
+    return reduce_extent, pre, group_span, num_threads // group_span, lane_expr
 
 
 def _emit_cute_matmul_n_collapse(
@@ -693,6 +817,38 @@ def _emit_cute_matmul_n_collapse(
     return result
 
 
+def _cute_k_lane_loop_is_innermost(cg: GenerateAST, loop_state: object) -> bool:
+    """Whether the K block's loop body is the innermost open statement scope.
+
+    The per-thread ``dot_acc`` running sum is zeroed one statement list up,
+    outside the K loop body and the lane loop that wraps it, and then
+    accumulates on every iteration below that point.  That equals the K
+    contraction only when nothing but the K loop and its lane loop sit between
+    the zero-init and the accumulate.  A free-axis device loop or lane loop
+    nested inside the K loop (``for lane_K: ... for tile_M: for lane_M:
+    dot_acc += ...``) would be summed as well, so such matmuls take the owned
+    product-sum marker route whose lane scheduler proves or rejects a lowering.
+
+    A device loop's body is its ``inner_statements``; the grid body is the
+    list pushed directly below the grid's ``hoist_parent_statements``.
+    """
+    from ..tile_strategy import DeviceGridState
+    from ..tile_strategy import DeviceLoopState
+
+    statements_stack = cg.statements_stack
+    if isinstance(loop_state, DeviceLoopState):
+        return statements_stack[-1] is loop_state.inner_statements
+    if isinstance(loop_state, DeviceGridState):
+        # Every grid lane loop sits between the hoist parent and the body, so
+        # a second (free-axis) lane loop would also be folded into the sum.
+        return (
+            len(statements_stack) >= 2
+            and statements_stack[-2] is loop_state.hoist_parent_statements
+            and len(loop_state.lane_loops) == 1
+        )
+    return False
+
+
 def _cute_product_uses_owned_lane_reduction(
     cg: CodegenInterface, product: ast.AST, owner_lane: str
 ) -> bool:
@@ -755,8 +911,15 @@ def _emit_cute_matmul(
     lhs_node: object = None,
     rhs_node: object = None,
     acc_node: object = None,
+    fx_node: torch.fx.Node | None = None,
 ) -> ast.AST:
-    """Build a CuTe matmul fallback using a cross-thread reduction over K."""
+    """Build a CuTe matmul fallback using a cross-thread reduction over K.
+
+    ``fx_node`` is the matmul's own device IR node.  When its K axis turns out
+    to be split across a serial lane loop, the node's consumers decide whether
+    an ``hl.atomic_*`` user may see per-lane partial sums instead of the
+    per-thread running sum (``cute_atomic_consumer_lane_route``).
+    """
     if hasattr(cg, "cute_uses_matmul"):
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
     reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
@@ -821,18 +984,43 @@ def _emit_cute_matmul(
         lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
         if not accumulate_in_lane_loop:
             lane_var = None
+        assert isinstance(cg, GenerateAST)
+        if lane_var is not None:
+            # K really is split across this lane loop, so an atomic consumer
+            # of the running sum would add every prefix of the contraction.
+            atomic_route = cute_atomic_consumer_lane_route(
+                fx_node, is_acc_none=acc is None, get_graph=cg.get_graph
+            )
+            if atomic_route is CuteAtomicLaneRoute.PER_LANE:
+                # Every K lane adds its own partial, so the atomic varies
+                # along this lane loop although its index does not cover the
+                # K block; the atomic lowering must not record it as uniform
+                # along the loop (and have the lane placement pin it to the
+                # first lane).
+                assert fx_node is not None
+                cg.device_function.cute_state.per_lane_atomic_lane_vars.setdefault(
+                    cute_per_lane_atomic_consumer(fx_node), set()
+                ).add(lane_var)
+                lane_var = None
+            elif atomic_route is CuteAtomicLaneRoute.OWNED:
+                product_lane = lane_var
+                lane_var = None
         # Keep the running sum when its inputs are independent of the owned
         # lane reductions. A reduction-fed rescale or product needs an explicit
-        # product marker and a complete staged reduction schedule.
-        if (
-            lane_var is not None
-            and acc is not None
-            and (
-                (
-                    _cute_acc_is_rescaled_loop_carried(acc_node)
-                    and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+        # product marker and a complete staged reduction schedule.  So does a K
+        # lane loop that is not the innermost open scope: the running sum would
+        # also fold the free-axis iterations nested inside it.
+        if lane_var is not None and (
+            not _cute_k_lane_loop_is_innermost(cg, loop_state)
+            or (
+                acc is not None
+                and (
+                    (
+                        _cute_acc_is_rescaled_loop_carried(acc_node)
+                        and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+                    )
+                    or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
                 )
-                or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
             )
         ):
             # Complete dependent reductions before the product sum and consume

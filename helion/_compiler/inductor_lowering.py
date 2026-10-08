@@ -53,6 +53,8 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
+from .cute.cute_reshape import REBOUND_CHECK_TARGETS
+from .cute.cute_reshape import check_pointwise_rebound_block_ids
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -1618,6 +1620,25 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
+                    # ``has_current``: test_cute_fx_replay replays ``run_node``
+                    # with no CompileEnvironment.
+                    if (
+                        CompileEnvironment.has_current()
+                        and CompileEnvironment.current().backend.name == "cute"
+                    ):
+                        # Local import: at module level, cute.repeated_block_ids
+                        # -> completed_matmul_sum -> device_ir -> ``from helion
+                        # import Config`` fails while helion/__init__ is still
+                        # importing (via language -> ... -> runtime.kernel ->
+                        # generate_ast -> this module).
+                        from .cute.repeated_block_ids import check_repeated_block_ids
+
+                        check_repeated_block_ids(self.cg, n)
+                        if (
+                            isinstance(n.meta["lowering"], PointwiseLowering)
+                            or n.target in REBOUND_CHECK_TARGETS
+                        ):
+                            check_pointwise_rebound_block_ids(self.cg, n)
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result

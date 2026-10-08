@@ -24,12 +24,14 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from .ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.scalar_recipe import PURE_DECODE_HELPERS
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -1223,6 +1225,39 @@ def _split_one_lane_loop(
             # nesting; the reason stays in its debug log.
             raise register_tile_failure
         if any(_find_lane_reduce_call(node) is not None for node in ast.walk(loop)):
+            folded = _split_lane_loop_around_vector_lane(
+                loop,
+                lane_var,
+                uniform_names,
+                proven_disjoint_tensor_pairs,
+                proven_tensor_stride_values,
+                thread_axis_names,
+                scalar_definitions,
+                rename_groups,
+                running_sums,
+            )
+            if folded is not None:
+                return folded
+            if any(
+                isinstance(node, ast.For)
+                and not _is_serial_for(node)
+                and getattr(node, HELION_LANE_LOOP_VAR_ATTR, None) is None
+                and any(_find_lane_reduce_call(s) is not None for s in node.body)
+                for node in ast.walk(loop)
+            ):
+                # A ``cutlass.range_constexpr`` vector lane (``cute_vector_widths``
+                # > 1) holds the marker and the body is outside the shape the
+                # fold above proves (a collective or a matmul contribution in
+                # the vector lane, a marker input independent of the vector
+                # element, statements after the vector lane, a memory write
+                # anywhere in the loop, a constexpr loop that is not this
+                # lane's own vector lane): its complete reduction would need
+                # the vector unroll folded together with this lane loop.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "lane reduction nested in a constexpr vector lane "
+                    "(cute_vector_widths > 1) has no proved lowering",
+                )
             raise exc.BackendUnsupported(
                 "cute",
                 "lane reduction under a guard whose thread uniformity cannot be proven",
@@ -1577,6 +1612,201 @@ def _split_one_lane_loop(
         rename_groups,
         running_sum=running_sum,
     )
+    return result
+
+
+def _vector_lane_fold_shape(
+    loop: ast.For, lane_var: str
+) -> tuple[list[ast.AST], ast.For] | None:
+    """``(prefix, vector lane)`` when every reduction marker of ``loop`` sits
+    at the top level of one trailing constexpr vector lane that
+    :func:`_split_lane_loop_around_vector_lane` can fold.
+
+    The shape is the per-element body of a lane-looped tile axis with
+    ``cute_vector_widths > 1``: ``prefix`` holds the lane base and the vector
+    loads hoisted above the ``cutlass.range_constexpr(V)`` loop (plain
+    assignments without a store, a collective or a marker), and the vector
+    lane walks the elements of each packet.  The vector lane must be the
+    wrapper loop the strategies build for ``lane_var`` (``vec_lane_{N}`` for
+    ``lane_{N}``, see ``VecLaneWrapper``); any other constexpr loop is a
+    serial unroll whose iterations the fold may not treat as lane
+    coordinates.  Every marker must be a plain reduction owned by
+    ``lane_var`` (no matmul contribution, no strided restore); the loop may
+    not hold a collective, a nested loop or a marker anywhere else, and
+    nothing may follow the vector lane.
+
+    Nothing in the loop may write memory.  The split proves its passes
+    reorder no aliasing access on the flat body, where the ``vec = lane``
+    sentinel is a definition of ``vec``: the alias expansion would rewrite a
+    packet-shifted address such as ``base + vec`` to ``lane * V + lane`` and
+    reason in the wrong iteration space, so a store in the vector lane could
+    be hoisted past a load of another lane's packet that the rolled loop
+    orders after it.  With no write, the passes only re-run loads and the
+    proof is trivially sound.
+    """
+    body: list[ast.AST] = list(loop.body)
+    if not body:
+        return None
+    vloop = body[-1]
+    if not (
+        isinstance(vloop, ast.For)
+        and _is_constexpr_lane_iter(vloop)
+        and getattr(vloop, HELION_LANE_LOOP_VAR_ATTR, None) is None
+        and isinstance(vloop.target, ast.Name)
+        and getattr(vloop, HELION_VEC_LANE_OF_ATTR, None) == lane_var
+        and not vloop.orelse
+    ):
+        return None
+    prefix = body[:-1]
+    if any(
+        not isinstance(stmt, ast.Assign)
+        or _has_side_effect(stmt)
+        or _find_lane_reduce_call(stmt) is not None
+        for stmt in prefix
+    ):
+        return None
+    if any(_has_observable_memory_write(stmt) for stmt in body):
+        return None
+    if _contains_unduplicatable_op(loop):
+        return None
+    markers = [
+        marker
+        for stmt in vloop.body
+        if (marker := _is_lane_reduce_marker_assign(stmt)) is not None
+    ]
+    if not markers or any(
+        marker.owner_lane != lane_var
+        or marker.matmul_contribution
+        or marker.strided_restore
+        for marker in markers
+    ):
+        return None
+    nested_markers = sum(
+        _is_lane_reduce_marker_assign(node) is not None for node in ast.walk(loop)
+    )
+    if nested_markers != len(markers):
+        return None
+    if any(
+        isinstance(node, (ast.For, ast.While))
+        for stmt in vloop.body
+        for node in ast.walk(stmt)
+    ):
+        return None
+    return prefix, vloop
+
+
+def _split_lane_loop_around_vector_lane(
+    loop: ast.For,
+    lane_var: str,
+    uniform_names: set[str],
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    proven_tensor_stride_values: dict[tuple[str, int], int],
+    thread_axis_names: dict[str, frozenset[int]],
+    scalar_definitions: dict[str, ast.AST],
+    rename_groups: dict[str, str],
+    running_sums: set[str] | None,
+) -> list[ast.AST] | None:
+    """Split a lane loop whose reduction markers sit in its constexpr vector lane.
+
+    ``cute_vector_widths > 1`` nests the per-element body of a lane-looped
+    tile axis in ``for vec in cutlass.range_constexpr(V)`` below the vector
+    load of each lane step, so a reduction over that axis reduces over the
+    lane steps AND the vector elements.  The vector lane is a second lane
+    coordinate rather than a serial loop: the two-pass / dependent split of
+    :func:`_split_one_lane_loop` applies unchanged to the flat body
+    ``prefix + [vec = lane] + elements``.  The sentinel assignment makes every
+    element-level value lane-varying and marks where the vector lane begins;
+    every marker input must depend on it, so each accumulate pass of the
+    split keeps the vector lane and folds all ``lanes x V`` elements.  Each
+    lane loop the split emits is re-nested at the sentinel: the prefix stays
+    per lane step and the element statements (with the accumulator updates
+    that follow them) go back under the constexpr loop, while the split's
+    lane-invariant tail already runs once outside both.  Returns ``None``
+    when the loop is outside the shape; a split decline propagates.
+    """
+    shape = _vector_lane_fold_shape(loop, lane_var)
+    if shape is None:
+        return None
+    prefix, vloop = shape
+    vec_var = cast("ast.Name", vloop.target).id
+    sentinel_index = len(prefix)
+    flat: list[ast.AST] = [
+        *prefix,
+        statement_from_string(f"{vec_var} = {lane_var}"),
+        *vloop.body,
+    ]
+    for index, stmt in enumerate(flat):
+        marker = _is_lane_reduce_marker_assign(stmt)
+        if marker is None:
+            continue
+        indices, _ = _backward_slice(flat[:index], {marker.input_name}, rename_groups)
+        if sentinel_index not in indices:
+            return None
+    lowered = _split_one_lane_loop(
+        _clone_lane_loop_with_body(loop, flat),
+        lane_var,
+        uniform_names,
+        proven_disjoint_tensor_pairs,
+        proven_tensor_stride_values,
+        thread_axis_names,
+        scalar_definitions,
+        rename_groups,
+        running_sums,
+    )
+    return _renest_vector_lane(lowered, lane_var, vloop, vec_var)
+
+
+def _renest_vector_lane(
+    statements: list[ast.AST], lane_var: str, vloop: ast.For, vec_var: str
+) -> list[ast.AST]:
+    """Move the statements after the ``vec = lane`` sentinel of every emitted
+    ``lane_var`` loop back under a copy of the constexpr vector lane."""
+
+    def is_sentinel(stmt: ast.AST) -> bool:
+        return (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == vec_var
+            and isinstance(stmt.value, ast.Name)
+            and stmt.value.id == lane_var
+        )
+
+    def renest(stmt: ast.AST) -> ast.AST:
+        for field in ("body", "orelse", "finalbody"):
+            old = getattr(stmt, field, None)
+            if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+                setattr(stmt, field, [renest(s) for s in old])
+        if (
+            isinstance(stmt, ast.For)
+            and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) == lane_var
+        ):
+            positions = [i for i, s in enumerate(stmt.body) if is_sentinel(s)]
+            if len(positions) == 1:
+                split_at = positions[0]
+                elements = stmt.body[split_at + 1 :]
+                nested: list[ast.stmt] = []
+                if elements:
+                    nested.append(
+                        create(
+                            ast.For,
+                            target=create(ast.Name, id=vec_var, ctx=ast.Store()),
+                            iter=ast.parse(ast.unparse(vloop.iter), mode="eval").body,
+                            body=elements,
+                            orelse=[],
+                            type_comment=None,
+                        )
+                    )
+                stmt.body = [*stmt.body[:split_at], *nested]
+        return stmt
+
+    result = [renest(stmt) for stmt in statements]
+    if any(is_sentinel(node) for stmt in result for node in ast.walk(stmt)):
+        raise exc.BackendUnsupported(
+            "cute",
+            "lane reduction nested in a constexpr vector lane left the vector "
+            "lane outside its lane loop",
+        )
     return result
 
 
@@ -4156,6 +4386,8 @@ def _restore_per_lane_markers(
     loop: ast.For,
     markers: list[tuple[int, _LaneReduceMarker]],
     rename_groups: Mapping[str, str] | None = None,
+    *,
+    lane_var: str | None = None,
 ) -> ast.For:
     """Keep the lane loop whole when a two-pass split is unsafe.
 
@@ -4175,10 +4407,14 @@ def _restore_per_lane_markers(
     declined here; :func:`_restore_lane_markers` totals the shares across
     the lanes for a lane-invariant tail instead.  The interchange proof removes its
     already-materialized marker consumers separately.
+
+    ``loop`` is the lane loop itself, or (``lane_var`` given) a serial loop
+    nested in the lane loop ``lane_var`` whose body holds the markers.
     """
     body = list(loop.body)
-    assert isinstance(loop.target, ast.Name)
-    lane_var = loop.target.id
+    if lane_var is None:
+        assert isinstance(loop.target, ast.Name)
+        lane_var = loop.target.id
     if any(
         marker.owner_lane is not None
         and (
@@ -4458,10 +4694,16 @@ def _lane_varying_names(
 
 def _is_serial_for(stmt: ast.AST) -> bool:
     """Return True when ``stmt`` is an ordinary serial ``for`` loop (a device
-    serial loop), NOT a per-thread lane loop."""
+    serial loop), NOT a per-thread lane loop.
+
+    A ``cutlass.range_constexpr`` unroll (the constexpr vector lane of a
+    ``cute_vector_widths`` partition) is a lane dimension as well, never a
+    serial device loop, so markers nested in it are left to the lane split.
+    """
     return (
         isinstance(stmt, ast.For)
         and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) is None
+        and not _is_constexpr_lane_iter(stmt)
     )
 
 
@@ -4627,14 +4869,13 @@ def _interchange_one_lane_loop(
         # The lane reduction inside the serial loop is not consumed by a
         # broadcast store, so the interchange does not apply. Markers nested in
         # a serial loop are not reachable by ``split_lane_loop_reductions`` (it
-        # only rewrites top-level lane loops), so restore them to their raw
-        # per-lane inputs to avoid leaving an unprocessed marker behind.
-        restored: list[ast.stmt] = [cast("ast.stmt", s) for s in mb_body]
-        for idx, m in markers:
-            restored[idx] = statement_from_string(
-                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
-            )
-        mb_loop.body = restored
+        # only rewrites top-level lane loops), so finalize them in place like
+        # an unsplittable lane loop would: a legacy unowned marker restores
+        # its raw per-lane input and a ``strided_restore`` marker whose
+        # consumers are lane carries folds it across its thread group, while
+        # any other owned marker denotes a full reduction over the lane that
+        # a raw per-lane input cannot complete and declines loudly.
+        _restore_per_lane_markers(mb_loop, markers, lane_var=lane_var)
         return [loop]
 
     # A name is lane-varying if it (transitively) depends on the lane var across
@@ -4876,7 +5117,7 @@ def _is_proven_relocatable_call(
     name = _qualified_name(call.func)
     if name is None:
         return False
-    if name in _PURE_RELOCATABLE_NAMES:
+    if name in _PURE_RELOCATABLE_NAMES or name in PURE_DECODE_HELPERS:
         return True
     if name.startswith("cutlass."):
         member = name.rsplit(".", 1)[-1]
@@ -6143,6 +6384,13 @@ class VecLaneWrapper:
     # mutable container used by the load/store hoist protocol, but splice its
     # body directly into the enclosing scope when this flag is set.
     elide_outer_loop: bool = False
+
+    def __post_init__(self) -> None:
+        # The lane reduction split tells this V-loop from any other constexpr
+        # loop in the lane body by the lane variable it is nested in.
+        lane_target = self.outer_for.target
+        assert isinstance(lane_target, ast.Name)
+        setattr(self.vloop, HELION_VEC_LANE_OF_ATTR, lane_target.id)
 
 
 def _cute_lane_coordinates(lane_var: str, wrapper: VecLaneWrapper | None) -> set[str]:
@@ -7568,6 +7816,10 @@ class BlockSizeTileStrategy(TileStrategy):
         # more elements than the tile holds. Reserve one axis per reduction
         # that actually spreads across threads; single-thread reductions
         # (thread_idx is constant 0 on their axis) may share an axis safely.
+        # The reservation is kernel-wide (it also counts reductions of other
+        # ``hl.barrier()`` phases); ``TileStrategyDispatch.thread_axis_for_strategy``
+        # mirrors it for multi-phase kernels so the launch block dims agree
+        # with the axes the body indexes.
         reduction_strategies = [
             strategy
             for strategy in self.fn.tile_strategy.strategies
@@ -9023,6 +9275,41 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return min(thread_extent, size)
         return thread_extent
 
+    def _demote_blocks_beyond_thread_axes(self, state: CodegenState) -> None:
+        """Serve blocks that would land on CUDA thread axis >= 3 with lanes.
+
+        A launch only has x/y/z thread axes. Once the enclosing loops and
+        reductions have claimed them (``_thread_axis_offset``), every further
+        block of this strategy is demoted to what ``num_threads=1`` means:
+        thread extent 1 and a single thread's lane loop walking the whole
+        tile. This only changes the thread layout, never the elements the tile
+        covers, so it is safe to decide per call site at codegen time.
+        """
+        if self.mma_mode or CompileEnvironment.current().backend.name != "cute":
+            return
+        axis = self._thread_axis_offset(state)
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            block_size = block_size_by_id[block_id]
+            if not self._uses_thread_axis_for_block(block_id, block_size):
+                continue
+            if axis < 3:
+                axis += 1
+                continue
+            size = self._configured_block_size_int(block_size)
+            if size is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"thread axis {axis}: block {block_id} needs a static block "
+                    "size to run as a lane loop",
+                )
+            self._shared_thread_extents[block_id] = 1
+            if size > 1 and block_id not in self._lane_var_by_block:
+                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            if size % vec:
+                self._cute_lane_vec_width_by_block.pop(block_id, None)
+
     def _maybe_apply_cute_cluster(
         self, env: CompileEnvironment, state: CodegenState
     ) -> None:
@@ -9282,6 +9569,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         return exprs
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        self._demote_blocks_beyond_thread_axes(state)
         if not self._lane_var_by_block and not self._shared_thread_extents:
             return super().codegen_grid(state)
 
@@ -9597,6 +9885,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        self._demote_blocks_beyond_thread_axes(state)
         if (
             not self._lane_var_by_block
             and not self._shared_thread_extents

@@ -1756,6 +1756,14 @@ class ConfigSpec:
     ) -> None:
         self._cute_tcgen05_config.rowvec_aux_facts = value
 
+    @property
+    def cute_tcgen05_matmul_operands_tma_provable(self) -> bool:
+        return self._cute_tcgen05_config.matmul_operands_tma_provable
+
+    @cute_tcgen05_matmul_operands_tma_provable.setter
+    def cute_tcgen05_matmul_operands_tma_provable(self, value: bool) -> None:
+        self._cute_tcgen05_config.matmul_operands_tma_provable = value
+
     def _cute_flash_autotune_fragments(
         self,
         topology_override: str | None = None,
@@ -4863,7 +4871,10 @@ class ConfigSpec:
                         f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
                     )
             else:
-                config["pid_type"] = VALID_PID_TYPES[0]
+                # ``allowed_pid_types`` is order-preserving and non-empty, so
+                # its head is the preferred legal choice even when ``flat``
+                # has been disallowed (``hl.barrier()``, forced persistence).
+                config["pid_type"] = self.allowed_pid_types[0]
 
         if self.supports_config_key("xcd_remap"):
             if "xcd_remap" in config:
@@ -5091,6 +5102,10 @@ class ConfigSpec:
             preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
                 config
             )
+            if "flat" not in self.allowed_pid_types:
+                # ``Config.pid_type`` falls back to ``flat`` for a missing key,
+                # so a persistent choice is not an implicit default.
+                preserve_keys = {*preserve_keys, "pid_type"}
             for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 

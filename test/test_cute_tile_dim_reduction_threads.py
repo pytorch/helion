@@ -14,6 +14,12 @@ thread kept its own column.  Such a block keeps the strided warp combine now.
 A mean over a masked tile dim divides by the tile's extent, ``min(begin +
 block, end) - begin``; a masked loop that carries no end variable has no such
 extent, and the mean is declined there rather than divided by the block.
+
+A tile beside a sibling root loop that runs more threads on its axis is
+widened to the launch: its surplus threads hold the identity and the combine
+spans them all.  Its index and mask definitions, hoisted ahead of lane loops
+it does not have, were never emitted, so the body read ``mask_1`` undefined.
+They precede the body now.
 """
 
 from __future__ import annotations
@@ -88,6 +94,21 @@ def _row_sums_after_the_column_loop(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _row_sums_beside_a_wider_tile(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two sibling root loops on one thread axis: the first reduces over a
+    128-thread column tile, the second tiles 512 rows."""
+    m, n = x.size()
+    partial = torch.empty([m], dtype=torch.float32, device=x.device)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        partial[tile_m] = x[tile_m, tile_n].sum(dim=1)
+    for tile_m in hl.tile(m):
+        out[tile_m] = y[tile_m, :].sum(-1)
+    return partial, out
+
+
 def _kernel(
     fn: Callable[..., torch.Tensor], *, static_shapes: bool = True
 ) -> helion.Kernel:
@@ -106,6 +127,13 @@ def _config(
         cute_vector_widths=[1] * len(block_sizes),
         cute_lane_layouts=["strided"] * len(block_sizes),
     )
+    return helion.Config.from_dict(config)
+
+
+def _sibling_config(bound: BoundKernel, pid_type: str) -> helion.Config:
+    """The column tile on 128 threads of axis 1 beside a 512-row tile there."""
+    config = dict(bound.config_spec.default_config().config)
+    config.update(block_sizes=[1, 128, 512], reduction_loops=[128], pid_type=pid_type)
     return helion.Config.from_dict(config)
 
 
@@ -234,6 +262,40 @@ def test_a_reduction_after_the_blocks_loop_matches_reference(
     out = bound.compile_config(config)(x)
     expected = x.sum(dim=1) if reduction == "sum" else x.sum(dim=1) / block
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.parametrize("pid_type", ["flat", "persistent_blocked"])
+def test_a_tile_reduction_beside_a_wider_sibling_defines_its_indices(
+    pid_type: str,
+) -> None:
+    """The 128-thread column tile runs on the sibling's 512-thread launch, so its load is masked to the tile's threads and the combine spans the launch; the index and mask definitions were parked in the grid's prefix and never emitted (``NameError: name 'mask_1' is not defined``)."""
+    with _cpu_codegen():
+        bound = _cpu_bind(
+            _kernel(_row_sums_beside_a_wider_tile),
+            (torch.randn(64, 128), torch.randn(64, 1024)),
+        )
+        code = bound.to_code(_sibling_config(bound, pid_type))
+    body = _kernel_body(code)
+    assert "mask_1 = cutlass.Int32(cute.arch.thread_idx()[1]) < 128" in body, code
+    assert "group_span=512" in body, code
+    (load,) = [line for line in body.splitlines() if "if mask_1 else" in line]
+    for name in ("indices_0", "indices_1"):
+        assert f"cutlass.Int32({name})" in load, code
+        assert body.index(f"{name} = ") < body.index(load), code
+    assert body.index("mask_1 = ") < body.index(load), code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("pid_type", ["flat", "persistent_blocked"])
+def test_a_tile_reduction_beside_a_wider_sibling_matches_reference(
+    pid_type: str,
+) -> None:
+    x = torch.randn(64, 128, device=DEVICE)
+    y = torch.randn(64, 1024, device=DEVICE)
+    bound = _kernel(_row_sums_beside_a_wider_tile).bind((x, y))
+    partial, out = bound.compile_config(_sibling_config(bound, pid_type))(x, y)
+    torch.testing.assert_close(partial, x.sum(dim=1), rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(out, y.sum(dim=1), rtol=1e-4, atol=1e-3)
 
 
 def test_a_mean_in_a_masked_loop_without_an_end_variable_is_declined() -> None:

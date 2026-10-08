@@ -79,6 +79,10 @@ def tile_loop_thread_count(
                 extent = threads if threads > 0 else size
                 if extent > 1:
                     extents.append(extent)
+        # A launch has three thread axes; tiles beyond them run as single
+        # thread lane loops (``PerThreadNDTileStrategy`` demotes them) and
+        # add no threads.
+        del extents[3:]
         for axis, extent in enumerate(extents):
             if axis == len(launch_extents):
                 launch_extents.append(extent)

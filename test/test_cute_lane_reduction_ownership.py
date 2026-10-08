@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 from itertools import accumulate
+import math
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
 from examples.layer_norm import layer_norm_bwd
+from examples.welford import welford
 import numpy as np
 import pytest
 import torch
@@ -16,11 +18,19 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_interchanged_store_dce import _PAIRS
 from test.test_cute_interchanged_store_dce import _execute as _execute_interchange
 from test.test_cute_interchanged_store_dce import _program
+from test.test_cute_sibling_layout_safety import _config
 
 import helion
+from helion._compiler import reduction_strategy as reductions
 from helion._compiler import tile_strategy as lanes
+from helion._compiler.ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from helion._compiler.ast_read_writes import ast_rename
+from helion._testing import DEVICE
+from helion._testing import TestCase
+from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 
 def _marker(owner: str | None, value: str = "partial") -> str:
@@ -31,6 +41,20 @@ def _marker(owner: str | None, value: str = "partial") -> str:
 
 def _source(body: list[ast.AST]) -> str:
     return ast.unparse(ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[]))
+
+
+def _stamped(body: list[ast.AST], lane_var: str = "lane") -> list[ast.AST]:
+    """Mark ``for vec_lane in cutlass.range_constexpr(V)`` loops as ``lane_var``'s
+    vector lane, as ``VecLaneWrapper`` does for the loops the strategies build."""
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "vec_lane"
+            ):
+                setattr(node, HELION_VEC_LANE_OF_ATTR, lane_var)
+    return body
 
 
 def _body(source: str) -> list[ast.AST]:
@@ -1324,3 +1348,607 @@ def test_a_second_marker_input_reading_the_first_result_stays_declined() -> None
             _ROW_SUMS_RENAMES,
             _TWO_TENSORS_DISJOINT,
         )
+
+
+def _online_softmax_mm(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Attention-style online softmax: two carried row vectors (``m_i``,
+    ``l_i``) plus a matmul accumulator, with the key tile reduced by
+    ``amax`` / ``sum`` and contracted by the ``p @ v`` product."""
+    b, m_dim, d = q.size()
+    n = k.size(1)
+    out = torch.empty_like(q)
+    for tile_b, tile_m in hl.tile([b, m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, d], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            qk = torch.bmm(q[tile_b, tile_m, :], k[tile_b, tile_n, :].transpose(1, 2))
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            p = torch.exp2(qk - m_ij[:, :, None])
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            acc = torch.baddbmm(acc, p.to(v.dtype), v[tile_b, tile_n, :])
+            m_i = m_ij
+        out[tile_b, tile_m, :] = (acc / l_i[:, :, None]).to(out.dtype)
+    return out
+
+
+def _online_softmax_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    scores = torch.bmm(q.float(), k.float().transpose(1, 2))
+    # ``exp2(x) == exp(x * ln 2)``
+    probabilities = torch.softmax(scores * math.log(2.0), dim=-1)
+    return torch.bmm(probabilities, v.float()).to(q.dtype)
+
+
+def _online_softmax_kernel() -> helion.Kernel:
+    return helion.kernel(
+        _online_softmax_mm,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+
+
+# ``block_sizes=[1, 16, 16]`` is the default config of the attention examples:
+# the head_dim matmul reduction owns 64 threads on axis 0 (a persistent
+# reduction state), ``tile_m`` 2 threads on axis 1 and ``tile_n`` 4 threads on
+# axis 2 times a 4-iteration per-thread lane loop. The key-tile reductions are
+# therefore lane-strided AND have a live thread axis whose lanes sit 128
+# threads apart.
+_ONLINE_SOFTMAX_BLOCKS = [1, 16, 16]
+
+
+def _emitted_tile_reduction_markers(
+    monkeypatch: pytest.MonkeyPatch, config: helion.Config
+) -> tuple[str, list[lanes._LaneReduceMarker]]:
+    """CPU-only codegen of the online-softmax kernel; capture every lane
+    reduction marker ``BlockReductionStrategy`` emits and return the code."""
+    captured: list[str] = []
+    original = reductions.BlockReductionStrategy._lane_loop_marker_expr
+
+    def capture(
+        self: reductions.BlockReductionStrategy, *args: object, **kwargs: object
+    ) -> str:
+        expression = original(self, *args, **kwargs)  # pyrefly: ignore [bad-argument-type]
+        captured.append(expression)
+        return expression
+
+    monkeypatch.setattr(
+        reductions.BlockReductionStrategy, "_lane_loop_marker_expr", capture
+    )
+    q = torch.empty((4, 256, 64), dtype=torch.bfloat16)
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(_online_softmax_kernel(), (q, q, q))
+        code = bound.to_code(config)
+    markers = []
+    for expression in captured:
+        marker = lanes._is_lane_reduce_marker_assign(
+            ast.parse(f"reduced = {expression}").body[0]
+        )
+        assert marker is not None
+        markers.append(marker)
+    return code, markers
+
+
+@skipUnlessBackends(["cute"])
+def test_lane_looped_tile_reduction_marker_uses_full_launch_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lane-looped tile block with a live thread axis must emit the two-pass
+    marker (not a thread-only strided reduce), and the marker's physical group
+    must come from the full launch layout: ``pre`` counts the 64 persistent
+    reduction threads on axis 0 times the 2 ``tile_m`` threads on axis 1, so
+    the finalize folds the 4 ``tile_n`` threads that are 128 lanes apart."""
+    code, markers = _emitted_tile_reduction_markers(
+        monkeypatch, helion.Config(block_sizes=_ONLINE_SOFTMAX_BLOCKS)
+    )
+    assert [marker.reduction_type for marker in markers] == ["max", "sum"]
+    owners = {marker.owner_lane for marker in markers}
+    assert len(owners) == 1 and next(iter(owners))
+    for marker in markers:
+        assert (
+            marker.threads_in_group,
+            marker.group_pre,
+            marker.group_span,
+            marker.group_count,
+        ) == (4, 128, 512, 1)
+        # Linear thread index over all three launch axes: axis 1 strides by
+        # the 64 persistent threads, axis 2 by 64 * 2.
+        assert "cute.arch.thread_idx()[0]" in marker.group_lane_expr
+        assert "thread_idx()[1])) * cutlass.Int32(64)" in marker.group_lane_expr
+        assert "thread_idx()[2])) * cutlass.Int32(128)" in marker.group_lane_expr
+    # The post-pass finalized both markers with the cross-warp grouped reduce
+    # of that physical group; no thread-only partial reduce survives.
+    assert "_helion_lane_reduce" not in code
+    assert code.count("pre=128, group_span=512, group_count=1") >= 2
+    assert "_cute_grouped_reduce_warp(" not in code
+
+
+@skipUnlessBackends(["cute"])
+def test_vectorized_lane_tile_reduction_declines_before_emission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cute_vector_widths > 1`` on the reduced key tile nests the per-element
+    body in a constexpr vector lane. The ``amax`` / ``sum`` keep the legacy
+    single-pass flow (V-folded by ``hoist_warp_reduce``), but the owned
+    ``p @ v`` contribution marker sits inside the vector lane where it used to
+    be silently restored to its raw per-lane input (25% wrong attention
+    output); it must decline instead."""
+    with pytest.raises(helion.exc.BackendUnsupported, match="constexpr vector lane"):
+        _emitted_tile_reduction_markers(
+            monkeypatch,
+            helion.Config(
+                block_sizes=_ONLINE_SOFTMAX_BLOCKS, cute_vector_widths=[1, 1, 1, 4]
+            ),
+        )
+
+
+def test_constexpr_vector_lane_is_not_a_serial_interchange_loop() -> None:
+    """The interchange pass must not treat a ``cutlass.range_constexpr``
+    unroll as a serial device loop: an owned marker nested in it is left to
+    the lane split, which folds the vector lane into its accumulate pass
+    (all ``lanes x V`` elements, one warp combine, the carried update once)
+    instead of restoring the raw input."""
+    vector_loop = ast.parse(
+        f"for vec_lane in cutlass.range_constexpr(4):\n"
+        f"    partial = lane + vec_lane\n"
+        f"    reduced = {_marker('lane')}\n"
+        f"    carried = carried + reduced"
+    ).body[0]
+    _stamped([vector_loop])
+    assert not lanes._is_serial_for(vector_loop)
+    loop = lanes._create_lane_loop("lane", 2, [vector_loop])
+    unchanged = lanes.interchange_lane_outside_serial_reductions([loop])
+    assert "_helion_lane_reduce" in _source(unchanged)
+    lowered = lanes.split_lane_loop_reductions(unchanged)
+    assert [ast.unparse(stmt) for stmt in lowered] == [
+        "reduced_lane_acc = cutlass.Float32(0)",
+        (
+            "for lane in range(2):\n"
+            "    for vec_lane in cutlass.range_constexpr(4):\n"
+            "        partial = lane + vec_lane\n"
+            "        reduced_lane_acc = reduced_lane_acc + cutlass.Float32(partial)"
+        ),
+        "reduced = cute.arch.warp_reduction_sum(reduced_lane_acc, threads_in_group=32)",
+        "carried = carried + reduced",
+    ]
+
+
+def _vector_lane_marker(value: str) -> str:
+    return lanes._lane_reduce_marker_expr(
+        value, "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+
+
+def test_vector_lane_markers_fold_into_the_lane_split() -> None:
+    """A lane loop whose markers sit in its constexpr vector lane (the
+    per-element body of a ``cute_vector_widths > 1`` tile axis below the
+    vector load of each lane step, named ``vec_<lane>`` by the strategies) is
+    split as the flat lane loop over the lane prefix plus the vector elements,
+    and every emitted pass re-nests the vector lane: welford's chunk sum and
+    its dependent centered sum reduce over all ``lanes x V`` elements, the
+    prefix stays per lane step and the lane-invariant carried updates run
+    once.  The fold admits no memory write, so the passes are the accumulate
+    passes alone and the results leave the loop through the carries."""
+    text = (
+        "base = lane * 4\n"
+        "packet = base + 1\n"
+        "for vec_lane in cutlass.range_constexpr(4):\n"
+        "    count_copy = count\n"
+        "    m2_copy = m2_total\n"
+        "    element = packet + vec_lane\n"
+        f"    total = {_vector_lane_marker('element')}\n"
+        "    mean = total / 8\n"
+        "    centered = element - mean\n"
+        "    squared = centered * centered\n"
+        f"    m2 = {_vector_lane_marker('squared')}\n"
+        "    next_count = count_copy + total\n"
+        "    next_m2_total = m2_copy + m2\n"
+    )
+    renames = {
+        "next_count": "count",
+        "count": "count",
+        "next_m2_total": "m2_total",
+        "m2_total": "m2_total",
+    }
+    lowered = lanes.split_lane_loop_reductions(
+        [
+            *_body("count = 0.0\nm2_total = 0.0"),
+            lanes._create_lane_loop("lane", 2, _stamped(_body(text))),
+            *_body("late_out.store(count)\n(late_out.iterator + 1).store(m2_total)"),
+        ],
+        rename_groups=renames,
+    )
+    code = _source(lowered)
+    assert "_helion_lane_reduce" not in code
+    assert "vec_lane = lane" not in code
+    lane_loops = [stmt for stmt in lowered if isinstance(stmt, ast.For)]
+    # One accumulate pass per dependency level; nothing is left for a
+    # consume pass.
+    assert len(lane_loops) == 2
+    for lane_loop in lane_loops:
+        assert ast.unparse(lane_loop.body[0]) == "base = lane * 4"
+        vector_lane = lane_loop.body[-1]
+        assert isinstance(vector_lane, ast.For)
+        assert ast.unparse(vector_lane.target) == "vec_lane"
+        assert ast.unparse(vector_lane.iter) == "cutlass.range_constexpr(4)"
+    assert "total_lane_acc = total_lane_acc + cutlass.Float32(element)" in code
+    assert "m2_lane_acc = m2_lane_acc + cutlass.Float32(squared)" in code
+    assert code.count("next_count = count_copy + total") == 1
+    assert code.count("next_m2_total = m2_copy + m2") == 1
+    values, calls = _execute_scalars(lowered, renames)
+    elements = [lane * 4 + 1 + vec for lane in range(2) for vec in range(4)]
+    total = float(sum(elements))
+    mean = total / 8
+    m2 = sum((element - mean) ** 2 for element in elements)
+    assert values["late_out"] == {0: total, 1: m2}
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            f"    total = {_vector_lane_marker('base')}\n"
+            "    scaled = base * total\n",
+            id="input-independent-of-the-element",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = base + vec_lane\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    flushed = element - total\n"
+            "(out.iterator + lane).store(flushed)\n",
+            id="store-flush-after-the-vector-lane",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = _cute_grouped_reduce_shared_two_stage("
+            "cutlass.Float32(base + vec_lane), 'sum', cutlass.Float32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+            "pre=1, group_span=64, group_count=1)\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    scaled = element * total\n",
+            id="collective-in-the-vector-lane",
+        ),
+        pytest.param(
+            # Lane 1 loads the packet lane 0 stores; the rolled loop orders
+            # lane 0's store first, a fold would run every lane's loads first.
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = (x.iterator + base + vec_lane).load()\n"
+            "    previous = (x.iterator + base + vec_lane - 4).load()\n"
+            "    summed = element + previous\n"
+            f"    total = {_vector_lane_marker('summed')}\n"
+            "    (x.iterator + base + vec_lane).store(element * total)\n",
+            id="aliasing-store-in-the-vector-lane",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = base + vec_lane\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    packet[vec_lane] = element - total\n",
+            id="fragment-write-in-the-vector-lane",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for step in cutlass.range_constexpr(4):\n"
+            "    element = base + step\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    scaled = element * total\n",
+            id="foreign-constexpr-loop",
+        ),
+    ],
+)
+def test_vector_lane_markers_outside_the_fold_shape_decline(text: str) -> None:
+    """The fold admits only the per-element shape it proves: every marker
+    input depends on the vector element (the original body reduces a
+    per-lane-step value V times), nothing follows the vector lane (a vector
+    store flush reads values of every element), no collective sits in it (the
+    passes re-run the element producers), nothing in the loop writes memory
+    (the alias proof runs on the flat body, where the ``vec_lane = lane``
+    sentinel makes it read a packet-shifted address in the wrong iteration
+    space: the scalar analog of the aliasing shape declines as a reordered
+    aliasing write) and the constexpr loop is this lane's own ``vec_lane``
+    wrapper (any other constexpr loop is a serial unroll)."""
+    loop = lanes._create_lane_loop("lane", 4, _stamped(_body(text)))
+    with pytest.raises(helion.exc.BackendUnsupported, match="constexpr vector lane"):
+        lanes.split_lane_loop_reductions([loop])
+
+
+def test_owned_marker_in_serial_loop_without_store_declines() -> None:
+    """An owned marker inside a genuine serial loop that no broadcast store
+    consumes has no interchange; its raw per-lane input is not a complete
+    reduction, so the pass declines rather than restoring it."""
+    serial_loop = ast.parse(
+        f"for mb in range(0, 64, 8):\n"
+        f"    partial = lane + mb\n"
+        f"    reduced = {_marker('lane')}\n"
+        f"    carried = carried + reduced"
+    ).body[0]
+    assert lanes._is_serial_for(serial_loop)
+    loop = lanes._create_lane_loop("lane", 8, [serial_loop])
+    with pytest.raises(helion.exc.BackendUnsupported, match="no proved complete"):
+        lanes.interchange_lane_outside_serial_reductions([loop])
+    legacy_loop = lanes._create_lane_loop(
+        "lane",
+        8,
+        [
+            ast.parse(
+                f"for mb in range(0, 64, 8):\n"
+                f"    partial = lane + mb\n"
+                f"    reduced = {_marker(None)}\n"
+                f"    carried = carried + reduced"
+            ).body[0]
+        ],
+    )
+    restored = _source(lanes.interchange_lane_outside_serial_reductions([legacy_loop]))
+    assert "reduced = partial" in restored and "_helion_lane_reduce" not in restored
+
+
+@onlyBackends(["cute"])
+class TestLaneLoopedTileReductionNumerics(TestCase):
+    def _inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        return tuple(  # pyrefly: ignore [bad-return]
+            torch.randn(4, 256, 64, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+
+    def test_online_softmax_default_attention_config(self) -> None:
+        args = self._inputs()
+        code, out = code_and_output(
+            _online_softmax_kernel(), args, block_sizes=_ONLINE_SOFTMAX_BLOCKS
+        )
+        torch.testing.assert_close(
+            out.float(), _online_softmax_reference(*args).float(), rtol=1e-1, atol=1e-1
+        )
+        self.assertNotIn("_helion_lane_reduce", code)
+        self.assertIn("pre=128, group_span=512, group_count=1", code)
+
+    def test_welford_vector_lane_fold_with_padded_columns(self) -> None:
+        """welford's scalar-stats sibling layout nests the chunk count, sum
+        and dependent centered sum in the constexpr vector lane of its
+        128-wide column tile (one thread, 32 lane steps of 4 elements).  The
+        fold reduces all 128 elements of a chunk; the raw per-element restore
+        this shape used to get (one element per Welford merge) only matched
+        for fully valid rows and divided by a zero count on the 48 padded
+        columns of an 80-column row."""
+        torch.manual_seed(0)
+        columns = 80
+        weight = torch.rand(columns, device=DEVICE, dtype=torch.float32)
+        bias = torch.rand(columns, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(17, columns, device=DEVICE, dtype=torch.float32)
+        kernel = helion.kernel(
+            welford.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        )
+        bound = kernel.bind((weight, bias, x))
+        config = _config("scalar_stats")
+        code = bound.to_code(config)
+        out = bound.compile_config(config)(weight, bias, x)
+        expected = torch.nn.functional.layer_norm(x, (columns,), weight, bias, eps=1e-5)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        self.assertNotIn("_helion_lane_reduce", code)
+        self.assertIn("for vec_lane_1 in cutlass.range_constexpr(4):", code)
+        self.assertIn("sum_2_lane_acc = sum_2_lane_acc + cutlass.Float32(chunk)", code)
+        self.assertIn(
+            "m2_c_lane_acc = m2_c_lane_acc + cutlass.Float32(_mask_to_2)", code
+        )
+
+    def test_online_softmax_vectorized_key_tile_declines(self) -> None:
+        """The GPU bind takes the same decline the CPU-only
+        ``test_vectorized_lane_tile_reduction_declines_before_emission`` pins:
+        the owned ``p @ v`` contribution marker sits inside the constexpr
+        vector lane, which has no proved two-pass lowering."""
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "constexpr vector lane"
+        ):
+            code_and_output(
+                _online_softmax_kernel(),
+                self._inputs(),
+                block_sizes=_ONLINE_SOFTMAX_BLOCKS,
+                cute_vector_widths=[1, 1, 1, 4],
+            )
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
+    observed: bool,
+) -> None:
+    marker = lanes._lane_reduce_marker_expr(
+        "row_sums", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    # The inner serial loop updates ``row_sums`` through the SSA alias
+    # ``next_row_sums`` that only the final rename pass restores
+    # (jagged_layer_norm's per-feature row sums).
+    text = (
+        "total_copy = total\n"
+        "row_sums = 0.0\n"
+        "for step in range(3):\n"
+        "    row_sums_copy = row_sums\n"
+        "    next_row_sums = row_sums_copy + (lane + 1)\n"
+        f"reduced = {marker}\n"
+        "next_total = total_copy + reduced\n"
+    )
+    if observed:
+        text += "(out.iterator + lane).store(row_sums + reduced)\n"
+    renames = {
+        "next_row_sums": "row_sums",
+        "row_sums": "row_sums",
+        "next_total": "total",
+        "total": "total",
+    }
+
+    def make() -> list[ast.AST]:
+        return [
+            *_body("total = 6.0"),
+            lanes._create_lane_loop("lane", 8, _body(text)),
+            *_body("late_out.store(total)"),
+        ]
+
+    # Without the recorded alias the update loop is an unproved producer.
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="complete per-lane restore"
+    ):
+        lanes.split_lane_loop_reductions(make())
+    lowered = lanes.split_lane_loop_reductions(make(), rename_groups=renames)
+    code = _source(lowered)
+    assert "_helion_lane_reduce" not in code
+    assert code.count("next_total = total_copy + reduced") == 1
+    values, calls = _execute_scalars(lowered, renames)
+    # Each lane accumulates 3 * (lane + 1); the complete lane sum is 108.
+    assert values["late_out"] == {0: 114.0} and calls == 0
+    if observed:
+        # The per-lane row sum stays lane-varying after the alias is restored.
+        assert values["out"] == {lane: float(3 * (lane + 1) + 108) for lane in range(8)}
+
+
+def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
+    first = lanes._lane_reduce_marker_expr(
+        "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    second = lanes._lane_reduce_marker_expr(
+        "centered", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    # ``acc`` is re-derived by a collective under an SSA alias and feeds a
+    # chain of dependent reductions whose result updates a carried scalar, so
+    # neither the stash nor the dependent split may re-run the producer.
+    loop = lanes._create_lane_loop(
+        "lane",
+        8,
+        _body(
+            "total_copy = total\n"
+            "acc = 0.0\n"
+            "for step in range(2):\n"
+            "    acc_copy = acc\n"
+            "    partial = _cute_grouped_reduce_shared_two_stage("
+            "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+            "pre=1, group_span=64, group_count=1)\n"
+            "    next_acc = acc_copy + partial\n"
+            f"reduced = {first}\n"
+            "centered = acc - reduced\n"
+            f"reduced_again = {second}\n"
+            "next_total = total_copy + reduced_again\n"
+            "(out.iterator + lane).store(centered + reduced_again)"
+        ),
+    )
+    renames = {
+        "next_acc": "acc",
+        "acc": "acc",
+        "next_total": "total",
+        "total": "total",
+    }
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="complete per-lane restore"
+    ):
+        lanes.split_lane_loop_reductions(
+            [*_body("total = 6.0"), loop, *_body("late_out.store(total)")],
+            rename_groups=renames,
+        )
+
+
+@pytest.mark.parametrize("extent", [8, 512])
+def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> None:
+    marker = lanes._lane_reduce_marker_expr(
+        "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    # matmul_layernorm's shape: a collective K loop re-derives the per-lane
+    # ``acc`` that the reduction over the lane axis consumes.
+    loop = lanes._create_lane_loop(
+        "lane",
+        extent,
+        _body(
+            "acc = 0.0\n"
+            "for step in range(2):\n"
+            "    acc_copy = acc\n"
+            "    partial = _cute_grouped_reduce_shared_two_stage("
+            "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+            "pre=1, group_span=64, group_count=1)\n"
+            "    acc_1 = acc_copy + partial\n"
+            f"reduced = {marker}\n"
+            "centered = acc - reduced\n"
+            "(out.iterator + lane).store(centered)"
+        ),
+    )
+    renames = {"acc_1": "acc", "acc": "acc"}
+    if extent > 256:
+        # Each lane's live-out value needs one register slot per lane, so the
+        # stash does not apply and no other path lowers this shape.
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="complete per-lane restore"
+        ):
+            lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+        return
+    lowered = lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+    values, calls = _execute_scalars(lowered, renames)
+    # The collective runs once per lane and K step, in the stash pass only.
+    assert calls == 2 * extent
+    reduced = 128.0 * sum(range(1, extent + 1))
+    assert values["out"] == {
+        lane: 128.0 * (lane + 1) - reduced for lane in range(extent)
+    }
+
+
+@pytest.mark.parametrize("feeds_reduction", [False, True])
+def test_collective_outside_the_reduction_slice_runs_once_per_lane(
+    feeds_reduction: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = lanes._lane_reduce_marker_expr(
+        "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    collective = (
+        "_cute_grouped_reduce_shared_two_stage("
+        "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+        "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+        "pre=1, group_span=64, group_count=1)"
+    )
+    # rms_norm_bwd's resident-row seed: the grad_weight sum over the row lanes
+    # is independent of the per-row thread-group mean consumed by the grad_x
+    # store, so the two-pass split runs that collective once per lane in the
+    # consume pass exactly as the original loop did.  Only a collective that
+    # feeds the reduction AND a live lane-varying consumer would run in both
+    # passes; once the register stash has declined, that shape must decline.
+    if feeds_reduction:
+        text = f"partial = {collective}\nreduced = {marker}\nrow_mean = partial\n"
+    else:
+        text = f"partial = lane + 1\nreduced = {marker}\nrow_mean = {collective}\n"
+    text += "(out.iterator + lane).store(row_mean + reduced)"
+    loop = lanes._create_lane_loop("lane", 8, _body(text))
+    monkeypatch.setattr(lanes, "_split_lane_loop_with_register_stash", lambda *_: None)
+    if feeds_reduction:
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="complete per-lane restore"
+        ):
+            lanes.split_lane_loop_reductions([loop])
+        return
+    lowered = lanes.split_lane_loop_reductions([loop])
+    code = _source(lowered)
+    assert "_helion_lane_reduce" not in code
+    assert code.count("_cute_grouped_reduce_shared_two_stage(") == 1
+    # The collective follows the finalized reduction (in the consume loop).
+    assert code.index("_cute_grouped_reduce_shared_two_stage(") > code.index(
+        "reduced = "
+    )
+    values, calls = _execute_scalars(lowered)
+    assert calls == 8
+    assert values["out"] == {lane: float(64 * (lane + 1) + 36) for lane in range(8)}

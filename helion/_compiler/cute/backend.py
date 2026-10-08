@@ -36,6 +36,9 @@ from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from .thread_budget import MAX_THREADS_PER_BLOCK
+from .thread_budget import check_thread_block_dims
+from .thread_budget import check_thread_limit
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -244,6 +247,100 @@ def _thread_axes_read_outside_leader_guards(statements: Sequence[ast.AST]) -> se
             if axis is not None and id(node) not in guards:
                 axes.add(axis)
     return axes
+
+
+def _multi_phase_block_dims(
+    device_function: DeviceFunction,
+    *,
+    exact_grid_thread_dims: tuple[int, ...],
+) -> tuple[int, int, int]:
+    """Launch block dims for an ``hl.barrier()`` (multi-phase) kernel.
+
+    All phases run inside one persistent CTA, so the launch is the elementwise
+    max of the thread extents the phase bodies recorded.  A phase with fewer
+    lanes on an axis then runs with surplus threads: tile axes mask them, but
+    a cross-lane reduction over that axis would either fold the surplus lanes
+    in or leave them racing on the result, so any reduced axis whose
+    phase-local extent differs from the launch is rejected loudly instead of
+    silently computing garbage.
+    """
+    # Local imports: these modules import ``compile_environment``, which
+    # reaches this module back through ``backend_registry`` -> ``..backend``
+    # before ``CompileEnvironment`` exists.
+    from ..inductor_lowering import ReductionLowering
+    from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
+
+    codegen = device_function.codegen
+    tile_strategy = device_function.tile_strategy
+    dims = (
+        max(
+            codegen.max_thread_block_dims[0],
+            codegen.root_thread_block_dims[0],
+            codegen.referenced_thread_block_dims[0],
+            exact_grid_thread_dims[0],
+        ),
+        max(
+            codegen.max_thread_block_dims[1],
+            codegen.root_thread_block_dims[1],
+            codegen.referenced_thread_block_dims[1],
+            exact_grid_thread_dims[1],
+        ),
+        max(
+            codegen.max_thread_block_dims[2],
+            codegen.root_thread_block_dims[2],
+            codegen.referenced_thread_block_dims[2],
+            exact_grid_thread_dims[2],
+        ),
+    )
+    if functools.reduce(operator.mul, dims, 1) > MAX_THREADS_PER_BLOCK:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"hl.barrier() phases need a combined launch block of {dims} "
+            f"threads, exceeding {MAX_THREADS_PER_BLOCK}",
+        )
+
+    def reject(axis: int, extent: int, what: str) -> None:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{what} spans {extent} lanes on thread axis {axis} but the "
+            f"hl.barrier() launch {dims} runs {dims[axis]} there; the surplus "
+            "lanes of another phase would corrupt the cross-lane reduction",
+        )
+
+    reduced_block_ids = {
+        lowering.block_index
+        for graph in codegen.codegen_graphs
+        for node in graph.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+    }
+    for strategy in tile_strategy.strategies:
+        base_axis = tile_strategy.thread_axis_for_strategy(strategy)
+        if base_axis is None:
+            continue
+        if isinstance(strategy, ReductionStrategy):
+            count = strategy._reduction_thread_count()
+            if count > 1 and base_axis < 3 and dims[base_axis] != count:
+                reject(base_axis, count, f"reduction block {strategy.block_index}")
+            continue
+        for (
+            block_id,
+            local_axis,
+            size,
+            _expr,
+        ) in tile_strategy._iter_strategy_thread_axes(strategy):
+            if block_id not in reduced_block_ids or size is None:
+                continue
+            if isinstance(strategy, PerThreadNDTileStrategy):
+                size = strategy.thread_extent_for_masking(block_id, size)
+            axis = base_axis + local_axis
+            if size > 1 and axis < 3 and dims[axis] != size:
+                reject(axis, size, f"reduction over tile block {block_id}")
+    for subject, layout in device_function.cute_state.multi_phase_lane_reduce_layouts:
+        for axis, size in layout.items():
+            if axis < 3 and dims[axis] != size:
+                reject(axis, size, subject)
+    return dims
 
 
 def _pointwise_grid_thread_dims(
@@ -2076,11 +2173,18 @@ class CuteBackend(Backend):
         # ``.iterator`` is the underlying ``cute.Pointer`` to the semaphore.
         return f"_cute_grid_barrier({sem_arg}.iterator)"
 
+    def _check_thread_axis(self, axis: int) -> None:
+        # ``cute.arch.thread_idx()`` is an (x, y, z) triple; indexing it with
+        # a fourth axis fails deep inside DSL tracing with an IndexError.
+        if axis >= 3:
+            raise exc.BackendUnsupported(self.name, f"thread axis {axis}")
+
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
     ) -> str:
         from ..compile_environment import CompileEnvironment
 
+        self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_type()
         return (
             f"{offset_var} + {index_dtype}(cute.arch.thread_idx()[{axis}])"
@@ -2093,6 +2197,7 @@ class CuteBackend(Backend):
     def thread_index_expr(self, *, axis: int) -> str:
         from ..compile_environment import CompileEnvironment
 
+        self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_type()
         return f"{index_dtype}(cute.arch.thread_idx()[{axis}])"
 
@@ -2124,6 +2229,7 @@ class CuteBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
+        self._check_thread_axis(axis)
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
             f" + {dtype}(cute.arch.thread_idx()[{axis}])"
@@ -2132,10 +2238,9 @@ class CuteBackend(Backend):
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
-        if axis >= 3 and block_size_var != "1":
-            raise exc.BackendUnsupported(self.name, f"thread axis {axis}")
         if block_size_var == "1":
             return offset_var
+        self._check_thread_axis(axis)
         return f"{offset_var} + {dtype}(cute.arch.thread_idx()[{axis}])"
 
     def loop_index_expr(
@@ -2163,7 +2268,6 @@ class CuteBackend(Backend):
         self, requested: int, existing_strategies: list[TileStrategy]
     ) -> int:
         from ..reduction_strategy import ReductionStrategy
-        from .thread_budget import MAX_THREADS_PER_BLOCK
 
         if requested <= 1:
             return requested
@@ -2204,6 +2308,7 @@ class CuteBackend(Backend):
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
+        self._check_thread_axis(axis)
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
@@ -2248,6 +2353,7 @@ class CuteBackend(Backend):
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
+        self._check_thread_axis(axis)
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
@@ -2366,6 +2472,8 @@ class CuteBackend(Backend):
     def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
         from ..compile_environment import CompileEnvironment
 
+        for axis in axis_sizes:
+            self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_dtype
         index_type = self.index_type_str(index_dtype)
         if not axis_sizes:
@@ -2461,8 +2569,6 @@ class CuteBackend(Backend):
         from ..device_function import ConstExprArg
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
-        from .thread_budget import MAX_THREADS_PER_BLOCK
-        from .thread_budget import check_thread_block_dims
 
         device_function = DeviceFunction.current()
         codegen = device_function.codegen
@@ -2856,6 +2962,18 @@ class CuteBackend(Backend):
         tcgen05_compact_dims = (
             recorded_tcgen05_block_shape if specialized_root_tcgen05 else None
         )
+        if len(device_ir.phases) > 1 and tcgen05_compact_dims is None:
+            phase_dims = _multi_phase_block_dims(
+                device_function,
+                exact_grid_thread_dims=tuple(exact_grid_thread_dims),
+            )
+            # An argument-sized axis never reaches here: the phases are
+            # separate strategy branches, which share no single launch
+            # shape expression, so ``symbolic_axes`` declined above.
+            check_thread_block_dims(phase_dims, context=str(phase_dims))
+            return launcher_args_with_compile_options(
+                f"block=({phase_dims[0]}, {phase_dims[1]}, {phase_dims[2]})"
+            )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims
         elif has_nested_device_loops:
@@ -3024,7 +3142,6 @@ class CuteBackend(Backend):
         # so the strategy can intentionally launch fewer threads on a
         # reduction axis (e.g. K) than the codegen "references" through the
         # strategy's per-block thread count.
-        from .thread_budget import check_thread_block_dims
 
         def _emits_cute_gemm(stmt: ast.AST) -> bool:
             for sub in ast.walk(stmt):
@@ -3218,7 +3335,6 @@ class CuteBackend(Backend):
         # Budget simultaneously active grid/device-loop axes. Sibling
         # passes reuse axes; multiplying all their tile sizes would turn
         # otherwise legal threaded reductions into serial lane loops.
-        from .thread_budget import MAX_THREADS_PER_BLOCK
         from .thread_budget import tile_loop_thread_count
 
         inactive_grid_block_ids: set[int] = set()
@@ -3475,7 +3591,6 @@ class CuteBackend(Backend):
                     per_axis_limit //= 2
                 thread_limit = max(1, per_axis_limit)
             static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
-            from .thread_budget import check_thread_limit
 
             # Detect MMA-compatible K-loops: device loops containing
             # addmm/mm with float16/bfloat16 operands.  Metal borrows this
@@ -3612,8 +3727,6 @@ class CuteBackend(Backend):
             # lane loop (each thread owns block_size // 1024 elements).
             flat_num_threads = MAX_THREADS_PER_BLOCK
         if isinstance(block_size, int) and flat_num_threads > 0:
-            from .thread_budget import check_thread_limit
-
             check_thread_limit(flat_num_threads, context=str(block_size))
         return PerThreadFlattenedTileStrategy(
             fn,

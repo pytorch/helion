@@ -666,6 +666,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )
             return out
 
+        torch.manual_seed(0)
         batch_size = 32
         dim = 64
         x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
@@ -685,7 +686,10 @@ class TestReductions(RefEagerTestBase, TestCase):
             block_sizes=[32],
             reduction_loops=[8],
         )
-        torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
+        # var and mean come out in bf16, so the two reduction orders can round
+        # a row's var or mean one bf16 ulp apart, which moves the bf16 outputs
+        # by a few ulps (far beyond a 1e-3 tolerance; seen on TileIR).
+        torch.testing.assert_close(result1, result2, rtol=2e-2, atol=3e-2)
 
     @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")

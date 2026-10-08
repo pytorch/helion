@@ -279,12 +279,12 @@ def _materialize_config(
         and allowed_pid_types
         and supported["pid_type"] not in allowed_pid_types
     ):
-        # Replace an illegal pid_type with the highest-preference legal one rather
-        # than popping it: a plain pop lets ``normalize`` refill the field with
-        # ``VALID_PID_TYPES[0]`` (== 'flat'), which re-introduces the disallowed value
-        # (e.g. under ``hl.barrier()`` / a data-dependent grid bound / force-persistent,
-        # where 'flat' is disallowed). ``allowed_pid_types`` is guaranteed non-empty and
-        # order-preserving, so ``[0]`` is a valid persistent choice when 'flat' is stripped.
+        # Replace an illegal pid_type with the highest-preference legal one.
+        # ``allowed_pid_types`` is guaranteed non-empty and order-preserving, so
+        # ``[0]`` is a valid persistent choice when 'flat' is disallowed (e.g.
+        # under ``hl.barrier()`` / a data-dependent grid bound / force-persistent);
+        # it is also the value ``normalize`` fills in for a missing key, so the
+        # explicit replacement only keeps the intent visible here.
         supported["pid_type"] = allowed_pid_types[0]
     config_spec.normalize(supported, _fix_invalid=True)
     config = Config(**cast("dict[str, Any]", supported))
