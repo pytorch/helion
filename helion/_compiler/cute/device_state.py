@@ -706,6 +706,15 @@ class CuteDeviceFunctionState:
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
         self.matmul_fx_nodes: set[torch.fx.Node] = set()
+        # Pointwise ops on a tcgen05 epilogue chain whose block-id re-binding
+        # check waits for the store's epilogue classifier
+        # (``cute_reshape.check_pointwise_rebound_block_ids``).
+        self.deferred_rebound_pointwise_nodes: list[torch.fx.Node] = []
+        # ``build_inner_outputs_index_from_graphs`` of the codegen graphs,
+        # built once for those checks (the graphs are fixed per codegen).
+        self.rebound_inner_outputs_index: (
+            dict[int, tuple[torch.fx.Node | None, ...]] | None
+        ) = None
         # tcgen05 matmul anchor -> registered result var. Fused epilogue walks
         # from a store value back to the anchor and reuses the store value
         # registered under this result var, even when user-visible names were

@@ -4,6 +4,13 @@
 current lane iteration.  The exchange is only correct when both pair elements
 are staged in the same lane iteration that reads them; the layouts below pin
 down which combinations of lane layout and pair geometry that admits.
+
+A permute in the split's producer chain is a per-thread relabel (every block
+id owns one coordinate per thread), so the thread still holds the element at
+its block coordinates and both the load fold and the exchange see the pair
+the split-view coordinates describe.  The old position-keyed permute shuffle
+broke that invariant and made every accepted layout of ``transposed_pairs``
+below return the wrong pairs; those kernels now pin the numerics.
 """
 
 from __future__ import annotations
@@ -98,7 +105,7 @@ def join_then_split(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(static_shapes=True)
 def transposed_pairs(x: torch.Tensor) -> torch.Tensor:
-    """Pairs of a transposed tile; the permute is a cross-thread shuffle."""
+    """Adjacent pairs of a transposed loaded tile, swapped (re-read fold)."""
     n, d = x.size()
     out = torch.empty([d, n], dtype=x.dtype, device=x.device)
     for tile_n, tile_d in hl.tile([n, d]):
@@ -110,14 +117,79 @@ def transposed_pairs(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def transposed_pairs_scaled(x: torch.Tensor) -> torch.Tensor:
+    """``transposed_pairs`` on a non-load tile (``* 2.0`` after the permute)."""
+    n, d = x.size()
+    out = torch.empty([d, n], dtype=x.dtype, device=x.device)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = (x[tile_n, tile_d].permute(1, 0) * 2.0).reshape(
+            [tile_d, tile_n.block_size // 2, 2]
+        )
+        lo, hi = hl.split(pair)
+        out[tile_d, tile_n] = hl.join(hi, lo).reshape([tile_d, tile_n])
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def hoisted_transposed_pairs(x: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
+    """The permute is hoisted out of the loop that splits it (exchange)."""
+    n, d = x.size()
+    out = torch.empty([d, n], dtype=x.dtype, device=x.device)
+    for tile_n, tile_d in hl.tile([n, d]):
+        transposed = x[tile_n, tile_d].permute(1, 0)
+        acc = hl.zeros([tile_d, tile_n], dtype=x.dtype)
+        for _tile_s in hl.tile(steps.size(0)):
+            pair = transposed.reshape([tile_d, tile_n.block_size // 2, 2])
+            lo, hi = hl.split(pair)
+            acc = acc + hl.join(hi, lo).reshape([tile_d, tile_n])
+        out[tile_d, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def joined_pairs_transposed(x: torch.Tensor) -> torch.Tensor:
+    """``hl.join`` of swapped pairs, stored through a permute."""
+    n, d = x.size()
+    out = torch.empty([d, n], dtype=x.dtype, device=x.device)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = (x[tile_n, tile_d] * 2.0).reshape([tile_n, tile_d.block_size // 2, 2])
+        lo, hi = hl.split(pair)
+        out[tile_d, tile_n] = hl.join(hi, lo).reshape([tile_n, tile_d]).permute(1, 0)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def unit_permuted_pairs(x: torch.Tensor) -> torch.Tensor:
+    """A permute that only moves a unit dim, over a non-load tile."""
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n, tile_d in hl.tile([n, d]):
+        rows = (x[tile_n, tile_d] * 2.0).unsqueeze(0).permute(1, 0, 2)
+        pair = rows.reshape([tile_n, 1, tile_d.block_size // 2, 2])
+        lo, hi = hl.split(pair)
+        out[tile_n, tile_d] = hl.join(hi, lo).reshape([tile_n, 1, tile_d]).squeeze(1)
+    return out
+
+
 def _swapped_halves(x: torch.Tensor, block: int) -> torch.Tensor:
     pairs = (x * 2.0).view(x.shape[0], x.shape[1] // block, 2, block // 2)
     return torch.cat((pairs[:, :, 1:], pairs[:, :, :1]), dim=2).view(x.shape)
 
 
-def _swapped_interleaved(x: torch.Tensor) -> torch.Tensor:
-    pairs = (x * 2.0).view(x.shape[0], x.shape[1] // 2, 2)
+def _swapped_interleaved(x: torch.Tensor, scale: float = 2.0) -> torch.Tensor:
+    pairs = (x * scale).view(x.shape[0], x.shape[1] // 2, 2)
     return torch.stack((pairs[..., 1], pairs[..., 0]), dim=-1).view(x.shape)
+
+
+def _swapped_transposed_pairs(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    return _swapped_interleaved(x.t().contiguous(), scale)
+
+
+# ``transposed_pairs`` layouts without lane loops.  The old position-keyed
+# permute shuffle returned the wrong pairs for every one of them (and the
+# exchange proof rejected [64, 32]); the permute is a per-thread relabel now.
+_TRANSPOSED_PAIR_LAYOUTS = ([32, 32], [16, 32], [32, 16], [16, 16], [8, 32])
 
 
 @onlyBackends(["cute"])
@@ -201,17 +273,75 @@ class TestCuteSplitExchange(TestCase):
         ):
             code_and_output(join_then_split, (self.x, y), block_sizes=[32, 32])
 
-    def test_shuffled_permute_is_not_re_read(self) -> None:
-        # A permute materialized through shared memory holds one element per
-        # thread; the load fold cannot re-read it at the partner's coordinate,
-        # so the split takes the verified exchange (rejected for this layout)
-        # instead of silently returning the thread's own element twice.
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported,
-            "hl.split of a non-load tile: a pair element is produced by a "
-            "different iteration",
-        ):
-            code_and_output(transposed_pairs, (self.x,), block_sizes=[64, 32])
+    def test_transposed_pairs_re_read(self) -> None:
+        # The permute relabels the loaded tile, so the fold re-reads each
+        # partner at the inverse-permuted coordinate: no exchange, and the
+        # lane-loop layout [64, 32] works too (its store stages the final
+        # reshape through shared memory by block coordinates).
+        expected = _swapped_transposed_pairs(self.x)
+        for block_sizes in (*_TRANSPOSED_PAIR_LAYOUTS, [64, 32]):
+            with self.subTest(block_sizes=block_sizes):
+                code, result = code_and_output(
+                    transposed_pairs, (self.x,), block_sizes=block_sizes
+                )
+                self.assertNotIn("split_smem", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_transposed_pairs_exchange(self) -> None:
+        # A pointwise op after the permute makes the tile non-load; the
+        # exchange stages the thread's element at its block coordinates,
+        # which the relabeled permute leaves in place.
+        expected = _swapped_transposed_pairs(self.x, 2.0)
+        for block_sizes in _TRANSPOSED_PAIR_LAYOUTS:
+            with self.subTest(block_sizes=block_sizes):
+                self._assert_exchange(
+                    transposed_pairs_scaled, expected, block_sizes=block_sizes
+                )
+
+    def test_transposed_pairs_exchange_lane_loop_rejected(self) -> None:
+        # Under lane loops the interleaved partner of the non-load tile is
+        # the next lane iteration of the blocked layout, as for
+        # ``interleaved_tiled``; the proof rejects it rather than the permute.
+        self._assert_rejected(transposed_pairs_scaled, block_sizes=[64, 32])
+
+    def test_hoisted_transposed_pairs(self) -> None:
+        # The permute reaches the split through a loop-body placeholder; the
+        # inner loop's exchange still sees the thread's own element.
+        steps = torch.empty([4], device=DEVICE)
+        expected = _swapped_transposed_pairs(self.x)
+        for block_sizes in ([32, 32, 4], [16, 32, 4]):
+            with self.subTest(block_sizes=block_sizes):
+                code, result = code_and_output(
+                    hoisted_transposed_pairs, (self.x, steps), block_sizes=block_sizes
+                )
+                self.assertIn("split_smem", code)
+                self.assertNotIn("rebind_smem", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_joined_pairs_stored_transposed(self) -> None:
+        # ``hl.join`` selects by the split's minor coordinate; the permute on
+        # the way to the store relabels the joined tile for the transposed
+        # subscript.
+        expected = _swapped_interleaved(self.x).t().contiguous()
+        for block_sizes in ([32, 32], [16, 32], [64, 32]):
+            with self.subTest(block_sizes=block_sizes):
+                code, result = code_and_output(
+                    joined_pairs_transposed, (self.x,), block_sizes=block_sizes
+                )
+                self.assertNotIn("rebind_smem", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_unit_permute_exchange(self) -> None:
+        # Moving a unit dim reorders no thread dim either; the exchange of
+        # the non-load tile stays exact.
+        for block_sizes in ([32, 32], [64, 64]):
+            with self.subTest(block_sizes=block_sizes):
+                self._assert_exchange(
+                    unit_permuted_pairs,
+                    _swapped_interleaved(self.x),
+                    block_sizes=block_sizes,
+                    cute_lane_layouts=["blocked", "strided"],
+                )
 
     def test_exchange_over_smem_budget_rejected(self) -> None:
         # A 64 x 256 fp32 tile needs 64 KiB of static shared memory.

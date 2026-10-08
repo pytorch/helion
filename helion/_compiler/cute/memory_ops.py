@@ -35,7 +35,7 @@ from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import CuteTileVecStoreSite
-from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
+from ...language.memory_ops import _codegen_cute_store_reshape_lane_loops
 from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
 from ...language.memory_ops import _cute_access_regions
 from ...language.memory_ops import _cute_active_index_var
@@ -69,6 +69,12 @@ from ..indexing_strategy import _get_tile_with_offset_info
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
+from .cute_reshape import check_memory_mask_rebound
+from .cute_reshape import codegen_cute_store_rebound_value
+from .cute_reshape import describe_rebound_block_dims
+from .cute_reshape import run_deferred_rebound_checks
+from .cute_reshape import store_rebound_dims
+from .cute_reshape import tcgen05_rebound_store_error
 from .indexing import CUTE_SCALAR_LOAD_SITE_META
 from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
@@ -2684,6 +2690,24 @@ def _try_splice_tcgen05_grouped_tail_epilogue(
 
 @_decorators.codegen(store, "cute")
 def _(state: CodegenState) -> ast.AST:
+    def drain_deferred_rebound_checks() -> None:
+        # The pointwise checks deferred to the epilogue classifier, for this
+        # chain's ancestors only: another chain's store keeps the first word.
+        run_deferred_rebound_checks(
+            state.codegen,
+            _pure_epilogue_ancestors(value_node)
+            if isinstance(value_node, torch.fx.Node)
+            else (),
+        )
+
+    def finish_tcgen05_store() -> None:
+        # A tcgen05 store path accepted the chain: a re-bound value has no
+        # per-thread element to exchange, and the pointwise checks deferred
+        # to the classifier run now.
+        if rebound_tcgen05:
+            raise tcgen05_rebound_store_error(state, rebound)
+        drain_deferred_rebound_checks()
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -2692,19 +2716,61 @@ def _(state: CodegenState) -> ast.AST:
     raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
-    if (
-        planned := _try_codegen_tcgen05_fragment_epilogue(
-            state, tensor, subscript, ast_subscript, extra_mask
-        )
-    ) is not None:
-        return planned
     value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         maybe_value_node = state.fx_node.args[2]
         if isinstance(maybe_value_node, torch.fx.Node):
             value_node = maybe_value_node
 
+    # Before any store path: a subscript that binds a value dim to another
+    # block id needs the exchanged value, whichever path stores it.  On a
+    # tcgen05 epilogue chain there is no per-thread value to exchange (the
+    # value may still be the deferred fragment-epilogue marker here): the
+    # chain is refused where a tcgen05 store path would accept it, and the
+    # classifier's own diagnostic wins where it rejects the chain.
+    rebound: list[tuple[int, int, int]] = []
+    rebound_tcgen05 = False
+    exchanged: ast.AST | None = None
     if isinstance(tensor, torch.Tensor):
+        rebound = store_rebound_dims(state, tensor, subscript)
+    elif isinstance(tensor, tuple):
+        # A stack tensor store writes ``value`` through the pointer table's
+        # dims and ``tensor_like[subscript]``; it has no exchange, so a
+        # re-bound value is refused.
+        tensor_like, dev_ptrs = tensor
+        rebound = store_rebound_dims(
+            state, tensor_like, subscript, leading_sizes=dev_ptrs.shape
+        )
+        if rebound:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"stack tensor store re-binds {describe_rebound_block_dims(rebound)}; "
+                "the value must be held by the thread that owns the destination lane",
+            )
+    if rebound:
+        rebound_tcgen05 = bool(
+            value_node is not None
+            and state.device_function.cute_state.matmul_fx_nodes
+            and reach_tcgen05_matmul_anchors(state, value_node)
+        )
+        if not rebound_tcgen05:
+            assert isinstance(tensor, torch.Tensor)
+            exchanged = codegen_cute_store_rebound_value(
+                state, tensor, subscript, state.ast_arg(2), rebound
+            )
+            raw_value = exchanged
+    if (
+        planned := _try_codegen_tcgen05_fragment_epilogue(
+            state, tensor, subscript, ast_subscript, extra_mask
+        )
+    ) is not None:
+        finish_tcgen05_store()
+        return planned
+
+    if isinstance(tensor, torch.Tensor):
+        # An exchanged value must not be rebuilt from its FX node: the paths
+        # below see no node for it and store ``raw_value`` (= the exchange).
+        store_value_node = value_node if exchanged is None else None
         affine_range_store = _codegen_cute_affine_range_store(
             state,
             tensor,
@@ -2712,18 +2778,24 @@ def _(state: CodegenState) -> ast.AST:
             ast_subscript,
             raw_value,
             extra_mask,
-            value_node,
+            store_value_node,
         )
         if affine_range_store is not None:
             state.add_statement(affine_range_store)
             return ast.Constant(value=None)
-        affine_reshape_store = _codegen_cute_affine_reshape_store(
-            state,
-            tensor,
-            subscript,
-            ast_subscript,
-            extra_mask,
-            value_node,
+        # The paths below rebuild the value from its FX node; an exchanged
+        # value must take the generic store, which writes ``exchanged``.
+        affine_reshape_store = (
+            None
+            if exchanged is not None
+            else _codegen_cute_affine_reshape_store(
+                state,
+                tensor,
+                subscript,
+                ast_subscript,
+                extra_mask,
+                value_node,
+            )
         )
         if affine_reshape_store is not None:
             state.add_statement(affine_reshape_store)
@@ -2734,15 +2806,15 @@ def _(state: CodegenState) -> ast.AST:
             subscript,
             raw_value,
             extra_mask,
-            value_node,
+            store_value_node,
         )
         if strided_slice_store is not None:
             state.add_statement(strided_slice_store)
             return ast.Constant(value=None)
 
-    value = state.ast_arg(2)
+    value = exchanged if exchanged is not None else state.ast_arg(2)
 
-    if value_node is not None:
+    if value_node is not None and exchanged is None:
         if value_node.op == "call_function":
             if isinstance(tensor, torch.Tensor):
                 rewritten_stmt = _codegen_cute_store_stack_load(
@@ -2777,7 +2849,7 @@ def _(state: CodegenState) -> ast.AST:
                 )
                 if rewritten_stmt is not None:
                     return rewritten_stmt
-                rewritten_stmt = _codegen_cute_store_permute_lane_loops(
+                rewritten_stmt = _codegen_cute_store_reshape_lane_loops(
                     state,
                     tensor,
                     subscript,
@@ -2788,11 +2860,6 @@ def _(state: CodegenState) -> ast.AST:
                 )
                 if rewritten_stmt is not None:
                     return rewritten_stmt
-            from .cute_reshape import codegen_cute_store_permute
-
-            rewritten = codegen_cute_store_permute(state, value, value_node)
-            if rewritten is not None:
-                value = rewritten
 
     if isinstance(tensor, tuple):
         stack_tensor_ast = state.ast_args[0]
@@ -2859,6 +2926,7 @@ def _(state: CodegenState) -> ast.AST:
             stmts = (
                 rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
             )
+            finish_tcgen05_store()
             for stmt in stmts:
                 state.add_statement(stmt)
             return ast.Constant(value=None)
@@ -2874,11 +2942,13 @@ def _(state: CodegenState) -> ast.AST:
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
     if spliced is not None:
+        finish_tcgen05_store()
         return spliced
     spliced = _try_splice_tcgen05_grouped_tail_epilogue(
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
     if spliced is not None:
+        finish_tcgen05_store()
         return spliced
 
     # Loud-failure backstop for fused-epilogue stores that follow a
@@ -2926,6 +2996,8 @@ def _(state: CodegenState) -> ast.AST:
             "written with `bias[tile_m][:, None]` / "
             "`.unsqueeze(-1)`.",
         )
+
+    drain_deferred_rebound_checks()
 
     tensor_name = state.device_function.tensor_arg(tensor).name
     backend = CompileEnvironment.current().backend
@@ -5220,6 +5292,22 @@ def _(state: CodegenState) -> object:
     assert isinstance(ast_subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    if isinstance(tensor, torch.Tensor):
+        check_memory_mask_rebound(
+            state, tensor, subscript, state.proxy_arg(2), what="load"
+        )
+    elif isinstance(tensor, tuple):
+        # A stack tensor load ANDs the mask through _cute_stack_tensor_mask_expr
+        # over the pointer table's dims and tensor_like[subscript].
+        stack_tensor_like, stack_dev_ptrs = tensor
+        check_memory_mask_rebound(
+            state,
+            stack_tensor_like,
+            subscript,
+            state.proxy_arg(2),
+            what="stack tensor load",
+            leading_sizes=stack_dev_ptrs.shape,
+        )
 
     if isinstance(tensor, tuple):
         stack_tensor_ast = state.ast_args[0]
