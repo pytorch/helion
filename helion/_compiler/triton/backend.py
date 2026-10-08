@@ -72,6 +72,14 @@ class TritonBackend(Backend):
     def supports_eager_prepared_call(self) -> bool:
         return True
 
+    @property
+    def supports_inductor_fusion(self) -> bool:
+        return True
+
+    @property
+    def dynamo_inline_capture_loses_view_writes(self) -> bool:
+        return True
+
     def transform_host_arg(
         self,
         arg: Argument,

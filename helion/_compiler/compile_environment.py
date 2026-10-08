@@ -30,6 +30,7 @@ from torch._subclasses import FakeTensorMode
 import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import StatelessSymbolicContext
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils import _pytree as pytree
 
@@ -135,6 +136,31 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
             and _is_supported_tensor_input_source(source.base)
         )
     return False
+
+
+# Set by the torch.compile HOP lowering on its example inputs: the dims
+# Dynamo's graph keeps static, which the captured trace bound as literals.
+HELION_STATIC_DIMS_ATTR = "_helion_static_dims"
+
+
+def _static_dims_symbolic_context(
+    tensor: torch.Tensor,
+) -> StatelessSymbolicContext | None:
+    """A dynamic-shape fakeification of ``tensor`` that keeps its
+    ``HELION_STATIC_DIMS_ATTR`` dims static (None: the default context)."""
+    static_dims = getattr(tensor, HELION_STATIC_DIMS_ATTR, None)
+    if not static_dims:
+        return None
+    ndim = tensor.dim()
+    return StatelessSymbolicContext(
+        dynamic_sizes=[
+            DimDynamic.STATIC if i in static_dims else DimDynamic.DUCK
+            for i in range(ndim)
+        ],
+        dynamic_strides=[DimDynamic.INFER_STRIDE] * ndim,
+        constraint_sizes=[None] * ndim,
+        constraint_strides=[None] * ndim,
+    )
 
 
 def tensor_descriptor_runtime_alignment_signature(
@@ -1781,14 +1807,30 @@ class CompileEnvironment:
             return cached
         if free_unbacked_symbols(expr):
             result = self.create_unbacked_symint()
-        else:
-            assert isinstance(expr, sympy.Symbol)
+        elif isinstance(expr, sympy.Symbol):
             hint = int(shape_env_var_hints(outer_se)[expr])
             new_expr = self.shape_env.create_symbol(
                 hint, source, dynamic_dim=DimDynamic.DYNAMIC
             )
             result = self.shape_env.create_symintnode(
                 new_expr, hint=hint, source=source
+            )
+        else:
+            # A compound size (``s0 - 1`` for ``x[1:]``): mirror each foreign
+            # symbol, then rebuild the expression over the mirrors.  ``source``
+            # names this size, not its symbols, which get ephemeral sources.
+            hints = shape_env_var_hints(outer_se)
+            mirrors: dict[sympy.Basic, sympy.Basic] = {}
+            for symbol in expr.free_symbols:
+                assert isinstance(symbol, sympy.Symbol)
+                mirror = self._maybe_recreate_symint(
+                    outer_se.create_symintnode(symbol, hint=int(hints[symbol])),
+                    EphemeralSource(f"helion_foreign_{symbol}"),
+                )
+                assert isinstance(mirror, torch.SymInt)
+                mirrors[symbol] = mirror._sympy_()
+            result = self.shape_env.create_symintnode(
+                expr.xreplace(mirrors), hint=int(expr.xreplace(hints))
             )
         self._foreign_symint_cache[cache_key] = result
         return result
@@ -1831,7 +1873,11 @@ class CompileEnvironment:
             )
         else:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
-                self.fake_mode, tensor, shape_env=self.shape_env, source=source
+                self.fake_mode,
+                tensor,
+                shape_env=self.shape_env,
+                source=source,
+                symbolic_context=_static_dims_symbolic_context(tensor),
             )
         result = self.backend.normalize_input_fake_tensor(result)
         previous_source = self.input_sources.get(result)
