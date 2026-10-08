@@ -676,6 +676,13 @@ class CuteDeviceFunctionState:
         self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
         self.resident_sequence_regions: dict[int, SequenceRegion] = {}
         self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
+        # ``hl.atomic_add`` nodes that receive the per-K-lane partial sums of a
+        # scalar matmul whose K axis is split across a serial lane loop
+        # (``cute/matmul_fallback.py``), mapped to the lane variables of those
+        # loops.  Such an atomic varies along the loop although its index does
+        # not cover the loop's block, so the atomic lowering does not record
+        # it as uniform along the loop (``atomic_ops._cute_uniform_lane_vars``).
+        self.per_lane_atomic_lane_vars: dict[Node, set[str]] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).

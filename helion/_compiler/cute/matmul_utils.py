@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import enum
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -10,6 +11,13 @@ import sympy
 import torch
 from torch.fx.node import Node
 
+from ... import exc
+from ...language._tracing_ops import _for_loop
+from ...language._tracing_ops import _for_loop_step
+from ...language._tracing_ops import _if
+from ...language._tracing_ops import _while_loop
+from ...language.atomic_ops import ATOMIC_OPS
+from ...language.atomic_ops import atomic_add
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -21,11 +29,14 @@ from .indexing import CutePackedTerms
 from .indexing import match_cute_stack_reshape_rhs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
 
     from ...autotuner.config_spec import MatmulFact
     from ..aten_lowering import LoweringContext
     from ..device_ir import DeviceIR
+    from ..device_ir import GraphInfo
     from ..helper_function import CodegenInterface
 
 
@@ -472,6 +483,219 @@ def cute_outer_accumulates_result(
     is_acc_none: bool,
 ) -> bool:
     return cute_outer_accumulator_node(fx_node, is_acc_none=is_acc_none) is not None
+
+
+# Pure dtype / layout changes and lane-invariant scaling between a matmul and
+# the ``hl.atomic_add`` that consumes it.  Each is linear in the matmul result,
+# so adding the per-K-lane partial products separately gives the same total.
+_CUTE_ATOMIC_LINEAR_PASSTHROUGH_TARGETS = frozenset(
+    {
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.squeeze.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.expand.default,
+    }
+)
+_CUTE_ATOMIC_LINEAR_SCALE_TARGETS = frozenset(
+    {
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten.mul.Scalar,
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Scalar,
+    }
+)
+# Device IR control flow: ``(graph id argument, subgraph argument list)``
+# positions whose list entries line up with the subgraph's placeholders.
+_CUTE_SUBGRAPH_ARG_SLOTS: dict[object, tuple[tuple[int, int], ...]] = {
+    _for_loop: ((0, 3),),
+    _for_loop_step: ((0, 3),),
+    _while_loop: ((0, 2), (1, 2)),
+    _if: ((1, 3), (2, 4)),
+}
+
+
+class CuteAtomicLaneRoute(enum.Enum):
+    """How a matmul whose K axis is split across lanes reaches ``hl.atomic_*``."""
+
+    NONE = "none"
+    """No atomic consumes the result inside the K lane loop: keep the running sum."""
+    PER_LANE = "per_lane"
+    """Each K lane's partial product sum is atomically added on its own."""
+    OWNED = "owned"
+    """Complete the K sum with the owned product-sum marker before the atomic."""
+
+
+def cute_atomic_consumer_lane_route(
+    fx_node: torch.fx.Node | None,
+    *,
+    is_acc_none: bool,
+    get_graph: Callable[[int], GraphInfo],
+) -> CuteAtomicLaneRoute:
+    """Pick how a lane-split matmul result that reaches ``hl.atomic_*`` lowers.
+
+    Only meaningful when the matmul's K axis really is split across a serial
+    lane loop: the per-thread ``dot_acc`` running sum then exposes a prefix
+    of the contraction to every lane iteration, and every consumer inside the
+    lane loop (the matmul's own graph plus the loop and branch subgraphs
+    nested in it, reached through ``get_graph``) sees that prefix.  A
+    thread-mapped K axis is complete at every thread and needs none of this,
+    so callers decide after resolving the lane variable.
+
+    ``PER_LANE``: ``hl.atomic_add`` is the only consumer of a bare fp32/fp64
+    matmul result, separated from it by nothing but linear, lane-invariant
+    transforms (views, widening float casts, multiplication or division by a
+    Python number).  Each lane's partial sum is then atomically added on its
+    own.
+
+    ``OWNED``: the same chain, but the matmul result is half precision, so
+    every per-lane partial would be rounded before its add.  The owned
+    product-sum marker completes the K sum first (or its lane scheduler
+    declines the lowering).
+
+    Any other route to an atomic op (a second user, a tensor or
+    kernel-argument scale, a non-linear op, a second matmul fed by the
+    prefix, ``atomic_max`` and friends, a loop-carried accumulator, or an
+    atomic inside a nested loop or branch) cannot be split per lane, and the
+    running sum is wrong for it too, so it is rejected loudly.  A result that
+    only leaves the K loop through the loop's outputs is complete there and
+    is not followed.
+    """
+    if fx_node is None:
+        return CuteAtomicLaneRoute.NONE
+    if is_acc_none and _linear_atomic_add_consumer(fx_node) is not None:
+        val = fx_node.meta["val"]
+        assert isinstance(val, torch.Tensor)
+        # Per-lane partials are exact for integer results and carry one fp32
+        # rounding each; half-precision results would stack one rounding per
+        # K lane, so they take the owned product-sum route instead.
+        if val.dtype in (torch.float32, torch.float64) or not val.is_floating_point():
+            return CuteAtomicLaneRoute.PER_LANE
+        return CuteAtomicLaneRoute.OWNED
+    if _reaches_atomic_value(fx_node, set(), get_graph):
+        raise exc.BackendUnsupported(
+            "cute",
+            "hl.atomic_* consumes a matmul result whose K axis is split across "
+            "lanes through a chain the scalar fallback cannot split per lane "
+            "(shared result, non-linear op, second matmul, tensor scale, "
+            "loop-carried accumulator, or an atomic in a nested loop or branch)",
+        )
+    return CuteAtomicLaneRoute.NONE
+
+
+def _atomic_value_argument(user: torch.fx.Node) -> object:
+    # ``hl.atomic_add(target, index, value, sem=...)``: the value is the third
+    # positional argument.  ``atomic_cas`` puts ``expected`` there instead,
+    # so this helper is only for ``atomic_add``.
+    assert user.target is atomic_add
+    if "value" in user.kwargs:
+        return user.kwargs["value"]
+    return user.args[2] if len(user.args) > 2 else None
+
+
+def cute_per_lane_atomic_consumer(fx_node: torch.fx.Node) -> torch.fx.Node:
+    """The ``hl.atomic_add`` node a ``PER_LANE``-routed matmul's partials reach."""
+    consumer = _linear_atomic_add_consumer(fx_node)
+    assert consumer is not None
+    return consumer
+
+
+def _linear_atomic_add_consumer(fx_node: torch.fx.Node) -> torch.fx.Node | None:
+    """The ``hl.atomic_add`` whose value is *fx_node* through linear ops alone, or None."""
+    node = fx_node
+    while True:
+        users = [user for user in node.users if isinstance(user, torch.fx.Node)]
+        if len(users) != 1:
+            return None
+        (user,) = users
+        if user.op != "call_function":
+            return None
+        if user.target is atomic_add:
+            return user if _atomic_value_argument(user) is node else None
+        if user.target is torch.ops.prims.convert_element_type.default:
+            # Each lane's partial is cast before its atomic add, so only a
+            # cast that keeps every fp32 partial exact may stay in the chain.
+            if user.args[1] not in (torch.float32, torch.float64):
+                return None
+            node = user
+            continue
+        if user.target in _CUTE_ATOMIC_LINEAR_PASSTHROUGH_TARGETS:
+            node = user
+            continue
+        if user.target in _CUTE_ATOMIC_LINEAR_SCALE_TARGETS and len(user.args) == 2:
+            lhs, rhs = user.args
+            other = rhs if lhs is node else lhs
+            is_division = user.target in (
+                torch.ops.aten.div.Tensor,
+                torch.ops.aten.div.Scalar,
+            )
+            if is_division and lhs is not node:
+                return None
+            if not isinstance(other, (int, float)) or isinstance(other, bool):
+                return None
+            node = user
+            continue
+        return None
+
+
+def _subgraph_placeholders(
+    user: torch.fx.Node,
+    node: torch.fx.Node,
+    get_graph: Callable[[int], GraphInfo],
+) -> Iterator[torch.fx.Node]:
+    """Yield the subgraph placeholders that *user* binds to *node*."""
+    for graph_id_index, args_index in _CUTE_SUBGRAPH_ARG_SLOTS[user.target]:
+        graph_id = user.args[graph_id_index]
+        outer_args = user.args[args_index]
+        assert isinstance(graph_id, int)
+        assert isinstance(outer_args, (list, tuple))
+        placeholders = get_graph(graph_id).graph.find_nodes(op="placeholder")
+        for placeholder, outer_arg in zip(placeholders, outer_args, strict=True):
+            if outer_arg is node:
+                yield placeholder
+
+
+def _reaches_atomic_value(
+    node: torch.fx.Node,
+    visited: set[torch.fx.Node],
+    get_graph: Callable[[int], GraphInfo],
+) -> bool:
+    """Whether *node* flows into an atomic op inside the K lane loop.
+
+    Every op of the graph propagates the per-lane prefix of a running sum,
+    including a second matmul fed by it, so the walk follows all users and
+    descends into the loop and branch subgraphs that take *node* as an
+    argument; every value such a subgraph returns counts as tainted too.  The
+    walk does not climb out through a graph's outputs: the running sum is
+    only used when the K lane loop is the innermost open scope, so the only
+    outputs the matmul's own graph can reach are the K loop's, and a value
+    that leaves the K loop is complete once the loop has finished.
+    """
+    if node in visited:
+        return False
+    visited.add(node)
+    for user in node.users:
+        if not isinstance(user, torch.fx.Node) or user.op != "call_function":
+            continue
+        if user.target in ATOMIC_OPS:
+            # ``user`` reads ``node`` in some argument (value, expected or an
+            # index), and every one of them is wrong for a prefix.
+            return True
+        if user.target in _CUTE_SUBGRAPH_ARG_SLOTS and any(
+            _reaches_atomic_value(placeholder, visited, get_graph)
+            for placeholder in _subgraph_placeholders(user, node, get_graph)
+        ):
+            return True
+        if _reaches_atomic_value(user, visited, get_graph):
+            return True
+    return False
 
 
 def cute_outer_accumulator_node(
