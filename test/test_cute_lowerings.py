@@ -24654,6 +24654,24 @@ def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
 
 
 @onlyBackends(["cute"])
+class TestCuteDebugDtypeAsserts(unittest.TestCase):
+    def test_debug_dtype_asserts_is_refused_up_front(self) -> None:
+        # The setting emits Triton tl.cast / tl.static_assert checks; on CuTe
+        # they used to reach the DSL compile as a NameError for ``tl``.
+        @helion.kernel(backend="cute", autotune_effort="none", debug_dtype_asserts=True)
+        def scaled(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = torch.sigmoid(x[tile]) * 2
+            return out
+
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, r"debug_dtype_asserts=True \(it emits Triton"
+        ):
+            scaled(torch.randn(64, device=DEVICE))
+
+
+@onlyBackends(["cute"])
 class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
     """Synthetic-lane K matmul fold through leading-dim permutes, and demotion
     of tile blocks that would need a fourth CUDA thread axis."""

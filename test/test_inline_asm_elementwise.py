@@ -16,6 +16,14 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+# The call each backend lowers hl.inline_asm_elementwise to.
+_INLINE_ASM_CALL = (
+    "_cute_inline_asm_elementwise"
+    if _get_backend() == "cute"
+    else "tl.inline_asm_elementwise"
+)
 
 # Two f32 lanes per asm invocation, the same PTX examples/blackwell_attention.py uses.
 _MUL_F32X2_ASM = """
@@ -29,7 +37,7 @@ _MUL_F32X2_ASM = """
 """
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
@@ -59,7 +67,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         x = torch.randint(0, 100, [16], device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(kernel_simple_asm, (x,))
         torch.testing.assert_close(result, x)
-        self.assertIn("tl.inline_asm_elementwise", code)
+        self.assertIn(_INLINE_ASM_CALL, code)
 
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
@@ -98,7 +106,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         # Expected: (y << n) | (x >> (32 - n))
         expected = (y << n) | (x >> (32 - n))
         torch.testing.assert_close(result, expected)
-        self.assertIn("tl.inline_asm_elementwise", code)
+        self.assertIn(_INLINE_ASM_CALL, code)
 
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"

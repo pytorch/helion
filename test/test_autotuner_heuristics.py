@@ -11374,6 +11374,8 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
     # Ref eager binding builds no device IR; the child always binds normally.
     environment.pop("HELION_INTERPRET", None)
+    # CuTe refuses debug_dtype_asserts, which the dtype-asserts CI job exports.
+    environment.pop("HELION_DEBUG_DTYPE_ASSERTS", None)
     result = subprocess.run(
         [
             sys.executable,

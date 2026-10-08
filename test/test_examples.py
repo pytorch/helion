@@ -39,7 +39,6 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -48,6 +47,11 @@ from helion.runtime.ref_mode import is_ref_mode_enabled
 
 _orig_cudnn_fp32_precision: str = "none"
 _orig_float32_matmul_precision: str = "none"
+
+_CUTE_LINEAR_ATTN_SKIP = (
+    "[C, C] intra-chunk tiles (causal mask, q @ k^T, hl.zeros([t, C, C])) bind "
+    "one block id to two axes; cute's SIMT lowering has one lane per block id"
+)
 
 
 def _compile_only(
@@ -345,7 +349,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute", "triton"])
     def test_matmul_layernorm_half_dtype_multi_k_tile(self):
         """Guards K-loop accumulator precision when inputs are half-precision.
 
@@ -370,7 +374,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul_layernorm",
             args,
             expected,
-            block_sizes=[32, 256],
+            # [32, 256] keeps a whole [32, 1024] fp32 accumulator per program,
+            # which overflows Triton's shared memory and is refused by CuTe;
+            # [16, 16] still accumulates 64 K tiles.
+            block_sizes=[32, 256] if _get_backend() == "pallas" else [16, 16],
             static_shapes=True,
             atol=0.02,
             rtol=0.2,
@@ -391,8 +398,11 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfFn(
         lambda: _get_backend() == "cute",
-        "CuTe lane reduction over a dynamic-shape full-slice N (400) is nested in "
-        "a different lane owner (BackendUnsupported); static shapes are covered",
+        "N=400 is not a power of two (static shapes fail too): the padded "
+        "full-slice N (512) and the row reduction over n get two reduction "
+        "dims, so the reduction's lane owner is not the loop producing its "
+        "input (BackendUnsupported: reduction marker is nested in a different "
+        "lane owner); test_matmul_layernorm_static_shapes covers N=512",
     )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
@@ -668,33 +678,41 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @parametrize("reduction_block_size", (32, 1024))
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("Test requires compiling a specific reduction config")
-    @skipUnlessTensorDescriptor("Test configs require tensor descriptor support")
+    @skipIfFn(
+        lambda: _get_backend() != "cute" and not _compat.supports_tensor_descriptor(),
+        "Test configs require tensor descriptor support",
+    )
     def test_welford_bfloat16_accuracy(self, reduction_block_size):
         from examples.welford import eager_layer_norm
         from examples.welford import welford
 
-        config = helion.Config(
-            atomic_indexing=[],
-            block_sizes=[16, reduction_block_size, 256],
-            indexing=[
-                "pointer",
-                "pointer",
-                "pointer",
-                "tensor_descriptor",
-                "pointer",
-            ],
-            load_eviction_policies=["last", "first", "", "last"],
-            num_stages=1,
-            num_warps=4,
-            pid_type="flat",
-            range_flattens=[None, None, None],
-            range_multi_buffers=[None, None, None],
-            range_num_stages=[0, 0, 0],
-            range_unroll_factors=[0, 0, 0],
-        )
+        if _get_backend() == "cute":
+            # The Triton config below pins Triton-only knobs (indexing,
+            # num_warps, range hints); cute checks the same reduction tiling.
+            config = helion.Config(block_sizes=[16, reduction_block_size, 256])
+        else:
+            config = helion.Config(
+                atomic_indexing=[],
+                block_sizes=[16, reduction_block_size, 256],
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                ],
+                load_eviction_policies=["last", "first", "", "last"],
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_flattens=[None, None, None],
+                range_multi_buffers=[None, None, None],
+                range_num_stages=[0, 0, 0],
+                range_unroll_factors=[0, 0, 0],
+            )
 
         torch.manual_seed(1337)
         rows, columns = 4096, 1024
@@ -3165,90 +3183,70 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
 

@@ -200,6 +200,16 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def supports_debug_dtype_asserts(self) -> bool:
+        """Whether ``Settings.debug_dtype_asserts`` can run on this backend.
+
+        The setting emits Triton ``tl.cast`` / ``tl.static_assert`` checks
+        after every device node, so only backends that generate Triton support
+        it.
+        """
+        return False
+
+    @property
     def supports_eager_prepared_call(self) -> bool:
         """Whether eager calls may reuse a resolved ``BoundKernel`` directly.
 

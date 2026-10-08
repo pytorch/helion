@@ -12,7 +12,7 @@ import torch
 
 from helion.runtime.settings import _get_backend
 
-if _get_backend() not in ("triton", "tileir"):
+if _get_backend() not in ("triton", "tileir", "cute"):
     raise unittest.SkipTest("triton not available")
 
 import triton.runtime.interpreter as triton_interpreter
@@ -23,13 +23,17 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 import helion.language as hl
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
+# TRITON_INTERPRET runs the Triton interpreter; a CuTe kernel never sees it.
+_TRITON_INTERPRET_ONLY = "TRITON_INTERPRET only affects Triton kernels"
 
-@onlyBackends(["triton"])
+
+@onlyBackends(["triton", "cute"])
 class TestBreakpoint(RefEagerTestDisabled, TestCase):
     @staticmethod
     @contextmanager
@@ -103,6 +107,7 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
     def test_device_breakpoint_no_interpret(self) -> None:
         self._run_device_breakpoint_test(triton_interpret=0, helion_interpret=0)
 
+    @skipIfCute(_TRITON_INTERPRET_ONLY)
     @unittest.skipUnless(
         hasattr(triton_interpreter, "_MISSING"),
         "https://github.com/triton-lang/triton/pull/8735",
@@ -133,6 +138,7 @@ class TestBreakpoint(RefEagerTestDisabled, TestCase):
     def test_host_breakpoint_no_interpret(self) -> None:
         self._run_host_breakpoint_test(triton_interpret=0, helion_interpret=0)
 
+    @skipIfCute(_TRITON_INTERPRET_ONLY)
     @unittest.skipUnless(
         hasattr(triton_interpreter, "_MISSING"),
         "https://github.com/triton-lang/triton/pull/8735",
