@@ -1592,6 +1592,7 @@ class CuteBackend(Backend):
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
                 "cute_fragment_atomic_consumer_fusion",
+                "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
                 "cute_fragment_warp_results",

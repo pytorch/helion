@@ -21,9 +21,13 @@ KEY = "cute_fragment_bounded_gather"
 
 
 def bounded_gather_roots(
-    env: CompileEnvironment, device_ir: DeviceIR
+    env: CompileEnvironment, device_ir: DeviceIR, *, allow_unbound: bool = False
 ) -> frozenset[int]:
-    """The complete root proof, shared by explicit dependent capabilities."""
+    """The complete root proof, shared by explicit dependent capabilities.
+
+    Discovery may use registered live alias facts before binding snapshots them.
+    Code generation and other callers keep requiring immutable bound facts.
+    """
     from ..cute.bounded_gather import prove_gather
     from ..cute.computed_fragment import computed_fragment_supported
 
@@ -33,12 +37,15 @@ def bounded_gather_roots(
     with host:
         for root, graphs in fragment_root_regions(device_ir):
             if not any(
-                prove_gather(env, node, graphs=graphs) is not None
+                prove_gather(env, node, graphs=graphs, allow_unbound=allow_unbound)
+                is not None
                 for info in graphs
                 for node in info.graph.nodes
             ):
                 continue
-            if computed_fragment_supported(env, graphs, bounded_gather_owned=True):
+            if computed_fragment_supported(
+                env, graphs, bounded_gather_owned=True, allow_unbound=allow_unbound
+            ):
                 roots.add(root)
     return frozenset(roots)
 
@@ -51,7 +58,7 @@ class CuteFragmentBoundedGatherHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        roots = bounded_gather_roots(env, device_ir)
+        roots = bounded_gather_roots(env, device_ir, allow_unbound=True)
         env.config_spec.cute_fragment_bounded_gather_root_ids = frozenset(roots)
         return frozenset({"input_tensor_metadata"}) if roots else frozenset()
 

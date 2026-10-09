@@ -765,6 +765,51 @@ class CompileEnvironment:
             and (storage_offset * fake_tensor.element_size()) % 16 == 0
         )
 
+    def _tensor_input_storage_owners(
+        self, fake_tensor: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, Source], ...]:
+        """Trace an exact view to inputs sharing its storage, not disjoint inputs.
+
+        This is provenance only. Different fake storages do not establish any
+        runtime alias fact. Static/exact layouts retain the traced view/copy
+        decision when a bound kernel is reused.
+        """
+        if (
+            not (
+                self.settings.static_shapes
+                or self.tensor_layout_is_symbolically_exact(fake_tensor)
+            )
+            or not all(isinstance(value, int) for value in fake_tensor.size())
+            or not all(isinstance(value, int) for value in fake_tensor.stride())
+        ):
+            return ()
+        return tuple(
+            (tensor, source)
+            for tensor, source in self.input_sources.items()
+            if tensor.untyped_storage() == fake_tensor.untyped_storage()
+        )
+
+    def tensor_storage_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
+        """Find a unique input owner for a whole-storage runtime predicate.
+
+        Unlike pointer alignment, storage-span disjointness also applies to
+        nonzero-offset views. The caller must still establish its registered,
+        cache-key-backed runtime predicate on the returned input Source.
+        """
+        source = self.tensor_input_source(fake_tensor)
+        if source is not None and _is_supported_tensor_input_source(source):
+            return source
+        owners = self._tensor_input_storage_owners(fake_tensor)
+        if len(owners) != 1:
+            return None
+        tensor, source = owners[0]
+        if (
+            id(tensor) in self._ambiguous_tensor_input_source_ids
+            or not _is_supported_tensor_input_source(source)
+        ):
+            return None
+        return source
+
     def tensor_alignment_owner(
         self, fake_tensor: torch.Tensor
     ) -> tuple[Source, int] | None:
@@ -797,9 +842,8 @@ class CompileEnvironment:
 
         owners = tuple(
             (tensor, candidate)
-            for tensor, candidate in self.input_sources.items()
-            if tensor.untyped_storage() == fake_tensor.untyped_storage()
-            and is_zero_offset(tensor)
+            for tensor, candidate in self._tensor_input_storage_owners(fake_tensor)
+            if is_zero_offset(tensor)
             and _is_supported_tensor_input_source(candidate)
             and id(tensor) not in self._ambiguous_tensor_input_source_ids
         )
