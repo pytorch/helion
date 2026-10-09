@@ -23,6 +23,51 @@ to benchmark in-process.
    :show-inheritance:
 ```
 
+## Choosing a source-optimization handoff point
+
+`find_handoff` runs an autotuner until a user-selected stopping point or search
+completion, then confirms a starting kernel for source optimization. It is
+opt-in; ordinary `autotune()` calls are unchanged.
+
+```python
+from helion.autotuner import HandoffPolicy, LFBOTreeSearch, find_handoff
+
+bound = kernel.bind(args)
+point = find_handoff(
+    LFBOTreeSearch(bound, args),
+    HandoffPolicy(after_trials=100),
+)
+# point.config and point.fn identify the selected starting kernel.
+# point.measurements retains search trials and fresh confirmation measurements.
+```
+
+Use `HandoffPolicy(after_trials=100)`, `HandoffPolicy(after_seconds=60)`, or
+`HandoffPolicy(callback=lambda progress: ...)` for explicit control. The default
+`HandoffPolicy()` waits for search completion. Enabled triggers are alternatives;
+limits are checked after each completed benchmark batch and can overrun by that
+batch. Trials include rejected candidates. Hybrid stages share one counter and
+one stop. Callbacks receive a frozen progress snapshot; distributed runs invoke
+them on each rank and synchronize the decision.
+
+If `autotune_baseline_fn` triggers autotuning of another Helion kernel, those
+trials share the handoff session and can interfere with selection.
+
+Multi-shape searches count the combined source identity across all shapes and
+preserve their aggregate objective.
+
+Selection rechecks correctness and benchmarks up to `finalists=5` distinct
+sources, plus the returned config, using `repetitions=3` fresh passes with rotating
+order. It chooses the lowest median among candidates that pass every repetition.
+Final confirmation after stopping can extend the time limit. Confirmation does
+not count as exploration. A cache-wrapped search is also accepted: cache hits are
+confirmed and report `"completed"` with zero search trials. Completed searches
+retain normal cache behavior; early handoff unwinds before the cache write.
+
+The returned `HandoffPoint` includes the reason, callable, config, finalist
+samples, and trial history. `autotune_log_details` records handoff and confirmation
+events in the existing trace. This API selects the starting point; agent execution
+and source editing are separate steps.
+
 ## Configuration Classes
 
 ### Config
