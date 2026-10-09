@@ -401,15 +401,21 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                 )
                 if (site_id := site_ids.get(0)) is not None:
                     setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
+            from .cute.integer_loop_reduction import prepare
+
+            device_loop.integer_reduction_hoist = prepare(self, state, device_loop)
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
             ):
-                return codegen_call_with_graph(
+                result = codegen_call_with_graph(
                     state.codegen,
                     self.graph,
                     args,
                 )
+                if device_loop.integer_reduction_hoist is not None:
+                    device_loop.integer_reduction_hoist.finish(result)
+                return result
         finally:
             # pyrefly: ignore [missing-attribute]
             state.codegen._cute_active_graph_info = previous_active_graph_info
