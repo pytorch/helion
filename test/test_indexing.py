@@ -3602,13 +3602,6 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
         ),
     ):
         bound = _cpu_bind(kernel, (torch.ones(3, 65), stepped))
-        first = bound.host_function.local_types["first"].proxy()
-        second = bound.host_function.local_types["second"].proxy()
-        assert first is not second
-        assert first.untyped_storage() != second.untyped_storage()
-        with bound.env, bound.host_function:
-            assert not bound.env.known_equal(first.size(-1), 1)
-            assert not bound.env.known_equal(second.size(-1), 1)
         loads = [
             node
             for graph in bound.host_function.device_ir.graphs
@@ -3618,7 +3611,16 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
                 isinstance(k, slice) and (k.step == 2) == stepped for k in node.args[1]
             )
         ]
-        assert {node.args[0].args[0] for node in loads} == {"first", "second"}
+        # Read the captured allocation tensors: Triton can discard their
+        # names from the host-local table after tracing the device roots.
+        buffers = {node.args[0].args[0]: node.args[0].meta["val"] for node in loads}
+        assert set(buffers) == {"first", "second"}
+        first, second = buffers["first"], buffers["second"]
+        assert first is not second
+        assert first.untyped_storage() != second.untyped_storage()
+        with bound.env, bound.host_function:
+            assert not bound.env.known_equal(first.size(-1), 1)
+            assert not bound.env.known_equal(second.size(-1), 1)
         for block in (16, 32, 128):
             config = bound.config_spec.default_config()
             config.config["pid_type"] = (
