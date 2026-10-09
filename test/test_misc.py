@@ -1179,8 +1179,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
         if _get_backend() == "triton":
-            # Uses tl.sort for largest=False (tl.topk only supports largest=True)
-            self.assertIn("tl.sort", code)
+            # Inverted ordered keys use the same descending top-k primitive.
+            self.assertIn("tl.topk", code)
 
     def test_profiler_does_not_concretize_block_vars(self):
         """Compiling a kernel inside a torch.profiler context must not
