@@ -1,7 +1,7 @@
 name: Build and install torch_tpu
 description: >
   Install jax/libtpu, build the torch_tpu wheel from the pinned commit
-  (.github/ci_commit_pins/torch_tpu.txt), install it, and verify torch.tpu is
+  (.github/ci_commit_pins/torch_tpu.txt), install it, and verify torch_tpu is
   available. Assumes a uv-managed .venv with the pinned PyTorch already
   installed (see the install-pytorch-for-torchtpu action).
 runs:
@@ -16,7 +16,7 @@ runs:
           --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
           --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
           --pre \
-          'jax==0.11.2' 'jaxlib==0.11.2' 'libtpu==0.0.48' 'tpu-info==0.14.2' 'jaxtyping' 'frozendict' 'immutabledict'
+          'jax==0.11.2' 'jaxlib==0.11.2' 'libtpu==0.0.50' 'tpu-info==0.14.2' 'jaxtyping' 'frozendict' 'immutabledict'
         # Install Bazel
         if ! command -v bazel &> /dev/null; then
           sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -63,4 +63,4 @@ runs:
         cd -
         rm -rf /tmp/torch_tpu
         # Verify
-        python -c "import torch, sys; print('Success') if torch.tpu.is_available() else (print('(Torch)TPU not available'), sys.exit(1))"
+        python -c "import torch, sys; print('Success') if torch.accelerator.is_available() else (print('(Torch)TPU not available'), sys.exit(1))"

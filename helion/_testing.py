@@ -590,7 +590,7 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
         try:
             from jax.experimental import pallas  # noqa: F401
 
-            return hasattr(torch, "tpu") and torch.tpu.is_available()
+            return hasattr(torch, "tpu") and torch.accelerator.is_available()
         except Exception:
             return False
 
