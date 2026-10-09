@@ -50,6 +50,7 @@ from helion._compiler.cute.aten_lowering import codegen_unsqueeze_cute
 from helion._compiler.cute.aten_lowering import codegen_view_cute
 from helion._compiler.cute.backend import _detect_mma_loop
 from helion._compiler.cute.backend import _loop_may_use_mma
+from helion._compiler.cute.backend import validate_thread_axis_accesses
 from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
@@ -24695,8 +24696,14 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
             backend.thread_index_expr(axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
+        # Root ownership may discard a speculative grid coordinate. Validate
+        # the surviving expression, and allow an elided singleton coordinate.
+        index = backend.grid_index_expr("offset", "bs", "cutlass.Int32", axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
-            backend.grid_index_expr("offset", "bs", "cutlass.Int32", axis=3)
+            validate_thread_axis_accesses(ast.parse(f"index = {index}").body)
+        singleton = backend.grid_index_expr("offset", "1", "cutlass.Int32", axis=3)
+        self.assertEqual(singleton, "offset")
+        validate_thread_axis_accesses(ast.parse(f"index = {singleton}").body)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.thread_in_tile_mask_expr("bs", axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
