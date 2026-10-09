@@ -604,6 +604,9 @@ class TritonBackend(Backend):
                 graph = HostFunction.current().device_ir.tile_dependency_graph
                 assert graph is not None
                 out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
+        env = CompileEnvironment.current()
+        if env.pdl_entry or env.pdl_exit:
+            out.append("launch_pdl=True")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="

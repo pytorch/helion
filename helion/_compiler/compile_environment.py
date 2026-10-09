@@ -34,6 +34,7 @@ from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils import _pytree as pytree
 
 from .. import exc
+from .._compat import is_hip
 from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
@@ -565,6 +566,9 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+        # hl.pdl_* ops in source order, run at kernel entry or exit.
+        self.pdl_entry: list[str] = []
+        self.pdl_exit: list[str] = []
 
     def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
@@ -1939,6 +1943,13 @@ class CompileEnvironment:
     @property
     def codegen_name(self) -> str:
         return self._backend.codegen_name
+
+    @property
+    def ptx_capability(self) -> tuple[int, int] | None:
+        """Compute capability when the kernel lowers to NVIDIA PTX, else None."""
+        if self.backend_name != "triton" or is_hip():
+            return None
+        return self.config_spec.target_device_capability
 
     def index_type(self) -> str:
         """Backend-specific index type string based on Settings()."""

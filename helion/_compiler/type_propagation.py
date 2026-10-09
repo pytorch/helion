@@ -36,6 +36,7 @@ from .type_info import LiteralType
 from .type_info import NestedFunctionType
 from .type_info import NoType
 from .type_info import NumericType
+from .type_info import PdlResultType
 from .type_info import SequenceType
 from .type_info import SliceType
 from .type_info import StackTensorType
@@ -208,6 +209,8 @@ class TypePropagation(ast.NodeVisitor):
         self.scope = scope
         self.device_loop_depth = 0
         self.device_loop_count = 0
+        # Names bound inside device code; they never exist on the host.
+        self.device_names: set[str] = set()
 
     def push_scope(self) -> None:
         self.scope = LocalScope(parent=self.scope)
@@ -462,6 +465,8 @@ class TypePropagation(ast.NodeVisitor):
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )
 
+            if self.device_loop_depth > 0:
+                self.device_names.add(lhs.id)
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:
@@ -1068,7 +1073,15 @@ class TypePropagation(ast.NodeVisitor):
                 raise exc.DeviceLoopElseBlock(fn.__qualname__)
 
             if self.device_loop_depth == 0:
-                self.func.set_local_types(parent_scope.extract_locals())
+                # A one-element list's loop variable leaked from an earlier root
+                # keeps that element's host origin; it is still not a host name.
+                self.func.set_local_types(
+                    {
+                        name: type_info
+                        for name, type_info in parent_scope.extract_locals().items()
+                        if name not in self.device_names
+                    }
+                )
                 node._loop_type = LoopType.GRID
                 node._root_id = self.device_loop_count
                 self.device_loop_count += 1
@@ -1386,6 +1399,36 @@ def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
             host_stmt_after_loop = True
 
 
+def _place_pdl_ops(body: list[ast.stmt]) -> None:
+    """Run top level hl.pdl_* ops at entry if they precede the loops, else at exit."""
+    env = CompileEnvironment.current()
+    seen_loop = False
+    for stmt in body:
+        if isinstance(stmt, ast.For):
+            seen_loop = True
+            continue
+        ops = [
+            node
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            and isinstance(node, ExtendedAST)
+            and isinstance(node._type_info, PdlResultType)
+        ]
+        if not ops:
+            continue
+        # A nested op (e.g. under a host if) would silently not run.
+        if not isinstance(stmt, ast.Expr) or ops != [stmt.value]:
+            raise exc.PdlPlacement
+        op = ops[0]._type_info
+        assert isinstance(op, PdlResultType) and isinstance(op.value, str)
+        if seen_loop and op.value == "wait":
+            raise exc.PdlPlacement
+        # griddepcontrol needs sm_90; older targets run in plain stream order.
+        capability = env.ptx_capability
+        if capability is not None and capability >= (9, 0):
+            (env.pdl_exit if seen_loop else env.pdl_entry).append(op.value)
+
+
 def propagate_types(func: HostFunction) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
     with compile_lock, func, enable_python_dispatcher():
@@ -1393,3 +1436,4 @@ def propagate_types(func: HostFunction) -> None:
         for stmt in func.body:
             prop.visit(stmt)
         _check_no_stmts_between_loops(func.body)
+        _place_pdl_ops(func.body)

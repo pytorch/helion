@@ -2343,6 +2343,28 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, x[10:])
 
+    @onlyBackends(["triton"])
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
+    @unittest.skipIf(
+        get_tensor_descriptor_fn_name() == "tl._experimental_make_tensor_descriptor",
+        "Experimental descriptors keep a per-dim block minimum",
+    )
+    def test_tensor_descriptor_batch_block_under_16_bytes(self):
+        # Leading batch dims of the box need not span 16 bytes.
+        @helion.kernel(static_shapes=True)
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_a, tile_b, tile_c in hl.tile(x.size()):
+                out[tile_a, tile_b, tile_c] = x[tile_a, tile_b, tile_c]
+            return out
+
+        x = torch.randint(0, 255, [4, 16, 64], dtype=torch.uint8, device=DEVICE)
+        code, result = code_and_output(
+            copy, (x,), block_sizes=[2, 16, 64], indexing="tensor_descriptor"
+        )
+        torch.testing.assert_close(result, x)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfTileIR(
         "TileIR does not support descriptor with index not multiple of tile size"

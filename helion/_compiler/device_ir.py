@@ -1848,6 +1848,8 @@ class WalkDeviceAST(NodeVisitor):
                 if k in writes
                 and (include_new or k in self.scope)
                 and self.scope.get(k) is not v
+                # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
+                and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
             }
         )
 
@@ -3775,9 +3777,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
-                # R5: only the dynamic pipeline has cross-rank transports.
+                # Peer transports order static and dynamic schedules alike; only
+                # static ones mark guard-skipped tasks for inband scatters.
+                graph = device_ir.tile_dependency_graph
+                choices = ("static", "dynamic") if cross_rank else None
+                if any(
+                    graph.scatter_position(allocation_id) is not None
+                    for allocation_id in graph.inband_allocation_ids
+                ):
+                    choices = ("static",)
                 config_spec.enable_cross_loop_pipeline(
-                    choices=("dynamic",) if cross_rank else VALID_CROSS_LOOP_PIPELINES
+                    choices=choices or VALID_CROSS_LOOP_PIPELINES
                 )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
