@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from ...autotuner.compiler_coverage import CompilerCoverageGroup
-from ...autotuner.compiler_coverage import CoverageWitness
-from ...exc import InvalidConfig
-from ...runtime.config import Config
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
+from .cute_fragment_common import register_fragment_boolean_coverage
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
@@ -60,29 +58,8 @@ def register_fragment_published_scalars_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_published_scalar_root_ids:
         return
-    generation = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = generation.canonicalize_flat(generation.default_flat())
-        generation.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     spec.cute_fragment_published_scalars_search_enabled = True
-    generation = spec.create_config_generation()
-    effective = Config.from_dict(deepcopy(carrier.config))
-    try:
-        generation.strict_config_pair(Config.from_dict(effective.config | {KEY: True}))
-    except InvalidConfig:
-        return
-    spec.register_compiler_coverage_group(
-        CompilerCoverageGroup(
-            mechanism="cute.fragment_published_scalars",
-            version=1,
-            key=KEY,
-            domain=(False, True),
-            legacy=False,
-            witnesses=(CoverageWitness(effective, True),),
-            deferred=True,
-        )
-    )
+    register_fragment_boolean_coverage(spec, KEY, carrier)

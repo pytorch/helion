@@ -10,6 +10,7 @@ from ...autotuner.compiler_coverage import CoverageDependency
 from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -60,13 +61,8 @@ def register_fragment_integer_atomic_epochs_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_integer_atomic_epochs_root_ids:
         return
-    previous = spec.create_config_generation()
-    try:
-        carrier = resource_carrier
-        if carrier is None:
-            _, carrier = previous.canonicalize_flat(previous.default_flat())
-        previous.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec, resource_carrier)
+    if carrier is None:
         return
     # The existing lane-private load proof removes shared input staging. Couple
     # only the new deferred witness to that storage choice; old seeds stay as-is.

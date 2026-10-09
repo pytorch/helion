@@ -13,6 +13,7 @@ from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..inductor_lowering import ReductionLowering
 from .cute_fragment_common import computed_fragment_discovery_supported
+from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
 from .registry import AutotunerHeuristic
 
@@ -101,11 +102,8 @@ def register_fragment_reduction_coverage(
     spec = env.config_spec
     if not spec.cute_fragment_reduction_root_ids:
         return
-    previous = spec.create_config_generation()
-    try:
-        _, carrier = previous.canonicalize_flat(previous.default_flat())
-        previous.strict_config_pair(carrier)
-    except InvalidConfig:
+    carrier = fragment_coverage_carrier(spec)
+    if carrier is None:
         return
     spec.cute_fragment_reduction_search_enabled = True
     generation = spec.create_config_generation()
