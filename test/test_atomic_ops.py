@@ -8620,7 +8620,14 @@ class TestFragmentAtomicConsumerFusionCPU(unittest.TestCase):
             static_shapes=True,
             autotune_effort="full",
         )
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_packet_loads_coverage"
+            ),
+        ):
             bound = _cpu_bind(kernel, args)
             default = bound.config_spec.default_config()
             self.assertNotIn(key, default)
