@@ -61,6 +61,38 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
+    """Reject live invalid CUDA coordinates after owned-root scaffolding DCE."""
+    nodes = [node for statement in statements for node in ast.walk(statement)]
+
+    def thread_tuple(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "cute.arch.thread_idx"
+        ) or (isinstance(node, ast.Name) and node.id in aliases)
+
+    aliases: set[str] = set()
+    while True:
+        previous = len(aliases)
+        for node in nodes:
+            if isinstance(node, ast.Assign) and thread_tuple(node.value):
+                aliases.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+        if len(aliases) == previous:
+            break
+    for node in nodes:
+        if not isinstance(node, ast.Subscript) or not thread_tuple(node.value):
+            continue
+        axis = node.slice
+        if not (
+            isinstance(axis, ast.Constant)
+            and type(axis.value) is int
+            and 0 <= axis.value < 3
+        ):
+            raise exc.BackendUnsupported("cute", f"thread axis {ast.unparse(axis)}")
+
+
 def _live_grid_thread_extents(
     statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
 ) -> dict[int, int]:
@@ -360,6 +392,10 @@ def _pointwise_grid_thread_dims(
         or has_synthetic_free_axes
     ):
         return None
+    if any(axis < 0 or axis >= 3 for axis in final_thread_axes | live_extents.keys()):
+        raise exc.BackendUnsupported(
+            "cute", "pointwise grid requires more than three physical thread axes"
+        )
     if any(referenced_dims[axis] > live_extents[axis] for axis in final_thread_axes):
         # A larger reference is not evidence that every producer has a surplus
         # mask. Do not add duplicate/out-of-tile writers to satisfy it.
@@ -1248,6 +1284,16 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    def build_standalone_code(
+        self,
+        bound: BoundKernel[Any],
+        import_lines: list[str],
+        body_root: ast.Module,
+    ) -> ast.Module:
+        from .standalone import build_standalone_code
+
+        return build_standalone_code(bound, import_lines, body_root)
+
     def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
         from ..compile_environment import CompileEnvironment
         from .grouped_row_union import physical_schedule
@@ -1367,9 +1413,15 @@ class CuteBackend(Backend):
         return priors
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from ..aten_lowering import squeeze_lowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
+            # These overloads have the same logical-view semantics as squeeze.dim.
+            # Register them before Inductor turns them into a ReinterpretView;
+            # the CuTe handler uses the traced output shape, not a scalar dim.
+            return squeeze_lowering
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -1525,6 +1577,28 @@ class CuteBackend(Backend):
                 "cute_host_paired_sum",
                 "cute_materialized_schedule",
                 "cute_materialized_operand_schedule",
+                "cute_fragment_scan",
+                "cute_fragment_reduction",
+                "cute_fragment_threads",
+                "cute_fragment_register_loads",
+                "cute_fragment_producer_cache",
+                "cute_fragment_warp_scan",
+                "cute_fragment_atomic_aggregation",
+                "cute_fragment_integer_atomic_epochs",
+                "cute_fragment_local_atomic_registers",
+                "cute_fragment_register_snapshots",
+                "cute_fragment_register_producers",
+                "cute_fragment_scan_exports",
+                "cute_fragment_warp_producer_regions",
+                "cute_fragment_bounded_gather",
+                "cute_fragment_published_scalars",
+                "cute_fragment_skip_zero_atomics",
+                "cute_fragment_atomic_consumer_fusion",
+                "cute_fragment_pure_producer_regions",
+                "cute_integer_loop_reduction",
+                "cute_fragment_packet_loads",
+                "cute_fragment_warp_results",
+                "cute_fragment_private_scalar_loops",
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
@@ -1876,6 +1950,7 @@ class CuteBackend(Backend):
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
+            "_cute_python_mod": "from helion._compiler.cute.integer_helpers import python_mod as _cute_python_mod",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
@@ -1900,6 +1975,7 @@ class CuteBackend(Backend):
             "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
             "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
             "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_scalar_policy_load": "from helion._compiler.cute.l2_policy import scalar_policy_load as _cute_scalar_policy_load",
             "_cute_load_l1_l2_evict_first": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_first as _cute_load_l1_l2_evict_first",
             "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",
             "_cute_load_l1_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_last as _cute_load_l1_l2_evict_last",
@@ -2129,6 +2205,20 @@ class CuteBackend(Backend):
 
             @staticmethod
             def remainder(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    expected is not None
+                    and not expected.dtype.is_floating_point
+                    and expected.dtype != torch.bool
+                ):
+                    # TensorIterator first converts wrapped scalar operands to
+                    # the logical promoted tensor dtype. Keep this distinct
+                    # from scalar PythonMod's ordinary Python/SDK promotion.
+                    left = CuteDSLOpOverrides._cast_expr("{a}", expected.dtype)
+                    right = CuteDSLOpOverrides._cast_expr("{b}", expected.dtype)
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, f"_cute_python_mod({left}, {right})"
+                    )
                 return HelionCuteDSLOpOverrides.mod(a, b)
 
             @staticmethod
@@ -2240,7 +2330,8 @@ class CuteBackend(Backend):
     ) -> str:
         if block_size_var == "1":
             return offset_var
-        self._check_thread_axis(axis)
+        # Root emitters may replace the entire scalar schedule, making this
+        # index dead. Validate surviving coordinates after final codegen/DCE.
         return f"{offset_var} + {dtype}(cute.arch.thread_idx()[{axis}])"
 
     def loop_index_expr(
@@ -2383,6 +2474,17 @@ class CuteBackend(Backend):
         val = self.cast_expr(val, self.dtype_str(dtype))
         if reduction_type == "sum":
             return f"({acc} + {val})"
+        if reduction_type in ("min", "max") and dtype == torch.int32:
+            # Preserve signed ordering through unsigned keys. The CUDA compiler
+            # can lose a source negation when combining a signed Int32 extrema
+            # chain into VIMNMX3. Flipping the sign bit is an exact order
+            # isomorphism and avoids that invalid signed fusion.
+            sign_bit = "cutlass.Uint32(2147483648)"
+            lhs = f"(cutlass.Uint32({acc}) ^ {sign_bit})"
+            rhs = f"(cutlass.Uint32({val}) ^ {sign_bit})"
+            return (
+                f"cutlass.Int32(cute.math.{reduction_type}({lhs}, {rhs}) ^ {sign_bit})"
+            )
         if reduction_type == "max":
             return f"({acc}) if ({acc}) > ({val}) else ({val})"
         if reduction_type == "min":
@@ -2670,6 +2772,7 @@ class CuteBackend(Backend):
 
         register_chain_block_dims = (
             device_function.cute_state.collective_register_chain_block_dims
+            or device_function.cute_state.owned_root_block_dims
         )
         if register_chain_block_dims is not None:
             return launcher_args_with_compile_options(
@@ -3315,8 +3418,13 @@ class CuteBackend(Backend):
         device_ir = HostFunction.current().device_ir
         block_size_infos = [env.block_sizes[i] for i in block_ids]
         flattened = block_size_infos[0].is_flattened(config)
-        loop_order = env.config_spec.loop_orders.config_get(
-            config.loop_orders, block_ids[0]
+        # A registered tile can also appear in a multidimensional loop.
+        # Its permutation applies only there; a one-dimensional loop has
+        # no order to configure.
+        loop_order = (
+            env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
+            if len(block_ids) > 1
+            else None
         ) or [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1

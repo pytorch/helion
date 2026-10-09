@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 import contextlib
+from contextvars import ContextVar
 import csv
+import datetime
 import hashlib
 import io
 import itertools
@@ -11,8 +14,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from types import TracebackType
@@ -24,12 +29,15 @@ from typing import Literal
 from typing import NamedTuple
 from typing import TypeAlias
 from typing import TypeVar
+from typing import cast
 from typing_extensions import Self
+from uuid import uuid4
 
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 from torch.cuda import OutOfMemoryError as CudaOOMError
 
+from .search_space_logger import canonical_config_id
 from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
@@ -38,6 +46,8 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .handoff import HandoffMeasurement
+    from .handoff import HandoffPoint
     from .metrics import KernelMetadata
 
 else:
@@ -69,6 +79,33 @@ _AUTOTUNE_SOURCE_CSV_FIELDS = (
     "status",
     "source_hash",
 )
+
+_active_trace: ContextVar[_AutotuneTrace | None] = ContextVar(
+    "helion_autotune_trace", default=None
+)
+
+
+@contextlib.contextmanager
+def _logging_errors() -> Iterator[None]:
+    """Keep logging failures out of the search, including during cleanup."""
+    try:
+        yield
+    except Exception:
+        # Reporting the error must also tolerate a broken logging handler.
+        with contextlib.suppress(Exception):
+            logging.getLogger(__name__).exception(
+                "Autotune logging failed; continuing tuning"
+            )
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 class _ElapsedFormatter(logging.Formatter):
@@ -109,8 +146,11 @@ class AutotuningLogger:
         self._extra_handlers: list[logging.Handler] = []
         self._active_handlers: list[logging.Handler] = []
         self._log_sink: AutotuneLogSink | None = None
+        self._trace_sink: _AutotuneTrace | None = None
+        self._trace_algorithm = ""
         self.reset()
 
+    @_logging_errors()
     def reset(self) -> None:
         self._start_time = time.perf_counter()
         for handler in list(self._active_handlers):
@@ -151,33 +191,210 @@ class AutotuningLogger:
         if not path:
             yield None
             return
-        with AutotuneLogSink(path, metadata, collect_dataset) as sink:
+        sink = None
+        with _logging_errors():
+            sink = AutotuneLogSink(path, metadata, collect_dataset)
+            sink.open()
             self._attach_sink(sink)
             sink.start_run()
-            try:
-                yield sink
-            finally:
-                sink.end_run()
+        try:
+            yield self._log_sink
+        finally:
+            with _logging_errors():
                 self._detach_sink()
+            if sink is not None:
+                with _logging_errors():
+                    sink.end_run()
+                with _logging_errors():
+                    sink.close()
 
     def record_autotune_entry(self, entry: AutotuneLogEntry) -> None:
         """Write a structured autotune log entry when a sink is active."""
 
-        if self._log_sink is None:
+        if self._log_sink is not None:
+            with _logging_errors():
+                self._log_sink.record(entry)
+        self.record_trace_entry(entry)
+
+    @_logging_errors()
+    def record_trace_entry(
+        self, entry: AutotuneLogEntry, *, event: str | None = None
+    ) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record_entry(self._trace_algorithm, entry, event=event)
+
+    @property
+    def trace_enabled(self) -> bool:
+        return self._trace_sink is not None
+
+    @_logging_errors()
+    def record_selected_config(self, config: Config) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "selected",
+                self._trace_algorithm,
+                config_id=canonical_config_id(config),
+                config=config.config,
+            )
+
+    @_logging_errors()
+    def record_handoff(self, point: HandoffPoint) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "handoff",
+                self._trace_algorithm,
+                reason=point.reason,
+                config_id=canonical_config_id(point.config),
+                config=point.config.config,
+                source_hash=point.finalists[0].source_hash,
+                objective_unit=point.objective_unit,
+                objective=point.finalists[0].perf,
+                perf_ms=point.finalists[0].perf
+                if point.objective_unit == "ms"
+                else None,
+                trials=point.progress.trials,
+                unique_sources=point.progress.unique_sources,
+                samples=point.finalists[0].samples,
+            )
+
+    @_logging_errors()
+    def record_handoff_event(self, event: str, **fields: object) -> None:
+        """Record native-source progress separately from configuration timings."""
+        if self._trace_sink is not None:
+            self._trace_sink.record(event, "native_source", **fields)
+
+    @_logging_errors()
+    def record_handoff_chat(self, transcript: Path, session_id: str) -> Path | None:
+        """Save each full agent conversation beside the autotune log files."""
+        filename = self._settings.autotune_log
+        if not filename:
+            return None
+        path = (
+            Path(filename).with_suffix(f".handoff.{session_id}.chat.jsonl").absolute()
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(transcript, path)
+        return path
+
+    @_logging_errors()
+    def record_handoff_measurement(
+        self,
+        measurement: HandoffMeasurement,
+        objective_unit: str,
+        *,
+        completed_at: float | None = None,
+    ) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "handoff_confirmation",
+                measurement.algorithm,
+                completed_at=completed_at,
+                config_id=canonical_config_id(measurement.config),
+                config=measurement.config.config,
+                source_hash=measurement.source_hash,
+                status=measurement.status,
+                objective=measurement.perf,
+                objective_unit=objective_unit,
+                per_shape_ms=[
+                    value if math.isfinite(value) else None
+                    for value in measurement.per_shape
+                ],
+                per_shape_statuses=measurement.per_shape_statuses,
+            )
+
+    @_logging_errors()
+    def record_llm_request(self, **fields: object) -> _LLMTraceRequest | None:
+        trace = self._trace_sink
+        if trace is None:
+            return None
+        request = _LLMTraceRequest(trace, self._trace_algorithm, uuid4().hex)
+        trace.record(
+            "llm_request", request.algorithm, request_id=request.request_id, **fields
+        )
+        return request
+
+    @_logging_errors()
+    def record_llm_response(
+        self, request: _LLMTraceRequest | None, **fields: object
+    ) -> None:
+        if request is not None:
+            request.trace.record(
+                "llm_response",
+                request.algorithm,
+                request_id=request.request_id,
+                **fields,
+            )
+
+    @contextlib.contextmanager
+    def autotune_tracing(self, algorithm: str) -> Iterator[None]:
+        """Trace an entire search, sharing the clock across nested search stages."""
+        from .handoff import _HandoffStop
+
+        filename = self._settings.autotune_log
+        if (
+            not self._settings.autotune_log_details
+            or not filename
+            or not is_master_rank()
+        ):
+            yield
             return
-        self._log_sink.record(entry)
+        stack = contextlib.ExitStack()
+        active = None
+        owns_trace = False
+        previous = self._trace_sink, self._trace_algorithm
+        try:
+            with _logging_errors():
+                path = Path(filename).with_suffix(".trace.jsonl").absolute()
+                trace = _active_trace.get()
+                owns_trace = trace is None or trace.path != path
+                if owns_trace:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    file = stack.enter_context(path.open("a", encoding="utf-8"))
+                    trace = _AutotuneTrace(path, file)
+                    token = _active_trace.set(trace)
+                    stack.callback(_active_trace.reset, token)
+                    stack.callback(trace.close)
+                active = trace
+                self._trace_sink, self._trace_algorithm = active, algorithm
+            with _logging_errors():
+                if active is not None:
+                    if owns_trace:
+                        active.record("run_start", algorithm)
+                    active.record("stage_start", algorithm)
+            status = "error"
+            try:
+                yield
+                status = "ok"
+            except _HandoffStop:
+                status = "handoff"
+                raise
+            finally:
+                if active is not None:
+                    with _logging_errors():
+                        active.record("stage_end", algorithm, status=status)
+                    if owns_trace:
+                        with _logging_errors():
+                            active.record("run_end", algorithm, status=status)
+        finally:
+            self._trace_sink, self._trace_algorithm = previous
+            with _logging_errors():
+                stack.close()
 
     def register_config(self, config: Config) -> str | None:
         """Return the content-addressed ``config_id`` (registering it on the sink
         for the ``.meta.jsonl`` record), or ``None`` when no sink is active."""
 
-        if self._log_sink is None:
+        if self._log_sink is None and self._trace_sink is None:
             return None
-        return self._log_sink.register_config(config)
+        with _logging_errors():
+            if self._log_sink is not None:
+                return self._log_sink.register_config(config)
+            return canonical_config_id(config)
+        return ""
 
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
-        self._log_sink = sink
         self.add_handler(sink.handler)
+        self._log_sink = sink
 
     def _detach_sink(self) -> None:
         sink = self._log_sink
@@ -200,6 +417,7 @@ class AutotuningLogger:
     def _make_stream_handler(self) -> logging.Handler:
         return logging.StreamHandler(sys.stderr)
 
+    @_logging_errors()
     def __call__(
         self,
         *msg: str | Callable[[], str],
@@ -301,6 +519,151 @@ class AutotuneLogEntry(NamedTuple):
     config_id: str
     config: Config
     source_hash: str | None = None
+    objective: float | None = None
+    objective_unit: str = "ms"
+    completed_at: float | None = None
+
+
+class _LLMTraceRequest(NamedTuple):
+    trace: _AutotuneTrace
+    algorithm: str
+    request_id: str
+
+
+class _TraceMinimum:
+    """Chronological improvement frontier for measurements already recorded."""
+
+    def __init__(self) -> None:
+        self.points: list[tuple[float, float]] = []
+
+    def best_at(self, timestamp: float) -> float | None:
+        index = bisect_right(self.points, (timestamp, math.inf))
+        return self.points[index - 1][1] if index else None
+
+    def record(self, timestamp: float, value: float | None) -> None:
+        if value is None:
+            return
+        index = bisect_right(self.points, (timestamp, math.inf))
+        if index and self.points[index - 1][1] <= value:
+            return
+        start = index
+        if index and self.points[index - 1][0] == timestamp:
+            start -= 1
+        end = index
+        while end < len(self.points) and self.points[end][1] >= value:
+            end += 1
+        self.points[start:end] = [(timestamp, value)]
+
+
+class _AutotuneTrace:
+    """Append JSON-safe events at observation time, flushing every record.
+
+    ``trial`` rows are terminal candidate outcomes; ``trial_start`` marks actual
+    timing attempts. ``rebenchmark`` rows are subsequent timings used by search.
+    The running best excludes recorded observations completed after the row's
+    timestamp; it is not a claim about the final noise-corrected selection.
+    Failed timings are represented by JSON null.
+    """
+
+    def __init__(self, path: Path, file: io.TextIOWrapper) -> None:
+        self.path = path
+        self.file = file
+        self.run_id = uuid4().hex
+        self.start = time.perf_counter()
+        self.wall_start = time.time()
+        self._best_perf_ms = _TraceMinimum()
+        self._best_objective = _TraceMinimum()
+        self.trial_index = 0
+        # Round zero overlaps the LLM request with seed benchmarking.
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def close(self) -> None:
+        # Stop accepting late LLM callbacks before ExitStack closes the file.
+        with self._lock:
+            self._closed = True
+
+    def record(self, event: str, algorithm: str, **fields: object) -> None:
+        with self._lock:
+            if not self._closed:
+                self._record(event, algorithm, **fields)
+                if event == "run_end":
+                    self._closed = True
+
+    def _record(self, event: str, algorithm: str, **fields: object) -> None:
+        completed_at = cast("float | None", fields.pop("completed_at", None))
+        observed_at = completed_at if completed_at is not None else time.perf_counter()
+        elapsed = observed_at - self.start
+        timestamp = (
+            self.wall_start + elapsed if completed_at is not None else time.time()
+        )
+        if fields.pop("_update_best", False):
+            self._best_perf_ms.record(
+                observed_at, cast("float | None", fields["perf_ms"])
+            )
+            self._best_objective.record(
+                observed_at, cast("float | None", fields["objective"])
+            )
+        row = {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "event": event,
+            "algorithm": algorithm,
+            "timestamp": datetime.datetime.fromtimestamp(
+                timestamp, datetime.timezone.utc
+            ).isoformat(),
+            "timestamp_s": timestamp,
+            "elapsed_s": elapsed,
+            "best_perf_ms": self._best_perf_ms.best_at(observed_at),
+            "best_objective": self._best_objective.best_at(observed_at),
+            **fields,
+        }
+        self.file.write(
+            json.dumps(_json_safe(row), default=str, allow_nan=False) + "\n"
+        )
+        self.file.flush()
+
+    def record_entry(
+        self, algorithm: str, entry: AutotuneLogEntry, *, event: str | None
+    ) -> None:
+        with self._lock:
+            if not self._closed:
+                self._record_entry(algorithm, entry, event=event)
+
+    def _record_entry(
+        self, algorithm: str, entry: AutotuneLogEntry, *, event: str | None
+    ) -> None:
+        event = event or ("trial_start" if entry.status == "started" else "trial")
+        perf_ms = entry.perf_ms
+        if perf_ms is not None and not math.isfinite(perf_ms):
+            perf_ms = None
+        objective = (
+            entry.objective
+            if entry.objective is not None
+            else perf_ms
+            if entry.objective_unit == "ms"
+            else None
+        )
+        if objective is not None and not math.isfinite(objective):
+            objective = None
+        if event == "trial":
+            self.trial_index += 1
+        self.record(
+            event,
+            algorithm,
+            _update_best=entry.status in ("ok", "deduplicated"),
+            completed_at=entry.completed_at,
+            trial_index=self.trial_index if event == "trial" else None,
+            config_id=entry.config_id,
+            config=entry.config.config,
+            generation=entry.generation,
+            status=entry.status,
+            perf_ms=perf_ms,
+            objective=objective,
+            objective_unit=entry.objective_unit,
+            compile_time_s=entry.compile_time,
+            source_hash=entry.source_hash,
+        )
 
 
 class AutotuneLogSink:
@@ -364,19 +727,14 @@ class AutotuneLogSink:
         self._log_handler = handler
 
     def close(self) -> None:
-        if self._csv_file is not None:
-            self._csv_file.flush()
-            self._csv_file.close()
+        for stream in (self._csv_file, self._source_csv_file, self._log_handler):
+            if stream is not None:
+                with _logging_errors():
+                    stream.close()
         self._csv_file = None
         self._csv_writer = None
-        if self._source_csv_file is not None:
-            self._source_csv_file.flush()
-            self._source_csv_file.close()
         self._source_csv_file = None
         self._source_csv_writer = None
-        if self._log_handler is not None:
-            self._log_handler.flush()
-            self._log_handler.close()
         self._log_handler = None
         self._run_start_time = None
         self._configs = {}
@@ -392,7 +750,9 @@ class AutotuneLogSink:
         if self._collect_dataset and self._metadata is not None:
             record = {**self._metadata.to_dict(), "configs": self._configs}
             with self.meta_path.open("a", encoding="utf-8") as meta_file:
-                meta_file.write(json.dumps(record, default=str) + "\n")
+                meta_file.write(
+                    json.dumps(_json_safe(record), default=str, allow_nan=False) + "\n"
+                )
         self._run_start_time = None
         self._configs = {}
 
@@ -405,8 +765,6 @@ class AutotuneLogSink:
         """
         if self._csv_writer is None:
             return None
-        from .search_space_logger import canonical_config_id
-
         config_id = canonical_config_id(config)
         if self._collect_dataset:
             self._configs[config_id] = config.config
@@ -417,7 +775,11 @@ class AutotuneLogSink:
             return
         timestamp_field = ""
         if self._run_start_time is not None:
-            timestamp = time.perf_counter() - self._run_start_time
+            timestamp = (
+                entry.completed_at
+                if entry.completed_at is not None
+                else time.perf_counter()
+            ) - self._run_start_time
             timestamp_field = f"{timestamp:.2f}"
         perf_field = ""
         if entry.perf_ms is not None and math.isfinite(entry.perf_ms):

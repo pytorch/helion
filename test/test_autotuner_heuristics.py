@@ -6547,7 +6547,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             100 - coverage_budget,
         )
 
-    def test_cute_flash_sm103_rank0_seed_policy(self) -> None:
+    def test_cute_flash_sm103_template_seeds_and_rank0(self) -> None:
         sm103_policy = get_flash_target_policy((10, 3)).tuning
         dense_policies = {
             shape_policy.num_kv: shape_policy
@@ -6568,12 +6568,33 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     "standard_dense_output": not is_causal,
                     "standard_causal_output": is_causal,
                 }
-                seed = flash_attention_seed_config(
+                ranked = flash_attention_seed_configs(
                     64,
                     num_kv,
                     target_device_capability=(10, 3),
                     **seed_kwargs,
                 )
+                resident_policy = (
+                    causal_policies[num_kv] if is_causal else dense_policies[num_kv]
+                )
+                # Historical lengths no longer rank seeds. Every legal policy
+                # template still contributes its exact schedule to the union.
+                matching = [
+                    candidate
+                    for candidate in ranked
+                    if candidate.config[FLASH_KV_STAGE_KEY] == resident_policy.kv_stage
+                    and candidate.config[FLASH_E2E_OFFSET_KEY]
+                    == resident_policy.e2e_offset
+                    and candidate.config[FLASH_E2E_OFFSET0_KEY]
+                    == resident_policy.e2e_offset0
+                    and candidate.config[FLASH_SOFTMAX_REGS_KEY]
+                    == resident_policy.softmax_regs
+                    and candidate.config[FLASH_FIRST_LOAD_ORDER_KEY]
+                    == resident_policy.first_load_order
+                    and candidate.config[FLASH_ROLE_MAP_KEY] == resident_policy.role_map
+                ]
+                self.assertEqual(len(matching), 1)
+                seed = matching[0]
                 assert seed is not None
 
                 self.assertEqual(seed.config[FLASH_P_STORE_REP_KEY], 16)
@@ -6667,13 +6688,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 self.assertEqual(seed.config[FLASH_Q_TILE_COUNT_KEY], 2)
 
-                ranked = flash_attention_seed_configs(
+                default = flash_attention_seed_config(
                     64,
                     num_kv,
                     target_device_capability=(10, 3),
                     **seed_kwargs,
                 )
-                self.assertEqual(ranked[0], seed)
+                self.assertEqual(ranked[0], default)
                 if is_causal and num_kv == 1024:
                     self.assertEqual(
                         sum(
@@ -6710,14 +6731,27 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     {"cute": (CuteFlashAttentionHeuristic,)},
                 ):
                     compiler_seeds = compiler_seed_configs(env, MagicMock())
-                self.assertEqual(compiler_seeds[0], seed)
+                self.assertEqual(compiler_seeds[0], default)
+                self.assertIn(seed, compiler_seeds)
                 self.assertIsNone(spec.compiler_default_config)
-                self.assertEqual(spec.autotune_seed_configs()[0], seed)
+                self.assertEqual(spec.autotune_seed_configs()[0], default)
 
                 spec.compiler_seed_configs = compiler_seeds
                 config_gen = ConfigGeneration(spec)
                 roundtrip = config_gen.unflatten(config_gen.flatten(seed))
-                self.assertEqual(roundtrip, seed)
+                self.assertNotIn(cute_flash.FLASH_SOFTMAX_LOWERING_KEY, seed.config)
+                self.assertNotIn(cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY, seed.config)
+                self.assertEqual(
+                    roundtrip.config,
+                    {
+                        **seed.config,
+                        cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
+                        cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
+                    },
+                )
+                self.assertEqual(
+                    config_gen.unflatten(config_gen.flatten(roundtrip)), roundtrip
+                )
 
     def test_cute_flash_sm103_seed_policy_changes_cache_identity(self) -> None:
         def make_spec(
@@ -6756,7 +6790,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         sm100 = make_spec((10, 0))
         sm103 = make_spec((10, 3))
 
-        self.assertEqual(sm100.structural_fingerprint(), sm103.structural_fingerprint())
+        rowmax_key = cute_flash.FLASH_ROWMAX_KEY
+        self.assertEqual(
+            tuple(
+                row for row in sm100.structural_fingerprint() if row[0] != rowmax_key
+            ),
+            tuple(
+                row for row in sm103.structural_fingerprint() if row[0] != rowmax_key
+            ),
+        )
+        self.assertEqual(
+            cast("EnumFragment", sm100._flat_fields()[rowmax_key])._active_choices(),
+            ("software",),
+        )
+        self.assertEqual(
+            cast("EnumFragment", sm103._flat_fields()[rowmax_key])._active_choices(),
+            ("software", "tmem"),
+        )
         self.assertNotEqual(
             sm100.compiler_seed_configs,
             sm103.compiler_seed_configs,
@@ -6781,7 +6831,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             "helion._compiler.cute.flash_policy.get_flash_target_policy",
             return_value=dataclasses.replace(target_policy, tuning=unrelated_tuning),
         ):
-            self.assertEqual(sm103.cache_fingerprint_hash(), original_hash)
+            # A template at another historical length is part of this union.
+            self.assertNotEqual(sm103.cache_fingerprint_hash(), original_hash)
 
         dense_policy = target_policy.tuning.dense_policy(1024)
         assert dense_policy is not None
@@ -6836,7 +6887,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 causal_sm103.cache_fingerprint_hash(), causal_original_hash
             )
 
-    def test_cute_flash_registered_causal_shape_builds_direct_target_seed(self) -> None:
+    def test_cute_flash_registered_causal_template_joins_seed_union(self) -> None:
         target_policy = get_flash_target_policy((10, 3))
         extra_policy = FlashCausalTuningPolicy(
             num_kv=768,
@@ -6857,7 +6908,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 tuning=extended_tuning,
             ),
         ):
-            seed = flash_attention_seed_config(
+            seeds = flash_attention_seed_configs(
                 64,
                 768,
                 dtype=torch.float16,
@@ -6866,7 +6917,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 target_device_capability=(10, 3),
             )
 
-        assert seed is not None
+        matching = [
+            seed
+            for seed in seeds
+            if seed.config[FLASH_KV_STAGE_KEY] == 4
+            and seed.config[FLASH_E2E_OFFSET_KEY] == 2
+            and seed.config[FLASH_E2E_OFFSET0_KEY] == 3
+        ]
+        self.assertEqual(len(matching), 1)
+        seed = matching[0]
         self.assertEqual(seed.config[FLASH_KV_STAGE_KEY], 4)
         self.assertEqual(seed.config[FLASH_E2E_OFFSET_KEY], 2)
         self.assertEqual(seed.config[FLASH_E2E_OFFSET0_KEY], 3)
@@ -6890,25 +6949,70 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 *target_policy.tuning.dense_policies[1:],
             ),
         )
-        with (
-            patch(
-                "helion._compiler.cute.cute_flash.get_flash_target_policy",
-                return_value=dataclasses.replace(
-                    target_policy,
-                    tuning=invalid_tuning,
-                ),
+        with patch(
+            "helion._compiler.cute.cute_flash.get_flash_target_policy",
+            return_value=dataclasses.replace(
+                target_policy,
+                tuning=invalid_tuning,
             ),
-            self.assertRaisesRegex(ValueError, "does not round-trip"),
         ):
-            flash_attention_seed_config(
+            seeds = flash_attention_seed_configs(
                 64,
                 256,
                 dtype=torch.float16,
                 standard_dense_output=True,
                 target_device_capability=(10, 3),
             )
+        self.assertTrue(seeds)
+        sibling = target_policy.tuning.dense_policies[1]
+        self.assertTrue(
+            any(
+                candidate.config[FLASH_EXP2_PACKET_KEY] == sibling.exp2_packet
+                and candidate.config[FLASH_E2E_SCHEDULE_KEY] == sibling.e2e_schedule
+                and candidate.config[FLASH_E2E_OFFSET_KEY] == sibling.e2e_offset
+                and candidate.config[FLASH_E2E_OFFSET0_KEY] == sibling.e2e_offset0
+                and candidate.config[FLASH_FIRST_LOAD_ORDER_KEY]
+                == sibling.first_load_order
+                and candidate.config[FLASH_ROLE_MAP_KEY] == sibling.role_map
+                for candidate in seeds
+            )
+        )
+        self.assertFalse(
+            any(
+                seed.config[FLASH_EXP2_PACKET_KEY] == "deg1_16x8"
+                and seed.config[FLASH_E2E_SCHEDULE_KEY] == "8/2"
+                for seed in seeds
+            )
+        )
+        # The aggregate excludes an invalid template while strict validation
+        # continues rejecting its contradictory explicit packet/schedule pair.
+        invalid_values = {
+            **seeds[0].config,
+            FLASH_EXP2_PACKET_KEY: "deg1_16x8",
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+        }
+        with self.assertRaisesRegex(ValueError, "does not round-trip"):
+            cute_flash._flash_validated_target_seed(
+                head_dim=64,
+                num_kv=256,
+                dtype=torch.float16,
+                num_bh=None,
+                is_causal=False,
+                standard_dense_output=True,
+                standard_causal_output=False,
+                tmem_rowmax_compatible=True,
+                supports_tensor_4d_tma=True,
+                target_device_capability=(10, 3),
+                values=invalid_values,
+                expected={
+                    FLASH_EXP2_PACKET_KEY: "deg1_16x8",
+                    FLASH_E2E_SCHEDULE_KEY: "8/2",
+                },
+            )
 
-    def test_cute_flash_target_policy_preserves_b200_fragment_surface(self) -> None:
+    def test_cute_flash_target_policy_preserves_non_rowmax_fragment_surface(
+        self,
+    ) -> None:
         def fragment_signature(
             target: tuple[int, int] | None, *, is_causal: bool
         ) -> tuple[tuple[object, ...], ...]:
@@ -6929,6 +7033,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     cast("EnumFragment", fragment).search_choices,
                 )
                 for key, fragment in fragments.items()
+                if key != cute_flash.FLASH_ROWMAX_KEY
             )
 
         for is_causal in (False, True):
@@ -6937,6 +7042,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 self.assertEqual(
                     baseline,
                     fragment_signature(target, is_causal=is_causal),
+                )
+            for target in (None, (10, 0), (10, 3), (999, 999)):
+                rowmax = flash_autotune_fragments(
+                    64,
+                    512,
+                    dtype=torch.float16,
+                    is_causal=is_causal,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                    target_device_capability=target,
+                )[cute_flash.FLASH_ROWMAX_KEY]
+                assert isinstance(rowmax, EnumFragment)
+                self.assertEqual(rowmax.choices, ("software", "tmem"))
+                self.assertEqual(
+                    rowmax._active_choices(),
+                    ("software", "tmem") if target == (10, 3) else ("software",),
                 )
 
     def test_cute_flash_non_sm103_seed_order_is_unchanged(self) -> None:
@@ -6986,7 +7107,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             {"standard_dense_output": True, "has_kv_tile_pruning": True},
             {"standard_dense_output": True, "requires_ws_overlap": True},
             {"standard_dense_output": True, "small_biased_candidate": True},
-            {"standard_dense_output": True, "num_kv": 768},
             {
                 "standard_dense_output": True,
                 "block_size_targets": (1, 64, 128),
@@ -7013,6 +7133,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     **case,
                 )
                 self.assertEqual(actual, baseline)
+        # Unregistered lengths share the complete legal template union.
+        self.assertEqual(
+            flash_attention_seed_configs(
+                64, 768, standard_dense_output=True, target_device_capability=(10, 3)
+            ),
+            flash_attention_seed_configs(
+                64, 256, standard_dense_output=True, target_device_capability=(10, 3)
+            ),
+        )
 
     def test_cute_flash_dense_degree2_seed_uses_validated_schedule(self) -> None:
         expected_configs: list[dict[str, object]] = []
@@ -7558,7 +7687,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(persistent.search_choices, (False,))
 
     def test_cute_flash_large_causal_compiler_seeds_project_to_tma(self) -> None:
-        spec = ConfigSpec(backend=CuteBackend())
+        spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 3))
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
         spec.enable_cute_flash_search(
@@ -7577,6 +7706,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
+            target_device_capability=spec.target_device_capability,
         )
         raw_snapshots = [dict(seed.config) for seed in raw_seeds]
         expected = spec._legalize_cute_flash_compiler_seeds(raw_seeds)
@@ -11216,7 +11346,12 @@ def _cute_matmul_for_heuristics(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
 def _bind_cute_matmul_without_cutlass() -> None:
     """Child-process body: every cute heuristic registers facts without cutlass."""
     assert sys.modules.get("cutlass", 0) is None
-    with _grouped_worklist_bind_patches(), _mock_cuda_unavailable():
+    with (
+        _grouped_worklist_bind_patches(),
+        _mock_cuda_unavailable(),
+        # This checks planning imports only; no CuTe source generation runs.
+        patch("helion._compiler.cute.backend.CuteBackend.validate_environment"),
+    ):
         kernel = helion.kernel(
             _cute_matmul_for_heuristics, backend="cute", static_shapes=True
         )

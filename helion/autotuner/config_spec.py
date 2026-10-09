@@ -31,6 +31,9 @@ from .._compat import warps_to_threads
 from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
 from .._compiler.cute.block_scaled_config import normalize_block_scaled_config
+from .._compiler.cute.cute_flash import _FLASH_EXP2_PACKET_PARAMS
+from .._compiler.cute.cute_flash import _FLASH_MANUAL_EXP2_PACKET_PARAMS
+from .._compiler.cute.cute_flash import _FLASH_MANUAL_EXP2_PACKET_SCHEDULES
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
@@ -52,18 +55,24 @@ from .._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
 from .._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
 from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
+from .._compiler.cute.cute_flash import FLASH_ROWMAX_KEY
+from .._compiler.cute.cute_flash import FLASH_SOFTMAX_LOWERING_KEY
 from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from .._compiler.cute.cute_flash import FLASH_WAIT_HINT_KEY
+from .._compiler.cute.cute_flash import ROW_MMA_FAMILY
 from .._compiler.cute.cute_flash import FlashAttentionConfig
 from .._compiler.cute.cute_flash import _flash_compound_exp2_packet_overrides
 from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
 from .._compiler.cute.cute_flash import _flash_env_get
+from .._compiler.cute.cute_flash import _flash_inactive_lpt_domain
 from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
 from .._compiler.cute.cute_flash import _flash_pipeline_family_flags
+from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
@@ -153,6 +162,9 @@ if TYPE_CHECKING:
 
     import sympy
 
+    from .._compiler.autotuner_heuristics.cute_fragment_common import (
+        FragmentRootRequirement,
+    )
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
     from .._compiler.cute.split_k_cluster import ClusterKFacts
@@ -216,6 +228,29 @@ def _record_restriction(
 
 
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
+
+
+def _normalize_cute_flash_ws_inactive_values(config: dict[str, object]) -> None:
+    """Preserve recognized fixed-config aliases outside the WS search domain."""
+    masked_schedule = config.get(FLASH_MASKED_E2E_SCHEDULE_KEY)
+    if isinstance(masked_schedule, str) and (
+        masked_schedule in ("inherit", "xu", "16/4", "8/2")
+        or masked_schedule
+        in (
+            f"{freq}/{res}"
+            for freq, res in _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.values()
+        )
+    ):
+        config[FLASH_MASKED_E2E_SCHEDULE_KEY] = "inherit"
+    packet = config.get(FLASH_EXP2_PACKET_KEY)
+    if isinstance(packet, str) and (
+        packet in _FLASH_EXP2_PACKET_PARAMS
+        or packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS
+    ):
+        config[FLASH_EXP2_PACKET_KEY] = "1x1"
+    wait_hint = config.get(FLASH_WAIT_HINT_KEY)
+    if type(wait_hint) is int and wait_hint in (0, 10_000_000):
+        config[FLASH_WAIT_HINT_KEY] = 10_000_000
 
 
 def _copy_config_structure(value: object) -> object:
@@ -932,6 +967,28 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_reduction_group_rows",
         "cute_materialized_schedule",
         "cute_materialized_operand_schedule",
+        "cute_fragment_scan",
+        "cute_fragment_reduction",
+        "cute_fragment_threads",
+        "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
+        "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
+        "cute_fragment_bounded_gather",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
+        "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
+        "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1033,6 +1090,28 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_reduction_group_rows",
         "cute_materialized_schedule",
         "cute_materialized_operand_schedule",
+        "cute_fragment_scan",
+        "cute_fragment_reduction",
+        "cute_fragment_threads",
+        "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
+        "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
+        "cute_fragment_bounded_gather",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
+        "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
+        "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1139,6 +1218,28 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_reduction_group_rows",
         "cute_materialized_schedule",
         "cute_materialized_operand_schedule",
+        "cute_fragment_scan",
+        "cute_fragment_reduction",
+        "cute_fragment_threads",
+        "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
+        "cute_fragment_integer_atomic_epochs",
+        "cute_fragment_local_atomic_registers",
+        "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
+        "cute_fragment_bounded_gather",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
+        "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
+        "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
+        "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1445,6 +1546,59 @@ class ConfigSpec:
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False
+        self.cute_fragment_scan_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_scan_search_enabled = False
+        self.cute_fragment_reduction_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_reduction_search_enabled = False
+        self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_threads_search_enabled = False
+        self.cute_fragment_producer_cache_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_producer_cache_search_enabled = False
+        self.cute_fragment_register_load_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_scan_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_scan_requirements: tuple[
+            FragmentRootRequirement, ...
+        ] = ()
+        self.cute_fragment_warp_scan_search_enabled = False
+        self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_integer_atomic_epochs_search_enabled = False
+        self.cute_fragment_atomic_aggregation_search_enabled = False
+        self.cute_fragment_local_atomic_registers_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_local_atomic_registers_search_enabled = False
+        self.cute_fragment_atomic_consumer_fusion_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_atomic_consumer_fusion_search_enabled = False
+        self.cute_fragment_pure_producer_regions_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_pure_producer_regions_search_enabled = False
+        self.cute_fragment_local_atomic_register_min_threads = 0
+        self.cute_fragment_register_snapshots_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_register_snapshot_while_root_ids: frozenset[int] = (
+            frozenset()
+        )
+        self.cute_fragment_register_snapshots_search_enabled = False
+        self.cute_fragment_register_producer_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_register_producers_search_enabled = False
+        self.cute_fragment_scan_exports_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_scan_exports_search_enabled = False
+        self.cute_fragment_warp_producer_regions_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_producer_regions_search_enabled = False
+        self.cute_fragment_bounded_gather_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_bounded_gather_search_enabled = False
+        self.cute_integer_loop_reduction_available = False
+        self.cute_integer_loop_reduction_search_enabled = False
+        self.cute_fragment_register_snapshot_min_threads = 0
+        self.cute_fragment_packet_load_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_packet_loads_search_enabled = False
+        self.cute_fragment_register_loads_search_enabled = False
+        self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_results_search_enabled = False
+        self.cute_fragment_published_scalar_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_published_scalars_search_enabled = False
+        self.cute_fragment_skip_zero_atomics_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_skip_zero_atomics_search_enabled = False
+        self.cute_fragment_private_scalar_loop_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_private_scalar_loops_search_enabled = False
+        self.cute_fragment_warp_result_min_threads = 32
         self.cute_materialized_operand_schedule_available: bool = False
         self.cute_materialized_operand_schedule_search_enabled: bool = False
         self.cute_grouped_rna_k_choices: tuple[int, ...] = ()
@@ -1488,6 +1642,8 @@ class ConfigSpec:
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
         self._cute_flash_standard_causal_output: bool = False
+        self._cute_flash_tmem_rowmax_compatible: bool = False
+        self._cute_flash_causal_resident_compatible: bool = False
         self._cute_flash_output_requires_tma: bool = False
         self._cute_flash_supports_tensor_4d_tma: bool = True
         self._cute_flash_has_row_epilogue: bool = False
@@ -1803,6 +1959,8 @@ class ConfigSpec:
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
+                tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
+                causal_resident_compatible=self._cute_flash_causal_resident_compatible,
                 target_device_capability=self.target_device_capability,
                 output_requires_tma=self._cute_flash_output_requires_tma,
                 supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
@@ -1835,7 +1993,10 @@ class ConfigSpec:
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
+            tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
+            causal_resident_compatible=self._cute_flash_causal_resident_compatible,
             supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
+            target_device_capability=self.target_device_capability,
             prefer_packed_reduce=(
                 self._cute_flash_has_kv_tile_pruning
                 or self._cute_flash_requires_ws_overlap
@@ -1844,6 +2005,30 @@ class ConfigSpec:
             has_row_epilogue=self._cute_flash_has_row_epilogue,
             has_score_modifiers=self._cute_flash_has_score_modifiers,
         )
+
+    def _cute_flash_config_topology(self, config: Mapping[str, object]) -> str:
+        """Resolve only structural selectors before validating lowering children."""
+        assert self._cute_flash_num_kv is not None
+        if self._cute_flash_requires_ws_overlap:
+            return "ws_overlap"
+        family = _flash_pipeline_family_flags(config.get(FLASH_PIPELINE_FAMILY_KEY))
+        topology = (
+            family.topology if family is not None else config.get(FLASH_TOPOLOGY_KEY)
+        )
+        if topology in ("fa4", "ws_overlap"):
+            if topology == "fa4" and self._cute_flash_num_kv % 2:
+                return "ws_overlap"
+            return cast("str", topology)
+        # Register-MMA rows support odd KV counts and have their own admission.
+        # The environment can select them when no explicit parent is present.
+        # Resolve only structural selectors so unrelated lowering children keep
+        # their established validation order.
+        structural = {
+            key: value
+            for key, value in config.items()
+            if key in (FLASH_PIPELINE_FAMILY_KEY, *FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS)
+        }
+        return self._resolve_cute_flash_config(structural).topology
 
     def _legalize_cute_flash_compiler_seed(
         self, seed: helion.Config | None
@@ -1900,9 +2085,23 @@ class ConfigSpec:
         # active Boolean fragment validates it.
         if FLASH_MMA_INTERLEAVE_KEY in config:
             config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
+        topology = self._cute_flash_config_topology(config)
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
-        if self._cute_flash_is_causal and type(causal_lpt) is int:
-            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = 1
+        if (
+            self._cute_flash_is_causal
+            and type(causal_lpt) is int
+            and config.get(FLASH_SOFTMAX_LOWERING_KEY) != "resident_stateful"
+        ):
+            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = _flash_inactive_lpt_domain(
+                is_causal=self._cute_flash_is_causal, topology=topology
+            )[0]
+        config.update(
+            _flash_resident_softmax_overrides(
+                config.get(FLASH_SOFTMAX_LOWERING_KEY),
+                is_causal=self._cute_flash_is_causal,
+                topology=topology,
+            )
+        )
         block_size_targets = self._cute_flash_block_size_target_list()
         if fix_invalid:
             config["block_sizes"] = list(block_size_targets)
@@ -1917,21 +2116,6 @@ class ConfigSpec:
             config.pop("epilogue_subtile", None)
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
             return
-
-        config.update(
-            _flash_compound_exp2_packet_overrides(
-                self._cute_flash_head_dim,
-                self._cute_flash_num_kv,
-                config,
-                dtype=self._cute_flash_dtype,
-                is_causal=self._cute_flash_is_causal,
-                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
-                small_biased_candidate=self._cute_flash_small_biased_candidate,
-                standard_dense_output=self._cute_flash_standard_dense_output,
-                standard_causal_output=self._cute_flash_standard_causal_output,
-            )
-        )
 
         has_legacy_structural_config = any(
             config.get(key) is not None for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
@@ -1948,6 +2132,37 @@ class ConfigSpec:
                     FLASH_PERSISTENT_KEY
                 ]
             legacy_effective = self._resolve_cute_flash_config(legacy_resolution_config)
+        requested_family = _flash_pipeline_family_flags(
+            config.get(FLASH_PIPELINE_FAMILY_KEY)
+        )
+        if (
+            self._cute_flash_requires_ws_overlap
+            or (
+                requested_family is not None
+                and requested_family.topology == "ws_overlap"
+            )
+            or (
+                legacy_effective is not None
+                and legacy_effective.topology == "ws_overlap"
+            )
+        ):
+            # Resolve the parent before expanding a compound packet: an inactive
+            # child must not turn a legacy WS parent into an FA4 family.
+            _normalize_cute_flash_ws_inactive_values(config)
+        config.update(
+            _flash_compound_exp2_packet_overrides(
+                self._cute_flash_head_dim,
+                self._cute_flash_num_kv,
+                config,
+                dtype=self._cute_flash_dtype,
+                is_causal=self._cute_flash_is_causal,
+                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                small_biased_candidate=self._cute_flash_small_biased_candidate,
+                standard_dense_output=self._cute_flash_standard_dense_output,
+                standard_causal_output=self._cute_flash_standard_causal_output,
+            )
+        )
         if self._cute_flash_requires_ws_overlap:
             config[FLASH_PIPELINE_FAMILY_KEY] = "ws_overlap"
             topology_override = "ws_overlap"
@@ -1978,7 +2193,7 @@ class ConfigSpec:
                     if legacy_effective is not None
                     else None
                 )
-                valid_manual_topologies = {"fa4", "ws_overlap"}
+                valid_manual_topologies = {"fa4", "ws_overlap", ROW_MMA_FAMILY}
                 topology_value = config.get(FLASH_TOPOLOGY_KEY)
                 topology_override = (
                     topology_value
@@ -2012,6 +2227,14 @@ class ConfigSpec:
         fragments = make_fragments(
             cast("str | None", topology_override), pipeline_family_override
         )
+        fragment_family = _flash_pipeline_family_flags(
+            fragments[FLASH_PIPELINE_FAMILY_KEY].default()
+        )
+        if fragment_family is not None and fragment_family.topology == "ws_overlap":
+            # Fixed configs may contain old FA4 values for inactive WS fields.
+            # Keep those aliases out of the search fragments; unknown values
+            # still reach strict membership validation below.
+            _normalize_cute_flash_ws_inactive_values(config)
         e2e_offset_was_present = FLASH_E2E_OFFSET_KEY in config
         e2e_offset0_was_present = FLASH_E2E_OFFSET0_KEY in config
         e2e_offset_keys = (FLASH_E2E_OFFSET_KEY, FLASH_E2E_OFFSET0_KEY)
@@ -2080,7 +2303,12 @@ class ConfigSpec:
                 )
         effective_topology = effective.topology
         config.update(flash_effective_config_values(effective))
-        if effective_topology == "fa4":
+        if effective.softmax_lowering in ("resident_value_graph", "resident_stateful"):
+            # The value graph owns its all-XU cadence. Legacy aliases and
+            # inherited offsets must not reintroduce an inactive split schedule.
+            for key in (FLASH_EXP2_IMPL_KEY, FLASH_E2E_FREQ_KEY, FLASH_E2E_RES_KEY):
+                config.pop(key, None)
+        elif effective_topology == "fa4":
             config.update(explicit_e2e_offsets)
             if effective.alternating_warpgroups:
                 # Both softmax warpgroups of the alternating family process
@@ -2275,6 +2503,8 @@ class ConfigSpec:
         small_biased_candidate: bool = False,
         standard_dense_output: bool = False,
         standard_causal_output: bool = False,
+        tmem_rowmax_compatible: bool | None = None,
+        causal_resident_compatible: bool = False,
         output_requires_tma: bool = False,
         supports_tensor_4d_tma: bool = True,
         has_row_epilogue: bool = False,
@@ -2299,6 +2529,12 @@ class ConfigSpec:
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
         self._cute_flash_standard_causal_output = standard_causal_output
+        self._cute_flash_causal_resident_compatible = causal_resident_compatible
+        self._cute_flash_tmem_rowmax_compatible = (
+            standard_dense_output or standard_causal_output
+            if tmem_rowmax_compatible is None
+            else tmem_rowmax_compatible
+        )
         self._cute_flash_output_requires_tma = output_requires_tma
         self._cute_flash_supports_tensor_4d_tma = supports_tensor_4d_tma
         self._cute_flash_has_row_epilogue = has_row_epilogue
@@ -2957,6 +3193,7 @@ class ConfigSpec:
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
                     num_bh=self._cute_flash_num_bh,
+                    num_sm=self.num_sm,
                     tensor_4d_heads=self._cute_flash_tensor_4d_heads,
                     dtype=self._cute_flash_dtype,
                     is_causal=self._cute_flash_is_causal,
@@ -2965,6 +3202,8 @@ class ConfigSpec:
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
+                    tmem_rowmax_compatible=self._cute_flash_tmem_rowmax_compatible,
+                    causal_resident_compatible=self._cute_flash_causal_resident_compatible,
                     target_device_capability=self.target_device_capability,
                     supports_tensor_4d_tma=(self._cute_flash_supports_tensor_4d_tma),
                     has_row_epilogue=self._cute_flash_has_row_epilogue,
@@ -3243,6 +3482,417 @@ class ConfigSpec:
             config.pop(key, None)
             return
         raise InvalidConfig(f"{key}={value!r} requires a proved pointwise region")
+
+    def _normalize_cute_fragment_option(
+        self,
+        config: dict[str, object],
+        key: str,
+        root_ids: frozenset[int],
+        requirement: str,
+        *,
+        fix_invalid: bool,
+        choices: tuple[bool | int | str, ...] = (False, True),
+    ) -> None:
+        """Normalize independent modes without weakening their typed defaults."""
+        default = choices[0]
+        value = config.get(key, default)
+        if type(value) is type(default):
+            if value == default:
+                config.pop(key, None)
+                return
+            if (
+                value in choices
+                and root_ids
+                and not config.get("cute_collective_mma")
+                and not config.get("cute_register_chain")
+            ):
+                return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key}={value!r} requires {requirement}")
+
+    def _normalize_cute_fragment_published_scalars(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_published_scalars",
+            self.cute_fragment_published_scalar_root_ids,
+            "a complete fragment with published scalar candidates",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_skip_zero_atomics(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_skip_zero_atomics",
+            self.cute_fragment_skip_zero_atomics_root_ids,
+            "a proved unused or dead-zero-result relaxed CTA-local Int32 atomic add",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_private_scalar_loops(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_private_scalar_loops",
+            self.cute_fragment_private_scalar_loop_root_ids,
+            "a proved read-only scalar finalizer loop",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_producer_cache(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_producer_cache",
+            self.cute_fragment_producer_cache_root_ids,
+            "repeated pure fragment producers",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_warp_scan(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        from .._compiler.autotuner_heuristics.cute_fragment_common import (
+            active_fragment_roots,
+        )
+
+        key = "cute_fragment_warp_scan"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and active_fragment_roots(
+                self.cute_fragment_warp_scan_root_ids,
+                self.cute_fragment_warp_scan_requirements,
+                config,
+            )
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a supported bounded warp-prefix scan"
+        )
+
+    def _normalize_cute_fragment_atomic_aggregation(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_atomic_aggregation",
+            self.cute_fragment_atomic_aggregation_root_ids,
+            "proved CTA-private Int32 relaxed unused atomic updates",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_atomic_consumer_fusion(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_atomic_consumer_fusion",
+            self.cute_fragment_atomic_consumer_fusion_root_ids,
+            "a proved same-coordinate local Int32 atomic consumer region",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_pure_producer_regions(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_pure_producer_regions",
+            self.cute_fragment_pure_producer_regions_root_ids,
+            "a proved same-owner pure producer publication region",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_integer_atomic_epochs(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_integer_atomic_epochs",
+            self.cute_fragment_integer_atomic_epochs_root_ids,
+            "proved CTA-private Int32 relaxed unused loop updates",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_local_atomic_registers(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_local_atomic_registers"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_local_atomic_registers_root_ids
+            and cast("int", config.get("cute_fragment_threads", 128))
+            >= self.cute_fragment_local_atomic_register_min_threads
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires proved same-coordinate local Int32 atomic return consumers"
+        )
+
+    def _normalize_cute_integer_loop_reduction(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_integer_loop_reduction"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if value is True and self.cute_integer_loop_reduction_available:
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key} requires a pure single integer min/max loop recurrence"
+        )
+
+    def _normalize_cute_fragment_bounded_gather(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_bounded_gather"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_bounded_gather_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key} requires a proved bounded last-axis gather")
+
+    def _normalize_cute_fragment_warp_producer_regions(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_warp_producer_regions"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_warp_producer_regions_root_ids
+            and config.get("cute_fragment_warp_scan") is True
+            and config.get("cute_fragment_reduction") == "warp"
+            and not any(
+                config.get(other)
+                for other in (
+                    "cute_collective_mma",
+                    "cute_register_chain",
+                    "cute_fragment_register_snapshots",
+                    "cute_fragment_register_loads",
+                    "cute_fragment_register_producers",
+                    "cute_fragment_warp_results",
+                    "cute_fragment_scan_exports",
+                )
+            )
+            and not config.get("reduction_loops")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key} requires a proved scalar-frontier warp producer prefix"
+        )
+
+    def _normalize_cute_fragment_scan_exports(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_scan_exports"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_scan_exports_root_ids
+            and config.get("cute_fragment_warp_scan") is True
+            and not any(
+                config.get(k)
+                for k in (
+                    "cute_collective_mma",
+                    "cute_register_chain",
+                    "cute_fragment_register_snapshots",
+                    "cute_fragment_register_loads",
+                    "cute_fragment_register_producers",
+                    "cute_fragment_warp_results",
+                    "cute_fragment_pure_producer_regions",
+                )
+            )
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key} requires shared producers and a proved terminal warp-scan interval"
+        )
+
+    def _normalize_cute_fragment_register_producers(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_register_producers"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_register_producer_root_ids
+            and config.get("cute_fragment_register_snapshots") is True
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires bounded readonly snapshots and repeated pure producers"
+        )
+
+    def _normalize_cute_fragment_register_snapshots(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_register_snapshots"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_register_snapshots_root_ids
+            and cast("int", config.get("cute_fragment_threads", 128))
+            >= self.cute_fragment_register_snapshot_min_threads
+            and (
+                not self.cute_fragment_register_snapshot_while_root_ids
+                or config.get("cute_fragment_bounded_gather", False) is True
+            )
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires proved bounded readonly rank-one snapshots with exact integer reductions"
+        )
+
+    def _normalize_cute_fragment_packet_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_packet_loads",
+            self.cute_fragment_packet_load_root_ids,
+            "a complete fragment root with readonly Float32 host loads",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_register_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_register_loads",
+            self.cute_fragment_register_load_root_ids,
+            "a supported lane-private fragment load",
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_fragment_warp_results(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_warp_results"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_warp_result_root_ids
+            and cast("int", config.get("cute_fragment_threads", 128))
+            >= self.cute_fragment_warp_result_min_threads
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a supported warp-owned reduction/atomic value chain"
+        )
+
+    def _normalize_cute_fragment_threads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        from .._compiler.autotuner_heuristics.cute_fragment_threads import THREADS
+
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_threads",
+            self.cute_fragment_thread_root_ids,
+            "a supported computed fragment root",
+            fix_invalid=fix_invalid,
+            choices=(128, *(count for count in THREADS if count != 128)),
+        )
+
+    def _normalize_cute_fragment_reduction(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_reduction",
+            self.cute_fragment_reduction_root_ids,
+            "a supported computed scalar reduction",
+            fix_invalid=fix_invalid,
+            choices=("serial", "warp"),
+        )
+
+    def _normalize_cute_fragment_scan(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_scan",
+            self.cute_fragment_scan_root_ids,
+            "a supported computed additive scan",
+            fix_invalid=fix_invalid,
+            choices=("serial", "cooperative"),
+        )
 
     def _normalize_cute_materialized_operand_schedule(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -3887,6 +4537,30 @@ class ConfigSpec:
             )
             return
 
+        if (
+            self.backend_name == "cute"
+            and config.get("cute_fragment_producer_cache") is True
+            and (
+                config.get("cute_fragment_register_loads") is True
+                or config.get("cute_fragment_warp_results") is True
+            )
+        ):
+            raise InvalidConfig(
+                "shared producer caching cannot consume lane-private fragment storage"
+            )
+        if (
+            self.backend_name == "cute"
+            and config.get("cute_fragment_warp_results") is True
+            and config.get("cute_fragment_register_loads") is True
+        ):
+            # These modes assign different physical owners to the same logical
+            # element. Even repair-mode search must reject, not silently pick
+            # one storage policy and benchmark a different configuration.
+            raise InvalidConfig(
+                "cute_fragment_warp_results and cute_fragment_register_loads "
+                "have incompatible physical ownership"
+            )
+
         # ``cross_loop_schedule`` was the former public name. Accept old configs
         # only at this boundary, then keep ``cross_loop_pipeline`` as the sole
         # internal key.
@@ -4089,6 +4763,58 @@ class ConfigSpec:
             self._normalize_cute_reduction_row_output(config, fix_invalid=_fix_invalid)
             self._normalize_cute_reduction_sequence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_reduction(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_threads(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_producer_cache(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_atomic_aggregation(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_integer_atomic_epochs(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_local_atomic_registers(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_integer_loop_reduction(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_register_snapshots(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_atomic_consumer_fusion(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_pure_producer_regions(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_packet_loads(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_register_loads(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_warp_results(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_private_scalar_loops(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_published_scalars(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_skip_zero_atomics(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_bounded_gather(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_register_producers(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_scan_exports(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_warp_producer_regions(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_operand_schedule(
                 config, fix_invalid=_fix_invalid
@@ -5080,20 +5806,31 @@ class ConfigSpec:
         )
 
         if range_warp_specializes and any(range_warp_specializes):
-            # Only one range_warp_specializes is allowed, take the first one
+            # Only one range_warp_specializes per loop nest, take the first one
             # Prefer warp specialize on outermost loop
-            first_idx = range_warp_specializes.index(True)
-            for i in range(first_idx + 1, len(range_warp_specializes)):
-                range_warp_specializes[i] = None
-
+            nest_starts = [0]
+            if config.get("cross_loop_pipeline") == "static":
+                # Static cross-loop roots are sequential loop nests in one kernel.
+                grid_ids = {*self.grid_block_ids}
+                nest_starts = [
+                    i
+                    for i, spec in enumerate(self.range_warp_specialize)
+                    if i == 0 or spec.block_ids[0] in grid_ids
+                ]
+            nest_stops = [*nest_starts[1:], len(range_warp_specializes)]
             range_unroll_factors = cast(
                 "list[int]", config.get("range_unroll_factors", [])
             )
-            if range_unroll_factors and range_unroll_factors[first_idx] > 1:
-                if range_unroll_factors[first_idx]:
+            for start, stop in zip(nest_starts, nest_stops, strict=True):
+                nest = range_warp_specializes[start:stop]
+                if True not in nest:
+                    continue
+                first_idx = start + nest.index(True)
+                for i in range(first_idx + 1, stop):
+                    range_warp_specializes[i] = None
+                if range_unroll_factors and range_unroll_factors[first_idx] > 1:
                     range_unroll_factors[first_idx] = 0
-
-                config["range_unroll_factors"] = range_unroll_factors
+                    config["range_unroll_factors"] = range_unroll_factors
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
@@ -5118,10 +5855,11 @@ class ConfigSpec:
             )
 
         # Allow tunable parameter keys in addition to backend-supported keys.
-        allowed_keys = self.supported_config_keys() | {
+        unknown_keys = {*config} - VALID_KEYS
+        invalid_keys = (unknown_keys | {*self.unsupported_config_keys(config)}) - {
             *self.user_defined_tunables.keys()
         }
-        if invalid_keys := ({*config} - allowed_keys):
+        if invalid_keys:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def raise_grid_block_minimums(self) -> None:
@@ -5269,6 +6007,35 @@ class ConfigSpec:
                 return True, "off"
             if key == "cute_materialized_operand_schedule":
                 return True, "off"
+            if key == "cute_fragment_private_scalar_loops":
+                return True, False
+            if key == "cute_fragment_producer_cache":
+                return True, False
+            if key == "cute_fragment_warp_results":
+                return True, False
+            if key in (
+                "cute_fragment_register_loads",
+                "cute_fragment_warp_scan",
+                "cute_fragment_atomic_aggregation",
+                "cute_fragment_integer_atomic_epochs",
+                "cute_fragment_local_atomic_registers",
+                "cute_fragment_register_snapshots",
+                "cute_fragment_register_producers",
+                "cute_fragment_scan_exports",
+                "cute_fragment_warp_producer_regions",
+                "cute_fragment_bounded_gather",
+                "cute_fragment_published_scalars",
+                "cute_fragment_skip_zero_atomics",
+                "cute_fragment_atomic_consumer_fusion",
+                "cute_fragment_pure_producer_regions",
+                "cute_integer_loop_reduction",
+                "cute_fragment_packet_loads",
+            ):
+                return True, False
+            if key == "cute_fragment_threads":
+                return True, 128
+            if key in ("cute_fragment_scan", "cute_fragment_reduction"):
+                return True, "serial"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
@@ -5282,6 +6049,39 @@ class ConfigSpec:
         overrides: Mapping[str, object],
     ) -> None:
         if self.backend_name == "cute":
+            if self.cute_flash_search_enabled:
+                # A sampled resident mode must honor fixed parent controls too.
+                # Reject incompatible samples so generation can retry another
+                # lowering instead of silently overwriting an explicit override.
+                requested_lowering = overrides.get(
+                    FLASH_SOFTMAX_LOWERING_KEY, config.get(FLASH_SOFTMAX_LOWERING_KEY)
+                )
+                topology = self._cute_flash_config_topology({**config, **overrides})
+                inactive_lpt = _flash_inactive_lpt_domain(
+                    is_causal=self._cute_flash_is_causal, topology=topology
+                )
+                requirements = _flash_resident_softmax_overrides(
+                    requested_lowering,
+                    is_causal=self._cute_flash_is_causal,
+                    topology=topology,
+                )
+                for key, required_value in requirements.items():
+                    if (
+                        key in overrides
+                        and overrides[key] != required_value
+                        and not (
+                            key == FLASH_CAUSAL_LPT_SWIZZLE_KEY
+                            and type(overrides[key]) is int
+                            and overrides[key] in inactive_lpt
+                        )
+                    ):
+                        raise InvalidConfig(
+                            f"{FLASH_SOFTMAX_LOWERING_KEY}={requested_lowering!r} "
+                            f"requires {key}={required_value!r}, got {overrides[key]!r}"
+                        )
+                if FLASH_SOFTMAX_LOWERING_KEY in overrides:
+                    config.update(requirements)
+                    self._resolve_cute_flash_config(config)
             family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
             family_flags = _flash_pipeline_family_flags(family)
             if self.cute_flash_search_enabled and family_flags is not None:
@@ -5292,6 +6092,15 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"cute_flash_pipeline_family={family!r} is not effective "
                         f"for this kernel; it normalizes to {effective_family!r}"
+                    )
+            if self.cute_flash_search_enabled and FLASH_ROWMAX_KEY in overrides:
+                requested_rowmax = overrides[FLASH_ROWMAX_KEY]
+                effective_rowmax = self._resolve_cute_flash_config(config).rowmax
+                if effective_rowmax != requested_rowmax:
+                    raise InvalidConfig(
+                        f"cute_flash_rowmax={requested_rowmax!r} is not effective "
+                        f"for this target and score layout; it normalizes to "
+                        f"{effective_rowmax!r}"
                     )
             if self.cute_flash_search_enabled and FLASH_EXP2_PACKET_KEY in overrides:
                 assert self._cute_flash_head_dim is not None
@@ -5488,6 +6297,58 @@ class ConfigSpec:
             if self.cute_materialized_operand_schedule_search_enabled:
                 fields["cute_materialized_operand_schedule"] = EnumFragment(
                     choices=("off", "warp_narrow4")
+                )
+            if self.cute_fragment_private_scalar_loops_search_enabled:
+                fields["cute_fragment_private_scalar_loops"] = BooleanFragment()
+            if self.cute_fragment_producer_cache_search_enabled:
+                fields["cute_fragment_producer_cache"] = BooleanFragment()
+            if self.cute_fragment_warp_results_search_enabled:
+                fields["cute_fragment_warp_results"] = BooleanFragment()
+            if self.cute_fragment_atomic_aggregation_search_enabled:
+                fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
+            if self.cute_fragment_integer_atomic_epochs_search_enabled:
+                fields["cute_fragment_integer_atomic_epochs"] = BooleanFragment()
+            if self.cute_fragment_packet_loads_search_enabled:
+                fields["cute_fragment_packet_loads"] = BooleanFragment()
+            if self.cute_fragment_warp_scan_search_enabled:
+                fields["cute_fragment_warp_scan"] = BooleanFragment()
+            if self.cute_fragment_local_atomic_registers_search_enabled:
+                fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
+            if self.cute_integer_loop_reduction_search_enabled:
+                fields["cute_integer_loop_reduction"] = BooleanFragment()
+            if self.cute_fragment_register_snapshots_search_enabled:
+                fields["cute_fragment_register_snapshots"] = BooleanFragment()
+            if self.cute_fragment_bounded_gather_search_enabled:
+                fields["cute_fragment_bounded_gather"] = BooleanFragment()
+            if self.cute_fragment_register_producers_search_enabled:
+                fields["cute_fragment_register_producers"] = BooleanFragment()
+            if self.cute_fragment_warp_producer_regions_search_enabled:
+                fields["cute_fragment_warp_producer_regions"] = BooleanFragment()
+            if self.cute_fragment_scan_exports_search_enabled:
+                fields["cute_fragment_scan_exports"] = BooleanFragment()
+            if self.cute_fragment_published_scalars_search_enabled:
+                fields["cute_fragment_published_scalars"] = BooleanFragment()
+            if self.cute_fragment_skip_zero_atomics_search_enabled:
+                fields["cute_fragment_skip_zero_atomics"] = BooleanFragment()
+            if self.cute_fragment_atomic_consumer_fusion_search_enabled:
+                fields["cute_fragment_atomic_consumer_fusion"] = BooleanFragment()
+            if self.cute_fragment_pure_producer_regions_search_enabled:
+                fields["cute_fragment_pure_producer_regions"] = BooleanFragment()
+            if self.cute_fragment_register_loads_search_enabled:
+                fields["cute_fragment_register_loads"] = BooleanFragment()
+            if self.cute_fragment_threads_search_enabled:
+                from .._compiler.autotuner_heuristics.cute_fragment_threads import (
+                    THREADS,
+                )
+
+                fields["cute_fragment_threads"] = EnumFragment(choices=THREADS)
+            if self.cute_fragment_scan_search_enabled:
+                fields["cute_fragment_scan"] = EnumFragment(
+                    choices=("serial", "cooperative")
+                )
+            if self.cute_fragment_reduction_search_enabled:
+                fields["cute_fragment_reduction"] = EnumFragment(
+                    choices=("serial", "warp")
                 )
             if self.cute_pointwise_region_block_ids:
                 fields["cute_pointwise_pid_type"] = EnumFragment(

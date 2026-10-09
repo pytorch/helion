@@ -347,6 +347,14 @@ class _PacketVectorizer(_Vectorizer):
             guards.append(guard)
         return guards, False
 
+    def candidate_loop(self, loop: ast.For) -> bool:
+        return (
+            not self.shadowed
+            and isinstance(loop.target, ast.Name)
+            and _range_extent(loop) in (4, 8)
+            and not loop.orelse
+        )
+
     def loop(
         self,
         original: ast.For,
@@ -354,13 +362,9 @@ class _PacketVectorizer(_Vectorizer):
         multiples: dict[str, int],
         int32_names: frozenset[str],
     ) -> list[ast.stmt] | None:
-        if (
-            self.shadowed
-            or not isinstance(original.target, ast.Name)
-            or _range_extent(original) not in (4, 8)
-            or original.orelse
-        ):
+        if not self.candidate_loop(original):
             return None
+        assert isinstance(original.target, ast.Name)
         writes = _binding_write_roots(original)
         inside = Counter(
             node.id

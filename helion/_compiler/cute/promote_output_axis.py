@@ -180,7 +180,30 @@ def _read_only_host_dsl(call: ast.Call, callee: CallableType) -> bool:
     )
 
 
-def _fresh_tensors(host: HostFunction) -> set[torch.Tensor]:
+def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
+    from ... import next_power_of_2
+    from ..type_info import LiteralType
+    from ..type_info import SymIntType
+
+    return (
+        any(callee.value is function for function in (min, max, next_power_of_2))
+        and not call.keywords
+        and bool(call.args)
+        and all(
+            isinstance(arg, ExtendedAST)
+            and (
+                isinstance(arg._type_info, SymIntType)
+                or isinstance(arg._type_info, LiteralType)
+                and type(arg._type_info.value) is int
+            )
+            for arg in call.args
+        )
+    )
+
+
+def _fresh_tensors(
+    host: HostFunction, *, integer_metadata_calls: bool = False
+) -> set[torch.Tensor]:
     """Prove that factory storage survives all host-side operations.
 
     Fresh storage comes from the ``torch.*`` factories, ``torch.empty_strided``
@@ -234,6 +257,8 @@ def _fresh_tensors(host: HostFunction) -> set[torch.Tensor]:
                 and (
                     any(callee.value is function for function in _READ_ONLY_HOST_CALLS)
                     or _read_only_host_dsl(call, callee)
+                    or integer_metadata_calls
+                    and _integer_metadata_call(call, callee)
                 )
                 or isinstance(callee, TensorAttributeType)
                 and callee.attr() in _READ_ONLY_TENSOR_METHODS

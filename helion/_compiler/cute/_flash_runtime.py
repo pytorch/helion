@@ -131,6 +131,7 @@ def flash_fa4_shared_storage(
     clc_stages: int = 1,
     separate_kv: bool = False,
     kv_tile_n: int = 128,
+    kv_cta_group_size: int = 1,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -149,8 +150,16 @@ def flash_fa4_shared_storage(
     warpgroup). The optional
     epi-TMA path gets a dedicated 2-stage ``sO`` buffer so persistent work-items
     can load the next Q tile while the epilogue drains the previous O tile.
+
+    Cooperative two-CTA MMA partitions each K/V tile across the two CTAs.
+    Allocate its per-CTA extent, matching make_smem_layout_b. Query/output
+    storage stays local and is unchanged. A two-CTA cluster using local MMA
+    still passes kv_cta_group_size=1.
     """
+    assert kv_cta_group_size in (1, 2)
+    assert kv_tile_n % kv_cta_group_size == 0
     softmax_threads = 128
+    kv_elements = kv_tile_n * head_dim * kv_stage // kv_cta_group_size
     clc_response_size = clc_stages * 4 if use_clc_scheduler else 0
     clc_mbar_size = clc_stages * 2 if use_clc_scheduler else 0
     separate_o_size = 128 * head_dim * 2 if epi_tma else 0
@@ -184,12 +193,8 @@ def flash_fa4_shared_storage(
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
-            ]
-            sV: cute.struct.Align[
-                cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
-            ]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
+            sV: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
         return SharedStorage
@@ -230,9 +235,7 @@ def flash_fa4_shared_storage(
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
-            ]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim * 2], 1024]
 
         return SharedStorage
@@ -270,9 +273,7 @@ def flash_fa4_shared_storage(
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
-        sK: cute.struct.Align[
-            cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
-        ]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
 
     return SharedStorage
 
@@ -1602,6 +1603,7 @@ def fa4_disc_exp_convert_store(
     pair_batch: int = 1,
     emu_batch: int = 1,
     pforc_ptr_stage: object = None,
+    degree2: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -1649,6 +1651,7 @@ def fa4_disc_exp_convert_store(
             last_frag,
             pair_batch,
             emu_batch,
+            degree2=degree2,
         )
         _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -3465,6 +3468,7 @@ def resident_softmax_value_graph(
     row_sum_init: object,
     wait_hint: int = 10_000_000,
     *,
+    io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
     loc: object = None,
@@ -3474,8 +3478,9 @@ def resident_softmax_value_graph(
 
     Keep scale, exp2/conversion, split-P publication, statistics acquire, and
     row-sum reduction in one lowering unit.  The exp2 results remain fp32 in
-    ``tLDrS`` for the reducer while a distinct register tensor holds fp16 P.
+    ``tLDrS`` for the reducer while a distinct register tensor holds 16-bit P.
     """
+    assert io_dtype in (cutlass.Float16, cutlass.BFloat16)
     assert tLDrS.element_type is cutlass.Float32
     assert cute.size(tLDrS) % 32 == 0
     frag_count = cute.size(tLDrS) // 32
@@ -3491,7 +3496,7 @@ def resident_softmax_value_graph(
 
     tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
     tSTrS_e = cute.make_tensor(
-        cute.recast_ptr(tSTrS.iterator, dtype=cutlass.Float16), tLDrS.layout
+        cute.recast_ptr(tSTrS.iterator, dtype=io_dtype), tLDrS.layout
     )
     src = cute.logical_divide(tLDrS, cute.make_layout(32))
     dst = cute.logical_divide(tSTrS_e, cute.make_layout(32))
@@ -3502,7 +3507,7 @@ def resident_softmax_value_graph(
             src[i, ci] = exp0
             src[i + 1, ci] = exp1
         cast("cute.Tensor", dst[None, ci]).store(
-            cast("cute.Tensor", src[None, ci]).load().to(cutlass.Float16)
+            cast("cute.Tensor", src[None, ci]).load().to(io_dtype)
         )
 
     for ci in range(frag_count):

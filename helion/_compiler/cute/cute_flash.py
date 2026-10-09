@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import functools
+from functools import partial
 import itertools
 import math
 import operator
@@ -1711,7 +1712,11 @@ def _flash_deep_1cta_kv_stage_cap(head_dim: int) -> int:
 
 
 def _flash_aliased_kv_stage_cap(
-    head_dim: int, *, stage_output: bool, kv_tile_n: int = 128
+    head_dim: int,
+    *,
+    stage_output: bool,
+    kv_tile_n: int = 128,
+    use_2cta_instrs: bool = False,
 ) -> int:
     """Largest legal aliased K/V depth for the requested output storage.
 
@@ -1724,6 +1729,8 @@ def _flash_aliased_kv_stage_cap(
             kv_depth=2,
             stage_output=stage_output,
             kv_tile_n=kv_tile_n,
+            cta_count=2 if use_2cta_instrs else 1,
+            cooperative_mma=use_2cta_instrs,
         )
     )
 
@@ -1898,6 +1905,11 @@ class FlashAttentionConfig:
     # neighboring shapes and prevents the autotuner from measuring both.
     persistent_loop: str = "while"
     sp_row_sum: str = "fragment"
+    rowmax: str = "software"
+    # ``auto`` preserves existing target-policy lowerings. Explicit choices
+    # let the autotuner compare whole-row implementations on any legal shape.
+    softmax_lowering: str = "auto"
+    row_sum_schedule: str = "post_acquire"
     softmax_setup: str = "shared"
     epi_tma_setup: str = "shared"
 
@@ -2652,6 +2664,8 @@ def resolve_flash_config(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     supports_tensor_4d_tma: bool = True,
     prefer_packed_reduce: bool = False,
     plain_row_body: bool = True,
@@ -2659,6 +2673,7 @@ def resolve_flash_config(
     has_score_modifiers: bool = False,
     row_mma_aligned: bool = True,
     row_mma_aux_dtypes: Sequence[str] = (),
+    target_device_capability: tuple[int, int] | None = None,
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
 
@@ -2666,8 +2681,8 @@ def resolve_flash_config(
     surface (``cute_flash_search_enabled``), the autotunable knobs (see
     ``FLASH_CONFIG_KEYS`` / ``flash_autotune_fragments``) are read from the
     config Mapping; any knob the config does not carry falls back to the env-var
-    resolution below, so behavior is byte-identical when the key is absent (the
-    default-off gating path) or unset.
+    resolution below. New lowering choices have explicit conservative defaults;
+    normalized configs record the selected implementation.
 
     *plain_row_body* is False when the score plan has modifiers or a fused row
     epilogue; those rows exist only in the 128-row body, so the 64-row query
@@ -2684,7 +2699,34 @@ def resolve_flash_config(
     row programs' shared-memory budget resolves to the tcgen05 default too.
     """
 
+    if tmem_rowmax_compatible is None:
+        tmem_rowmax_compatible = standard_dense_output or standard_causal_output
+
+    softmax_lowering = (
+        config.get(FLASH_SOFTMAX_LOWERING_KEY, "auto") if config is not None else "auto"
+    )
+    if softmax_lowering not in (
+        "auto",
+        "standard",
+        "resident_value_graph",
+        "resident_stateful",
+    ):
+        raise ValueError(f"invalid flash softmax lowering: {softmax_lowering!r}")
+    row_sum_schedule = (
+        config.get(FLASH_ROW_SUM_SCHEDULE_KEY, "post_acquire")
+        if config is not None
+        else "post_acquire"
+    )
+    if row_sum_schedule not in ("post_acquire", "pre_acquire"):
+        raise ValueError(f"invalid flash row-sum schedule: {row_sum_schedule!r}")
+    if softmax_lowering != "resident_stateful":
+        row_sum_schedule = "post_acquire"
+    resident_overrides = _flash_resident_softmax_overrides(
+        softmax_lowering, is_causal=is_causal
+    )
     packet_config = config
+    if resident_overrides:
+        packet_config = {**({} if config is None else config), **resident_overrides}
     env_exp2_packet = _flash_env_get("HELION_CUTE_FLASH_EXP2_PACKET")
     if env_exp2_packet is not None and (
         packet_config is None or FLASH_EXP2_PACKET_KEY not in packet_config
@@ -2711,6 +2753,8 @@ def resolve_flash_config(
     )
 
     def _cfg(key: str) -> object | None:
+        if key in resident_overrides:
+            return resident_overrides[key]
         if key in compound_packet_overrides:
             return compound_packet_overrides[key]
         if config is None:
@@ -2766,6 +2810,15 @@ def resolve_flash_config(
             topology = str(topology_cfg)
     if topology not in ("ws_overlap", "fa4", ROW_MMA_FAMILY):
         topology = "ws_overlap"
+    if (
+        topology == ROW_MMA_FAMILY or alt_requested or has_row_epilogue
+    ) and softmax_lowering in (
+        "resident_value_graph",
+        "resident_stateful",
+    ):
+        raise InvalidConfig(
+            "resident softmax lowerings require ordinary FA4 without a row epilogue"
+        )
     if topology == ROW_MMA_FAMILY:
         if row_mma_aligned and row_mma_supported(
             head_dim=head_dim,
@@ -2802,6 +2855,32 @@ def resolve_flash_config(
         topology = topology_default
     if topology == "fa4" and num_kv % 2 != 0:
         topology = "ws_overlap"
+    if softmax_lowering == "resident_value_graph" and not (
+        _flash_dense_resident_workload_supported(
+            fa4=topology == "fa4" and not has_row_epilogue,
+            dtype=dtype,
+            standard_dense_output=standard_dense_output,
+        )
+        and not is_causal
+    ):
+        raise InvalidConfig(
+            "cute_flash_softmax_lowering='resident_value_graph' requires "
+            "FP16/BF16 dense output on an FA4 pipeline"
+        )
+    explicit_stateful = softmax_lowering == "resident_stateful"
+    if explicit_stateful and not _flash_causal_stateful_workload_supported(
+        fa4=topology == "fa4" and not has_row_epilogue,
+        head_dim=head_dim,
+        num_kv=num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        standard_causal_output=standard_causal_output,
+        causal_resident_compatible=causal_resident_compatible,
+    ):
+        raise InvalidConfig(
+            "cute_flash_softmax_lowering='resident_stateful' requires "
+            "D64/D128 FP16/BF16 causal output with proven complete paired coverage"
+        )
     dense_hd64_fa4 = topology == "fa4" and not is_causal and head_dim == 64
     causal_hd64_fa4 = topology == "fa4" and is_causal and head_dim == 64
     causal_e2e_offset_default = 2
@@ -2994,10 +3073,10 @@ def resolve_flash_config(
         softmax_disc = bool(softmax_disc_cfg)
     if topology != "fa4":
         softmax_disc = True
-    elif is_causal:
-        # Causal correction has no acknowledged single-slot statistics handoff.
-        # The whole-row/ring2 protocol can lap after a sufficiently long KV
-        # traversal, so causal FA4 uses the chunked pipeline unconditionally.
+    elif is_causal and not explicit_stateful:
+        # Generic causal correction has no acknowledged single-slot statistics
+        # handoff. The explicit stateful graph supplies its own SAME_SLOT
+        # acknowledgments; the ordinary graph retains its chunked pipeline.
         softmax_disc = True
     elif has_row_epilogue:
         # A fused row epilogue holds a warpgroup at the end of every work item
@@ -3288,10 +3367,13 @@ def resolve_flash_config(
     if not is_causal:
         causal_lpt_swizzle = 0
     else:
-        # Wider same-length CTA waves expose an unresolved, nondeterministic
-        # long-running causal barrier race. Only the serial head ordering is
-        # safe, so canonicalize both fresh and cached configs to it.
-        causal_lpt_swizzle = 1
+        # Keep historical protocols in their tested serial order. The explicit
+        # SAME_SLOT graph owns CTA-local credits and disjoint output pairs.
+        causal_lpt_swizzle = (
+            max(1, min(causal_lpt_swizzle, 64))
+            if explicit_stateful
+            else _flash_inactive_lpt_domain(is_causal=is_causal, topology=topology)[0]
+        )
         if num_bh is not None:
             causal_lpt_swizzle = min(causal_lpt_swizzle, max(num_bh, 1))
     causal_kv_order_default = "ascending"
@@ -3733,10 +3815,16 @@ def resolve_flash_config(
         # The mixed Rep32/Rep16 publication helper owns a fixed PASS2 pipeline
         # and does not consume the generic pipeline-depth argument.
         disc_pipe_depth = 1
-    stat_transport_eligible = topology == "fa4" and not is_causal and head_dim == 64
+    # Statistics have 128 FP32 rows per query slot, independent of the head
+    # width and 16-bit I/O dtype. Preserve the existing D64 default and ring2
+    # repair separately from the general dense transport capability.
+    stat_transport_eligible = topology == "fa4" and (not is_causal or explicit_stateful)
+    legacy_stat_transport_eligible = (
+        stat_transport_eligible and not is_causal and head_dim == 64
+    )
     legacy_stat_handoff = _flash_bool_env("HELION_CUTE_FLASH_FA4_STAT_HANDOFF", True)
     stat_transport_default = (
-        "single" if stat_transport_eligible and legacy_stat_handoff else "ring2"
+        "single" if legacy_stat_transport_eligible and legacy_stat_handoff else "ring2"
     )
     stat_transport = _flash_env_get(
         "HELION_CUTE_FLASH_STAT_TRANSPORT", stat_transport_default
@@ -3749,7 +3837,7 @@ def resolve_flash_config(
     if not stat_transport_eligible:
         stat_transport = "ring2"
     single_final_stat_eligible = (
-        stat_transport_eligible
+        legacy_stat_transport_eligible
         and exp2_impl == "split"
         and standard_dense_output
         and (not persistent or use_2cta_instrs)
@@ -3758,9 +3846,9 @@ def resolve_flash_config(
         and exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
     )
     if stat_transport == "single_final" and not single_final_stat_eligible:
-        stat_transport = "single"
+        stat_transport = "single" if legacy_stat_transport_eligible else "ring2"
     if (
-        stat_transport_eligible
+        legacy_stat_transport_eligible
         and not softmax_disc
         and stat_transport == "ring2"
         and mma_ptx
@@ -3841,13 +3929,14 @@ def resolve_flash_config(
 
     if topology == "fa4" and not separate_kv_rings and head_dim in (64, 128):
         # The staging depth has to be capped for the *configured* tile width:
-        # each K/V slot is ``kv_tile_n * head_dim`` elements, so a wider tile
-        # fits fewer stages, and exceeding the budget makes the launch fail
+        # Cooperative MMA partitions each K/V slot across its two CTAs. A
+        # wider tile still fits fewer stages, and exceeding the budget fails
         # with cudaErrorInvalidValue rather than falling back.
         aliased_kv_stage_cap = _flash_aliased_kv_stage_cap(
             head_dim,
             stage_output=epi_tma or epi_stg,
             kv_tile_n=kv_tile_n,
+            use_2cta_instrs=use_2cta_instrs,
         )
         kv_stage = min(max(kv_stage, 2), aliased_kv_stage_cap)
     pipeline_family = _flash_pipeline_family_from_flags(
@@ -3893,9 +3982,7 @@ def resolve_flash_config(
     sp_row_sum_eligible = (
         topology == "fa4"
         and not softmax_disc
-        and not is_causal
-        and head_dim == 64
-        and dtype is torch.float16
+        and ((not is_causal and _flash_supported_io_dtype(dtype)) or explicit_stateful)
     )
     if sp_row_sum not in ("fragment", "whole") or not sp_row_sum_eligible:
         sp_row_sum = "fragment"
@@ -3972,6 +4059,8 @@ def resolve_flash_config(
         )
     )
     if alternating_warpgroups:
+        softmax_lowering = "auto"
+        row_sum_schedule = "post_acquire"
         pipeline_family = "fa4_alt"
         persistent = True
         persistent_ctas_per_sm = 1
@@ -4016,6 +4105,33 @@ def resolve_flash_config(
         pipeline_family != "fa4" or not causal_loop_split
     ):
         exp2_packet = "1x1"
+    rowmax = _cfg(FLASH_ROWMAX_KEY)
+    if rowmax is None:
+        rowmax = "software"
+    if rowmax not in ("software", "tmem"):
+        raise ValueError(f"invalid flash row-max lowering: {rowmax!r}")
+    if (
+        not _flash_tmem_rowmax_supported(
+            target_device_capability=target_device_capability,
+            fa4=topology == "fa4",
+            score_compatible=tmem_rowmax_compatible,
+        )
+        or s_load_repetition != 32
+        or alternating_warpgroups
+    ):
+        rowmax = "software"
+    if explicit_stateful and (
+        pipeline_family != "fa4"
+        or requested_family_flags not in (None, FLASH_PIPELINE_FAMILY_FLAGS["fa4"])
+        or persistent
+        or q_tile_count != 2
+        or not mma_ptx
+        or kv_tile_n != 128
+    ):
+        raise InvalidConfig(
+            "resident_stateful requires the ordinary nonpersistent two-slot "
+            "FA4 PTX pipeline with KV128"
+        )
     return FlashAttentionConfig(
         s_stage=s_stage,
         kv_stage=kv_stage,
@@ -4026,6 +4142,9 @@ def resolve_flash_config(
         num_regs_consumer=_FLASH_NUM_REGS_CONSUMER,
         persistent_loop=persistent_loop,
         sp_row_sum=sp_row_sum,
+        rowmax=cast("str", rowmax),
+        softmax_lowering=cast("str", softmax_lowering),
+        row_sum_schedule=cast("str", row_sum_schedule),
         softmax_setup=softmax_setup,
         epi_tma_setup=epi_tma_setup,
         topology=topology,
@@ -4308,6 +4427,8 @@ FLASH_TENSOR_4D_TMA_KEY = "cute_flash_tensor_4d_tma"
 FLASH_CAUSAL_LOOP_SPLIT_KEY = "cute_flash_causal_loop_split"
 FLASH_PERSISTENT_LOOP_KEY = "cute_flash_persistent_loop"
 FLASH_SP_ROW_SUM_KEY = "cute_flash_sp_row_sum"
+FLASH_SOFTMAX_LOWERING_KEY = "cute_flash_softmax_lowering"
+FLASH_ROW_SUM_SCHEDULE_KEY = "cute_flash_row_sum_schedule"
 FLASH_SOFTMAX_SETUP_KEY = "cute_flash_softmax_setup"
 FLASH_KV_TILE_N_KEY = "cute_flash_kv_tile_n"
 FLASH_Q_TILE_M_KEY = "cute_flash_q_tile_m"
@@ -4380,6 +4501,8 @@ FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] =
         FLASH_Q_TILE_M_KEY: 64,
     },
 }
+FLASH_ROWMAX_KEY = "cute_flash_rowmax"
+
 
 FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_S_STAGE_KEY,
@@ -4428,6 +4551,9 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_CAUSAL_LOOP_SPLIT_KEY,
     FLASH_PERSISTENT_LOOP_KEY,
     FLASH_SP_ROW_SUM_KEY,
+    FLASH_ROWMAX_KEY,
+    FLASH_SOFTMAX_LOWERING_KEY,
+    FLASH_ROW_SUM_SCHEDULE_KEY,
     FLASH_SOFTMAX_SETUP_KEY,
     FLASH_EPI_TMA_SETUP_KEY,
     FLASH_KV_TILE_N_KEY,
@@ -4520,6 +4646,9 @@ def flash_effective_config_values(
         FLASH_CAUSAL_LOOP_SPLIT_KEY: config.causal_loop_split,
         FLASH_PERSISTENT_LOOP_KEY: config.persistent_loop,
         FLASH_SP_ROW_SUM_KEY: config.sp_row_sum,
+        FLASH_ROWMAX_KEY: config.rowmax,
+        FLASH_SOFTMAX_LOWERING_KEY: config.softmax_lowering,
+        FLASH_ROW_SUM_SCHEDULE_KEY: config.row_sum_schedule,
         FLASH_SOFTMAX_SETUP_KEY: config.softmax_setup,
         FLASH_EPI_TMA_SETUP_KEY: config.epi_tma_setup,
         FLASH_KV_TILE_N_KEY: config.kv_tile_n,
@@ -4528,6 +4657,130 @@ def flash_effective_config_values(
         FLASH_ROW_WARPS_KEY: config.row_warps,
         FLASH_ROW_TILE_M_KEY: config.row_tile_m,
     }
+
+
+def _flash_dense_resident_workload_supported(
+    *, fa4: bool, dtype: torch.dtype, standard_dense_output: bool
+) -> bool:
+    # The helper keeps FP32 scores and packs P using the 16-bit I/O dtype.
+    # Head width, KV count and persistence do not alter its score-row layout
+    # or the surrounding single-slot protocol.
+    return fa4 and _flash_supported_io_dtype(dtype) and standard_dense_output
+
+
+def _flash_causal_stateful_workload_supported(
+    *,
+    fa4: bool,
+    head_dim: int,
+    num_kv: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    standard_causal_output: bool,
+    causal_resident_compatible: bool,
+) -> bool:
+    # The state object converts through the destination element type. Its
+    # masked/unmasked loop and SAME_SLOT graph require complete query pairs;
+    # the matcher supplies that proof, independently of any tuning policy.
+    return (
+        fa4
+        and head_dim in (64, 128)
+        and _flash_supported_io_dtype(dtype)
+        and is_causal
+        and standard_causal_output
+        and causal_resident_compatible
+        and num_kv >= 2
+        and num_kv % 2 == 0
+    )
+
+
+def _flash_inactive_lpt_domain(*, is_causal: bool, topology: str) -> tuple[int, ...]:
+    """Canonical inactive width first, followed by accepted historical aliases."""
+    if not is_causal:
+        return (0,)
+    return (1, 0) if topology == "fa4" else (0, 1)
+
+
+def _flash_resident_softmax_overrides(
+    lowering: object, *, is_causal: bool | None = None, topology: str | None = None
+) -> dict[str, object]:
+    """Canonical controls owned by the explicit whole-row lowerings."""
+    # Only the explicit stateful implementation exposes private row-sum
+    # scheduling. Other modes retain their historical order; keeping this in
+    # the ownership map also removes the inactive coordinate from proposals.
+    values: dict[str, object] = (
+        {}
+        if lowering == "resident_stateful"
+        else {FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire"}
+    )
+    # The inactive mapping differs between causal and dense kernels. Derive it
+    # from the actual workload, never from an observed normalized parent.
+    if (
+        lowering != "resident_stateful"
+        and is_causal is not None
+        and topology is not None
+    ):
+        values[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = _flash_inactive_lpt_domain(
+            is_causal=is_causal, topology=topology
+        )[0]
+    if lowering not in ("resident_value_graph", "resident_stateful"):
+        return values
+    values.update(
+        {
+            FLASH_SOFTMAX_DISC_KEY: False,
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_STAT_TRANSPORT_KEY: "single",
+            FLASH_SPLIT_P_ARRIVE_KEY: True,
+            FLASH_P_CHUNK_ARRIVE_KEY: False,
+            # Rep32 stores halve the chunk count and cannot implement this helper's
+            # split. Rep32 loads retain the full-row register layout it consumes.
+            FLASH_P_STORE_REP_KEY: 16,
+            FLASH_S_LOAD_REP_KEY: 32,
+            FLASH_SP_ROW_SUM_KEY: "whole",
+            FLASH_E2E_SCHEDULE_KEY: "xu",
+            FLASH_MASKED_E2E_SCHEDULE_KEY: "inherit",
+            FLASH_E2E_OFFSET_KEY: 0,
+            FLASH_E2E_OFFSET0_KEY: 0,
+            FLASH_EXP2_PACKET_KEY: "1x1",
+            FLASH_EXP2_IMPL_KEY: "xu",
+            FLASH_E2E_FREQ_KEY: 8,
+            FLASH_E2E_RES_KEY: 0,
+        }
+    )
+    if lowering == "resident_stateful":
+        values.update(
+            {
+                FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+                FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+                FLASH_KV_TILE_N_KEY: 128,
+            }
+        )
+    return values
+
+
+def flash_tmem_rowmax_score_plan_supported(score_plan: AttentionScorePlan) -> bool:
+    """TMEM scores can be reduced before the optional causal register mask."""
+    return score_plan.modifier_kinds in ((DENSE_SCORE_KIND,), (CAUSAL_MASK_KIND,))
+
+
+def _flash_tmem_rowmax_supported(
+    *,
+    target_device_capability: tuple[int, int] | None,
+    fa4: bool,
+    score_compatible: bool,
+) -> bool:
+    """Current LDRED layout is proved for FA4 dense/causal score plans.
+
+    Hardware reduction reads FP32 scores, independent of input dtype and head
+    dimension. Other score transforms require a separate post-transform proof.
+    The 32-repetition load requirement is normalized with the actual config.
+    """
+    return (
+        fa4
+        and score_compatible
+        and get_flash_target_policy(
+            target_device_capability
+        ).hardware.supports_tmem_row_reduce
+    )
 
 
 def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T, ...]:
@@ -4605,6 +4858,48 @@ def _flash_causal_lpt_candidates() -> tuple[int, ...]:
     return (1,)
 
 
+def _flash_stateful_lpt_candidates(num_bh: int | None) -> tuple[int, ...]:
+    """Logarithmic effective widths for the explicit CTA-local decoder."""
+    if num_bh is None or num_bh < 1:
+        return (1,)
+    return tuple(sorted({min(num_bh, width) for width in (1, 2, 4, 8, 16, 32, 64)}))
+
+
+# A seed working-set budget, matching the upstream FA4 scheduling heuristic.
+# This is a tuning policy, not a claim about the physical device's L2 capacity.
+_FLASH_LPT_SEED_KV_BUDGET_BYTES = 50 * 1024 * 1024
+
+
+def _flash_stateful_lpt_seed_widths(
+    head_dim: int,
+    num_kv: int,
+    *,
+    num_bh: int | None,
+    num_sm: int | None,
+    dtype: torch.dtype,
+) -> tuple[int, ...]:
+    """Balance KV locality, query-pair wave size and the legal head endpoint."""
+    if num_bh is None or num_bh < 1 or num_sm is None or num_sm < 1:
+        return (1,)
+    kv_bytes_per_head = num_kv * 128 * (2 * head_dim) * (torch.finfo(dtype).bits // 8)
+    query_pairs = max(1, num_kv // 2)
+    cache_heads = max(1, _FLASH_LPT_SEED_KV_BUDGET_BYTES // kv_bytes_per_head)
+    wave_heads = max(1, num_sm // query_pairs)
+    cache_width = 1 << (cache_heads.bit_length() - 1)
+    wave_width = 1 << (wave_heads.bit_length() - 1)
+    endpoint = min(num_bh, 64)
+    return tuple(
+        sorted(
+            {
+                1,
+                min(endpoint, cache_width, wave_width),
+                min(endpoint, cache_width),
+                endpoint,
+            }
+        )
+    )
+
+
 _FLASH_SEED_BLOCK_SIZE_TARGETS = (1, 128, 128)
 _FLASH_RESCALE_THRESHOLD_VALUES = (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
 
@@ -4646,11 +4941,14 @@ def _flash_seed_values(
     small_biased_candidate: bool,
     standard_dense_output: bool,
     standard_causal_output: bool,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     supports_tensor_4d_tma: bool,
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
     has_score_modifiers: bool = False,
     pipeline_family_override: str | None = None,
+    target_device_capability: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     fragments = flash_autotune_fragments(
         head_dim,
@@ -4664,11 +4962,14 @@ def _flash_seed_values(
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
         standard_causal_output=standard_causal_output,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
         has_score_modifiers=has_score_modifiers,
         pipeline_family_override=pipeline_family_override,
+        target_device_capability=target_device_capability,
     )
     return {key: fragment.default() for key, fragment in fragments.items()}
 
@@ -4702,6 +5003,12 @@ def _flash_config_with_values(
     block_sizes: Sequence[int],
     values: Mapping[str, object],
 ) -> Config:
+    values = dict(values)
+    # Adding an optional lowering must retain every existing raw seed.
+    if values.get(FLASH_SOFTMAX_LOWERING_KEY) == "auto":
+        values.pop(FLASH_SOFTMAX_LOWERING_KEY)
+    if values.get(FLASH_ROW_SUM_SCHEDULE_KEY) == "post_acquire":
+        values.pop(FLASH_ROW_SUM_SCHEDULE_KEY)
     return Config.from_dict({"block_sizes": list(block_sizes), **values})
 
 
@@ -4791,6 +5098,91 @@ def _flash_causal_tuning_overrides(
     if policy.first_load_order is not None:
         overrides[FLASH_FIRST_LOAD_ORDER_KEY] = policy.first_load_order
     return overrides
+
+
+def _flash_target_seed_templates(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    num_bh: int | None,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    target_device_capability: tuple[int, int] | None,
+    supports_tensor_4d_tma: bool,
+    allowed_families: Sequence[str],
+    output_requires_tma: bool = False,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
+    has_row_epilogue: bool = False,
+    plain_row_body: bool = True,
+    has_score_modifiers: bool = False,
+) -> tuple[dict[str, object], ...]:
+    """Project every target template onto the current implementation's legality.
+
+    Historical policy lengths select emitter lowerings elsewhere; they neither
+    select nor rank compiler seeds. A template contributes only when every
+    explicit coordinate survives resolution, including its parent family and
+    compound packet. This preserves optimized templates without leaking child
+    values into incompatible families or silently changing their algorithm.
+    """
+    tuning = get_flash_target_policy(target_device_capability).tuning_for_torch(
+        head_dim, str(dtype).removeprefix("torch.")
+    )
+    if (
+        tuning is None
+        or has_kv_tile_pruning
+        or requires_ws_overlap
+        or small_biased_candidate
+    ):
+        return ()
+    if is_causal and standard_causal_output:
+        templates = [
+            _flash_causal_tuning_overrides(policy) for policy in tuning.causal_policies
+        ]
+    elif not is_causal and standard_dense_output:
+        templates = [
+            _flash_dense_tuning_overrides(policy) for policy in tuning.dense_policies
+        ]
+    else:
+        return ()
+    legal: dict[tuple[tuple[str, str], ...], dict[str, object]] = {}
+    for template in templates:
+        expected = {**template, FLASH_Q_TILE_COUNT_KEY: 2}
+        if expected[FLASH_PIPELINE_FAMILY_KEY] not in allowed_families:
+            continue
+        resolved = resolve_flash_config(
+            head_dim,
+            num_kv,
+            expected,
+            dtype=dtype,
+            num_bh=num_bh,
+            is_causal=is_causal,
+            standard_dense_output=standard_dense_output,
+            standard_causal_output=standard_causal_output,
+            tmem_rowmax_compatible=tmem_rowmax_compatible,
+            causal_resident_compatible=causal_resident_compatible,
+            target_device_capability=target_device_capability,
+            supports_tensor_4d_tma=supports_tensor_4d_tma,
+            has_row_epilogue=has_row_epilogue,
+            plain_row_body=plain_row_body,
+            has_score_modifiers=has_score_modifiers,
+        )
+        if not _flash_config_matches_tuning_values(resolved, expected):
+            continue
+        if output_requires_tma and not resolved.epi_tma:
+            continue
+        if 2 * resolved.softmax_regs + resolved.corr_regs + resolved.other_regs > 512:
+            continue
+        # Config content, never registry order, historical lengths or timings,
+        # determines ordering. Identical templates contribute exactly once.
+        identity = tuple((key, repr(value)) for key, value in sorted(expected.items()))
+        legal[identity] = template
+    return tuple(legal[identity] for identity in sorted(legal))
 
 
 def _flash_config_matches_tuning_values(
@@ -4937,7 +5329,10 @@ def _flash_validated_target_seed(
     is_causal: bool,
     standard_dense_output: bool,
     standard_causal_output: bool,
+    tmem_rowmax_compatible: bool,
+    causal_resident_compatible: bool = False,
     supports_tensor_4d_tma: bool,
+    target_device_capability: tuple[int, int] | None,
     values: Mapping[str, object],
     expected: Mapping[str, object],
     has_row_epilogue: bool = False,
@@ -4953,6 +5348,10 @@ def _flash_validated_target_seed(
     values instead of being rejected: it then equals its normalized form.
     """
     seed = Config.from_dict(dict(values))
+    if seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "auto":
+        seed.config.pop(FLASH_SOFTMAX_LOWERING_KEY)
+    if seed.config.get(FLASH_ROW_SUM_SCHEDULE_KEY) == "post_acquire":
+        seed.config.pop(FLASH_ROW_SUM_SCHEDULE_KEY)
     resolved = resolve_flash_config(
         head_dim,
         num_kv,
@@ -4962,10 +5361,13 @@ def _flash_validated_target_seed(
         is_causal=is_causal,
         standard_dense_output=standard_dense_output,
         standard_causal_output=standard_causal_output,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         plain_row_body=plain_row_body,
         has_row_epilogue=has_row_epilogue,
         has_score_modifiers=has_score_modifiers,
+        target_device_capability=target_device_capability,
     )
     actual = flash_effective_config_values(resolved)
     mismatches = {
@@ -4988,7 +5390,7 @@ def _flash_validated_target_seed(
     )
 
 
-def _flash_target_seed_config(
+def _flash_target_seed_configs(
     head_dim: int,
     num_kv: int,
     *,
@@ -5001,122 +5403,103 @@ def _flash_target_seed_config(
     small_biased_candidate: bool,
     standard_dense_output: bool,
     standard_causal_output: bool,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     target_device_capability: tuple[int, int] | None,
     supports_tensor_4d_tma: bool,
     block_size_targets: Sequence[int],
     has_row_epilogue: bool = False,
     plain_row_body: bool = True,
     has_score_modifiers: bool = False,
-) -> Config | None:
-    target_policy = get_flash_target_policy(target_device_capability)
-    tuning_policy = target_policy.tuning_for_torch(
-        head_dim, str(dtype).removeprefix("torch.")
+) -> tuple[Config, ...]:
+    if tmem_rowmax_compatible is None:
+        tmem_rowmax_compatible = standard_dense_output or standard_causal_output
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return ()
+    common = {
+        "dtype": dtype,
+        "num_bh": num_bh,
+        "is_causal": is_causal,
+        "has_kv_tile_pruning": has_kv_tile_pruning,
+        "requires_ws_overlap": requires_ws_overlap,
+        "small_biased_candidate": small_biased_candidate,
+        "standard_dense_output": standard_dense_output,
+        "standard_causal_output": standard_causal_output,
+        "supports_tensor_4d_tma": supports_tensor_4d_tma,
+        "has_row_epilogue": has_row_epilogue,
+        "plain_row_body": plain_row_body,
+        "has_score_modifiers": has_score_modifiers,
+    }
+    families = _flash_legal_autotune_pipeline_families(
+        head_dim, num_kv, output_requires_tma=False, requested_family=None, **common
     )
-    if (
-        tuning_policy is None
-        or has_kv_tile_pruning
-        or requires_ws_overlap
-        or small_biased_candidate
-    ):
-        return None
-
-    if is_causal:
-        causal_policy = tuning_policy.causal_policy(num_kv)
-        if not standard_causal_output or causal_policy is None:
-            return None
-        block_sizes = _flash_seed_block_sizes(block_size_targets)
-        if block_sizes is None:
-            return None
-        causal_overrides = _flash_causal_tuning_overrides(causal_policy)
-        pipeline_family = cast("str", causal_overrides[FLASH_PIPELINE_FAMILY_KEY])
+    templates = _flash_target_seed_templates(
+        head_dim,
+        num_kv,
+        target_device_capability=target_device_capability,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
+        allowed_families=families,
+        **common,
+    )
+    seeds: list[Config] = []
+    for template in templates:
         fragments = flash_autotune_fragments(
             head_dim,
             num_kv,
-            num_bh=num_bh,
             tensor_4d_heads=tensor_4d_heads,
-            dtype=dtype,
-            is_causal=True,
-            has_kv_tile_pruning=False,
-            requires_ws_overlap=False,
-            small_biased_candidate=False,
-            standard_causal_output=True,
+            tmem_rowmax_compatible=tmem_rowmax_compatible,
+            causal_resident_compatible=causal_resident_compatible,
             target_device_capability=target_device_capability,
-            supports_tensor_4d_tma=supports_tensor_4d_tma,
-            has_row_epilogue=has_row_epilogue,
-            plain_row_body=plain_row_body,
-            has_score_modifiers=has_score_modifiers,
-            pipeline_family_override=pipeline_family,
+            pipeline_family_override=cast("str", template[FLASH_PIPELINE_FAMILY_KEY]),
+            **common,
         )
         values = {key: fragment.default() for key, fragment in fragments.items()}
-        if not _flash_seed_set_all(values, fragments, causal_overrides):
-            return None
-        expected = {
-            **causal_overrides,
-            FLASH_Q_TILE_COUNT_KEY: 2,
-        }
-        return _flash_validated_target_seed(
-            head_dim=head_dim,
-            num_kv=num_kv,
-            dtype=dtype,
-            num_bh=num_bh,
-            is_causal=True,
-            standard_dense_output=False,
-            standard_causal_output=True,
-            supports_tensor_4d_tma=supports_tensor_4d_tma,
-            values={"block_sizes": block_sizes, **values, FLASH_Q_TILE_COUNT_KEY: 2},
-            expected=expected,
-            has_row_epilogue=has_row_epilogue,
-            plain_row_body=plain_row_body,
-            has_score_modifiers=has_score_modifiers,
+        if not _flash_seed_set_all(values, fragments, template):
+            raise AssertionError("legal flash target template is absent from fragments")
+        # Preserve the row-reduction implementation of former target seeds.
+        # Instruction legality is independent of the template's historical length.
+        rowmax = (
+            "tmem"
+            if _flash_tmem_rowmax_supported(
+                target_device_capability=target_device_capability,
+                fa4=True,
+                score_compatible=tmem_rowmax_compatible,
+            )
+            and values[FLASH_S_LOAD_REP_KEY] == 32
+            else "software"
         )
-
-    dense_policy = tuning_policy.dense_policy(num_kv)
-    if not standard_dense_output or dense_policy is None:
-        return None
-    block_sizes = _flash_seed_block_sizes(block_size_targets)
-    if block_sizes is None:
-        return None
-    fragments = flash_autotune_fragments(
-        head_dim,
-        num_kv,
-        num_bh=num_bh,
-        tensor_4d_heads=tensor_4d_heads,
-        dtype=dtype,
-        is_causal=False,
-        has_kv_tile_pruning=False,
-        requires_ws_overlap=False,
-        small_biased_candidate=False,
-        standard_dense_output=True,
-        target_device_capability=target_device_capability,
-        supports_tensor_4d_tma=supports_tensor_4d_tma,
-        has_row_epilogue=has_row_epilogue,
-        plain_row_body=plain_row_body,
-        has_score_modifiers=has_score_modifiers,
-        pipeline_family_override=dense_policy.pipeline_family,
-    )
-    values = {key: fragment.default() for key, fragment in fragments.items()}
-    overrides = _flash_dense_tuning_overrides(dense_policy)
-    if not _flash_seed_set_all(values, fragments, overrides):
-        return None
-    expected = {
-        **overrides,
-        FLASH_Q_TILE_COUNT_KEY: 2,
-    }
-    return _flash_validated_target_seed(
-        head_dim=head_dim,
-        num_kv=num_kv,
-        dtype=dtype,
-        num_bh=num_bh,
-        is_causal=False,
-        standard_dense_output=True,
-        standard_causal_output=False,
-        supports_tensor_4d_tma=supports_tensor_4d_tma,
-        values={"block_sizes": block_sizes, **values, FLASH_Q_TILE_COUNT_KEY: 2},
-        expected=expected,
-        has_row_epilogue=has_row_epilogue,
-        plain_row_body=plain_row_body,
-        has_score_modifiers=has_score_modifiers,
-    )
+        values[FLASH_ROWMAX_KEY] = rowmax
+        seeds.append(
+            _flash_validated_target_seed(
+                head_dim=head_dim,
+                num_kv=num_kv,
+                dtype=dtype,
+                num_bh=num_bh,
+                is_causal=is_causal,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+                tmem_rowmax_compatible=tmem_rowmax_compatible,
+                causal_resident_compatible=causal_resident_compatible,
+                supports_tensor_4d_tma=supports_tensor_4d_tma,
+                target_device_capability=target_device_capability,
+                has_row_epilogue=has_row_epilogue,
+                plain_row_body=plain_row_body,
+                has_score_modifiers=has_score_modifiers,
+                values={
+                    "block_sizes": block_sizes,
+                    **values,
+                    FLASH_Q_TILE_COUNT_KEY: 2,
+                },
+                expected={
+                    **template,
+                    FLASH_Q_TILE_COUNT_KEY: 2,
+                    FLASH_ROWMAX_KEY: rowmax,
+                },
+            )
+        )
+    return tuple(seeds)
 
 
 def flash_attention_seed_config(
@@ -5132,6 +5515,8 @@ def flash_attention_seed_config(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     target_device_capability: tuple[int, int] | None = None,
     supports_tensor_4d_tma: bool = True,
     has_row_epilogue: bool = False,
@@ -5140,17 +5525,16 @@ def flash_attention_seed_config(
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     seed_kind: str = "default",
 ) -> Config | None:
-    """Return a legal measured starting point for the flash search.
+    """Return the first legal template in deterministic order, or a generic seed.
 
-    Target-specific seeds may depend on length, but they only guide generation
-    zero. The legality-driven search surface remains independent of a winner
-    table, and every seed is benchmarked like any other candidate.
+    The default is also the first plural seed. Historical lengths do not select
+    templates; only implementation legality can change the candidate set.
     """
 
     if num_kv is None:
         return None
     if seed_kind == "default":
-        target_seed = _flash_target_seed_config(
+        target_seeds = _flash_target_seed_configs(
             head_dim,
             num_kv,
             dtype=dtype,
@@ -5162,6 +5546,8 @@ def flash_attention_seed_config(
             small_biased_candidate=small_biased_candidate,
             standard_dense_output=standard_dense_output,
             standard_causal_output=standard_causal_output,
+            tmem_rowmax_compatible=tmem_rowmax_compatible,
+            causal_resident_compatible=causal_resident_compatible,
             target_device_capability=target_device_capability,
             supports_tensor_4d_tma=supports_tensor_4d_tma,
             block_size_targets=block_size_targets,
@@ -5169,8 +5555,8 @@ def flash_attention_seed_config(
             plain_row_body=plain_row_body,
             has_score_modifiers=has_score_modifiers,
         )
-        if target_seed is not None:
-            return target_seed
+        if target_seeds:
+            return target_seeds[0]
     block_sizes = _flash_seed_block_sizes(block_size_targets)
     if block_sizes is None:
         return None
@@ -5186,10 +5572,13 @@ def flash_attention_seed_config(
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
         standard_causal_output=standard_causal_output,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         has_row_epilogue=has_row_epilogue,
         plain_row_body=plain_row_body,
         has_score_modifiers=has_score_modifiers,
+        target_device_capability=target_device_capability,
     )
     if seed_kind == "default":
         return _flash_config_with_values(block_sizes, values)
@@ -5217,11 +5606,79 @@ def flash_attention_seed_config(
     return _flash_config_with_values(block_sizes, values)
 
 
+def _flash_stateful_joint_seed_configs(
+    seeds: Sequence[Config],
+    fragments: Mapping[str, ConfigSpecFragment],
+    resolve_seed: Callable[[Mapping[str, object]], FlashAttentionConfig],
+) -> tuple[Config, ...]:
+    """Append legal depth/register endpoints to the existing stateful templates."""
+    parents = [
+        seed
+        for seed in seeds
+        if seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4"
+        and seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
+        and seed.config.get(FLASH_ROWMAX_KEY) == "tmem"
+    ]
+    depths = cast("EnumFragment", fragments[FLASH_KV_STAGE_KEY])._active_choices()
+    registers = cast(
+        "EnumFragment", fragments[FLASH_SOFTMAX_REGS_KEY]
+    )._active_choices()
+    if not parents or not registers:
+        return ()
+    resolved_parents = [(seed, resolve_seed(seed.config)) for seed in parents]
+    seen = {
+        _flash_config_with_values(
+            cast("Sequence[int]", seed.config["block_sizes"]),
+            flash_effective_config_values(resolved),
+        )
+        for seed, resolved in resolved_parents
+    }
+    result: list[Config] = []
+    for seed, parent in resolved_parents:
+        values = flash_effective_config_values(parent)
+        low_registers = min(cast("Sequence[int]", registers))
+        register_endpoints = (parent.softmax_regs,)
+        if low_registers < parent.softmax_regs:
+            register_endpoints += (low_registers,)
+        for depth in sorted(
+            (
+                value
+                for value in cast("Sequence[int]", depths)
+                if parent.kv_stage < value <= 2 * parent.kv_stage
+            ),
+            reverse=True,
+        ):
+            deeper = {**values, FLASH_KV_STAGE_KEY: depth}
+            # The family domain can exceed this parent's output-storage cap.
+            # Try the next depth when normalization clamps or changes its graph.
+            if not _flash_config_matches_tuning_values(resolve_seed(deeper), deeper):
+                continue
+            for softmax_regs in register_endpoints:
+                if softmax_regs not in registers:
+                    continue
+                candidate_values = {**deeper, FLASH_SOFTMAX_REGS_KEY: softmax_regs}
+                if 2 * softmax_regs + parent.corr_regs + parent.other_regs > 512:
+                    continue
+                if not _flash_config_matches_tuning_values(
+                    resolve_seed(candidate_values), candidate_values
+                ):
+                    continue
+                candidate = _flash_config_with_values(
+                    cast("Sequence[int]", seed.config["block_sizes"]), candidate_values
+                )
+                if candidate not in seen:
+                    seen.add(candidate)
+                    result.append(candidate)
+            break
+    return tuple(result)
+
+
 def flash_attention_seed_configs(
     head_dim: int,
     num_kv: int | None,
     *,
     num_bh: int | None = None,
+    num_sm: int | None = None,
     tensor_4d_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
@@ -5230,6 +5687,8 @@ def flash_attention_seed_configs(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     target_device_capability: tuple[int, int] | None = None,
     supports_tensor_4d_tma: bool = True,
     has_row_epilogue: bool = False,
@@ -5240,9 +5699,9 @@ def flash_attention_seed_configs(
 ) -> tuple[Config, ...]:
     """Return measured starting points plus generic structural coverage.
 
-    A target policy may contribute the first candidate. The remaining seeds
-    cover every legal family and compound packet from fragment defaults. Every
-    candidate is subsequently measured; none is selected without benchmarking.
+    All legal target templates precede generic family and compound-packet
+    coverage. Template order depends only on config content, and every candidate
+    is subsequently measured; none is selected without benchmarking.
 
     ``device_sm_count`` (0 when unknown) lets a problem whose 128-row tiles
     cannot fill the device seed the 64-row tile of the flat ws_overlap grid.
@@ -5264,23 +5723,24 @@ def flash_attention_seed_configs(
         "small_biased_candidate": small_biased_candidate,
         "standard_dense_output": standard_dense_output,
         "standard_causal_output": standard_causal_output,
+        "tmem_rowmax_compatible": tmem_rowmax_compatible,
+        "causal_resident_compatible": causal_resident_compatible,
         "supports_tensor_4d_tma": supports_tensor_4d_tma,
         "has_row_epilogue": has_row_epilogue,
         "plain_row_body": plain_row_body,
         "has_score_modifiers": has_score_modifiers,
+        "target_device_capability": target_device_capability,
     }
     fragments = flash_autotune_fragments(head_dim, num_kv, **common)
     base_values = {key: fragment.default() for key, fragment in fragments.items()}
     seeds: list[Config] = []
-    target_seed = flash_attention_seed_config(
+    target_seeds = _flash_target_seed_configs(
         head_dim,
         num_kv,
-        target_device_capability=target_device_capability,
         block_size_targets=block_size_targets,
         **common,
     )
-    if target_seed is not None:
-        seeds.append(target_seed)
+    seeds.extend(target_seeds)
     base_seed = _flash_config_with_values(block_sizes, base_values)
     if base_seed not in seeds:
         seeds.append(base_seed)
@@ -5350,6 +5810,23 @@ def flash_attention_seed_configs(
             False,
             {FLASH_PIPELINE_FAMILY_KEY: "ws_overlap", FLASH_EPI_STG_KEY: True},
         ),
+        (FLASH_ROWMAX_KEY, "tmem", {FLASH_S_LOAD_REP_KEY: 32}),
+        (
+            FLASH_STAT_TRANSPORT_KEY,
+            "single",
+            {FLASH_SOFTMAX_DISC_KEY: False, FLASH_EXP2_PACKET_KEY: "1x1"},
+        ),
+        (
+            FLASH_STAT_TRANSPORT_KEY,
+            "single",
+            {
+                FLASH_SOFTMAX_DISC_KEY: False,
+                FLASH_EXP2_PACKET_KEY: "1x1",
+                FLASH_E2E_SCHEDULE_KEY: "xu",
+                FLASH_E2E_OFFSET_KEY: 0,
+                FLASH_E2E_OFFSET0_KEY: 0,
+            },
+        ),
         (FLASH_PERSISTENT_LOOP_KEY, "counted", {}),
         (
             FLASH_SP_ROW_SUM_KEY,
@@ -5362,6 +5839,26 @@ def flash_attention_seed_configs(
             "role_local",
             {FLASH_EPI_TMA_KEY: True},
         ),
+        (
+            FLASH_SOFTMAX_LOWERING_KEY,
+            "resident_value_graph",
+            {
+                key: value
+                for key, value in _flash_resident_softmax_overrides(
+                    "resident_value_graph"
+                ).items()
+                if key in FLASH_AUTOTUNE_CONFIG_KEYS
+            },
+        ),
+        (
+            FLASH_SOFTMAX_LOWERING_KEY,
+            "resident_stateful",
+            {
+                **_flash_resident_softmax_overrides("resident_stateful"),
+                FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            },
+        ),
+        (FLASH_SOFTMAX_LOWERING_KEY, "standard", {}),
     )
     if has_row_epilogue:
         # The fa4 family seeds carry the softmax-warpgroup row epilogue (the
@@ -5411,10 +5908,136 @@ def flash_attention_seed_configs(
         values = {**base_values, **dependencies, key: value}
         seeds.append(_flash_config_with_values(block_sizes, values))
 
+    # These lowerings interact with row reduction and pipeline depth. Marginal
+    # coverage of each field does not give their combination a starting point.
+    # Retain the normal family defaults, including its register allocation, and
+    # let tuning measure both the ordinary ring and one deeper prefetch ring.
+    lowering_fragment = fragments[FLASH_SOFTMAX_LOWERING_KEY]
+    assert isinstance(lowering_fragment, EnumFragment)
+    for family, lowering in (
+        ("fa4_2cta", "resident_value_graph"),
+        ("fa4", "resident_stateful"),
+    ):
+        if (
+            family not in families
+            or lowering not in lowering_fragment._active_choices()
+        ):
+            continue
+        joint_fragments = flash_autotune_fragments(
+            head_dim, num_kv, pipeline_family_override=family, **common
+        )
+        rowmax_fragment = joint_fragments[FLASH_ROWMAX_KEY]
+        assert isinstance(rowmax_fragment, EnumFragment)
+        if "tmem" not in rowmax_fragment._active_choices():
+            continue
+        values = {
+            **{key: fragment.default() for key, fragment in joint_fragments.items()},
+            **{
+                key: value
+                for key, value in _flash_resident_softmax_overrides(lowering).items()
+                if key in FLASH_AUTOTUNE_CONFIG_KEYS
+            },
+            FLASH_PIPELINE_FAMILY_KEY: family,
+            FLASH_SOFTMAX_LOWERING_KEY: lowering,
+            FLASH_ROWMAX_KEY: "tmem",
+        }
+        depth = cast("int", values[FLASH_KV_STAGE_KEY])
+        depths = [depth]
+        if lowering == "resident_value_graph":
+            depth_fragment = joint_fragments[FLASH_KV_STAGE_KEY]
+            assert isinstance(depth_fragment, EnumFragment)
+            deeper = max(
+                candidate
+                for candidate in depth_fragment._active_choices()
+                if isinstance(candidate, int) and candidate <= 2 * depth
+            )
+            if deeper > depth:
+                depths.append(deeper)
+        for depth in depths:
+            values[FLASH_KV_STAGE_KEY] = depth
+            resolved = resolve_flash_config(
+                head_dim,
+                num_kv,
+                values,
+                dtype=dtype,
+                num_bh=num_bh,
+                is_causal=is_causal,
+                has_kv_tile_pruning=has_kv_tile_pruning,
+                requires_ws_overlap=requires_ws_overlap,
+                small_biased_candidate=small_biased_candidate,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+                tmem_rowmax_compatible=tmem_rowmax_compatible,
+                causal_resident_compatible=causal_resident_compatible,
+                supports_tensor_4d_tma=supports_tensor_4d_tma,
+                target_device_capability=target_device_capability,
+                has_row_epilogue=has_row_epilogue,
+                plain_row_body=plain_row_body,
+                has_score_modifiers=has_score_modifiers,
+            )
+            if (
+                resolved.pipeline_family == family
+                and resolved.softmax_lowering == lowering
+                and resolved.rowmax == "tmem"
+                and resolved.kv_stage == depth
+            ):
+                seeds.append(_flash_config_with_values(block_sizes, values))
+
     unique: list[Config] = []
     for seed in seeds:
         if seed not in unique:
             unique.append(seed)
+    # Preserve every normal post-acquire seed, and give the conditionally
+    # active scheduling alternative the same general legal starting points.
+    # No shape-specific configuration or measured winner is injected.
+    for seed in tuple(unique):
+        if seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful":
+            values = {**seed.config, FLASH_ROW_SUM_SCHEDULE_KEY: "pre_acquire"}
+            candidate = Config.from_dict(values)
+            if candidate not in unique:
+                unique.append(candidate)
+    # Retain that entire prefix. Seed the same normal stateful templates at a
+    # small geometry-derived set of mappings, including both row-sum orders.
+    stateful_seeds = tuple(
+        seed
+        for seed in unique
+        if seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
+        and seed.config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY) == 1
+    )
+    if stateful_seeds:
+        for width in _flash_stateful_lpt_seed_widths(
+            head_dim, num_kv, num_bh=num_bh, num_sm=num_sm, dtype=dtype
+        ):
+            if width == 1:
+                continue
+            for seed in stateful_seeds:
+                candidate = Config.from_dict(
+                    {**seed.config, FLASH_CAUSAL_LPT_SWIZZLE_KEY: width}
+                )
+                if candidate not in unique:
+                    unique.append(candidate)
+    # Preserve the complete old prefix, including row-sum and LPT coverage.
+    if any(
+        seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4"
+        and seed.config.get(FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
+        and seed.config.get(FLASH_ROWMAX_KEY) == "tmem"
+        for seed in unique
+    ):
+        joint_fragments = flash_autotune_fragments(
+            head_dim, num_kv, pipeline_family_override="fa4", **common
+        )
+
+        # Head count is fragment-only; all resolver context is already shared.
+        resolve_seed = partial(
+            resolve_flash_config,
+            head_dim,
+            num_kv,
+            **{key: value for key, value in common.items() if key != "tensor_4d_heads"},
+        )
+
+        unique.extend(
+            _flash_stateful_joint_seed_configs(unique, joint_fragments, resolve_seed)
+        )
     return tuple(unique)
 
 
@@ -5508,6 +6131,8 @@ def flash_autotune_fragments(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     target_device_capability: tuple[int, int] | None = None,
     output_requires_tma: bool = False,
     supports_tensor_4d_tma: bool = True,
@@ -5524,8 +6149,13 @@ def flash_autotune_fragments(
     choices, and their ordering are identical for every length.
     """
 
+    if tmem_rowmax_compatible is None:
+        tmem_rowmax_compatible = standard_dense_output or standard_causal_output
+
     valid_topology = (
-        topology_override if topology_override in ("fa4", "ws_overlap") else None
+        topology_override
+        if topology_override in ("fa4", "ws_overlap", ROW_MMA_FAMILY)
+        else None
     )
     valid_family = (
         pipeline_family_override
@@ -5555,11 +6185,14 @@ def flash_autotune_fragments(
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
         standard_causal_output=standard_causal_output,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         prefer_packed_reduce=has_kv_tile_pruning or requires_ws_overlap,
         plain_row_body=plain_row_body,
         has_row_epilogue=has_row_epilogue,
         has_score_modifiers=has_score_modifiers,
+        target_device_capability=target_device_capability,
     )
     paired = num_kv >= 2 and num_kv % 2 == 0
     cluster_aligned = num_kv >= 4 and num_kv % 4 == 0
@@ -5571,7 +6204,7 @@ def flash_autotune_fragments(
         if valid_family_flags is not None
         else valid_topology
     )
-    fa4_search_eligible = fa4_eligible and requested_search_topology != "ws_overlap"
+    fa4_search_eligible = fa4_eligible and requested_search_topology in (None, "fa4")
     d64_fa4 = head_dim == 64 and fa4_search_eligible
     dense_d64_fa4 = d64_fa4 and not is_causal
     causal_d64_fa4 = d64_fa4 and is_causal
@@ -5591,6 +6224,39 @@ def flash_autotune_fragments(
     bf16_d128_compound_packet_eligible = (
         bf16_d128_fa4 and not has_kv_tile_pruning and not small_biased_candidate
     )
+
+    active_families = _flash_legal_autotune_pipeline_families(
+        head_dim,
+        num_kv,
+        num_bh=num_bh,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        output_requires_tma=output_requires_tma,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        requested_family=valid_family,
+        has_row_epilogue=has_row_epilogue,
+        plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
+    )
+    if valid_family is None and valid_topology is not None:
+        active_families = tuple(
+            family
+            for family in active_families
+            if cast(
+                "FlashPipelineFamilyFlags", _flash_pipeline_family_flags(family)
+            ).topology
+            == valid_topology
+        )
+    if not active_families:
+        raise InvalidConfig(
+            f"CuTe flash pipeline family {valid_family!r} is not legal for "
+            f"head_dim={head_dim}, num_kv={num_kv}, causal={is_causal}"
+        )
 
     def enum(
         default: _T,
@@ -5639,10 +6305,22 @@ def flash_autotune_fragments(
         kv_stage_values = tuple(range(2, cap + 1))
         kv_stage = enum(defaults.kv_stage, kv_stage_values, kv_stage_values)
     elif fa4_search_eligible and head_dim in (64, 128):
-        value_cap = _flash_aliased_kv_stage_cap(head_dim, stage_output=False)
+        # A mixed-family fragment must represent the deepest legal cooperative
+        # ring. Normalization applies each selected family's own resource cap.
+        # Pinning a local-MMA family keeps its original per-CTA storage domain.
+        use_2cta_kv_layout = any(
+            FLASH_PIPELINE_FAMILY_FLAGS[family].use_2cta_instrs
+            for family in active_families
+        )
+        value_cap = _flash_aliased_kv_stage_cap(
+            head_dim,
+            stage_output=False,
+            use_2cta_instrs=use_2cta_kv_layout,
+        )
         search_cap = _flash_aliased_kv_stage_cap(
             head_dim,
             stage_output=output_requires_tma,
+            use_2cta_instrs=use_2cta_kv_layout,
         )
         kv_stage_values = tuple(range(2, value_cap + 1))
         kv_stage_search = tuple(range(2, search_cap + 1))
@@ -5893,38 +6571,6 @@ def flash_autotune_fragments(
         ("helion", "fa4") if fa4_search_eligible else (defaults.role_map,),
     )
 
-    active_families = _flash_legal_autotune_pipeline_families(
-        head_dim,
-        num_kv,
-        num_bh=num_bh,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        standard_dense_output=standard_dense_output,
-        standard_causal_output=standard_causal_output,
-        output_requires_tma=output_requires_tma,
-        supports_tensor_4d_tma=supports_tensor_4d_tma,
-        requested_family=valid_family,
-        has_row_epilogue=has_row_epilogue,
-        plain_row_body=plain_row_body,
-        has_score_modifiers=has_score_modifiers,
-    )
-    if valid_family is None and valid_topology is not None:
-        active_families = tuple(
-            family
-            for family in active_families
-            if cast(
-                "FlashPipelineFamilyFlags", _flash_pipeline_family_flags(family)
-            ).topology
-            == valid_topology
-        )
-    if not active_families:
-        raise InvalidConfig(
-            f"CuTe flash pipeline family {valid_family!r} is not legal for "
-            f"head_dim={head_dim}, num_kv={num_kv}, causal={is_causal}"
-        )
     family_default = (
         defaults.pipeline_family
         if defaults.pipeline_family in active_families
@@ -6118,6 +6764,8 @@ def flash_autotune_fragments(
                 small_biased_candidate=small_biased_candidate,
                 standard_dense_output=standard_dense_output,
                 standard_causal_output=standard_causal_output,
+                tmem_rowmax_compatible=tmem_rowmax_compatible,
+                causal_resident_compatible=causal_resident_compatible,
                 supports_tensor_4d_tma=supports_tensor_4d_tma,
                 has_row_epilogue=has_row_epilogue,
                 plain_row_body=plain_row_body,
@@ -6134,10 +6782,25 @@ def flash_autotune_fragments(
     else:
         exp2_packet = enum(defaults.exp2_packet, packet_values, packet_search)
 
-    if dense_d64_fa4:
+    stateful_search_eligible = _flash_causal_stateful_workload_supported(
+        fa4=fa4_search_eligible and not has_row_epilogue,
+        head_dim=head_dim,
+        num_kv=num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        standard_causal_output=standard_causal_output,
+        causal_resident_compatible=causal_resident_compatible,
+    ) and pipeline_family_override in (None, "fa4")
+    if stateful_search_eligible:
+        causal_lpt = enum(
+            defaults.causal_lpt_swizzle,
+            range(65),
+            _flash_stateful_lpt_candidates(num_bh),
+        )
+    if fa4_search_eligible and not is_causal:
         transports = (
             ("ring2", "single", "single_final")
-            if standard_dense_output
+            if dense_d64_fa4 and standard_dense_output
             else ("ring2", "single")
         )
         if fixed_family_requires_persistence or has_row_epilogue:
@@ -6150,6 +6813,10 @@ def flash_autotune_fragments(
             transports,
             transports,
         )
+    elif stateful_search_eligible:
+        # Single transport is a child of the explicit stateful graph; it does
+        # not enable an unproven generic causal single-slot implementation.
+        stat_transport = enum("ring2", ("ring2", "single"), ("ring2",))
     else:
         stat_transport = enum("ring2", ("ring2",), ("ring2",))
 
@@ -6173,7 +6840,10 @@ def flash_autotune_fragments(
         defaults.sp_row_sum,
         ("fragment", "whole"),
         ("fragment", "whole")
-        if dense_d64_fa4 and dtype is torch.float16 and not has_row_epilogue
+        if fa4_search_eligible
+        and not is_causal
+        and _flash_supported_io_dtype(dtype)
+        and not has_row_epilogue
         else ("fragment",),
     )
     softmax_setup = enum(
@@ -6315,6 +6985,37 @@ def flash_autotune_fragments(
         FLASH_CAUSAL_LOOP_SPLIT_KEY: causal_split,
         FLASH_PERSISTENT_LOOP_KEY: persistent_loop,
         FLASH_SP_ROW_SUM_KEY: sp_row_sum,
+        FLASH_SOFTMAX_LOWERING_KEY: enum(
+            "auto",
+            ("auto", "standard", "resident_value_graph", "resident_stateful"),
+            ("auto", "standard", "resident_value_graph")
+            if _flash_dense_resident_workload_supported(
+                fa4=fa4_search_eligible and not has_row_epilogue,
+                dtype=dtype,
+                standard_dense_output=standard_dense_output and not is_causal,
+            )
+            else ("auto", "standard", "resident_stateful")
+            if stateful_search_eligible
+            else ("auto",),
+        ),
+        FLASH_ROWMAX_KEY: enum(
+            "software",
+            ("software", "tmem"),
+            ("software", "tmem")
+            if _flash_tmem_rowmax_supported(
+                target_device_capability=target_device_capability,
+                fa4=fa4_search_eligible,
+                score_compatible=tmem_rowmax_compatible,
+            )
+            else ("software",),
+        ),
+        FLASH_ROW_SUM_SCHEDULE_KEY: enum(
+            "post_acquire",
+            ("post_acquire", "pre_acquire"),
+            ("post_acquire", "pre_acquire")
+            if stateful_search_eligible
+            else ("post_acquire",),
+        ),
         FLASH_SOFTMAX_SETUP_KEY: softmax_setup,
         FLASH_EPI_TMA_SETUP_KEY: epi_tma_setup,
         FLASH_Q_TILE_M_KEY: q_tile_m,
@@ -6323,6 +7024,16 @@ def flash_autotune_fragments(
         FLASH_ROW_TILE_M_KEY: row_tile_m,
         FLASH_P_CHUNK_ARRIVE_KEY: p_chunk,
     }
+    if valid_family == "fa4_alt":
+        for key, value in (
+            (FLASH_SOFTMAX_LOWERING_KEY, "auto"),
+            (FLASH_ROW_SUM_SCHEDULE_KEY, "post_acquire"),
+            (FLASH_ROWMAX_KEY, "software"),
+            (FLASH_SP_ROW_SUM_KEY, "fragment"),
+        ):
+            fragment = fragments[key]
+            assert isinstance(fragment, EnumFragment)
+            fragments[key] = EnumFragment(fragment.choices, (value,))
     if valid_family == ROW_MMA_FAMILY:
         # Every other knob is dead for the row programs: pin its search to the
         # default so the family's surface is exactly its two knobs.
@@ -6335,34 +7046,41 @@ def flash_autotune_fragments(
                 continue
             assert isinstance(fragment, EnumFragment)
             fragments[key] = EnumFragment(fragment.choices, (fragment.default(),))
-    target_tuning_policy = get_flash_target_policy(
-        target_device_capability
-    ).tuning_for_torch(head_dim, str(dtype).removeprefix("torch."))
-    policy_values: dict[str, object] = {}
-    if target_tuning_policy is not None:
-        if not is_causal and standard_dense_output:
-            dense_policy = target_tuning_policy.dense_policy(num_kv)
-            if dense_policy is not None:
-                policy_values = _flash_dense_tuning_overrides(dense_policy)
-        elif is_causal and standard_causal_output:
-            causal_policy = target_tuning_policy.causal_policy(num_kv)
-            if causal_policy is not None:
-                policy_values = _flash_causal_tuning_overrides(causal_policy)
-    for key, value in policy_values.items():
-        if key not in fragments:
-            continue
-        fragment = cast("EnumFragment", fragments[key])
-        if value not in fragment.choices:
-            search_choices = fragment.search_choices
-            if search_choices is None:
-                # Target-only seed values remain legal without entering the
-                # generic search surface.
-                search_choices = fragment.choices
-            fragments[key] = EnumFragment(
-                (*fragment.choices, value),
-                search_choices,
-                fragment.coverage_choices,
-            )
+    templates = _flash_target_seed_templates(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        num_bh=num_bh,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        target_device_capability=target_device_capability,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        allowed_families=active_families,
+        has_row_epilogue=has_row_epilogue,
+        plain_row_body=plain_row_body,
+        has_score_modifiers=has_score_modifiers,
+        output_requires_tma=output_requires_tma,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
+    )
+    for template in templates:
+        for key, value in template.items():
+            fragment = cast("EnumFragment", fragments[key])
+            if value not in fragment.choices:
+                search_choices = fragment.search_choices
+                if search_choices is None:
+                    # Seed compatibility values do not widen the generic
+                    # coordinate search or structural coverage surface.
+                    search_choices = fragment.choices
+                fragments[key] = EnumFragment(
+                    (*fragment.choices, value),
+                    search_choices,
+                    fragment.coverage_choices,
+                )
     return fragments
 
 
@@ -6379,10 +7097,13 @@ def flash_config_from_config(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    tmem_rowmax_compatible: bool | None = None,
+    causal_resident_compatible: bool = False,
     supports_tensor_4d_tma: bool = True,
     plain_row_body: bool = True,
     has_row_epilogue: bool = False,
     has_score_modifiers: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -6402,10 +7123,13 @@ def flash_config_from_config(
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
         standard_causal_output=standard_causal_output,
+        tmem_rowmax_compatible=tmem_rowmax_compatible,
+        causal_resident_compatible=causal_resident_compatible,
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         plain_row_body=plain_row_body,
         has_row_epilogue=has_row_epilogue,
         has_score_modifiers=has_score_modifiers,
+        target_device_capability=target_device_capability,
     )
 
 
@@ -6420,7 +7144,7 @@ if TYPE_CHECKING:
 # ``_flash_runtime`` (a real module compiled WITHOUT ``from __future__ import
 # annotations``); the generated module imports them. The remaining cute / utils
 # / pipeline symbols are imported under flash-local aliases.
-_FLASH_RUNTIME_ABI = 6
+_FLASH_RUNTIME_ABI = 7
 
 # This literal is part of generated source and therefore the CuTe disk-cache
 # key. Bump it whenever an imported flash runtime helper changes semantics.
@@ -6988,6 +7712,7 @@ class _FlashOnlineSoftmaxIteration:
     alpha_pre_probability: str
     alpha_publish_pre_probability: str
     probability_update: str
+    probability_publication: str = ""
     pre_max_update: str = ""
     alpha_post_probability: str = ""
     alpha_publish_post_probability: str = ""
@@ -7046,6 +7771,7 @@ def _format_fa4_online_softmax_loop(
 {iteration.alpha_pre_probability}
 {iteration.alpha_publish_pre_probability}
 {iteration.probability_update}
+{iteration.probability_publication}
 {iteration.alpha_post_probability}
 {iteration.alpha_publish_post_probability}
 {iteration.statistics_acquire}
@@ -9157,15 +9883,11 @@ def emit_flash_fa4_device_body(
     target_policy = get_flash_target_policy(target_device_capability)
     hardware_capabilities = target_policy.hardware
     tuning_policy = target_policy.tuning_for_cute(hd, io_dtype)
-    tmem_row_reduce_min_kv = (
-        tuning_policy.tmem_row_reduce_min_kv if tuning_policy is not None else None
-    )
     use_tmem_row_reduce = (
-        hardware_capabilities.supports_tmem_row_reduce
-        and tmem_row_reduce_min_kv is not None
-        and num_kv >= tmem_row_reduce_min_kv
+        cfg.rowmax == "tmem"
+        and hardware_capabilities.supports_tmem_row_reduce
         and cfg.s_load_repetition == 32
-        and score_plan.modifier_kinds in ((DENSE_SCORE_KIND,), (CAUSAL_MASK_KIND,))
+        and flash_tmem_rowmax_score_plan_supported(score_plan)
     )
     causal_desc_kv = is_causal and cfg.causal_kv_order == "descending"
     desc_kv = causal_desc_kv or (not is_causal and cfg.kv_order == "descending")
@@ -9192,7 +9914,9 @@ def emit_flash_fa4_device_body(
     assert 0 < kv_tail_cols <= kv_n
     has_kv_tail = kv_tail_cols != kv_n
     dense_tuning = (
-        tuning_policy.dense_policy(num_kv) if tuning_policy is not None else None
+        tuning_policy.dense_policy(num_kv)
+        if cfg.softmax_lowering == "auto" and tuning_policy is not None
+        else None
     )
     probability_log2_shift = (
         dense_tuning.probability_log2_shift if dense_tuning is not None else 0
@@ -9211,7 +9935,8 @@ def emit_flash_fa4_device_body(
         else FlashPackedExp2Mode.DISABLED
     )
     dense_target_lowering_applies = (
-        dense_tuning is not None
+        cfg.softmax_lowering == "auto"
+        and dense_tuning is not None
         and dense_lowering_schedule_ok
         and not is_causal
         and not has_lse
@@ -9229,12 +9954,28 @@ def emit_flash_fa4_device_body(
         and cfg.rescale_threshold > 0.0
         and dense_softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
     )
+    explicit_resident_value_graph = cfg.softmax_lowering == "resident_value_graph"
+    if explicit_resident_value_graph:
+        # The full-row load/P-store views and acknowledged statistics graph are
+        # shared by all FA4 families, including their persistent wrappers. The
+        # helper changes only the per-KV value graph inside that protocol.
+        assert not is_causal and not has_lse
+        assert io_dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        assert score_plan.modifier_kinds == (DENSE_SCORE_KIND,)
+        assert cfg.q_tile_count == 2 and not cfg.softmax_disc
+        assert cfg.p_store_repetition == 16 and cfg.s_load_repetition == 32
+        assert cfg.split_p_arrive and cfg.stat_transport == "single"
+        assert cfg.sp_row_sum == "whole" and cfg.exp2_impl == "xu"
+        dense_resident_value_graph_candidate = True
     causal_tuning = (
-        tuning_policy.causal_policy(num_kv) if tuning_policy is not None else None
+        tuning_policy.causal_policy(num_kv)
+        if cfg.softmax_lowering == "auto" and tuning_policy is not None
+        else None
     )
     causal_schedule_ok = _flash_causal_resident_schedule_supported(cfg, causal_tuning)
     use_causal_resident_native = (
-        causal_tuning is not None
+        cfg.softmax_lowering == "auto"
+        and causal_tuning is not None
         and causal_schedule_ok
         and use_tmem_row_reduce
         and is_causal
@@ -9272,6 +10013,25 @@ def emit_flash_fa4_device_body(
         # validated rank-0 schedule. Other manual/autotuned configs remain on
         # their resolved standard lowering.
         cfg = _flash_resident_softmax_config(cfg)
+    explicit_stateful = cfg.softmax_lowering == "resident_stateful"
+    if explicit_stateful:
+        # Recheck the actual emitted tile/mask proof; detector metadata alone
+        # must not authorize an unmasked load in an incompatible source graph.
+        assert is_causal and not has_lse
+        assert io_dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        assert score_plan.modifier_kinds == (CAUSAL_MASK_KIND,)
+        assert cfg.pipeline_family == "fa4" and not cfg.persistent
+        assert not cfg.use_2cta_instrs and not cfg.separate_kv_rings
+        assert not cfg.use_cga2_local_cta and not cfg.use_clc_scheduler
+        assert cfg.q_tile_count == 2 and cfg.kv_tile_n == 128 and cfg.mma_ptx
+        assert causal_split_proof.proven and causal_split_equal_iteration_proof.proven
+        assert cfg.causal_loop_split and causal_desc_kv
+        assert cfg.p_store_repetition == 16 and cfg.s_load_repetition == 32
+        assert cfg.split_p_arrive and not cfg.softmax_disc
+        assert cfg.stat_transport == "single" and cfg.sp_row_sum == "whole"
+        assert cfg.exp2_impl == "xu" and cfg.e2e_offset == cfg.e2e_offset0 == 0
+        use_causal_resident_native = True
+        use_causal_stateful_softmax = True
     stat_release_mapping = (
         FlashStatReleaseMapping.SAME_SLOT
         if use_causal_stateful_softmax
@@ -9298,7 +10058,9 @@ def emit_flash_fa4_device_body(
         and cfg.exp2_packet in _FLASH_DEG1_EXP2_PACKETS
     )
     effective_probability_log2_shift = (
-        _flash_fitted_probability_log2_shift(
+        0
+        if explicit_resident_value_graph
+        else _flash_fitted_probability_log2_shift(
             probability_log2_shift, cfg.rescale_threshold
         )
         if use_packed_f16x2_xu or dense_resident_value_graph_candidate
@@ -9314,12 +10076,13 @@ def emit_flash_fa4_device_body(
     # handoff below.
     fa4_stat_pipeline = (
         fa4_stat_handoff
-        and (
-            (not is_causal and cfg.exp2_impl == "split")
-            or (use_causal_resident_native and cfg.exp2_impl == "xu")
-        )
+        and (not is_causal or (use_causal_resident_native and cfg.exp2_impl == "xu"))
         and not cfg.softmax_disc
-        and cfg.rescale_threshold > 0.0
+        and (
+            cfg.rescale_threshold > 0.0
+            or explicit_resident_value_graph
+            or explicit_stateful
+        )
         and (
             cfg.exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
             or dense_resident_value_graph_candidate
@@ -9550,7 +10313,7 @@ def emit_flash_fa4_device_body(
     )
     role_chain = cfg.role_chain
     storage_extra_args = f", {epi_smem!s}, {use_clc_scheduler!s}, {cfg.clc_stages}"
-    storage_extra_args += f", {separate_kv_rings!s}, {kv_n}"
+    storage_extra_args += f", {separate_kv_rings!s}, {kv_n}, {cta_group_size}"
     prefetch_epi_tma = (
         "\n    cute_cpasync_flash.prefetch_descriptor(_flash_tma_o)"
         if cfg.epi_tma
@@ -9827,10 +10590,15 @@ tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
     _flash_tma_v, 0, cute.make_layout(1),
     cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3)){setup_gmem_slice}"""
     )
+    # A warp publishes/consumes 32 adjacent rows. Keep rows contiguous so the
+    # ring and query slots do not multiply the lane stride and alias SMEM banks.
     scale_layout = (
         f"cute.make_layout(({q_stage} * 128))"
         if fa4_stat_handoff
-        else f"cute.make_layout(({s_corr_stage}, {q_stage}, 128))"
+        else (
+            f"cute.make_layout(({s_corr_stage}, {q_stage}, 128), "
+            f"stride=({q_stage * 128}, 128, 1))"
+        )
     )
 
     def _scale_slot_expr(index: str, stage: str) -> str:
@@ -11115,7 +11883,7 @@ if warp_idx == 15:
         )
     else:
         sp_minus_max_scale = "(0.0 - flash_row_max_safe) * _flash_scale_log2"
-    if cfg.rescale_threshold > 0.0:
+    if cfg.rescale_threshold > 0.0 or explicit_resident_value_graph:
 
         def _sp_alpha_pre_for(not_first: str) -> str:
             pin = f"({not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
@@ -11525,11 +12293,22 @@ if warp_idx == 15:
             rowsum_producer_acquire = f"""        _helion_flash_rt.mbar_spin_wait(
             {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase, {cfg.wait_hint})
 """
-            if not fa4_stat_handoff:
-                rowsum_producer_acquire += f"""        _helion_flash_rt.mbar_spin_wait(
-            {corr_empty_ptr} + ({corr_prod_index} ^ 1),
-            flash_s_corr_prod_phase ^ {corr_prod_index}, {cfg.wait_hint})
+        if not fa4_stat_handoff and not cfg.skip_rescale_stats:
+            # Ring2 protects each data slot, but both slots reuse one named
+            # notification barrier. Unlike the next alpha, the final row sum
+            # has no intervening QK/PV dependency that guarantees correction
+            # consumed the previous notification. Wait for that alpha's empty
+            # credit before arriving again. The producer has already advanced:
+            # its previous slot is index^1 and that slot's next phase is
+            # phase^index. This observes the credit without advancing the ring.
+            rowsum_producer_acquire = (
+                f"""        if {kv_loop_bound} > 1:
+            _helion_flash_rt.mbar_spin_wait(
+                {corr_empty_ptr} + (flash_s_corr_prod_index ^ 1),
+                flash_s_corr_prod_phase ^ flash_s_corr_prod_index, {cfg.wait_hint})
 """
+                + rowsum_producer_acquire
+            )
         softmax_row_sum_expr = (
             "flash_softmax.row_sum[0]"
             if use_causal_stateful_softmax
@@ -11608,23 +12387,25 @@ if warp_idx == 15:
                         if chunk in resident_layout
                         else "flash_res_rowmax_tmp"
                     )
-                    rowmax_lines.extend(
-                        [
-                            (
-                                f"            {fragment} = cute.make_rmem_tensor("
-                                "flash_res_ld_shape, cutlass.Float32)"
-                            ),
-                            (
-                                f"            cute.copy({ld}, {ldt}[None, {chunk}, "
-                                f"None, None], {fragment})"
-                            ),
-                            (
-                                "            flash_row_max = "
-                                "_helion_flash_rt._fmax_reduce_chunk_balanced("
-                                f"{fragment}, flash_row_max)"
-                            ),
-                        ]
+                    rowmax_lines.append(
+                        f"            {fragment} = cute.make_rmem_tensor("
+                        "flash_res_ld_shape, cutlass.Float32)"
                     )
+                    if use_tmem_row_reduce:
+                        rowmax_lines.extend(
+                            f"""            flash_res_red = cute.make_rmem_tensor(
+                ((1, 1), *{fragment}.shape[1:]), cutlass.Float32)
+            cute.copy(flash_tiled_ldred{stage},
+                tLDRedtS{stage}[None, {chunk}, None, None],
+                ({fragment}, flash_res_red))
+            for flash_red_i in cutlass.range_constexpr(cute.size(flash_res_red.shape)):
+                flash_row_max = cute.arch.fmax(flash_row_max, flash_res_red[flash_red_i])""".splitlines()
+                        )
+                    else:
+                        rowmax_lines.extend(
+                            f"""            cute.copy({ld}, {ldt}[None, {chunk}, None, None], {fragment})
+            flash_row_max = _helion_flash_rt._fmax_reduce_chunk_balanced({fragment}, flash_row_max)""".splitlines()
+                        )
                 rowmax_lines.append(
                     "            cute.arch.fence_view_async_tmem_load()"
                 )
@@ -11802,6 +12583,9 @@ if warp_idx == 15:
                 if dense_resident_value_graph_candidate and use_2cta_instrs
                 else ""
             )
+            # Keep the old FP16 call text and default lowering unchanged.
+            if explicit_resident_value_graph and io_dtype == "cutlass.BFloat16":
+                resident_pfor_args += ", io_dtype=cutlass.BFloat16"
             sp_exp_block = f"""            flash_row_sum = _helion_flash_rt.resident_softmax_value_graph(
                 tLDrS, {st}, {stt}, tSTcS, _flash_scale_log2,
                 flash_minus_max_scale, flash_pfor_ptr + {stage},
@@ -11921,28 +12705,33 @@ if warp_idx == 15:
             if acknowledged_stat_pipeline
             else ""
         )
-        if use_whole_row_tmem_reduce:
-            assert not score_transform
-        sp_score_load = (
-            f"""            tLDrS_red = cute.make_rmem_tensor(
+        plain_score_load = f"""            cute.copy({ld}, {ldt}, tLDrS)
+            cute.arch.fence_view_async_tmem_load(){score_transform}"""
+        tmem_ld = f"flash_tiled_ldred{stage}" if is_causal else ld
+        tmem_ldt = f"tLDRedtS{stage}" if is_causal else ldt
+        tmem_score_load = f"""            tLDrS_red = cute.make_rmem_tensor(
                 ((1, 1), *tLDrS.shape[1:]), cutlass.Float32)
-            cute.copy({ld}, {ldt}, (tLDrS, tLDrS_red))
+            cute.copy({tmem_ld}, {tmem_ldt}, (tLDrS, tLDrS_red))
             cute.arch.fence_view_async_tmem_load()
             flash_hw_row_max = cutlass.Float32(-cutlass.Float32.inf)
             for flash_red_i in cutlass.range_constexpr(cute.size(tLDrS_red.shape)):
                 flash_hw_row_max = cute.arch.fmax(
                     flash_hw_row_max, tLDrS_red[flash_red_i])"""
-            if use_whole_row_tmem_reduce
-            else f"""            cute.copy({ld}, {ldt}, tLDrS)
-            cute.arch.fence_view_async_tmem_load(){score_transform}"""
-        )
-        sp_rowmax = (
-            "            flash_row_max = cute.arch.fmax("
-            "flash_row_max, flash_hw_row_max)"
-            if use_whole_row_tmem_reduce
-            else "            flash_row_max = "
+        software_rowmax = (
+            "            flash_row_max = "
             "_helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
         )
+        hardware_rowmax = (
+            "            flash_row_max = cute.arch.fmax("
+            "flash_row_max, flash_hw_row_max)"
+        )
+        if use_whole_row_tmem_reduce:
+            assert not score_transform
+            sp_score_load = tmem_score_load
+            sp_rowmax = hardware_rowmax
+        else:
+            sp_score_load = plain_score_load
+            sp_rowmax = software_rowmax
         if use_causal_resident_native:
             assert acknowledged_stat_pipeline
             assert cfg.exp2_impl == "xu"
@@ -12002,25 +12791,10 @@ if warp_idx == 15:
                     wait_hint=cfg.wait_hint,
                 )
 
-            masked_score_load = f"""            cute.copy({ld}, {ldt}, tLDrS)
-            cute.arch.fence_view_async_tmem_load(){score_transform}"""
-            masked_rowmax = (
-                "            flash_row_max = "
-                "_helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
-            )
-            unmasked_score_load = f"""            tLDrS_red = cute.make_rmem_tensor(
-                ((1, 1), *tLDrS.shape[1:]), cutlass.Float32)
-            cute.copy(
-                flash_tiled_ldred{stage}, tLDRedtS{stage}, (tLDrS, tLDrS_red))
-            cute.arch.fence_view_async_tmem_load()
-            flash_hw_row_max = cutlass.Float32(-cutlass.Float32.inf)
-            for flash_red_i in cutlass.range_constexpr(cute.size(tLDrS_red.shape)):
-                flash_hw_row_max = cute.arch.fmax(
-                    flash_hw_row_max, tLDrS_red[flash_red_i])"""
-            unmasked_rowmax = (
-                "            flash_row_max = "
-                "cute.arch.fmax(flash_row_max, flash_hw_row_max)"
-            )
+            masked_score_load = plain_score_load
+            masked_rowmax = software_rowmax
+            unmasked_score_load = tmem_score_load
+            unmasked_rowmax = hardware_rowmax
             if use_causal_stateful_softmax:
                 assert not use_causal_resident_value_graph
 
@@ -12040,6 +12814,15 @@ if warp_idx == 15:
                     row_sum_first_arg = ", True" if is_first else ""
                     score_load_at_indent = textwrap.indent(
                         textwrap.dedent(score_load), indent
+                    )
+                    row_sum_update = f"""{indent}flash_softmax.update_row_sum(
+{indent}    tLDrS.load(), flash_alpha{row_sum_first_arg})"""
+                    stat_acquire = f"""{indent}_helion_flash_rt.mbar_spin_wait(
+{indent}    {corr_empty_ptr} + 0, flash_s_corr_prod_phase, {cfg.wait_hint})"""
+                    post_p_statistics = (
+                        f"{row_sum_update}\n{stat_acquire}"
+                        if explicit_stateful and cfg.row_sum_schedule == "pre_acquire"
+                        else f"{stat_acquire}\n{row_sum_update}"
                     )
                     return f"""{indent}{_softmax_wait_s_ready(stage)}
 {indent}flash_s_full_phase ^= 1
@@ -12064,10 +12847,7 @@ if warp_idx == 15:
 {indent}              {stt}[None, None, flash_ci])
 {indent}cute.arch.fence_view_async_tmem_store()
 {indent}_helion_flash_rt.mbarrier_arrive(flash_pfor2_ptr + {stage})
-{indent}_helion_flash_rt.mbar_spin_wait(
-{indent}    {corr_empty_ptr} + 0, flash_s_corr_prod_phase, {cfg.wait_hint})
-{indent}flash_softmax.update_row_sum(
-{indent}    tLDrS.load(), flash_alpha{row_sum_first_arg})
+{post_p_statistics}
 {indent}flash_s_corr_prod_phase ^= 1"""
 
                 first_step = _format_stateful_softmax_step(
@@ -12082,9 +12862,23 @@ if warp_idx == 15:
                     indent="            ",
                     is_first=False,
                 )
+                # A plain causal load includes the diagonal mask. The proven
+                # suffix needs neither that mask nor LDRED: software row-max is
+                # an independent implementation choice on the raw full row.
+                stateful_unmasked_load = (
+                    unmasked_score_load
+                    if use_tmem_row_reduce
+                    else f"""            cute.copy({ld}, {ldt}, tLDrS)
+            cute.arch.fence_view_async_tmem_load()"""
+                )
+                stateful_unmasked_rowmax = (
+                    "update_row_max_precomputed(flash_hw_row_max, False)"
+                    if use_tmem_row_reduce
+                    else "update_row_max_masked(tLDrS.load(), False)"
+                )
                 unmasked_step = _format_stateful_softmax_step(
-                    unmasked_score_load,
-                    "update_row_max_precomputed(flash_hw_row_max, False)",
+                    stateful_unmasked_load,
+                    stateful_unmasked_rowmax,
                     indent="            ",
                     is_first=False,
                 )
@@ -12201,13 +12995,22 @@ if warp_idx == 15:
                     publish if fa4_publish_alpha_before_exp else ""
                 ),
                 probability_update=sp_exp_block,
+                # Generic XU computes P in registers. Its stores, TMEM fence,
+                # and P-ready arrivals must precede the empty-slot acquire:
+                # correction may need PV to complete before granting credit.
+                # Split helpers already publish P inside probability_update.
+                probability_publication=(
+                    sp_p_store_block if acknowledged_stat_pipeline else ""
+                ),
                 alpha_post_probability=_sp_alpha_post,
                 alpha_publish_post_probability=(
                     "" if fa4_publish_alpha_before_exp else publish
                 ),
                 statistics_acquire=post_p_stat_acquire,
                 statistics_update=statistics_update,
-                post_statistics=sp_p_store_block,
+                post_statistics=(
+                    "" if acknowledged_stat_pipeline else sp_p_store_block
+                ),
             )
 
         if split_segments is not None:
@@ -13315,6 +14118,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     ``flash_attention_tensor_plan`` gate, a False return here is a defensive
     backstop rather than an expected path.
     """
+    from ..compile_environment import CompileEnvironment
+
     df = cg.device_function
     if df.cute_state.attention_flash_block_ids is None:
         return False
@@ -13396,7 +14201,6 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     # on each input's pointer residue, so a base proven only 8-byte aligned
     # (a contiguous view four bf16 elements into a buffer, say) resolves to
     # the tcgen05 families for that binding alone.
-    from ..compile_environment import CompileEnvironment
     from .memory_ops import cute_tensor_base_is_aligned
 
     env = CompileEnvironment.current()
@@ -13433,12 +14237,17 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             and _standard_causal_score_plan_supported(score_plan)
         ),
         supports_tensor_4d_tma=supports_tensor_4d_tma,
+        tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(score_plan),
+        causal_resident_compatible=seq % 256 == 0,
         prefer_packed_reduce=bool(score_plan.modifiers),
         plain_row_body=row_emit is None and not score_plan.modifiers,
         has_row_epilogue=row_emit is not None,
         has_score_modifiers=bool(score_plan.modifiers),
         row_mma_aligned=row_mma_aligned,
         row_mma_aux_dtypes=row_mma_aux_dtypes,
+        target_device_capability=(
+            CompileEnvironment.current().config_spec.target_device_capability
+        ),
     )
     if _flash_output_requires_tma(batch, seq, head_dim) and not cfg.epi_tma:
         return False
@@ -13763,8 +14572,6 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             )
         )
     elif cfg.topology == "fa4":
-        from ..compile_environment import CompileEnvironment
-
         df.cute_state.attention_flash_threads = 512
         df.body = list(
             emit_flash_fa4_device_body(

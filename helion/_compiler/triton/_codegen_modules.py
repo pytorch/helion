@@ -23,6 +23,7 @@ from . import inline_asm_ops  # noqa: F401
 from . import inline_triton_ops  # noqa: F401
 from . import matmul_ops  # noqa: F401
 from . import memory_ops  # noqa: F401
+from . import pdl_ops  # noqa: F401
 from . import quantized_ops  # noqa: F401
 from . import reduce_ops  # noqa: F401
 from . import scan_ops  # noqa: F401

@@ -84,48 +84,45 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     Get hardware information for the current or specified device.
 
     Args:
-        device: Optional device to get info for. If None, uses first available GPU or CPU.
+        device: Optional device to get info for. If None, uses first available GPU or TPU.
 
     Returns:
         HardwareInfo with device details for caching and heuristic lookup.
     """
-    # XPU (Intel) path
-    if (
-        device is not None
-        and device.type == "xpu"
-        and getattr(torch, "xpu", None) is not None
-        and torch.xpu.is_available()
-    ):
-        props = torch.xpu.get_device_properties(device)
-        return HardwareInfo(
-            device_kind="xpu",
-            hardware_name=props.name,
-            runtime_version=props.driver_version,
-            compute_capability=props.name,  # XPU doesn't have compute capability
-        )
+    if device is None:
+        # CUDA/ROCm path
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+        # XPU (Intel) path
+        elif torch.xpu.is_available():
+            device = torch.device("xpu:0")
 
-    # CUDA/ROCm path
-    if torch.cuda.is_available():
-        dev = (
-            device
-            if device is not None and device.type == "cuda"
-            else torch.device("cuda:0")
-        )
-        props = torch.cuda.get_device_properties(dev)
+    if device is not None:
+        if device.type == "cuda":
+            props = torch.cuda.get_device_properties(device)
 
-        if torch.version.cuda is not None:
+            if torch.version.cuda is not None:
+                return HardwareInfo(
+                    device_kind="cuda",
+                    hardware_name=props.name,
+                    runtime_version=str(torch.version.cuda),
+                    compute_capability=f"sm{props.major}{props.minor}",
+                )
+
+            if torch.version.hip is not None:
+                return HardwareInfo(
+                    device_kind="rocm",
+                    hardware_name=props.gcnArchName,
+                    runtime_version=torch.version.hip,
+                    compute_capability=props.gcnArchName,
+                )
+        if device.type == "xpu":
+            props = torch.xpu.get_device_properties(device)
             return HardwareInfo(
-                device_kind="cuda",
+                device_kind="xpu",
                 hardware_name=props.name,
-                runtime_version=str(torch.version.cuda),
-                compute_capability=f"sm{props.major}{props.minor}",
-            )
-        if torch.version.hip is not None:
-            return HardwareInfo(
-                device_kind="rocm",
-                hardware_name=props.gcnArchName,
-                runtime_version=torch.version.hip,
-                compute_capability=props.gcnArchName,
+                runtime_version=props.driver_version,
+                compute_capability=props.name,
             )
 
     # TPU / Pallas path

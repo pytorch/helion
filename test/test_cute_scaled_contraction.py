@@ -384,6 +384,7 @@ def test_actual_packed_staging_preserves_scales_and_nan_padding(
                     )
                 ),
                 "operator": operator,
+                "_cute_python_mod": operator.mod,
                 "_cute_float4_e2m1fn_x2_to_float32": lambda value: (
                     _FP4[value & 15].item(),
                     _FP4[value >> 4].item(),

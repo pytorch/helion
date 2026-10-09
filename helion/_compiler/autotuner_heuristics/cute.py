@@ -5283,14 +5283,18 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         assert spec._cute_flash_num_kv is not None
         common = {
             "num_bh": spec._cute_flash_num_bh,
+            "num_sm": spec.num_sm,
             "tensor_4d_heads": spec._cute_flash_tensor_4d_heads,
             "dtype": spec._cute_flash_dtype,
             "is_causal": spec._cute_flash_is_causal,
             "has_kv_tile_pruning": spec._cute_flash_has_kv_tile_pruning,
             "requires_ws_overlap": spec._cute_flash_requires_ws_overlap,
             "small_biased_candidate": spec._cute_flash_small_biased_candidate,
+            "tmem_rowmax_compatible": spec._cute_flash_tmem_rowmax_compatible,
+            "causal_resident_compatible": spec._cute_flash_causal_resident_compatible,
             "supports_tensor_4d_tma": spec._cute_flash_supports_tensor_4d_tma,
             "has_row_epilogue": spec._cute_flash_has_row_epilogue,
+            "has_score_modifiers": spec._cute_flash_has_score_modifiers,
             "target_device_capability": spec.target_device_capability,
             "block_size_targets": spec._cute_flash_block_size_target_list(),
             "plain_row_body": spec._cute_flash_plain_row_body,

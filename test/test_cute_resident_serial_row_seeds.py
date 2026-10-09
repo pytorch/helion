@@ -124,6 +124,73 @@ def _search(bound: BoundKernel, args: tuple[object, ...]) -> LFBOTreeSearch:
     return search
 
 
+def _capture_initial_population(
+    bound: BoundKernel, args: tuple[object, ...], seed: int
+) -> tuple[LFBOTreeSearch, list[helion.Config], object]:
+    search = _search(bound, args)
+    search._autotune_metrics = AutotuneMetrics()
+    delivered: list[helion.Config] = []
+
+    class HeldBenchmark(Exception):
+        pass
+
+    def hold(
+        members: Sequence[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool = True,
+    ) -> None:
+        assert desc == "Initial population"
+        delivered.extend(deepcopy(member.config) for member in members)
+        raise HeldBenchmark
+
+    with (
+        bound.env,
+        patch.object(search, "_find_similar_cached_configs", return_value=[]),
+        patch.object(search, "benchmark_population", side_effect=hold),
+        pytest.raises(HeldBenchmark),
+    ):
+        random.seed(seed)
+        search._autotune()
+    return search, delivered, random.getstate()
+
+
+def _initial_population_with_legacy_prefix(
+    bound: BoundKernel, args: tuple[object, ...], seed: int
+) -> tuple[LFBOTreeSearch, list[helion.Config]]:
+    # New compiler witnesses append after the complete original LFBO
+    # population. Check the actual benchmark boundary, exact order and RNG.
+    spec = bound.config_spec
+    groups = spec.compiler_coverage_groups
+    with (
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
+        ),
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
+        ),
+    ):
+        old_bound = _cpu_bind(bound.kernel, args)
+    _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
+    search, delivered, rng = _capture_initial_population(bound, args, seed)
+    assert len(old) == 100
+    assert delivered[: len(old)] == old
+    assert rng == old_rng
+    additions = delivered[len(old) :]
+    assert all(config not in old for config in additions)
+    assert all(
+        any(
+            group.mechanism
+            in ("cute.computed_fragment_reduction", "cute.computed_fragment_threads")
+            and config.config.get(group.key, group.legacy) != group.legacy
+            for group in groups
+        )
+        for config in additions
+    )
+    assert len(set(additions)) == len(additions)
+    return search, delivered
+
+
 @pytest.mark.parametrize("kind", ("rms", "layer"))
 @pytest.mark.parametrize("static", (False, True))
 def test_entire_old_seed_prefix_and_default_are_preserved(
@@ -175,7 +242,12 @@ def test_entire_old_seed_prefix_and_default_are_preserved(
     ]
     assert current == [*old, *_family(bound), *deeper]
     assert len(current) == len(old) + 3 + len(deeper)
-    assert [group.mechanism for group in spec.compiler_coverage_groups] == [
+    assert [
+        group.mechanism
+        for group in spec.compiler_coverage_groups
+        if group.mechanism
+        not in ("cute.computed_fragment_reduction", "cute.computed_fragment_threads")
+    ] == [
         "cute.resident_row_consumption",
         "cute.resident_terminal_product",
     ]
@@ -235,32 +307,7 @@ def test_family_reaches_actual_first_full_lfbo_benchmark(
         static=static,
         dtype=torch.bfloat16 if kind == "layer" else torch.float16,
     )
-    search = _search(bound, args)
-    search._autotune_metrics = AutotuneMetrics()
-    delivered = []
-
-    class HeldBenchmark(Exception):
-        pass
-
-    def hold(
-        members: Sequence[PopulationMember],
-        *,
-        desc: str,
-        raise_if_no_viable_config: bool = True,
-    ) -> None:
-        assert desc == "Initial population"
-        delivered.extend(deepcopy(member.config) for member in members)
-        raise HeldBenchmark
-
-    with (
-        bound.env,
-        patch.object(search, "_find_similar_cached_configs", return_value=[]),
-        patch.object(search, "benchmark_population", side_effect=hold),
-        pytest.raises(HeldBenchmark),
-    ):
-        random.seed(2026092701)
-        search._autotune()
-    assert len(delivered) == 100
+    search, delivered = _initial_population_with_legacy_prefix(bound, args, 2026092701)
     for seed in _family(bound):
         flat, normalized = search.config_gen.strict_config_pair(seed)
         assert search.config_gen.unflatten(flat) == normalized

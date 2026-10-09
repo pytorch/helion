@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import struct
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -695,3 +696,68 @@ for vec_lane_1 in cutlass.range_constexpr(4):
     assert rewriter.loop(loop, {}, {}, frozenset()) is not None
     assert rewriter.changed == 1
     assert ast.dump(loop) == before
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "value = argument + 1",
+        "if condition:\n    value = argument + 1",
+        "for vec_lane_0 in cutlass.range_constexpr(16):\n    value = argument + 1",
+        "for scalar_lane in cutlass.range_constexpr(4):\n    value = argument + 1",
+        "for vec_lane_0 in range(4):\n    value = argument + 1",
+        "for vec_lane_0 in cutlass.range_constexpr(1):\n    value = argument + 1",
+        "for left, right in pairs:\n    value = argument + 1",
+        "\n".join(
+            ["value0 = argument"]
+            + [
+                f"value{i} = (value{i - 1} * 1664525 + 1013904223) & 4294967295"
+                for i in range(1, 128)
+            ]
+        ),
+    ],
+)
+def test_snapshot_gate_skips_scopes_without_candidate_loops(source: str):
+    body = ast.parse(source).body
+    before = ast.dump(ast.Module(body=body, type_ignores=[]))
+    vectorizer = _Vectorizer(
+        body, strides={}, alignments={}, dtypes={}, disjoint=set(), constexpr={}
+    )
+    with patch.object(
+        vectorizer, "snapshots", side_effect=AssertionError("unneeded snapshots")
+    ):
+        output = vectorizer.body(body)
+    assert output is body
+    assert ast.dump(ast.Module(body=output, type_ignores=[])) == before
+    assert vectorizer.changed == 0
+
+
+@pytest.mark.parametrize("length", [0, 1, 3, 4, 17, 32])
+@pytest.mark.parametrize("disjoint", [False, True])
+def test_snapshot_gate_preserves_nested_masks_and_alias_rejection(
+    length: int, disjoint: bool
+):
+    # The candidate is behind runtime loops and a branch; the snapshots must
+    # still preserve assignment-time address values and tail predicates.
+    source = _SOURCE.replace(
+        "            for vec_lane_1",
+        "            saved_base = lane_base_1\n"
+        "            alias_base = saved_base\n"
+        "            saved_base = cutlass.Int32(123)\n"
+        "            for vec_lane_1",
+    ).replace("indices_1 = lane_base_1", "indices_1 = alias_base")
+    source = source.replace(
+        "    for tile_offset_1", "    if length >= 0:\n        for tile_offset_1"
+    )
+    lines = source.splitlines()
+    loop_line = next(i for i, line in enumerate(lines) if "for tile_offset_1" in line)
+    source = "\n".join(
+        line if i <= loop_line else "    " + line for i, line in enumerate(lines)
+    )
+    transformed, changed = _rewrite(source, disjoint=disjoint)
+    expected, _ = _execute(ast.parse(source), 0, length)
+    actual, _ = _execute(transformed, 0, length)
+    assert actual == expected
+    if not disjoint:
+        assert changed == 0
+        assert ast.dump(transformed) == ast.dump(ast.parse(source))

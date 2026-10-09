@@ -429,10 +429,12 @@ class DeviceFunction:
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
         # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
-        # awaiting their first use, and the inband accesses emitted so far.
+        # awaiting their first use, the inband accesses emitted so far, and the
+        # done-word asm of each root with inband scatter stores.
         self.peer_state: PeerState | None = None
         self.inband_polls: list[InbandPoll] = []
         self.inband_access_ids: set[int] = set()
+        self.inband_scatter_done: dict[int, str] = {}
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -744,6 +746,13 @@ class DeviceFunction:
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
+        if env.codegen_name == "cute":
+            from .integer_power import prepare_integer_powers
+
+            # Expressions already evaluated on the host or in a device local
+            # need no new arithmetic. Prove integer powers only for the residual
+            # expression that will actually be evaluated in this device scope.
+            expr = prepare_integer_powers(expr, self)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
@@ -1289,14 +1298,27 @@ class DeviceFunction:
                 dependent_launch = [
                     statement_from_string("cute.arch.griddepcontrol_wait()")
                 ]
+        env = CompileEnvironment.current()
+        if (
+            self.triton_persistent_state_specs
+            and env.pdl_exit + env.pdl_entry
+            and "wait" not in env.pdl_entry
+        ):
+            raise exc.PdlStateWithoutWait
+        pdl = {
+            "wait": "tl.extra.cuda.gdc_wait()",
+            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
+        }
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
                 *dependent_launch,
+                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
+                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
         if backend.name == "cute":
@@ -1390,10 +1412,12 @@ class DeviceFunction:
                 )
                 exact_thread_block_dims = thread_block_dims = (288, 1, 1)
                 thread_block_dims_are_exact = True
-            if self.cute_state.collective_register_chain_block_dims is not None:
-                exact_thread_block_dims = thread_block_dims = (
-                    self.cute_state.collective_register_chain_block_dims
-                )
+            owned_block_dims = (
+                self.cute_state.collective_register_chain_block_dims
+                or self.cute_state.owned_root_block_dims
+            )
+            if owned_block_dims is not None:
+                exact_thread_block_dims = thread_block_dims = owned_block_dims
                 thread_block_dims_are_exact = True
             # Autotuner-selected reload mode per rolled or persistent
             # reduction dim ("auto" / "register" / "gmem").
@@ -1934,11 +1958,32 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.backend import validate_thread_axis_accesses
             from .cute.boolean_guards import reassociate_boolean_guards
 
             # Type facts must see the final binding names, including every
             # loop-carried alias, before changing the SDK's Boolean tree shape.
             definition.body = reassociate_boolean_guards(definition.body)
+            if self.config.get("cute_fragment_published_scalars", False):
+                for request in self.cute_state.published_scalar_requests:
+                    request.lower(
+                        definition.body,
+                        {k: v[0] for k, v in self._variable_renames.items()},
+                        self.new_var,
+                    )
+            if self.config.get("cute_fragment_register_producers", False):
+                for request in self.cute_state.register_producer_requests:
+                    request.lower(
+                        definition.body,
+                        {k: v[0] for k, v in self._variable_renames.items()},
+                        self.new_var,
+                    )
+            validate_thread_axis_accesses([*prefix, definition])
+            from .cute.scalar_policy_loads import lower_scalar_policy_loads
+
+            # Keep ordinary load/effect recognition intact through all memory
+            # scheduling, including the late published/register-producer cuts.
+            definition.body = lower_scalar_policy_loads(definition.body)
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"

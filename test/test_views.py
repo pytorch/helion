@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import ast
+import itertools
+import math
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import cast
 import unittest
 
 import torch
@@ -20,6 +26,9 @@ from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+if TYPE_CHECKING:
+    from helion._compiler.aten_lowering import LoweringContext
 
 
 @onlyBackends(["triton", "pallas", "cute"])
@@ -1115,6 +1124,169 @@ class TestViews(RefEagerTestBase, TestCase):
                 ".to(tl.int16)" in code or "tl.cast(" in code,
                 "Expected bitcast to int16 via .to() or tl.cast()",
             )
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("checks generated numeric bitcasts")
+    def test_numeric_view_dtype_preserves_bits(self):
+        @helion.kernel(static_shapes=True)
+        def reinterpret(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+            out = torch.empty(x.shape, device=x.device, dtype=dtype)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile].view(dtype)
+            return out
+
+        for source, target in [
+            (torch.float16, torch.int16),
+            (torch.bfloat16, torch.int16),
+            (torch.float32, torch.int32),
+            (torch.float64, torch.int64),
+            (torch.int8, torch.uint8),
+            (torch.int32, torch.uint32),
+            (torch.int64, torch.uint64),
+        ]:
+            with self.subTest(source=source, target=target):
+                x = torch.arange(137, device=DEVICE).to(source)
+                if source.is_floating_point:
+                    x[:4] = torch.tensor(
+                        [float("inf"), -float("inf"), float("nan"), -0.0],
+                        device=DEVICE,
+                        dtype=source,
+                    )
+                code, actual = code_and_output(
+                    reinterpret, (x, target), block_sizes=[32]
+                )
+                self.assertNotIn("view_dtype_smem", code)
+                self.assertIn(".bitcast(", code)
+                self.assertTrue(
+                    torch.equal(actual.view(torch.uint8), x.view(torch.uint8))
+                )
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("checks declared dtype boundary")
+    def test_view_dtype_after_low_precision_arithmetic(self):
+        @helion.kernel(static_shapes=True)
+        def reinterpret(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape, device=x.device, dtype=torch.int16)
+            for tile in hl.tile(x.numel()):
+                values = x[tile] + 0.0078125
+                out[tile] = values.view(torch.int16)
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.linspace(0.5, 2, 137, device=DEVICE, dtype=dtype)
+                _, actual = code_and_output(reinterpret, (x,), block_sizes=[32])
+                self.assertTrue(torch.equal(actual, (x + 0.0078125).view(torch.int16)))
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("requires replicated physical thread axes")
+    def test_view_dtype_reduction_with_independent_output_axis(self):
+        @helion.kernel(static_shapes=True)
+        def count_bits(x: torch.Tensor, cutoff: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape, dtype=torch.int32, device=x.device)
+            for row in hl.tile(x.size(0)):
+                count = (
+                    (x[row, :].view(torch.int32) >= cutoff[row, None])
+                    .to(torch.int32)
+                    .sum(-1)
+                )
+                for col in hl.tile(x.size(1)):
+                    bits = x[row, col].view(torch.int32)
+                    out[row, col] = count[:, None] + (bits & 15)
+            return out
+
+        x = torch.rand((17, 64), device=DEVICE)
+        cutoff = x[:, 0].contiguous().view(torch.int32)
+        code, actual = code_and_output(
+            count_bits,
+            (x, cutoff),
+            block_sizes=[8, 32],
+            reduction_loops=[4],
+        )
+        bits = x.view(torch.int32)
+        expected = (bits >= cutoff[:, None]).sum(-1)[:, None] + (bits & 15)
+        self.assertNotIn("view_dtype_smem", code)
+        torch.testing.assert_close(actual, expected.to(torch.int32), rtol=0, atol=0)
+
+
+def _execute_triton_stack_lowering(values, dim):
+    from helion._compiler.triton.aten_lowering import codegen_stack
+
+    graph = torch.fx.Graph()
+    inputs = [graph.placeholder(f"arg{i}") for i in range(len(values))]
+    for node, value in zip(inputs, values, strict=True):
+        node.meta["val"] = value
+    node = graph.call_function(torch.ops.aten.stack.default, (inputs, dim))
+    node.meta["val"] = torch.stack(values, dim=dim)
+    statements = []
+    sequence = itertools.count()
+    context = SimpleNamespace(
+        env={n: ast.Name(id=f"arg{i}", ctx=ast.Load()) for i, n in enumerate(inputs)},
+        cg=SimpleNamespace(
+            add_statement=statements.append,
+            device_function=SimpleNamespace(
+                new_var=lambda name: f"{name}_{next(sequence)}",
+                tile_strategy=SimpleNamespace(
+                    compact_shape=lambda shape: [
+                        SimpleNamespace(user_indices=[axis])
+                        for axis in range(len(shape))
+                    ]
+                ),
+            ),
+        ),
+    )
+    expression = codegen_stack(cast("LoweringContext", context), node)
+    statements.append(
+        ast.Assign(
+            targets=[ast.Name(id="result", ctx=ast.Store())],
+            value=cast("ast.expr", expression),
+        )
+    )
+    namespace = {
+        "tl": SimpleNamespace(
+            arange=torch.arange,
+            expand_dims=torch.unsqueeze,
+            zeros_like=torch.zeros_like,
+            where=torch.where,
+        ),
+        **{f"arg{i}": value for i, value in enumerate(values)},
+    }
+    module = ast.fix_missing_locations(ast.Module(body=statements, type_ignores=[]))
+    exec(compile(module, "<triton-stack-lowering>", "exec"), namespace)
+    return namespace["result"]
+
+
+class TestTritonStackAxisCPU(unittest.TestCase):
+    def test_stack_axes_follow_output_rank(self):
+        # Execute the actual emitted selector/expand/where operations. Distinct
+        # inputs expose reordered stacking; non-power-of-two lists check padding.
+        for shape in ((), (5,), (2, 4), (2, 3, 4)):
+            base = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+            layouts = (base, base.transpose(-1, -2)) if len(shape) >= 2 else (base,)
+            for value in layouts:
+                for count in (1, 2, 3, 4):
+                    values = [value + 100 * i for i in range(count)]
+                    rank = value.ndim + 1
+                    for dim in range(-rank, rank):
+                        with self.subTest(shape=value.shape, count=count, dim=dim):
+                            actual = _execute_triton_stack_lowering(values, dim)
+                            axis = dim % rank
+                            torch.testing.assert_close(
+                                actual.narrow(axis, 0, count),
+                                torch.stack(values, dim=dim),
+                                rtol=0,
+                                atol=0,
+                            )
+                            padded = 1 << (count - 1).bit_length()
+                            self.assertEqual(actual.ndim, rank)
+                            self.assertEqual(actual.size(axis), padded)
+                            if padded != count:
+                                self.assertEqual(
+                                    torch.count_nonzero(
+                                        actual.narrow(axis, count, padded - count)
+                                    ),
+                                    0,
+                                )
 
 
 if __name__ == "__main__":

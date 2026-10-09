@@ -170,6 +170,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
    Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
 
+   This flag also appends ``<autotune_log>.trace.jsonl`` with timestamped search
+   stages, config evaluations, rebenchmarks, selection, and exact LLM prompts
+   and responses. Recording is disabled by default; set
+   ``HELION_AUTOTUNE_LOG=/tmp/run`` and ``HELION_AUTOTUNE_LOG_DETAILS=1`` before
+   importing the kernel. Each trace uses a per-search ``run_id``, distinct from
+   the identity used by the CSV and metadata.
+
 .. autoattribute:: Settings.autotune_log_search_space
 
     Enable search space analysis logging after autotuning. When enabled, Helion logs:
@@ -249,6 +256,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_budget_seconds
 
    Wall-clock budget in seconds for autotuning. When the budget is exceeded, Helion returns the best configuration found so far. Controlled by ``HELION_AUTOTUNE_BUDGET_SECONDS``.
+
+.. autoattribute:: Settings.autotune_handoff
+
+   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
+
+.. autoattribute:: Settings.autotune_handoff_budget_seconds
+
+   Time budget for native-source rounds, excluding search and export. Defaults to 1500 seconds. Controlled by ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS``.
 
 .. autoattribute:: Settings.autotune_ignore_errors
 
@@ -399,6 +414,11 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
+| ``HELION_AUTOTUNE_HANDOFF`` | ``autotune_handoff`` | Automatically hand configuration search to a native-source agent (default off). |
+| ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS`` | ``autotune_handoff_budget_seconds`` | Native-source session budget in seconds (default 1500). |
+| ``HELION_HANDOFF_AGENT`` | (source agent) | Agent CLI: ``codex`` (default) or ``claude``. |
+| ``HELION_HANDOFF_MODEL`` | (source agent) | Model override; defaults to ``gpt-6-astra`` for Codex, ``opus`` for Claude. |
+| ``HELION_HANDOFF_EFFORT`` | (source agent) | Reasoning effort supported by the selected CLI; defaults to ``ultra`` for Codex, ``max`` for Claude. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |

@@ -177,6 +177,13 @@ def _launch_block(code: str) -> tuple[int, int, int]:
     return values[0]
 
 
+def _single_thread_axis(code: str, width: int) -> int:
+    """Check the complete physical extent without reserving a dead axis."""
+    block = _launch_block(code)
+    assert sorted(block) == [1, 1, width]
+    return block.index(width)
+
+
 @pytest.mark.parametrize("layout", ["blocked", "strided"])
 @pytest.mark.parametrize("vector", [1, 8])
 @pytest.mark.parametrize("length", [4096, 4112])
@@ -229,11 +236,25 @@ def test_explicit_launch_metadata_ignores_expression_spelling_and_dead_names() -
 
 
 def test_live_free_axis_is_not_dropped() -> None:
-    args = (torch.empty((65, 32)),)
+    from .test_indexing import _execute_pointwise_thread_program
+
+    x = torch.arange(65 * 32, dtype=torch.float32).reshape(65, 32)
+    args = (x,)
     blocked = _code(_free_axis_copy, args, _config("free", "blocked"))
     strided = _code(_free_axis_copy, args, _config("free", "strided"))
     assert _launch_block(blocked) == _launch_block(strided)
-    assert sorted(_launch_block(strided)) == [1, 2, 8]
+    # The explicit row allocation stays at eight threads. A free column axis
+    # must remain independently live; its serial/hardware split may change
+    # when an unused broadcast reservation is removed.
+    block = _launch_block(strided)
+    assert 8 in block
+    assert sum(extent > 1 for extent in block) == 2
+    expected = x + torch.arange(65)[:, None]
+    snapshot = x.clone()
+    for source in (blocked, strided):
+        actual, _ = _execute_pointwise_thread_program(source, args)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(x, snapshot, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -250,12 +271,12 @@ def test_mixed_rank_grid_keeps_surplus_thread_mask(
         (torch.empty((2, 4096)), torch.empty((1024,)), torch.empty((1024,))),
         config,
     )
-    assert sorted(_launch_block(code)) == [1, 1, max(first_threads, second_threads)]
+    axis = _single_thread_axis(code, max(first_threads, second_threads))
     if first_threads > second_threads:
         # A 128-element root cannot spread over 256 threads, so its surplus
         # threads stay masked by the physical thread bound.
         assert "_BLOCK_SIZE_2 = 128" in code
-        assert "cute.arch.thread_idx()[1]) < 128" in code
+        assert f"cute.arch.thread_idx()[{axis}]) < 128" in code
         assert "if mask_2:" in code
     elif second_threads > first_threads:
         # The vectorized 2048-element root is re-planned over all 256 launched
