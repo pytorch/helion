@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from .test_cute_grid_launch_extents import _code
-from .test_cute_grid_launch_extents import _launch_block
 from .test_cute_grid_launch_extents import _mixed_rank_copy
+from .test_cute_grid_launch_extents import _single_thread_axis
 import helion
 from helion import exc
 from helion._testing import DEVICE
@@ -104,7 +104,7 @@ def test_fixed_block_ids_do_not_index_tunable_slots(
             layout=layout,
         ),
     )
-    assert _launch_block(code) == (1, 128, 1)
+    _single_thread_axis(code, 128)
     # No surplus exists: each root needs 128 physical threads even though the
     # second root walks multiple elements per thread. Keep safe mask elision.
     assert "mask_1 =" not in code
@@ -131,7 +131,7 @@ def test_actual_surplus_and_logical_tails_keep_their_masks(
         _config(second_threads=second_threads, reverse=reverse),
     )
     width = 512 if second_threads in (0, 512) else 128
-    assert _launch_block(code) == (1, width, 1)
+    axis = _single_thread_axis(code, width)
     col_id = 2 if reverse else 1
     mask = f"mask_{col_id}"
     predicate = None
@@ -148,7 +148,7 @@ def test_actual_surplus_and_logical_tails_keep_their_masks(
         # Launch repair spells the physical bound literally; a tail-only mask
         # keeps the tile strategy's constexpr spelling. Both evaluate to 128.
         assert re.search(
-            rf"thread_idx\(\)\[1\]\) < (128|_BLOCK_SIZE_{col_id})\b", expression
+            rf"thread_idx\(\)\[{axis}\]\) < (128|_BLOCK_SIZE_{col_id})\b", expression
         )
         assert f"if {mask}:" in code
         predicate = compile(ast.Expression(assignments[0].value), "<mask>", "eval")
@@ -170,7 +170,9 @@ def test_actual_surplus_and_logical_tails_keep_their_masks(
                         "cutlass": SimpleNamespace(Int32=int),
                         "cute": SimpleNamespace(
                             arch=SimpleNamespace(
-                                thread_idx=lambda thread=thread: (0, thread, 0)
+                                thread_idx=lambda thread=thread: tuple(
+                                    thread if dim == axis else 0 for dim in range(3)
+                                )
                             )
                         ),
                         f"indices_{col_id}": index,
@@ -190,8 +192,8 @@ def test_default_thread_counts_keep_surplus_mask() -> None:
         (torch.empty((2, 1024)), torch.empty(2048), torch.empty(2048)),
         config,
     )
-    assert _launch_block(code) == (1, 512, 1)
-    assert "thread_idx()[1]) < 128" in code
+    axis = _single_thread_axis(code, 512)
+    assert f"thread_idx()[{axis}]) < 128" in code
     assert "if mask_1:" in code
 
 
@@ -206,7 +208,7 @@ def test_two_fixed_axes_resolve_the_logical_block_id() -> None:
             cute_lane_layouts=["blocked"] * 4,
         ),
     )
-    assert _launch_block(code) == (1, 128, 1)
+    _single_thread_axis(code, 128)
 
 
 @pytest.mark.parametrize("threads", [(512, 128), (512, 512)])

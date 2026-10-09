@@ -2680,6 +2680,7 @@ class CuteBackend(Backend):
 
         register_chain_block_dims = (
             device_function.cute_state.collective_register_chain_block_dims
+            or device_function.cute_state.owned_root_block_dims
         )
         if register_chain_block_dims is not None:
             return launcher_args_with_compile_options(

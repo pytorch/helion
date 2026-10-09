@@ -11309,7 +11309,12 @@ def _cute_matmul_for_heuristics(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
 def _bind_cute_matmul_without_cutlass() -> None:
     """Child-process body: every cute heuristic registers facts without cutlass."""
     assert sys.modules.get("cutlass", 0) is None
-    with _grouped_worklist_bind_patches(), _mock_cuda_unavailable():
+    with (
+        _grouped_worklist_bind_patches(),
+        _mock_cuda_unavailable(),
+        # This checks planning imports only; no CuTe source generation runs.
+        patch("helion._compiler.cute.backend.CuteBackend.validate_environment"),
+    ):
         kernel = helion.kernel(
             _cute_matmul_for_heuristics, backend="cute", static_shapes=True
         )

@@ -2380,9 +2380,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             best = RandomSearch(bound_kernel, args, 8).autotune()
 
         self.assertIsNotNone(best)
-        # Random configs that fail to compile never reach the accuracy check
-        # (hardware-dependent even with a pinned seed), so leave slack here.
-        self.assertGreaterEqual(call_count[0], 4)
+        # The second accuracy-check attempt crashes. A third proves the search
+        # continued; random configs can fail compilation before reaching this hook.
+        self.assertGreaterEqual(call_count[0], 3)
         self.assertEqual(call_count[1], 1)
 
 

@@ -276,7 +276,7 @@ def test_a_tile_reduction_beside_a_wider_sibling_defines_its_indices(
         )
         code = bound.to_code(_sibling_config(bound, pid_type))
     body = _kernel_body(code)
-    assert "mask_1 = cutlass.Int32(cute.arch.thread_idx()[1]) < 128" in body, code
+    assert "mask_1 = cutlass.Int32(cute.arch.thread_idx()[0]) < 128" in body, code
     assert "group_span=512" in body, code
     (load,) = [line for line in body.splitlines() if "if mask_1 else" in line]
     for name in ("indices_0", "indices_1"):

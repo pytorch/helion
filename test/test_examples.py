@@ -3060,6 +3060,16 @@ class TestExamples(RefEagerTestBase, TestCase):
                 )
                 kernel.settings.autotune_effort = "none"
 
+        if _get_backend() == "triton" and torch.version.cuda is not None:
+            # Sixteen warps avoid Triton 3.7.1's loop-to-dot layout-conversion
+            # failure in this correctness-only schedule. Keep the tiled loops
+            # and arithmetic intact, and restore production configs afterward.
+            kernel = engine.chunk_bwd_wy_dL_delta_helion
+            self.addCleanup(kernel.reset)
+            self.addCleanup(setattr, kernel, "configs", kernel.configs)
+            kernel.configs = [helion.Config(block_sizes=[16, 16, 16], num_warps=16)]
+            kernel.reset()
+
     def _run_linear_example(self, name: str, method: str = "test") -> None:
         import importlib
 

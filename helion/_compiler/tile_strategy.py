@@ -7787,6 +7787,17 @@ class BlockSizeTileStrategy(TileStrategy):
             if offset is not None:
                 return offset
 
+        if (
+            env.backend.name == "cute"
+            and len(HostFunction.current().device_ir.phases) > 1
+        ):
+            # All barrier phases share the launch layout. Use the dispatcher's
+            # kernel-wide reservation, including axes absent from this phase,
+            # so the body's tile indices agree with the launch block dimensions.
+            offset = self.fn.tile_strategy.thread_axis_for_strategy(self)
+            if offset is not None:
+                return offset
+
         seen: set[int] = set()
         active_reduction_axes = 0
         active_non_reduction_axes = 0
@@ -7807,29 +7818,28 @@ class BlockSizeTileStrategy(TileStrategy):
         if not env.backend.reduction_axis_first():
             return active_non_reduction_axes + active_reduction_axes
 
-        # Reduction strategies claim axes 0..n-1 in creation order
-        # (``_get_thread_axis``), so reserving only one axis when two
-        # multi-thread reductions are live would place this strategy on the
-        # same axis as the second reduction. That collision double-books the
-        # axis (e.g. a tile axis planned for 2 threads sharing thread_idx[1]
-        # with a 4-thread reduction), making the generated tile indices span
-        # more elements than the tile holds. Reserve one axis per reduction
-        # that actually spreads across threads; single-thread reductions
-        # (thread_idx is constant 0 on their axis) may share an axis safely.
-        # The reservation is kernel-wide (it also counts reductions of other
-        # ``hl.barrier()`` phases); ``TileStrategyDispatch.thread_axis_for_strategy``
-        # mirrors it for multi-phase kernels so the launch block dims agree
-        # with the axes the body indexes.
+        # Reserve through the highest axis assigned to a coexecuting
+        # multi-thread reduction or full slice. Counting strategies can miss
+        # gaps in those assignments and make tile indices overlap a reduction
+        # axis. Single-thread reductions use constant zero and need no axis.
         reduction_strategies = [
             strategy
             for strategy in self.fn.tile_strategy.strategies
             if isinstance(strategy, ReductionStrategy)
         ]
         planned_reduction_axes = max(
-            sum(
-                1
-                for strategy in reduction_strategies
-                if strategy._reduction_thread_count() > 1
+            max(
+                (
+                    axis + strategy.thread_axes_used()
+                    for strategy in reduction_strategies
+                    if strategy._reduction_thread_count() > 1
+                    and self.fn.tile_strategy.strategies_can_coexecute(self, strategy)
+                    and (
+                        axis := self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+                    )
+                    is not None
+                ),
+                default=0,
             ),
             1
             if any(strategy.thread_axes_used() > 0 for strategy in reduction_strategies)
