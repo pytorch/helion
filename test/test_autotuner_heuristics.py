@@ -5344,8 +5344,7 @@ class TestTritonReductionHeuristicUnit(TestCase):
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
             seed = TritonReductionHeuristic.get_seed_config(env, MagicMock())
-        self.assertEqual(seed.config["block_sizes"][0], 512)
-        self.assertLessEqual(seed.config["block_sizes"][1], 4)
+        self.assertEqual(seed.config["block_sizes"], [512, 4])
 
     def test_warp_selection_descends_when_resident_warps_are_retained(
         self,

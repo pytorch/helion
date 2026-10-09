@@ -4823,8 +4823,9 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         ]
         slot_of = {block.block_id: index for index, block in enumerate(specs)}
         floors = {block.block_id: cls._block_floor(block) for block in specs}
+        full_widths = {block.block_id: _np2(max(1, block.size_hint)) for block in specs}
         maximums = {
-            block.block_id: min(block.max_size, _np2(max(1, block.size_hint)))
+            block.block_id: min(block.max_size, full_widths[block.block_id])
             for block in specs
         }
         blocks = [floors[block.block_id] for block in specs]
@@ -4975,7 +4976,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         full_reduction_ids = {
             block_id
             for block_id in descriptors_by_block
-            if candidate.reduction_width(block_id) == reduction_maximums[block_id]
+            if candidate.reduction_width(block_id)
+            == full_widths.get(block_id, reduction_maximums[block_id])
         }
         adjustable_ids = {
             *(
@@ -5062,7 +5064,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                 if block_id in grid_ids:
                     required_gain = (
                         cls.FULL_GRID_SPLIT_GAIN_THRESHOLD
-                        if current_value == axis_maximums[block_id]
+                        if current_value == full_widths[block_id]
                         else cls.GRID_RESIDENCY_GAIN_THRESHOLD
                     )
                     worthwhile = (
