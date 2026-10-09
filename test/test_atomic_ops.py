@@ -2106,8 +2106,14 @@ def _simulate_register_load_program(
     state = {"lane": 0, "row": 0, "shared": [], "barriers": 0}
 
     class Pointer:
-        def __init__(self, values, offset=0, initialized=None):
-            self.values, self.offset = values, int(offset)
+        def __init__(self, values, offset=None, initialized=None):
+            self.values = values
+            self.offset = values.storage_offset() if offset is None else int(offset)
+            self.flat = values.as_strided(
+                (values.untyped_storage().nbytes() // values.element_size(),),
+                (1,),
+                storage_offset=0,
+            )
             self.initialized = initialized
 
         def __add__(self, offset):
@@ -2118,16 +2124,23 @@ def _simulate_register_load_program(
             return self
 
         def load(self):
-            assert 0 <= self.offset < self.values.numel()
+            assert 0 <= self.offset < self.flat.numel()
             if self.initialized is not None:
                 assert self.offset in self.initialized, (
                     "shared pointer read before initialization"
                 )
-            return self.values.flatten()[self.offset].item()
+            value = self.flat[self.offset].item()
+            if self.values.dtype == torch.int32:
+                return np.int32(value)
+            if self.values.dtype == torch.int64:
+                return np.int64(value)
+            return value
 
         def store(self, value):
-            assert 0 <= self.offset < self.values.numel()
-            self.values.flatten()[self.offset] = float(value)
+            assert 0 <= self.offset < self.flat.numel()
+            self.flat[self.offset] = (
+                float(value) if self.values.dtype.is_floating_point else int(value)
+            )
             if self.initialized is not None:
                 self.initialized.add(self.offset)
             elif memory_events is not None:
@@ -7147,7 +7160,14 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
             static_shapes=True,
             autotune_effort="full",
         )
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_register_snapshots_coverage"
+            ),
+        ):
             bound = _cpu_bind(kernel, args)
             spec = bound.config_spec
             default = spec.default_config()
@@ -8748,6 +8768,113 @@ class TestFragmentThreadCoverageCompatibilityCPU(unittest.TestCase):
                             for row in rows
                         )
                     )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_snapshot_branch(x, positive: hl.constexpr):
+    out = torch.empty_like(x)
+    counts = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        index = hl.arange(x.size(1))
+        values = hl.load(x, [row, index])
+        gate = hl.zeros([1], dtype=torch.int32)
+        hl.atomic_add(gate, [0], positive)
+        if gate.sum() > 0:
+            local = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(local, [index % 17], values.to(torch.int32))
+            counts[row, :] = local
+            hl.store(out, [row, index], values + 2)
+        else:
+            other = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(other, [index % 17], (values + 1).to(torch.int32))
+            counts[row, :] = other
+            hl.store(out, [row, index], values - 3)
+    return out, counts
+
+
+class TestFragmentReadonlySnapshotAtomicCPU(TestCase):
+    def test_uniform_captured_snapshot_epochs_and_aggregation(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        for positive in (False, True):
+            for aggregate in (False, True):
+                for threads in (32, 128):
+                    with self.subTest(
+                        positive=positive, aggregate=aggregate, threads=threads
+                    ):
+                        x = torch.arange(2 * 65).reshape(2, 65).float() % 7
+                        with (
+                            _mock_cuda_unavailable(),
+                            _target(),
+                            _forbid_native_compile(),
+                        ):
+                            bound = _cpu_bind(_fragment_snapshot_branch, (x, positive))
+                            config = bound.config_spec.default_config()
+                            config.config.update(
+                                cute_fragment_register_snapshots=True,
+                                cute_fragment_threads=threads,
+                                cute_fragment_atomic_aggregation=aggregate,
+                            )
+                            code = bound.to_code(config)
+                        self.assertIn("fragment_snapshot", code)
+                        for order in (
+                            list(range(threads)),
+                            list(reversed(range(threads))),
+                        ):
+                            out = torch.full_like(x, -99)
+                            counts = torch.full((2, 17), -99, dtype=torch.int32)
+                            _simulate_register_load_program(
+                                code,
+                                x,
+                                threads,
+                                host_tensors={"out": out, "counts": counts},
+                                lane_order=order,
+                            )
+                            torch.testing.assert_close(
+                                out, x + 2 if positive else x - 3, rtol=0, atol=0
+                            )
+                            expected = torch.zeros_like(counts)
+                            expected.scatter_add_(
+                                1,
+                                (torch.arange(65) % 17).expand(2, -1),
+                                (x if positive else x + 1).to(torch.int32),
+                            )
+                            torch.testing.assert_close(counts, expected, rtol=0, atol=0)
+
+
+@onlyBackends("cute")
+class TestFragmentReadonlySnapshotNative(TestCase):
+    def test_uniform_branch_captures(self):
+        for positive in (False, True):
+            for aggregate in (False, True):
+                for threads in (32, 1024):
+                    with self.subTest(
+                        positive=positive, aggregate=aggregate, threads=threads
+                    ):
+                        x = torch.arange(130, device=DEVICE).reshape(2, 65).float() % 7
+                        before = x.clone()
+                        bound = _fragment_snapshot_branch.bind((x, positive))
+                        config = bound.config_spec.default_config()
+                        config.config.update(
+                            cute_fragment_register_snapshots=True,
+                            cute_fragment_threads=threads,
+                            cute_fragment_atomic_aggregation=aggregate,
+                        )
+                        out, counts = bound.compile_config(config)(x, positive)
+                        torch.testing.assert_close(
+                            out, x + 2 if positive else x - 3, rtol=0, atol=0
+                        )
+                        expected = torch.zeros_like(counts)
+                        expected.scatter_add_(
+                            1,
+                            (torch.arange(65, device=DEVICE) % 17).expand(2, -1),
+                            (x if positive else x + 1).to(torch.int32),
+                        )
+                        torch.testing.assert_close(counts, expected, rtol=0, atol=0)
+                        torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
