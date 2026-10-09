@@ -5118,10 +5118,11 @@ class ConfigSpec:
             )
 
         # Allow tunable parameter keys in addition to backend-supported keys.
-        allowed_keys = self.supported_config_keys() | {
+        unknown_keys = {*config} - VALID_KEYS
+        invalid_keys = (unknown_keys | {*self.unsupported_config_keys(config)}) - {
             *self.user_defined_tunables.keys()
         }
-        if invalid_keys := ({*config} - allowed_keys):
+        if invalid_keys:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def raise_grid_block_minimums(self) -> None:

@@ -16,6 +16,7 @@ from typing import Sequence
 
 import torch
 
+from ... import _compat
 from ... import exc
 from ..backend import Backend
 from ..backend import LauncherInfo
@@ -97,36 +98,23 @@ class TritonBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         if key == "host_tensor_descriptors":
-            from ..._compat import supports_host_tensor_descriptor
-
-            return self.name == "triton" and supports_host_tensor_descriptor()
+            return self.name == "triton" and _compat.supports_host_tensor_descriptor()
         if key == "cross_loop_pipeline":
-            from ..._compat import is_hip
-
-            return self.name == "triton" and not is_hip()
+            return self.name == "triton" and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":
-            from ..._compat import is_hip
-
-            return is_hip()
+            return _compat.is_hip()
         if key == "matrix_instr_nonkdim":
-            from ..._compat import supports_amd_cdna_tunables
-
-            return supports_amd_cdna_tunables()
+            return _compat.supports_amd_cdna_tunables()
         if key == "xcd_remap":
-            from ..._compat import supports_amd_cdna_tunables
-
             # Accepted on all AMD CDNA.  On single-XCD devices it normalizes to a
             # no-op (ConfigSpec.normalize) and is excluded from the search space
             # (ConfigSpec.flat_config) rather than rejected.
-            return supports_amd_cdna_tunables()
+            return _compat.supports_amd_cdna_tunables()
 
-        from ..._compat import get_mtia_tunable_fragments
-        from ..._compat import supports_mtia_tunables
-
-        if key in get_mtia_tunable_fragments():
-            return supports_mtia_tunables()
+        if key in _compat.get_mtia_tunable_fragments():
+            return _compat.supports_mtia_tunables()
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
