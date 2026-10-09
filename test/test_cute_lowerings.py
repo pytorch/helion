@@ -25602,9 +25602,10 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
             )
 
     def test_tuple_reduce_operands(self) -> None:
-        # A tuple reduce's combine pairs its inputs' elements: consistent
-        # inputs stay exact (and a single-input reduce is never compared
-        # against itself), a transposed input is refused.  (The 16-wide rows
+        # The ordinary tuple combine pairs its inputs' elements: consistent
+        # inputs stay exact, and a transposed input is refused. Independent
+        # builtin sums can instead canonicalize into separate reductions.
+        # (The 16-wide rows
         # are what the cute tuple reduce computes correctly today; 64-wide
         # rows are wrong on pristine too, independent of this check.)
         torch.manual_seed(0)
@@ -25616,12 +25617,43 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
         torch.testing.assert_close(out_x, x.sum(1), rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(out_y, y.sum(1), rtol=1e-4, atol=1e-4)
         square = torch.randn(64, 64, device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "at the position of another block's lane"
+        with (
+            patch(
+                "helion._compiler.cute.canonicalize_reductions.canonicalize_reductions"
+            ),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported, "at the position of another block's lane"
+            ),
         ):
-            code_and_output(
-                _cute_tuple_reduce_transposed, (square,), block_sizes=[16, 16]
+            # Keep this graph out of the shared bind cache so the positive
+            # case below exercises normal canonicalization on a fresh graph.
+            _cute_tuple_reduce_transposed._bind_isolated((square,)).to_code(
+                helion.Config(block_sizes=[16, 16])
             )
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def transposed_sums(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            rows = torch.empty_like(x)
+            columns = torch.empty_like(x)
+            for tm, tn in hl.tile(x.size()):
+                tile = x[tm, tn]
+                a, b = hl.reduce(_tuple_add_combine, (tile, tile.T), dim=1)
+                rows[tm, tn] = a[:, None]
+                columns[tm, tn] = b[None, :]
+            return rows, columns
+
+        # Keep the same input and tile sizes, but assign each output element
+        # to one tile. The rejection probe has competing column-tile stores.
+        _, (rows, columns) = code_and_output(
+            transposed_sums, (square,), block_sizes=[16, 16]
+        )
+        tiles = square.reshape(4, 16, 4, 16)
+        expected_rows = tiles.sum(3, keepdim=True).expand_as(tiles).reshape_as(square)
+        expected_columns = (
+            tiles.sum(1, keepdim=True).expand_as(tiles).reshape_as(square)
+        )
+        torch.testing.assert_close(rows, expected_rows, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(columns, expected_columns, rtol=1e-4, atol=1e-4)
 
     def test_matmul_transposed_accumulator_rejected(self) -> None:
         # Tracing admits ``acc=t.T`` with equal block sizes; Triton adds the

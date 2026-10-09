@@ -197,15 +197,22 @@ class TestMasking(RefEagerTestBase, TestCase):
                 out[tile_m] = acc.sum(dim=1)
             return out
 
-        args = (torch.randn([100, 100], device=DEVICE),)
-        code, result = code_and_output(
-            fn,
-            args,
-        )
-        if _get_backend() == "cute":
-            self.assertIn("if mask_1 else cutlass.Float32(0)", code)
-        else:
-            self.assertIn("tl.where", code)
+        for width in (33, 64, 100):
+            with self.subTest(width=width):
+                args = (torch.randn([100, width], device=DEVICE),)
+                _, result = code_and_output(fn, args)
+                # The reduction inside each tile sees only its live columns.
+                # The final reduction sees the complete 32-element accumulator.
+                expected_acc = torch.zeros((100, 32), device=DEVICE)
+                for start in range(0, width, 32):
+                    live_columns = min(32, width - start)
+                    expected_acc += expected_acc[:, :live_columns].sum(
+                        dim=1, keepdim=True
+                    )
+                    expected_acc += 1
+                torch.testing.assert_close(
+                    result, expected_acc.sum(dim=1), rtol=0, atol=0
+                )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRefEager(

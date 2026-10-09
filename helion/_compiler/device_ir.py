@@ -3296,11 +3296,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             rewrite_implicit_random_ops(graph.graph)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.canonicalize_reductions import canonicalize_reductions
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
             from .cute.scaled_contraction import expose_scaled_contractions
 
+            canonicalize_reductions(device_ir)
             scaled_contractions = expose_scaled_contractions(device_ir)
             for graph_info in device_ir.graphs:
                 fold_noop_stores(graph_info.graph)

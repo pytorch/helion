@@ -324,6 +324,9 @@ class ReductionRoller:
                 or self.is_reduction(node)
             ):
                 return
+            if node.op == "placeholder":
+                self.get_inner_arg(node)
+                return
             for n in node.all_input_nodes:
                 readd(n)
             new_node = self.inner_graph.create_node(

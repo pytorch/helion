@@ -57,8 +57,10 @@ def tile_loop_thread_count(
         extents: list[int] = []
         seen: set[int] = set()
         for block_ids in path:
-            order = env.config_spec.loop_orders.config_get(
-                config.loop_orders, block_ids[0]
+            order = (
+                env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
+                if len(block_ids) > 1
+                else None
             ) or range(len(block_ids))
             for position in order:
                 block_id = block_ids[position]

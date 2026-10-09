@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
+import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils._sympy.functions import FloorDiv
 
 import helion
 from helion import exc
+from helion._compiler.cute.computed_fragment import FragmentCompiler
+from helion._compiler.host_function import HostFunction
+from helion._compiler.variable_origin import BlockSizeOrigin
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -373,3 +381,79 @@ def test_fragment_rejects_oversized_shared_storage_before_launch():
         bound = _fragment_recurrence.bind((x, 1))
     with pytest.raises(exc.InvalidConfig, match="shared bytes, exceeding"):
         bound.to_code(bound.config_spec.default_config())
+
+
+def _fragment_extent_fixture(rows_per_block, columns_per_block):
+    rows, columns, parts = sympy.symbols(
+        "rows columns parts", integer=True, positive=True
+    )
+    symbols = (rows, columns, rows, columns, parts)
+    numels = (17, 65, rows, columns, FloorDiv(columns + 64, columns))
+    configured = (rows_per_block, columns_per_block, 64, 128, 8192)
+    blocks = [
+        SimpleNamespace(
+            block_id=i,
+            var=SimpleNamespace(_sympy_=lambda symbol=symbol: symbol),
+            numel=sympy.sympify(numel),
+            reduction=i >= 2,
+        )
+        for i, (symbol, numel) in enumerate(zip(symbols, numels, strict=True))
+    ]
+    compiler = object.__new__(FragmentCompiler)
+    compiler.df = SimpleNamespace(
+        resolved_block_size=lambda block_id: configured[block_id], literal_expr=str
+    )
+    compiler.env = SimpleNamespace(
+        block_sizes=blocks,
+        specialize_expr=lambda expr: expr,
+        backend=SimpleNamespace(sympy_printer_expr=str),
+    )
+    compiler.sym_indices = {}
+    compiler.offsets = {}
+    host = SimpleNamespace(
+        expr_to_origin={
+            symbol: SimpleNamespace(origin=BlockSizeOrigin(block_id))
+            for symbol, block_id in ((rows, 0), (columns, 1), (parts, 4))
+        }
+    )
+    return compiler, host, rows, columns, parts
+
+
+@pytest.mark.parametrize(
+    "rows_per_block,columns_per_block", [(8, 16), (16, 32), (32, 64), (16, 128)]
+)
+def test_fragment_configured_extents_preserve_coordinate_geometry(
+    rows_per_block, columns_per_block
+):
+    compiler, host, rows, columns, parts = _fragment_extent_fixture(
+        rows_per_block, columns_per_block
+    )
+    expected_parts = (65 + columns_per_block - 1) // columns_per_block
+    with patch.object(HostFunction, "current", return_value=host):
+        assert compiler.shape((rows, parts)) == (rows_per_block, expected_parts)
+        assert compiler.shape((rows, columns)) == (rows_per_block, columns_per_block)
+        # The same symbolic dimension determines both allocation and coordinate
+        # stride; alias reductions must not change either one.
+        row, column = sympy.symbols("row column", integer=True)
+        address = sympy.sympify(
+            compiler.sym(row * parts + column), locals={"row": row, "column": column}
+        )
+        for r in range(rows_per_block):
+            for c in range(expected_parts):
+                assert int(address.subs({row: r, column: c})) == r * expected_parts + c
+        assert compiler.extent(FloorDiv(columns + 64, columns)) == expected_parts
+
+
+def test_fragment_configured_extents_preserve_dynamic_symbols_and_reject_cycles():
+    compiler, host, rows, columns, parts = _fragment_extent_fixture(16, 32)
+    dynamic = sympy.Symbol("dynamic", integer=True, positive=True)
+    with patch.object(HostFunction, "current", return_value=host):
+        expression = FloorDiv(dynamic + columns - 1, columns)
+        assert compiler.configured_expr(expression) == FloorDiv(dynamic + 31, 32)
+        with pytest.raises(exc.InvalidConfig, match="static local extents"):
+            compiler.extent(expression)
+        compiler.env.block_sizes[4].numel = parts
+        with pytest.raises(exc.InvalidConfig, match="cyclic"):
+            compiler.extent(parts)
+        with pytest.raises(exc.InvalidConfig, match="cyclic"):
+            compiler.sym(parts)

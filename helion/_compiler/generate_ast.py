@@ -2450,6 +2450,21 @@ def _generate_ast(
                 load_transform=load_transform,
                 extra_params=extra_params,
             )
+        if (
+            env.backend.name == "cute"
+            and len(func.device_ir.phases) > 1
+            and config.pid_type == "flat"
+        ):
+            from .cute.ordered_phases import generate_ordered_phases
+
+            return generate_ordered_phases(
+                func,
+                config,
+                emit_repro_caller,
+                store_transform=store_transform,
+                load_transform=load_transform,
+                extra_params=extra_params,
+            )
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
