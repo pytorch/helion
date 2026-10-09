@@ -144,6 +144,14 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
     decomp_table = select_decomp_table().copy()
+    if (
+        CompileEnvironment.has_current()
+        and CompileEnvironment.current().backend_name == "cute"
+    ):
+        # CuTe lowers these native numeric extrema directly. Preserve their
+        # distinction from NaN-propagating minimum/maximum during tracing.
+        decomp_table.pop(torch.ops.aten.fmin.default, None)
+        decomp_table.pop(torch.ops.aten.fmax.default, None)
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.

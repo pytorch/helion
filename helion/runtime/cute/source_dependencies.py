@@ -16,6 +16,7 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 # a generated import statement alone cannot identify the compiled device code.
 _COMMON_DEPENDENCIES = (
     "runtime/cute/launcher.py",
+    "runtime/cute/register_tensor.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
     "_compiler/cute/cutedsl_compat.py",

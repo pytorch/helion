@@ -22,6 +22,7 @@ from torch.fx.node import map_arg
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..aten_lowering import Lowering
 from ..aten_lowering import LoweringContext
 from ..aten_lowering import _argreduce_schema
 from ..aten_lowering import _env_arg
@@ -1566,3 +1567,40 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
     node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
     node.meta["cute_topk_k"] = k
     return _emit_cute_rank_sort(ctx, load, input_tensor, descending=largest, k=k)
+
+
+class NumericExtremumLowering(Lowering):
+    """Lower numeric extrema that choose the non-NaN operand when available."""
+
+    def codegen(self, ctx: LoweringContext, node: Node) -> ast.AST:
+        backend = CompileEnvironment.current().backend
+        dtype = node.meta["val"].dtype
+        operands = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert all(isinstance(arg, ast.AST) for arg in operands)
+        left, right = (
+            backend.cast_ast(cast("ast.AST", arg), dtype) for arg in operands
+        )
+        operation = "min" if node.target is torch.ops.aten.fmin.default else "max"
+        if dtype == torch.float32:
+            cg = cast("GenerateAST", ctx.cg)
+            module = "helion.runtime.cute.register_tensor"
+            name = "_cute_numeric_extremum"
+            if not any(
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == module
+                and any(alias.name == name for alias in statement.names)
+                for statement in cg.module_statements
+            ):
+                cg.module_statements.append(
+                    ast.ImportFrom(module=module, names=[ast.alias(name=name)], level=0)
+                )
+            return expr_from_string(
+                f"{name}({{left}}, {{right}}, minimum={operation == 'min'})",
+                left=left,
+                right=right,
+            )
+        return expr_from_string(
+            f"cute.math.{operation}({{left}}, {{right}}, propagate_nan=False)",
+            left=left,
+            right=right,
+        )

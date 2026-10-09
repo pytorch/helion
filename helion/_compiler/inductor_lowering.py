@@ -513,13 +513,19 @@ class PointwiseLowering(InductorLowering):
         ctx: LoweringContext,
         node: torch.fx.Node,
         input_asts: list[ast.AST],
+        *,
+        kernel_handlers: ContextManager[None] | None = None,
     ) -> object:
         """Lower this pointwise node with explicitly supplied tensor values."""
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
         assert len(input_asts) == len(self.input_names)
-        with install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+        with (
+            install_inductor_kernel_handlers(
+                ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+            )
+            if kernel_handlers is None
+            else kernel_handlers
         ):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
