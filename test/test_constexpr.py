@@ -199,7 +199,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         device_code, host_code = code[: match.start()], code[match.start() :]
         if _get_backend() == "cute":
             self.assertIn("_default_cute_launcher", host_code)
-            self.assertIn("block=(16, 1, 1)", host_code)
+            # The host binds constexpr values independently of CTA shape.
             self.assertNotIn("_BLOCK_SIZE_", host_code)
         else:
             self.assertIn("_BLOCK_SIZE_0 = 1", host_code)

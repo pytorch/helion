@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import math
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -3465,6 +3466,259 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
 
+@pytest.mark.parametrize("mode", ["serial", "cooperative"])
+def test_computed_tile_grid_ownership_codegen(mode):
+    kernel = helion.kernel(
+        _computed_tile_coordinates.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(kernel, (torch.zeros(5, 65),))
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_scan"] = mode
+        code = bound.to_code(config)
+    validate_thread_axis_accesses(ast.parse(code).body)
+    assert "fragment_thread" in code
+    assert "block=(128, 1, 1)" in code
+    assert "thread_idx()[3]" not in code
+
+
+@pytest.mark.parametrize(
+    "source,valid",
+    [
+        ("value = cute.arch.thread_idx()[0]", True),
+        ("value = cute.arch.thread_idx()[1]", True),
+        ("value = cute.arch.thread_idx()[2]", True),
+        ("x, y, z = cute.arch.thread_idx()", True),
+        ("indices = cute.arch.thread_idx(); alias = indices; value = alias[2]", True),
+        ("value = cute.arch.thread_idx()[3]", False),
+        ("value = cute.arch.thread_idx()[-1]", False),
+        ("value = cute.arch.thread_idx()[axis]", False),
+        ("indices = cute.arch.thread_idx(); alias = indices; value = alias[4]", False),
+        ("if predicate:\n    value = cute.arch.thread_idx()[3]", False),
+    ],
+)
+def test_cute_final_thread_axis_validation(source, valid):
+    if valid:
+        validate_thread_axis_accesses(ast.parse(source).body)
+    else:
+        with pytest.raises(exc.BackendUnsupported, match="thread axis"):
+            validate_thread_axis_accesses(ast.parse(source).body)
+
+
+def test_cute_live_invalid_grid_axis_rejected_after_codegen():
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add_one(x: torch.Tensor):
+        out = torch.empty_like(x)
+        for row, col in hl.tile(x.shape, block_size=[2, 32]):
+            out[row, col] = x[row, col] + 1
+        return out
+
+    original_grid_index = CuteBackend.grid_index_expr
+
+    def invalid_grid_index(self, offset_var, block_size_var, dtype, *, axis):
+        return original_grid_index(self, offset_var, block_size_var, dtype, axis=3)
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch.object(CuteBackend, "grid_index_expr", invalid_grid_index),
+    ):
+        bound = _cpu_bind(add_one, (torch.zeros(5, 65),))
+        with pytest.raises(exc.BackendUnsupported, match="thread axis 3"):
+            bound.to_code(bound.config_spec.default_config())
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _partition_allocations(x: torch.Tensor, stepped: hl.constexpr):
+    rows, width = x.shape
+    block = hl.register_block_size(width)
+    parts = (width + block - 1) // block
+    first = torch.empty((rows, parts), device=x.device, dtype=x.dtype)
+    second = torch.empty((rows, parts), device=x.device, dtype=x.dtype)
+    out = torch.empty((rows,), device=x.device, dtype=x.dtype)
+    for row, col in hl.tile([rows, width], block_size=[1, block]):
+        values = x[row, col].sum(-1)
+        first[row, col.id] = values
+        second[row, col.id] = values + 1
+    hl.barrier()
+    for row in hl.tile(rows):
+        if stepped:
+            out[row] = (first[row, ::2] + second[row, ::2]).sum(-1)
+        else:
+            out[row] = (first[row, :] + second[row, :]).sum(-1)
+    return first, second, out
+
+
+@skipIfRefEager("requires compiler IR and explicit configurations")
+@pytest.mark.parametrize("backend", ["cute", "triton"])
+@pytest.mark.parametrize("stepped", [False, True])
+def test_partition_allocation_slices_preserve_configured_extent(backend, stepped):
+    kernel = helion.kernel(
+        _partition_allocations.fn,
+        backend=backend,
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(kernel, (torch.ones(3, 65), stepped))
+        first = bound.host_function.local_types["first"].proxy()
+        second = bound.host_function.local_types["second"].proxy()
+        assert first is not second
+        assert first.untyped_storage() != second.untyped_storage()
+        with bound.env, bound.host_function:
+            assert not bound.env.known_equal(first.size(-1), 1)
+            assert not bound.env.known_equal(second.size(-1), 1)
+        loads = [
+            node
+            for graph in bound.host_function.device_ir.graphs
+            for node in graph.graph.nodes
+            if node.target is hl.load
+            and any(
+                isinstance(k, slice) and (k.step == 2) == stepped for k in node.args[1]
+            )
+        ]
+        assert {node.args[0].args[0] for node in loads} == {"first", "second"}
+        for block in (16, 32, 128):
+            config = bound.config_spec.default_config()
+            config.config["pid_type"] = (
+                "flat" if kernel.settings.backend == "cute" else "persistent_blocked"
+            )
+            cast("list[int]", config["block_sizes"])[:] = [block, 4]
+            config.config["reduction_loops"] = [None] * len(
+                cast("list[object]", config["reduction_loops"])
+            )
+            count = (65 + block - 1) // block
+            expected = (count + 1) // 2 if stepped else count
+            with bound.env, bound.host_function:
+                for node in loads:
+                    block_id = bound.env.get_block_id(node.meta["val"].size(-1))
+                    assert block_id is not None
+                    logical = bound.env.block_sizes[block_id].size
+                    expression = logical._sympy_()
+                    assert (
+                        int(expression.subs(bound.env.block_sizes[0].symbol(), block))
+                        == expected
+                    )
+            if backend == "cute" and stepped:
+                with pytest.raises(exc.BackendUnsupported, match="strided slices"):
+                    bound.to_code(config)
+                continue
+            code = bound.to_code(config)
+            # Native execution below checks values; here the independently
+            # allocated buffers must still have partition-dependent stores.
+            if count > 1:
+                sources = [code] + [
+                    node.value
+                    for node in ast.walk(ast.parse(code))
+                    if isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and "def _helion_" in node.value
+                ]
+                for name in ("first", "second"):
+                    stores = []
+                    for source in sources:
+                        for call in ast.walk(ast.parse(source)):
+                            if not (
+                                isinstance(call, ast.Call)
+                                and isinstance(call.func, ast.Attribute)
+                                and call.func.attr == "store"
+                            ):
+                                continue
+                            pointer = (
+                                call.args[0]
+                                if ast.unparse(call.func) == "tl.store"
+                                else call.func.value
+                            )
+                            if any(
+                                isinstance(node, ast.Name) and node.id == name
+                                for node in ast.walk(pointer)
+                            ):
+                                stores.append(ast.unparse(call))
+                    assert stores
+                    assert all(
+                        "tile_id" in line or "tile_offset_0 //" in line
+                        for line in stores
+                    ), stores
+
+
+@skipIfRefEager("requires compiler IR and explicit configurations")
+@skipUnlessBackends(["cute", "triton"])
+@pytest.mark.parametrize("stepped", [False, True])
+@pytest.mark.parametrize("block", [16, 32, 128])
+def test_partition_allocation_slice_values(block, stepped):
+    if stepped and _get_backend() == "cute":
+        pytest.skip("CuTe rejects stepped slices; CPU test checks that rejection")
+    x = torch.arange(3 * 65, device=DEVICE, dtype=torch.float32).reshape(3, 65)
+    before = x.clone()
+    bound = _partition_allocations.bind((x, stepped))
+    config = bound.config_spec.default_config()
+    config.config["pid_type"] = (
+        "flat" if _get_backend() == "cute" else "persistent_blocked"
+    )
+    cast("list[int]", config["block_sizes"])[:] = [block, 4]
+    config.config["reduction_loops"] = [None] * len(
+        cast("list[object]", config["reduction_loops"])
+    )
+    first, second, out = bound.compile_config(config)(x, stepped)
+    expected = torch.stack(
+        [x[:, start : start + block].sum(-1) for start in range(0, 65, block)],
+        dim=-1,
+    )
+    torch.testing.assert_close(first, expected)
+    torch.testing.assert_close(second, expected + 1)
+    selected = expected[:, ::2] if stepped else expected
+    torch.testing.assert_close(out, (selected * 2 + 1).sum(-1))
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+    assert first.untyped_storage() != second.untyped_storage()
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_coordinate_pad_2d(x: torch.Tensor, width: int):
+    width = hl.specialize(width)
+    flat = x.reshape(-1)
+    out = torch.empty((x.size(0), width), device=x.device, dtype=x.dtype)
+    for row, col in hl.tile(out.shape):
+        address = row.index[:, None] * x.size(1) + col.index[None, :]
+        valid = col.index[None, :] < x.size(1)
+        value = hl.load(flat, [address], extra_mask=valid)
+        out[row, col] = torch.where(valid, value + 1, -7)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_coordinate_pad_3d(x: torch.Tensor, width: int):
+    width = hl.specialize(width)
+    flat = x.reshape(-1)
+    out = torch.empty((x.size(0), x.size(1), width), device=x.device, dtype=x.dtype)
+    for plane, row, col in hl.tile(out.shape):
+        address = (
+            plane.index[:, None, None] * x.size(1) + row.index[None, :, None]
+        ) * x.size(2) + col.index[None, None, :]
+        valid = col.index[None, None, :] < x.size(2)
+        value = hl.load(flat, [address], extra_mask=valid)
+        out[plane, row, col] = torch.where(valid, value + 1, -7)
+    return out
+
+
 def _execute_pointwise_thread_program(source, inputs):
     """Execute the actual scalar program for every launched CTA/thread on CPU."""
     import itertools
@@ -3540,190 +3794,6 @@ def _execute_pointwise_thread_program(source, inputs):
         ),
         "_default_cute_launcher": launcher,
         "_next_power_of_2": lambda value: 1 << (value - 1).bit_length(),
-    }
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
-            "<pointwise-thread-model>",
-            "exec",
-        ),
-        namespace,
-    )
-    wrapper = next(
-        node.name for node in reversed(body) if isinstance(node, ast.FunctionDef)
-    )
-    result = namespace[wrapper](*inputs)
-    assert len(writes) == result.numel()
-    assert set(writes.values()) == {1}, "duplicate or missing output ownership"
-    return result, launches
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-@pytest.mark.parametrize("mode", ["serial", "cooperative"])
-def test_computed_tile_grid_ownership_codegen(mode):
-    kernel = helion.kernel(
-        _computed_tile_coordinates.fn,
-        backend="cute",
-        static_shapes=True,
-        autotune_effort="none",
-    )
-    with (
-        _mock_cuda_unavailable(),
-        _target(),
-        _forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        bound = _cpu_bind(kernel, (torch.zeros(5, 65),))
-        config = bound.config_spec.default_config()
-        config.config["cute_fragment_scan"] = mode
-        code = bound.to_code(config)
-    validate_thread_axis_accesses(ast.parse(code).body)
-    assert "fragment_thread" in code
-    assert "block=(128, 1, 1)" in code
-    assert "thread_idx()[3]" not in code
-
-
-@pytest.mark.parametrize(
-    "source,valid",
-    [
-        ("value = cute.arch.thread_idx()[0]", True),
-        ("value = cute.arch.thread_idx()[1]", True),
-        ("value = cute.arch.thread_idx()[2]", True),
-        ("x, y, z = cute.arch.thread_idx()", True),
-        ("indices = cute.arch.thread_idx(); alias = indices; value = alias[2]", True),
-        ("value = cute.arch.thread_idx()[3]", False),
-        ("value = cute.arch.thread_idx()[-1]", False),
-        ("value = cute.arch.thread_idx()[axis]", False),
-        ("indices = cute.arch.thread_idx(); alias = indices; value = alias[4]", False),
-        ("if predicate:\n    value = cute.arch.thread_idx()[3]", False),
-    ],
-)
-def test_cute_final_thread_axis_validation(source, valid):
-    if valid:
-        validate_thread_axis_accesses(ast.parse(source).body)
-    else:
-        with pytest.raises(exc.BackendUnsupported, match="thread axis"):
-            validate_thread_axis_accesses(ast.parse(source).body)
-
-
-def test_cute_live_invalid_grid_axis_rejected_after_codegen():
-    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-    def add_one(x: torch.Tensor):
-        out = torch.empty_like(x)
-        for row, col in hl.tile(x.shape, block_size=[2, 32]):
-            out[row, col] = x[row, col] + 1
-        return out
-
-    original_grid_index = CuteBackend.grid_index_expr
-
-    def invalid_grid_index(self, offset_var, block_size_var, dtype, *, axis):
-        return original_grid_index(self, offset_var, block_size_var, dtype, axis=3)
-
-    with (
-        _mock_cuda_unavailable(),
-        _target(),
-        _forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch.object(CuteBackend, "grid_index_expr", invalid_grid_index),
-    ):
-        bound = _cpu_bind(add_one, (torch.zeros(5, 65),))
-        with pytest.raises(exc.BackendUnsupported, match="thread axis 3"):
-            bound.to_code(bound.config_spec.default_config())
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _broadcast_coordinate_pad_2d(x: torch.Tensor, width: int):
-    width = hl.specialize(width)
-    flat = x.reshape(-1)
-    out = torch.empty((x.size(0), width), device=x.device, dtype=x.dtype)
-    for row, col in hl.tile(out.shape):
-        address = row.index[:, None] * x.size(1) + col.index[None, :]
-        valid = col.index[None, :] < x.size(1)
-        value = hl.load(flat, [address], extra_mask=valid)
-        out[row, col] = torch.where(valid, value + 1, -7)
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _broadcast_coordinate_pad_3d(x: torch.Tensor, width: int):
-    width = hl.specialize(width)
-    flat = x.reshape(-1)
-    out = torch.empty((x.size(0), x.size(1), width), device=x.device, dtype=x.dtype)
-    for plane, row, col in hl.tile(out.shape):
-        address = (
-            plane.index[:, None, None] * x.size(1) + row.index[None, :, None]
-        ) * x.size(2) + col.index[None, None, :]
-        valid = col.index[None, None, :] < x.size(2)
-        value = hl.load(flat, [address], extra_mask=valid)
-        out[plane, row, col] = torch.where(valid, value + 1, -7)
-    return out
-
-
-def _execute_pointwise_thread_program(source, inputs):
-    """Execute the actual scalar program for every launched CTA/thread on CPU."""
-    import itertools
-    import operator
-    from types import SimpleNamespace
-
-    writes = {}
-
-    class Pointer:
-        def __init__(self, tensor, offset=0):
-            self.tensor, self.offset = tensor, int(offset)
-
-        def __add__(self, offset):
-            return Pointer(self.tensor, self.offset + int(offset))
-
-        def load(self):
-            assert 0 <= self.offset < self.tensor.numel()
-            return self.tensor.reshape(-1)[self.offset].item()
-
-        def store(self, value):
-            assert 0 <= self.offset < self.tensor.numel()
-            key = (self.tensor.data_ptr(), self.offset)
-            writes[key] = writes.get(key, 0) + 1
-            self.tensor.reshape(-1)[self.offset] = value
-
-    current = {"block": (0, 0, 0), "thread": (0, 0, 0)}
-    launches = []
-
-    def launcher(function, grid, *arguments, block):
-        launches.append(block)
-        args = [
-            SimpleNamespace(
-                iterator=Pointer(arg), layout=SimpleNamespace(stride=arg.stride())
-            )
-            if isinstance(arg, torch.Tensor)
-            else arg
-            for arg in arguments
-        ]
-        for cta in itertools.product(*(range(size) for size in grid)):
-            current["block"] = (*cta, *((0,) * (3 - len(cta))))
-            for thread in itertools.product(*(range(size) for size in block)):
-                current["thread"] = thread
-                function(*args)
-
-    tree = ast.parse(source)
-    body = []
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            continue
-        if isinstance(node, ast.FunctionDef):
-            node.decorator_list = []
-        body.append(node)
-    namespace = {
-        "torch": torch,
-        "operator": operator,
-        "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float, Boolean=bool),
-        "cute": SimpleNamespace(
-            arch=SimpleNamespace(
-                block_idx=lambda: current["block"], thread_idx=lambda: current["thread"]
-            )
-        ),
-        "_default_cute_launcher": launcher,
     }
     exec(
         compile(
@@ -3828,7 +3898,7 @@ def _broadcast_axis_matmul(x: torch.Tensor, y: torch.Tensor):
     return out
 
 
-@pytest.mark.parametrize("kind", ["reduction", "free_iota", "nested", "matmul"])
+@pytest.mark.parametrize("kind", ["reduction", "free_iota", "matmul"])
 def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
     from helion._compiler.tile_dispatch import TileStrategyDispatch
 
@@ -3843,7 +3913,6 @@ def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
             (torch.ones(3, 8),),
         ),
         "free_iota": (_broadcast_axis_free_iota, (torch.ones(3, 8),)),
-        "nested": (_broadcast_axis_nested, (torch.ones(3, 17),)),
         "matmul": (
             _broadcast_axis_matmul,
             (
@@ -3901,3 +3970,380 @@ def test_cute_inactive_broadcast_axes_native(shape, width, tiles):
     expected = torch.full((*shape[:-1], width), -7.0, device=DEVICE)
     expected[..., : shape[-1]] = x + 1
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _scaled_tile_slice(
+    x: torch.Tensor, divide: hl.constexpr, factor: hl.constexpr
+) -> torch.Tensor:
+    rows, width = x.shape
+    logical_width = width * factor if divide else width // factor
+    block = hl.register_block_size(logical_width)
+    out = torch.empty((rows, logical_width), dtype=x.dtype, device=x.device)
+    for row, col in hl.tile([rows, logical_width], block_size=[1, block]):
+        if divide:
+            packed = x[
+                row,
+                col.begin // factor : col.begin // factor + col.block_size // factor,
+            ]
+            values = torch.stack([packed] * factor, dim=-1).reshape(
+                row.block_size, col.block_size
+            )
+        else:
+            packed = x[
+                row, col.begin * factor : col.begin * factor + col.block_size * factor
+            ]
+            values = packed.reshape(row.block_size, col.block_size, factor).sum(-1)
+        out[row, col] = values
+    return out
+
+
+@skipIfRefEager("requires compiler IR and explicit configurations")
+@pytest.mark.parametrize("backend", ["cute", "triton"])
+@pytest.mark.parametrize("divide", [False, True])
+@pytest.mark.parametrize("factor", [2, 4])
+def test_scaled_tile_slices_preserve_shape_algebra(backend, divide, factor):
+    kernel = helion.kernel(
+        _scaled_tile_slice.fn,
+        backend=backend,
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(kernel, (torch.ones(3, 64), divide, factor))
+        loads = [
+            node
+            for graph in bound.host_function.device_ir.graphs
+            for node in graph.graph.nodes
+            if node.target is hl.load
+        ]
+        assert len(loads) == 1
+        # Reshape above must keep the algebraic relation to the registered
+        # tile width; an unrelated reduction symbol cannot satisfy it.
+        with bound.env, bound.host_function:
+            width = bound.env.block_sizes[0].var
+            expected = width // factor if divide else width * factor
+            assert bound.env.known_equal(loads[0].meta["val"].size(-1), expected)
+        for block in (8, 16, 32):
+            config = bound.config_spec.default_config()
+            config.config["block_sizes"] = [block]
+            if backend == "cute" and not divide:
+                # This pre-existing non-matmul affine-load limitation is
+                # independent of the shape relation fixed here.
+                with pytest.raises(exc.BackendUnsupported, match="affine hl.arange"):
+                    bound.to_code(config)
+            else:
+                ast.parse(bound.to_code(config))
+
+
+@skipUnlessBackends(["cute", "triton"])
+@pytest.mark.parametrize("factor", [2, 4])
+@pytest.mark.parametrize("block", [8, 32])
+def test_scaled_tile_slice_values(factor, block):
+    # Noncontiguous storage exercises slice addresses as well as reshape sizes.
+    x = torch.arange(6 * 128, device=DEVICE, dtype=torch.float32).reshape(6, 128)[
+        ::2, ::2
+    ]
+    before = x.clone()
+    _, actual = code_and_output(
+        _scaled_tile_slice, (x, True, factor), block_sizes=[block]
+    )
+    torch.testing.assert_close(actual, x.repeat_interleave(factor, -1), rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=False, disable_autotuner_heuristics=True)
+def _singleton_cache_copy(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty((x.size(0), x.size(1)), device=x.device, dtype=x.dtype)
+    for row in hl.tile(x.size(0)):
+        out[row, :] = x[row, :] + 1
+    return out
+
+
+@pytest.mark.parametrize("widths", [(1, 5, 1, 9), (5, 1, 5, 1)])
+@pytest.mark.parametrize("block", [2, 4])
+def test_backed_singleton_slice_binding_cache(widths, block):
+    # Keep pointer/stride/shape alignment residues equal so an unrelated
+    # vectorization guard cannot hide a missing singleton specialization.
+    kernel = helion.kernel(
+        _singleton_cache_copy.fn,
+        backend="cute",
+        static_shapes=False,
+        disable_autotuner_heuristics=True,
+    )
+    storage = torch.arange(3 * 16, dtype=torch.float32).reshape(3, 16)
+    before = storage.clone()
+    bound_by_width = {}
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        for width in widths:
+            x = storage[:, :width]
+            bound = kernel.bind((x,))
+            if width in bound_by_width:
+                assert bound is bound_by_width[width]
+            bound_by_width[width] = bound
+            config = bound.config_spec.default_config()
+            config.config["block_sizes"] = [block]
+            actual, _ = _execute_pointwise_thread_program(bound.to_code(config), (x,))
+            torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+            torch.testing.assert_close(storage, before, rtol=0, atol=0)
+        if widths[0] == 1:
+            assert bound_by_width[1] is not bound_by_width[5]
+            assert bound_by_width[1].env.specialized_vars
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("widths", [(1, 5, 1, 9), (5, 1, 5, 1)])
+@pytest.mark.parametrize("block", [2, 4])
+def test_backed_singleton_slice_binding_values(widths, block):
+    kernel = helion.kernel(
+        _singleton_cache_copy.fn,
+        backend="cute",
+        static_shapes=False,
+        disable_autotuner_heuristics=True,
+    )
+    storage = torch.arange(3 * 16, device=DEVICE, dtype=torch.float32).reshape(3, 16)
+    before = storage.clone()
+    for width in widths:
+        x = storage[:, :width]
+        bound = kernel.bind((x,))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [block]
+        actual = bound.compile_config(config)(x)
+        torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+        torch.testing.assert_close(storage, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("hint", [1, 5])
+def test_singleton_guard_only_specializes_true_backed_size(hint):
+    from torch._dynamo.source import LocalSource
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=False)
+        )
+        with env:
+            size = env.input_symint(hint, LocalSource("size"))
+            symbols = set(size._sympy_().free_symbols)
+            assert symbols
+            assert env.is_singleton_size(size) == (hint == 1)
+            assert env.specialized_vars == (symbols if hint == 1 else set())
+
+
+@pytest.mark.parametrize("derived", [False, True])
+def test_singleton_guard_does_not_specialize_configured_hint_one(derived):
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=False)
+        )
+        with env:
+            tile = env.create_unbacked_symint(32 if derived else 1)
+            size = (tile + 31) // 32 if derived else tile
+            replacements = dict(env.shape_env.replacements)
+            guards = tuple(env.shape_env.guards)
+            assert not env.is_singleton_size(size)
+            assert not env.specialized_vars
+            assert env.shape_env.replacements == replacements
+            assert tuple(env.shape_env.guards) == guards
+            assert env.is_singleton_size(tile * 0 + 1)
+            assert not env.specialized_vars
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _nested_broadcast_gather(col, val, table, flat: hl.constexpr):
+    m, n, k = col.shape
+    _, p, q = table.shape
+    out = torch.empty((m, n, p, q), dtype=val.dtype, device=val.device)
+    flat_table = table.reshape(-1)
+    for mi, ni, pi, qi in hl.tile([m, n, p, q]):
+        acc = hl.zeros([mi, ni, pi, qi], dtype=torch.float32)
+        for ki in hl.tile(k):
+            column = col[mi, ni, ki]
+            if flat:
+                index = (
+                    column[:, :, :, None, None] * (p * q)
+                    + pi.index[None, None, :, None] * q
+                    + qi.index[None, None, None, :]
+                )
+                selected = hl.load(flat_table, [index])
+            else:
+                selected = table[
+                    column[:, :, :, None, None],
+                    pi.index[None, None, :, None],
+                    qi.index[None, None, None, :],
+                ]
+            acc += (val[mi, ni, ki][:, :, :, None, None] * selected).sum(2)
+        out[mi, ni, pi, qi] = acc
+    return out
+
+
+@pytest.mark.parametrize("shape", [(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)])
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes):
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.tile_dispatch import TileStrategyDispatch
+
+    m, n, k, p, q = shape
+    column = torch.arange(m * n * k).reshape(m, n, k) % k
+    # Small integer-valued FP32 data makes every modeled add/multiply exact.
+    values = (torch.arange(m * n * k).reshape(m, n, k) % 5).float()
+    table = (torch.arange(k * p * q).reshape(k, p, q) % 7).float()
+    inputs = column, values, table, flat
+    aliases = []
+    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+
+    def observe(dispatch, function):
+        result = original(dispatch, function)
+        env = CompileEnvironment.current()
+        outer = set(function.codegen.host_function.device_ir.grid_block_ids[0])
+        assert result.isdisjoint(env.config_spec.reduction_loops.valid_block_ids())
+        assert all(env.canonical_block_id(block) in outer for block in result)
+        aliases.append(result)
+        return result
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
+    ):
+        kernel = helion.kernel(
+            _nested_broadcast_gather.fn,
+            backend="cute",
+            static_shapes=static_shapes,
+            autotune_effort="none",
+        )
+        bound = _cpu_bind(kernel, inputs)
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [2, 2, 4, 4, 4]
+        config.config["loop_orders"] = [[3, 2, 1, 0] if reverse else [0, 1, 2, 3]]
+        source = bound.to_code(config)
+    assert any(aliases)
+    actual, launches = _execute_pointwise_thread_program(source, inputs)
+    expected = (values[..., None, None] * table[column]).sum(2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert all(len(block) == 3 and math.prod(block) <= 1024 for block in launches)
+
+
+def test_cute_nested_pointwise_outer_alias_values():
+    inputs = (torch.arange(3 * 17, dtype=torch.float32).reshape(3, 17),)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_broadcast_axis_nested, inputs)
+        source = bound.to_code(helion.Config(block_sizes=[2, 8]))
+    actual, _ = _execute_pointwise_thread_program(source, inputs)
+    torch.testing.assert_close(
+        actual, inputs[0] + torch.arange(3)[:, None], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "guard", ["second_root", "scalar_loop", "child_owner", "executable", "free_iota"]
+)
+def test_cute_nested_broadcast_alias_scope_guards(guard):
+    import dataclasses
+
+    from helion._compiler.device_ir import ForLoopGraphInfo
+    from helion._compiler.device_ir import RootGraphInfo
+    from helion._compiler.tile_dispatch import TileStrategyDispatch
+
+    column = torch.arange(3 * 5 * 7).reshape(3, 5, 7) % 7
+    inputs = (
+        column,
+        torch.ones_like(column, dtype=torch.float32),
+        torch.ones(7, 9, 11),
+        False,
+    )
+    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
+    checked = []
+
+    def observe(dispatch, function):
+        result = original(dispatch, function)
+        assert result
+        graphs = function.codegen.codegen_graphs
+        child = next(graph for graph in graphs if type(graph) is ForLoopGraphInfo)
+        root = next(graph for graph in graphs if isinstance(graph, RootGraphInfo))
+        if guard == "second_root":
+            replacement = [*graphs, root.copy()]
+            context = patch.object(function.codegen, "codegen_graphs", replacement)
+        elif guard == "scalar_loop":
+            replacement = [
+                dataclasses.replace(graph, block_ids=[]) if graph is child else graph
+                for graph in graphs
+            ]
+            context = patch.object(function.codegen, "codegen_graphs", replacement)
+        elif guard == "child_owner":
+            context = patch.object(
+                function.codegen.host_function.device_ir,
+                "grid_block_ids",
+                [child.block_ids],
+            )
+        elif guard == "executable":
+            context = patch.object(
+                bound.env.config_spec.reduction_loops,
+                "valid_block_ids",
+                return_value=[
+                    *bound.env.config_spec.reduction_loops.valid_block_ids(),
+                    *result,
+                ],
+            )
+        else:
+            changed_root = root.copy()
+            changed_root.graph.call_function(torch.ops.aten.arange.default, (4,))
+            replacement = [changed_root if graph is root else graph for graph in graphs]
+            context = patch.object(function.codegen, "codegen_graphs", replacement)
+        with context:
+            assert not original(dispatch, function)
+        checked.append(guard)
+        return result
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
+    ):
+        bound = _cpu_bind(_nested_broadcast_gather, inputs)
+        bound.to_code(helion.Config(block_sizes=[2, 2, 4, 4, 4]))
+    assert checked == [guard]
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cute_nested_broadcast_alias_native(flat, reverse):
+    m, n, k, p, q = 3, 5, 7, 9, 11
+    column = torch.arange(m * n * k, device=DEVICE).reshape(m, n, k) % k
+    values = (torch.arange(m * n * k, device=DEVICE).reshape(m, n, k) % 5).float()
+    table = (torch.arange(k * p * q, device=DEVICE).reshape(k, p, q) % 7).float()
+    inputs = column, values, table, flat
+    before = tuple(tensor.clone() for tensor in inputs[:3])
+    bound = _nested_broadcast_gather.bind(inputs)
+    config = bound.config_spec.default_config()
+    config.config["block_sizes"] = [2, 2, 4, 4, 4]
+    config.config["loop_orders"] = [[3, 2, 1, 0] if reverse else [0, 1, 2, 3]]
+    actual = bound.compile_config(config)(*inputs)
+    torch.testing.assert_close(
+        actual, (values[..., None, None] * table[column]).sum(2), rtol=0, atol=0
+    )
+    torch.testing.assert_close(inputs[:3], before, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -871,3 +871,43 @@ def test_supplemental_witnesses_share_validation_and_limits():
         )
     with pytest.raises(FrozenInstanceError):
         replaced.supplemental_witnesses = ()
+
+
+def test_deferred_coverage_preserves_supplemental_and_warm_prefix():
+    from dataclasses import replace
+
+    spec = make_spec()
+    first, second, third = spec.compiler_coverage_groups
+    first = replace(first, witnesses=first.witnesses[:1])
+    second = replace(
+        second,
+        supplemental_witnesses=(
+            CoverageWitness(Config(block_sizes=[64], old_choice=91), True),
+        ),
+    )
+    third = replace(third, deferred=True)
+    old_groups = (first, second)
+    spec._compiler_coverage_groups = old_groups
+    generation = spec.create_config_generation()
+    cached = Mock(
+        return_value=(Config(block_sizes=[32], old_choice=92, coverage_mode="b"),)
+    )
+    before = random.getstate()
+    old, old_outcomes = append_compiler_coverage(
+        [], generation, cached_configs=cached, pin=Mock()
+    )
+    spec._compiler_coverage_groups = (*old_groups, third)
+    cached.reset_mock()
+    actual, outcomes = append_compiler_coverage(
+        [], generation, cached_configs=cached, pin=Mock()
+    )
+    assert random.getstate() == before
+    assert actual[: len(old)] == old
+    assert outcomes[: len(old_outcomes)] == old_outcomes
+    assert any(entry.origin == "cache" for entry in old_outcomes)
+    assert len(actual) == len(old) + 1
+    assert cached.call_count == 1
+    assert "deferred" not in first.policy()
+    assert third.policy()["deferred"] is True
+    with pytest.raises(ValueError, match="Boolean"):
+        replace(third, deferred=1)

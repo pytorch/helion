@@ -6002,6 +6002,8 @@ class LoopDimInfo:
     begin_expr: sympy.Expr | None = None
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
+    # Absolute root-grid end; end_expr may instead describe its normalized extent.
+    grid_end_expr: sympy.Expr | None = None
     # True when the generated extent mask checks both the logical begin and end.
     mask_has_lower_bound: bool = False
 
@@ -7628,6 +7630,15 @@ class TileStrategy:
                     end_var_name=end_var_name,
                     end_expr=end_expr,
                 )
+
+        # Root grid arguments still carry the absolute logical bounds here.
+        # Keep them separate from normalized extent metadata used by strategies.
+        if state.ast_args is None and len(state.proxy_args) == 3:
+            begin_or_end, end, _ = state.proxy_args
+            grid_ends = normalize_dim_values(begin_or_end if end is None else end)
+            for block_id, grid_end in zip(self.block_ids, grid_ends, strict=True):
+                if isinstance(grid_end, (int, torch.SymInt, sympy.Expr)):
+                    block_id_to_info[block_id].grid_end_expr = _to_sympy(grid_end)
 
         return block_id_to_info
 

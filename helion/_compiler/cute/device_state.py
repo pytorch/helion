@@ -679,6 +679,7 @@ class CuteDeviceFunctionState:
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
         self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
+        self.reshape_physical_fallbacks: dict[str, tuple[int, int, str]] = {}
         self.resident_sequence_regions: dict[int, SequenceRegion] = {}
         self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
         # ``hl.atomic_add`` nodes that receive the per-K-lane partial sums of a
