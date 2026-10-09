@@ -1137,10 +1137,20 @@ def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
         return 0
 
     info = loops[-1].block_id_to_info.get(block_id)
-    if info is None or info.begin_expr is None:
+    if info is None:
         return 0
 
     begin = info.begin_expr
+    if begin is None:
+        name = info.begin_var_name
+        if name is None:
+            return 0
+        if name.isdigit():
+            return int(name) % bs_value
+        alignment = loop_begin_alignment(name, state)
+        if alignment is not None and alignment % bs_value == 0:
+            return 0
+        return bs_value - 1
     if isinstance(begin, (int, sympy.Integer)):
         return int(begin) % bs_value
 
@@ -1161,8 +1171,12 @@ def loop_begin_alignment(begin_expr: str, state: CodegenState) -> int | None:
             continue
         info = loops[-1].block_id_to_info.get(block_id)
         # Only sound when the outer loop begins at 0, so the offset is a clean
-        # multiple of the outer block size.
-        if info is None or info.begin_expr not in (0, sympy.Integer(0)):
+        # multiple of the outer block size. A fori_loop or emit_pipeline outer
+        # loop carries its literal begin in begin_var_name, not begin_expr.
+        if info is None or not (
+            info.begin_expr in (0, sympy.Integer(0))
+            or (info.begin_expr is None and info.begin_var_name == "0")
+        ):
             return None
         outer_bs = state.device_function.resolved_block_size(block_id)
         return outer_bs if isinstance(outer_bs, int) else None
