@@ -368,6 +368,15 @@ def _triton_iota_expr(
                 value = ctx.cg.device_function.resolved_block_size(block_id)
                 if not isinstance(value, int):
                     break
+                if expression == symbol and value == next_power_of_2(value):
+                    # A direct block extent already has a constexpr argument,
+                    # which can also be used outside a hl.tile loop.
+                    block_var = ctx.cg.device_function.block_size_var(
+                        env.canonical_block_id(block_id)
+                    )
+                    assert block_var is not None
+                    expr = f"tl.arange(0, {block_var})"
+                    break
                 replacements[symbol] = sympy.Integer(value)
             else:
                 resolved = expression.xreplace(replacements)
