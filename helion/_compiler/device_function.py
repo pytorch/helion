@@ -1949,6 +1949,13 @@ class DeviceFunction:
             # Type facts must see the final binding names, including every
             # loop-carried alias, before changing the SDK's Boolean tree shape.
             definition.body = reassociate_boolean_guards(definition.body)
+            if self.config.get("cute_fragment_published_scalars", False):
+                for request in self.cute_state.published_scalar_requests:
+                    request.lower(
+                        definition.body,
+                        {k: v[0] for k, v in self._variable_renames.items()},
+                        self.new_var,
+                    )
             validate_thread_axis_accesses([*prefix, definition])
         result = [*prefix, definition]
         if (

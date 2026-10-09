@@ -973,6 +973,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_atomic_aggregation",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1085,6 +1087,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_atomic_aggregation",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1202,6 +1206,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_atomic_aggregation",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
+        "cute_fragment_published_scalars",
+        "cute_fragment_skip_zero_atomics",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1532,6 +1538,10 @@ class ConfigSpec:
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
+        self.cute_fragment_published_scalar_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_published_scalars_search_enabled = False
+        self.cute_fragment_skip_zero_atomics_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_skip_zero_atomics_search_enabled = False
         self.cute_fragment_private_scalar_loop_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_private_scalar_loops_search_enabled = False
         self.cute_fragment_warp_result_min_threads = 32
@@ -3419,6 +3429,51 @@ class ConfigSpec:
             return
         raise InvalidConfig(f"{key}={value!r} requires a proved pointwise region")
 
+    def _normalize_cute_fragment_published_scalars(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_published_scalars"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_published_scalar_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a complete fragment with published scalar candidates"
+        )
+
+    def _normalize_cute_fragment_skip_zero_atomics(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_skip_zero_atomics"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_skip_zero_atomics_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a proved unused or dead-zero-result "
+            "relaxed CTA-local Int32 atomic add"
+        )
+
     def _normalize_cute_fragment_private_scalar_loops(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4562,6 +4617,12 @@ class ConfigSpec:
             )
             self._normalize_cute_fragment_warp_results(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_private_scalar_loops(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_published_scalars(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_skip_zero_atomics(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
@@ -5757,6 +5818,8 @@ class ConfigSpec:
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
+                "cute_fragment_published_scalars",
+                "cute_fragment_skip_zero_atomics",
             ):
                 return True, False
             if key == "cute_fragment_threads":
@@ -6039,6 +6102,10 @@ class ConfigSpec:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
             if self.cute_fragment_register_snapshots_search_enabled:
                 fields["cute_fragment_register_snapshots"] = BooleanFragment()
+            if self.cute_fragment_published_scalars_search_enabled:
+                fields["cute_fragment_published_scalars"] = BooleanFragment()
+            if self.cute_fragment_skip_zero_atomics_search_enabled:
+                fields["cute_fragment_skip_zero_atomics"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:
