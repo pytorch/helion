@@ -1087,6 +1087,14 @@ class DeviceFunction:
         self.arguments.append(rv)
         return True
 
+    def resolved_int_constexpr(self, name: str) -> int | None:
+        """Return a registered constexpr's value as an int, if it is a static literal."""
+        arg = self._constexpr_args.get(name)
+        if arg is None:
+            return None
+        host_str = arg.host_str()
+        return int(host_str) if host_str.isdigit() else None
+
     def constexpr_arg_with_host_def(self, name: str, value: object) -> None:
         """Create a constexpr argument and add its host-side definition if needed."""
         created = self.constexpr_arg(name, value)
