@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import operator
 import re
 from types import SimpleNamespace
 
@@ -334,6 +335,7 @@ def _execute_grid_copy_program(source, inputs):
         body.append(node)
     namespace = {
         "torch": torch,
+        "_cute_python_mod": operator.mod,
         "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float, Boolean=bool),
         "cute": SimpleNamespace(
             arch=SimpleNamespace(
