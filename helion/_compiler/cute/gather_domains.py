@@ -401,4 +401,15 @@ def loop_domain_facts(
                         facts = result
     from .resident_while import resident_while_domain_facts
 
-    return resident_while_domain_facts(env, graphs, facts, allow_unbound=allow_unbound)
+    facts = resident_while_domain_facts(env, graphs, facts, allow_unbound=allow_unbound)
+    calls = {
+        node
+        for info in graphs
+        for node in info.graph.nodes
+        if node.target is _tracing_ops._while_loop
+    }
+    if calls and calls <= facts.resident_whiles:
+        return facts
+    from .uniform_region_tree import uniform_region_domains
+
+    return uniform_region_domains(env, graphs, facts, allow_unbound=allow_unbound)

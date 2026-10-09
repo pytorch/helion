@@ -111,7 +111,7 @@ def snapshot_capture_slots(
         plan = resident_while_plan(call, graphs)
     except exc.InvalidConfig:
         return ()
-    if source.graph is not plan.root.graph:
+    if plan.composed or source.graph is not plan.root.graph:
         return ()
     # Limit persistent domains to the existing direct iota coordinates. A
     # loaded/remapped index can hide a shared domain dependency whose lifetime
