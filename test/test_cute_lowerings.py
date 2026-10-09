@@ -25110,8 +25110,9 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
             backend.lane_index_expr("offset", 1, axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.thread_index_expr(axis=3)
+        arange = backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
-            backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
+            validate_thread_axis_accesses(ast.parse(arange).body)
         # Root ownership may discard a speculative grid coordinate. Validate
         # the surviving expression, and allow an elided singleton coordinate.
         index = backend.grid_index_expr("offset", "bs", "cutlass.Int32", axis=3)
@@ -25120,8 +25121,9 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         singleton = backend.grid_index_expr("offset", "1", "cutlass.Int32", axis=3)
         self.assertEqual(singleton, "offset")
         validate_thread_axis_accesses(ast.parse(f"index = {singleton}").body)
+        mask = backend.thread_in_tile_mask_expr("bs", axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
-            backend.thread_in_tile_mask_expr("bs", axis=3)
+            validate_thread_axis_accesses(ast.parse(f"mask = {mask}").body)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.reduction_index_expr("bs", "cutlass.Int32", 0, axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):

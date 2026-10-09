@@ -2553,6 +2553,40 @@ def _cute_affine_arange(node: object) -> tuple[int, int] | None:
     return None
 
 
+def _cute_topk_cast_input(node: torch.fx.Node) -> torch.fx.Node | None:
+    """Prove a dtype conversion preserves the top-k value's physical lane."""
+    if (
+        node.target is not torch.ops.prims.convert_element_type.default
+        or len(node.args) != 2
+        or node.kwargs
+    ):
+        return None
+    source, dtype = node.args
+    if (
+        not isinstance(source, torch.fx.Node)
+        or not isinstance(dtype, torch.dtype)
+        or node.all_input_nodes != [source]
+    ):
+        return None
+    value = node.meta.get("val")
+    source_value = source.meta.get("val")
+    if (
+        not isinstance(value, torch.Tensor)
+        or not isinstance(source_value, torch.Tensor)
+        or value.dtype != dtype
+        or value.ndim != source_value.ndim
+    ):
+        return None
+    env = CompileEnvironment.current()
+    if not all(
+        itertools.starmap(
+            env.known_equal, zip(value.shape, source_value.shape, strict=True)
+        )
+    ):
+        return None
+    return source
+
+
 def _cute_topk_store_index_exprs(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -3440,6 +3474,11 @@ def _(state: CodegenState) -> ast.AST:
     topk_bound: str | None = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         value_node = state.fx_node.args[2]
+        while isinstance(value_node, torch.fx.Node):
+            source = _cute_topk_cast_input(value_node)
+            if source is None:
+                break
+            value_node = source
         if (
             isinstance(value_node, torch.fx.Node)
             and value_node.target is operator.getitem
