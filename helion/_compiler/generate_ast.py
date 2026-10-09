@@ -1631,18 +1631,36 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             self.statements_stack[-1]
                         )
                     root = root_graph_info.graph
-                    requested_fragment = (
-                        self.device_function.config.get("cute_fragment_scan", "serial")
-                        == "cooperative"
-                        and root_graph_info.graph_id
-                        in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
-                    ) or (
-                        self.device_function.config.get(
-                            "cute_fragment_reduction", "serial"
+                    from .cute.captured_reduction import captured_reduction_coordinates
+
+                    captured_fragment = (
+                        CompileEnvironment.current().backend_name == "cute"
+                        and bool(
+                            captured_reduction_coordinates(
+                                CompileEnvironment.current(),
+                                self.host_function.device_ir.graphs,
+                                root_graph_id=root_graph_info.graph_id,
+                            )
                         )
-                        == "warp"
-                        and root_graph_info.graph_id
-                        in CompileEnvironment.current().config_spec.cute_fragment_reduction_root_ids
+                    )
+                    requested_fragment = (
+                        captured_fragment
+                        or (
+                            self.device_function.config.get(
+                                "cute_fragment_scan", "serial"
+                            )
+                            == "cooperative"
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
+                        )
+                        or (
+                            self.device_function.config.get(
+                                "cute_fragment_reduction", "serial"
+                            )
+                            == "warp"
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_reduction_root_ids
+                        )
                     )
                     if (
                         not (

@@ -203,7 +203,8 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             self.assertNotIn("_BLOCK_SIZE_", host_code)
         else:
             self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
-            self.assertRegex(host_code, r"2 \* _BLOCK_SIZE_\d+, ")
+            self.assertRegex(host_code, r"_SHAPE_DIM = 2 \* _BLOCK_SIZE_\d+\n")
+            self.assertRegex(host_code, r"_launcher\([^\n]*, _SHAPE_DIM, ")
             self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
     @skipIfRefEager("metadata-only bind inspection does not exercise run_ref")
