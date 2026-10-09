@@ -2027,7 +2027,13 @@ class PopulationBasedSearch(BaseSearch):
         config_spec = getattr(self, "config_spec", None)
         return bool(
             config_spec is not None
-            and getattr(config_spec, "cute_flash_search_enabled", False)
+            and (
+                getattr(config_spec, "cute_flash_search_enabled", False)
+                or (
+                    getattr(config_spec, "backend_name", None) == "cute"
+                    and getattr(config_spec, "cute_topk_search_enabled", False)
+                )
+            )
         )
 
     def _finalist_history_perf(self, member: PopulationMember) -> float:
@@ -2042,10 +2048,10 @@ class PopulationBasedSearch(BaseSearch):
     ) -> None:
         """Refresh finalist history after its source members are rebenchmarked.
 
-        Long CuTe kernels can have optimistic first-call timings. Candidates are
-        initially recorded before the normal higher-effort rebenchmark, so the
+        CuTe flash and top-k searches can have optimistic initial timings.
+        Candidates are recorded before the normal higher-effort rebenchmark, so the
         first sample must not permanently decide which configs survive in the
-        bounded final-verification history. Other backends preserve their prior
+        bounded final-verification history. Other searches preserve their prior
         low-water ranking and do not reinsert configs that were already pruned;
         they still need an explicit refresh now that snapshots own their perf lists.
         A failed duplicate retains the last successful snapshot for final checking,
@@ -2108,8 +2114,8 @@ class PopulationBasedSearch(BaseSearch):
             ):
                 continue
             if member is not None:
-                # CuTe flash reinserts configs pruned by their initial sample.
-                # Other backends only refresh existing snapshots above.
+                # CuTe flash/top-k reinserts configs pruned by their initial sample.
+                # Other searches only refresh existing snapshots above.
                 self._record_best_member_for_config(
                     benchmarked_members,
                     config,
