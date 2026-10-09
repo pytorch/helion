@@ -2019,7 +2019,7 @@ class PopulationBasedSearch(BaseSearch):
         config_spec = getattr(self, "config_spec", None)
         return bool(
             config_spec is not None
-            and getattr(config_spec, "cute_flash_search_enabled", False)
+            and getattr(config_spec, "backend_name", None) == "cute"
         )
 
     def _finalist_history_perf(self, member: PopulationMember) -> float:
@@ -2034,7 +2034,7 @@ class PopulationBasedSearch(BaseSearch):
     ) -> None:
         """Refresh finalist history after its source members are rebenchmarked.
 
-        Long CuTe kernels can have optimistic first-call timings. Candidates are
+        CuTe kernels can have optimistic initial timings. Candidates are
         initially recorded before the normal higher-effort rebenchmark, so the
         first sample must not permanently decide which configs survive in the
         bounded final-verification history. Other backends preserve their prior
@@ -2100,7 +2100,7 @@ class PopulationBasedSearch(BaseSearch):
             ):
                 continue
             if member is not None:
-                # CuTe flash reinserts configs pruned by their initial sample.
+                # CuTe reinserts configs pruned by their initial sample.
                 # Other backends only refresh existing snapshots above.
                 self._record_best_member_for_config(
                     benchmarked_members,
