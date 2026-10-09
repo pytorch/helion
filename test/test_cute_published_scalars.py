@@ -348,6 +348,89 @@ def test_actual_generated_program_owned_values_and_default(width, dtype):
         torch.testing.assert_close(results[1][0], expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "slot", ["0 * 1", "(7 - 7) * 9", "-3 + 3", "+0", "7 // 8", "-8 % 4"]
+)
+@pytest.mark.parametrize("dtype", [np.int64, np.float32])
+def test_closed_integer_scalar_slots_preserve_epochs_and_typed_values(slot, dtype):
+    source = _FINAL_EPOCH_SOURCE.replace("shared[0]", f"shared[{slot}]")
+    if dtype is np.float32:
+        source = source.replace("Int64", "Float32")
+    result, count = _transform(source)
+    assert count > 0
+    before, after = ast.parse(source).body, ast.parse(result).body
+    assert [ast.dump(n) for n in before[:6]] == [ast.dump(n) for n in after[:6]]
+    retained = [
+        n.slice
+        for n in ast.walk(ast.parse(result))
+        if isinstance(n, ast.Subscript)
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "shared"
+        and not isinstance(n.slice, ast.Name)
+    ]
+    assert retained
+    assert all(
+        ast.dump(n) == ast.dump(ast.parse(slot, mode="eval").body) for n in retained
+    )
+    values = (
+        [-(2**63), -7, 0, 2**63 - 2] if dtype is np.int64 else [-0.0, np.inf, np.nan]
+    )
+    for value in values:
+        for order in (list(range(32)), list(reversed(range(32)))):
+            assert _execute_published_phases(source, dtype(value), dtype, order) == (
+                _execute_published_phases(result, dtype(value), dtype, order)
+            )
+
+
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "0 * unknown()",
+        "thread - thread",
+        "0 * thread",
+        "1 * 1",
+        "0.0 * 1",
+        "False",
+        "True - 1",
+        "cutlass.Int32(2147483647) + 1 + cutlass.Int32(-2147483648)",
+        "0 // 0",
+        "0 % 0",
+        "0 / 1",
+    ],
+)
+def test_unproved_or_nonzero_scalar_coordinates_do_not_change_code(slot):
+    source = _FINAL_EPOCH_SOURCE.replace("shared[0]", f"shared[{slot}]")
+    result, count = _transform(source)
+    assert count == 0
+    assert ast.dump(ast.parse(source)) == ast.dump(ast.parse(result))
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("for scratch", "alias = shared\nfor scratch"),
+        (
+            "shared[0] = cutlass.Int64(source)",
+            "shared[0] = cutlass.Int64(source)\n        shared[0] = cutlass.Int64(3)",
+        ),
+        ("thread % 32 == 0", "thread % 32 == 1"),
+        (
+            "shared[0] = cutlass.Int64(source)\ncute.arch.sync_threads()",
+            "shared[0] = cutlass.Int64(source)\npass",
+        ),
+        (
+            "out[index] = cutlass.Int64(b + index)",
+            "shared[0] = b\n        out[index] = b",
+        ),
+    ],
+)
+def test_closed_slots_keep_alias_writer_and_publication_guards(old, new):
+    source = _FINAL_EPOCH_SOURCE.replace(old, new).replace("shared[0]", "shared[0 * 1]")
+    result, count = _transform(source)
+    assert count == 0
+    assert ast.dump(ast.parse(source)) == ast.dump(ast.parse(result))
+
+
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", (torch.int32, torch.int64, torch.float32))
