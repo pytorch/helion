@@ -893,9 +893,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         """
         spec = env.config_spec
         out: dict[int, int] = {}
-        config_dict = dict(spec._base_default_config().config)
-        config_dict["block_sizes"] = block_sizes
-        candidate = Config.from_dict(config_dict)
+        candidate = Config.from_dict(
+            {
+                "block_sizes": block_sizes,
+                "reduction_loops": spec.reduction_loops._flat_config(
+                    spec, lambda fragment: fragment.default()
+                ),
+                **{
+                    name: fragment.default()
+                    for name, fragment in spec.user_defined_tunables.items()
+                },
+            }
+        )
         # A TUNABLE axis's per-program extent is simply the entry the config carries for it.
         # Read it straight from the list rather than round-tripping through the block-size
         # source: ``LoopSpecBlockSizeSource.from_config`` reaches for
