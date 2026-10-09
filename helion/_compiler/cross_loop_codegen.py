@@ -945,9 +945,9 @@ def _guarded_extent(
 ) -> _GuardedExtent | None:
     """Turn a trailing ``if offset < bound`` on the slowest PID axis into a task count.
 
-    Every other top-level statement must be a pure single assignment (or a rebase of
-    a task-variant PID), so tasks past the bound are no-ops. Invariant loads and
-    reductions are hoisted with the bound.
+    Pure prefix statements may move when their reaching definitions are invariant.
+    Hoisting preserves dependencies between assignments, including repeated writes
+    and compile-time assertions, without rewriting the original statements.
     """
     if not body or not isinstance(guard := body[-1], ast.If):
         return None
@@ -966,67 +966,25 @@ def _guarded_extent(
             return None
         return node.id if isinstance(node, ast.Name) else None
 
-    if not all(
-        isinstance(statement, (ast.Assign, ast.AugAssign))
-        and (name := target(statement)) is not None
-        and (isinstance(statement, ast.Assign) or name in variant_names)
-        and all(
-            _is_pure_call(node)
-            for node in ast.walk(statement.value)
-            if isinstance(node, ast.Call)
-        )
-        for statement in prefix
-    ):
-        return None
-    stores: dict[str, int] = {}
-    loads: dict[str, int] = {}
-    for statement in body:
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Name):
-                counts = stores if isinstance(node.ctx, ast.Store) else loads
-                counts[node.id] = counts.get(node.id, 0) + 1
-    values = {
-        cast("str", target(statement)): statement.value
-        for statement in prefix
-        if isinstance(statement, ast.Assign)
-    }
-    test = guard.test.id
-    predicate = values.get(test)
-    if (
-        stores.get(test) != 1
-        or loads.get(test) != 1
-        or not isinstance(predicate, ast.Compare)
-        or len(predicate.ops) != 1
-    ):
-        return None
-    left, right = predicate.left, predicate.comparators[0]
-    if isinstance(predicate.ops[0], ast.Gt):
-        bound, offset = left, right
-    elif isinstance(predicate.ops[0], ast.Lt):
-        bound, offset = right, left
-    else:
-        return None
-    if not isinstance(bound, ast.Name) or not isinstance(offset, ast.Name):
-        return None
-    # The guarded offset must be the tile begin of the slowest axis.
-    pid = slowest.pid_var
-    offset_value = values.get(offset.id)
-    if (
-        stores.get(offset.id) != 1
-        or offset_value is None
-        or ast.unparse(offset_value)
-        not in (f"{pid} * {slowest.block_size_var}", *([pid] * (block_size == 1)))
-    ):
-        return None
+    stored_names = _stored_names(body)
+    body_writes = _stored_names(guard.body)
+    targets: list[str | None] = []
+    values: list[ast.expr] = []
+    references: list[dict[str, int | None]] = []
+    definitions: dict[str, list[int]] = {}
+    reaching: dict[str, int] = {}
+    invariant: set[int] = set()
 
-    def is_invariant(value: ast.expr, invariant: set[str]) -> bool:
+    def is_invariant(value: ast.expr, reads: dict[str, int | None]) -> bool:
         for node in ast.walk(value):
-            if (
-                isinstance(node, ast.Name)
-                and node.id not in invariant
-                and (node.id in stores or node.id in variant_names)
-            ):
-                return False
+            if isinstance(node, ast.Name):
+                definition = reads[node.id]
+                if (
+                    node.id in variant_names
+                    or (definition is None and node.id in stored_names)
+                    or (definition is not None and definition not in invariant)
+                ):
+                    return False
             if (
                 isinstance(node, ast.Call)
                 and _is_tl_call(node, frozenset({"load"}))
@@ -1044,48 +1002,189 @@ def _guarded_extent(
                 return False
         return True
 
-    invariant: set[str] = set()
-    for name, value in values.items():
-        if stores[name] == 1 and is_invariant(value, invariant):
-            invariant.add(name)
-    if bound.id not in invariant and (bound.id in stores or bound.id in variant_names):
+    for index, statement in enumerate(prefix):
+        name = target(statement)
+        compile_time_assert = isinstance(statement, ast.Expr) and _is_tl_call(
+            statement.value, frozenset({"static_assert"})
+        )
+        if not (
+            (
+                isinstance(statement, (ast.Assign, ast.AugAssign))
+                and name is not None
+                and (isinstance(statement, ast.Assign) or name in variant_names)
+            )
+            or compile_time_assert
+        ):
+            return None
+        value = cast("ast.Assign | ast.AugAssign | ast.Expr", statement).value
+        if any(
+            (
+                isinstance(node, ast.Call)
+                and not (compile_time_assert and node is value)
+                and not _is_pure_call(node)
+            )
+            or (isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load))
+            for node in ast.walk(value)
+        ):
+            return None
+        reads = {
+            node.id: reaching.get(node.id)
+            for node in ast.walk(value)
+            if isinstance(node, ast.Name)
+        }
+        if isinstance(statement, ast.AugAssign):
+            assert name is not None
+            reads[name] = reaching.get(name)
+        targets.append(name)
+        values.append(value)
+        references.append(reads)
+        if not isinstance(statement, ast.AugAssign) and is_invariant(value, reads):
+            invariant.add(index)
+        if name is not None:
+            definitions.setdefault(name, []).append(index)
+            reaching[name] = index
+
+    test = guard.test.id
+    predicate_index = reaching.get(test)
+    if predicate_index is None:
+        return None
+    predicate = values[predicate_index]
+    if not isinstance(predicate, ast.Compare) or len(predicate.ops) != 1:
+        return None
+    left, right = predicate.left, predicate.comparators[0]
+    if isinstance(predicate.ops[0], ast.Gt):
+        bound, offset = left, right
+    elif isinstance(predicate.ops[0], ast.Lt):
+        bound, offset = right, left
+    else:
+        return None
+    if not isinstance(bound, ast.Name) or not isinstance(offset, ast.Name):
+        return None
+    predicate_reads = references[predicate_index]
+    bound_index = predicate_reads[bound.id]
+    if (
+        (bound_index is None and bound.id in stored_names | variant_names)
+        or (bound_index is not None and bound_index not in invariant)
+        or reaching.get(bound.id) != bound_index
+    ):
         return None
 
-    anchors = [
-        name
-        for name in invariant
-        if name == bound.id
+    # Follow aliases to the exact tile-begin expression used by the predicate.
+    offset_index = predicate_reads[offset.id]
+    if offset_index is None:
+        return None
+    pid = slowest.pid_var
+    offset_value = values[offset_index]
+    while isinstance(offset_value, ast.Name) and offset_value.id != pid:
+        alias = references[offset_index][offset_value.id]
+        if alias is None:
+            break
+        offset_index = alias
+        offset_value = values[offset_index]
+    if ast.unparse(offset_value) not in (
+        f"{pid} * {slowest.block_size_var}",
+        *([pid] * (block_size == 1)),
+    ):
+        return None
+
+    # Original names are retained, so all definitions of a moved name must move.
+    hoistable = {
+        index
+        for name, writes in definitions.items()
+        if name not in body_writes and all(write in invariant for write in writes)
+        for index in writes
+    } | {index for index in invariant if targets[index] is None}
+    while True:
+        invalid = {
+            index
+            for index in hoistable
+            if any(
+                definition is not None and definition not in hoistable
+                for definition in references[index].values()
+            )
+        }
+        if not invalid:
+            break
+        invalid.update(
+            write
+            for index in tuple(invalid)
+            if (name := targets[index]) is not None
+            for write in definitions[name]
+        )
+        hoistable.difference_update(invalid)
+    if bound_index is not None and bound_index not in hoistable:
+        return None
+
+    pending = [
+        index
+        for index in sorted(hoistable)
+        if targets[index] is None
+        or index == bound_index
         or any(
-            _is_tl_call(node, _HOIST_ANCHOR_CALLS) for node in ast.walk(values[name])
+            _is_tl_call(node, _HOIST_ANCHOR_CALLS) for node in ast.walk(values[index])
         )
     ]
-    hoisted: set[str] = set()
-    while anchors:
-        name = anchors.pop()
-        if name in hoisted:
-            continue
-        hoisted.add(name)
-        anchors.extend(
-            node.id
-            for node in ast.walk(values[name])
-            if isinstance(node, ast.Name) and node.id in invariant
-        )
+    hoisted: set[int] = set()
+    while True:
+        while pending:
+            index = pending.pop()
+            if index in hoisted:
+                continue
+            if index not in hoistable:
+                return None
+            hoisted.add(index)
+            pending.extend(
+                definition
+                for definition in references[index].values()
+                if definition is not None
+            )
+            if (name := targets[index]) is not None:
+                pending.extend(definitions[name])
+        moved_definitions = {
+            name: writes[-1]
+            for name, writes in definitions.items()
+            if writes[-1] in hoisted
+        }
+        # A statement that reads an earlier version must precede the later write.
+        # Move it too when invariant; otherwise the original names cannot be kept.
+        pending = [
+            index
+            for index, reads in enumerate(references)
+            if index not in hoisted
+            and any(
+                name in moved_definitions and definition != moved_definitions[name]
+                for name, definition in reads.items()
+            )
+        ]
+        if not pending:
+            break
+
+    # Retain a predicate used by another prefix statement or by the guarded body.
+    remove_predicate = not any(
+        predicate_index in reads.values()
+        for index, reads in enumerate(references)
+        if index != predicate_index
+    ) and test not in _all_names(guard.body)
     hoisted_statements = [
         _clone_stmt(statement)
-        for statement in prefix
-        if isinstance(statement, ast.Assign) and target(statement) in hoisted
+        for index, statement in enumerate(prefix)
+        if index in hoisted
     ]
     remaining = [
         _clone_stmt(statement)
-        for statement in prefix
-        if target(statement) not in {*hoisted, test}
+        for index, statement in enumerate(prefix)
+        if index not in hoisted and not (remove_predicate and index == predicate_index)
     ]
     tiles = bound.id if block_size == 1 else f"tl.cdiv({bound.id}, {block_size})"
     return _GuardedExtent(
         hoisted=hoisted_statements,
         body=[*remaining, *(_clone_stmt(statement) for statement in guard.body)],
         hoisted_names=tuple(
-            cast("str", target(statement)) for statement in hoisted_statements
+            dict.fromkeys(
+                name
+                for index, name in enumerate(targets)
+                if index in hoisted and name is not None
+            )
         ),
         live_tasks=tiles if inner_tasks == 1 else f"{inner_tasks} * {tiles}",
     )

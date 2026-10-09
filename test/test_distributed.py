@@ -1578,7 +1578,9 @@ class TestDistributedTileDependencies(TestCase):
         symm, x = torch.zeros(2, 4096, device=DEVICE)
         moment = torch.zeros(1, device=DEVICE)
         group = self._world(world, chained_exchange_kernel)
-        code = chained_exchange_kernel.bind((symm, moment, x, group)).to_triton_code()
+        bound = chained_exchange_kernel.bind((symm, moment, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "block_sizes": [1024, 1024, 1, 512]})
         # Both buffers go in band, each with its own push and poll. The even
         # symm tiles push word pairs; the one-element moment pushes single words.
         self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)

@@ -26,6 +26,7 @@ from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
+from helion._compiler.program_id import PIDInfo
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import DenseTaskOrder
@@ -894,6 +895,157 @@ def specialized_quotient_chain(
 
 
 class TestCrossLoopCodegenHelpers(TestCase):
+    def test_guard_hoisting_preserves_dtype_checks(self) -> None:
+        indexing = "pid_0 = virtual_pid\noffset_0 = pid_0\n"
+        invariant = (
+            "indices = tl.arange(0, 16)\n"
+            "member = tl.load(flags + indices)\n"
+            "member = tl.cast(member, tl.int32)\n"
+            "tl.static_assert(member.dtype == tl.int32)\n"
+            "live = tl.sum(member, 0)\n"
+            "live = tl.cast(live, tl.int64)\n"
+            "tl.static_assert(live.dtype == tl.int64)\n"
+        )
+        task = (
+            "value = tl.load(x + offset_0)\n"
+            "value = tl.cast(value, tl.float32)\n"
+            "tl.static_assert(value.dtype == tl.float32)\n"
+            "tl.store(out + offset_0, value)\n"
+        )
+        guarded = (
+            "predicate = live > offset_0\n"
+            "if predicate:\n"
+            + "".join(f"    {line}\n" for line in task.splitlines())
+            + "else:\n    pass\n"
+        )
+
+        def extent(
+            source: str, read_only: bool = True
+        ) -> cross_loop_codegen._GuardedExtent | None:
+            return cross_loop_codegen._guarded_extent(
+                ast.parse(source).body,
+                slowest=PIDInfo("pid_0", "1", "16", 0),
+                block_size=1,
+                inner_tasks=1,
+                variant_names=frozenset({"virtual_pid"}),
+                read_only_tensors=frozenset({"flags"}) if read_only else frozenset(),
+                tensor_names=frozenset({"flags", "x", "out"}),
+            )
+
+        result = extent(indexing + invariant + guarded)
+        assert result is not None
+        self.assertEqual(result.live_tasks, "live")
+        self.assertEqual(result.hoisted_names, ("indices", "member", "live"))
+        self.assertEqual(
+            _ast_fingerprint(result.hoisted),
+            _ast_fingerprint(ast.parse(invariant).body),
+        )
+        self.assertEqual(
+            _ast_fingerprint(result.body),
+            _ast_fingerprint(ast.parse(indexing + task).body),
+        )
+        # Bounds from mutable memory or task-varying loads cannot move.
+        self.assertIsNone(extent(indexing + invariant + guarded, read_only=False))
+        self.assertIsNone(
+            extent(
+                indexing
+                + invariant.replace("flags + indices", "flags + offset_0")
+                + guarded
+            )
+        )
+        # Narrowing the offset can wrap it, so it no longer denotes the tile begin.
+        self.assertIsNone(
+            extent(
+                indexing
+                + "offset_0 = tl.cast(offset_0, tl.int8)\n"
+                + "tl.static_assert(offset_0.dtype == tl.int8)\n"
+                + invariant
+                + guarded
+            )
+        )
+        # Ordinary updates and intervening uses follow the same dataflow rules.
+        for reassignment in (
+            "live = live + 1\n",
+            "other = live\nlive = tl.cast(live, tl.int64)\n",
+            "tl.static_assert(live.dtype == tl.int64, 'expected int64')\n",
+        ):
+            with self.subTest(reassignment=reassignment):
+                result = extent(indexing + invariant + reassignment + guarded)
+                assert result is not None
+                self.assertEqual(
+                    _ast_fingerprint(result.hoisted),
+                    _ast_fingerprint(ast.parse(invariant + reassignment).body),
+                )
+
+    def test_guard_hoisting_preserves_reaching_definitions(self) -> None:
+        indexing = "pid_0 = virtual_pid\noffset_0 = pid_0\n"
+        invariant = (
+            "live = 2\n"
+            "earlier = live\n"
+            "live = live + 1\n"
+            "bound = live\n"
+            "live = live + 2\n"
+            "tl.static_assert(bound == 3, 'bound keeps the earlier value')\n"
+        )
+        guarded = (
+            "predicate = bound > offset_0\n"
+            "if predicate:\n"
+            "    out[offset_0] = earlier + live\n"
+            "else:\n"
+            "    pass\n"
+        )
+
+        def extent(source: str) -> cross_loop_codegen._GuardedExtent | None:
+            return cross_loop_codegen._guarded_extent(
+                ast.parse(source).body,
+                slowest=PIDInfo("pid_0", "1", "16", 0),
+                block_size=1,
+                inner_tasks=1,
+                variant_names=frozenset({"virtual_pid"}),
+                read_only_tensors=frozenset(),
+                tensor_names=frozenset(),
+            )
+
+        def execute(statements: list[ast.stmt], namespace: dict[str, Any]) -> None:
+            module = ast.fix_missing_locations(ast.Module(statements, type_ignores=[]))
+            exec(compile(module, "<guard-hoisting-test>", "exec"), namespace)
+
+        source = indexing + invariant + guarded
+        result = extent(source)
+        assert result is not None
+        self.assertEqual(result.live_tasks, "bound")
+        self.assertEqual(result.hoisted_names, ("live", "earlier", "bound"))
+        reference: dict[str, Any] = {
+            "out": [0] * 16,
+            "tl": SimpleNamespace(static_assert=self.assertTrue),
+        }
+        transformed: dict[str, Any] = {
+            "out": [0] * 16,
+            "tl": reference["tl"],
+        }
+        for pid in range(16):
+            reference["virtual_pid"] = pid
+            execute(ast.parse(source).body, reference)
+        execute(result.hoisted, transformed)
+        for pid in range(transformed[result.live_tasks]):
+            transformed["virtual_pid"] = pid
+            execute(result.body, transformed)
+        self.assertEqual(reference["out"], [7] * 3 + [0] * 13)
+        self.assertEqual(transformed["out"], reference["out"])
+
+        # A task-dependent reader of an older value cannot move past its update.
+        self.assertIsNone(
+            extent(source.replace("earlier = live", "earlier = live + offset_0"))
+        )
+        self.assertIsNone(
+            extent(source.replace("live = live + 1", "live = live + offset_0"))
+        )
+        self.assertIsNone(
+            extent(
+                source.replace("bound = live", "tl.store(output, live)\nbound = live")
+            )
+        )
+
     def test_blackwell_dot_root_stays_in_kernel_scope(self) -> None:
         dot_body = ast.parse("acc = tl.dot(lhs, rhs, acc=acc)\n").body
         scaled_body = ast.parse(
