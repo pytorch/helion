@@ -11,7 +11,9 @@ from ...autotuner.compiler_coverage import CompilerCoverageGroup
 from ...autotuner.compiler_coverage import CoverageDependency
 from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
+from ...language import _tracing_ops
 from ...runtime.config import Config
+from .cute_fragment_bounded_gather import bounded_gather_roots
 from .cute_fragment_common import fragment_root_regions
 from .cute_fragment_threads import THREADS
 from .registry import AutotunerHeuristic
@@ -40,12 +42,25 @@ class CuteFragmentRegisterSnapshotsHeuristic(AutotunerHeuristic):
         host = device_ir.host_function
         assert host is not None
         roots = set()
+        while_roots = set()
         sizes = []
         with host:
             for root, graphs in fragment_root_regions(device_ir):
                 chains = snapshot_chains(graphs, env, allow_unbound=True)
+                has_while = any(
+                    node.target is _tracing_ops._while_loop
+                    for info in graphs
+                    for node in info.graph.nodes
+                )
+                bounded = has_while and root in bounded_gather_roots(
+                    env, device_ir, allow_unbound=True
+                )
                 if not chains or not computed_fragment_supported(
-                    env, graphs, snapshot_owned=True
+                    env,
+                    graphs,
+                    snapshot_owned=True,
+                    bounded_gather_owned=bounded,
+                    allow_unbound=has_while,
                 ):
                     continue
                 counts = [
@@ -58,8 +73,13 @@ class CuteFragmentRegisterSnapshotsHeuristic(AutotunerHeuristic):
                 # initialization -> updates -> final-read lifetime proof.
                 if counts:
                     roots.add(root)
+                    if has_while:
+                        while_roots.add(root)
                     sizes.extend(counts)
         env.config_spec.cute_fragment_register_snapshots_root_ids = frozenset(roots)
+        env.config_spec.cute_fragment_register_snapshot_while_root_ids = frozenset(
+            while_roots
+        )
         env.config_spec.cute_fragment_thread_root_ids |= frozenset(roots)
         env.config_spec.cute_fragment_register_snapshot_min_threads = (
             (min(sizes) + MAX_SLOTS - 1) // MAX_SLOTS if sizes else 0
@@ -89,6 +109,22 @@ def register_fragment_register_snapshots_coverage(
         previous.strict_config_pair(carrier)
     except InvalidConfig:
         return
+    while_dependency = ()
+    if spec.cute_fragment_register_snapshot_while_root_ids:
+        group = next(
+            (
+                group
+                for group in spec.compiler_coverage_groups
+                if group.key == "cute_fragment_bounded_gather"
+            ),
+            None,
+        )
+        if group is None:
+            return
+        carrier = Config.from_dict(
+            deepcopy(carrier.config) | {"cute_fragment_bounded_gather": True}
+        )
+        while_dependency = (CoverageDependency(group.mechanism, group.key, True),)
     required = spec.cute_fragment_register_snapshot_min_threads
     if cast("int", carrier.get("cute_fragment_threads", 128)) < required:
         carrier = Config.from_dict(
@@ -129,7 +165,7 @@ def register_fragment_register_snapshots_coverage(
             domain=(False, True),
             legacy=False,
             witnesses=(CoverageWitness(carrier, True),),
-            dependencies=dependencies,
+            dependencies=dependencies + while_dependency,
             deferred=True,
         )
     )

@@ -62,6 +62,53 @@ _ASM_STORE_V4_B32_L2_EVICT_LAST = (
 _L2_EVICT_LAST_POLICY = 0x14F0000000000000
 
 
+@dsl_user_op
+def scalar_policy_load(
+    ptr: object,
+    dtype: type[cutlass.Numeric],
+    policy: str,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Numeric:
+    """Load scalar bits with the exact selected first/last/streaming policy.
+
+    Side effects and the memory clobber keep the load ordered with surrounding
+    memory operations. The unsigned carrier avoids numerical conversion of
+    floating point values, signed zero, NaNs and signed integer high bits.
+    """
+    assert dtype in (
+        cutlass.Float32,
+        cutlass.Float64,
+        cutlass.Int32,
+        cutlass.Int64,
+        cutlass.Uint32,
+        cutlass.Uint64,
+    )
+    suffix = {
+        "first": ".L1::evict_first",
+        "last": ".L1::evict_last",
+        "streaming": ".cs",
+    }[policy]
+    wide = dtype in (cutlass.Float64, cutlass.Int64, cutlass.Uint64)
+    carrier = cutlass.Uint64 if wide else cutlass.Uint32
+    address = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    bits = llvm.inline_asm(
+        carrier.mlir_type,
+        [address],
+        f"ld.global{suffix}.b{64 if wide else 32} $0, [$1];",
+        "=l,l,~{memory}" if wide else "=r,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    if dtype in (cutlass.Float32, cutlass.Float64):
+        bits = llvm.bitcast(dtype.mlir_type, bits, loc=loc, ip=ip)
+    return dtype(bits)
+
+
 def fixed_l2_evict_last_store_policy_supported(
     target_device_capability: tuple[int, int] | None,
 ) -> bool:
