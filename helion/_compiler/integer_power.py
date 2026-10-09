@@ -60,7 +60,8 @@ def lower_integer_powers(
         if not (bounds.lower >= 0 and bounds.upper <= 62):
             if backend == "cute":
                 raise exc.BackendUnsupported(
-                    backend, "scalar integer power requires a proved exponent in [0, 62]"
+                    backend,
+                    "scalar integer power requires a proved exponent in [0, 62]",
                 )
             continue
         replacements[power] = cast(

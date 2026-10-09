@@ -195,6 +195,7 @@ def test_scalar_integer_power_codegen(cpu_codegen, base, begin, end, step):
             assert isinstance(actual, int)
 
 
+@pytest.mark.parametrize("backend", ["triton", "tileir"])
 @pytest.mark.parametrize(
     "base,bounds",
     [
@@ -204,13 +205,13 @@ def test_scalar_integer_power_codegen(cpu_codegen, base, begin, end, step):
         (2, ValueRanges.unknown_int()),
     ],
 )
-def test_unproved_integer_powers_keep_existing_expression(base, bounds):
+def test_unproved_integer_powers_keep_existing_expression(base, bounds, backend):
     from helion._compiler.integer_power import lower_integer_powers
 
     exponent = sympy.Symbol("exponent", integer=True)
     expression = PowByNatural(base, exponent)
     assert (
-        lower_integer_powers(expression, {exponent: bounds}, backend="triton")
+        lower_integer_powers(expression, {exponent: bounds}, backend=backend)
         is expression
     )
 
