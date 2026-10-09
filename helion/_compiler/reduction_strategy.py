@@ -2079,6 +2079,21 @@ class PersistentReductionStrategy(ReductionStrategy):
             return expr_from_string(
                 backend.full_expr(shape_dims, constant_repr(default), fake_output.dtype)
             )
+        if backend.name == "cute" and backend.is_indexed_reduction(reduction_type):
+            from .cute.argreduce import codegen_packed_reduction
+
+            packed = codegen_packed_reduction(
+                state,
+                self,
+                None,
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+            )
+            if packed is not None:
+                return packed
         acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
@@ -3095,6 +3110,21 @@ class LoopedReductionStrategy(ReductionStrategy):
             backend = env.backend
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
             assert isinstance(device_loop, DeviceLoopState)
+            if backend.name == "cute" and backend.is_indexed_reduction(reduction_type):
+                from .cute.argreduce import codegen_packed_reduction
+
+                packed = codegen_packed_reduction(
+                    state,
+                    self,
+                    device_loop,
+                    input_name,
+                    reduction_type,
+                    dim,
+                    fake_input,
+                    fake_output,
+                )
+                if packed is not None:
+                    return packed
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
             acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)

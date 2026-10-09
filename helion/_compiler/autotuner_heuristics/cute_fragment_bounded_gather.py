@@ -28,12 +28,21 @@ def bounded_gather_roots(
     """
     from ..cute.bounded_gather import prove_gather
     from ..cute.computed_fragment import computed_fragment_supported
+    from ..cute.topk import match_topk_root
 
     roots = set()
     host = device_ir.host_function
     assert host is not None
     with host:
         for root, graphs in fragment_root_regions(device_ir):
+            if (
+                match_topk_root(
+                    graphs,
+                    noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+                )
+                is not None
+            ):
+                continue
             if not any(
                 prove_gather(env, node, graphs=graphs, allow_unbound=allow_unbound)
                 is not None

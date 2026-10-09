@@ -5193,6 +5193,339 @@ class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
         return seeds[0] if seeds else None
 
 
+class CuteTopKHeuristic(AutotunerHeuristic):
+    """Seed subgroup geometry from bounded per-lane selection fragments."""
+
+    name = "cute_topk"
+    backend = "cute"
+
+    @staticmethod
+    def _supports_float32_bit_keys(dtype: torch.dtype, n: int) -> bool:
+        if dtype not in (torch.float16, torch.bfloat16):
+            return False
+        index_bits = (n - 1).bit_length()
+        index_mask = (1 << index_bits) - 1
+        min_key = -(32767 << index_bits)
+        max_key = (32767 << index_bits) | index_mask
+        # Match the emitter's biased-key proof: real keys are positive normal
+        # finite Float32 values, leaving zero below every real key for padding.
+        return 0x40000000 + min_key >= 0x00800000 and 0x40000000 + max_key <= 0x7F7FFFFF
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.memory_ops import register_cute_tensor_alias_specializations
+        from ..cute.topk import match_topk_root
+        from ..cute.topk import topk_tensors_are_proven_disjoint
+
+        host_function = device_ir.host_function
+        if host_function is None or len(device_ir.root_ids) != 1:
+            return frozenset()
+        with host_function:
+            plan = match_topk_root(
+                device_ir.graphs,
+                noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+            )
+            # The structural match precedes real-argument availability. Wait
+            # until binding can prove disjoint storage before freezing generic
+            # tiling; the registered alias classifier guards bound-cache reuse.
+            if plan is not None:
+                # Singleton top-k has no reduction dimension, so the reduction
+                # registration pass may not have installed its alias facts.
+                register_cute_tensor_alias_specializations(env)
+                if topk_tensors_are_proven_disjoint(plan, env, allow_unbound=True):
+                    env.config_spec.enable_cute_topk_search(plan.selection_dtype)
+                    env.config_spec.cute_topk_coarse_keys_available = (
+                        plan.selection_dtype == torch.float32
+                        and 1 < plan.n <= (1 << 23)
+                        and (1 << (plan.k - 1).bit_length()) <= plan.n
+                    )
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_topk_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        from ..cute.topk import match_topk_root
+        from ..cute.topk import topk_tensors_are_proven_disjoint
+
+        host_function = device_ir.host_function
+        if host_function is None or len(device_ir.root_ids) != 1:
+            return None
+        with host_function:
+            plan = match_topk_root(
+                device_ir.graphs,
+                noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+            )
+            # A structural candidate can still fail the final runtime alias
+            # proof. Do not seed its specialized schedule without that proof.
+            if plan is None or not topk_tensors_are_proven_disjoint(plan, env):
+                return None
+        full_precision = plan.selection_dtype == torch.float32
+        integer_key = "int64" if full_precision else "int32"
+        padded_k = 1 << (plan.k - 1).bit_length()
+        seeds = []
+        # Retain the original register-pressure and occupancy candidates. All
+        # seeds are search hints, not promoted defaults.
+        for target, threads, value_mode, rank_mode, layout in (
+            (32, 128, "decode", "ordinal", "replicated"),
+            (64, 128, "decode", "signed", "replicated"),
+            (128, 64, "gather", "signed", "replicated"),
+            (32, 64, "decode", "ordinal", "distributed"),
+        ):
+            elements_per_lane = max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
+            config = env.config_spec.default_config()
+            config.config.update(
+                cute_topk_lanes_per_row=lanes,
+                cute_topk_rows_per_block=threads // lanes,
+                cute_topk_vector_width=8,
+                cute_topk_output_vector_width=4,
+                cute_topk_value_mode=value_mode,
+                cute_topk_key_dtype=integer_key,
+                cute_topk_rank_mode=rank_mode,
+                cute_topk_selection_layout=layout,
+            )
+            seeds.append(config)
+
+        # Growing distributed fragments need not contain K keys in every lane.
+        # Native floating-point comparisons provide a complementary replicated
+        # schedule; their precision guard can fall back to integer keys.
+        for target, layout, key_dtype in (
+            (8, "distributed", "int32"),
+            (16, "distributed", "int32"),
+            (32, "replicated", "float32_native"),
+            (64, "replicated", "float32_native"),
+        ):
+            distributed = layout == "distributed"
+            elements_per_lane = target if distributed else max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(
+                32,
+                32 if distributed else padded_k,
+                1 << (required_lanes - 1).bit_length(),
+            )
+            per_lane = (plan.n + lanes - 1) // lanes
+            input_vector = min(8, 1 << (per_lane.bit_length() - 1))
+            config = env.config_spec.default_config()
+            config.config.update(
+                cute_topk_lanes_per_row=lanes,
+                cute_topk_rows_per_block=128 // lanes,
+                cute_topk_vector_width=input_vector,
+                cute_topk_output_vector_width=4,
+                cute_topk_value_mode="decode",
+                cute_topk_key_dtype=integer_key if full_precision else key_dtype,
+                cute_topk_rank_mode="ordinal",
+                cute_topk_selection_layout=layout,
+                cute_topk_sort_network="compact_pruned",
+            )
+            seeds.append(config)
+        if full_precision:
+            # Couple exact coarse-key recovery with value gathering at two bounded
+            # register budgets. The existing full-precision seeds stay first.
+            if env.config_spec.cute_topk_coarse_keys_available:
+                for register_target in (16, 32):
+                    required_lanes = (plan.n + register_target - 1) // register_target
+                    lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                    per_lane = (plan.n + lanes - 1) // lanes
+                    rows = 64 // lanes
+                    if per_lane > register_target or (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=min(8, 1 << (per_lane.bit_length() - 1)),
+                        cute_topk_output_vector_width=1,
+                        cute_topk_value_mode="gather",
+                        cute_topk_key_dtype="int64",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="compact_pruned",
+                        cute_topk_key_encoder="dsl",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="sequential",
+                        cute_topk_coarse_keys=True,
+                        cute_topk_key_recovery="packed",
+                    )
+                    seeds.append(config)
+            return dedupe_configs(seeds)
+        # Replicated ordinal decoding can avoid irregular value gathers. Add
+        # all encoder implementations at two bounded register-fragment sizes;
+        # these remain unpromoted search hints with the ordinary merge default.
+        for target in (32, 64):
+            elements_per_lane = max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
+            for encoder in ("dsl", "asm", "paired"):
+                config = env.config_spec.default_config()
+                config.config.update(
+                    cute_topk_lanes_per_row=lanes,
+                    cute_topk_rows_per_block=128 // lanes,
+                    cute_topk_vector_width=8,
+                    cute_topk_output_vector_width=4,
+                    cute_topk_value_mode="decode",
+                    cute_topk_key_dtype=integer_key,
+                    cute_topk_rank_mode="ordinal",
+                    cute_topk_selection_layout="replicated",
+                    cute_topk_sort_network="compact_pruned",
+                    cute_topk_key_encoder=encoder,
+                    cute_topk_defer_value_gathers=True,
+                )
+                seeds.append(config)
+        # Complement the existing integer/replicated hints with a bounded
+        # distributed floating-key family at two occupancy budgets. Keep the
+        # original seed order and promoted/default configuration unchanged.
+        if cls._supports_float32_bit_keys(plan.selection_dtype, plan.n):
+            for register_target in (32, 64):
+                required_lanes = (plan.n + register_target - 1) // register_target
+                lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                per_lane = (plan.n + lanes - 1) // lanes
+                if per_lane > register_target:
+                    continue
+                input_vector = min(4, 1 << (per_lane.bit_length() - 1))
+                output_vector = min(4, max(1, padded_k // lanes))
+                for threads in (128, 256):
+                    rows = threads // lanes
+                    if (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=input_vector,
+                        cute_topk_output_vector_width=output_vector,
+                        cute_topk_value_mode="decode",
+                        cute_topk_key_dtype="float32_bits",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="batcher",
+                        cute_topk_key_encoder="paired",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="sequential",
+                    )
+                    seeds.append(config)
+        # Keep scalar single-warp hints before paired-store two-warp hints.
+        if plan.selection_dtype in (torch.float16, torch.bfloat16):
+            for threads, output_width in ((32, 1), (64, 2)):
+                for register_target in (32, 64):
+                    required_lanes = (plan.n + register_target - 1) // register_target
+                    lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                    per_lane = (plan.n + lanes - 1) // lanes
+                    if per_lane > register_target:
+                        continue
+                    rows = threads // lanes
+                    if (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=min(8, 1 << (per_lane.bit_length() - 1)),
+                        cute_topk_output_vector_width=min(
+                            output_width, max(1, padded_k // lanes)
+                        ),
+                        cute_topk_value_mode="decode",
+                        cute_topk_key_dtype="int32",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="compact_pruned",
+                        cute_topk_key_encoder="paired",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="balanced",
+                    )
+                    seeds.append(config)
+            # Scalar stores complement the vector-output hints at the existing
+            # register budgets and multi-warp occupancies. Keep these integer
+            # schedules after the original seeds; they do not change defaults.
+            for register_target in (32, 64):
+                required_lanes = (plan.n + register_target - 1) // register_target
+                lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                per_lane = (plan.n + lanes - 1) // lanes
+                if per_lane > register_target:
+                    continue
+                for threads in (128, 256):
+                    rows = threads // lanes
+                    if (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=min(4, 1 << (per_lane.bit_length() - 1)),
+                        cute_topk_output_vector_width=1,
+                        cute_topk_value_mode="decode",
+                        cute_topk_key_dtype="int32",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="batcher",
+                        cute_topk_key_encoder="paired",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="sequential",
+                    )
+                    seeds.append(config)
+            # Couple a larger distributed fragment with scalar output and the
+            # compact balanced network. Keep all earlier search hints first.
+            register_target = 128
+            required_lanes = (plan.n + register_target - 1) // register_target
+            lanes = min(32, 1 << (required_lanes - 1).bit_length())
+            per_lane = (plan.n + lanes - 1) // lanes
+            rows = 128 // lanes
+            if 64 < per_lane <= register_target and (
+                rows in env.config_spec.cute_topk_choices["cute_topk_rows_per_block"]
+            ):
+                config = env.config_spec.default_config()
+                config.config.update(
+                    cute_topk_lanes_per_row=lanes,
+                    cute_topk_rows_per_block=rows,
+                    cute_topk_vector_width=8,
+                    cute_topk_output_vector_width=1,
+                    cute_topk_value_mode="decode",
+                    cute_topk_key_dtype="int32",
+                    cute_topk_rank_mode="ordinal",
+                    cute_topk_selection_layout="distributed",
+                    cute_topk_sort_network="compact_pruned",
+                    cute_topk_key_encoder="paired",
+                    cute_topk_defer_value_gathers=False,
+                    cute_topk_merge_schedule="balanced",
+                )
+                seeds.append(config)
+        return dedupe_configs(seeds)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
 class CuteChunkPrepareHeuristic(AutotunerHeuristic):
     """Expose exact BT16 prepare schedules with a geometry-derived seed."""
 
