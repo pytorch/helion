@@ -2382,6 +2382,16 @@ def _generate_ast(
             validate_scan_exports(env, func.device_ir, config)
         if (
             env.backend_name == "cute"
+            and config.get("cute_fragment_warp_producer_regions", False)
+            and _codegen_graphs is None
+        ):
+            from .autotuner_heuristics.cute_fragment_warp_producer_regions import (
+                validate_warp_producer_regions,
+            )
+
+            validate_warp_producer_regions(env, func.device_ir, config)
+        if (
+            env.backend_name == "cute"
             and config.get("cute_materialized_operand_schedule", "off") != "off"
         ):
             from .cute.packed_operand_codegen import generate_packed_operand
