@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
     from .register_producers import RegisterProducerRequest
+    from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+    from .topk import CuteTopKPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -800,6 +802,8 @@ class CuteDeviceFunctionState:
         # Its CTA shape is authoritative because the direct lowering replaces
         # the ordinary lane topology.
         self.direct_affine_plan: DirectAffinePlan | None = None
+        self.topk_plan: CuteTopKPlan | None = None
+        self.register_region_plan: RegisterRegionPlan | None = None
         # Packed one-warp lowering for structurally proven split-input T=1
         # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.
         self.split_single_token_rank1_plan: CuteSplitSingleTokenRank1Plan | None = None

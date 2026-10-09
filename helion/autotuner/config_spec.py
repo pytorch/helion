@@ -877,6 +877,21 @@ VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc5",
 )
 CUTE_AFFINE_SCAN_SCHEDULE_KEY = "cute_affine_scan_schedule"
+CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
+    "cute_topk_lanes_per_row": (16, 1, 2, 4, 8, 32),
+    "cute_topk_rows_per_block": (8, 1, 2, 4, 16, 32, 64, 128),
+    "cute_topk_vector_width": (8, 1, 2, 4),
+    "cute_topk_output_vector_width": (1, 2, 4, 8),
+    "cute_topk_value_mode": ("gather", "decode"),
+    "cute_topk_key_dtype": ("int32", "float32", "float32_bits", "float32_native"),
+    "cute_topk_rank_mode": ("signed", "ordinal"),
+    "cute_topk_selection_layout": ("replicated", "distributed"),
+    "cute_topk_sort_network": ("batcher", "compact", "compact_pruned"),
+    "cute_topk_key_encoder": ("dsl", "asm", "paired"),
+    "cute_topk_defer_value_gathers": (False, True),
+    "cute_topk_merge_schedule": ("sequential", "balanced"),
+}
+CUTE_TOPK_CONFIG_KEYS: frozenset[str] = frozenset(CUTE_TOPK_CHOICES)
 
 
 def _cute_chunk_recurrence_config_is_safe(
@@ -953,6 +968,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        *CUTE_TOPK_CONFIG_KEYS,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -973,8 +989,11 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
@@ -1058,6 +1077,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        *CUTE_TOPK_CONFIG_KEYS,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1096,8 +1116,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
@@ -1224,8 +1247,11 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
@@ -1531,6 +1557,13 @@ class ConfigSpec:
         # Enabled only after a generic matcher proves a compatible affine scan.
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
+        # Enabled only when the whole root is a supported top-k load/store
+        # dataflow. Its emitter owns the row geometry and vector layout.
+        self.cute_topk_search_enabled = False
+        self.cute_topk_coarse_keys_available = False
+        self.cute_topk_coarse_keys_search_enabled = False
+        self.cute_topk_key_recovery_search_enabled = False
+        self.cute_topk_choices = dict(CUTE_TOPK_CHOICES)
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
         # A separately launched, proved pointwise producer can share one
@@ -1560,6 +1593,8 @@ class ConfigSpec:
             FragmentRootRequirement, ...
         ] = ()
         self.cute_fragment_warp_scan_search_enabled = False
+        self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_topk_network_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_search_enabled = False
@@ -2969,6 +3004,28 @@ class ConfigSpec:
             choices=direct_affine_schedule_choices(step_count)
         )
 
+    def enable_cute_topk_search(
+        self, selection_dtype: torch.dtype | None = None
+    ) -> None:
+        """Expose the independent row, lane, and vector geometry of top-k."""
+        self.cute_topk_search_enabled = True
+        if selection_dtype == torch.float32:
+            # A full FP32 value plus an index cannot fit any 32-bit key.
+            # The 16-bit packed encoders are not legal for this representation.
+            self.cute_topk_choices = {
+                **CUTE_TOPK_CHOICES,
+                "cute_topk_key_dtype": ("int64",),
+                "cute_topk_key_encoder": ("dsl",),
+                "cute_topk_defer_value_gathers": (False,),
+            }
+        # The root emitter supplies its own tiling. Ordinary block sizes do
+        # not change its code; retain valid defaults for shared compiler
+        # bookkeeping without searching duplicate generated kernels.
+        for spec in self.block_sizes:
+            target = spec._fragment(self).default_val
+            spec.autotuner_min = target
+            spec.max_size = target
+
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if "block_sizes" not in config:
             return
@@ -3584,6 +3641,17 @@ class ConfigSpec:
             return
         raise InvalidConfig(
             f"{key}={value!r} requires a supported bounded warp-prefix scan"
+        )
+
+    def _normalize_cute_fragment_topk_network(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_topk_network",
+            self.cute_fragment_topk_network_root_ids,
+            "a supported complete fragment top-k",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_atomic_aggregation(
@@ -4386,6 +4454,65 @@ class ConfigSpec:
                 )
             config.pop(key, None)
 
+    def _normalize_cute_topk(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        for key, choices in self.cute_topk_choices.items():
+            if not self.cute_topk_search_enabled:
+                if key in config and not fix_invalid:
+                    raise InvalidConfig(f"{key} requires a compatible top-k root")
+                config.pop(key, None)
+                continue
+            value = config.setdefault(key, choices[0])
+            if type(value) is not type(choices[0]) or value not in choices:
+                if fix_invalid:
+                    config[key] = choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be one of {choices!r}, got {value!r}"
+                    )
+        if self.cute_topk_search_enabled:
+            lanes = cast("int", config["cute_topk_lanes_per_row"])
+            rows = cast("int", config["cute_topk_rows_per_block"])
+            if lanes * rows > 1024:
+                if fix_invalid:
+                    config["cute_topk_rows_per_block"] = 1024 // lanes
+                else:
+                    raise InvalidConfig(
+                        "cute_topk_lanes_per_row * cute_topk_rows_per_block "
+                        "must not exceed 1024 threads"
+                    )
+
+        key = "cute_topk_coarse_keys"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+        elif not (
+            value is True
+            and self.cute_topk_search_enabled
+            and self.cute_topk_coarse_keys_available
+            and config.get("cute_topk_selection_layout") == "distributed"
+            and config.get("cute_topk_key_dtype") == "int64"
+        ):
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires a complete FP32 distributed Int64-key selection"
+                )
+
+        key = "cute_topk_key_recovery"
+        value = config.get(key, "direct")
+        if value == "direct":
+            config.pop(key, None)
+        elif value != "packed" or config.get("cute_topk_coarse_keys") is not True:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires an enabled coarse-key selection and direct/packed mode"
+                )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -4770,6 +4897,7 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_topk_network(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
@@ -4825,6 +4953,7 @@ class ConfigSpec:
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
@@ -6016,8 +6145,10 @@ class ConfigSpec:
             if key in (
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
+                "cute_fragment_topk_network",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
+                "cute_topk_coarse_keys",
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
                 "cute_fragment_register_producers",
@@ -6032,6 +6163,8 @@ class ConfigSpec:
                 "cute_fragment_packet_loads",
             ):
                 return True, False
+            if key == "cute_topk_key_recovery":
+                return True, "direct"
             if key == "cute_fragment_threads":
                 return True, 128
             if key in ("cute_fragment_scan", "cute_fragment_reduction"):
@@ -6304,6 +6437,12 @@ class ConfigSpec:
                 fields["cute_fragment_producer_cache"] = BooleanFragment()
             if self.cute_fragment_warp_results_search_enabled:
                 fields["cute_fragment_warp_results"] = BooleanFragment()
+            if self.cute_topk_coarse_keys_search_enabled:
+                fields["cute_topk_coarse_keys"] = BooleanFragment()
+            if self.cute_topk_key_recovery_search_enabled:
+                fields["cute_topk_key_recovery"] = EnumFragment(
+                    choices=("direct", "packed")
+                )
             if self.cute_fragment_atomic_aggregation_search_enabled:
                 fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
             if self.cute_fragment_integer_atomic_epochs_search_enabled:
@@ -6312,6 +6451,8 @@ class ConfigSpec:
                 fields["cute_fragment_packet_loads"] = BooleanFragment()
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
+            if self.cute_fragment_topk_network_search_enabled:
+                fields["cute_fragment_topk_network"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
             if self.cute_integer_loop_reduction_search_enabled:
@@ -6354,7 +6495,12 @@ class ConfigSpec:
                 fields["cute_pointwise_pid_type"] = EnumFragment(
                     choices=("inherit", "flat")
                 )
-            if self.cute_tcgen05_search_enabled:
+            if self.cute_topk_search_enabled:
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in self.cute_topk_choices.items()
+                )
+            elif self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
                 if self.cute_pointwise_region_block_ids:
                     fields["num_threads"] = self.num_threads
