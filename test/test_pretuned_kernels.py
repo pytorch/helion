@@ -13,7 +13,9 @@ import math
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -24,7 +26,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+from test._cute_binding import _forbid_native_compile
+
 import helion
+from helion._hardware import HardwareInfo
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
@@ -35,9 +40,14 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessBackends
+from helion.autotuner.aot_cache import AOTAutotuneCache
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
+
+    from helion.runtime.kernel import BoundKernel
 
 
 def _under_xdist() -> bool:
@@ -95,6 +105,125 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     return sys.modules[module_name]
+
+
+_RMS_NORM_CUTE_SHAPES = tuple(
+    _import_pretuned_heuristic("rms_norm_cute", "sm103")._SHAPES
+)
+
+
+@pytest.fixture
+def rms_norm_cute_cpu_cache(tmp_path: Path) -> Iterator[AOTAutotuneCache]:
+    module = _import_pretuned_kernel_module("rms_norm_cute")
+    cache = object.__new__(AOTAutotuneCache)
+    cache.kernel = cast("BoundKernel", SimpleNamespace(kernel=module.rms_norm_cute))
+    cache.data_dir = tmp_path
+    hardware = HardwareInfo(
+        device_kind="cuda",
+        hardware_name="NVIDIA GB300",
+        runtime_version="13.0",
+        compute_capability="sm103",
+    )
+    with (
+        patch.dict(os.environ, HELION_AOT_MODE="evaluate"),
+        patch("helion.autotuner.aot_cache.get_hardware_info", return_value=hardware),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
+        _forbid_native_compile(),
+    ):
+        AOTAutotuneCache.clear_caches()
+        try:
+            yield cache
+        finally:
+            AOTAutotuneCache.clear_caches()
+
+
+@pytest.mark.parametrize("shape", _RMS_NORM_CUTE_SHAPES)
+def test_rms_norm_cute_selects_presets_through_aot(
+    shape: tuple[int, int], rms_norm_cute_cpu_cache: AOTAutotuneCache
+) -> None:
+    module = _import_pretuned_kernel_module("rms_norm_cute")
+    heuristic = _import_pretuned_heuristic("rms_norm_cute", "sm103")
+    m, n = shape
+    device = torch.device("meta")
+    inputs = (
+        torch.empty((m, n), device=device, dtype=torch.bfloat16),
+        torch.empty(n, device=device, dtype=torch.bfloat16),
+        1e-5,
+    )
+    assert module.rms_norm_cute.settings.static_shapes
+    assert module.rms_norm_cute.settings.backend == "cute"
+    index = module.rms_norm_cute._key_fn(*inputs)
+    selected = rms_norm_cute_cpu_cache._get_heuristic_config(inputs)
+    assert selected is not None
+    assert selected.config == heuristic.CONFIGS[index]
+    if shape == (2048, 8192):
+        assert selected.config["cute_reduction_reloads"] == ["gmem"]
+
+
+def test_rms_norm_cute_aot_cache_preserves_input_contract(
+    rms_norm_cute_cpu_cache: AOTAutotuneCache,
+) -> None:
+    device = torch.device("meta")
+    x = torch.empty((2048, 8192), device=device, dtype=torch.bfloat16)
+    weight = torch.empty(8192, device=device, dtype=x.dtype)
+    selected = rms_norm_cute_cpu_cache._get_heuristic_config((x, weight, 1e-5))
+    assert selected is not None and selected.config
+    # Same sizes/dtypes but different strides must remain a different AOT result
+    # after the contiguous preset has populated the process-wide result cache.
+    strided_x = torch.empty_strided(x.shape, (16384, 1), device=device, dtype=x.dtype)
+    strided_weight = torch.empty_strided(
+        weight.shape, (2,), device=device, dtype=weight.dtype
+    )
+    for inputs in (
+        (strided_x, weight, 1e-5),
+        (x, strided_weight, 1e-5),
+        (x, weight, 1e-3),
+        (x.to(torch.float16), weight, 1e-5),
+        (x, weight.to(torch.float16), 1e-5),
+        (x[:1024], weight, 1e-5),
+    ):
+        fallback = rms_norm_cute_cpu_cache._get_heuristic_config(inputs)
+        assert fallback is not None and fallback.config == {}
+    assert rms_norm_cute_cpu_cache._get_heuristic_config((x, weight, 1e-5)) == selected
+
+
+def test_rms_norm_cute_is_registered_for_gb300() -> None:
+    path = PRETUNED_KERNELS_DIR / "run.py"
+    spec = importlib.util.spec_from_file_location("_pretuned_rms_runner", path)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    assert "rms_norm_cute" in runner.KERNELS
+    assert runner._supported_hardware("rms_norm_cute") == {"gb300"}
+
+
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("shape", _RMS_NORM_CUTE_SHAPES)
+def test_rms_norm_cute_graph_replay(shape: tuple[int, int]) -> None:
+    if not is_cuda() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("rms_norm_cute is pretuned for NVIDIA GB300 (SM103)")
+    module = _import_pretuned_kernel_module("rms_norm_cute")
+    heuristic = _import_pretuned_heuristic("rms_norm_cute", "sm103")
+    inputs = module._make_inputs(shape)
+    x, weight, eps = inputs
+    expected = module._rms_norm_torch(*inputs)
+    actual = module.rms_norm_cute(*inputs)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    bound = module.rms_norm_cute.bind(inputs)
+    index = heuristic.key_rms_norm_cute(*module._rms_norm_shape_key(*inputs))
+    assert bound._config == bound._normalized_config_copy(
+        helion.Config.from_dict(heuristic.CONFIGS[index])
+    )
+    with helion.runtime.cute_cuda_graph() as graph:
+        captured = module.rms_norm_cute(*inputs)
+    x.add_(0.5)
+    weight.add_(0.25)
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = F.rms_norm(x, (shape[1],), weight, eps=eps)
+    torch.testing.assert_close(captured, expected, rtol=0.02, atol=0.02)
 
 
 @pytest.mark.parametrize(
