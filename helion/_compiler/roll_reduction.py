@@ -115,6 +115,31 @@ class ReductionRoller:
                 "hl.associative_scan operations are not compatible with reduction rolling"
             )
 
+        if node.target in (torch.ops.aten.topk.default, torch.ops.aten.sort.default):
+            # Ordering needs every value of its selected axis. Top-k shrinks
+            # that axis, so output-shape placement would leave it outside the
+            # rolled producer loop, observing only its last chunk. Sorting each
+            # chunk independently likewise lacks a cross-chunk merge. Other
+            # axes remain independent and may still be rolled normally.
+            source = node.args[0]
+            assert isinstance(source, torch.fx.Node)
+            value = source.meta["val"]
+            assert isinstance(value, torch.Tensor)
+            position = 2 if node.target is torch.ops.aten.topk.default else 1
+            dim = (
+                node.args[position]
+                if len(node.args) > position
+                else node.kwargs.get("dim", -1)
+            )
+            assert isinstance(dim, int)
+            if (
+                CompileEnvironment.current().get_block_id(value.shape[dim])
+                == self.rdim.block_id
+            ):
+                raise NotImplementedError(
+                    "selection axes require complete input or a cross-chunk merge"
+                )
+
         if is_for_loop_target(node.target) or node.target is _if:
             if is_for_loop_target(node.target):
                 graph_id, *_ = node.args
@@ -323,6 +348,9 @@ class ReductionRoller:
                 or node in self.inner_nodes
                 or self.is_reduction(node)
             ):
+                return
+            if node.op == "placeholder":
+                self.get_inner_arg(node)
                 return
             for n in node.all_input_nodes:
                 readd(n)

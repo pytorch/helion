@@ -199,11 +199,17 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         device_code, host_code = code[: match.start()], code[match.start() :]
         if _get_backend() == "cute":
             self.assertIn("_default_cute_launcher", host_code)
-            self.assertIn("block=(16, 1, 1)", host_code)
+            # Output rows may be distributed through the persistent grid or
+            # physical threads, depending on the target's minimum dot tile.
+            # Validate the complete result rather than a particular CTA shape.
+            actual = matmul_int4_block_expr(A, B_packed)
+            expected = (A.float() @ B_unpacked.float()).to(torch.bfloat16)
+            torch.testing.assert_close(actual, expected)
             self.assertNotIn("_BLOCK_SIZE_", host_code)
         else:
             self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
-            self.assertRegex(host_code, r"2 \* _BLOCK_SIZE_\d+, ")
+            self.assertRegex(host_code, r"_SHAPE_DIM = 2 \* _BLOCK_SIZE_\d+\n")
+            self.assertRegex(host_code, r"_launcher\([^\n]*, _SHAPE_DIM, ")
             self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
     @skipIfRefEager("metadata-only bind inspection does not exercise run_ref")

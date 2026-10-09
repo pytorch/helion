@@ -21,6 +21,7 @@ import torch
 
 from .._argument_device import _find_argument_device
 from .._compat import get_device_name
+from .._compat import supports_torch_compile_fusion
 from .._utils import counters
 from .._utils import indexing_uses_tensor_descriptor
 from ..autotuner.base_cache import helion_key
@@ -245,6 +246,8 @@ def compiled_kernel_cache_key(
         not kernel.settings.generated_code_cache
         or kernel.settings.backend != "triton"
         or kernel.settings.force_autotune
+        or kernel.settings.autotune_handoff
+        or not supports_torch_compile_fusion()
         or kernel.settings.print_output_code
         or kernel.settings.print_repro
         or is_ref_mode_enabled(kernel.settings)

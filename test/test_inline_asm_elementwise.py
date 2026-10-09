@@ -336,6 +336,56 @@ class TestInlineAsmElementwisePacked(RefEagerTestDisabled, TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteInlineAsmElementwise(RefEagerTestDisabled, TestCase):
+    def test_pure_inline_asm_computed_scan_and_reuse(self) -> None:
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(
+            x: torch.Tensor, bias: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            output = torch.empty_like(x)
+            reused = torch.empty_like(x)
+            for row, col in hl.tile(x.shape, block_size=[2, 32]):
+                values = hl.inline_asm_elementwise(
+                    "add.f32 $0, $1, $2;",
+                    "=f,f,f",
+                    [x[row, col], bias[row, None]],
+                    dtype=torch.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+                output[row, col] = hl.cumsum(values, dim=-1)
+                reused[row, col] = values * 2
+            return output, reused
+
+        x = torch.arange(5 * 65, device=DEVICE, dtype=torch.float32).reshape(5, 65)
+        bias = torch.arange(5, device=DEVICE, dtype=torch.float32)
+        _, (output, reused) = code_and_output(kernel, (x, bias))
+        values = x + bias[:, None]
+        expected = torch.cat([part.cumsum(-1) for part in values.split(32, -1)], -1)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(reused, values * 2, rtol=0, atol=0)
+
+    def test_impure_inline_asm_computed_scan_rejected(self) -> None:
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            output = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                values = hl.inline_asm_elementwise(
+                    "mov.b32 $0, $1;",
+                    "=f,f",
+                    [x[row, :]],
+                    dtype=torch.float32,
+                    is_pure=False,
+                    pack=1,
+                )
+                output[row, :] = hl.cumsum(values, dim=-1)
+            return output
+
+        x = torch.ones(3, 65, device=DEVICE)
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "fragment"):
+            code_and_output(
+                kernel, (x,), block_sizes=[1], cute_fragment_scan="cooperative"
+            )
+
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
     )

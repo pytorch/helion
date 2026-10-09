@@ -37,6 +37,23 @@ def kernel_tuple_addition(
 
 
 @helion.kernel(autotune_effort="none")
+def kernel_list_stores_then_second_root(
+    x: torch.Tensor, ys: list[torch.Tensor], zs: list[torch.Tensor]
+) -> torch.Tensor:
+    """List loops in one root leave their loop variables bound for the next root."""
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(x.size(0)):
+        v = x[tile_n] * 2
+        for peer_y in ys:
+            peer_y[tile_n] = v
+        for peer_z in zs:
+            peer_z[tile_n] = v + 1
+    for tile_n in hl.tile(x.size(0)):
+        out[tile_n] = x[tile_n]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def kernel_tuple_with_scaling(
     tensor1: torch.Tensor,
     tensor2: torch.Tensor,
@@ -564,6 +581,23 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
         # Test correctness - should just copy the tensor
         torch.testing.assert_close(result, tensor)
+
+    @onlyBackends(["triton"])
+    def test_single_element_list_stores_before_second_root(self):
+        """One-element lists' leaked loop variables are not host arguments."""
+        x = torch.randn(16, device=DEVICE)
+        for count in (1, 3):
+            ys = [torch.zeros_like(x) for _ in range(count)]
+            zs = [torch.zeros_like(x) for _ in range(count)]
+            code, result = code_and_output(
+                kernel_list_stores_then_second_root, (x, ys, zs)
+            )
+            if not self._in_ref_eager_mode:
+                self.assertNotIn("peer_", code.split("_launcher(")[-1])
+            torch.testing.assert_close(result, x)
+            for y, z in zip(ys, zs, strict=True):
+                torch.testing.assert_close(y, 2 * x)
+                torch.testing.assert_close(z, 2 * x + 1)
 
     def test_constants_iteration(self):
         """Test iteration over tuple of constants."""

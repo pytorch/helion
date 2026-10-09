@@ -135,7 +135,8 @@ PURE_DECODE_HELPERS = frozenset(
         "_cute_fp8e4m3fn_x2_to_float32",
     }
 )
-_GLOBALS = _BUILTINS | PURE_DECODE_HELPERS | {"cutlass", "cute", "math", "operator"}
+_HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod"}
+_GLOBALS = _BUILTINS | _HELPERS | {"cutlass", "cute", "math", "operator"}
 _METADATA = frozenset({"iterator", "layout", "shape", "stride", "element_type"})
 _AstT = TypeVar("_AstT", bound=ast.AST)
 
@@ -260,7 +261,7 @@ class _PureExpression(ast.NodeVisitor):
         path = _path(node.func)
         pure_global = path is not None and (
             len(path) == 1
-            and path[0] in _BUILTINS | PURE_DECODE_HELPERS
+            and path[0] in _BUILTINS | _HELPERS
             or len(path) == 2
             and path[0] == "cutlass"
             and path[1] in _NUMERIC_TYPES | {"min", "max"}

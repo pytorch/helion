@@ -84,6 +84,7 @@ def cache_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cache, "helion_key", lambda: "helion-v1")
     monkeypatch.setattr(cache, "torch_key_wrapper", lambda: "torch-v1")
     monkeypatch.setattr(cache, "triton_key_wrapper", lambda: "triton-v1")
+    monkeypatch.setattr(cache, "supports_torch_compile_fusion", lambda: True)
     counters["generated_code_cache"].clear()
     return tmp_path
 

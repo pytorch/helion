@@ -910,8 +910,9 @@ def _cute_atomic_indexed_blocks(
 ) -> set[int] | None:
     """Resolved ids of the tile axes the atomic varies along; None when unknown.
 
-    A ``BlockSizeOrigin`` index covers its tile axis, a gather index the axis
-    it was loaded along and a slice the axis the pointer lowering assigns it.
+    A ``BlockSizeOrigin`` index covers its tile axis, a gather index every
+    non-broadcast tile axis of its tensor and a slice the axis the pointer
+    lowering assigns it.
     A tile-uniform index (a constant, a tile attribute, a 0-d tensor) covers
     nothing by itself; the atomic then varies along the tile axes of its
     update value (:func:`_cute_uniform_index_value_blocks`).  ``None`` when
@@ -926,22 +927,21 @@ def _cute_atomic_indexed_blocks(
     has_block_size_index = False
     for idx in index:
         if isinstance(idx, torch.Tensor):
-            # A gather/scatter index tensor (e.g. ``output[idxs, tile_f]``)
-            # covers the tile dimension it was loaded along: the per-thread
-            # ``idxs`` value differs across that axis, so it is *indexed* and
-            # must not be collapsed to a single leader thread.
-            tensor_block_id = (
-                env.resolve_block_id(idx.shape[0]) if idx.ndim >= 1 else None
-            )
-            if tensor_block_id is not None and state.fx_node is not None:
-                has_block_size_index = True
-                indexed_block_ids.add(
-                    env.resolve_codegen_block_id(
-                        tensor_block_id,
-                        state.codegen,
-                        state.fx_node.graph,
+            # Every non-broadcast tensor-index dimension contributes, even
+            # when repeated indices intentionally collide. Restricting coverage
+            # to the first dimension would collapse other logical contributions
+            # to their leader threads.
+            for size in idx.shape:
+                tensor_block_id = env.resolve_block_id(size)
+                if tensor_block_id is not None and state.fx_node is not None:
+                    has_block_size_index = True
+                    indexed_block_ids.add(
+                        env.resolve_codegen_block_id(
+                            tensor_block_id,
+                            state.codegen,
+                            state.fx_node.graph,
+                        )
                     )
-                )
             continue
         if not isinstance(idx, torch.SymInt):
             continue

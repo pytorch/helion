@@ -47,6 +47,9 @@ class TestGeneratedCodePolicy(RefEagerTestDisabled, TestCase):
         self._test_stack.enter_context(
             patch.object(cache, "triton_key_wrapper", return_value="triton-v1")
         )
+        self._test_stack.enter_context(
+            patch.object(cache, "supports_torch_compile_fusion", return_value=True)
+        )
         self.sources: list[str] = []
         self._test_stack.enter_context(
             patch.object(PyCodeCache, "load", side_effect=self._load_source)

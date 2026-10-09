@@ -62,10 +62,88 @@ from .cute import grouped_row_union_paired_clc_carrier
 from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
+from .cute_fragment_atomic_aggregation import CuteFragmentAtomicAggregationHeuristic
+from .cute_fragment_atomic_aggregation import (
+    register_fragment_atomic_aggregation_coverage,
+)
+from .cute_fragment_atomic_consumer_fusion import (
+    CuteFragmentAtomicConsumerFusionHeuristic,
+)
+from .cute_fragment_atomic_consumer_fusion import (
+    register_fragment_atomic_consumer_fusion_coverage,
+)
+from .cute_fragment_bounded_gather import CuteFragmentBoundedGatherHeuristic
+from .cute_fragment_bounded_gather import register_fragment_bounded_gather_coverage
+from .cute_fragment_integer_atomic_epochs import (
+    CuteFragmentIntegerAtomicEpochsHeuristic,
+)
+from .cute_fragment_integer_atomic_epochs import (
+    register_fragment_integer_atomic_epochs_coverage,
+)
+from .cute_fragment_local_atomic_registers import (
+    CuteFragmentLocalAtomicRegistersHeuristic,
+)
+from .cute_fragment_local_atomic_registers import (
+    register_fragment_local_atomic_registers_coverage,
+)
+from .cute_fragment_packet_loads import CuteFragmentPacketLoadsHeuristic
+from .cute_fragment_packet_loads import register_fragment_packet_loads_coverage
+from .cute_fragment_private_scalar_loops import CuteFragmentPrivateScalarLoopsHeuristic
+from .cute_fragment_private_scalar_loops import (
+    register_fragment_private_scalar_loops_coverage,
+)
+from .cute_fragment_producer_cache import CuteFragmentProducerCacheHeuristic
+from .cute_fragment_producer_cache import register_fragment_producer_cache_coverage
+from .cute_fragment_published_scalars import CuteFragmentPublishedScalarsHeuristic
+from .cute_fragment_published_scalars import (
+    register_fragment_published_scalars_coverage,
+)
+from .cute_fragment_pure_producer_regions import (
+    CuteFragmentPureProducerRegionsHeuristic,
+)
+from .cute_fragment_pure_producer_regions import (
+    register_fragment_pure_producer_regions_coverage,
+)
+from .cute_fragment_reduction import CuteFragmentReductionHeuristic
+from .cute_fragment_reduction import register_fragment_reduction_coverage
+from .cute_fragment_register_loads import CuteFragmentRegisterLoadsHeuristic
+from .cute_fragment_register_loads import register_fragment_register_loads_coverage
+from .cute_fragment_register_producers import CuteFragmentRegisterProducersHeuristic
+from .cute_fragment_register_producers import (
+    register_fragment_register_producers_coverage,
+)
+from .cute_fragment_register_snapshots import CuteFragmentRegisterSnapshotsHeuristic
+from .cute_fragment_register_snapshots import (
+    register_fragment_register_snapshots_coverage,
+)
+from .cute_fragment_resources import fragment_resource_carrier
+from .cute_fragment_scan import CuteFragmentScanHeuristic
+from .cute_fragment_scan import register_fragment_scan_coverage
+from .cute_fragment_scan_exports import CuteFragmentScanExportsHeuristic
+from .cute_fragment_scan_exports import register_fragment_scan_exports_coverage
+from .cute_fragment_skip_zero_atomics import CuteFragmentSkipZeroAtomicsHeuristic
+from .cute_fragment_skip_zero_atomics import (
+    register_fragment_skip_zero_atomics_coverage,
+)
+from .cute_fragment_threads import CuteFragmentThreadsHeuristic
+from .cute_fragment_threads import register_fragment_threads_coverage
+from .cute_fragment_warp_producer_regions import (
+    CuteFragmentWarpProducerRegionsHeuristic,
+)
+from .cute_fragment_warp_producer_regions import (
+    register_fragment_warp_producer_regions_coverage,
+)
+from .cute_fragment_warp_results import CuteFragmentWarpResultsHeuristic
+from .cute_fragment_warp_results import register_fragment_warp_results_coverage
+from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
+from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
+from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
 from .cute_host_paired_sum import add_host_sum_seeds
+from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
+from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
@@ -151,6 +229,28 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteHostPairedSumHeuristic,
         CuteTcgen05GroupedSource64Heuristic,
         CuteSplitKClusterHeuristic,
+        CuteFragmentScanHeuristic,
+        CuteFragmentReductionHeuristic,
+        CuteFragmentThreadsHeuristic,
+        CuteFragmentPrivateScalarLoopsHeuristic,
+        CuteFragmentRegisterLoadsHeuristic,
+        CuteFragmentWarpResultsHeuristic,
+        CuteFragmentProducerCacheHeuristic,
+        CuteFragmentWarpScanHeuristic,
+        CuteFragmentAtomicAggregationHeuristic,
+        CuteFragmentLocalAtomicRegistersHeuristic,
+        CuteFragmentRegisterSnapshotsHeuristic,
+        CuteFragmentPublishedScalarsHeuristic,
+        CuteFragmentSkipZeroAtomicsHeuristic,
+        CuteFragmentAtomicConsumerFusionHeuristic,
+        CuteIntegerLoopReductionHeuristic,
+        CuteFragmentIntegerAtomicEpochsHeuristic,
+        CuteFragmentPacketLoadsHeuristic,
+        CuteFragmentRegisterProducersHeuristic,
+        CuteFragmentScanExportsHeuristic,
+        CuteFragmentWarpProducerRegionsHeuristic,
+        CuteFragmentBoundedGatherHeuristic,
+        CuteFragmentPureProducerRegionsHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -260,6 +360,12 @@ def compiler_seed_configs(
     for heuristic in heuristics:
         registered_fact_specialization_facts.update(
             heuristic.register_facts(env, device_ir)
+        )
+    if env.backend_name == "cute":
+        from ..cute.computed_fragment import computed_fragment_specialization_facts
+
+        registered_fact_specialization_facts.update(
+            computed_fragment_specialization_facts(env, device_ir)
         )
     env.compiler_fact_specialization_facts = frozenset(
         registered_fact_specialization_facts
@@ -562,3 +668,75 @@ def register_compiler_coverage_groups(
                 )
             )
             break
+    resource_carrier = fragment_resource_carrier(env, device_ir)
+    register_fragment_scan_coverage(
+        env, device_ir, supplemental_carrier=resource_carrier
+    )
+    register_fragment_reduction_coverage(
+        env, device_ir, supplemental_carrier=resource_carrier
+    )
+    register_fragment_threads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_register_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_warp_results_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_private_scalar_loops_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_producer_cache_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_warp_scan_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_atomic_aggregation_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_local_atomic_registers_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    if not env.config_spec.cute_fragment_register_snapshot_while_root_ids:
+        register_fragment_register_snapshots_coverage(
+            env, device_ir, resource_carrier=resource_carrier
+        )
+    register_fragment_published_scalars_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_skip_zero_atomics_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_atomic_consumer_fusion_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_integer_loop_reduction_coverage(env, device_ir)
+    register_fragment_integer_atomic_epochs_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_packet_loads_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_register_producers_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_bounded_gather_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    if env.config_spec.cute_fragment_register_snapshot_while_root_ids:
+        # This new capture case depends on the existing uniform-while owner.
+        # Preserve the registration order of all pre-existing snapshot roots.
+        register_fragment_register_snapshots_coverage(
+            env, device_ir, resource_carrier=resource_carrier
+        )
+    register_gather_warp_scan_coverage(env, device_ir)
+    register_fragment_atomic_consumer_fusion_coverage(
+        env, device_ir, resource_carrier=resource_carrier, extended_only=True
+    )
+    register_fragment_pure_producer_regions_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_scan_exports_coverage(env, device_ir)
+    register_fragment_warp_producer_regions_coverage(env, device_ir)

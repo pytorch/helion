@@ -425,6 +425,19 @@ class _PreparedMetadataSpecializationExtractor:
         return self.extractor(args)
 
 
+def _capture_safe_specialization(
+    extractor: Callable[[Sequence[object]], Hashable],
+) -> bool:
+    if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        return True
+    if isinstance(extractor, _SpecializationAlias):
+        return all(
+            _capture_safe_specialization(item)
+            for item in extractor.schemas[extractor.canonical_signature]
+        )
+    return False
+
+
 @dataclasses.dataclass(frozen=True)
 class _RuntimeInputSpecializationExtractor:
     """Runtime classifier together with its source projections."""
@@ -2084,7 +2097,17 @@ class Kernel(Generic[_R]):
             and prepared.bound._run is not None
         ):
             return prepared.bound._run(*args)
-        if self._dispatch_cache:
+        # Runtime specialization extractors can inspect pointers/storage offsets.
+        # Capture may reuse metadata-only entries; legacy Dynamo integration
+        # needs their compiled launchers and cannot trace isolated binding.
+        if self._dispatch_cache and (
+            not is_compiling
+            or all(
+                _capture_safe_specialization(extractor)
+                for extractors in self._specialize_extra.values()
+                for extractor in extractors
+            )
+        ):
             # Fast path: repeat call with argument metadata seen before. The
             # cache is only populated by calls that already took the slow
             # path below, so hitting it cannot skip autotuning/compilation.
@@ -2642,7 +2665,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Args:
             config: The configuration to use for code generation.
-            options: Optional :class:`~helion.runtime.precompile.OutputCodeOptions`.
+            options: Optional :class:`~helion.runtime.kernel.OutputCodeOptions`.
                 With ``allow_helion_deps=False`` the returned module is
                 self-contained (no ``helion`` import at runtime); ``jax_fn=True``
                 (Pallas only) emits a pure-JAX module operating on ``jax.Array``s.
@@ -2682,11 +2705,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 body_start = len(root.body)
             body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
             ast.fix_missing_locations(body_root)
-        # One optional AST processing step, then the single unparse. Both rewrites run
-        # after generate_ast and outside the fake-tensor env above: jax_fn's launch
-        # capture runs the compiled kernel on *real* tensors (which specializes
-        # fake_args, so codegen must already be done); dep-free is pure-AST and
-        # unaffected by placement. jax_fn is checked first -- it spans both dep modes.
+        # Export after codegen and outside the fake-tensor environment: backends
+        # may capture launch metadata before rewriting the module. Check jax_fn
+        # first because it supports both dependency modes.
         if options is not None and options.jax_fn:
             from .._compiler.output_code_utils import build_jax_fn_module
             from .._compiler.output_code_utils import capture_jax_launch_metadata
@@ -4140,6 +4161,7 @@ class _CachedBoundKernel(Generic[_R]):
             or not self._matches_inputs(normalized_args)
             or force
             or self.settings.force_autotune
+            or self.settings.autotune_handoff
             or kwargs
             or len(self.configs) > 1
         ):

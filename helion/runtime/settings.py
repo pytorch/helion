@@ -439,6 +439,16 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_LOG_DETAILS", False
         )
     )
+    autotune_handoff: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_HANDOFF", False
+        )
+    )
+    autotune_handoff_budget_seconds: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS", 1500
+        )
+    )
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -736,9 +746,22 @@ class Settings(_Settings):
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_log_details": (
-            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to also write the cost-model "
-            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
-            "configs tested, keyed by config_id). Off by default; needs autotune_log."
+            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to write /tmp/run.trace.jsonl "
+            "with config evaluations, rebenchmarks, selection, exact LLM prompts/"
+            "responses, and timestamps, plus the cost-model dataset sidecar "
+            "/tmp/run.meta.jsonl (kernel identity and configs keyed by config_id). "
+            "Off by default; needs autotune_log."
+        ),
+        "autotune_handoff": (
+            "Hand configuration search to a native-source agent automatically. "
+            "Off by default; enable with HELION_AUTOTUNE_HANDOFF=1. "
+            "Uses the existing search budget or search completion, "
+            "then saves validated standalone source beside the autotune logs."
+        ),
+        "autotune_handoff_budget_seconds": (
+            "Wall-clock budget for the native-source agent session, excluding "
+            "search and export. Default 1500 seconds; override with "
+            "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
@@ -996,6 +1019,9 @@ class Settings(_Settings):
                 f"set HELION_AUTOTUNE_BEST_OF_K to a positive integer "
                 f"(default 1 = single-trial behavior)"
             )
+
+        if self.autotune_handoff_budget_seconds < 1:
+            raise ValueError("autotune_handoff_budget_seconds must be positive")
 
         self._check_ref_eager_mode_before_print_output_code()
 

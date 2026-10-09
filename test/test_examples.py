@@ -3060,6 +3060,16 @@ class TestExamples(RefEagerTestBase, TestCase):
                 )
                 kernel.settings.autotune_effort = "none"
 
+        if _get_backend() == "triton" and torch.version.cuda is not None:
+            # Sixteen warps avoid Triton 3.7.1's loop-to-dot layout-conversion
+            # failure in this correctness-only schedule. Keep the tiled loops
+            # and arithmetic intact, and restore production configs afterward.
+            kernel = engine.chunk_bwd_wy_dL_delta_helion
+            self.addCleanup(kernel.reset)
+            self.addCleanup(setattr, kernel, "configs", kernel.configs)
+            kernel.configs = [helion.Config(block_sizes=[16, 16, 16], num_warps=16)]
+            kernel.reset()
+
     def _run_linear_example(self, name: str, method: str = "test") -> None:
         import importlib
 
@@ -3310,18 +3320,21 @@ class TestExamples(RefEagerTestBase, TestCase):
         # use_beta_sigmoid_in_kernel); our engine wants a per-timestep log-decay and
         # an activated beta, so reproduce FLA's elementwise transforms here.
         def preprocess(q, g, beta, kw):
-            A_log, dt_bias = kw.get("A_log"), kw.get("dt_bias")
-            if A_log is not None:
+            if kw.get("use_gate_in_kernel", False):
+                A_log, dt_bias = kw["A_log"], kw.get("dt_bias")
                 # gate == FLA naive_gdn_gate (fla/ops/gated_delta_rule/gate.py):
                 # https://github.com/fla-org/flash-linear-attention/blob/6bd90692588c81fe102ee6e12ac70686359658a2/fla/ops/gated_delta_rule/gate.py#L20
-                g = g + dt_bias if dt_bias is not None else g
-                g = -A_log.float().exp() * F.softplus(g.float())
+                g = g.float()
+                g = g + dt_bias.float() if dt_bias is not None else g
+                g = -A_log.float().exp() * F.softplus(g)
             # beta == FLA fused_beta_sigmoid, scale=2 if allow_neg_eigval else 1
             # (fla/ops/gated_delta_rule/chunk.py, use_beta_sigmoid_in_kernel branch):
             # https://github.com/fla-org/flash-linear-attention/blob/6bd90692588c81fe102ee6e12ac70686359658a2/fla/ops/gated_delta_rule/chunk.py#L286
-            scale = 2.0 if kw.get("allow_neg_eigval") else 1.0
-            beta = scale * torch.sigmoid(beta.float())
-            return g.to(q.dtype), beta.to(q.dtype)
+            if kw.get("use_beta_sigmoid_in_kernel", False):
+                scale = 2.0 if kw.get("allow_neg_eigval") else 1.0
+                beta = scale * torch.sigmoid(beta.float())
+            # Older FLA versions activate these inputs in the layer itself.
+            return g, beta
 
         self._linear_attn_monkeypatch_test(
             LinearAttentionVariant.GATED_DELTA_RULE,

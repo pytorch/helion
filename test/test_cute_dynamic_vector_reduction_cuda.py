@@ -297,7 +297,8 @@ class TestCuteDynamicVectorReduction(TestCase):
     def test_size_residue_rebinds_and_both_shapes_run(self) -> None:
         # ``n % 8`` is part of the bound cache key: 4096 (chunk-uniform V=8)
         # and 4100 (8-byte rows, scalar) bind separately and both stay
-        # correct in either call order; 2056 shares the residue-0 bound.
+        # correct in either call order. Compiler seed guards also specialize
+        # the row-size class, so 2056 uses its own bound.
         kernel = _kernel()
         config = helion.Config(
             block_sizes=[1],
@@ -316,7 +317,7 @@ class TestCuteDynamicVectorReduction(TestCase):
             )
             bounds.append(bound)
         self.assertIs(bounds[0], bounds[2])
-        self.assertIs(bounds[0], bounds[3])
+        self.assertIsNot(bounds[0], bounds[3])
         self.assertIsNot(bounds[0], bounds[1])
 
     @skipIfNotCUDA()
@@ -423,7 +424,7 @@ class TestCuteDynamicVectorReduction(TestCase):
         )
         torch.testing.assert_close(bound(x, 1e-5), _reference(x), atol=1e-2, rtol=1e-2)
         long_x = torch.randn(4, 73728, device=DEVICE, dtype=torch.bfloat16)
-        self.assertIs(kernel.bind((long_x, 1e-5)), bound)
+        self.assertIsNot(kernel.bind((long_x, 1e-5)), bound)
         torch.testing.assert_close(
             bound(long_x, 1e-5), _reference(long_x), atol=1e-2, rtol=1e-2
         )
@@ -521,7 +522,7 @@ class TestCuteDynamicVectorReduction(TestCase):
             short_out = torch.zeros(
                 13, short_stride, device=DEVICE, dtype=torch.bfloat16
             )
-            self.assertIs(kernel.bind((short, short_out[:, :short_width])), bound)
+            self.assertIsNot(kernel.bind((short, short_out[:, :short_width])), bound)
             torch.testing.assert_close(
                 bound(short, short_out[:, :short_width]),
                 _reference(short),

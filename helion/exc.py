@@ -122,6 +122,20 @@ class BarrierOnlyAllowedAtTopLevel(BaseError):
     message = "hl.barrier() is only supported between top level hl.tile/hl.grid loops."
 
 
+class PdlPlacement(BaseError):
+    message = (
+        "PDL ops run on the host before the first top level loop (entry) or after "
+        "the last one (exit); hl.pdl_wait() only at entry."
+    )
+
+
+class PdlStateWithoutWait(BaseError):
+    message = (
+        "A PDL launch with cross-loop state needs hl.pdl_wait() before the first "
+        "loop: the state is written by the previous launch."
+    )
+
+
 class BarrierRequiresPersistent(BaseError):
     message = "hl.barrier() requires pid_type to be persistent (got '{0}')."
 

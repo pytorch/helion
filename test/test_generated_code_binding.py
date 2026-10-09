@@ -15,6 +15,8 @@ from helion._testing import TestCase
 from helion._testing import skipIfRefEager
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
+from helion.runtime.kernel import BoundKernel
+from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
 
@@ -27,7 +29,7 @@ def _runtime_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 @skipIfRefEager("generated source caching requires frontend compilation")
-class TestGeneratedCodeBinding(TestCase):
+class _GeneratedCodeBindingTestCase(TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.root = Path(self._test_stack.enter_context(tempfile.TemporaryDirectory()))
@@ -39,6 +41,9 @@ class TestGeneratedCodeBinding(TestCase):
         )
         for name in ("helion_key", "torch_key_wrapper", "triton_key_wrapper"):
             self._test_stack.enter_context(patch.object(cache, name, return_value=name))
+        self._test_stack.enter_context(
+            patch.object(cache, "supports_torch_compile_fusion", return_value=True)
+        )
         self.sources: list[str] = []
         self._test_stack.enter_context(
             patch.object(
@@ -46,6 +51,8 @@ class TestGeneratedCodeBinding(TestCase):
             )
         )
 
+
+class TestGeneratedCodeBinding(_GeneratedCodeBindingTestCase):
     def test_dynamic_bindings_and_runtime_keys_match_cache_disabled(self) -> None:
         x, y = torch.ones(16), torch.ones(64)
         kernels = [
@@ -121,3 +128,68 @@ class TestGeneratedCodeBinding(TestCase):
         self.assertEqual(compile_fn.call_count, 1)
         self.assertEqual(sources[0], sources[1])
         self.assertIsNot(warm.kernel.bind((x, 2)), warm)
+
+
+class TestGeneratedCodeLegacyCapture(_GeneratedCodeBindingTestCase):
+    def _kernel(self) -> Kernel:
+        return helion.kernel(
+            backend="triton",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[32]),
+            generated_code_cache=True,
+            torch_compile_fusion=False,
+        )(_runtime_scale)
+
+    def test_supported_integration_keeps_frontend_reuse_with_fusion_disabled(
+        self,
+    ) -> None:
+        x = torch.ones(16)
+        self._kernel().bind((x, 2.0)).set_config(helion.Config(block_sizes=[32]))
+        with patch.object(
+            KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+        ):
+            warm = self._kernel().bind((x, 2.0))
+            self.assertNotIsInstance(warm, BoundKernel)
+            torch.testing.assert_close(warm(x, 2.0), x * 2)
+
+    def test_legacy_integration_reuses_source_with_native_dispatch(self) -> None:
+        x = torch.ones(16)
+        with patch.object(cache, "supports_torch_compile_fusion", return_value=False):
+            self._kernel().bind((x, 2.0)).set_config(helion.Config(block_sizes=[32]))
+            with (
+                patch.object(
+                    KernelCompiler,
+                    "compile",
+                    autospec=True,
+                    side_effect=KernelCompiler.compile,
+                ) as compile_fn,
+                patch.object(
+                    BoundKernel, "to_code", side_effect=AssertionError("codegen ran")
+                ),
+            ):
+                kernel = self._kernel()
+                bound = kernel.bind((x, 2.0))
+                self.assertIsInstance(bound, BoundKernel)
+                torch.testing.assert_close(kernel(x, 2.0), x * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+            self.assertTrue(kernel._dispatch_cache)
+            with patch.object(torch.compiler, "is_compiling", return_value=True):
+                torch.testing.assert_close(kernel(x, 3.0), x * 3)
+
+    def test_legacy_source_load_failure_propagates_and_retry_succeeds(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        with patch.object(cache, "supports_torch_compile_fusion", return_value=False):
+            self._kernel().bind((x, 2.0)).set_config(config)
+            warm = self._kernel().bind((x, 2.0))
+            with (
+                patch.object(
+                    PyCodeCache,
+                    "load",
+                    side_effect=RuntimeError("source import failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "source import failed"),
+            ):
+                warm.set_config(config)
+            warm.set_config(config)
+            torch.testing.assert_close(warm(x, 2.0), x * 2)

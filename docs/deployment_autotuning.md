@@ -57,6 +57,11 @@ Custom config selectors still run. Adaptive tuning with the default selector
 retains frontend compilation so that `LocalAutotuneCache` remains authoritative
 when a tuning result is deleted or replaced. Pre-frontend reuse is available
 with explicit configs, custom selectors and `autotune_effort="none"`.
+Native-source handoff (`autotune_handoff=True`) retains the ordinary frontend
+and backend tuning path so that cache hits cannot skip the requested handoff.
+PyTorch builds without Helion's `torch.compile` integration also retain frontend
+compilation, allowing legacy graph capture to reuse ordinary compiled launchers.
+Both paths can still reuse generated source after frontend compilation.
 
 The cache is disabled by default. Distributed kernels, tensor-descriptor configs
 and kernels with runtime input specializations retain normal compilation.

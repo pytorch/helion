@@ -676,9 +676,8 @@ def test_lane_unroll_without_a_lane_loop_or_a_movable_load_changes_nothing() -> 
 
 
 def test_lane_unroll_declines_bodies_with_scalar_cache_policy_loads() -> None:
-    # ``streaming`` on the scalar next-index load emits ``cute.arch.load(...,
-    # cutlass.Int64, cop='cs')``, whose trace-time unrolled form aborts the
-    # DSL compiler: the pass declines and the knob-off kernel is regenerated.
+    # The scalar streaming helper is not eligible for lane-load unrolling.
+    # Keep the policy and regenerate the ordinary loop unchanged.
     args = _segment_args()
     policies = ["", "", "streaming"]
     plain = _codegen(
@@ -691,7 +690,8 @@ def test_lane_unroll_declines_bodies_with_scalar_cache_policy_loads() -> None:
         load_eviction_policies=policies,
         cute_lane_unroll=16,
     )
-    assert "cop='cs'" in plain
+    assert "_cute_scalar_policy_load(" in plain
+    assert "cutlass.Int64, 'streaming'" in plain
     assert plain == unrolled
     assert LOAD_LIST not in unrolled
 

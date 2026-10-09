@@ -34,6 +34,7 @@ from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils import _pytree as pytree
 
 from .. import exc
+from .._compat import is_hip
 from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
@@ -565,6 +566,9 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+        # hl.pdl_* ops in source order, run at kernel entry or exit.
+        self.pdl_entry: list[str] = []
+        self.pdl_exit: list[str] = []
 
     def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
@@ -765,6 +769,51 @@ class CompileEnvironment:
             and (storage_offset * fake_tensor.element_size()) % 16 == 0
         )
 
+    def _tensor_input_storage_owners(
+        self, fake_tensor: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, Source], ...]:
+        """Trace an exact view to inputs sharing its storage, not disjoint inputs.
+
+        This is provenance only. Different fake storages do not establish any
+        runtime alias fact. Static/exact layouts retain the traced view/copy
+        decision when a bound kernel is reused.
+        """
+        if (
+            not (
+                self.settings.static_shapes
+                or self.tensor_layout_is_symbolically_exact(fake_tensor)
+            )
+            or not all(isinstance(value, int) for value in fake_tensor.size())
+            or not all(isinstance(value, int) for value in fake_tensor.stride())
+        ):
+            return ()
+        return tuple(
+            (tensor, source)
+            for tensor, source in self.input_sources.items()
+            if tensor.untyped_storage() == fake_tensor.untyped_storage()
+        )
+
+    def tensor_storage_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
+        """Find a unique input owner for a whole-storage runtime predicate.
+
+        Unlike pointer alignment, storage-span disjointness also applies to
+        nonzero-offset views. The caller must still establish its registered,
+        cache-key-backed runtime predicate on the returned input Source.
+        """
+        source = self.tensor_input_source(fake_tensor)
+        if source is not None and _is_supported_tensor_input_source(source):
+            return source
+        owners = self._tensor_input_storage_owners(fake_tensor)
+        if len(owners) != 1:
+            return None
+        tensor, source = owners[0]
+        if (
+            id(tensor) in self._ambiguous_tensor_input_source_ids
+            or not _is_supported_tensor_input_source(source)
+        ):
+            return None
+        return source
+
     def tensor_alignment_owner(
         self, fake_tensor: torch.Tensor
     ) -> tuple[Source, int] | None:
@@ -797,9 +846,8 @@ class CompileEnvironment:
 
         owners = tuple(
             (tensor, candidate)
-            for tensor, candidate in self.input_sources.items()
-            if tensor.untyped_storage() == fake_tensor.untyped_storage()
-            and is_zero_offset(tensor)
+            for tensor, candidate in self._tensor_input_storage_owners(fake_tensor)
+            if is_zero_offset(tensor)
             and _is_supported_tensor_input_source(candidate)
             and id(tensor) not in self._ambiguous_tensor_input_source_ids
         )
@@ -1801,6 +1849,26 @@ class CompileEnvironment:
         assert isinstance(n, int)
         return n
 
+    def is_singleton_size(self, size: int | torch.SymInt) -> bool:
+        """Specialize input singletons without fixing configurable tile extents.
+
+        Backed input sizes need a binding-cache guard when collapsed. Allocation
+        sizes involving unbacked tile symbols must remain valid across configs,
+        even when their tracing hint happens to be one.
+        """
+        if not isinstance(size, torch.SymInt):
+            return size == 1
+        symbols = _symint_free_symbols(size)
+        if _has_unbacked(size._sympy_()):
+            return self.known_equal(size, 1)
+        singleton = bool(size == 1)
+        if singleton:
+            # ShapeEnv equality guards alone are not part of BoundKernel's
+            # cache key. Capture symbols before evaluating the equality, which
+            # may replace the backed expression with the constant one.
+            self.specialized_vars.update(symbols)
+        return singleton
+
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
             sa = _symint_expr(a) if isinstance(a, torch.SymInt) else sympy.Integer(a)
@@ -1875,6 +1943,13 @@ class CompileEnvironment:
     @property
     def codegen_name(self) -> str:
         return self._backend.codegen_name
+
+    @property
+    def ptx_capability(self) -> tuple[int, int] | None:
+        """Compute capability when the kernel lowers to NVIDIA PTX, else None."""
+        if self.backend_name != "triton" or is_hip():
+            return None
+        return self.config_spec.target_device_capability
 
     def index_type(self) -> str:
         """Backend-specific index type string based on Settings()."""

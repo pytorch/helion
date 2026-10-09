@@ -85,6 +85,9 @@ class TestGeneratedCodeDependencies(TestCase):
         self._test_stack.enter_context(
             patch.object(cache, "triton_key_wrapper", return_value="triton-v1")
         )
+        self._test_stack.enter_context(
+            patch.object(cache, "supports_torch_compile_fusion", return_value=True)
+        )
         self.cache_root = Path(root)
         self.x = torch.ones(16)
 
