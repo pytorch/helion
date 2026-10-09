@@ -43,12 +43,20 @@ that source without running `KernelCompiler.compile` or source generation.
 Triton's binary cache remains independent; a source hit can still require
 Triton's first binary compilation.
 
-The input signature includes exact tensor shapes, strides, dtypes, devices,
-alignment and aliases, together with scalar values. This also works with
-`static_shapes=False`, but uses separate bindings for exact signatures rather
-than reusing a dynamic-shape binding across different sizes. Custom config
-selectors still run. Selecting a different config, requesting frontend IR or
-changing inputs restores normal frontend compilation on demand.
+The disk lookup includes exact tensor shapes, strides, dtypes, devices,
+alignment and aliases, together with scalar values. It leaves in-memory
+specialization and autotuning keys unchanged: dynamic shapes still share
+ordinary bindings as they do with the cache disabled. A source hit creates a
+lightweight runner. Changing its input signature, selecting another config or
+requesting frontend IR creates an ordinary binding on demand. Subsequent calls
+use the specialization guards established by that frontend compilation.
+Function dependencies are fingerprinted during disk lookup, rather than on
+each kernel launch; cached runners check argument metadata before executing.
+
+Custom config selectors still run. Adaptive tuning with the default selector
+retains frontend compilation so that `LocalAutotuneCache` remains authoritative
+when a tuning result is deleted or replaced. Pre-frontend reuse is available
+with explicit configs, custom selectors and `autotune_effort="none"`.
 
 The cache is disabled by default. Distributed kernels, tensor-descriptor configs
 and kernels with runtime input specializations retain normal compilation.
@@ -61,7 +69,8 @@ during autotuning.
 `HELION_SKIP_CACHE=1` skips both reads and writes. Entries are checksummed and
 published with atomic renames. Missing, corrupt or unreadable entries fall back
 to compilation; failed writes leave the compiled kernel usable. Remove the
-`generated_code` directory to clear it.
+`generated_code` directory to clear it. There is no automatic eviction or size
+limit; long-running deployments should manage this directory's lifetime.
 
 The rest of this document covers strategies for pre-tuning and deploying
 tuned configs, which is the recommended approach for production workloads.

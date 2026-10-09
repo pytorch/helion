@@ -38,6 +38,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 import torch.distributed as dist
 from torch.utils._pytree import tree_map
@@ -57,6 +58,7 @@ from .._compiler.autotuner_heuristics import compiler_promotion_specialization_k
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from .._compiler.autotuner_heuristics import register_compiler_coverage_groups
+from .._compiler.backend_registry import get_backend_class
 from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
@@ -90,6 +92,7 @@ from .cute_structural_config import CuteStructuralConfig
 from .cute_structural_config import StructuralPolicyError
 from .cute_structural_config import require_same_structural_policy
 from .cute_structural_config import select_structural_policy
+from .generated_code_cache import _argument_key
 from .generated_code_cache import compiled_kernel_cache_key
 from .generated_code_cache import exact_input_key
 from .generated_code_cache import generated_code_cache_key
@@ -100,7 +103,6 @@ from .generated_code_cache import save_generated_code
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
-from .settings import default_autotuner_fn
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -110,6 +112,7 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.backend import Backend
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
@@ -120,6 +123,21 @@ if TYPE_CHECKING:
     ConfigLike = Config | dict[str, object] | CuteStructuralConfig
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _load_code(
+    kernel: Kernel,
+    backend: Backend,
+    source: str,
+    device_index: int,
+    *,
+    extra: str = "",
+) -> types.ModuleType:
+    backend.setup_compile_cache_dir(device_index)
+    with measure("BoundKernel.PyCodeCache.load"):
+        module = PyCodeCache.load(source, extra=extra)
+    backend.annotate_compiled_module(module, source, kernel.name)
+    return module
 
 
 def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
@@ -1352,11 +1370,6 @@ class Kernel(Generic[_R]):
             key.append(self._key_fn(*args) if signature is None else signature[-1])
         if (tensor_aliases := _input_tensor_aliases(args)) is not None:
             key.append(("input_tensor_aliases", tensor_aliases))
-        if (
-            self.settings.backend == "triton"
-            and (exact := exact_input_key(self, args)) is not None
-        ):
-            key.append(("generated_code_inputs", exact))
         if signature is not None:
             extra_fns = self._specialize_extra.get(signature)
             if extra_fns:
@@ -1420,6 +1433,8 @@ class Kernel(Generic[_R]):
     ) -> tuple[_PreparedCall | None, bool] | None:
         """Validate and construct eager fast paths from one runtime snapshot."""
         try:
+            if isinstance(bound, _CachedBoundKernel):
+                return None
             if fast_entry.specialization_generation != self._specialization_generation:
                 return None
             if bound._reset_generation != self._reset_generation:
@@ -1536,6 +1551,11 @@ class Kernel(Generic[_R]):
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
             )
+            if isinstance(bound_kernel, _CachedBoundKernel):
+                normalized_args = self.normalize_args(*args)
+                if not bound_kernel._matches_inputs(normalized_args):
+                    bound_kernel._materialize(normalized_args)
+                    return self._bind(args)
             if bound_kernel is None:
                 normalized_args: tuple[object, ...] = self.normalize_args(*args)
                 extra_fns: list[Callable[[Sequence[object]], Hashable]] | None = None
@@ -1577,12 +1597,11 @@ class Kernel(Generic[_R]):
                             artifact_key=artifact_key,
                         )
                     else:
-                        bound_kernel = _CachedBoundKernel(
-                            self,
-                            args,
-                            signature,
-                            artifact,
-                            artifact_key,
+                        # The facade forwards the BoundKernel API to a separate
+                        # normal binding when frontend state is requested.
+                        bound_kernel = cast(
+                            "BoundKernel[_R]",
+                            _CachedBoundKernel(self, args, signature, artifact),
                         )
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
@@ -1632,11 +1651,6 @@ class Kernel(Generic[_R]):
                 result.append(self._specialization_key(value))
         if (tensor_aliases := _input_tensor_aliases(args)) is not None:
             result.append(("input_tensor_aliases", tensor_aliases))
-        if (
-            self.settings.backend == "triton"
-            and (exact := exact_input_key(self, args)) is not None
-        ):
-            result.append(("generated_code_inputs", exact))
         device_type, device_capability, promotion_hardware_key = (
             _device_specialization_key(
                 args,
@@ -2239,7 +2253,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         is_distributed: bool | None = None,
         cache_managed: bool = True,
         artifact_key: str | None = None,
-        _defer_frontend: bool = False,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -2332,7 +2345,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]
-            self._host_function = None
+            self.host_function = None  # type: ignore[assignment]
             return
 
         if (
@@ -2360,7 +2373,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.kernel, args, self._env
                     )
 
-        with self._env:
+        with self.env:
             self._env.process_group_name = _find_process_group_name(
                 kernel.fn, args, is_distributed
             )
@@ -2386,13 +2399,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.fake_args.append(arg)
                     constexpr_args[name] = arg
                 else:
-                    self.fake_args.append(self._env.to_fake(arg, ArgumentOrigin(name)))
+                    self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
 
             self._apply_mark_static(args)
-
-            if _defer_frontend:
-                self._host_function = None
-                return
 
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
@@ -2401,7 +2410,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             ):
                 try:
                     compiler = KernelCompiler(self.env)
-                    self._host_function = compiler.compile(
+                    self.host_function: HostFunction = compiler.compile(
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,
@@ -2445,23 +2454,23 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # ``compiler_seed_configs`` runs; they depend only on the
                 # traced host function, not on the runtime arguments.
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    host_function_has_tcgen05_aux_kernel_pattern(self._host_function)
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
                 )
                 self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
-                        self._host_function
+                        self.host_function
                     )
                 )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
-                    host_function_matmul_has_non_tcgen05_operand(self._host_function)
+                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
                 )
                 self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
-                    host_function_tcgen05_rowvec_aux_facts(self._host_function)
+                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
                 )
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                         self.env,
-                        self._host_function.device_ir,
+                        self.host_function.device_ir,
                     )
                     if not self._cache_managed:
                         self.env.snapshot_runtime_input_specialization_results(
@@ -2509,7 +2518,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             )
                 with self.env.use_runtime_arg_values(runtime_args):
                     register_compiler_coverage_groups(
-                        self.env, self._host_function.device_ir
+                        self.env, self.host_function.device_ir
                     )
 
         if (
@@ -2518,11 +2527,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             and self._cache_managed
             and not torch.compiler.is_compiling()
         ):
-            self._generated_code_input_key = (
-                self._base_spec_key,
-                tuple(extractor(args) for extractor in self._specialize_extra()),
-                self._compiler_seed_specialization_results,
-            )
+            disk_input_key = artifact_key or exact_input_key(kernel, args)
+            if disk_input_key is not None:
+                self._generated_code_input_key = (
+                    self._base_spec_key,
+                    tuple(extractor(args) for extractor in self._specialize_extra()),
+                    self._compiler_seed_specialization_results,
+                    disk_input_key,
+                )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -2536,19 +2548,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for dim in getattr(arg, "_dynamo_static_indices", ()):
                     size = fake_arg.size(dim)
                     if isinstance(size, torch.SymInt):
-                        self._env.specialized_vars.update(_symint_free_symbols(size))
+                        self.env.specialized_vars.update(_symint_free_symbols(size))
 
     @property
     def env(self) -> CompileEnvironment:  # pyrefly: ignore[bad-override]
         return self._env
-
-    @property
-    def host_function(self) -> HostFunction | None:
-        return self._host_function
-
-    @host_function.setter
-    def host_function(self, value: HostFunction | None) -> None:
-        self._host_function = value
 
     @property
     def settings(self) -> Settings:
@@ -2759,6 +2763,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 source_key is not None
                 and (path := self._cache_path_map.get(config)) is not None
             ):
+                # PyCodeCache writes the supplied source unchanged; its extra
+                # key changes the module identity, not the stored source text.
                 try:
                     source = Path(path).read_text(encoding="utf-8")
                 except OSError as error:
@@ -2769,7 +2775,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
         )
-        self.env.backend.setup_compile_cache_dir(device_index)
         try:
             triton_code = None
             if source_key is not None:
@@ -2802,10 +2807,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 cache_extra = repr(self._base_spec_key)
             if self.kernel.cute_structural_policy is not None:
                 cache_extra += self.extra_cache_key()
-            with measure("BoundKernel.PyCodeCache.load"):
-                module = PyCodeCache.load(triton_code, extra=cache_extra)
-            self.env.backend.annotate_compiled_module(
-                module, triton_code, self.kernel.name
+            module = _load_code(
+                self.kernel,
+                self.env.backend,
+                triton_code,
+                device_index,
+                extra=cache_extra,
             )
             if source_key is not None and source_miss:
                 save_generated_code(source_key, triton_code)
@@ -3152,11 +3159,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             and not tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
         ):
-            return (
-                [_GeneratedCodeInputGuard(self.kernel)]
-                if self._generated_code_artifact_key is not None
-                else []
-            )
+            return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
             if isinstance(v, TensorPropertySource):
@@ -3229,11 +3232,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
-        extractors: list[Callable[[Sequence[object]], Hashable]] = (
-            [_GeneratedCodeInputGuard(self.kernel)]
-            if self._generated_code_artifact_key is not None
-            else []
-        )
+        extractors: list[Callable[[Sequence[object]], Hashable]] = []
         extracted_strides: set[TensorPropertySource] = set()
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
@@ -3810,15 +3809,36 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
 
 @dataclasses.dataclass(frozen=True)
-class _GeneratedCodeInputGuard:
-    kernel: Kernel
+class _CachedTensorArgument:
+    reference: weakref.ReferenceType[torch.Tensor]
+    identity: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+    requires_grad: bool
+    static_indices: tuple[int, ...]
 
-    def __call__(self, args: Sequence[object]) -> Hashable:
-        return exact_input_key(self.kernel, args), _input_tensor_aliases(args)
+    @classmethod
+    def capture(cls, value: torch.Tensor) -> _CachedTensorArgument:
+        return cls(
+            weakref.ref(value),
+            id(value),
+            tuple(int(dim) for dim in value.shape),
+            tuple(int(stride) for stride in value.stride()),
+            value.dtype,
+            value.device,
+            value.requires_grad,
+            tuple(getattr(value, "_dynamo_static_indices", ())),
+        )
 
 
-class _CachedBoundKernel(BoundKernel[_R]):
-    """Run a validated disk artifact, materializing frontend state on demand."""
+class _CachedBoundKernel(Generic[_R]):
+    """A disk runner that delegates frontend operations to a normal binding.
+
+    The private input guard protects only this runner. It never participates in
+    the kernel's specialization schema or the autotuner's cache identity.
+    """
 
     def __init__(
         self,
@@ -3826,118 +3846,277 @@ class _CachedBoundKernel(BoundKernel[_R]):
         args: tuple[object, ...],
         signature: tuple[Hashable, ...],
         artifact: tuple[Config, Config, str],
-        artifact_key: str | None,
     ) -> None:
-        self._materialized = False
-        self._materialize_lock = threading.RLock()
+        self.kernel = kernel
+        self._base_spec_key = signature
+        self._reset_generation = kernel._reset_generation
+        self._cache_managed = True
+        self._dispatch_generation: int | None = None
+        self._compiler_seed_specialization_extractors: tuple[
+            _CompilerSeedSpecializationExtractor, ...
+        ] = ()
+        self._compiler_seed_specialization_results: tuple[Hashable, ...] = ()
         self._artifact = artifact
-        self._binding_args = tree_map_only(torch.Tensor, weakref.ref, args)
-        self._input_guard = _GeneratedCodeInputGuard(kernel)
-        self._input_guard_result = self._input_guard(args)
-        super().__init__(
-            kernel,
-            args,
-            base_spec_key=signature,
-            is_distributed=False,
-            artifact_key=artifact_key,
-            _defer_frontend=True,
+        self._input_key = _argument_key(args), _input_tensor_aliases(args)
+        self._binding_args = tree_map_only(
+            torch.Tensor, _CachedTensorArgument.capture, args
         )
-
-    def _materialize(self) -> None:
-        with self._materialize_lock:
-            if self._materialized:
-                return
-
-            def dereference(value: object, fake: object) -> object:
-                if isinstance(value, weakref.ReferenceType):
-                    tensor = value()
-                    return fake if tensor is None else tensor
-                return value
-
-            args = tree_map(dereference, self._binding_args, tuple(self.fake_args))
-            run, config = self._run, self._config
-            compile_cache, paths = self._compile_cache, self._cache_path_map
-            self._materialized = True
-            try:
-                BoundKernel.__init__(
-                    self,
-                    self.kernel,
-                    args,
-                    base_spec_key=self._base_spec_key,
-                    is_distributed=False,
-                    artifact_key=self._generated_code_artifact_key,
-                )
-            except Exception:
-                self._materialized = False
-                raise
-            self._run, self._config = run, config
-            self._compile_cache.update(compile_cache)
-            self._cache_path_map.update(paths)
+        self._materialize_lock = threading.RLock()
+        self._delegate: BoundKernel[_R] | None = None
+        self._introspection_bound: BoundKernel[_R] | None = None
+        self._compiled_run: CompiledConfig | None = None
+        self._compiled_path: str | None = None
+        self._run: Callable[..., _R] | None = None
+        self._config: Config | None = None
+        self._backend = get_backend_class(kernel.settings.backend)()
+        self._backend.validate_environment()
+        self._device = _canonicalize_argument_device(_find_device(args))
 
     @property
-    def env(self) -> CompileEnvironment:
-        self._materialize()
-        return self._env
+    def settings(self) -> Settings:
+        return self.kernel.settings
 
     @property
-    def host_function(self) -> HostFunction | None:
-        self._materialize()
-        return self._host_function
+    def configs(self) -> list[Config]:
+        return self.kernel.configs
 
-    @host_function.setter
-    def host_function(self, value: HostFunction | None) -> None:
-        self._host_function = value
+    def __getattr__(self, name: str) -> object:
+        # Frontend-dependent APIs retain the ordinary BoundKernel behavior.
+        # The facade never partially initializes or mutates that object.
+        return getattr(self._materialize(), name)
+
+    def _matches_inputs(self, args: Sequence[object]) -> bool:
+        return (
+            _argument_key(tuple(args)),
+            _input_tensor_aliases(args),
+        ) == self._input_key
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
-        if not self._materialized:
-            return [self._input_guard]
-        return super()._specialize_extra()
+        return []
 
     def _record_runtime_input_specialization_results(
         self,
         extractors: Sequence[Callable[[Sequence[object]], Hashable]],
         results: Sequence[Hashable],
     ) -> bool:
-        if self._materialized:
-            return super()._record_runtime_input_specialization_results(
-                extractors, results
+        return not extractors and not results
+
+    def _restore_binding_args(self) -> tuple[tuple[object, ...], bool]:
+        expired = False
+        restored: dict[int, torch.Tensor] = {}
+
+        def restore(value: object) -> object:
+            nonlocal expired
+            if not isinstance(value, _CachedTensorArgument):
+                return value
+            tensor = value.reference()
+            if tensor is not None:
+                return tensor
+            expired = True
+            if value.identity not in restored:
+                # Metadata-only introspection must not allocate a user's tensor
+                # again, especially on a GPU. This fake input is never launched.
+                with FakeTensorMode():
+                    fake = torch.empty_strided(
+                        value.shape,
+                        value.stride,
+                        dtype=value.dtype,
+                        device=value.device,
+                        requires_grad=value.requires_grad,
+                    )
+                for dim in value.static_indices:
+                    torch._dynamo.mark_static(fake, dim)
+                restored[value.identity] = fake
+            return restored[value.identity]
+
+        return tree_map(restore, self._binding_args), expired
+
+    def _materialize(self, args: tuple[object, ...] | None = None) -> BoundKernel[_R]:
+        # Every path which needs both locks uses this order, including bind().
+        with self.kernel._bind_lock, self._materialize_lock:
+            if self._delegate is not None:
+                return self._delegate
+            expired = False
+            if args is None:
+                args, expired = self._restore_binding_args()
+            if expired or self._reset_generation != self.kernel._reset_generation:
+                if self._introspection_bound is None:
+                    self._introspection_bound = BoundKernel(
+                        self.kernel,
+                        args,
+                        base_spec_key=self._base_spec_key,
+                        is_distributed=False,
+                        cache_managed=False,
+                    )
+                return self._introspection_bound
+
+            signature = self.kernel._base_specialization_key(args)
+            current_key = self.kernel._get_bound_kernel_cache_key(args, signature)
+            current = (
+                None
+                if current_key is None
+                else self.kernel._bound_kernels.get(current_key)
             )
-        return False
+            if current is not None and not isinstance(current, _CachedBoundKernel):
+                self._delegate = current
+                return current
+            normal = BoundKernel(
+                self.kernel,
+                args,
+                base_spec_key=signature,
+                is_distributed=False,
+                artifact_key=compiled_kernel_cache_key(self.kernel, args, signature),
+            )
+            has_native_schema = any(
+                not isinstance(bound, _CachedBoundKernel)
+                and bound._base_spec_key == signature
+                for bound in self.kernel._bound_kernels.values()
+            )
+            if not has_native_schema:
+                extra_fns = normal._specialize_extra()
+                compiler_seed_fns = normal._compiler_seed_specialization_extractors
+                aliases = {
+                    alias_signature: alias
+                    for alias_signature, alias in self.kernel._specialization_aliases.items()
+                    if alias.canonical_signature == signature
+                }
+                # Validate projections before replacing the provisional schema.
+                # A frontend failure leaves every exact disk runner intact.
+                extra_results = tuple(extractor(args) for extractor in extra_fns)
+                compiler_seed_results = tuple(
+                    extractor(args) for extractor in compiler_seed_fns
+                )
+                hash((signature, extra_results, compiler_seed_results))
+                with self.kernel._specialize_extra_lock:
+                    self.kernel._specialize_extra[signature] = extra_fns
+                    self.kernel._compiler_seed_specialize_extra[signature] = (
+                        compiler_seed_fns
+                    )
+                    for alias_signature, alias in aliases.items():
+                        self.kernel._specialize_extra[alias_signature] = [alias]
+                        self.kernel._compiler_seed_specialize_extra[alias_signature] = (
+                            compiler_seed_fns
+                        )
+                    if extra_fns:
+                        self.kernel._has_specialization_extras = True
+                    self.kernel._specialization_generation += 1
+                affected = {signature, *aliases}
+                for key in list(self.kernel._bound_kernels):
+                    if key.specialization_key in affected:
+                        self.kernel._bound_kernels.pop(key)
+                for key, bound in list(self.kernel._dispatch_cache.items()):
+                    if bound._base_spec_key in affected:
+                        self.kernel._dispatch_cache.pop(key)
+                self.kernel._prepared_call = None
+            else:
+                # A different native specialization already established this
+                # schema. Preserve it and its bindings, as ordinary bind() does.
+                for key, bound in list(self.kernel._bound_kernels.items()):
+                    if bound is self:
+                        self.kernel._bound_kernels.pop(key)
+                for key, bound in list(self.kernel._dispatch_cache.items()):
+                    if bound is self:
+                        self.kernel._dispatch_cache.pop(key)
+                if (
+                    self.kernel._prepared_call is not None
+                    and self.kernel._prepared_call.bound is self
+                ):
+                    self.kernel._prepared_call = None
+            cache_key = self.kernel._create_bound_kernel_cache_key(
+                normal, args, signature, snapshot_runtime_results=True
+            )
+            self.kernel._bound_kernels[cache_key] = normal
+            self._delegate = normal
+            return normal
 
-    def _normalized_config_copy(self, config: ConfigLike) -> Config:
-        requested = self._normalize_config(config)
-        original, normalized = self._artifact[:2]
-        if not self._materialized and requested in (original, normalized):
-            return Config.from_json(normalized.to_json())
-        self._materialize()
-        return super()._normalized_config_copy(config)
+    def _requested_config(self, config: ConfigLike | None) -> Config:
+        if config is None:
+            return self._config or self._artifact[0]
+        if isinstance(config, Config):
+            return config
+        if isinstance(config, CuteStructuralConfig):
+            return self._materialize()._normalize_config(config)
+        return Config.from_dict(config)
 
-    def _compile_config(
+    def compile_config(
+        self, config: ConfigLike | None = None, *, allow_print: bool = True
+    ) -> CompiledConfig:
+        if self._delegate is not None:
+            return self._delegate.compile_config(config, allow_print=allow_print)
+        requested = self._requested_config(config)
+        if requested not in self._artifact[:2]:
+            return self._materialize().compile_config(
+                requested, allow_print=allow_print
+            )
+        with self._materialize_lock:
+            if self._compiled_run is None:
+                module = _load_code(
+                    self.kernel,
+                    self._backend,
+                    self._artifact[2],
+                    self._device.index or 0,
+                    extra=(
+                        repr(self._base_spec_key)
+                        if self.settings.static_shapes
+                        and self._backend.requires_shape_specialized_module
+                        else ""
+                    ),
+                )
+                self._compiled_run = getattr(module, self.kernel.name)
+                self._compiled_path = module.__file__
+        return self._call_compiled_config
+
+    def _call_compiled_config(self, *args: object) -> _R:
+        if len(args) != self.kernel._num_params:
+            args = self.kernel.normalize_args(*args)
+        if (
+            self._delegate is None
+            and self._reset_generation == self.kernel._reset_generation
+            and not torch.compiler.is_compiling()
+            and self._matches_inputs(args)
+        ):
+            assert self._compiled_run is not None
+            return self._compiled_run(*args)
+        if (
+            self._delegate is None
+            and self._reset_generation == self.kernel._reset_generation
+            and not torch.compiler.is_compiling()
+            and self.kernel._base_specialization_key(args) == self._base_spec_key
+        ):
+            self._materialize(args)
+        # compile_config() returns a callable for this particular config,
+        # independently of a later set_config() or normal binding selection.
+        bound = self.kernel.bind(args)
+        return bound.compile_config(self._artifact[0])(*args)
+
+    def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
+        if self._delegate is not None:
+            return self._delegate.get_cached_path(config)
+        if self._requested_config(config) in self._artifact[:2]:
+            return self._compiled_path
+        return self._materialize().get_cached_path(config)
+
+    def set_config(self, config: ConfigLike) -> None:
+        requested = self._requested_config(config)
+        if self._delegate is not None or requested not in self._artifact[:2]:
+            self._materialize().set_config(requested)
+        else:
+            self.compile_config(requested)
+        self._config = requested
+        self._run = self._call_cached
+
+    def to_triton_code(
         self,
         config: ConfigLike | None = None,
         *,
-        allow_print: bool = True,
-        cache_generated_code: bool = False,
-    ) -> CompiledConfig:
-        if config is None:
-            config = self._require_implicit_config()
-        normalized = self._normalized_config_copy(config)
-        if self._materialized:
-            return super()._compile_config(
-                config,
-                allow_print=allow_print,
-                cache_generated_code=cache_generated_code,
-            )
-        if (run := self._compile_cache.get(normalized)) is not None:
-            return run
-        source = self._artifact[2]
-        self._env.backend.setup_compile_cache_dir(self._env.device.index or 0)
-        module = PyCodeCache.load(source)
-        self._env.backend.annotate_compiled_module(module, source, self.kernel.name)
-        run = getattr(module, self.kernel.name)
-        self._compile_cache[normalized] = run
-        self._cache_path_map[normalized] = module.__file__
-        return run
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str:
+        return self._materialize().to_triton_code(
+            config,
+            emit_repro_caller=emit_repro_caller,
+            output_origin_lines=output_origin_lines,
+        )
 
     def autotune(
         self,
@@ -3947,34 +4126,54 @@ class _CachedBoundKernel(BoundKernel[_R]):
         **kwargs: object,
     ) -> Config:
         normalized_args = self.kernel.normalize_args(*args)
-        rebound = self.kernel.bind(normalized_args)
-        if rebound is not self:
-            return rebound.autotune(normalized_args, force=force, **kwargs)
         if (
-            self._materialized
+            self._reset_generation != self.kernel._reset_generation
+            or torch.compiler.is_compiling()
+            or self.kernel._base_specialization_key(normalized_args)
+            != self._base_spec_key
+        ):
+            return self.kernel.bind(normalized_args).autotune(
+                normalized_args, force=force, **kwargs
+            )
+        if (
+            self._delegate is not None
+            or not self._matches_inputs(normalized_args)
             or force
             or self.settings.force_autotune
             or kwargs
-            or len(self.kernel.configs) > 1
+            or len(self.configs) > 1
         ):
-            self._materialize()
-            return super().autotune(normalized_args, force=force, **kwargs)
-        if len(self.kernel.configs) == 1:
-            (config,) = self.kernel.configs
-        elif (
-            self.settings.autotune_effort == "none"
-            or self.settings.autotuner_fn is default_autotuner_fn
-        ):
+            normal = self._materialize(normalized_args)
+            return normal.autotune(normalized_args, force=force, **kwargs)
+        if len(self.configs) == 1:
+            (config,) = self.configs
+        elif self.settings.autotune_effort == "none":
             config = self._artifact[0]
         else:
-            # Preset selectors (including vLLM's) must still choose the config.
-            # A different config or frontend-dependent selector materializes normally.
+            # Custom selectors still choose their configuration. Frontend
+            # access or a different winner naturally materializes the delegate.
             self.settings.check_autotuning_disabled()
-            config = self.settings.autotuner_fn(self, normalized_args).autotune(
-                skip_cache=False
-            )
+            config = self.settings.autotuner_fn(
+                self.kernel.bind(normalized_args), normalized_args
+            ).autotune(skip_cache=False)
         self.set_config(config)
         return config
+
+    def _call_cached(self, *args: object) -> _R:
+        if len(args) != self.kernel._num_params:
+            args = self.kernel.normalize_args(*args)
+        if (
+            self._delegate is not None
+            or self._reset_generation != self.kernel._reset_generation
+            or torch.compiler.is_compiling()
+        ):
+            return self.kernel.bind(args)(*args)
+        if not self._matches_inputs(args):
+            if self.kernel._base_specialization_key(args) != self._base_spec_key:
+                return self.kernel.bind(args)(*args)
+            return self._materialize(args)(*args)
+        assert self._compiled_run is not None
+        return self._compiled_run(*args)
 
     def __call__(self, *args: object) -> _R:
         if len(args) != self.kernel._num_params:
@@ -3984,26 +4183,9 @@ class _CachedBoundKernel(BoundKernel[_R]):
             or torch.compiler.is_compiling()
         ):
             return self.kernel.bind(args)(*args)
-        if self._input_guard(args) != self._input_guard_result:
-            return self.kernel.bind(args)(*args)
-        if self._materialized:
-            return super().__call__(*args)
         if self._run is None:
-            with self._first_compile_lock:
-                if self._run is None:
-                    self.ensure_config_exists(args)
-        assert self._run is not None
-        return self._run(*args)
-
-    def _user_provided_config(self) -> Config | None:
-        if (
-            not self._materialized
-            and not self.kernel.configs
-            and self.settings.autotune_effort == "none"
-            and not self.settings.force_autotune
-        ):
-            return self._artifact[0]
-        return super()._user_provided_config()
+            self.autotune(args, force=False)
+        return self._call_cached(*args)
 
 
 class _KernelDecorator(Protocol):

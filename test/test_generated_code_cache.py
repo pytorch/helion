@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import inspect
 import json
+import operator
 import os
 import subprocess
 import sys
@@ -68,6 +69,7 @@ def _cached_shift(x: torch.Tensor) -> torch.Tensor:
 
 
 def _bound(x: torch.Tensor, scale: int = 2, **settings: object):
+    settings.setdefault("autotune_effort", "none")
     kernel = helion.kernel(backend="triton", generated_code_cache=True, **settings)(
         _cached_scale.fn
     )
@@ -92,7 +94,11 @@ def _source_loader(root: Path, sources: list[str]):
         path = root / f"module_{len(sources)}.py"
         path.write_text(source)
         # Importing/launching the generated module belongs to the CUDA test.
-        return SimpleNamespace(__file__=str(path), _cached_scale=lambda *args: None)
+        return SimpleNamespace(
+            __file__=str(path),
+            _cached_scale=lambda *args: None,
+            _runtime_scale=operator.mul,
+        )
 
     return load
 
@@ -243,15 +249,15 @@ def test_preset_selector_still_runs(cache_root: Path) -> None:
     with patch.object(
         PyCodeCache, "load", side_effect=_source_loader(cache_root, sources)
     ):
-        _bound(x, static_shapes=False, autotuner_fn=selector).autotune(
-            (x, 2), force=False
-        )
+        _bound(
+            x, static_shapes=False, autotuner_fn=selector, autotune_effort="quick"
+        ).autotune((x, 2), force=False)
         with patch.object(
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
-            _bound(x, static_shapes=False, autotuner_fn=selector).autotune(
-                (x, 2), force=False
-            )
+            _bound(
+                x, static_shapes=False, autotuner_fn=selector, autotune_effort="quick"
+            ).autotune((x, 2), force=False)
     assert calls == [False, False]
 
 
@@ -346,9 +352,9 @@ def test_global_values_invalidate_frontend_identity(
     cache_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def bind():
-        kernel = helion.kernel(backend="triton", generated_code_cache=True)(
-            _cached_shift.fn
-        )
+        kernel = helion.kernel(
+            backend="triton", generated_code_cache=True, autotune_effort="none"
+        )(_cached_shift.fn)
         return kernel.bind((torch.ones(16),))
 
     first = bind()

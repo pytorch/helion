@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import dis
+import enum
 import hashlib
 import inspect
 import json
@@ -28,6 +31,7 @@ from ..autotuner.local_cache import get_helion_cache_dir
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import is_ref_mode_enabled
+from .settings import default_autotuner_fn
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -35,6 +39,7 @@ if TYPE_CHECKING:
 
     from .kernel import BoundKernel
     from .kernel import Kernel
+    from .settings import Settings
 
 log = logging.getLogger(__name__)
 _UNCACHEABLE = object()
@@ -66,12 +71,51 @@ def _code_key(code: types.CodeType) -> tuple[object, ...]:
     )
 
 
+def _global_names(code: types.CodeType) -> set[str]:
+    """Include globals loaded only by nested functions and comprehensions."""
+    names = {
+        cast("str", instruction.argval)
+        for instruction in dis.get_instructions(code)
+        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
+    }
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            names.update(_global_names(constant))
+    return names
+
+
+def _function_dependencies(fn: types.FunctionType) -> object:
+    try:
+        closure = inspect.getclosurevars(fn)
+    except ValueError:
+        # A deleted nonlocal leaves an empty closure cell.
+        return _UNCACHEABLE
+    dependencies: dict[str, object] = {}
+    for name in sorted(_global_names(fn.__code__)):
+        if name in fn.__globals__:
+            dependencies[name] = fn.__globals__[name]
+        elif name in fn.__builtins__:
+            dependencies[name] = fn.__builtins__[name]
+        else:
+            # A missing global could be installed before compilation or resolved
+            # by dynamic execution. Its dependency cannot be established here.
+            return _UNCACHEABLE
+    # Dependency discovery order can vary with Python's hash seed.
+    # Variable bindings are unordered; user-provided dict inputs are not.
+    return dict(sorted(closure.nonlocals.items())), dict(sorted(dependencies.items()))
+
+
 def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object:
     """Fingerprint supported Python dependencies without pickling live objects."""
     if value is None or type(value) in (int, float, bool, str, bytes):
         return type(value).__name__, value
     if isinstance(value, (torch.dtype, torch.device)):
         return str(value)
+    if isinstance(value, enum.Enum):
+        item = _dependency_key(value.value, seen)
+        if item is _UNCACHEABLE:
+            return _UNCACHEABLE
+        return "enum", type(value).__module__, type(value).__qualname__, item
     if type(value) in (tuple, list, dict):
         if id(value) in seen:
             return _UNCACHEABLE
@@ -95,6 +139,12 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
             return "module", name
         return _UNCACHEABLE
     if isinstance(value, types.BuiltinFunctionType):
+        if value.__module__ == "builtins" and value.__name__ in {
+            "eval",
+            "exec",
+            "globals",
+        }:
+            return _UNCACHEABLE
         return "builtin", value.__module__, value.__qualname__
     if isinstance(value, type) and value.__module__.split(".")[0] in {
         "helion",
@@ -106,12 +156,10 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
         if id(value) in seen:
             return "recursive", value.__module__, value.__qualname__
         seen = seen | {id(value)}
-        closure = inspect.getclosurevars(value)
-        # Dependency discovery order can vary with Python's hash seed.
-        # Variable bindings are unordered; user-provided dict inputs are not.
-        dependencies = _dependency_key(
-            dict(sorted({**closure.globals, **closure.nonlocals}.items())), seen
-        )
+        bindings = _function_dependencies(value)
+        if bindings is _UNCACHEABLE:
+            return _UNCACHEABLE
+        dependencies = _dependency_key(bindings, seen)
         defaults = _dependency_key((value.__defaults__, value.__kwdefaults__), seen)
         if dependencies is _UNCACHEABLE or defaults is _UNCACHEABLE:
             return _UNCACHEABLE
@@ -124,6 +172,21 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
             dependencies,
         )
     return _UNCACHEABLE
+
+
+def _compilation_settings_key(settings: Settings) -> object:
+    # Search policy selects a config already included in the source key. Reject
+    # unknown compilation values instead of hashing an address-bearing repr.
+    # Read fields directly: to_dict() deep-copies arbitrary future values first.
+    return _dependency_key(
+        dict(
+            sorted(
+                (field.name, getattr(settings, field.name))
+                for field in dataclasses.fields(settings)
+                if field.repr and not field.name.startswith("autotun")
+            )
+        )
+    )
 
 
 def _argument_key(value: object) -> object:
@@ -161,8 +224,12 @@ def _argument_key(value: object) -> object:
 
 
 def exact_input_key(kernel: Kernel, args: Sequence[object]) -> Hashable | None:
-    """A conservative guard usable before frontend specialization is discovered."""
-    if not kernel.settings.generated_code_cache or torch.compiler.is_compiling():
+    """Fingerprint an exact disk lookup, never an in-memory dispatch key."""
+    if (
+        not kernel.settings.generated_code_cache
+        or kernel.settings.backend != "triton"
+        or torch.compiler.is_compiling()
+    ):
         return None
     dependencies = _dependency_key(kernel.fn)
     inputs = _argument_key(tuple(args))
@@ -185,14 +252,20 @@ def compiled_kernel_cache_key(
         or torch.compiler.is_compiling()
     ):
         return None
+    if (
+        not kernel.configs
+        and kernel.settings.autotune_effort != "none"
+        and kernel.settings.autotuner_fn is default_autotuner_fn
+    ):
+        # Adaptive tuning must consult LocalAutotuneCache. A source manifest is
+        # not authoritative when the user deletes or replaces a tuning result.
+        return None
     inputs = exact_input_key(kernel, args)
     if inputs is None:
         return None
-    settings = {
-        name: value
-        for name, value in kernel.settings.to_dict().items()
-        if not name.startswith("autotun")
-    }
+    settings = _compilation_settings_key(kernel.settings)
+    if settings is _UNCACHEABLE:
+        return None
     device = _find_argument_device(args)
     hardware = (
         get_device_name(device)
@@ -298,13 +371,9 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     assert host_function is not None
     with bound.env:
         frontend = host_function.debug_str()
-    # Search policy determines the selected config, which is already in the key.
-    # In particular, the default time-based autotune seed must not prevent reuse.
-    settings = {
-        name: value
-        for name, value in bound.settings.to_dict().items()
-        if not name.startswith("autotun")
-    }
+    settings = _compilation_settings_key(bound.settings)
+    if settings is _UNCACHEABLE:
+        return None
     payload = (
         "helion-generated-code-v1",
         helion_key(),
