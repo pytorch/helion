@@ -121,6 +121,10 @@ def _invalid_config_reason(
     env: CompileEnvironment, config: Config, row_block_id: int, store: AccessLayout
 ) -> str | None:
     """Why ``config`` cannot lower ``store`` with the carry, or None."""
+    import torch
+
+    from helion._compiler.pallas.dma import is_tpu_dma_aligned_shape
+
     blocks: dict[int, int] = {}
     for bid in store.block_ids:
         if bid is None or bid in blocks:
@@ -133,6 +137,17 @@ def _invalid_config_reason(
     assert sublane is not None
     if blocks[row_block_id] % sublane != 0:
         return f"block_row ({blocks[row_block_id]}) must be a multiple of S ({sublane})"
+    shape = tuple(blocks[bid] for bid in store.block_ids if bid is not None)
+    full_shape = tuple(
+        env.size_hint(dim)
+        if isinstance(size := env.block_sizes[bid].size, (int, torch.SymInt))
+        and env.known_equal(size, dim)
+        else None
+        for bid, dim in zip(store.block_ids, store.tensor.shape, strict=True)
+        if bid is not None
+    )
+    if not is_tpu_dma_aligned_shape(shape, store.tensor.dtype, full_shape):
+        return f"store block shape {shape} is not TPU DMA aligned"
     return None
 
 
