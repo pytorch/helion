@@ -166,7 +166,10 @@ def _codegen_common_cute(
     # condition can differ between SIMT threads.  Warp-specialized tcgen05
     # bodies, whose roles no CTA barrier may separate, refuse such atomics
     # (``reject_atomics_beside_warp_roles``).
+    from .memory_ops import reject_reads_of_collective_placeholders
+
     sem = state.proxy_arg(len(state.ast_args) - 1)
+    reject_reads_of_collective_placeholders(state, "an atomic")
     statements = state.codegen.statements_stack[-1]
     start = len(statements)
     result = _codegen_cute_atomic_rmw(

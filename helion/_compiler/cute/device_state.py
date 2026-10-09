@@ -783,7 +783,7 @@ class CuteDeviceFunctionState:
         ] = {}
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
-        self._collective_handled_load_ids: set[int] = set()
+        self._collective_handled_loads: set[Node] = set()
         self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
@@ -1179,13 +1179,17 @@ class CuteDeviceFunctionState:
         same objects.  Node names are only unique within one graph: the root
         graph's first load is ``load`` like the K loop's operand load.
         """
-        self._collective_handled_load_ids.add(id(load_node))
+        self._collective_handled_loads.add(load_node)
         self._collective_handled_load_or_dependency_node_ids.update(
             id(node) for node in dependency_nodes
         )
 
     def is_collective_handled_load(self, load_node: Node) -> bool:
-        return id(load_node) in self._collective_handled_load_ids
+        return load_node in self._collective_handled_loads
+
+    @property
+    def collective_handled_loads(self) -> frozenset[Node]:
+        return frozenset(self._collective_handled_loads)
 
     def is_collective_handled_load_or_dependency_node(self, node: Node) -> bool:
         return id(node) in self._collective_handled_load_or_dependency_node_ids

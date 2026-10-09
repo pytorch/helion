@@ -26410,11 +26410,10 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
             patch_cute_mma_support(),
         ):
             bound = _cute_matmul_rebound_epilogue_into_atomic.bind((x, y, residual))
+            # A flat pid: beside persistent warp roles the atomic is refused
+            # before the drain runs.
             bound.to_triton_code(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
+                _make_tcgen05_persistent_config(block_sizes=[128, 128, 32])
             )
 
     def test_atomic_into_slice_keeps_its_own_diagnostic(self) -> None:
