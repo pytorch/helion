@@ -21,6 +21,8 @@ import torch
 
 from ...exc import InvalidConfig
 from ...language import _tracing_ops
+from ...language.reduce_ops import _reduce
+from ...language.scan_ops import _associative_scan
 from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
@@ -205,7 +207,10 @@ def _region_graph_ids(graphs: list[GraphInfo], root_id: int) -> frozenset[int]:
         result.add(graph_id)
         for node in graphs[graph_id].graph.nodes:
             assert node.target is not _tracing_ops._if
-            if _tracing_ops.is_for_loop_target(node.target):
+            if _tracing_ops.is_for_loop_target(node.target) or node.target in (
+                _reduce,
+                _associative_scan,
+            ):
                 child = node.args[0]
                 assert isinstance(child, int)
                 pending.append(child)

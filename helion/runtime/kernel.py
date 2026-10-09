@@ -63,6 +63,12 @@ from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
+from .._compiler.cute.aux_tensor import host_function_has_tcgen05_aux_kernel_pattern
+from .._compiler.cute.aux_tensor import (
+    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
+)
+from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
+from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
 from .._compiler.generate_ast import generate_ast
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
@@ -389,6 +395,19 @@ class _PreparedMetadataSpecializationExtractor:
 
     def __call__(self, args: Sequence[object]) -> Hashable:
         return self.extractor(args)
+
+
+def _capture_safe_specialization(
+    extractor: Callable[[Sequence[object]], Hashable],
+) -> bool:
+    if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        return True
+    if isinstance(extractor, _SpecializationAlias):
+        return all(
+            _capture_safe_specialization(item)
+            for item in extractor.schemas[extractor.canonical_signature]
+        )
+    return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2024,7 +2043,17 @@ class Kernel(Generic[_R]):
             and prepared.bound._run is not None
         ):
             return prepared.bound._run(*args)
-        if self._dispatch_cache:
+        # Runtime specialization extractors can inspect pointers/storage offsets.
+        # Capture may reuse metadata-only entries; legacy Dynamo integration
+        # needs their compiled launchers and cannot trace isolated binding.
+        if self._dispatch_cache and (
+            not is_compiling
+            or all(
+                _capture_safe_specialization(extractor)
+                for extractors in self._specialize_extra.values()
+                for extractor in extractors
+            )
+        ):
             # Fast path: repeat call with argument metadata seen before. The
             # cache is only populated by calls that already took the slow
             # path below, so hitting it cannot skip autotuning/compilation.
@@ -2363,6 +2392,46 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     zip(self.kernel.signature.parameters, args, strict=False)
                 )
                 self.env.snapshot_tensor_descriptor_alignments(runtime_args)
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                # The exact-shape detector is narrower: it gates the
+                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
+                # The compiler seeds below read these facts (the FFI
+                # direct-entry gate consults the non-tcgen05 operand
+                # flag, the cluster_m=2 seeds and the search projection
+                # the aux facts), so they are recorded before
+                # ``compiler_seed_configs`` runs; they depend only on the
+                # traced host function, not on the runtime arguments.
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
+                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
+                )
+                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
+                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
+                )
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                         self.env,
@@ -2403,52 +2472,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         )
                     )
 
-                # Post-compile FX-graph scan to detect kernels
-                # whose tcgen05 matmul is followed by an
-                # aux-fused store
-                # (``out[tile] = (acc + residual[tile]).to(...)``
-                # and variants — see
-                # ``host_function_has_tcgen05_aux_kernel_pattern``
-                # for the accepted shapes). When detected, the
-                # autotune surface widens to admit
-                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
-                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
-                # productive C-input warp lift is reachable from
-                # the normal autotune path. For pure-matmul
-                # kernels the detector returns False and the
-                # autotune surface keeps the narrow
-                # ``MONOLITHIC + c_input_warps=0`` shape so
-                # autotune cannot sample the strictly-worse
-                # inert C-input warp configuration.
-                # The exact-shape detector is narrower: it gates the
-                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_aux_kernel_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_matmul_has_non_tcgen05_operand,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_tcgen05_rowvec_aux_facts,
-                )
-
-                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
-                )
-                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
-                        self.host_function
-                    )
-                )
-                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
-                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
-                )
-                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
-                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
-                )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
@@ -2569,7 +2592,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Args:
             config: The configuration to use for code generation.
-            options: Optional :class:`~helion.runtime.precompile.OutputCodeOptions`.
+            options: Optional :class:`~helion.runtime.kernel.OutputCodeOptions`.
                 With ``allow_helion_deps=False`` the returned module is
                 self-contained (no ``helion`` import at runtime); ``jax_fn=True``
                 (Pallas only) emits a pure-JAX module operating on ``jax.Array``s.
@@ -2609,11 +2632,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 body_start = len(root.body)
             body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
             ast.fix_missing_locations(body_root)
-        # One optional AST processing step, then the single unparse. Both rewrites run
-        # after generate_ast and outside the fake-tensor env above: jax_fn's launch
-        # capture runs the compiled kernel on *real* tensors (which specializes
-        # fake_args, so codegen must already be done); dep-free is pure-AST and
-        # unaffected by placement. jax_fn is checked first -- it spans both dep modes.
+        # Export after codegen and outside the fake-tensor environment: backends
+        # may capture launch metadata before rewriting the module. Check jax_fn
+        # first because it supports both dependency modes.
         if options is not None and options.jax_fn:
             from .._compiler.output_code_utils import build_jax_fn_module
             from .._compiler.output_code_utils import capture_jax_launch_metadata

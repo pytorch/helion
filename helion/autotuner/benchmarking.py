@@ -33,7 +33,7 @@ T = TypeVar("T")
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
 _MIRRORED_BENCH_MAX_SWEEPS = 64
-_ROCM_INTERLEAVED_EVENT_PAIRS = 1024
+_INTERLEAVED_EVENT_PAIRS_CAP = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -426,13 +426,20 @@ def interleaved_bench(
                 # Each sample now averages ``calls`` kernel executions.
                 repeat = max(min(repeat, 20), math.ceil(repeat / calls))
 
-    # Large finalist passes can create hundreds of thousands of live HIP events
-    # and crash in hipEventCreateWithFlags. Reuse a bounded set after collecting
-    # each batch's timings, preserving the full sample count and interleaving.
+    # Large finalist passes can create hundreds of thousands of live timing
+    # events outstanding at once. On ROCm that crashes in
+    # hipEventCreateWithFlags. On XPU, each Event.record() submits a real
+    # profiling-tag command to the queue, and the Level Zero backend only
+    # reclaims completed events near a synchronization point, so per-event
+    # cost grows superlinearly with the backlog (flat ~0.3ms/event when
+    # synchronized every ~1000 events, tens of ms/event past ~100k
+    # unsynchronized events), turning a single rebenchmark pass into a
+    # multi-minute stall. Reuse a bounded set after collecting each batch's
+    # timings, preserving the full sample count and interleaving.
     batch_size = repeat
-    if torch.version.hip is not None:
+    if torch.version.hip is not None or torch.xpu.is_available():
         batch_size = min(
-            repeat, max(1, _ROCM_INTERLEAVED_EVENT_PAIRS // max(1, len(fns)))
+            repeat, max(1, _INTERLEAVED_EVENT_PAIRS_CAP // max(1, len(fns)))
         )
     start_events = [
         [di.Event(enable_timing=True) for _ in range(batch_size)]
@@ -1039,6 +1046,105 @@ def do_bench(
         if return_mode == "mean":
             return _positive_mean(times)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
+
+
+def do_bench_cuda_graph(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    fixed_repetitions: int | None = None,
+    pre_warmed: bool = False,
+    reset: Callable[[], None] | None = None,
+    phase: Callable[[str], None] | None = None,
+) -> float | tuple[float, ...]:
+    """Time GPU execution with external event nodes inside one CUDA graph.
+
+    Input reset and L2 clearing precede the start event. Python dispatch and
+    graph submission are excluded. ``reset`` must contain capturable device
+    operations; it runs before every invocation, including capture and warmup.
+
+    Warmup/repetition windows bound sampling wall time; reported samples are
+    device milliseconds. Capture errors propagate without a timing fallback.
+    """
+    from triton.testing import _summarize_statistics
+
+    from ..runtime import cute_cuda_graph
+
+    reason = _cudagraph_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(f"GPU-only CUDA graph timing is unavailable: {reason}")
+    if grad_to_none is not None:
+        raise ValueError("CUDA graph timing requires an explicit device reset callback")
+    if fixed_repetitions is not None and fixed_repetitions < 1:
+        raise ValueError("fixed_repetitions must be at least 1")
+    if warmup < 0 or rep <= 0:
+        raise ValueError("warmup must be nonnegative and rep must be positive")
+    if return_mode not in ("min", "max", "mean", "median", "all"):
+        raise ValueError(f"Invalid return_mode: {return_mode}")
+
+    clear_l2 = _make_l2_cache_clearer()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    start = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
+    with torch.cuda.stream(stream):
+        if reset is not None:
+            reset()
+        if not pre_warmed:
+            fn()
+        # Materialize event handles before capture.
+        start.record()
+        end.record()
+    stream.synchronize()
+    if phase is not None:
+        phase("capture")
+    with cute_cuda_graph(stream=stream) as graph:
+        if reset is not None:
+            reset()
+        clear_l2()
+        start.record()
+        # Keep the captured output alive until all replays finish.
+        _output = fn()
+        end.record()
+
+    def sample() -> float:
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        elapsed = float(start.elapsed_time(end))
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise ValueError(f"Invalid GPU-only timing: {elapsed}")
+        return elapsed
+
+    if phase is not None:
+        phase("warmup")
+    if fixed_repetitions is None:
+        began = time.perf_counter()
+        sample()
+        # Count complete replays, including cache clearing and synchronization,
+        # to avoid excessive sampling work for microsecond kernels.
+        iteration_ms = sync_object(
+            max((time.perf_counter() - began) * 1000, 1e-6), process_group_name
+        )
+        n_warmup = max(0, int(warmup / iteration_ms))
+        n_repeat = max(1, int(rep / iteration_ms))
+    else:
+        n_warmup = 0
+        n_repeat = fixed_repetitions
+    for _ in range(n_warmup):
+        sample()
+    if phase is not None:
+        phase("measure")
+    samples = [sample() for _ in range(n_repeat)]
+    return cast(
+        "float | tuple[float, ...]",
+        _summarize_statistics(samples, quantiles, return_mode),
+    )
 
 
 def do_bench_generic(

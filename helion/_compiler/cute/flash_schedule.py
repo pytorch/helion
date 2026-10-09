@@ -185,6 +185,13 @@ def _kv_node_name(kind: str, cta_rank: int, multicast: bool) -> str:
     return f"{kind}_r{cta_rank}"
 
 
+def _kv_tile_bytes(spec: FlashScheduleSpec) -> int:
+    # CtaGroup.TWO partitions the MMA B operand across CTAs. Merely clustering
+    # two local-MMAs does not reduce their independently resident K/V tiles.
+    cta_group_size = 2 if spec.cooperative_mma else 1
+    return spec.kv_tile_n * spec.head_dim * spec.dtype_bytes // cta_group_size
+
+
 def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
     kv_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
@@ -199,7 +206,7 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
         )
     q_bytes = spec.query_slots_per_cta * tile_bytes
     kv_rings = 2 if spec.separate_kv else 1
-    kv_bytes = kv_rings * spec.kv_depth * kv_tile_bytes
+    kv_bytes = kv_rings * spec.kv_depth * _kv_tile_bytes(spec)
     output_bytes = spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
     # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
     return q_bytes + kv_bytes + output_bytes + 3072
@@ -671,9 +678,7 @@ def max_fa4_kv_depth(
     if limits is None:
         limits = FlashScheduleLimits()
     base_bytes = _shared_memory_bytes(dataclasses.replace(spec, kv_depth=0))
-    # A staging slot holds one KV tile, which is ``kv_tile_n`` wide.
-    tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
-    bytes_per_stage = (2 if spec.separate_kv else 1) * tile_bytes
+    bytes_per_stage = (2 if spec.separate_kv else 1) * _kv_tile_bytes(spec)
     return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
 
 
@@ -780,7 +785,7 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     )
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
     q_bytes = spec.query_slots_per_cta * tile_bytes
-    kv_ring_bytes = spec.kv_depth * tile_bytes
+    kv_ring_bytes = spec.kv_depth * _kv_tile_bytes(spec)
     k_offset = q_bytes
     v_offset = k_offset + (kv_ring_bytes if spec.separate_kv else 0)
     output_offset = q_bytes + (2 if spec.separate_kv else 1) * kv_ring_bytes

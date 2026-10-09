@@ -25,6 +25,7 @@ import torch
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.attention_plan import DENSE_SCORE_KIND
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
@@ -1162,7 +1163,11 @@ def cute_permuted_store_batched_dot_tcgen05(
                 y[tile_b, tile_k, tile_n],
                 acc=acc,
             )
-        out[tile_b, tile_n, tile_m] = acc.to(torch.bfloat16)
+        # The transposed accumulator stored to the transposed slot: each dim
+        # keeps its block id (a bare ``out[tile_b, tile_n, tile_m] = acc``
+        # would bind the M lane to the N axis, a ShapeMismatch for M != N on
+        # every backend).
+        out[tile_b, tile_n, tile_m] = acc.to(torch.bfloat16).transpose(1, 2)
     return out
 
 
@@ -3060,6 +3065,7 @@ class TestCuteBackend(TestCase):
             cute_flash_pipeline_family="fa4",
             cute_flash_softmax_disc=False,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         with patch.object(
             dense_bound.env.config_spec, "target_device_capability", (10, 3)
@@ -3083,6 +3089,7 @@ class TestCuteBackend(TestCase):
             cute_flash_causal_kv_order="descending",
             cute_flash_causal_loop_split=True,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         with patch.object(
             causal_bound.env.config_spec, "target_device_capability", (10, 3)
@@ -3365,10 +3372,7 @@ class TestCuteBackend(TestCase):
     def test_flash_attention_target_ldred_matches_sdpa(self) -> None:
         capability = torch.cuda.get_device_capability()
         target_policy = get_flash_target_policy(capability)
-        if (
-            not target_policy.hardware.supports_tmem_row_reduce
-            or target_policy.tuning.tmem_row_reduce_min_kv is None
-        ):
+        if not target_policy.hardware.supports_tmem_row_reduce:
             self.skipTest("target has no tcgen05.ld.red flash lowering")
         q, k, v = (
             torch.randn(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
@@ -3379,6 +3383,7 @@ class TestCuteBackend(TestCase):
             cute_flash_pipeline_family="fa4",
             cute_flash_softmax_disc=False,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         dense_bound = cute_dense_attention.bind((q, k, v))
         with patch.object(
@@ -3400,6 +3405,7 @@ class TestCuteBackend(TestCase):
             cute_flash_causal_kv_order="descending",
             cute_flash_causal_loop_split=True,
             cute_flash_s_load_rep=32,
+            cute_flash_rowmax="tmem",
         )
         causal_bound = cute_causal_attention.bind((q, k, v))
         with patch.object(
@@ -3945,6 +3951,7 @@ class TestCuteBackend(TestCase):
                         has_kv_tile_pruning=False,
                         requires_ws_overlap=requires_ws,
                         modifiers=(),
+                        modifier_kinds=(DENSE_SCORE_KIND,),
                     ),
                 )
                 for requires_ws in requires_ws_order
@@ -7139,35 +7146,36 @@ class TestCuteBackend(TestCase):
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
     def test_permute_transposes_tile_values(self) -> None:
-        """Permute should shuffle scalar values between threads."""
+        """The slot re-binds the transposed tile's dims: the store exchanges
+        the elements between threads (one element per thread here)."""
 
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
-        _, out = code_and_output(cute_permute_transpose, (x,), block_sizes=[4, 4])
+        code, out = code_and_output(cute_permute_transpose, (x,), block_sizes=[4, 4])
         torch.testing.assert_close(out, x.transpose(0, 1))
+        self.assertIn("rebind_smem", code)
 
     def test_permute_transposes_tile_values_with_lane_loops(self) -> None:
+        # The within-tile transpose stores another thread's element; with two
+        # elements per thread the exchange would need every lane iteration
+        # staged before one barrier, so the store is refused.
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
-        code, out = code_and_output(
-            cute_permute_transpose,
-            (x,),
-            block_sizes=[4, 4],
-            num_threads=[2, 2],
-        )
-        torch.testing.assert_close(out, x.transpose(0, 1))
-        self.assertIn("for lane_", code)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "re-binds"):
+            code_and_output(
+                cute_permute_transpose,
+                (x,),
+                block_sizes=[4, 4],
+                num_threads=[2, 2],
+            )
 
-    def test_permute_store_then_read_preserves_program_order_with_lane_loops(
-        self,
-    ) -> None:
+    def test_permute_store_then_read_with_lane_loops_rejected(self) -> None:
         x = torch.arange(16, device=DEVICE, dtype=torch.float32).reshape(4, 4)
-        code, out = code_and_output(
-            cute_permute_store_then_read,
-            (x,),
-            block_sizes=[4, 4],
-            num_threads=[2, 2],
-        )
-        torch.testing.assert_close(out, x.transpose(0, 1) + 1)
-        self.assertIn("x[indices_1, indices_0]", code)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "re-binds"):
+            code_and_output(
+                cute_permute_store_then_read,
+                (x,),
+                block_sizes=[4, 4],
+                num_threads=[2, 2],
+            )
 
     def test_matmul_mma(self) -> None:
         """Test MMA tensor core matmul with float16 inputs."""
@@ -10441,6 +10449,78 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.gemm", code)
         self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
         self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_rounds_to_declared_dtype(self) -> None:
+        # The direct warp-MMA path accumulates in fp32; a bf16 x bf16 matmul
+        # whose declared dtype is bf16 must still round before the user's
+        # widening cast observes it.
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+            static_shapes=True,
+        )
+        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m, y.size(1)], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = (x[tile_m, :] @ y[:, :]).to(torch.float32)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, out = code_and_output(grouped_n_matmul, args)
+        self.assertIn("cute.gemm", code)
+        self.assertIn("cutlass.BFloat16(direct_mma_result", code)
+        self.assertEqual(out.dtype, torch.float32)
+        torch.testing.assert_close(
+            out, out.to(torch.bfloat16).to(torch.float32), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out, (args[0] @ args[1]).float(), atol=1e-1, rtol=1e-2
+        )
+
+    def test_matmul_m_major_lhs_non_pipelined_tma_kloop(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        # An M-major fp16 A (stride(-2) == 1, e.g. ``mat1.T`` in the matmul
+        # autograd backward) disables A-TMA while B stays TMA-eligible, so the
+        # K loop takes the non-pipelined branch under the default config.
+        @helion.kernel(backend="cute", static_shapes=True)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        m = n = k = 256
+        torch.manual_seed(0)
+        x = torch.randn(k, m, device=DEVICE, dtype=torch.float16).T
+        for transpose_rhs in (False, True):
+            with self.subTest(transpose_rhs=transpose_rhs):
+                y = (
+                    torch.randn(n, k, device=DEVICE, dtype=torch.float16).T
+                    if transpose_rhs
+                    else torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+                )
+                code, out = code_and_output(matmul, (x, y), block_sizes=[128, 16, 16])
+                self.assertIn("cute.gemm", code)
+                self.assertIn(
+                    "tcgen05_ab_consumer_try_token = "
+                    "tcgen05_ab_pipeline.consumer_try_wait(",
+                    code,
+                )
+                expected = (x.float() @ y.float()).to(out.dtype)
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
 
     def test_matmul_direct_grouped_n_slice_operands_use_mma(self) -> None:
         @helion.kernel(

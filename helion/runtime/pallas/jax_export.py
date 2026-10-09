@@ -260,7 +260,7 @@ def _device_for_jax_export() -> torch.device:
     """
     if hasattr(torch, "tpu"):
         try:
-            if torch.tpu.is_available():
+            if torch.accelerator.is_available():
                 return torch.device("tpu", 0)
         except Exception:
             pass

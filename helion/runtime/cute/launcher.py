@@ -3324,8 +3324,22 @@ def _cute_scalar_cache_value(scalar_kind: str, scalar_value: object) -> object:
 def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
     if arg.device.type != "cuda":
         raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
-    if arg.ndim <= 0:
-        raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
+
+
+def _cute_launcher_tensor_layout(
+    arg: torch.Tensor,
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    """Return ``(rank, sizes, strides)`` for the cute tensor built by the wrapper.
+
+    ``cute.make_layout`` has no rank-0 form, so a 0-d tensor (``scale[()]``)
+    is marshalled as a one-element rank-1 view. Device code reads it through
+    the base pointer only, so the view never changes which element is read.
+    """
+    if arg.ndim == 0:
+        return 1, (1,), (1,)
+    sizes = tuple(int(arg.size(d)) for d in range(arg.ndim))
+    strides = tuple(int(arg.stride(d)) for d in range(arg.ndim))
+    return arg.ndim, sizes, strides
 
 
 def _cute_pointer_alignment(data_ptr: int) -> int:
@@ -6064,13 +6078,7 @@ def _build_cute_schema_and_args(
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             _validate_cute_launcher_tensor(arg)
-            ndim = arg.ndim
-            if ndim <= 0:
-                raise exc.BackendUnsupported(
-                    "cute", "launcher requires tensor rank >= 1"
-                )
-            sizes_t = tuple(int(arg.size(d)) for d in range(ndim))
-            strides_t = tuple(int(arg.stride(d)) for d in range(ndim))
+            ndim, sizes_t, strides_t = _cute_launcher_tensor_layout(arg)
             data_ptr = int(arg.data_ptr())
             alignment = _cute_pointer_alignment(data_ptr)
             launch_args.append(

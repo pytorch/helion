@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.signed_bitfield import PackedStoreValue
     from .._compiler.cute.signed_bitfield import SignedByteSite
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.tile_strategy import DeviceLoopOrGridState
     from .._compiler.tile_strategy import LoopDimInfo
 
 from .._compiler.host_function import SymbolOrigin
@@ -1010,6 +1011,9 @@ def _cute_index_tuple(index_exprs: list[str]) -> str:
 
 
 def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    if not index_exprs:
+        # Rank-0 tensor (``scale[()]``): the base pointer is the element.
+        return f"({tensor_name}.iterator)"
     env = CompileEnvironment.current()
     index_dtype = env.index_type()
     offset = " + ".join(
@@ -1049,7 +1053,16 @@ def _cute_scalar_load_expr(
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             f"{dtype_str}{eviction_suffix})"
         )
-    return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+    loaded = f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
+    if dtype in (torch.uint8, torch.uint32):
+        # CuTe pointer offsets reconstruct signless MLIR integers as signed
+        # Numeric types. Restore the logical unsigned dtype before a masked
+        # zero joins the load or a later conversion extends its high bit.
+        from .._compiler.compile_environment import CompileEnvironment
+
+        dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+        return f"{dtype_str}({loaded})"
+    return loaded
 
 
 # Maximum bytes per vector load/store transaction (LDG.128/STG.128).
@@ -1649,6 +1662,32 @@ def _cute_is_tile_scalar(
     return _symint_expr(idx) != _symint_expr(env.block_sizes[block_id].var)
 
 
+def _cute_tile_id_thread_extent_is_complete(
+    state: CodegenState, owner: DeviceLoopOrGridState, block_id: int
+) -> bool:
+    """A tile-level bound cannot discard a live physical/serial-lane mask."""
+    from .._compiler.tile_strategy import DeviceLoopState
+    from .._compiler.tile_strategy import PerThreadNDTileStrategy
+
+    # A serial device loop may still emit its store inside each element-lane
+    # iteration. Keep the original mask until that store's placement is proved:
+    # an empty tail lane must not overwrite a preceding nonempty lane's result.
+    if isinstance(owner, DeviceLoopState) and block_id in owner.lane_loop_blocks:
+        return False
+    axis = owner.block_thread_axes.get(block_id)
+    if axis is None:
+        return True
+    extent = owner.thread_axis_sizes.get(axis)
+    if extent is None:
+        return False
+    if isinstance(owner.strategy, PerThreadNDTileStrategy):
+        extent = owner.strategy.thread_extent_for_masking(block_id, extent)
+    # The dispatch includes ordinary sibling branches/roots. A wider sibling
+    # therefore keeps the original element mask and its existing arbitration.
+    planned = state.device_function.tile_strategy.thread_block_dims()
+    return 0 <= axis < len(planned) and 0 < planned[axis] <= extent
+
+
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -1656,7 +1695,10 @@ def _cute_combined_mask(
     tensor: torch.Tensor | None = None,
     *,
     include_tensor_index_masks: bool = True,
+    for_store: bool = False,
 ) -> str | None:
+    # Destination stores may need an element-owner mask for arbitration.
+    # A source/reloaded tile scalar must remain uniform across those lanes.
     env = CompileEnvironment.current()
     terms: list[str] = []
 
@@ -1791,6 +1833,63 @@ def _cute_combined_mask(
             continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
+            origin = _maybe_get_symbol_origin(idx)
+            if (
+                for_store
+                and origin is not None
+                and isinstance(origin.origin, TileIdOrigin)
+                and block_id is not None
+                and mask_var_for_block_id(block_id) is not None
+            ):
+                # A tile ID denotes one scalar per nonempty tile, not the
+                # current element of that tile. Its element mask can depend
+                # on both a thread coordinate and a serial lane loop, neither
+                # of which belongs to this address. Keep the tile's absolute
+                # end and destination bounds instead of borrowing that mask.
+                from .._compiler.tile_strategy import DeviceGridState
+
+                remapped = _cute_remap_block_id(state, block_id)
+                owners = state.codegen.active_device_loops.get(remapped)
+                owner = owners[-1] if owners else state.codegen.current_grid_state
+                info = (
+                    owner.block_id_to_info.get(remapped) if owner is not None else None
+                )
+                if info is None or owner is None:
+                    raise exc.BackendUnsupported("cute", "tile ID has no active owner")
+                if not _cute_tile_id_thread_extent_is_complete(state, owner, remapped):
+                    original_mask = mask_var_for_block_id(block_id)
+                    assert original_mask is not None
+                    terms.append(original_mask)
+                    seen.add(block_id)
+                    tensor_dim += 1
+                    continue
+                if isinstance(owner, DeviceGridState):
+                    end = info.grid_end_expr
+                    end_expr = (
+                        state.device_function.literal_expr(end)
+                        if end is not None
+                        else None
+                    )
+                else:
+                    end_expr = info.end_var_name
+                    if end_expr is None and info.end_expr is not None:
+                        end_expr = state.device_function.literal_expr(info.end_expr)
+                if end_expr is None:
+                    raise exc.BackendUnsupported("cute", "tile ID has no logical end")
+                begin = tile_begin_expr(block_id)
+                terms.append(f"({begin}) < ({end_expr})")
+                if tensor is not None and tensor_dim < tensor.ndim:
+                    size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+                    tile_size = state.device_function.block_size_var(remapped) or "1"
+                    terms.extend(
+                        (
+                            f"(({begin}) // ({tile_size})) >= 0",
+                            f"(({begin}) // ({tile_size})) < ({size})",
+                        )
+                    )
+                seen.add(block_id)
+                tensor_dim += 1
+                continue
             if block_id is not None and _cute_is_tile_scalar(env, idx, block_id):
                 # A tile attribute (``tile.begin``, ``tile.id``) or a grid
                 # index is one address for the whole tile, in range whenever
@@ -5667,10 +5766,13 @@ def _codegen_cute_store_tcgen05_tile(
             or diagnose_module_helper_store_tail
             or diagnose_split_first_t2r
             or diagnose_split_acc_t2r_store_tail
-        ) and aux_steps_in_chain:
+        ) and (
+            aux_steps_in_chain
+            or (epilogue_chain is not None and epilogue_chain.runtime_scalars)
+        ):
             raise exc.BackendUnsupported(
                 "cute",
-                "auxiliary-tensor epilogue (e.g. "
+                "auxiliary-tensor or runtime-scalar epilogue (e.g. "
                 "`out[tile] = (acc + residual[tile]).to(dtype)`) is "
                 f"not plumbed through {TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}="
                 f"{epilogue_layout!r}. Drop the layout config to use the "
@@ -6943,7 +7045,7 @@ def _codegen_cute_store_tcgen05_tile(
     return [*main_stmts, *post_loop_stmts]
 
 
-def _codegen_cute_store_permute_lane_loops(
+def _codegen_cute_store_reshape_lane_loops(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
@@ -6952,13 +7054,10 @@ def _codegen_cute_store_permute_lane_loops(
     extra_mask: ast.AST | None,
     value_node: torch.fx.Node,
 ) -> ast.AST | None:
-    from .._compiler.cute.cute_reshape import _coords_from_flat_index
     from .._compiler.cute.cute_reshape import _flat_index_from_coords
-    from .._compiler.cute.cute_reshape import _get_dim_local_coord
+    from .._compiler.cute.cute_reshape import _get_node_dim_local_coord
     from .._compiler.cute.cute_reshape import _get_tile_shape
-    from .._compiler.cute.cute_reshape import _permute_reorders_active_dims
     from .._compiler.cute.cute_reshape import _shape_op_needs_materialization
-    from .._compiler.cute.cute_reshape import _store_permute_info
     from .._compiler.generate_ast import GenerateAST
     from .._compiler.tile_strategy import DeviceGridState
 
@@ -6978,93 +7077,16 @@ def _codegen_cute_store_permute_lane_loops(
         inactive_singleton_slice_expr="0",
     )
     index_tuple = _cute_index_tuple(index_exprs)
-    mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)
-    tensor_name = state.device_function.tensor_arg(tensor).name
+    mask_expr = _cute_combined_mask(
+        state, subscript, extra_mask, tensor=tensor, for_store=True
+    )
 
     input_node: torch.fx.Node
     output_val = value_node.meta.get("val")
     read_flat: str
     input_shape: list[int]
 
-    info = _store_permute_info(value_node)
-    if info is not None:
-        input_node, perm = info
-        input_val = input_node.meta.get("val")
-        if not isinstance(input_val, torch.Tensor) or not isinstance(
-            output_val, torch.Tensor
-        ):
-            return None
-        if not _permute_reorders_active_dims(state.codegen, input_val, perm):
-            return None
-        source_tensor_node = input_node.args[0] if input_node.args else None
-        source_extra_mask = input_node.args[2] if len(input_node.args) > 2 else None
-        if (
-            input_node.op == "call_function"
-            and input_node.target is load
-            and isinstance(source_tensor_node, torch.fx.Node)
-            and source_extra_mask is None
-        ):
-            source_tensor = source_tensor_node.meta.get("val")
-            if isinstance(source_tensor, torch.Tensor):
-                reordered_subscript = [
-                    subscript[perm.index(i)] for i in range(len(perm))
-                ]
-                reordered_ast_subscript = (
-                    [ast_subscript[perm.index(i)] for i in range(len(perm))]
-                    if isinstance(ast_subscript, (list, tuple))
-                    else None
-                )
-                source_index_exprs = _cute_index_exprs(
-                    state,
-                    reordered_subscript,
-                    ast_subscript=reordered_ast_subscript,
-                    tensor=source_tensor,
-                    inactive_singleton_slice_expr="0",
-                )
-                source_index_tuple = _cute_index_tuple(source_index_exprs)
-                source_name = state.device_function.tensor_arg(source_tensor).name
-                source_mask = _cute_combined_mask(
-                    state,
-                    reordered_subscript,
-                    None,
-                    tensor=source_tensor,
-                )
-                source_dtype = CompileEnvironment.current().backend.dtype_str(
-                    source_tensor.dtype
-                )
-                return expr_from_string(
-                    (
-                        f"({tensor_name}.__setitem__({index_tuple}, "
-                        f"({source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))) "
-                        f"if {mask_expr} else None)"
-                    )
-                    if source_mask is not None and mask_expr is not None
-                    else (
-                        f"{tensor_name}.__setitem__({index_tuple}, "
-                        f"{source_name}[{source_index_tuple}] if {source_mask} else {source_dtype}(0))"
-                        if source_mask is not None
-                        else (
-                            f"({tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}]) "
-                            f"if {mask_expr} else None)"
-                            if mask_expr is not None
-                            else f"{tensor_name}.__setitem__({index_tuple}, {source_name}[{source_index_tuple}])"
-                        )
-                    )
-                )
-            raise exc.BackendUnsupported("cute", "permute lane-loop source tensor")
-        env = CompileEnvironment.current()
-        df = state.device_function
-        input_shape = _get_tile_shape(input_val, env, df.config)
-        output_shape = _get_tile_shape(output_val, env, df.config)
-        src_coords = [
-            _get_dim_local_coord(state.codegen, input_val, i)
-            for i in range(len(input_shape))
-        ]
-        current_flat = _flat_index_from_coords(src_coords, input_shape)
-        output_coords = _coords_from_flat_index(current_flat, output_shape)
-        read_coords = [output_coords[perm.index(i)] for i in range(len(perm))]
-        read_flat = _flat_index_from_coords(read_coords, input_shape)
-    elif value_node.target in {
+    if value_node.target in {
         torch.ops.aten.view.default,
         torch.ops.aten.reshape.default,
     }:
@@ -7087,13 +7109,16 @@ def _codegen_cute_store_permute_lane_loops(
         output_non_unit = [s for s in output_shape if s != 1]
         if input_non_unit == output_non_unit:
             return None
+        # Split-view dims carry their coordinates as node metadata; honoring
+        # it keeps a merge of such dims a relabel instead of a zero-coordinate
+        # shuffle that collapses the row.
         src_coords = [
-            _get_dim_local_coord(state.codegen, input_val, i)
+            _get_node_dim_local_coord(state.codegen, input_node, input_val, i)
             for i in range(len(input_shape))
         ]
         current_flat = _flat_index_from_coords(src_coords, input_shape)
         output_coords = [
-            _get_dim_local_coord(state.codegen, output_val, i)
+            _get_node_dim_local_coord(state.codegen, value_node, output_val, i)
             for i in range(len(output_shape))
         ]
         read_flat = _flat_index_from_coords(output_coords, output_shape)

@@ -1257,7 +1257,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
             # generated stores stay aligned and avoid misaligned-address errors.
-            return block_size * element_size >= 16
+            # Leading batch dims sit outside the 2D smem tile and need only fit.
+            batch = isinstance(stride, int) and any(
+                isinstance(s, int) and 1 < s < stride for s in fake_tensor.stride()
+            )
+            return batch or block_size * element_size >= 16
 
         # 4) Validate subscript forms and collect the descriptor block_shape in
         # tensor-dimension order. Scalar indices become block_shape=1, which is
@@ -1699,6 +1703,8 @@ class SubscriptIndexing(NamedTuple):
     # a size-1 dimension, since those terms are dropped from the offset sum and
     # what remains is scalar.
     block_shaped_offset: bool = True
+    # Whether each dim_index_exprs entry is block shaped rather than scalar.
+    block_dims: tuple[bool, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -1752,7 +1758,7 @@ class SubscriptIndexing(NamedTuple):
                 # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
 
-                if slice_size != 1:
+                if not env.is_singleton_size(slice_size):
                     # On backends that don't pad factory ops to
                     # power-of-2, keep concrete dims concrete so shape
                     # inference can prove equality with concretely-sized
@@ -2051,7 +2057,7 @@ class SubscriptIndexing(NamedTuple):
                     step = k.step
                     slice_size = compute_slice_size(k, size)
 
-                    if slice_size != 1:
+                    if not env.is_singleton_size(slice_size):
                         rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         if _has_active_codegen_block(state, block_idx):
@@ -2183,6 +2189,7 @@ class SubscriptIndexing(NamedTuple):
             per_dim.broadcast_dims,
             per_dim.dim_index_exprs,
             block_shaped,
+            per_dim.block_dims,
         )
 
 
@@ -2496,7 +2503,7 @@ class BlockedSubscriptIndexing:
                 start = k.start if k.start is not None else 0
                 start_expr = state.device_function.literal_expr(start)
                 slice_size = compute_slice_size(k, size)
-                if slice_size != 1:
+                if not env.is_singleton_size(slice_size):
                     rdim = env.allocate_reduction_dimension(slice_size)
                     if _has_active_codegen_block(state, rdim.block_id):
                         offset_var = state.codegen.offset_var(rdim.block_id)

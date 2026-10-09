@@ -20,7 +20,9 @@ from test.test_cute_resident_reductions import _source
 from test.test_cute_resident_reductions import _Tensor
 from test.test_cute_resident_serial_row_seeds import _bind
 from test.test_cute_resident_serial_row_seeds import _cpu_only  # noqa: F401
-from test.test_cute_resident_serial_row_seeds import _search
+from test.test_cute_resident_serial_row_seeds import (
+    _initial_population_with_legacy_prefix,
+)
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
@@ -29,12 +31,8 @@ from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
 )
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.autotuner.metrics import AutotuneMetrics
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from helion.autotuner.base_search import PopulationMember
     from helion.runtime.kernel import BoundKernel
 
 
@@ -323,32 +321,7 @@ def test_depth_survives_flat_random_biased_and_neighbor_routes() -> None:
 def test_full_lfbo_initial_population_receives_deep_pipeline_seeds() -> None:
     bound, args = _bind(64, 4096, kind="layer", dtype=torch.bfloat16)
     family = _family(bound)
-    search = _search(bound, args)
-    search._autotune_metrics = AutotuneMetrics()
-    delivered = []
-
-    class HeldBenchmark(Exception):
-        pass
-
-    def hold(
-        members: Sequence[PopulationMember],
-        *,
-        desc: str,
-        raise_if_no_viable_config: bool = True,
-    ) -> None:
-        assert desc == "Initial population"
-        delivered.extend(deepcopy(member.config) for member in members)
-        raise HeldBenchmark
-
-    with (
-        bound.env,
-        patch.object(search, "_find_similar_cached_configs", return_value=[]),
-        patch.object(search, "benchmark_population", side_effect=hold),
-        pytest.raises(HeldBenchmark),
-    ):
-        random.seed(2026092811)
-        search._autotune()
-    assert len(delivered) == 100
+    search, delivered = _initial_population_with_legacy_prefix(bound, args, 2026092811)
     for seed in family:
         _flat, normalized = search.config_gen.strict_config_pair(seed)
         assert normalized in delivered and normalized[KEY] == 4

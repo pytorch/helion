@@ -53,6 +53,8 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
+from .cute.cute_reshape import REBOUND_CHECK_TARGETS
+from .cute.cute_reshape import check_pointwise_rebound_block_ids
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -1323,6 +1325,32 @@ class GenerateASTFromInductor(DefaultHandler):
             # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
             return self.reciprocal(self.sqrt(x))
 
+    def _integer_shift(self, name: str, x: object, y: object) -> str:
+        dtype = self._expected_tensor_dtype()
+        if (
+            dtype is None
+            or CompileEnvironment.current().backend_name != "cute"
+            or dtype
+            not in (
+                torch.int8,
+                torch.uint8,
+                torch.int16,
+                torch.uint16,
+            )
+        ):
+            return self._default(name, (x, y), {})
+        # CuTe promotes a narrow integer combined with a Python shift count
+        # to Int32. Torch truncates each tensor operation to its result dtype,
+        # before any subsequent shift or conversion.
+        result = _unpack_opsvalue(getattr(self.parent_handler, name)(x, y))
+        return self._lift(self._create_cast_expr(expr_from_string(result), dtype))
+
+    def bitwise_left_shift(self, x0: object, x1: object) -> str:
+        return self._integer_shift("bitwise_left_shift", x0, x1)
+
+    def bitwise_right_shift(self, x0: object, x1: object) -> str:
+        return self._integer_shift("bitwise_right_shift", x0, x1)
+
     def neg(self, x: object) -> str:  # type: ignore[override]
         if CompileEnvironment.current().backend_name != "cute":
             return self._default("neg", (x,), {})
@@ -1618,6 +1646,25 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
+                    # ``has_current``: test_cute_fx_replay replays ``run_node``
+                    # with no CompileEnvironment.
+                    if (
+                        CompileEnvironment.has_current()
+                        and CompileEnvironment.current().backend.name == "cute"
+                    ):
+                        # Local import: at module level, cute.repeated_block_ids
+                        # -> completed_matmul_sum -> device_ir -> ``from helion
+                        # import Config`` fails while helion/__init__ is still
+                        # importing (via language -> ... -> runtime.kernel ->
+                        # generate_ast -> this module).
+                        from .cute.repeated_block_ids import check_repeated_block_ids
+
+                        check_repeated_block_ids(self.cg, n)
+                        if (
+                            isinstance(n.meta["lowering"], PointwiseLowering)
+                            or n.target in REBOUND_CHECK_TARGETS
+                        ):
+                            check_pointwise_rebound_block_ids(self.cg, n)
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result

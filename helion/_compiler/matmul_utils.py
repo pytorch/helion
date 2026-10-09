@@ -340,8 +340,6 @@ def emit_tl_dot_with_padding(
 
     env = CompileEnvironment.current()
     input_precision = env.backend.map_dot_precision(env.settings.dot_precision)
-    config = device_fn.config
-
     lhs_shape_list = list(lhs_shape)
     rhs_shape_list = list(rhs_shape)
     acc_shape_list = list(acc_shape) if acc_shape is not None else None
@@ -384,17 +382,14 @@ def emit_tl_dot_with_padding(
         # Unsupported dtype (like bfloat16), use float32 and cast afterward
         dot_out_dtype = torch.float32
 
-    # Squeeze 3D shapes to 2D when leading dims map to block size 1 for both operands.
+    # Squeeze literal and symbolic unit batch dimensions consistently so shared
+    # operands keep the same dot rank.
     need_squeeze_dim = (
         len(lhs_shape_list) == 3
-        and config is not None
+        and len(rhs_shape_list) == 3
         and all(
-            block_idx is not None
-            and env.block_sizes[block_idx].from_config(config) == 1
-            for block_idx in (
-                env.get_block_id(lhs_shape_list[0]),
-                env.get_block_id(rhs_shape_list[0]),
-            )
+            isinstance(size, int) and size == 1
+            for size in map(_resolve_dim_size, (lhs_shape_list[0], rhs_shape_list[0]))
         )
     )
 

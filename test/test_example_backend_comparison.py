@@ -88,10 +88,67 @@ def test_backward_callable_uses_identical_upstream_gradients():
     torch.testing.assert_close(direct()[0], different_layout()[0])
 
 
-@pytest.mark.parametrize("check", ["close", "relative_l2", "dropout"])
+def test_collection_mirrors_run_example_comparison_policy():
+    import helion._testing as testing
+
+    def check(rows, cols):
+        x = torch.ones(2, requires_grad=True)
+        testing.run_example(
+            torch.square, torch.square, (x,), bwd=True, bwd_relative_l2=0.02
+        )
+        testing.run_example(
+            torch.add,
+            torch.add,
+            (torch.ones(2), torch.ones(2)),
+            atol=0.01,
+            max_mismatch_pct=0.002,
+            max_mismatched_abs_diff=1.5,
+        )
+
+    with patch.object(
+        cases.importlib, "import_module", return_value=SimpleNamespace(check=check)
+    ):
+        bwd, fwd = cases.collect("add", 0)
+    assert (bwd.mode, bwd.check, bwd.rtol, bwd.atol) == (
+        "backward",
+        "relative_l2",
+        0.02,
+        0.0,
+    )
+    assert (fwd.check, fwd.rtol, fwd.atol) == ("mismatch_budget", 1e-2, 0.01)
+    assert (fwd.max_mismatch_pct, fwd.max_mismatched_abs_diff) == (0.002, 1.5)
+
+
+def test_relative_l2_check_uses_the_run_example_helper():
+    expected = torch.ones(4, 4)
+    case = cases.Case(
+        "test", "00_forward", (expected,), {}, {}, check="relative_l2", rtol=0.3
+    )
+    # One element off by 1.0 is a 25% relative L2 error, within budget even
+    # though an elementwise check at this rtol would reject it ...
+    actual = expected.clone()
+    actual[0, 0] = 2.0
+    baselines.assert_correct(actual, expected, case)
+    # ... and a larger miss is reported by helion._testing's shared helper, so
+    # the catalog and run_example judge gradients identically.
+    with pytest.raises(AssertionError, match="relative L2 error .* exceeds"):
+        baselines.assert_correct(actual * 2, expected, case)
+
+
+@pytest.mark.parametrize(
+    "check", ["close", "relative_l2", "mismatch_budget", "dropout"]
+)
 def test_output_shape_and_dtype_are_checked_before_numeric_comparison(check):
     expected = torch.ones(2, 3, dtype=torch.bfloat16)
-    case = cases.Case("test", "00_forward", (0.0, expected, 123), {}, {}, check=check)
+    case = cases.Case(
+        "test",
+        "00_forward",
+        (0.0, expected, 123),
+        {},
+        {},
+        check=check,
+        max_mismatch_pct=0.01,
+    )
     baselines.assert_correct(expected.clone(), expected, case)
     with pytest.raises(AssertionError):
         baselines.assert_correct(expected.float(), expected, case)

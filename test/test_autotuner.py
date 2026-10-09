@@ -141,6 +141,35 @@ def _cute_flash_test_config_spec() -> SimpleNamespace:
     )
 
 
+def _stub_flash_conditional_proposals(search: LFBOPatternSearch) -> None:
+    """Use an orchestration fixture's scripted proposals at the current seam.
+
+    These fixtures inspect qualification, retry, and composition bookkeeping.
+    Real parent discovery and its replayable ledger are tested separately in
+    test_conditional_parent_search.py.
+    """
+
+    def candidates(members, leaf, constraints, known, neighbor_limit):
+        parent = min(members, key=search._flash_member_rank_key)
+        proposed = next(
+            search._pruned_pattern_search_from(
+                0,
+                parent,
+                known,
+                constraints,
+                selected_limit=2,
+                neighbor_limit=neighbor_limit,
+                required_leaf=leaf,
+                conditional_surface=True,
+                disable_early_stopping=True,
+            ),
+            (),
+        )
+        return parent, [item for item in proposed if item.config != parent.config], {}
+
+    search._flash_conditional_parent_candidates = candidates
+
+
 # Pin the arch for config-population goldens: the pointwise seed promotes to the
 # autotune-off default only on PROMOTE_TARGETS (sm90/sm100), so an unpinned test
 # would emit the promoted tile on H100/B200 runners and the base default on
@@ -341,6 +370,60 @@ class TestMismatchTolerance(TestCase):
                 max_mismatched_abs_diff=5.0,
             )
 
+    def test_assert_close_with_mismatch_tolerance_non_finite(self) -> None:
+        # Matching infinities (e.g. -inf outside an attention window) are not
+        # mismatches, so only the 1.5 counts against the 30% budget here ...
+        inf = float("inf")
+        expected = torch.tensor([-inf, 1.0, 1.0, 1.0], device=DEVICE)
+        assert_close_with_mismatch_tolerance(
+            torch.tensor([-inf, 1.0, 1.0, 1.5], device=DEVICE),
+            expected,
+            max_mismatch_pct=0.3,
+            max_mismatched_abs_diff=1.0,
+        )
+        # ... while a one-sided inf or NaN is a mismatch with infinite diff.
+        for bad in (-inf, inf, float("nan")):
+            with self.assertRaisesRegex(
+                AssertionError, "Mismatched absolute diff too large"
+            ):
+                assert_close_with_mismatch_tolerance(
+                    torch.tensor([-inf, 1.0, 1.0, bad], device=DEVICE),
+                    expected,
+                    max_mismatch_pct=0.3,
+                    max_mismatched_abs_diff=1.0,
+                )
+        # A matching pair of infinities (or NaNs) has a NaN raw difference,
+        # which must not hide the 0.5 miss from the whole-tensor bounds.
+        for pad in (-inf, float("nan")):
+            actual = torch.tensor([pad, 1.0, 1.0, 1.5], device=DEVICE)
+            expected = torch.tensor([pad, 1.0, 1.0, 1.0], device=DEVICE)
+            assert_close_with_mismatch_tolerance(
+                actual,
+                expected,
+                max_mismatch_pct=0.3,
+                max_abs_diff=0.5,
+                max_rel_diff=0.5,
+            )
+            with self.assertRaisesRegex(AssertionError, "Absolute diff too large"):
+                assert_close_with_mismatch_tolerance(
+                    actual, expected, max_mismatch_pct=0.3, max_abs_diff=0.25
+                )
+            with self.assertRaisesRegex(AssertionError, "Relative diff too large"):
+                assert_close_with_mismatch_tolerance(
+                    actual, expected, max_mismatch_pct=0.3, max_rel_diff=0.25
+                )
+
+    def test_assert_close_with_mismatch_tolerance_mixed_dtypes(self) -> None:
+        # torch.isclose rejects differing dtypes; the helper must still judge
+        # such inputs numerically and raise only AssertionError, which is all
+        # the autotuner's accuracy check catches.
+        # CPU tensors: MPS has no float64, and the helper is device-agnostic.
+        actual = torch.tensor([1.0, 1.0, 1.0, 1.5])
+        expected = torch.ones(4, dtype=torch.float64)
+        assert_close_with_mismatch_tolerance(actual, expected, max_mismatch_pct=0.3)
+        with self.assertRaisesRegex(AssertionError, "Too many mismatches"):
+            assert_close_with_mismatch_tolerance(actual, expected, max_mismatch_pct=0.1)
+
     def test_accuracy_scaled_atol_tolerates_reduction_noise(self) -> None:
         from helion.autotuner.accuracy import assert_close
 
@@ -413,6 +496,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                supports_precompile=lambda: True,
                 autotune_config_is_viable=lambda _config_spec, _config: True,
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
@@ -4190,7 +4274,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             candidates = candidate_groups[len(selected_limits) - 1]
             return iter(((current, *candidates[: selected_limit - 1]),))
 
-        search._pruned_pattern_search_from = qualification_path
+        def conditional_candidates(members, _leaf, constraints, known, limit):
+            parent = members[0]
+            added = next(
+                qualification_path(0, parent, known, constraints, selected_limit=2)
+            )
+            return parent, list(added[1:]), {}
+
+        search._flash_conditional_parent_candidates = conditional_candidates
 
         def benchmark(members, *, desc):
             self.assertEqual(desc, "Structural qualification 2:")
@@ -4345,8 +4436,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
-        search._pruned_pattern_search_from = lambda *_args, **_kwargs: iter(
-            ((initial, duplicate),)
+        search._flash_conditional_parent_candidates = Mock(
+            return_value=(initial, [duplicate], {})
         )
         search._budgeted_range = lambda *args: range(*args)
         search.set_generation = Mock()
@@ -5245,8 +5336,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(search.population[0], winning_child)
         metrics = search._autotune_metrics.search_phase_metrics
-        self.assertEqual(metrics["phase"], "cute_flash_structural_qualification_v22")
-        self.assertEqual(metrics["cute_flash_lane_policy_version"], 14)
+        self.assertEqual(metrics["phase"], "cute_flash_structural_qualification_v24")
+        self.assertEqual(metrics["cute_flash_lane_policy_version"], 16)
         self.assertTrue(metrics["completed"])
         self.assertEqual(metrics["qualification_rounds"], 2)
         self.assertEqual(metrics["qualification_rounds_started"], 2)
@@ -5679,8 +5770,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         witness = Mock(return_value=synthesized)
         search._flash_pipeline_lane_witness = witness
-        search._pruned_pattern_search_from = lambda _index, current, *_args, **_kwargs: (
-            iter(((current, conditional_children[current.config.config[stage_key]]),))
+        search._flash_conditional_parent_candidates = lambda members, *_args: (
+            members[0],
+            [conditional_children[members[0].config.config[stage_key]]],
+            {},
         )
         search._budgeted_range = lambda *args: range(*args)
         search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
@@ -5848,6 +5941,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return iter(((current, child),))
 
         search._pruned_pattern_search_from = qualification_path
+        _stub_flash_conditional_proposals(search)
         search._budgeted_range = lambda *args: range(*args)
         search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
         search.set_generation = Mock()
@@ -5992,6 +6086,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return iter(((current, child),))
 
         search._pruned_pattern_search_from = Mock(side_effect=qualification_path)
+        _stub_flash_conditional_proposals(search)
         search._budgeted_range = lambda *args: range(*args)
         search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
         search.set_generation = Mock()
@@ -6126,6 +6221,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 return iter(((current, child),))
 
             search._pruned_pattern_search_from = Mock(side_effect=qualification_path)
+            _stub_flash_conditional_proposals(search)
             search._budgeted_range = lambda *args: range(*args)
             search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
             search.set_generation = Mock()
@@ -6266,6 +6362,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return iter(((current, generated[(stage, call_index)]),))
 
         search._pruned_pattern_search_from = Mock(side_effect=qualification_path)
+        _stub_flash_conditional_proposals(search)
         search._budgeted_range = lambda *args: range(*args)
         search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
         search.set_generation = Mock()
@@ -6414,6 +6511,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return iter(((current, generated[id(current)]),))
 
         search._pruned_pattern_search_from = Mock(side_effect=qualification_path)
+        search._flash_conditional_parent_candidates = lambda members, *_args: (
+            members[0],
+            [generated[id(members[0])]],
+            {},
+        )
         search._flash_clc_depth_variant = Mock(return_value=conditional_repair)
         search._budgeted_range = lambda *args: range(*args)
         search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
@@ -6963,8 +7065,44 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 for wait_hint in range(start, start + neighbor_limit)
             ]
 
-        search._generate_flash_leaf_neighbors = generate
-        search.make_unbenchmarked = lambda flat: children[(flat[1], flat[2])]
+        by_flat = {
+            tuple(item.flat_values): item for item in [*initial, *children.values()]
+        }
+        search.radius = 2
+        search.config_gen.flatten = lambda config: next(
+            item.flat_values for item in by_flat.values() if item.config == config
+        )
+        search.config_gen.canonicalize_flat = lambda flat: (
+            flat,
+            by_flat[tuple(flat)].config,
+        )
+
+        def leaf_generation(_leaf, constraints):
+            def projections(flat, *, radius, limit, frozen_indices):
+                self.assertEqual(frozen_indices, [])
+                parent = by_flat[tuple(flat)]
+                return [
+                    CoordinateNeighborProjection(
+                        2,
+                        "cute_flash_wait_hint",
+                        None,
+                        flat[2],
+                        child_flat[2],
+                        "candidate",
+                        child_flat,
+                        by_flat[tuple(child_flat)].config,
+                    )
+                    for child_flat in generate(parent, _leaf, constraints, limit)
+                ]
+
+            return SimpleNamespace(
+                flatten=search.config_gen.flatten,
+                canonicalize_flat=search.config_gen.canonicalize_flat,
+                coordinate_neighbor_projections=projections,
+                flash_owned_coordinate_indices=lambda config: [],
+            )
+
+        search._flash_leaf_config_generation = leaf_generation
         surrogate_stages: list[int] = []
 
         def hostile_surrogate(candidates, count):
@@ -7192,6 +7330,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search._pruned_pattern_search_from = lambda _index, current, *_args, **_kwargs: (
             iter(((current, conditional),))
         )
+        _stub_flash_conditional_proposals(search)
 
         def transfer_variant(source, _overrides, *, expected_leaf):
             self.assertEqual(expected_leaf, compound_leaf)
@@ -7604,6 +7743,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return iter(((current, child),))
 
         search._pruned_pattern_search_from = qualification_path
+        _stub_flash_conditional_proposals(search)
         composition_sources: list[tuple[PopulationMember, int]] = []
 
         def clc_depth_variant(source, value, **_kwargs):
@@ -7781,6 +7921,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             return iter(((current, child),))
 
         search._pruned_pattern_search_from = qualification_path
+        _stub_flash_conditional_proposals(search)
         composition_sources: list[tuple[PopulationMember, int]] = []
 
         def clc_depth_variant(source, value, **_kwargs):
@@ -12812,6 +12953,8 @@ class TestCuteAutotuner(TestCase):
                     64,
                     num_bh=1,
                     standard_dense_output=True,
+                    target_device_capability=long_bound.config_spec.target_device_capability,
+                    tmem_rowmax_compatible=long_bound.config_spec._cute_flash_tmem_rowmax_compatible,
                 )
             )
             for key, value in effective.items():
@@ -13157,7 +13300,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                 algorithm = policy["algorithm"]
                 assert isinstance(algorithm, dict)
                 self.assertEqual(
-                    algorithm["cute_flash_config_generation_policy_version"], 4
+                    algorithm["cute_flash_config_generation_policy_version"], 8
                 )
 
         full_policy = full.cache_policy()
@@ -13174,7 +13317,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         assert isinstance(random_algorithm, dict)
         self.assertEqual(
             full_algorithm["cute_flash_lane_policy_version"],
-            14,
+            16,
         )
         self.assertEqual(
             full_algorithm["cute_flash_terminal_coordinate_refinement"],
@@ -13224,7 +13367,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search._cute_flash_lane_policy_enabled = True
         cute_flash_policy = search._algorithm_cache_policy()
         self.assertEqual(cute_flash_policy["lfbo_version"], 3)
-        self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 14)
+        self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 16)
         self.assertEqual(cute_flash_policy["cute_flash_starting_path_limit"], 17)
         self.assertEqual(cute_flash_policy["cute_flash_family_probe_path_limit"], 18)
         self.assertEqual(cute_flash_policy["cute_flash_maximum_path_capacity"], 18)
@@ -14953,6 +15096,7 @@ class TestAutotuneBudget(TestCase):
         # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
         # its attributes, so new __init__ fields don't need to be added here.
         config_spec = SimpleNamespace(
+            backend=SimpleNamespace(supports_precompile=lambda: True),
             default_config=lambda: helion.Config(block_sizes=[1]),
             compiler_seed_timeout_retry_repetitions=None,
             cute_flash_search_enabled=False,
@@ -15432,6 +15576,52 @@ class TestAutotuneBudget(TestCase):
         )
         self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
         self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
+
+    def test_trial_timestamps_track_measurements_and_new_source_aliases(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec.backend = SimpleNamespace(
+            generated_source_hash=lambda fn: fn.source_hash,
+            should_deduplicate_generated_sources=lambda config_spec: True,
+        )
+        clock = [0.0]
+
+        def compile_config(config, allow_print):
+            def fn():
+                return None
+
+            index = config.block_sizes[0]
+            fn.source_hash = "shared" if index in (1, 3) else str(index)
+            return fn
+
+        def benchmark(config, fn):
+            clock[0] += 10.0
+            return math.inf if config.block_sizes[0] == 2 else 1.0
+
+        provider.kernel.compile_config = compile_config
+        configs = [helion.Config(block_sizes=[index]) for index in range(1, 5)]
+        with (
+            patch("time.perf_counter", lambda: clock[0]),
+            patch.object(provider, "_benchmark_function", side_effect=benchmark),
+            patch.object(provider.log, "register_config", side_effect=repr),
+            patch.object(provider.log, "record_autotune_entry") as record_entry,
+        ):
+            first = provider.benchmark(configs[:2])
+            clock[0] = 100.0
+            second = provider.benchmark(configs[2:])
+
+        self.assertEqual([result.status for result in first], ["ok", "error"])
+        self.assertEqual([result.completed_at for result in first], [10.0, 20.0])
+        self.assertEqual([result.status for result in second], ["deduplicated", "ok"])
+        self.assertEqual([result.completed_at for result in second], [100.0, 110.0])
+        terminal_entries = {
+            call.args[0].config: call.args[0]
+            for call in record_entry.call_args_list
+            if call.args[0].status != "started"
+        }
+        for result in [*first, *second]:
+            self.assertEqual(
+                terminal_entries[result.config].completed_at, result.completed_at
+            )
 
     def test_compile_config_failure_has_unstarted_source_evidence(self) -> None:
         provider = self._make_stub_provider()

@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .published_scalars import PublishedScalarRequest
+    from .register_producers import RegisterProducerRequest
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
@@ -650,6 +652,11 @@ class CuteDeviceFunctionState:
         # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
         # no V-loop is sunk after all, codegen restarts with the knob off.
         self.vloop_sink_layout_applied = False
+        # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
+        # matmul product sum or a lane-loop reduction marker) assumed for the
+        # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
+        # block shape that differs from them on any axis.
+        self.multi_phase_lane_reduce_layouts: list[tuple[str, dict[int, int]]] = []
         self.explicit_rng_seed_names: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
@@ -674,8 +681,16 @@ class CuteDeviceFunctionState:
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
         self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
+        self.reshape_physical_fallbacks: dict[str, tuple[int, int, str]] = {}
         self.resident_sequence_regions: dict[int, SequenceRegion] = {}
         self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
+        # ``hl.atomic_add`` nodes that receive the per-K-lane partial sums of a
+        # scalar matmul whose K axis is split across a serial lane loop
+        # (``cute/matmul_fallback.py``), mapped to the lane variables of those
+        # loops.  Such an atomic varies along the loop although its index does
+        # not cover the loop's block, so the atomic lowering does not record
+        # it as uniform along the loop (``atomic_ops._cute_uniform_lane_vars``).
+        self.per_lane_atomic_lane_vars: dict[Node, set[str]] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).
@@ -694,6 +709,15 @@ class CuteDeviceFunctionState:
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
         self.matmul_fx_nodes: set[torch.fx.Node] = set()
+        # Pointwise ops on a tcgen05 epilogue chain whose block-id re-binding
+        # check waits for the store's epilogue classifier
+        # (``cute_reshape.check_pointwise_rebound_block_ids``).
+        self.deferred_rebound_pointwise_nodes: list[torch.fx.Node] = []
+        # ``build_inner_outputs_index_from_graphs`` of the codegen graphs,
+        # built once for those checks (the graphs are fixed per codegen).
+        self.rebound_inner_outputs_index: (
+            dict[int, tuple[torch.fx.Node | None, ...]] | None
+        ) = None
         # tcgen05 matmul anchor -> registered result var. Fused epilogue walks
         # from a store value back to the anchor and reuses the store value
         # registered under this result var, even when user-visible names were
@@ -789,6 +813,9 @@ class CuteDeviceFunctionState:
         # cross-warp reductions for (None when it rewrote nothing); the
         # launcher refuses to emit a different ``block=`` for such a body.
         self.shared_reduce_launch_block: tuple[int, int, int] | None = None
+        self.owned_root_block_dims: tuple[int, int, int] | None = None
+        self.published_scalar_requests: list[PublishedScalarRequest] = []
+        self.register_producer_requests: list[RegisterProducerRequest] = []
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None

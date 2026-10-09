@@ -101,7 +101,8 @@ The returned BoundKernel has these methods:
 - `__call__(*args)` - Execute with bound arguments
 - `autotune(args, **kwargs)` - Autotune this specific binding
 - `set_config(config)` - Set and compile specific configuration
-- `to_triton_code(config)` - Generate Triton source code
+- `to_code(config, options=...)` - Generate source code for the selected backend
+- `to_triton_code(config)` - Backward-compatible alias for `to_code(config)`
 - `compile_config(config)` - Compile for specific configuration
 
 ## Advanced Usage
@@ -131,6 +132,41 @@ bound.set_config(helion.Config(block_sizes=[64], num_warps=8))
 triton_code = bound.to_triton_code(config)
 print(triton_code)
 ```
+
+### Standalone Export
+
+Export a kernel with its launcher and helpers so it can run without Helion:
+
+```python
+from pathlib import Path
+
+bound = kernel.bind(args)
+source = bound.to_code(
+    config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+)
+Path("exported_kernel.py").write_text(source)
+```
+
+The exported module contains native backend source (for example, Triton or CuTe)
+and a host entrypoint with the original kernel's name. Import that entrypoint and
+call it directly; no `BoundKernel` is needed:
+
+```python
+from exported_kernel import my_kernel
+
+result = my_kernel(*args)
+```
+
+The module still requires PyTorch and the backend's runtime dependencies. Its
+input types and specialization constraints remain those of the exported kernel;
+export does not make a shape-specialized kernel accept arbitrary shapes. The
+source and launcher can be edited directly, without regenerating a Helion config.
+Unsupported backend export paths raise `NotImplementedError`.
+
+CuTe export currently requires `static_shapes=True` and static tensor layouts at
+each native launch. Dynamic
+launch layouts and plans that require additional descriptor preparation are not
+yet supported.
 
 ## Caching and Specialization
 

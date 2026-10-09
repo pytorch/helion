@@ -5283,14 +5283,18 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         assert spec._cute_flash_num_kv is not None
         common = {
             "num_bh": spec._cute_flash_num_bh,
+            "num_sm": spec.num_sm,
             "tensor_4d_heads": spec._cute_flash_tensor_4d_heads,
             "dtype": spec._cute_flash_dtype,
             "is_causal": spec._cute_flash_is_causal,
             "has_kv_tile_pruning": spec._cute_flash_has_kv_tile_pruning,
             "requires_ws_overlap": spec._cute_flash_requires_ws_overlap,
             "small_biased_candidate": spec._cute_flash_small_biased_candidate,
+            "tmem_rowmax_compatible": spec._cute_flash_tmem_rowmax_compatible,
+            "causal_resident_compatible": spec._cute_flash_causal_resident_compatible,
             "supports_tensor_4d_tma": spec._cute_flash_supports_tensor_4d_tma,
             "has_row_epilogue": spec._cute_flash_has_row_epilogue,
+            "has_score_modifiers": spec._cute_flash_has_score_modifiers,
             "target_device_capability": spec.target_device_capability,
             "block_size_targets": spec._cute_flash_block_size_target_list(),
             "plain_row_body": spec._cute_flash_plain_row_body,
@@ -6202,6 +6206,43 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
 
     name = "cute_tcgen05_cluster_m2_ffi"
     backend = "cute"
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # The flat-role / FFI direct-entry seed hard-requires the TMA A/B
+        # pipeline and the TMA store epilogue, which codegen enables only when
+        # both matmul operands and the output destination pass the TensorMap
+        # alignment proof; an unaligned input keeps the scalar SMEM producers,
+        # an under-aligned or N-major output takes the SIMT store body, and
+        # either way the seed config fails to compile. Decide that here,
+        # before any seed or the search surface consults
+        # ``full_tile_direct_entry_seed_eligible``, and even when heuristic
+        # seeds are disabled, because the default projection reads it too.
+        host_function = device_ir.host_function
+        if host_function is None or not env.config_spec.cute_tcgen05_search_enabled:
+            return frozenset()
+        from ..cute.cute_mma import host_function_matmul_operands_tma_provable
+
+        # Codegen proves a pointer-preserving host view operand through its
+        # input's exact metadata (``input_view_copy_facts``), which this hook
+        # therefore requests (the static-shapes bind key already carries it);
+        # evaluate the proof under that registration so the bind-time and
+        # codegen answers agree.
+        facts: frozenset[CompilerHeuristicSpecializationFact] = (
+            frozenset({"input_tensor_metadata"})
+            if env.settings.static_shapes
+            else frozenset()
+        )
+        saved = env.compiler_fact_specialization_facts
+        env.compiler_fact_specialization_facts = saved | facts
+        try:
+            provable = host_function_matmul_operands_tma_provable(env, host_function)
+        finally:
+            env.compiler_fact_specialization_facts = saved
+        env.config_spec.cute_tcgen05_matmul_operands_tma_provable = provable
+        return facts
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:

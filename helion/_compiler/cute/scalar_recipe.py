@@ -125,9 +125,17 @@ _OPERATOR_CALLS = frozenset(
     }
 )
 _BUILTINS = frozenset({"abs", "bool", "float", "int", "max", "min", "round"})
-_HELPERS = frozenset(
-    {"_cute_float4_e2m1fn_x2_to_float32", "_cute_fp8e4m3fn_to_float32"}
+# Quantized decode helpers from ``quantized_helpers.py``: side-effect-free PTX
+# ``cvt`` inline asm over a register operand, so a call may be replayed or moved
+# across lane-loop scopes.  Shared with ``tile_strategy``'s relocation proofs.
+PURE_DECODE_HELPERS = frozenset(
+    {
+        "_cute_float4_e2m1fn_x2_to_float32",
+        "_cute_fp8e4m3fn_to_float32",
+        "_cute_fp8e4m3fn_x2_to_float32",
+    }
 )
+_HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod"}
 _GLOBALS = _BUILTINS | _HELPERS | {"cutlass", "cute", "math", "operator"}
 _METADATA = frozenset({"iterator", "layout", "shape", "stride", "element_type"})
 _AstT = TypeVar("_AstT", bound=ast.AST)

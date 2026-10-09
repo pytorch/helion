@@ -279,12 +279,12 @@ def _materialize_config(
         and allowed_pid_types
         and supported["pid_type"] not in allowed_pid_types
     ):
-        # Replace an illegal pid_type with the highest-preference legal one rather
-        # than popping it: a plain pop lets ``normalize`` refill the field with
-        # ``VALID_PID_TYPES[0]`` (== 'flat'), which re-introduces the disallowed value
-        # (e.g. under ``hl.barrier()`` / a data-dependent grid bound / force-persistent,
-        # where 'flat' is disallowed). ``allowed_pid_types`` is guaranteed non-empty and
-        # order-preserving, so ``[0]`` is a valid persistent choice when 'flat' is stripped.
+        # Replace an illegal pid_type with the highest-preference legal one.
+        # ``allowed_pid_types`` is guaranteed non-empty and order-preserving, so
+        # ``[0]`` is a valid persistent choice when 'flat' is disallowed (e.g.
+        # under ``hl.barrier()`` / a data-dependent grid bound / force-persistent);
+        # it is also the value ``normalize`` fills in for a missing key, so the
+        # explicit replacement only keeps the intent visible here.
         supported["pid_type"] = allowed_pid_types[0]
     config_spec.normalize(supported, _fix_invalid=True)
     config = Config(**cast("dict[str, Any]", supported))
@@ -893,9 +893,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         """
         spec = env.config_spec
         out: dict[int, int] = {}
-        config_dict = dict(spec._base_default_config().config)
-        config_dict["block_sizes"] = block_sizes
-        candidate = Config.from_dict(config_dict)
+        candidate = Config.from_dict(
+            {
+                "block_sizes": block_sizes,
+                "reduction_loops": spec.reduction_loops._flat_config(
+                    spec, lambda fragment: fragment.default()
+                ),
+                **{
+                    name: fragment.default()
+                    for name, fragment in spec.user_defined_tunables.items()
+                },
+            }
+        )
         # A TUNABLE axis's per-program extent is simply the entry the config carries for it.
         # Read it straight from the list rather than round-tripping through the block-size
         # source: ``LoopSpecBlockSizeSource.from_config`` reaches for

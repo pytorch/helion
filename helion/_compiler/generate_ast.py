@@ -28,6 +28,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cute.cute_reshape import run_deferred_rebound_checks
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
@@ -177,6 +178,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # ``backend.py`` can grow the thread block to cover those lanes.
         self.cute_synthetic_arange_axes: dict[tuple[object, ...], int] = {}
         self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
+        # ``(load/store node, synthetic axis key) -> index position``: one
+        # synthetic lane may address only one index dim of a given access.
+        self.cute_synthetic_arange_access_positions: dict[
+            tuple[torch.fx.Node, object], int
+        ] = {}
         # CuTe only: stack of ``(if_node_id, branch_side)`` entries describing the
         # mutually-exclusive control-flow branch the current codegen is inside.
         # ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body of
@@ -526,6 +532,70 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.device_function.cute_state.warp_mma_gemm_plan = None
         raise exc.BackendUnsupported(
             "cute", "warp_mma GEMM family failed late validation"
+        )
+
+    def _try_codegen_computed_fragment_root(self) -> bool:
+        from .cute.computed_fragment import codegen_computed_fragment_root
+
+        return codegen_computed_fragment_root(self)
+
+    def _prefer_computed_fragment_root(self, root_graph_id: int) -> bool:
+        """Try fragment ownership before other schedules when this root needs it."""
+        env = CompileEnvironment.current()
+        if env.backend_name != "cute":
+            return False
+        from .cute.captured_reduction import captured_reduction_coordinates
+        from .cute.free_iota_reduction import free_iota_reductions
+        from .cute.free_iota_reduction import owned_iota_reduction_axes
+
+        graphs = self.host_function.device_ir.graphs
+        captured = captured_reduction_coordinates(
+            env, graphs, root_graph_id=root_graph_id
+        )
+        owned_iota_axes = owned_iota_reduction_axes(self)
+        free = any(
+            node.graph is graphs[root_graph_id].graph
+            and node.meta["lowering"].block_index not in owned_iota_axes
+            for node in free_iota_reductions(env, graphs)
+        )
+        config = self.device_function.config
+        spec = env.config_spec
+        return (
+            bool(captured)
+            or free
+            or any(
+                enabled and root_graph_id in roots
+                for enabled, roots in (
+                    (
+                        config.get("cute_fragment_producer_cache", False),
+                        spec.cute_fragment_producer_cache_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_warp_scan", False),
+                        spec.cute_fragment_warp_scan_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_register_loads", False),
+                        spec.cute_fragment_register_load_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_warp_results", False),
+                        spec.cute_fragment_warp_result_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_threads", 128) != 128,
+                        spec.cute_fragment_thread_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_scan", "serial") == "cooperative",
+                        spec.cute_fragment_scan_root_ids,
+                    ),
+                    (
+                        config.get("cute_fragment_reduction", "serial") == "warp",
+                        spec.cute_fragment_reduction_root_ids,
+                    ),
+                )
+            )
         )
 
     def _try_codegen_single_token_rank1_root(self) -> bool:
@@ -1620,8 +1690,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             self.statements_stack[-1]
                         )
                     root = root_graph_info.graph
+                    requested_fragment = self._prefer_computed_fragment_root(
+                        root_graph_info.graph_id
+                    )
                     if (
-                        not self._try_codegen_block_scaled_root()
+                        not (
+                            requested_fragment
+                            and self._try_codegen_computed_fragment_root()
+                        )
+                        and not self._try_codegen_block_scaled_root()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_gdn_recurrence_root()
@@ -1630,6 +1707,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_fixed_token_rank1_root()
                         and not self._try_codegen_warp_mma_gemm_root()
                         and not self._try_codegen_attention_flash_root()
+                        and not self._try_codegen_computed_fragment_root()
                     ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):
@@ -1663,16 +1741,27 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_suffix
                                 )
                             else:
-                                grid_state.add_body_barriers(wrapped_body)
-                                self.statements_stack[-1].extend(wrapped_body)
+                                # A shared launch can require coordinate and
+                                # surplus-mask setup even with no lane loops.
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_prefix
+                                )
+                                self.statements_stack[-1].extend(
+                                    grid_state.wrap_body(wrapped_body)
+                                )
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
                         else:
                             codegen_call_with_graph(self, root, [])
                 finally:
                     self.current_root_graph_info = previous_root_graph_info
 
-                # Flush deferred RDIM definitions now that block sizes are determined
-                # This ensures block size and rdim vars are defined in the correct order
-                self.device_function.flush_deferred_rdim_defs(self)
+                # Reduction preambles can register extents that depend on a later
+                # root's block size. Its cached name exists before its host
+                # assignment, so wait until every root has emitted its definitions.
+                if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                    self.device_function.flush_deferred_rdim_defs(self)
 
                 if isinstance(self.device_function.pid, ForEachProgramID):
                     self.device_function.pid.case_phases.append(
@@ -1842,6 +1931,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     resolve_pruned_lane_owners(
                         list(self.device_function.body),
                         self.device_function.cute_state.reshape_lane_fallbacks,
+                        physical_fallbacks=self.device_function.cute_state.reshape_physical_fallbacks,
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
                     )
                     self.device_function.body = normalize_nested_lane_reductions(
                         list(self.device_function.body),
@@ -2242,6 +2339,36 @@ def _generate_ast(
         env = CompileEnvironment.current()
         if (
             env.backend_name == "cute"
+            and config.get("cute_fragment_warp_scan", False)
+            and _codegen_graphs is None
+        ):
+            from .autotuner_heuristics.cute_fragment_warp_scan import (
+                validate_warp_scan_request,
+            )
+
+            validate_warp_scan_request(env, func.device_ir, config)
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_fragment_scan_exports", False)
+            and _codegen_graphs is None
+        ):
+            from .autotuner_heuristics.cute_fragment_scan_exports import (
+                validate_scan_exports,
+            )
+
+            validate_scan_exports(env, func.device_ir, config)
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_fragment_warp_producer_regions", False)
+            and _codegen_graphs is None
+        ):
+            from .autotuner_heuristics.cute_fragment_warp_producer_regions import (
+                validate_warp_producer_regions,
+            )
+
+            validate_warp_producer_regions(env, func.device_ir, config)
+        if (
+            env.backend_name == "cute"
             and config.get("cute_materialized_operand_schedule", "off") != "off"
         ):
             from .cute.packed_operand_codegen import generate_packed_operand
@@ -2427,6 +2554,21 @@ def _generate_ast(
                 load_transform=load_transform,
                 extra_params=extra_params,
             )
+        if (
+            env.backend.name == "cute"
+            and len(func.device_ir.phases) > 1
+            and config.pid_type == "flat"
+        ):
+            from .cute.ordered_phases import generate_ordered_phases
+
+            return generate_ordered_phases(
+                func,
+                config,
+                emit_repro_caller,
+                store_transform=store_transform,
+                load_transform=load_transform,
+                extra_params=extra_params,
+            )
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
@@ -2466,6 +2608,10 @@ def _generate_ast(
                     prefix_recorded = True
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
+            # Re-binding checks deferred from tcgen05 epilogue chains that no
+            # store drained (chains ending in an atomic or a specialized
+            # store path).
+            run_deferred_rebound_checks(codegen)
             if _bounded_cache_request is None:
                 kernel_def = codegen.device_function.codegen_function_def()
             else:
@@ -2474,6 +2620,7 @@ def _generate_ast(
                 )
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
+                or codegen.device_function.cute_state.owned_root_block_dims
             )
             if block_dims is not None:
                 from .cute.thread_block_projection import update_launch_block

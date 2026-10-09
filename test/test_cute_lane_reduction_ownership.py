@@ -2,25 +2,226 @@ from __future__ import annotations
 
 import ast
 from itertools import accumulate
+import math
+import operator
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
 from examples.layer_norm import layer_norm_bwd
+from examples.welford import welford
 import numpy as np
 import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import _target
 from test.test_cute_interchanged_store_dce import _PAIRS
 from test.test_cute_interchanged_store_dce import _execute as _execute_interchange
 from test.test_cute_interchanged_store_dce import _program
+from test.test_cute_sibling_layout_safety import _config
 
 import helion
+from helion._compiler import reduction_strategy as reductions
 from helion._compiler import tile_strategy as lanes
+from helion._compiler.ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from helion._compiler.ast_read_writes import ast_rename
+from helion._testing import DEVICE
+from helion._testing import TestCase
+from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
+import helion.language as hl
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _tile_id_reduced_store(x: torch.Tensor, out: torch.Tensor, masked: hl.constexpr):
+    for row, col in hl.tile(x.shape):
+        reduced = x[row, col].sum(-1)
+        if masked:
+            hl.store(out, [row, col.id], reduced, extra_mask=row.index % 2 == 0)
+        else:
+            out[row, col.id] = reduced
+    return out
+
+
+def _tile_id_program(rows: int, columns: int, masked: bool, threads=32):
+    x = torch.arange(rows * columns, dtype=torch.float32).reshape(rows, columns)
+    out = torch.full((rows, (columns + 127) // 128), -1.0)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_tile_id_reduced_store, (x, out, masked))
+        config = bound.config_spec.default_config()
+        config.config.update(
+            block_sizes=[4, 128], num_threads=[1, 1 if columns == 1 else threads]
+        )
+        code = bound.to_code(config)
+    return code, x, out
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("rows,columns", [(3, 65), (7, 129), (5, 513)])
+def test_tile_id_reduction_store_uses_scalar_tile_bounds(rows, columns, masked):
+    code, _x, _out = _tile_id_program(rows, columns, masked)
+    tree = ast.parse(code)
+    device = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and any(ast.unparse(d) == "cute.kernel" for d in n.decorator_list)
+    )
+    stores = [
+        n
+        for n in ast.walk(device)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "store"
+    ]
+    assert len(stores) == 1
+    parents = {
+        child: parent
+        for parent in ast.walk(device)
+        for child in ast.iter_child_nodes(parent)
+    }
+    node = stores[0]
+    guards = []
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, ast.For):
+            assert "lane_1" not in ast.unparse(node.target)
+        if isinstance(node, ast.If):
+            guards.append(ast.unparse(node.test))
+    assert any(f"tile_offset_1 < {columns}" in test for test in guards)
+    assert all("mask_1" not in test for test in guards)
+    assert any("lane_idx" in test for test in guards)
+    if masked:
+        assert "_cute_python_mod" in code or "% 2" in code
+
+
+def _execute_tile_id_program(code, x, output, *, require_unique_writes=True):
+    """Replay the actual scalar body with an exact-integer warp-sum oracle."""
+    from test.test_cute_affine_vector_io import _Pointer
+
+    current = [0, 0]
+    reads = dict.fromkeys(("scalar_loads", "scalar_stores"), 0)
+    writes = []
+    data = x.flatten().tolist()
+    result = output.flatten().tolist()
+
+    class OutputPointer(_Pointer):
+        def __add__(self, offset):
+            return OutputPointer(self.values, self.stats, self.offset + offset)
+
+        def store(self, value):
+            writes.append(self.offset)
+            super().store(value)
+
+    class Collectives(ast.NodeTransformer):
+        def visit_Call(self, node):
+            if ast.unparse(node.func) == "cute.arch.warp_reduction_sum":
+                assert len(node.args) == 1
+                assert [
+                    (kw.arg, ast.literal_eval(kw.value)) for kw in node.keywords
+                ] == [("threads_in_group", 32)]
+                return ast.Yield(node.args[0])
+            return self.generic_visit(node)
+
+    tree = ast.parse(code)
+    function = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and any(ast.unparse(d) == "cute.kernel" for d in n.decorator_list)
+    )
+    function.decorator_list = []
+    function = Collectives().visit(function)
+    namespace = {
+        "cutlass": SimpleNamespace(
+            Int32=int,
+            Int64=int,
+            Float32=np.float32,
+            Boolean=bool,
+            range_constexpr=range,
+        ),
+        "cute": SimpleNamespace(
+            arch=SimpleNamespace(
+                thread_idx=lambda: (current[1], 0, 0),
+                lane_idx=lambda: current[1],
+                block_idx=lambda: (current[0], 0, 0),
+            )
+        ),
+        "operator": operator,
+        "_cute_python_mod": operator.mod,
+        "_BLOCK_SIZE_0": 4,
+        "_BLOCK_SIZE_1": 128,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module([function], [])),
+            "<tile-id-replay>",
+            "exec",
+        ),
+        namespace,
+    )
+    args = {
+        "x": SimpleNamespace(
+            iterator=_Pointer(data, reads), layout=SimpleNamespace(stride=x.stride())
+        ),
+        "out": SimpleNamespace(
+            iterator=OutputPointer(result, reads),
+            layout=SimpleNamespace(stride=output.stride()),
+        ),
+    }
+    assert {arg.arg for arg in function.args.args} == set(args)
+    launch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_launcher"
+    )
+    grid = eval(
+        compile(ast.Expression(launch.args[1]), "<tile-id-grid>", "eval"), namespace
+    )
+    assert len(grid) == 1
+    for block in range(grid[0]):
+        current[0] = block
+        if not any(isinstance(n, ast.Yield) for n in ast.walk(function)):
+            current[1] = 0
+            namespace[function.name](**args)
+            continue
+        generators = [namespace[function.name](**args) for _ in range(32)]
+        sent = None
+        while True:
+            active = []
+            for thread, generator in enumerate(generators):
+                current[1] = thread
+                try:
+                    active.append(generator.send(sent))
+                except StopIteration:
+                    active.append(None)
+            if all(value is None for value in active):
+                break
+            assert all(value is not None for value in active)
+            # Integer-valued inputs keep all sums exactly representable FP32.
+            sent = np.float32(sum(float(value) for value in active))
+    if require_unique_writes:
+        assert len(writes) == len(set(writes)), "duplicate reduction writer"
+    return torch.tensor(result).reshape(output.shape), writes
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("rows,columns", [(3, 1), (3, 65), (7, 129), (5, 513)])
+def test_tile_id_reduction_store_generated_values(rows, columns, masked):
+    code, x, out = _tile_id_program(rows, columns, masked)
+    actual, writes = _execute_tile_id_program(code, x, out)
+    expected = torch.stack(
+        [x[:, col : col + 128].sum(-1) for col in range(0, columns, 128)], dim=-1
+    )
+    if masked:
+        expected[1::2] = -1
+    assert torch.equal(actual, expected)
+    assert len(writes) == ((rows + 1) // 2 if masked else rows) * out.shape[1]
 
 
 def _marker(owner: str | None, value: str = "partial") -> str:
@@ -31,6 +232,20 @@ def _marker(owner: str | None, value: str = "partial") -> str:
 
 def _source(body: list[ast.AST]) -> str:
     return ast.unparse(ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[]))
+
+
+def _stamped(body: list[ast.AST], lane_var: str = "lane") -> list[ast.AST]:
+    """Mark ``for vec_lane in cutlass.range_constexpr(V)`` loops as ``lane_var``'s
+    vector lane, as ``VecLaneWrapper`` does for the loops the strategies build."""
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "vec_lane"
+            ):
+                setattr(node, HELION_VEC_LANE_OF_ATTR, lane_var)
+    return body
 
 
 def _body(source: str) -> list[ast.AST]:
@@ -1324,3 +1539,1018 @@ def test_a_second_marker_input_reading_the_first_result_stays_declined() -> None
             _ROW_SUMS_RENAMES,
             _TWO_TENSORS_DISJOINT,
         )
+
+
+def _online_softmax_mm(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Attention-style online softmax: two carried row vectors (``m_i``,
+    ``l_i``) plus a matmul accumulator, with the key tile reduced by
+    ``amax`` / ``sum`` and contracted by the ``p @ v`` product."""
+    b, m_dim, d = q.size()
+    n = k.size(1)
+    out = torch.empty_like(q)
+    for tile_b, tile_m in hl.tile([b, m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, d], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            qk = torch.bmm(q[tile_b, tile_m, :], k[tile_b, tile_n, :].transpose(1, 2))
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            p = torch.exp2(qk - m_ij[:, :, None])
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            acc = torch.baddbmm(acc, p.to(v.dtype), v[tile_b, tile_n, :])
+            m_i = m_ij
+        out[tile_b, tile_m, :] = (acc / l_i[:, :, None]).to(out.dtype)
+    return out
+
+
+def _online_softmax_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    scores = torch.bmm(q.float(), k.float().transpose(1, 2))
+    # ``exp2(x) == exp(x * ln 2)``
+    probabilities = torch.softmax(scores * math.log(2.0), dim=-1)
+    return torch.bmm(probabilities, v.float()).to(q.dtype)
+
+
+def _online_softmax_kernel() -> helion.Kernel:
+    return helion.kernel(
+        _online_softmax_mm,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+
+
+# ``block_sizes=[1, 16, 16]`` is the default config of the attention examples:
+# the head_dim matmul reduction owns 64 threads on axis 0 (a persistent
+# reduction state), ``tile_m`` 2 threads on axis 1 and ``tile_n`` 4 threads on
+# axis 2 times a 4-iteration per-thread lane loop. The key-tile reductions are
+# therefore lane-strided AND have a live thread axis whose lanes sit 128
+# threads apart.
+_ONLINE_SOFTMAX_BLOCKS = [1, 16, 16]
+
+
+def _emitted_tile_reduction_markers(
+    monkeypatch: pytest.MonkeyPatch, config: helion.Config
+) -> tuple[str, list[lanes._LaneReduceMarker]]:
+    """CPU-only codegen of the online-softmax kernel; capture every lane
+    reduction marker ``BlockReductionStrategy`` emits and return the code."""
+    captured: list[str] = []
+    original = reductions.BlockReductionStrategy._lane_loop_marker_expr
+
+    def capture(
+        self: reductions.BlockReductionStrategy, *args: object, **kwargs: object
+    ) -> str:
+        expression = original(self, *args, **kwargs)  # pyrefly: ignore [bad-argument-type]
+        captured.append(expression)
+        return expression
+
+    monkeypatch.setattr(
+        reductions.BlockReductionStrategy, "_lane_loop_marker_expr", capture
+    )
+    q = torch.empty((4, 256, 64), dtype=torch.bfloat16)
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(_online_softmax_kernel(), (q, q, q))
+        code = bound.to_code(config)
+    markers = []
+    for expression in captured:
+        marker = lanes._is_lane_reduce_marker_assign(
+            ast.parse(f"reduced = {expression}").body[0]
+        )
+        assert marker is not None
+        markers.append(marker)
+    return code, markers
+
+
+@skipUnlessBackends(["cute"])
+def test_lane_looped_tile_reduction_marker_uses_full_launch_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lane-looped tile block with a live thread axis must emit the two-pass
+    marker (not a thread-only strided reduce), and the marker's physical group
+    must come from the full launch layout: ``pre`` counts the 64 persistent
+    reduction threads on axis 0 times the 2 ``tile_m`` threads on axis 1, so
+    the finalize folds the 4 ``tile_n`` threads that are 128 lanes apart."""
+    code, markers = _emitted_tile_reduction_markers(
+        monkeypatch, helion.Config(block_sizes=_ONLINE_SOFTMAX_BLOCKS)
+    )
+    assert [marker.reduction_type for marker in markers] == ["max", "sum"]
+    owners = {marker.owner_lane for marker in markers}
+    assert len(owners) == 1 and next(iter(owners))
+    for marker in markers:
+        assert (
+            marker.threads_in_group,
+            marker.group_pre,
+            marker.group_span,
+            marker.group_count,
+        ) == (4, 128, 512, 1)
+        # Linear thread index over all three launch axes: axis 1 strides by
+        # the 64 persistent threads, axis 2 by 64 * 2.
+        assert "cute.arch.thread_idx()[0]" in marker.group_lane_expr
+        assert "thread_idx()[1])) * cutlass.Int32(64)" in marker.group_lane_expr
+        assert "thread_idx()[2])) * cutlass.Int32(128)" in marker.group_lane_expr
+    # The post-pass finalized both markers with the cross-warp grouped reduce
+    # of that physical group; no thread-only partial reduce survives.
+    assert "_helion_lane_reduce" not in code
+    assert code.count("pre=128, group_span=512, group_count=1") >= 2
+    assert "_cute_grouped_reduce_warp(" not in code
+
+
+@skipUnlessBackends(["cute"])
+def test_vectorized_lane_tile_reduction_declines_before_emission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cute_vector_widths > 1`` on the reduced key tile nests the per-element
+    body in a constexpr vector lane. The ``amax`` / ``sum`` keep the legacy
+    single-pass flow (V-folded by ``hoist_warp_reduce``), but the owned
+    ``p @ v`` contribution marker sits inside the vector lane where it used to
+    be silently restored to its raw per-lane input (25% wrong attention
+    output); it must decline instead."""
+    with pytest.raises(helion.exc.BackendUnsupported, match="constexpr vector lane"):
+        _emitted_tile_reduction_markers(
+            monkeypatch,
+            helion.Config(
+                block_sizes=_ONLINE_SOFTMAX_BLOCKS, cute_vector_widths=[1, 1, 1, 4]
+            ),
+        )
+
+
+def test_constexpr_vector_lane_is_not_a_serial_interchange_loop() -> None:
+    """The interchange pass must not treat a ``cutlass.range_constexpr``
+    unroll as a serial device loop: an owned marker nested in it is left to
+    the lane split, which folds the vector lane into its accumulate pass
+    (all ``lanes x V`` elements, one warp combine, the carried update once)
+    instead of restoring the raw input."""
+    vector_loop = ast.parse(
+        f"for vec_lane in cutlass.range_constexpr(4):\n"
+        f"    partial = lane + vec_lane\n"
+        f"    reduced = {_marker('lane')}\n"
+        f"    carried = carried + reduced"
+    ).body[0]
+    _stamped([vector_loop])
+    assert not lanes._is_serial_for(vector_loop)
+    loop = lanes._create_lane_loop("lane", 2, [vector_loop])
+    unchanged = lanes.interchange_lane_outside_serial_reductions([loop])
+    assert "_helion_lane_reduce" in _source(unchanged)
+    lowered = lanes.split_lane_loop_reductions(unchanged)
+    assert [ast.unparse(stmt) for stmt in lowered] == [
+        "reduced_lane_acc = cutlass.Float32(0)",
+        (
+            "for lane in range(2):\n"
+            "    for vec_lane in cutlass.range_constexpr(4):\n"
+            "        partial = lane + vec_lane\n"
+            "        reduced_lane_acc = reduced_lane_acc + cutlass.Float32(partial)"
+        ),
+        "reduced = cute.arch.warp_reduction_sum(reduced_lane_acc, threads_in_group=32)",
+        "carried = carried + reduced",
+    ]
+
+
+def _vector_lane_marker(value: str) -> str:
+    return lanes._lane_reduce_marker_expr(
+        value, "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+
+
+def test_vector_lane_markers_fold_into_the_lane_split() -> None:
+    """A lane loop whose markers sit in its constexpr vector lane (the
+    per-element body of a ``cute_vector_widths > 1`` tile axis below the
+    vector load of each lane step, named ``vec_<lane>`` by the strategies) is
+    split as the flat lane loop over the lane prefix plus the vector elements,
+    and every emitted pass re-nests the vector lane: welford's chunk sum and
+    its dependent centered sum reduce over all ``lanes x V`` elements, the
+    prefix stays per lane step and the lane-invariant carried updates run
+    once.  The fold admits no memory write, so the passes are the accumulate
+    passes alone and the results leave the loop through the carries."""
+    text = (
+        "base = lane * 4\n"
+        "packet = base + 1\n"
+        "for vec_lane in cutlass.range_constexpr(4):\n"
+        "    count_copy = count\n"
+        "    m2_copy = m2_total\n"
+        "    element = packet + vec_lane\n"
+        f"    total = {_vector_lane_marker('element')}\n"
+        "    mean = total / 8\n"
+        "    centered = element - mean\n"
+        "    squared = centered * centered\n"
+        f"    m2 = {_vector_lane_marker('squared')}\n"
+        "    next_count = count_copy + total\n"
+        "    next_m2_total = m2_copy + m2\n"
+    )
+    renames = {
+        "next_count": "count",
+        "count": "count",
+        "next_m2_total": "m2_total",
+        "m2_total": "m2_total",
+    }
+    lowered = lanes.split_lane_loop_reductions(
+        [
+            *_body("count = 0.0\nm2_total = 0.0"),
+            lanes._create_lane_loop("lane", 2, _stamped(_body(text))),
+            *_body("late_out.store(count)\n(late_out.iterator + 1).store(m2_total)"),
+        ],
+        rename_groups=renames,
+    )
+    code = _source(lowered)
+    assert "_helion_lane_reduce" not in code
+    assert "vec_lane = lane" not in code
+    lane_loops = [stmt for stmt in lowered if isinstance(stmt, ast.For)]
+    # One accumulate pass per dependency level; nothing is left for a
+    # consume pass.
+    assert len(lane_loops) == 2
+    for lane_loop in lane_loops:
+        assert ast.unparse(lane_loop.body[0]) == "base = lane * 4"
+        vector_lane = lane_loop.body[-1]
+        assert isinstance(vector_lane, ast.For)
+        assert ast.unparse(vector_lane.target) == "vec_lane"
+        assert ast.unparse(vector_lane.iter) == "cutlass.range_constexpr(4)"
+    assert "total_lane_acc = total_lane_acc + cutlass.Float32(element)" in code
+    assert "m2_lane_acc = m2_lane_acc + cutlass.Float32(squared)" in code
+    assert code.count("next_count = count_copy + total") == 1
+    assert code.count("next_m2_total = m2_copy + m2") == 1
+    values, calls = _execute_scalars(lowered, renames)
+    elements = [lane * 4 + 1 + vec for lane in range(2) for vec in range(4)]
+    total = float(sum(elements))
+    mean = total / 8
+    m2 = sum((element - mean) ** 2 for element in elements)
+    assert values["late_out"] == {0: total, 1: m2}
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            f"    total = {_vector_lane_marker('base')}\n"
+            "    scaled = base * total\n",
+            id="input-independent-of-the-element",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = base + vec_lane\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    flushed = element - total\n"
+            "(out.iterator + lane).store(flushed)\n",
+            id="store-flush-after-the-vector-lane",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = _cute_grouped_reduce_shared_two_stage("
+            "cutlass.Float32(base + vec_lane), 'sum', cutlass.Float32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+            "pre=1, group_span=64, group_count=1)\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    scaled = element * total\n",
+            id="collective-in-the-vector-lane",
+        ),
+        pytest.param(
+            # Lane 1 loads the packet lane 0 stores; the rolled loop orders
+            # lane 0's store first, a fold would run every lane's loads first.
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = (x.iterator + base + vec_lane).load()\n"
+            "    previous = (x.iterator + base + vec_lane - 4).load()\n"
+            "    summed = element + previous\n"
+            f"    total = {_vector_lane_marker('summed')}\n"
+            "    (x.iterator + base + vec_lane).store(element * total)\n",
+            id="aliasing-store-in-the-vector-lane",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for vec_lane in cutlass.range_constexpr(4):\n"
+            "    element = base + vec_lane\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    packet[vec_lane] = element - total\n",
+            id="fragment-write-in-the-vector-lane",
+        ),
+        pytest.param(
+            "base = lane * 4\n"
+            "for step in cutlass.range_constexpr(4):\n"
+            "    element = base + step\n"
+            f"    total = {_vector_lane_marker('element')}\n"
+            "    scaled = element * total\n",
+            id="foreign-constexpr-loop",
+        ),
+    ],
+)
+def test_vector_lane_markers_outside_the_fold_shape_decline(text: str) -> None:
+    """The fold admits only the per-element shape it proves: every marker
+    input depends on the vector element (the original body reduces a
+    per-lane-step value V times), nothing follows the vector lane (a vector
+    store flush reads values of every element), no collective sits in it (the
+    passes re-run the element producers), nothing in the loop writes memory
+    (the alias proof runs on the flat body, where the ``vec_lane = lane``
+    sentinel makes it read a packet-shifted address in the wrong iteration
+    space: the scalar analog of the aliasing shape declines as a reordered
+    aliasing write) and the constexpr loop is this lane's own ``vec_lane``
+    wrapper (any other constexpr loop is a serial unroll)."""
+    loop = lanes._create_lane_loop("lane", 4, _stamped(_body(text)))
+    with pytest.raises(helion.exc.BackendUnsupported, match="constexpr vector lane"):
+        lanes.split_lane_loop_reductions([loop])
+
+
+def test_owned_marker_in_serial_loop_without_store_declines() -> None:
+    """An owned marker inside a genuine serial loop that no broadcast store
+    consumes has no interchange; its raw per-lane input is not a complete
+    reduction, so the pass declines rather than restoring it."""
+    serial_loop = ast.parse(
+        f"for mb in range(0, 64, 8):\n"
+        f"    partial = lane + mb\n"
+        f"    reduced = {_marker('lane')}\n"
+        f"    carried = carried + reduced"
+    ).body[0]
+    assert lanes._is_serial_for(serial_loop)
+    loop = lanes._create_lane_loop("lane", 8, [serial_loop])
+    with pytest.raises(helion.exc.BackendUnsupported, match="no proved complete"):
+        lanes.interchange_lane_outside_serial_reductions([loop])
+    legacy_loop = lanes._create_lane_loop(
+        "lane",
+        8,
+        [
+            ast.parse(
+                f"for mb in range(0, 64, 8):\n"
+                f"    partial = lane + mb\n"
+                f"    reduced = {_marker(None)}\n"
+                f"    carried = carried + reduced"
+            ).body[0]
+        ],
+    )
+    restored = _source(lanes.interchange_lane_outside_serial_reductions([legacy_loop]))
+    assert "reduced = partial" in restored and "_helion_lane_reduce" not in restored
+
+
+@onlyBackends(["cute"])
+class TestLaneLoopedTileReductionNumerics(TestCase):
+    def _inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        return tuple(  # pyrefly: ignore [bad-return]
+            torch.randn(4, 256, 64, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+
+    def test_online_softmax_default_attention_config(self) -> None:
+        args = self._inputs()
+        code, out = code_and_output(
+            _online_softmax_kernel(), args, block_sizes=_ONLINE_SOFTMAX_BLOCKS
+        )
+        torch.testing.assert_close(
+            out.float(), _online_softmax_reference(*args).float(), rtol=1e-1, atol=1e-1
+        )
+        self.assertNotIn("_helion_lane_reduce", code)
+        self.assertIn("pre=128, group_span=512, group_count=1", code)
+
+    def test_welford_vector_lane_fold_with_padded_columns(self) -> None:
+        """welford's scalar-stats sibling layout nests the chunk count, sum
+        and dependent centered sum in the vector lane of its 128-wide column
+        tile (one thread, 32 packets of 4 elements). The owned reduction
+        flattens both coordinates and folds all 128 elements of a chunk; the
+        raw per-element restore
+        this shape used to get (one element per Welford merge) only matched
+        for fully valid rows and divided by a zero count on the 48 padded
+        columns of an 80-column row."""
+        torch.manual_seed(0)
+        columns = 80
+        weight = torch.rand(columns, device=DEVICE, dtype=torch.float32)
+        bias = torch.rand(columns, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(17, columns, device=DEVICE, dtype=torch.float32)
+        kernel = helion.kernel(
+            welford.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        )
+        bound = kernel.bind((weight, bias, x))
+        config = _config("scalar_stats")
+        code = bound.to_code(config)
+        out = bound.compile_config(config)(weight, bias, x)
+        expected = torch.nn.functional.layer_norm(x, (columns,), weight, bias, eps=1e-5)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        self.assertNotIn("_helion_lane_reduce", code)
+        self.assertIn("for lane_1 in range(128):", code)
+        self.assertIn("lane_1 // 4", code)
+        self.assertIn("lane_1 % 4", code)
+        self.assertIn("sum_2_lane_acc = sum_2_lane_acc + cutlass.Float32(chunk)", code)
+        self.assertIn(
+            "m2_c_lane_acc = m2_c_lane_acc + cutlass.Float32(_mask_to_2)", code
+        )
+
+    def test_online_softmax_vectorized_key_tile_declines(self) -> None:
+        """The GPU bind takes the same decline the CPU-only
+        ``test_vectorized_lane_tile_reduction_declines_before_emission`` pins:
+        the owned ``p @ v`` contribution marker sits inside the constexpr
+        vector lane, which has no proved two-pass lowering."""
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "constexpr vector lane"
+        ):
+            code_and_output(
+                _online_softmax_kernel(),
+                self._inputs(),
+                block_sizes=_ONLINE_SOFTMAX_BLOCKS,
+                cute_vector_widths=[1, 1, 1, 4],
+            )
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_owned_marker_input_updated_by_aliased_serial_loop_splits(
+    observed: bool,
+) -> None:
+    marker = lanes._lane_reduce_marker_expr(
+        "row_sums", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    # The inner serial loop updates ``row_sums`` through the SSA alias
+    # ``next_row_sums`` that only the final rename pass restores
+    # (jagged_layer_norm's per-feature row sums).
+    text = (
+        "total_copy = total\n"
+        "row_sums = 0.0\n"
+        "for step in range(3):\n"
+        "    row_sums_copy = row_sums\n"
+        "    next_row_sums = row_sums_copy + (lane + 1)\n"
+        f"reduced = {marker}\n"
+        "next_total = total_copy + reduced\n"
+    )
+    if observed:
+        text += "(out.iterator + lane).store(row_sums + reduced)\n"
+    renames = {
+        "next_row_sums": "row_sums",
+        "row_sums": "row_sums",
+        "next_total": "total",
+        "total": "total",
+    }
+
+    def make() -> list[ast.AST]:
+        return [
+            *_body("total = 6.0"),
+            lanes._create_lane_loop("lane", 8, _body(text)),
+            *_body("late_out.store(total)"),
+        ]
+
+    # Without the recorded alias the update loop is an unproved producer.
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="complete per-lane restore"
+    ):
+        lanes.split_lane_loop_reductions(make())
+    lowered = lanes.split_lane_loop_reductions(make(), rename_groups=renames)
+    code = _source(lowered)
+    assert "_helion_lane_reduce" not in code
+    assert code.count("next_total = total_copy + reduced") == 1
+    values, calls = _execute_scalars(lowered, renames)
+    # Each lane accumulates 3 * (lane + 1); the complete lane sum is 108.
+    assert values["late_out"] == {0: 114.0} and calls == 0
+    if observed:
+        # The per-lane row sum stays lane-varying after the alias is restored.
+        assert values["out"] == {lane: float(3 * (lane + 1) + 108) for lane in range(8)}
+
+
+def test_dependent_markers_with_unduplicatable_producer_decline() -> None:
+    first = lanes._lane_reduce_marker_expr(
+        "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    second = lanes._lane_reduce_marker_expr(
+        "centered", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    # ``acc`` is re-derived by a collective under an SSA alias and feeds a
+    # chain of dependent reductions whose result updates a carried scalar, so
+    # neither the stash nor the dependent split may re-run the producer.
+    loop = lanes._create_lane_loop(
+        "lane",
+        8,
+        _body(
+            "total_copy = total\n"
+            "acc = 0.0\n"
+            "for step in range(2):\n"
+            "    acc_copy = acc\n"
+            "    partial = _cute_grouped_reduce_shared_two_stage("
+            "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+            "pre=1, group_span=64, group_count=1)\n"
+            "    next_acc = acc_copy + partial\n"
+            f"reduced = {first}\n"
+            "centered = acc - reduced\n"
+            f"reduced_again = {second}\n"
+            "next_total = total_copy + reduced_again\n"
+            "(out.iterator + lane).store(centered + reduced_again)"
+        ),
+    )
+    renames = {
+        "next_acc": "acc",
+        "acc": "acc",
+        "next_total": "total",
+        "total": "total",
+    }
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="complete per-lane restore"
+    ):
+        lanes.split_lane_loop_reductions(
+            [*_body("total = 6.0"), loop, *_body("late_out.store(total)")],
+            rename_groups=renames,
+        )
+
+
+@pytest.mark.parametrize("extent", [8, 512])
+def test_register_stash_declines_beyond_its_lane_extent_limit(extent: int) -> None:
+    marker = lanes._lane_reduce_marker_expr(
+        "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    # matmul_layernorm's shape: a collective K loop re-derives the per-lane
+    # ``acc`` that the reduction over the lane axis consumes.
+    loop = lanes._create_lane_loop(
+        "lane",
+        extent,
+        _body(
+            "acc = 0.0\n"
+            "for step in range(2):\n"
+            "    acc_copy = acc\n"
+            "    partial = _cute_grouped_reduce_shared_two_stage("
+            "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+            "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+            "pre=1, group_span=64, group_count=1)\n"
+            "    acc_1 = acc_copy + partial\n"
+            f"reduced = {marker}\n"
+            "centered = acc - reduced\n"
+            "(out.iterator + lane).store(centered)"
+        ),
+    )
+    renames = {"acc_1": "acc", "acc": "acc"}
+    if extent > 256:
+        # Each lane's live-out value needs one register slot per lane, so the
+        # stash does not apply and no other path lowers this shape.
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="complete per-lane restore"
+        ):
+            lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+        return
+    lowered = lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+    values, calls = _execute_scalars(lowered, renames)
+    # The collective runs once per lane and K step, in the stash pass only.
+    assert calls == 2 * extent
+    reduced = 128.0 * sum(range(1, extent + 1))
+    assert values["out"] == {
+        lane: 128.0 * (lane + 1) - reduced for lane in range(extent)
+    }
+
+
+@pytest.mark.parametrize("feeds_reduction", [False, True])
+def test_collective_outside_the_reduction_slice_runs_once_per_lane(
+    feeds_reduction: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = lanes._lane_reduce_marker_expr(
+        "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    collective = (
+        "_cute_grouped_reduce_shared_two_stage("
+        "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+        "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+        "pre=1, group_span=64, group_count=1)"
+    )
+    # rms_norm_bwd's resident-row seed: the grad_weight sum over the row lanes
+    # is independent of the per-row thread-group mean consumed by the grad_x
+    # store, so the two-pass split runs that collective once per lane in the
+    # consume pass exactly as the original loop did.  Only a collective that
+    # feeds the reduction AND a live lane-varying consumer would run in both
+    # passes; once the register stash has declined, that shape must decline.
+    if feeds_reduction:
+        text = f"partial = {collective}\nreduced = {marker}\nrow_mean = partial\n"
+    else:
+        text = f"partial = lane + 1\nreduced = {marker}\nrow_mean = {collective}\n"
+    text += "(out.iterator + lane).store(row_mean + reduced)"
+    loop = lanes._create_lane_loop("lane", 8, _body(text))
+    monkeypatch.setattr(lanes, "_split_lane_loop_with_register_stash", lambda *_: None)
+    if feeds_reduction:
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="complete per-lane restore"
+        ):
+            lanes.split_lane_loop_reductions([loop])
+        return
+    lowered = lanes.split_lane_loop_reductions([loop])
+    code = _source(lowered)
+    assert "_helion_lane_reduce" not in code
+    assert code.count("_cute_grouped_reduce_shared_two_stage(") == 1
+    # The collective follows the finalized reduction (in the consume loop).
+    assert code.index("_cute_grouped_reduce_shared_two_stage(") > code.index(
+        "reduced = "
+    )
+    values, calls = _execute_scalars(lowered)
+    assert calls == 8
+    assert values["out"] == {lane: float(64 * (lane + 1) + 36) for lane in range(8)}
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _tile_id_multi_axis_store(x: torch.Tensor, out: torch.Tensor):
+    for row, left, right in hl.tile(x.shape):
+        out[row, left.id, right.id] = x[row, left, right].sum(-1).sum(-1)
+    return out
+
+
+@pytest.mark.parametrize("shape", [(3, 7, 65), (5, 17, 129)])
+def test_tile_id_multi_axis_keeps_nested_reduction_rejection(shape):
+    x = torch.ones(shape)
+    out = torch.empty((shape[0], (shape[1] + 7) // 8, (shape[2] + 127) // 128))
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_tile_id_multi_axis_store, (x, out))
+        config = bound.config_spec.default_config()
+        config.config.update(block_sizes=[4, 8, 128], num_threads=[1, 1, 32])
+        with pytest.raises(helion.exc.BackendUnsupported, match="nested reduction"):
+            bound.to_code(config)
+
+
+@pytest.mark.parametrize("shape", [(0, 65), (3, 0)])
+def test_tile_id_empty_domain_has_no_output_writes(shape):
+    code, x, out = _tile_id_program(*shape, False)
+    assert out.numel() == 0
+    # The ordinary launcher receives an empty grid. No scalar tile mask
+    # can manufacture an output when the logical domain contains no tiles.
+    assert x.numel() == 0
+    host = next(
+        n
+        for n in ast.parse(code).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_tile_id_reduced_store"
+    )
+    launch = next(
+        n
+        for n in ast.walk(host)
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == "_launcher"
+    )
+    constants = {"_BLOCK_SIZE_0": 4, "_BLOCK_SIZE_1": 128}
+    assert 0 in eval(
+        compile(ast.Expression(launch.args[1]), "<empty-grid>", "eval"), constants
+    )
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_tile_id_reduction_store_native(masked):
+    x = torch.arange(7 * 129, device=DEVICE, dtype=torch.float32).reshape(7, 129)
+    out = torch.full((7, 2), -1.0, device=DEVICE)
+    bound = _tile_id_reduced_store.bind((x, out, masked))
+    config = bound.config_spec.default_config()
+    config.config.update(block_sizes=[4, 128], num_threads=[1, 32])
+    actual = bound.compile_config(config)(x, out, masked)
+    expected = torch.stack([x[:, :128].sum(-1), x[:, 128:].sum(-1)], -1)
+    if masked:
+        expected[1::2] = -1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_tile_id_wider_sibling_keeps_original_mask_and_arbitration():
+    from helion.language.memory_ops import _cute_tile_id_thread_extent_is_complete
+
+    observed = []
+
+    def wider(state, owner, block_id):
+        axis = owner.block_thread_axes.get(block_id)
+        if axis is None:
+            return _cute_tile_id_thread_extent_is_complete(state, owner, block_id)
+        planned = list(state.device_function.tile_strategy.thread_block_dims())
+        planned[axis] = owner.thread_axis_sizes[axis] * 2
+        with patch.object(
+            state.device_function.tile_strategy,
+            "thread_block_dims",
+            return_value=tuple(planned),
+        ):
+            answer = _cute_tile_id_thread_extent_is_complete(state, owner, block_id)
+        observed.append(answer)
+        return answer
+
+    with (
+        patch(
+            "helion.language.memory_ops._cute_tile_id_thread_extent_is_complete",
+            side_effect=wider,
+        ),
+        pytest.raises(helion.exc.BackendUnsupported),
+    ):
+        _tile_id_program(3, 129, False)
+    assert observed and not any(observed)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _tile_id_serial_store(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    begin: hl.constexpr,
+    end: hl.constexpr,
+    masked: hl.constexpr,
+):
+    for row in hl.tile(x.size(0)):
+        for col in hl.tile(begin, end):
+            value = x[row, col].sum(-1)
+            if masked:
+                hl.store(out, [row, col.id], value, extra_mask=row.index % 2 == 0)
+            else:
+                out[row, col.id] = value
+    return out
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("begin,end", [(1, 130), (65, 194), (129, 258)])
+def test_tile_id_serial_tail_preserves_element_mask(begin, end, masked):
+    # Only the first element of the final tile is live. Later serial lanes must
+    # retain their original mask. Dense exact-valued inputs also expose a store
+    # of one lane's partial sum in place of the complete first tile's reduction.
+    x = torch.arange(3 * 513, dtype=torch.float32).reshape(3, 513) % 17 + 1
+    out = torch.full((3, 5), -1.0)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_tile_id_serial_store, (x, out, begin, end, masked))
+        config = bound.config_spec.default_config()
+        config.config.update(block_sizes=[4, 128], num_threads=[1, 32])
+        code = bound.to_code(config)
+        # This serial ownership path must remain byte-identical to the original
+        # element-mask route; the root-grid optimization is tested separately.
+        with patch(
+            "helion.language.memory_ops._cute_tile_id_thread_extent_is_complete",
+            return_value=False,
+        ):
+            original_mask_code = bound.to_code(config)
+    assert code == original_mask_code
+    actual, writes = _execute_tile_id_program(code, x, out, require_unique_writes=False)
+    expected = out.clone()
+    for start in range(begin, end, 128):
+        expected[:, start // 128] = x[:, start : min(start + 128, end)].sum(-1)
+    if masked:
+        expected[1::2] = -1
+    assert torch.equal(actual, expected)
+    # Four sequential writes of the same complete first-tile value and one
+    # nonempty tail write per live row, with no concurrent thread duplicates.
+    assert len(writes) == (2 if masked else 3) * 5
+    assert "if cutlass.Int32(cute.arch.lane_idx()) % 32 == 0:" in code
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("masked", [False, True])
+def test_tile_id_serial_tail_native(masked):
+    x = torch.arange(3 * 513, device=DEVICE, dtype=torch.float32).reshape(3, 513)
+    x = x % 17 + 1
+    out = torch.full((3, 5), -1.0, device=DEVICE)
+    bound = _tile_id_serial_store.bind((x, out, 1, 130, masked))
+    config = bound.config_spec.default_config()
+    config.config.update(block_sizes=[4, 128], num_threads=[1, 32])
+    actual = bound.compile_config(config)(x, out, 1, 130, masked)
+    expected = torch.full_like(out, -1.0)
+    expected[:, 0] = x[:, 1:129].sum(-1)
+    expected[:, 1] = x[:, 129]
+    if masked:
+        expected[1::2] = -1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _bounded_store_coordinate_definitions():
+    definitions = {}
+    for text in (
+        "for base in range(1, 130, _BLOCK_SIZE_1): pass",
+        "for serial in range(4): pass",
+    ):
+        definitions = lanes._loop_body_scalar_definitions(
+            _body(text)[0], definitions, {}
+        )
+    return definitions
+
+
+@pytest.mark.parametrize("scale", [1, 2, 4, 32])
+@pytest.mark.parametrize("comparison", ["<", "<="])
+def test_bounded_store_predicate_selects_zero_without_losing_live_writes(
+    scale, comparison
+):
+    expression = f"base + cutlass.Int32(cute.arch.thread_idx()[0]) * {scale} + serial {comparison} 130"
+    predicate = ast.parse(expression, mode="eval").body
+    definitions = _bounded_store_coordinate_definitions()
+    assert lanes._predicate_accepts_zero_thread_axis(
+        predicate, 0, {}, definitions, require_bounded=True
+    )
+    assert not lanes._predicate_accepts_zero_thread_axis(predicate, 0, {}, definitions)
+    # Check the implication, including empty serial tails: an enabled thread
+    # implies that thread zero is enabled; an empty lane stays empty.
+    for base in (1, 65, 129):
+        for serial in range(4):
+            values = [base + thread * scale + serial for thread in range(1024)]
+            live = [
+                value < 130 if comparison == "<" else value <= 130 for value in values
+            ]
+            assert not any(live) or live[0]
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "tid > 0",
+        "tid >= 1 and tid < 130",
+        "base - tid * 4 + serial < 130",
+        "tid % 2 == 1",
+        "(tid << 1) < 130",
+        "unknown + tid < 130",
+        "cutlass.Int32(2147483647 + tid) < 130",
+        "cutlass.Int32(-2147483648 - tid) < 130",
+        "cutlass.Int32(4294967296 + tid) < 130",
+        "base + tid < dynamic_end",
+    ],
+)
+def test_bounded_store_predicate_rejects_unsafe_coordinates(expression):
+    definitions = _bounded_store_coordinate_definitions()
+    definitions["tid"] = ast.parse(
+        "cutlass.Int32(cute.arch.thread_idx()[0])", mode="eval"
+    ).body
+    assert not lanes._predicate_accepts_zero_thread_axis(
+        ast.parse(expression, mode="eval").body,
+        0,
+        {"tid": frozenset({0})},
+        definitions,
+        require_bounded=True,
+    )
+
+
+def test_bounded_store_induction_facts_are_scoped_and_invalidated():
+    definitions = _bounded_store_coordinate_definitions()
+    expression = ast.parse("base + serial", mode="eval").body
+    assert lanes._scalar_integer_bounds(expression, definitions) == (1, 132)
+    inherited = dict(definitions)
+    unknown = lanes._loop_body_scalar_definitions(
+        _body("for base in range(dynamic_end): pass")[0], definitions, {}
+    )
+    assert lanes._scalar_integer_bounds(expression, unknown) is None
+    assert definitions == inherited
+    for mutation in ("base = load()", "base = base + 1", "if flag: base = load()"):
+        changed = dict(definitions)
+        lanes._update_scalar_definitions(_body(mutation)[0], changed)
+        assert lanes._scalar_integer_bounds(expression, changed) is None
+    marker = lanes._is_lane_reduce_marker_assign(_body(f"total = {_marker('lane')}")[0])
+    assert marker is not None
+    safe = lanes._StoreThreadAxes(set(), set(), {0}, set(), {0}, frozenset({0}))
+    assert lanes._lane_reduce_owner_expr(marker, safe) is not None
+    for axes in (
+        lanes._StoreThreadAxes({0}, set(), {0}, set(), {0}, frozenset({0})),
+        lanes._StoreThreadAxes(set(), set(), {0}, set(), set()),
+    ):
+        with pytest.raises(helion.exc.BackendUnsupported, match="thread-varying store"):
+            lanes._lane_reduce_owner_expr(marker, axes)
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "cutlass.Int32(2147483647 + tid) < _BLOCK_SIZE_1",
+        "base + tid < 130 and unknown + tid < _BLOCK_SIZE_1",
+    ],
+)
+def test_reduced_axis_requires_bounded_proof_for_every_predicate(predicate):
+    definitions = _bounded_store_coordinate_definitions()
+    definitions["tid"] = ast.parse(
+        "cutlass.Int32(cute.arch.thread_idx()[0])", mode="eval"
+    ).body
+    axes = lanes._store_thread_axes(
+        _body(f"if {predicate}: out.store(total)")[0],
+        {"tid": frozenset({0})},
+        definitions,
+    )
+    assert axes is not None
+    # Preserve the legacy redundant-axis classification while refusing its
+    # weaker proof for newly enabled reduced-axis stores.
+    assert axes.zero_safe_predicate == (
+        {0} if predicate.startswith("cutlass.Int32") else set()
+    )
+    assert not axes.bounded_zero_safe_predicate
+    marker = lanes._is_lane_reduce_marker_assign(_body(f"total = {_marker('lane')}")[0])
+    assert marker is not None
+    with pytest.raises(helion.exc.BackendUnsupported, match="thread-varying store"):
+        lanes._lane_reduce_owner_expr(marker, axes)
+
+
+@pytest.mark.parametrize("carry_name", ["base", "phi_base"])
+@pytest.mark.parametrize(
+    "header", ["for outer in range(2)", "while flag", "for outer, other in pairs"]
+)
+def test_bounded_store_loop_context_drops_backedge_and_else_facts(carry_name, header):
+    definitions = _bounded_store_coordinate_definitions()
+    definitions["alias"] = ast.parse("base + 1", mode="eval").body
+    rename_groups = {"phi_base": "base"}
+    loop = _body(
+        f"{header}:\n    consume()\n    {carry_name} = base + 2147483647\nelse:\n    consume()"
+    )[0]
+    observed = []
+
+    def observe(body, **kwargs):
+        observed.append(kwargs["scalar_definitions"])
+        return body
+
+    with patch.object(lanes, "split_lane_loop_reductions", side_effect=observe):
+        lanes._split_stmt_lane_reductions(
+            loop, set(), set(), {}, {}, definitions, rename_groups
+        )
+    assert len(observed) == 2
+    for context in observed:
+        assert "base" not in context and "alias" not in context
+    expected = (0, 1) if header == "for outer in range(2)" else None
+    assert lanes._scalar_integer_bounds(ast.Name(id="outer"), observed[0]) == expected
+    assert lanes._scalar_integer_bounds(ast.Name(id="outer"), observed[1]) is None
+    assert "base" in definitions and "alias" in definitions
+    shadow = _body("for base in range(200, 201): pass\nelse: consume()")[0]
+    assert (
+        lanes._scalar_integer_bounds(
+            ast.Name(id="base"),
+            lanes._loop_invariant_scalar_definitions(shadow, definitions, {}),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [
+        "for base in range(129 - 2 * tid, 130): pass",
+        "for base in range(1, 130 + tid): pass",
+        "for base in range(1, 130, 1 + tid): pass",
+        "for base in range(start, 130): pass",
+    ],
+)
+def test_bounded_store_induction_rejects_thread_dependent_ranges(loop):
+    definitions = {
+        "tid": ast.parse("cutlass.Int32(cute.arch.thread_idx()[0])", mode="eval").body,
+        "start": ast.parse("129 - 2 * tid", mode="eval").body,
+    }
+    axes = {"tid": frozenset({0}), "start": frozenset({0})}
+    definitions = lanes._loop_body_scalar_definitions(_body(loop)[0], definitions, axes)
+    predicate = ast.parse("base + tid < 129", mode="eval").body
+    assert not lanes._predicate_accepts_zero_thread_axis(
+        predicate, 0, axes, definitions, require_bounded=True
+    )
+    # At each thread's first iteration this enables thread one, not zero.
+    assert not 129 + 0 < 129
+    assert (129 - 2) + 1 < 129
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_bounded_store_canonical_alias_write_invalidates_prior_constant(inside):
+    assignments = _body("x = 0\nphi_x = cutlass.Int32(2147483647)")
+    body = _body(
+        "partial = cutlass.Float32(lane + 1)\n"
+        f"reduced = {_marker('lane')}\n"
+        "if cutlass.Int32(x + cutlass.Int32(cute.arch.thread_idx()[0])) < 130:\n"
+        "    out.store(reduced)"
+    )
+    loop = lanes._create_lane_loop("lane", 4, [*assignments, *body] if inside else body)
+    with pytest.raises(helion.exc.BackendUnsupported):
+        lanes.split_lane_loop_reductions(
+            [loop] if inside else [*assignments, loop], rename_groups={"phi_x": "x"}
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _tile_id_scalar_copy(x: torch.Tensor, weights: torch.Tensor):
+    out = torch.empty_like(weights)
+    for row, col in hl.tile(x.shape):
+        out[row, col.id] = weights[row, col.id]
+    return out
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete):
+    from test.test_indexing import _execute_pointwise_thread_program
+
+    from helion._compiler.backend_registry import repair_backend_codegen
+    from helion._compiler.cute import memory_ops as cute_memory_ops
+    import helion.language.memory_ops as memory_ops
+
+    repair_backend_codegen("cute")
+    x = torch.empty(3, 129)
+    weights = torch.arange(6, dtype=torch.float32).reshape(3, 2) + 11
+    observed = []
+    original = memory_ops._cute_combined_mask
+
+    def observe(state, subscript, extra_mask, tensor=None, **kwargs):
+        result = original(state, subscript, extra_mask, tensor, **kwargs)
+        observed.append((kwargs.get("for_store", False), result))
+        return result
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch.object(memory_ops, "_cute_combined_mask", observe),
+        patch.object(cute_memory_ops, "_cute_combined_mask", observe),
+        patch.object(
+            memory_ops, "_cute_tile_id_thread_extent_is_complete", return_value=complete
+        ),
+    ):
+        bound = _cpu_bind(_tile_id_scalar_copy, (x, weights))
+        config = bound.config_spec.default_config()
+        config.config.update(block_sizes=[4, 128], num_threads=[1, 32])
+        source = bound.to_code(config)
+    reads = [mask for store, mask in observed if not store]
+    writes = [mask for store, mask in observed if store]
+    assert reads and writes
+    assert all(mask is None or "mask_1" not in mask for mask in reads)
+    assert any(("mask_1" in (mask or "")) != complete for mask in writes)
+    actual, _launches = _execute_pointwise_thread_program(source, (x, weights))
+    torch.testing.assert_close(actual, weights, rtol=0, atol=0)

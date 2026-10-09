@@ -9,6 +9,7 @@ import re
 import tempfile
 from types import SimpleNamespace
 from typing import Any
+from typing import Callable
 from typing import Sequence
 from typing import cast
 import unittest
@@ -49,6 +50,7 @@ from helion._compiler.cute.aten_lowering import codegen_unsqueeze_cute
 from helion._compiler.cute.aten_lowering import codegen_view_cute
 from helion._compiler.cute.backend import _detect_mma_loop
 from helion._compiler.cute.backend import _loop_may_use_mma
+from helion._compiler.cute.backend import validate_thread_axis_accesses
 from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
@@ -107,6 +109,7 @@ from helion._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from helion._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from helion._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from helion._compiler.cute.matmul_utils import cute_supports_scalar_matmul_fallback
+from helion._compiler.cute.repeated_block_ids import _is_matmul_operand_load
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -241,7 +244,10 @@ from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCorePar
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from helion._compiler.cute.view_subtile import _feeds_split
+from helion._compiler.cute.view_subtile import _propagated_coord_meta
 from helion._compiler.cute.view_subtile import _split_minor_coord_meta
+from helion._compiler.cute.view_subtile import _split_output_coord_meta
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
@@ -259,6 +265,7 @@ from helion._compiler.type_info import CallableType
 from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
 from helion._testing import DEVICE
+from helion._testing import code_and_output
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
@@ -269,7 +276,6 @@ from helion.language import _tracing_ops
 from helion.language._tracing_ops import _mask_to
 from helion.language._tracing_ops import _new_var
 from helion.language.matmul_ops import _cute_dot_outer_accumulates_result
-from helion.language.memory_ops import _codegen_cute_store_permute_lane_loops
 from helion.language.memory_ops import _cute_combined_mask
 from helion.language.memory_ops import _cute_index_exprs
 from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
@@ -959,6 +965,7 @@ class _FakeCuteReductionCodegen(GenerateAST):
         }
         self.current_grid_state = None
         self.max_thread_block_dims = [3, 16, 1]
+        self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
         self.statements: list[object] = []
 
     def add_statement(self, stmt: object) -> None:
@@ -7383,6 +7390,8 @@ class TestCuteLowerings(unittest.TestCase):
         # not have triggered the rejection — without this message
         # text assertion, a future change that flipped the rejection
         # to "rank mismatch" or another path would silently pass).
+        # The pointwise re-binding check defers to this classifier
+        # for tcgen05 epilogue chains.
         message = str(cm.exception)
         self.assertIn("tcgen05 MMA path", message)
         self.assertIn("indices and masks", message)
@@ -8087,7 +8096,8 @@ class TestCuteLowerings(unittest.TestCase):
             )
             cute_matmul_colvec(x, y, colvec)
         # The diagnostic message points at the loud-failure backstop
-        # for non-whitelisted fused epilogues.
+        # for non-whitelisted fused epilogues (the pointwise re-binding
+        # check defers to it for tcgen05 epilogue chains).
         message = str(cm.exception)
         self.assertIn("tcgen05 MMA path", message)
         self.assertIn("rowvec", message)
@@ -9180,6 +9190,257 @@ class TestCuteLowerings(unittest.TestCase):
             "non-scalar binary ops",
             msg,
         )
+
+    def test_tcgen05_fused_symfloat_scalar_epilogue_runtime_correctness(
+        self,
+    ) -> None:
+        """``out[tile] = (alpha * acc).to(x.dtype)`` where ``alpha`` is a Python
+        float captured by the epilogue callable (``examples/matmul.py``
+        ``scale_by_alpha``). The float is lifted to a ``SymFloat`` kernel
+        argument, so FX carries ``mul(acc, _get_symnode)`` rather than a
+        literal; the chain renders it inline as a tile-uniform scalar and
+        splices the multiply into the tcgen05 T2R epilogue.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_epilogue(
+            x: torch.Tensor, y: torch.Tensor, epilogue: Callable[..., torch.Tensor]
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n)).to(x.dtype)
+            return out
+
+        alpha = 2.5
+
+        def scale_by_alpha(acc: torch.Tensor, tile: object) -> torch.Tensor:
+            return alpha * acc
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_epilogue.bind((x, y, scale_by_alpha))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertRegex(
+            code, r"tcgen05_acc_loaded_\d+ \* cutlass\.Float32\([A-Za-z_]\w*\)"
+        )
+        self.assertNotIn("non-whitelisted fused epilogues", code)
+        out = bound(x, y, scale_by_alpha)
+        expected = (alpha * (x @ y).to(torch.float32)).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_symfloat_bias_epilogue_runtime_correctness(
+        self,
+    ) -> None:
+        """``alpha * acc + beta * bias[tile_m, tile_n]`` with captured Python
+        floats (``examples/matmul.py`` ``addmm_epilogue``). Mixes two lifted
+        ``SymFloat`` scalars with an exact-shape aux load; the bf16 rounding
+        of ``beta * bias`` is kept as its own step like a literal scalar.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_epilogue(
+            x: torch.Tensor, y: torch.Tensor, epilogue: Callable[..., torch.Tensor]
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n)).to(x.dtype)
+            return out
+
+        alpha = 2.0
+        beta = 0.5
+        bias = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+
+        def addmm_epilogue(
+            acc: torch.Tensor, tile: tuple[object, object]
+        ) -> torch.Tensor:
+            return alpha * acc + beta * bias[tile[0], tile[1]]
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_epilogue.bind((x, y, addmm_epilogue))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        scalars = set(re.findall(r"cutlass\.Float32\(([A-Za-z_]\w*)\)", code))
+        self.assertEqual(len(scalars), 2, scalars)
+        out = bound(x, y, addmm_epilogue)
+        expected = (alpha * (x @ y).to(torch.float32) + beta * bias).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_rank0_scale_epilogue_runtime_correctness_bf16(
+        self,
+    ) -> None:
+        """``acc * scale_a[()] * scale_b[()]`` (``examples/fp8_gemm.py``) on a
+        bf16 tcgen05 matmul. Each rank-0 load is a tile-uniform scalar read
+        through the tensor's base pointer inline in the chain; the launcher
+        marshals the 0-d tensors as one-element views.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_scaled(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                acc = acc * scale_a[()] * scale_b[()]
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        scale_a = torch.tensor(0.5, device=DEVICE)
+        scale_b = torch.tensor(3.0, device=DEVICE)
+        bound = cute_matmul_scaled.bind((x, y, scale_a, scale_b))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        self.assertIn("* cutlass.Float32(scale_b.iterator.load())", code)
+        out = bound(x, y, scale_a, scale_b)
+        expected = ((x @ y).to(torch.float32) * scale_a * scale_b).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=4e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_rank0_scale_epilogue_runtime_correctness_fp8(
+        self,
+    ) -> None:
+        """The ``examples/fp8_gemm.py`` dequantization epilogue on the fp8
+        tcgen05 MMA: ``acc * scale_a[()] * scale_b[()]`` with 0-d fp32 scales.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_fp8_matmul_scaled(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[()] * scale_b[()]
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_a = torch.tensor(0.5, device=DEVICE)
+        scale_b = torch.tensor(0.25, device=DEVICE)
+        bound = cute_fp8_matmul_scaled.bind((x, y, scale_a, scale_b))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 128],
+            pid_type="persistent_interleaved",
+        )
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("* cutlass.Float32(scale_a.iterator.load())", code)
+        out = bound(x, y, scale_a, scale_b)
+        expected = (x.float() @ y.float() * scale_a * scale_b).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+
+    def test_cute_rank0_scalar_load_simt(self) -> None:
+        """``x[tile] * s[()]`` on the plain SIMT path: a rank-0 load renders
+        as a base-pointer read (no empty ``+`` join) and the launcher accepts
+        the 0-d tensor argument.
+        """
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def cute_scale_by_rank0(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * s[()]
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        for s in (
+            torch.tensor(2.0, device=DEVICE),
+            torch.tensor(0.5, device=DEVICE, dtype=torch.bfloat16),
+        ):
+            bound = cute_scale_by_rank0.bind((x, s))
+            config = helion.Config(block_sizes=[32, 32])
+            bound.set_config(config)
+            code = bound.to_triton_code(config)
+            self.assertIn("s.iterator.load()", code)
+            self.assertNotIn(".iterator + )", code)
+            out = bound(x, s)
+            torch.testing.assert_close(out, x * s)
+
+    def test_cute_rank0_scalar_store_simt(self) -> None:
+        """``out[()] = x[tile].sum()`` on the plain SIMT path: a rank-0 store
+        target renders as a base-pointer write (no empty ``+`` join) and the
+        launcher accepts the 0-d output tensor.
+        """
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def cute_store_rank0(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(x.size(0)):
+                out[()] = x[tile_n].sum()
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        code, out = code_and_output(cute_store_rank0, (x,), block_sizes=[64])
+        self.assertIn("out.iterator.store(", code)
+        self.assertNotIn(".iterator + )", code)
+        torch.testing.assert_close(out, x.sum())
 
     def test_tcgen05_fused_silu_epilogue_runtime_correctness_bf16(self) -> None:
         """``out[tile] = F.silu(acc).to(x.dtype)`` after a bf16 tcgen05
@@ -13097,7 +13358,7 @@ class TestCuteLowerings(unittest.TestCase):
             f"expected dealloc-mbarrier skip kwarg in code: {code!r}",
         )
 
-    def test_permute_codegen_materializes_non_store_use(self) -> None:
+    def test_permute_codegen_non_store_use_keeps_thread_scalar(self) -> None:
         graph = Graph()
         inp = graph.placeholder("inp")
         permute = graph.call_function(
@@ -13120,10 +13381,11 @@ class TestCuteLowerings(unittest.TestCase):
         ):
             result = codegen_cute_permute(ctx, permute)
 
-        self.assertNotEqual(ast.unparse(result), "load")
-        emitted = "\n".join(ast.unparse(stmt) for stmt in cg.statements)
-        self.assertIn("permute_smem", emitted)
-        self.assertIn("cute.arch.sync_threads()", emitted)
+        # Both dims are block-id coordinates of the thread, so the thread
+        # holding ``inp[i, j]`` holds ``inp.T[j, i]``: no shared-memory
+        # exchange, no barrier.
+        self.assertEqual(ast.unparse(result), "load")
+        self.assertEqual(cg.statements, [])
 
     def test_reshape_codegen_materializes_nontrivial_view(self) -> None:
         graph = Graph()
@@ -15248,88 +15510,6 @@ class TestCuteLowerings(unittest.TestCase):
         addmm.meta["val"] = torch.empty(16, 8, dtype=torch.float32)
         self.assertFalse(_mma_loop_is_exclusive(addmm))
 
-    def test_lane_loop_store_permute_codegen_stays_inline(self) -> None:
-        graph = Graph()
-        inp = graph.placeholder("inp")
-        permute = graph.call_function(
-            torch.ops.aten.permute.default,
-            args=(inp, [1, 0]),
-        )
-        inp.meta["val"] = torch.empty(2, 2)
-        permute.meta["val"] = torch.empty(2, 2)
-
-        grid_state = DeviceGridState(
-            strategy=SimpleNamespace(block_ids=[0, 1]),
-            block_id_to_info={},
-            lane_loops=[("lane_0", 2)],
-            lane_setup_statements=[],
-        )
-        codegen = _FakeGenerateASTForLaneStore(grid_state)
-        state = SimpleNamespace(
-            codegen=codegen,
-            device_function=codegen.device_function,
-        )
-        env = SimpleNamespace(
-            backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
-        )
-
-        with (
-            patch.object(CompileEnvironment, "current", return_value=env),
-            patch(
-                "helion._compiler.generate_ast.GenerateAST",
-                _FakeGenerateASTForLaneStore,
-            ),
-            patch(
-                "helion.language.memory_ops._cute_index_exprs",
-                return_value=["i0", "i1"],
-            ),
-            patch("helion.language.memory_ops._cute_combined_mask", return_value=None),
-            patch(
-                "helion._compiler.cute.cute_reshape._store_permute_info",
-                return_value=(inp, [1, 0]),
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._permute_reorders_active_dims",
-                return_value=True,
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._shape_op_needs_materialization",
-                return_value=False,
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._get_tile_shape",
-                return_value=[2, 2],
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._get_dim_local_coord",
-                return_value="0",
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._flat_index_from_coords",
-                side_effect=["0", "1"],
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._coords_from_flat_index",
-                return_value=["0", "1"],
-            ),
-        ):
-            result = _codegen_cute_store_permute_lane_loops(
-                state,
-                torch.empty(2, 2),
-                [slice(None), slice(None)],
-                [slice(None), slice(None)],
-                ast.Name(id="value", ctx=ast.Load()),
-                None,
-                permute,
-            )
-
-        assert result is not None
-        code = ast.unparse(result)
-        self.assertIn("cute.arch.sync_threads()", code)
-        self.assertIn("permute_smem", code)
-        self.assertIn("out.__setitem__((i0, i1)", code)
-        self.assertEqual(grid_state.outer_suffix, [])
-
     def test_mask_to_cute_casts_then_branch_to_tensor_dtype(self) -> None:
         state = SimpleNamespace(
             proxy_arg=lambda index: (
@@ -15353,93 +15533,6 @@ class TestCuteLowerings(unittest.TestCase):
             ast.unparse(result),
             "cutlass.Float16(load + 1) if mask_0 and mask_1 else cutlass.Float16(0)",
         )
-
-    def test_lane_loop_store_permute_masked_load_uses_materialization(self) -> None:
-        graph = Graph()
-        inp = graph.placeholder("inp")
-        mask = graph.placeholder("mask")
-        load_node = graph.call_function(
-            load,
-            args=(inp, [slice(None), slice(None)], mask, ""),
-        )
-        permute = graph.call_function(
-            torch.ops.aten.permute.default,
-            args=(load_node, [1, 0]),
-        )
-        inp.meta["val"] = torch.empty(2, 2)
-        mask.meta["val"] = torch.empty(2, 2, dtype=torch.bool)
-        load_node.meta["val"] = torch.empty(2, 2)
-        permute.meta["val"] = torch.empty(2, 2)
-
-        grid_state = DeviceGridState(
-            strategy=SimpleNamespace(block_ids=[0, 1]),
-            block_id_to_info={},
-            lane_loops=[("lane_0", 2)],
-            lane_setup_statements=[],
-        )
-        codegen = _FakeGenerateASTForLaneStore(grid_state)
-        state = SimpleNamespace(
-            codegen=codegen,
-            device_function=codegen.device_function,
-        )
-        env = SimpleNamespace(
-            backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
-        )
-
-        with (
-            patch.object(CompileEnvironment, "current", return_value=env),
-            patch(
-                "helion._compiler.generate_ast.GenerateAST",
-                _FakeGenerateASTForLaneStore,
-            ),
-            patch(
-                "helion.language.memory_ops._cute_index_exprs",
-                return_value=["i0", "i1"],
-            ),
-            patch("helion.language.memory_ops._cute_combined_mask", return_value=None),
-            patch(
-                "helion._compiler.cute.cute_reshape._store_permute_info",
-                return_value=(load_node, [1, 0]),
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._permute_reorders_active_dims",
-                return_value=True,
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._shape_op_needs_materialization",
-                return_value=False,
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._get_tile_shape",
-                return_value=[2, 2],
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._get_dim_local_coord",
-                return_value="0",
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._flat_index_from_coords",
-                side_effect=["0", "1"],
-            ),
-            patch(
-                "helion._compiler.cute.cute_reshape._coords_from_flat_index",
-                return_value=["0", "1"],
-            ),
-        ):
-            result = _codegen_cute_store_permute_lane_loops(
-                state,
-                torch.empty(2, 2),
-                [slice(None), slice(None)],
-                [slice(None), slice(None)],
-                ast.Name(id="value", ctx=ast.Load()),
-                None,
-                permute,
-            )
-
-        assert result is not None
-        code = ast.unparse(result)
-        self.assertIn("cute.arch.sync_threads()", code)
-        self.assertIn("permute_smem", code)
 
     def test_choose_mma_impl_forced_incompatible_override_falls_back(self) -> None:
         with patch(
@@ -16668,6 +16761,29 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertEqual(_split_minor_coord_meta(projected), coordinate)
         self.assertIsNone(_split_minor_coord_meta(opaque))
+
+    def test_split_coord_meta_propagates_through_permute(self) -> None:
+        graph = Graph()
+        source = graph.placeholder("source")
+        source.meta["val"] = torch.empty([8, 2, 4])
+        outer = {"block_id": 2, "divisor": 4, "modulus": 2}
+        inner = {"block_id": 2, "divisor": 1, "modulus": 4}
+        source.meta[CUTE_DIM_LOCAL_COORD_META] = [None, outer, inner]
+        permuted = graph.call_function(
+            torch.ops.aten.permute.default, (source, [0, 2, 1])
+        )
+        permuted.meta["val"] = torch.empty([8, 4, 2])
+        split = graph.call_function(hl.split, (permuted,))
+        projected = graph.call_function(operator.getitem, (split, 0))
+        projected.meta["val"] = torch.empty([8, 4])
+
+        # The split view is detected through the intervening permute, which
+        # reorders the coordinates so the pair dim becomes the minor one.
+        self.assertTrue(_feeds_split(source))
+        permuted.meta[CUTE_DIM_LOCAL_COORD_META] = _propagated_coord_meta(permuted)
+        self.assertEqual(permuted.meta[CUTE_DIM_LOCAL_COORD_META], [None, inner, outer])
+        self.assertEqual(_split_minor_coord_meta(projected), outer)
+        self.assertEqual(_split_output_coord_meta(projected), [None, inner])
 
     def test_tcgen05_fragment_index_compiler_matches_sympy(self) -> None:
         row = _Index.variable("row", 3)
@@ -24212,6 +24328,1553 @@ class TestReductionBlockClassifiers(unittest.TestCase):
     def test_block_has_live_thread_axis_false_when_only_serial_loop(self) -> None:
         strategy = self._make_strategy(active_device_loops={0: [self._serial_loop(0)]})
         self.assertFalse(strategy._reduction_block_has_live_thread_axis())
+
+
+@onlyBackends(["cute"])
+class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
+    """The SIMT lowering gives each block id one lane coordinate, so a tensor
+    that binds one block id to two of its axes collapses onto its diagonal.
+    The ordinary path must reject those kernels. Complete fragment ownership
+    can represent their distinct coordinates; supported cases also check that
+    path numerically against the full tensor, including off-diagonal values.
+    """
+
+    def test_two_full_slice_dot_cc_tile_is_rejected(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1, 16]),
+            static_shapes=True,
+        )
+        def attn_cc(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            B = q.size(0)
+            C = hl.specialize(q.size(1))
+            D = q.size(2)
+            out = torch.empty([B, C, C], dtype=torch.float32, device=q.device)
+            for tile_b in hl.tile(B):
+                # Both ':' slices have size C and dedup onto one reduction
+                # block, so attn is [tile_b, C, C] with that block on both axes.
+                attn = hl.zeros([tile_b, C, C], dtype=torch.float32)
+                for tile_d in hl.tile(D):
+                    qt = q[tile_b, :, tile_d]
+                    kt = k[tile_b, :, tile_d]
+                    attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
+                out[tile_b, :, :] = attn
+            return out
+
+        q = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
+        # Reference once supported: q.float() @ k.float().transpose(-2, -1)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
+            attn_cc(q, k)
+
+    def test_arange_outer_compare_mask_is_rejected(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1]),
+            static_shapes=True,
+        )
+        def causal_mask(x: torch.Tensor) -> torch.Tensor:
+            B = x.size(0)
+            C = hl.specialize(x.size(1))
+            out = torch.empty([B, C, C], dtype=torch.float32, device=x.device)
+            for tile_b in hl.tile(B):
+                ar = hl.arange(C)
+                mask = ar[:, None] >= ar[None, :]
+                out[tile_b, :, :] = torch.where(mask, 1.0, 0.0)[None, :, :].to(
+                    torch.float32
+                ) + hl.zeros([tile_b, C, C], dtype=torch.float32)
+            return out
+
+        x = torch.randn(4, 64, 32, device=DEVICE)
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "two axes"),
+        ):
+            causal_mask(x)
+        code, out = code_and_output(causal_mask, (x,), block_sizes=[1])
+        self.assertIn("fragment_thread", code)
+        expected = torch.ones(64, 64, device=DEVICE).tril().expand(4, -1, -1)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_dot_with_k_equal_m_block_is_rejected(self) -> None:
+        """``T = t[tile_bhn, :, :]`` with M == K dedups both full slices onto
+        one C block; the outer-loop load is consumed by the inner ``_for_loop``
+        rather than by ``hl.dot`` itself, so ``check_repeated_block_ids``
+        rejects the load.  The same kernel with M != K is the positive control.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1, 8]),
+            static_shapes=True,
+        )
+        def dot_t_k(t: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = k.size(0)
+            M = hl.specialize(t.size(1))
+            D = k.size(2)
+            out = torch.empty([BHN, M, D], dtype=torch.float32, device=k.device)
+            for tile_bhn in hl.tile(BHN):
+                T = t[tile_bhn, :, :]
+                for tile_d in hl.tile(D):
+                    kt = k[tile_bhn, :, tile_d].to(torch.float32)
+                    # K (T.shape[-1]) and M (T.shape[-2]) share the C block
+                    # when M == C.
+                    out[tile_bhn, :, tile_d] = hl.dot(T, kt)
+            return out
+
+        k = torch.randn(4, 16, 16, device=DEVICE, dtype=torch.bfloat16)
+        t_rect = torch.randn(4, 8, 16, device=DEVICE)
+        torch.testing.assert_close(
+            dot_t_k(t_rect, k), torch.bmm(t_rect, k.float()), rtol=1e-4, atol=1e-4
+        )
+        t_square = torch.randn(4, 16, 16, device=DEVICE)
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "two axes"),
+        ):
+            dot_t_k(t_square, k)
+        code, out = code_and_output(dot_t_k, (t_square, k), block_sizes=[1, 8])
+        self.assertIn("fragment_buffer", code)
+        torch.testing.assert_close(
+            out, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
+        )
+
+    def test_dot_with_k_equal_m_block_inner_load_is_rejected(self) -> None:
+        """Loading ``T`` next to the ``hl.dot`` exempts it from the load check
+        (a matmul operand), so the ``lhs_m_size`` branch of
+        ``cute_resolve_active_matmul_k_block_id`` is what refuses the M == K
+        contraction; the scalar fallback then finds no K block.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1, 8]),
+            static_shapes=True,
+        )
+        def dot_t_k_inner(t: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = k.size(0)
+            M = hl.specialize(t.size(1))
+            D = k.size(2)
+            out = torch.empty([BHN, M, D], dtype=torch.float32, device=k.device)
+            for tile_bhn in hl.tile(BHN):
+                for tile_d in hl.tile(D):
+                    T = t[tile_bhn, :, :]
+                    kt = k[tile_bhn, :, tile_d].to(torch.float32)
+                    out[tile_bhn, :, tile_d] = hl.dot(T, kt)
+            return out
+
+        k = torch.randn(4, 16, 16, device=DEVICE, dtype=torch.bfloat16)
+        t_rect = torch.randn(4, 8, 16, device=DEVICE)
+        torch.testing.assert_close(
+            dot_t_k_inner(t_rect, k),
+            torch.bmm(t_rect, k.float()),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        t_square = torch.randn(4, 16, 16, device=DEVICE)
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "requires an active K tile"),
+        ):
+            dot_t_k_inner(t_square, k)
+        code, out = code_and_output(dot_t_k_inner, (t_square, k), block_sizes=[1, 8])
+        self.assertIn("fragment_buffer", code)
+        torch.testing.assert_close(
+            out, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
+        )
+
+    def test_equal_free_aranges_on_two_dims_of_one_store_are_rejected(
+        self,
+    ) -> None:
+        """``rows``/``cols`` are distinct ``hl.arange(16)`` nodes loaded from
+        equal-sized dims, so they key onto one synthetic thread axis; using
+        both as index dims of one store would write only the diagonal.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[]),
+            static_shapes=True,
+        )
+        def dot_rows_cols(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = q.size(0)
+            C = hl.specialize(q.size(1))
+            out = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
+            for tile_bhn in hl.tile(BHN, block_size=1):
+                rows = hl.arange(16)
+                cols = hl.arange(16)
+                a = hl.dot(
+                    q[tile_bhn, rows, :].float(),
+                    k[tile_bhn, cols, :].float().transpose(-2, -1),
+                )
+                out[tile_bhn, rows, cols] = a
+            return out
+
+        q = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"),
+        ):
+            dot_rows_cols(q, k)
+        code, out = code_and_output(dot_rows_cols, (q, k), block_sizes=[])
+        self.assertIn("fragment_buffer", code)
+        expected = torch.zeros(4, 64, 64, device=DEVICE)
+        expected[:, :16, :16] = torch.bmm(
+            q[:, :16].float(), k[:, :16].float().transpose(-2, -1)
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_one_free_arange_on_two_dims_of_one_access_is_rejected(self) -> None:
+        """Helion indexes two tensor entries as a cartesian tile, so one
+        ``hl.arange(16)`` reaching both index dims of a load/store through
+        views or arithmetic spans a [16, 16] tile that its single synthetic
+        lane would collapse onto the diagonal.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1]),
+            static_shapes=True,
+        )
+        def outer_views(x: torch.Tensor) -> torch.Tensor:
+            B = x.size(0)
+            out = torch.zeros_like(x)
+            for tile_b in hl.tile(B):
+                r = hl.arange(16)
+                rows = r.unsqueeze(1)
+                cols = r.unsqueeze(0)
+                out[tile_b, rows, cols] = x[tile_b, rows, cols] * 2
+            return out
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[1]),
+            static_shapes=True,
+        )
+        def outer_offsets(x: torch.Tensor) -> torch.Tensor:
+            B = x.size(0)
+            out = torch.zeros_like(x)
+            for tile_b in hl.tile(B):
+                r = hl.arange(16)
+                rows = r + 1
+                cols = r + 2
+                out[tile_b, rows, cols] = x[tile_b, rows, cols] * 2
+            return out
+
+        x = torch.randn(4, 20, 20, device=DEVICE)
+        # Reference once supported: out[:, :16, :16] = 2 * x[:, :16, :16] and
+        # out[:, 1:17, 2:18] = 2 * x[:, 1:17, 2:18] respectively.
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"):
+            outer_views(x)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"):
+            outer_offsets(x)
+
+    def test_matmul_operand_load_exemption_requires_lhs_rhs_slot(self) -> None:
+        graph = Graph()
+        x = graph.placeholder("x")
+        other = graph.placeholder("other")
+        lhs = graph.call_function(load, (x, [slice(None), slice(None)]))
+        graph.call_function(hl.dot, (lhs, other))
+        rhs = graph.call_function(load, (x, [slice(None), slice(None)]))
+        rhs_t = graph.call_function(torch.ops.aten.transpose.int, (rhs, -2, -1))
+        graph.call_function(hl.dot, (other, rhs_t))
+        acc = graph.call_function(load, (x, [slice(None), slice(None)]))
+        graph.call_function(hl.dot, (other, other, acc))
+        dead = graph.call_function(load, (x, [slice(None), slice(None)]))
+
+        self.assertTrue(_is_matmul_operand_load(lhs))
+        self.assertTrue(_is_matmul_operand_load(rhs))
+        self.assertTrue(_is_matmul_operand_load(rhs_t))
+        # ``acc`` is not re-read by the direct-load serial-K path.
+        self.assertFalse(_is_matmul_operand_load(acc))
+        self.assertFalse(_is_matmul_operand_load(dead))
+
+    def test_resolve_active_matmul_k_block_id_rejects_m_alias(self) -> None:
+        cg = SimpleNamespace(
+            current_grid_state=SimpleNamespace(block_ids=[7, 3]),
+            active_device_loops={},
+        )
+        env = _fake_env({128: 7, 32: 3})
+
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertEqual(
+                cute_resolve_active_matmul_k_block_id(cg, 128, 128, 32, lhs_m_size=64),
+                7,
+            )
+            self.assertIsNone(
+                cute_resolve_active_matmul_k_block_id(cg, 128, 128, 32, lhs_m_size=128)
+            )
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_bmm_leading_permute_fold(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    L = q.size(0)
+    H = hl.specialize(q.size(1))
+    # Specialize D: the synthetic-lane K fold needs a static contraction extent.
+    hl.specialize(q.size(2))
+    out = torch.empty([H, L, L], dtype=q.dtype, device=q.device)
+    for tile_q in hl.tile(L):
+        # [tile_q, H, D] -> [H, tile_q, D]: a leading-dim permute that keeps the
+        # contraction axis (the full-slice D rdim) trailing, as in
+        # jagged_hstu_attn_2.
+        q_blk = q[tile_q, :, :].transpose(0, 1)
+        for tile_kv in hl.tile(L):
+            k_blk = k[tile_kv, :, :].transpose(0, 1)
+            out[:, tile_q, tile_kv] = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
+    G, B, C, D, E = x.shape
+    out = torch.empty_like(x)
+    for g in hl.grid(G):
+        for tile_b in hl.tile(B):
+            for tile_c in hl.tile(C):
+                for tile_d in hl.tile(D):
+                    for tile_e in hl.tile(E):
+                        out[g, tile_b, tile_c, tile_d, tile_e] = (
+                            x[g, tile_b, tile_c, tile_d, tile_e] * 2
+                        )
+    return out
+
+
+@onlyBackends(["cute"])
+class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
+    """Synthetic-lane K matmul fold through leading-dim permutes, and demotion
+    of tile blocks that would need a fourth CUDA thread axis."""
+
+    def test_bmm_leading_dim_permute_fold(self) -> None:
+        torch.manual_seed(0)
+        q = torch.randn(64, 4, 32, device=DEVICE)
+        k = torch.randn(64, 4, 32, device=DEVICE)
+        code, out = code_and_output(
+            _cute_bmm_leading_permute_fold, (q, k), block_sizes=[32, 32]
+        )
+        # D is split threads x synthetic lanes, so the bmm folds K itself by
+        # re-reading both (permuted) operands; tile_kv is the fourth
+        # thread-parallel dim and runs as a lane loop, not thread axis 3.
+        self.assertIn("mm_fold_k", code)
+        self.assertNotIn("thread_idx()[3]", code)
+        # The transposes only feed the bmm (the hoisted one through the loop
+        # argument), so neither is shuffled through shared memory inside the
+        # lane loops.
+        self.assertNotIn("permute_smem", code)
+        torch.testing.assert_close(
+            out, torch.einsum("qhd,khd->hqk", q, k), rtol=1e-4, atol=1e-4
+        )
+
+    def test_fourth_tile_block_demotes_to_lane_loop(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, 8, 8, 8, device=DEVICE)
+        code, out = code_and_output(
+            _cute_four_nested_tiles, (x,), block_sizes=[4, 4, 4, 4]
+        )
+        self.assertNotIn("thread_idx()[3]", code)
+        self.assertIn("block=(4, 4, 4)", code)
+        self.assertRegex(code, r"for lane_\d+ in range\(4\)")
+        torch.testing.assert_close(out, x * 2)
+
+    def test_thread_axis_beyond_launch_rejected(self) -> None:
+        backend = CuteBackend()
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.lane_index_expr("offset", 1, axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.thread_index_expr(axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
+        # Root ownership may discard a speculative grid coordinate. Validate
+        # the surviving expression, and allow an elided singleton coordinate.
+        index = backend.grid_index_expr("offset", "bs", "cutlass.Int32", axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            validate_thread_axis_accesses(ast.parse(f"index = {index}").body)
+        singleton = backend.grid_index_expr("offset", "1", "cutlass.Int32", axis=3)
+        self.assertEqual(singleton, "offset")
+        validate_thread_axis_accesses(ast.parse(f"index = {singleton}").body)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.thread_in_tile_mask_expr("bs", axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.reduction_index_expr("bs", "cutlass.Int32", 0, axis=3)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
+            backend.thread_linear_index_expr({0: 4, 3: 4})
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_live_transpose(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty([N, M], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        # abs is not a layout-preserving op the transpose can fold through, so
+        # the transposed tile is live: a consumer reads its values.
+        out[tile_n, tile_m] = torch.abs(x[tile_m, tile_n].T)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_store_transposed_tiles(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    out = torch.empty([N, M], dtype=x.dtype, device=x.device)
+    out_abs = torch.empty([N, M], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        # A transposed load and a transposed computed tile stored directly.
+        out[tile_n, tile_m] = x[tile_m, tile_n].T
+        out_abs[tile_n, tile_m] = torch.abs(x[tile_m, tile_n]).T
+    return out, out_abs
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_live_permute_3d(x: torch.Tensor) -> torch.Tensor:
+    A, B, C = x.shape
+    out = torch.empty([C, A, B], dtype=x.dtype, device=x.device)
+    for tile_a, tile_b, tile_c in hl.tile([A, B, C]):
+        out[tile_c, tile_a, tile_b] = torch.abs(
+            x[tile_a, tile_b, tile_c].permute(2, 0, 1)
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_transposed_abs_row_sum(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty([N], dtype=x.dtype, device=x.device)
+    for tile_n in hl.tile(N):
+        out[tile_n] = torch.abs(x[:, tile_n].T).sum(1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_blockwise_transpose(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([M, N]):
+        # The slot binds the transposed tile's dims to the other block ids:
+        # a within-tile transpose (needs equal block sizes).
+        out[tile_m, tile_n] = x[tile_m, tile_n].T
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_blockwise_abs_transpose(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([M, N]):
+        out[tile_m, tile_n] = torch.abs(x[tile_m, tile_n].T)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tile_plus_transpose(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([M, N]):
+        t = x[tile_m, tile_n]
+        out[tile_m, tile_n] = t + t.T
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_atomic_add_transposed(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile([M, N]):
+        hl.atomic_add(out, [tile_m, tile_n], x[tile_m, tile_n].T)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_blockwise_transpose_beside_a_wider_tile(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two sibling root loops on one thread axis: the exchange's tile beside a
+    wider 1-d tile, so the launch has surplus threads in the first loop."""
+    M, N = x.shape
+    out = torch.empty_like(x)
+    rows = torch.empty_like(y)
+    for tile_m, tile_n in hl.tile([M, N]):
+        out[tile_m, tile_n] = x[tile_m, tile_n].T
+    for tile_r in hl.tile(y.size(0)):
+        rows[tile_r] = y[tile_r] * 2
+    return out, rows
+
+
+@helion.kernel(backend="cute")
+def _cute_matmul_transposed_accumulator_store(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([n, m], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.T.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_row_and_column_broadcasts(
+    a: torch.Tensor, row_bias: torch.Tensor, col_scale: torch.Tensor
+) -> torch.Tensor:
+    """Lower-rank operands align to the tile by block id, not position: a
+    rank-1 ``row_bias[tile0]`` is a row broadcast (``[:, None]``)."""
+    out = torch.empty_like(a)
+    for tile0, tile1 in hl.tile(a.size()):
+        out[tile0, tile1] = a[tile0, tile1] * col_scale[tile1] + row_bias[tile0]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_middle_dim_broadcast(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile0, tile1, tile2 in hl.tile(a.size()):
+        out[tile0, tile1, tile2] = a[tile0, tile1, tile2] + b[tile1]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tile_and_slice_broadcast(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    k = a.size(2)
+    out = torch.empty_like(a)
+    for tile0, tile1 in hl.tile([a.size(0), a.size(1)]):
+        out[tile0, tile1, 0:k] = a[tile0, tile1, 0:k] + b[tile0, 0:k]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_chebyshev(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """test_loops' Chebyshev recurrence: ``w[order, c_tile]`` with the
+    ``block_size=1`` order tile broadcasts against the ``[b_tile, c_tile]``
+    polynomials."""
+    B, C = x.shape
+    N, C = w.shape
+    hl.specialize(N)
+    out = torch.zeros((B, C), device=x.device, dtype=x.dtype)
+    for b_tile, c_tile in hl.tile([B, C]):
+        in_x = x[b_tile, c_tile]
+        T0 = hl.full((b_tile, c_tile), 1.0, x.dtype)
+        T1 = in_x
+        acc = w[0, c_tile] * T0 + w[1, c_tile] * T1
+        for order in hl.tile(2, N, block_size=1):
+            T_new = 2 * in_x * T1 - T0
+            acc = acc + w[order, c_tile] * T_new
+            T0 = T1
+            T1 = T_new
+        out[b_tile, c_tile] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_phi_recurrence(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """test_loops' variable-assignment phi-node kernel (``U1 = two_x``)."""
+    B, C = x.shape
+    N, _ = w.shape
+    hl.specialize(N)
+    grad_x = torch.zeros_like(x)
+    for b_tile, c_tile in hl.tile([B, C]):
+        in_x = x[b_tile, c_tile]
+        two_x = 2.0 * in_x
+        U1 = two_x
+        U0 = hl.full((b_tile, c_tile), 1.0, x.dtype)
+        acc = w[0, c_tile] * U0 + w[1, c_tile] * U1
+        for order in hl.tile(2, N, block_size=1):
+            acc += w[order, c_tile] * U1
+            U_new = two_x * U1 - U0
+            U0 = U1
+            U1 = U_new
+        grad_x[b_tile, c_tile] = acc
+    return grad_x
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_atomic_add_into_slice(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for row, col in hl.tile((8, 8), block_size=(8, 8)):
+        hl.atomic_add(out, [row.index + 1, slice(None)], x[row, col])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_store_lower_rank_value(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``hl.store`` receives the value unexpanded (as ``tl.store`` does), so a
+    rank-1 ``b[tile_m]`` is right-aligned to the ``tile_n`` axis: a re-binding."""
+    out = torch.empty_like(a)
+    for tile_m, tile_n in hl.tile(a.size()):
+        hl.store(out, [tile_m, tile_n], b[tile_m])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_atomic_add_lower_rank_value(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(a)
+    for tile_m, tile_n in hl.tile(a.size()):
+        hl.atomic_add(out, [tile_m, tile_n], b[tile_m])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_reordered_lower_rank_operand(
+    a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """``b[t1, t0]`` into a ``[t0, t1, t2]`` result: the implicit broadcast only
+    inserts ``None``, so the two tile dims meet the result positionally."""
+    out = torch.empty_like(a)
+    for t0, t1, t2 in hl.tile(a.size()):
+        out[t0, t1, t2] = a[t0, t1, t2] + b[t1, t0]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_store_with_transposed_mask(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        hl.store(
+            out, [tile_m, tile_n], x[tile_m, tile_n], extra_mask=m[tile_m, tile_n].T
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_stack_store_transposed(
+    x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: torch.Tensor
+) -> None:
+    hl.specialize(dev_ptrs.size(0))
+    for tile0, tile1 in hl.tile(x.size()):
+        ptr_tile = dev_ptrs[:]
+        tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+        tensors[tile0, tile1] = x[tile0, tile1].T[None, :, :]
+
+
+@helion.kernel(backend="cute")
+def _cute_matmul_rebound_epilogue_into_atomic(
+    x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """A re-binding pointwise op on a tcgen05 epilogue chain whose only
+    consumer is an atomic: no store path drains the deferred check."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        hl.atomic_add(
+            out, [tile_m, tile_n], acc + residual[tile_n, tile_m].to(torch.float32)
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_where_transposed(c: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        t = x[tile_m, tile_n]
+        out[tile_m, tile_n] = torch.where(c[tile_m, tile_n], t, t.T)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_stack_transposed(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty([M, N, 2], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        t = x[tile_m, tile_n]
+        out[tile_m, tile_n, :] = torch.stack([t, t.T], dim=-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_gather_rows_into_other_tile(
+    src: torch.Tensor, idx: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """The gathered rows of the ``tile_m`` tile land in the ``tile_n`` slot: a
+    re-binding whose exchanged value the loaded-index trailing-slices store
+    path must honor."""
+    for tile_m, tile_n in hl.tile([idx.size(0), out.size(0)]):
+        out[tile_n, :] = src[idx[tile_m], :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_join_transposed(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty([M, N, 2], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([M, N]):
+        t = x[tm, tn]
+        out[tm, tn, :] = hl.join(t, t.T)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_join_consistent(x: torch.Tensor) -> torch.Tensor:
+    M, N = x.shape
+    out = torch.empty([N, M, 2], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([M, N]):
+        t = x[tm, tn].T
+        out[tn, tm, :] = hl.join(t, t * 2)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_inline_asm_transposed(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        t = x[tm, tn]
+        out[tm, tn] = hl.inline_asm_elementwise(
+            "add.f32 $0, $1, $2;",
+            "=r,r,r",
+            [t, t.T],
+            dtype=torch.float32,
+            is_pure=True,
+            pack=1,
+        )
+    return out
+
+
+def _pairwise_add_combine(
+    left_a: torch.Tensor,
+    left_b: torch.Tensor,
+    right_a: torch.Tensor,
+    right_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return left_a + right_a, left_b + right_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tuple_scan_transposed(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        t = x[tm, tn]
+        first, _second = hl.associative_scan(_pairwise_add_combine, (t, t.T), dim=1)
+        out[tm, tn] = first
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_where_lower_rank_operand(
+    c: torch.Tensor, x: torch.Tensor, row: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        out[tm, tn] = torch.where(c[tm, tn], x[tm, tn], row[tm])
+    return out
+
+
+def _tuple_add_combine(
+    left_values: torch.Tensor,
+    left_indices: torch.Tensor,
+    right_values: torch.Tensor,
+    right_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return left_values + right_values, left_indices + right_indices
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tuple_reduce(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    out_y = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out_x[tile], out_y[tile] = hl.reduce(
+            _tuple_add_combine, (x[tile, :], y[tile, :]), dim=1
+        )
+    return out_x, out_y
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tuple_reduce_transposed(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_a = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    out_b = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile(x.size()):
+        t = x[tm, tn]
+        a, b = hl.reduce(_tuple_add_combine, (t, t.T), dim=1)
+        out_a[tm] = a
+        out_b[tm] = b
+    return out_a, out_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_dot_transposed_accumulator(
+    a: torch.Tensor, b: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    M, K = a.shape
+    _, N = b.shape
+    out = torch.empty([M, N], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([M, N]):
+        acc = t[tm, tn].T
+        for tk in hl.tile(K):
+            acc = hl.dot(a[tm, tk], b[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_addmm_transposed_accumulator(
+    a: torch.Tensor, b: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    M, K = a.shape
+    _, N = b.shape
+    out = torch.empty([M, N], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([M, N]):
+        acc = t[tm, tn].T
+        for tk in hl.tile(K):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_slice_store_of_transposed_slice(x: torch.Tensor) -> torch.Tensor:
+    """``out[tile_m, :] = x[:, tile_m]``: the slot's slice is addressed by the
+    load's reduction block, so both dims of the value re-bind."""
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m, :] = x[:, tile_m]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_slice_store_of_transposed_slice_b(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        out[:, tile_m] = x[tile_m, :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_load_with_transposed_mask(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        out[tm, tn] = hl.load(x, [tm, tn], extra_mask=m[tm, tn].T)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_load_with_row_mask(x: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        out[tm, tn] = hl.load(x, [tm, tn], extra_mask=row[tm])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_gather_with_transposed_index(
+    x: torch.Tensor, idx: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        out[tm, tn] = torch.gather(x[tm, tn], 1, idx[tn, tm])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_two_slices_beside_a_tile(x: torch.Tensor) -> torch.Tensor:
+    """``out[tile_m, :, :] = x[tile_m, :, tile_n]``: the second slot slice is
+    addressed by ``tile_n`` (an equal-size active tile), not the reduction
+    block of the first, as ``_cute_index_exprs`` resolves it."""
+    M, A, B = x.shape
+    out = torch.empty([M, A, B], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, B]):
+        out[tile_m, :, :] = x[tile_m, :, tile_n]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_stack_load_with_transposed_mask(
+    m: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+) -> torch.Tensor:
+    P = hl.specialize(dev_ptrs.size(0))
+    M, N = example.shape
+    out = torch.empty([P, M, N], dtype=example.dtype, device=dev_ptrs.device)
+    for tile0, tile1 in hl.tile([M, N]):
+        tensors = hl.stacktensor_like(example, dev_ptrs[:])
+        out[:, tile0, tile1] = hl.load(
+            tensors, [tile0, tile1], extra_mask=m[tile0, tile1].T[None, :, :]
+        )
+    return out
+
+
+def _positional_row_vector_store(
+    b: torch.Tensor, rows: int, cols: int, block: int
+) -> torch.Tensor:
+    """What ``tl.store`` makes of a right-aligned rank-1 ``b[tile_m]`` value in a
+    ``[tile_m, tile_n]`` slot: ``out[m0 + i, n0 + j] = b[m0 + j]``."""
+    out = torch.empty(rows, cols, device=b.device, dtype=b.dtype)
+    for m0 in range(0, rows, block):
+        for n0 in range(0, cols, block):
+            out[m0 : m0 + block, n0 : n0 + block] = b[m0 : m0 + block][None, :]
+    return out
+
+
+def _positional_reordered_operand(
+    a: torch.Tensor, b: torch.Tensor, block: int
+) -> torch.Tensor:
+    """``a[t0, t1, t2] + b[t1, t0]`` as Triton computes it: the ``[t1, t0]``
+    tile is added at its own positions, ``b[t1_0 + i, t0_0 + j]``."""
+    out = torch.empty_like(a)
+    for t0_0 in range(0, a.size(0), block):
+        for t1_0 in range(0, a.size(1), block):
+            tile = b[t1_0 : t1_0 + block, t0_0 : t0_0 + block]
+            out[t0_0 : t0_0 + block, t1_0 : t1_0 + block] = (
+                a[t0_0 : t0_0 + block, t1_0 : t1_0 + block] + tile[:, :, None]
+            )
+    return out
+
+
+def _chebyshev_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    T0 = torch.ones_like(x)
+    T1 = x
+    acc = T0 * w[0] + T1 * w[1]
+    for n in range(2, w.size(0)):
+        T_new = 2 * x * T1 - T0
+        acc = acc + T_new * w[n]
+        T0 = T1
+        T1 = T_new
+    return acc
+
+
+def _phi_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    two_x = 2.0 * x
+    U1 = two_x
+    U0 = torch.ones_like(x)
+    acc = w[0] * U0 + w[1] * U1
+    for order in range(2, w.size(0)):
+        acc = acc + w[order] * U1
+        U_new = two_x * U1 - U0
+        U0 = U1
+        U1 = U_new
+    return acc
+
+
+def _blockwise_transpose(x: torch.Tensor, block: int) -> torch.Tensor:
+    """Each ``block`` x ``block`` tile transposed in place, the positional
+    (Triton) semantics of ``out[tile_m, tile_n] = x[tile_m, tile_n].T``; the
+    ragged tiles read zeros past the edge like the masked loads do."""
+    M, N = x.shape
+    padded_m = -(-M // block) * block
+    padded_n = -(-N // block) * block
+    padded = torch.nn.functional.pad(x, (0, padded_n - N, 0, padded_m - M))
+    out = torch.empty_like(padded)
+    for i in range(0, padded_m, block):
+        for j in range(0, padded_n, block):
+            out[i : i + block, j : j + block] = padded[i : i + block, j : j + block].T
+    return out[:M, :N]
+
+
+@onlyBackends(["cute"])
+class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
+    """A permute is a relabel of each thread's element; a consumer that
+    re-binds a dim to another block id exchanges or is refused.
+
+    Every block id maps to one coordinate per thread (and per lane iteration),
+    so while the consumer binds the dims consistently
+    (``out[tile_n, tile_m] = x[tile_m, tile_n].T``) the thread holding
+    ``x[i, j]`` is the one that stores ``x.T[j, i]``.  The former
+    shared-memory shuffle keyed by the element's position in the tile handed
+    each such thread another thread's element, and inside a lane loop read
+    positions other lane iterations write at other times.  Helion's tiles are
+    positional, so ``out[tile_m, tile_n] = x[tile_m, tile_n].T`` (equal block
+    sizes) is a within-tile transpose that does need another thread's element:
+    the store exchanges it through shared memory when every element has its
+    own thread and is refused inside lane loops; a pointwise operand re-bound
+    the same way (``t + t.T``) is refused.
+    """
+
+    _LANE_LOOP = r"for (?:vec_)?lane_\d+ in"
+
+    def _check_transpose(
+        self, configs: list[dict[str, object]], *, lane_loops: bool
+    ) -> None:
+        torch.manual_seed(0)
+        # Ragged tails exercise the tile masks on both sides of the transpose.
+        x = torch.randn(200, 136, device=DEVICE)
+        for config in configs:
+            with self.subTest(config=config):
+                code, out = code_and_output(_cute_live_transpose, (x,), **config)
+                torch.testing.assert_close(out, torch.abs(x.T))
+                self.assertNotIn("rebind_smem", code)
+                if lane_loops:
+                    self.assertRegex(code, self._LANE_LOOP)
+                else:
+                    self.assertNotRegex(code, self._LANE_LOOP)
+
+    def test_live_transpose_one_element_per_thread(self) -> None:
+        # Each tile element has its own thread; the old shuffle stored the
+        # element of the thread at the flat-reinterpreted position instead.
+        self._check_transpose(
+            [{"block_sizes": [32, 8]}, {"block_sizes": [16, 16]}],
+            lane_loops=False,
+        )
+
+    def test_live_transpose_in_lane_loops(self) -> None:
+        # More elements than threads: scalar lane loops from a large tile and
+        # from a small thread block, and a constexpr vector lane.
+        self._check_transpose(
+            [
+                {"block_sizes": [64, 64]},
+                {"block_sizes": [32, 8], "num_threads": [8, 4]},
+                {"block_sizes": [32, 128], "cute_vector_widths": [1, 4]},
+            ],
+            lane_loops=True,
+        )
+
+    def test_store_transposed_tiles(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(128, 128, device=DEVICE)
+        for config in (
+            {"block_sizes": [32, 8]},
+            {"block_sizes": [64, 64]},
+            {"block_sizes": [32, 8], "num_threads": [8, 4]},
+        ):
+            with self.subTest(config=config):
+                code, (out, out_abs) = code_and_output(
+                    _cute_store_transposed_tiles, (x,), **config
+                )
+                torch.testing.assert_close(out, x.T)
+                torch.testing.assert_close(out_abs, torch.abs(x.T))
+                self.assertNotIn("rebind_smem", code)
+
+    def test_live_permute_3d(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(24, 40, 20, device=DEVICE)
+        for config in ({"block_sizes": [8, 8, 4]}, {"block_sizes": [16, 16, 16]}):
+            with self.subTest(config=config):
+                code, out = code_and_output(_cute_live_permute_3d, (x,), **config)
+                torch.testing.assert_close(out, torch.abs(x.permute(2, 0, 1)))
+                self.assertNotIn("rebind_smem", code)
+
+    def test_transposed_tile_feeding_a_reduction(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(128, 96, device=DEVICE)
+        for config in ({"block_sizes": [8]}, {"block_sizes": [32]}):
+            with self.subTest(config=config):
+                code, out = code_and_output(
+                    _cute_transposed_abs_row_sum, (x,), **config
+                )
+                torch.testing.assert_close(
+                    out, torch.abs(x.T).sum(1), rtol=1e-4, atol=1e-4
+                )
+                self.assertNotIn("rebind_smem", code)
+
+    def test_blockwise_transpose_store_exchanges(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, device=DEVICE)
+        for kernel, reference in (
+            (_cute_blockwise_transpose, _blockwise_transpose(x, 16)),
+            (_cute_blockwise_abs_transpose, torch.abs(_blockwise_transpose(x, 16))),
+        ):
+            with self.subTest(kernel=kernel.name):
+                code, out = code_and_output(kernel, (x,), block_sizes=[16, 16])
+                torch.testing.assert_close(out, reference)
+                self.assertIn("rebind_smem", code)
+                self.assertIn("cute.arch.sync_threads()", code)
+
+    def test_blockwise_transpose_store_ragged_tiles(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(40, 24, device=DEVICE)
+        code, out = code_and_output(
+            _cute_blockwise_transpose, (x,), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(out, _blockwise_transpose(x, 16))
+        self.assertIn("rebind_smem", code)
+
+    def test_blockwise_transpose_store_unequal_block_sizes_rejected(self) -> None:
+        x = torch.randn(64, 64, device=DEVICE)
+        with self.assertRaises(exc.ShapeMismatch):
+            code_and_output(_cute_blockwise_transpose, (x,), block_sizes=[16, 32])
+
+    def test_blockwise_transpose_store_in_lane_loops_rejected(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE)
+        for config in (
+            {"block_sizes": [64, 64]},
+            {"block_sizes": [16, 16], "num_threads": [8, 8]},
+        ):
+            with (
+                self.subTest(config=config),
+                self.assertRaisesRegex(exc.BackendUnsupported, "re-binds"),
+            ):
+                code_and_output(_cute_blockwise_transpose, (x,), **config)
+
+    def test_pointwise_rebound_operand_rejected(self) -> None:
+        x = torch.randn(64, 64, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "at the position of another block's lane"
+        ):
+            code_and_output(_cute_tile_plus_transpose, (x,), block_sizes=[16, 16])
+
+    def test_atomic_rebound_value_rejected(self) -> None:
+        x = torch.randn(64, 64, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic_add .* re-binds"):
+            code_and_output(_cute_atomic_add_transposed, (x,), block_sizes=[16, 16])
+
+    def test_lower_rank_operands_align_by_block_id(self) -> None:
+        # The frontend's implicit broadcast (TileDispatch.broadcast_expand_dims)
+        # places a lower-rank operand's tile dims by block id; the re-binding
+        # check must not read them positionally.
+        torch.manual_seed(0)
+        a = torch.randn(64, 48, device=DEVICE)
+        row_bias = torch.randn(64, device=DEVICE)
+        col_scale = torch.randn(48, device=DEVICE)
+        _, out = code_and_output(
+            _cute_row_and_column_broadcasts,
+            (a, row_bias, col_scale),
+            block_sizes=[16, 16],
+        )
+        torch.testing.assert_close(out, a * col_scale + row_bias[:, None])
+        a3 = torch.randn(4, 32, 32, device=DEVICE)
+        b = torch.randn(32, device=DEVICE)
+        _, out = code_and_output(
+            _cute_middle_dim_broadcast, (a3, b), block_sizes=[4, 32, 32]
+        )
+        torch.testing.assert_close(out, a3 + b[None, :, None])
+        a3 = torch.randn(8, 16, 2, device=DEVICE)
+        b2 = torch.randn(8, 4, device=DEVICE)
+        _, out = code_and_output(
+            _cute_tile_and_slice_broadcast, (a3, b2), block_sizes=[8, 16]
+        )
+        torch.testing.assert_close(out, a3 + b2[:, 0:2].unsqueeze(1))
+
+    def test_unit_tile_dim_broadcasts(self) -> None:
+        # test_loops' recurrences: the result dim bound to the block_size=1
+        # ``order`` tile broadcasts, it is not a re-binding of ``T_new``'s
+        # b_tile dim (the check raised ShapeMismatch "extent 32 vs 1").
+        torch.manual_seed(0)
+        x = torch.randn(32, 64, device=DEVICE)
+        w = torch.randn(5, 64, device=DEVICE)
+        _, out = code_and_output(_cute_chebyshev, (x, w), block_sizes=[32, 64])
+        torch.testing.assert_close(
+            out, _chebyshev_reference(x, w), rtol=1e-4, atol=1e-4
+        )
+        x = torch.randn(4, 8, device=DEVICE)
+        w = torch.randn(4, 8, device=DEVICE)
+        _, out = code_and_output(_cute_phi_recurrence, (x, w), block_sizes=[4, 8])
+        torch.testing.assert_close(out, _phi_reference(x, w), rtol=1e-4, atol=1e-4)
+
+    def test_lower_rank_store_value_is_positional(self) -> None:
+        # Matches the Triton backend (test_views.test_lower_rank_store_value):
+        # the value is right-aligned, so the exchange makes column j of each
+        # tile carry b[m0 + j]; unequal extents are the ShapeMismatch Triton
+        # raises, and the atomic form, which has no exchange, is refused.
+        torch.manual_seed(0)
+        a = torch.randn(64, 64, device=DEVICE)
+        b = torch.randn(64, device=DEVICE)
+        code, out = code_and_output(
+            _cute_store_lower_rank_value, (a, b), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(out, _positional_row_vector_store(b, 64, 64, 16))
+        self.assertIn("rebind_smem", code)
+        with self.assertRaises(exc.ShapeMismatch):
+            code_and_output(_cute_store_lower_rank_value, (a, b), block_sizes=[16, 32])
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic_add .* re-binds"):
+            code_and_output(
+                _cute_atomic_add_lower_rank_value, (a, b), block_sizes=[16, 16]
+            )
+
+    def test_reordered_lower_rank_operand_rejected(self) -> None:
+        # Triton adds the [t1, t0] tile positionally (see
+        # test_views.test_reordered_lower_rank_operand); the per-thread
+        # lowering would add b at its block-id coordinates instead, so it is
+        # refused rather than silently different.
+        a = torch.randn(16, 16, 8, device=DEVICE)
+        b = torch.randn(16, 16, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "at the position of another block's lane"
+        ):
+            code_and_output(
+                _cute_reordered_lower_rank_operand, (a, b), block_sizes=[8, 8, 8]
+            )
+
+    def test_where_and_stack_operands_rebinding_rejected(self) -> None:
+        # where and stack have custom lowerings; both combined each thread's
+        # own scalars (returning x where Triton computes the blockwise t.T).
+        x = torch.randn(64, 64, device=DEVICE)
+        c = torch.rand(64, 64, device=DEVICE) > 0.5
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "aten.where.self .* at the position of another"
+        ):
+            code_and_output(_cute_where_transposed, (c, x), block_sizes=[16, 16])
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "aten.stack.default .* at the position of another"
+        ):
+            code_and_output(_cute_stack_transposed, (x,), block_sizes=[16, 16])
+
+    def test_join_inline_asm_and_tuple_scan_operands_rebinding_rejected(self) -> None:
+        # hl.join, hl.inline_asm_elementwise and the tuple scan's combine pair
+        # their operands' elements positionally (Triton computes the
+        # blockwise t.T); all three combined each thread's own scalar before.
+        x = torch.randn(64, 64, device=DEVICE)
+        for kernel in (
+            _cute_join_transposed,
+            _cute_inline_asm_transposed,
+            _cute_tuple_scan_transposed,
+        ):
+            with (
+                self.subTest(kernel=kernel.name),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "at the position of another block's lane"
+                ),
+            ):
+                code_and_output(kernel, (x,), block_sizes=[16, 16])
+
+    def test_slice_store_of_transposed_slice_is_positional(self) -> None:
+        # The slot's ``:`` is addressed by the active block of its size the
+        # tiles do not use (the load's reduction block), so the exchange reads
+        # at that coordinate: with one 32-tile both forms are the identity, as
+        # on Triton (test_views.test_slice_store_of_transposed_slice); before,
+        # every thread read value[m, m] and wrote a diagonal broadcast.
+        torch.manual_seed(0)
+        x = torch.randn(32, 32, device=DEVICE)
+        for kernel in (
+            _cute_slice_store_of_transposed_slice,
+            _cute_slice_store_of_transposed_slice_b,
+        ):
+            with self.subTest(kernel=kernel.name):
+                code, out = code_and_output(kernel, (x,), block_sizes=[32])
+                torch.testing.assert_close(out, x)
+                self.assertIn("rebind_smem", code)
+
+    def test_two_slices_beside_a_tile_follow_the_index_expressions(self) -> None:
+        # The slot's slices are bound the way _cute_index_exprs addresses
+        # them, in order and with each resolved block used up: the first
+        # slice takes the load's reduction block, the second the equal-size
+        # active tile_n, so the value is consistent and the store is the
+        # identity as on Triton (test_views.test_two_slices_beside_a_tile).
+        # Before, both slices bound the reduction block and the exchange read
+        # value[m, r, r], a diagonal broadcast.
+        torch.manual_seed(0)
+        x = torch.randn(4, 8, 8, device=DEVICE)
+        code, out = code_and_output(
+            _cute_two_slices_beside_a_tile, (x,), block_sizes=[1, 8]
+        )
+        torch.testing.assert_close(out, x)
+        self.assertNotIn("rebind_smem", code)
+
+    def test_stack_load_extra_mask_rebinding_rejected(self) -> None:
+        m = torch.rand(32, 32, device=DEVICE) > 0.5
+        tensor_list = [torch.randn(32, 32, device=DEVICE) for _ in range(2)]
+        dev_ptrs = torch.as_tensor(
+            [t.data_ptr() for t in tensor_list], device=DEVICE, dtype=torch.uint64
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "stack tensor load mask .* re-binds"
+        ):
+            code_and_output(
+                _cute_stack_load_with_transposed_mask,
+                (m, dev_ptrs, tensor_list[0]),
+                block_sizes=[16, 16],
+            )
+
+    def test_load_extra_mask_rebinding_rejected(self) -> None:
+        # Triton ANDs the extra mask positionally into the index masks
+        # (test_views.test_load_extra_mask_is_positional); the per-thread
+        # lowering tested each thread's own mask element and is refused.
+        x = torch.randn(64, 64, device=DEVICE)
+        m = torch.rand(64, 64, device=DEVICE) > 0.5
+        row = torch.rand(64, device=DEVICE) > 0.5
+        with self.assertRaisesRegex(exc.BackendUnsupported, "load mask .* re-binds"):
+            code_and_output(
+                _cute_load_with_transposed_mask, (x, m), block_sizes=[16, 16]
+            )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "load mask .* re-binds"):
+            code_and_output(_cute_load_with_row_mask, (x, row), block_sizes=[16, 16])
+
+    def test_gather_transposed_index_rejected(self) -> None:
+        # The gather reads its index per thread and addresses the input by the
+        # thread's own block coordinates, so an index tile of the other block
+        # order picked row m where torch picks row n.
+        x = torch.randn(64, 64, device=DEVICE)
+        idx = torch.randint(0, 16, (64, 64), device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "aten.gather.default .* at the position of another"
+        ):
+            code_and_output(
+                _cute_gather_with_transposed_index, (x, idx), block_sizes=[16, 16]
+            )
+
+    def test_tuple_reduce_operands(self) -> None:
+        # The ordinary tuple combine pairs its inputs' elements: consistent
+        # inputs stay exact, and a transposed input is refused. Independent
+        # builtin sums can instead canonicalize into separate reductions.
+        # (The 16-wide rows
+        # are what the cute tuple reduce computes correctly today; 64-wide
+        # rows are wrong on pristine too, independent of this check.)
+        torch.manual_seed(0)
+        x = torch.randn(32, 16, device=DEVICE)
+        y = torch.randn(32, 16, device=DEVICE)
+        _, (out_x, out_y) = code_and_output(
+            _cute_tuple_reduce, (x, y), block_sizes=[16]
+        )
+        torch.testing.assert_close(out_x, x.sum(1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(out_y, y.sum(1), rtol=1e-4, atol=1e-4)
+        square = torch.randn(64, 64, device=DEVICE)
+        with (
+            patch(
+                "helion._compiler.cute.canonicalize_reductions.canonicalize_reductions"
+            ),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported, "at the position of another block's lane"
+            ),
+        ):
+            # Keep this graph out of the shared bind cache so the positive
+            # case below exercises normal canonicalization on a fresh graph.
+            _cute_tuple_reduce_transposed._bind_isolated((square,)).to_code(
+                helion.Config(block_sizes=[16, 16])
+            )
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def transposed_sums(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            rows = torch.empty_like(x)
+            columns = torch.empty_like(x)
+            for tm, tn in hl.tile(x.size()):
+                tile = x[tm, tn]
+                a, b = hl.reduce(_tuple_add_combine, (tile, tile.T), dim=1)
+                rows[tm, tn] = a[:, None]
+                columns[tm, tn] = b[None, :]
+            return rows, columns
+
+        # Keep the same input and tile sizes, but assign each output element
+        # to one tile. The rejection probe has competing column-tile stores.
+        _, (rows, columns) = code_and_output(
+            transposed_sums, (square,), block_sizes=[16, 16]
+        )
+        tiles = square.reshape(4, 16, 4, 16)
+        expected_rows = tiles.sum(3, keepdim=True).expand_as(tiles).reshape_as(square)
+        expected_columns = (
+            tiles.sum(1, keepdim=True).expand_as(tiles).reshape_as(square)
+        )
+        torch.testing.assert_close(rows, expected_rows, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(columns, expected_columns, rtol=1e-4, atol=1e-4)
+
+    def test_matmul_transposed_accumulator_rejected(self) -> None:
+        # Tracing admits ``acc=t.T`` with equal block sizes; Triton adds the
+        # blockwise t.T to the product, the SIMT fallback adds each thread's
+        # own element, so the accumulator is checked positionally and refused.
+        a = torch.randn(64, 32, device=DEVICE)
+        b = torch.randn(32, 64, device=DEVICE)
+        t = torch.randn(64, 64, device=DEVICE)
+        for kernel in (
+            _cute_dot_transposed_accumulator,
+            _cute_addmm_transposed_accumulator,
+        ):
+            with (
+                self.subTest(kernel=kernel.name),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "at the position of another block's lane"
+                ),
+            ):
+                code_and_output(kernel, (a, b, t), block_sizes=[16, 16, 32])
+
+    def test_consistent_join_stays_exact(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(64, 48, device=DEVICE)
+        _, out = code_and_output(_cute_join_consistent, (x,), block_sizes=[16, 16])
+        torch.testing.assert_close(out, torch.stack([x.T, x.T * 2], dim=-1))
+
+    def test_where_lower_rank_operand_is_positional(self) -> None:
+        # tl.where receives its operands unexpanded, so a rank-1 row[tm] is
+        # right-aligned to the tn axis (test_views.test_where_lower_rank_operand
+        # pins Triton's values); the per-thread lowering read row at its own
+        # tm coordinate and must refuse instead.
+        c = torch.rand(64, 64, device=DEVICE) > 0.5
+        x = torch.randn(64, 64, device=DEVICE)
+        row = torch.randn(64, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "aten.where.self .* at the position of another"
+        ):
+            code_and_output(
+                _cute_where_lower_rank_operand, (c, x, row), block_sizes=[16, 16]
+            )
+        with self.assertRaises(exc.ShapeMismatch):
+            code_and_output(
+                _cute_where_lower_rank_operand, (c, x, row), block_sizes=[16, 32]
+            )
+
+    def test_gather_store_into_other_tile_uses_exchanged_value(self) -> None:
+        # One tile pair, so the positional result is deterministic:
+        # out[i, :] = src[idx[i], :].  Before, the trailing-slices store path
+        # rebuilt the value from the load and ignored the exchange.
+        torch.manual_seed(0)
+        src = torch.randn(64, 8, device=DEVICE)
+        idx = torch.randperm(64, device=DEVICE)[:16]
+        out = torch.zeros(16, 8, device=DEVICE)
+        code, result = code_and_output(
+            _cute_gather_rows_into_other_tile, (src, idx, out), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(result, src[idx])
+        self.assertIn("rebind_smem", code)
+
+    def test_store_mask_and_stack_store_rebinding_rejected(self) -> None:
+        x = torch.randn(32, 32, device=DEVICE)
+        m = torch.rand(32, 32, device=DEVICE) > 0.5
+        with self.assertRaisesRegex(exc.BackendUnsupported, "store mask .* re-binds"):
+            code_and_output(
+                _cute_store_with_transposed_mask, (x, m), block_sizes=[16, 16]
+            )
+        tensor_list = [torch.empty(32, 32, device=DEVICE) for _ in range(2)]
+        dev_ptrs = torch.as_tensor(
+            [t.data_ptr() for t in tensor_list], device=DEVICE, dtype=torch.uint64
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "stack tensor store re-binds"
+        ):
+            code_and_output(
+                _cute_stack_store_transposed,
+                (x, dev_ptrs, tensor_list[0]),
+                block_sizes=[16, 16],
+            )
+
+    def test_deferred_rebound_epilogue_into_atomic_is_checked(self) -> None:
+        # The pointwise check is deferred for tcgen05 epilogue chains; an
+        # atomic consumer takes no store path, so the end-of-codegen drain
+        # must raise it.
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaisesRegex(
+                exc.BackendUnsupported, "at the position of another block's lane"
+            ),
+            patch_cute_mma_support(),
+        ):
+            bound = _cute_matmul_rebound_epilogue_into_atomic.bind((x, y, residual))
+            bound.to_triton_code(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+
+    def test_atomic_into_slice_keeps_its_own_diagnostic(self) -> None:
+        # The slice is not a tile for the re-binding check (compute_shape
+        # gives it a reduction block), so the atomic lowering's established
+        # "distinct tile axes" rejection speaks, not the re-binding one.
+        x = torch.empty((8, 8), device=DEVICE)
+        out = torch.empty((9, 8), device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "distinct tile axes"):
+            _cute_atomic_add_into_slice.bind((x, out)).to_triton_code(helion.Config())
+
+    def test_pointwise_rebound_operand_unequal_extents_shape_mismatch(self) -> None:
+        x = torch.randn(64, 64, device=DEVICE)
+        with self.assertRaises(exc.ShapeMismatch):
+            code_and_output(_cute_tile_plus_transpose, (x,), block_sizes=[16, 32])
+
+    def test_blockwise_transpose_store_beside_a_wider_tile(self) -> None:
+        # block_sizes [16, 16, 64] launch (64, 16, 1) threads: in the first
+        # loop the threads with thread_idx()[0] >= 16 have coordinates past
+        # the tile, so the exchange must keep them off the staging buffer
+        # (unguarded, they wrote past its end: an illegal memory access).
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, device=DEVICE)
+        y = torch.randn(256, device=DEVICE)
+        code, (out, rows) = code_and_output(
+            _cute_blockwise_transpose_beside_a_wider_tile,
+            (x, y),
+            block_sizes=[16, 16, 64],
+        )
+        torch.testing.assert_close(out, _blockwise_transpose(x, 16))
+        torch.testing.assert_close(rows, y * 2)
+        self.assertIn("block=(64, 16, 1)", code)
+        self.assertIn("if rebind_staged", code)
+        self.assertIn("if rebind_reads else", code)
+
+    def test_tcgen05_transposed_accumulator_store_rejected(self) -> None:
+        # The tcgen05 tile store used to write the accumulator untransposed:
+        # the re-binding is detected before any store path and refused, since
+        # a TMEM accumulator is not one element per thread to exchange.
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        with (
+            self.assertRaisesRegex(
+                exc.BackendUnsupported, "re-binds .* of a tcgen05 matmul epilogue"
+            ),
+            patch_cute_mma_support(),
+        ):
+            bound = _cute_matmul_transposed_accumulator_store.bind((x, y))
+            bound.to_triton_code(
+                _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+            )
+
+
+@onlyBackends(["cute"])
+class TestCuteMultiAxisKContraction(unittest.TestCase):
+    """The shared-memory K sum of the scalar matmul fallback groups partials by
+    every launch axis, not only the x lane."""
+
+    def test_multi_axis_k64_contraction_matches_reference(self) -> None:
+        """M=8 rows and N=16 cols on free ``hl.arange`` thread axes next to a
+        64-thread K axis launch a (64, 8, 2) block.  The shared-memory K sum
+        must group partials per (y, z) row, not per x lane only.
+        """
+
+        @helion.kernel(
+            backend="cute",
+            config=helion.Config(block_sizes=[]),
+            static_shapes=True,
+        )
+        def dot_m8_n16(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            BHN = q.size(0)
+            C = hl.specialize(q.size(1))
+            out = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
+            for tile_bhn in hl.tile(BHN, block_size=1):
+                rows = hl.arange(8)
+                cols = hl.arange(16)
+                a = hl.dot(
+                    q[tile_bhn, rows, :].float() * 2.0,
+                    (k[tile_bhn, cols, :].float() * 0.5).transpose(-2, -1),
+                )
+                out[tile_bhn, rows, cols] = a
+            return out
+
+        q = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
+        with patch(
+            "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+            return_value=False,
+        ):
+            ordinary = dot_m8_n16._bind_isolated((q, k))
+            config = helion.Config(block_sizes=[])
+            code = ordinary.to_code(config)
+            out = ordinary.compile_config(config)(q, k)
+        self.assertIn("block=(64, 8, 2)", code)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+        ref = torch.zeros(4, 64, 64, device=DEVICE)
+        ref[:, :8, :16] = torch.bmm(
+            q[:, :8].float() * 2.0, (k[:, :16].float() * 0.5).transpose(-2, -1)
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+        fragment_code, fragment_out = code_and_output(
+            dot_m8_n16, (q, k), block_sizes=[]
+        )
+        self.assertIn("fragment_buffer", fragment_code)
+        torch.testing.assert_close(fragment_out, ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

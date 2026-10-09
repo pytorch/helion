@@ -80,6 +80,8 @@ class FlashSearchSurface(NamedTuple):
     has_row_epilogue: bool
     plain_row_body: bool
     has_score_modifiers: bool
+    tmem_rowmax_compatible: bool = False
+    causal_resident_compatible: bool = False
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -1053,6 +1055,15 @@ class Backend(abc.ABC):
             "to_code(allow_helion_deps=False) yet"
         )
 
+    def build_standalone_code(
+        self,
+        bound: BoundKernel[Any],
+        import_lines: list[str],
+        body_root: ast.Module,
+    ) -> ast.Module | None:
+        """Optionally specialize standalone launch code for the bound workload."""
+        return None
+
     def capture_jax_launch_metadata(
         self, bound: BoundKernel[Any], config: Config | dict[str, object]
     ) -> object:
@@ -1290,8 +1301,13 @@ class Backend(abc.ABC):
 
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_ids]
-        loop_order = env.config_spec.loop_orders.config_get(
-            config.loop_orders, block_ids[0]
+        # A registered tile can also appear in a multidimensional loop.
+        # Its permutation applies only there; a one-dimensional loop has
+        # no order to configure.
+        loop_order = (
+            env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
+            if len(block_ids) > 1
+            else None
         ) or [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1
@@ -1362,25 +1378,25 @@ class Backend(abc.ABC):
         if bound_kernel.settings.autotune_effort == "none" and (
             force or not bound_kernel.kernel.configs
         ):
-            config = bound_kernel.config_spec.default_config()
-        elif not force and bound_kernel.kernel.configs:
+            return bound_kernel.config_spec.default_config()
+        if not force and bound_kernel.kernel.configs:
             if len(bound_kernel.kernel.configs) == 1:
                 (config,) = bound_kernel.kernel.configs
-            else:
-                # We have finite predetermined configs, no need to precompile
-                bound_kernel.settings.autotune_precompile = None
+                return config
+            # We have finite predetermined configs, no need to precompile
+            bound_kernel.settings.autotune_precompile = None
 
-                from ..autotuner import FiniteSearch
+            from ..autotuner import FiniteSearch
 
-                config = FiniteSearch(
-                    bound_kernel, args, bound_kernel.configs
-                ).autotune()
+            autotuner = FiniteSearch(bound_kernel, args, bound_kernel.configs)
         else:
             bound_kernel.settings.check_autotuning_disabled()
-            config = bound_kernel.settings.autotuner_fn(
-                bound_kernel, args, **kwargs
-            ).autotune(skip_cache=force)
-        return config
+            autotuner = bound_kernel.settings.autotuner_fn(bound_kernel, args, **kwargs)
+        if bound_kernel.settings.autotune_handoff:
+            from ..autotuner.handoff_pipeline import autotune_with_handoff
+
+            return autotune_with_handoff(autotuner, skip_cache=force)
+        return autotuner.autotune(skip_cache=force)
 
     @staticmethod
     def map_dot_precision(precision: DotPrecision) -> str:
@@ -3124,6 +3140,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         from .cute.cute_flash import (
             flash_attention_graph_tensor_4d_batch_heads_from_graphs,
         )
+        from .cute.cute_flash import flash_tmem_rowmax_score_plan_supported
 
         if not flash_attention_graph_lse_plan_valid_from_graphs(
             device_ir.graphs,
@@ -3241,6 +3258,11 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 ),
                 # The row programs take a fused row epilogue but no modifier.
                 has_score_modifiers=bool(pattern.score_plan.modifiers),
+                # Equality and full 128-row coverage were established above.
+                causal_resident_compatible=q_seq % 256 == 0,
+                tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(
+                    pattern.score_plan
+                ),
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(

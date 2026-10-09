@@ -11,19 +11,30 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 from typing import cast
 import unittest
 from unittest.mock import patch
 
 from packaging import version
 import pytest
+import sympy
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
+from torch.utils._sympy.functions import PowByNatural
+from torch.utils._sympy.value_ranges import ValueRanges
 
+from ._cute_binding import _cpu_bind
+from ._cute_binding import _forbid_native_compile
+from ._cute_binding import _mock_cuda_unavailable
+from .cute_population_contracts import _target
 import helion
 from helion import _compat
+from helion import exc
 from helion._compat import supports_block_ptr
+from helion._compiler.cute.printer import cute_texpr
+from helion._compiler.integer_power import lower_integer_powers
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import PROJECT_ROOT
@@ -38,6 +49,7 @@ from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -1430,7 +1442,236 @@ class TestTritonExactGelu(RefEagerTestBase, TestCase):
 
 
 class TestHelionCutePrinter(TestCase):
+    @skipIfRefEager("inspects generated device code")
+    def test_host_integer_power_keeps_runtime_scalar_origin(self) -> None:
+        def powers(x: torch.Tensor, bits: int) -> torch.Tensor:
+            value = 1 << bits
+            result = torch.empty_like(x)
+            for row in hl.tile(x.numel()):
+                result[row] = x[row] + value
+            return result
+
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        ):
+            for backend in ("cute", "triton"):
+                kernel = helion.kernel(
+                    powers, backend=backend, static_shapes=True, autotune_effort="none"
+                )
+                for bits in (5, 31, 62):
+                    with self.subTest(backend=backend, bits=bits):
+                        bound = _cpu_bind(
+                            kernel, (torch.ones(3, dtype=torch.int64), bits)
+                        )
+                        code = bound.to_code(bound.config_spec.default_config())
+                        tree = ast.parse(code)
+                        device = next(
+                            node
+                            for node in tree.body
+                            if isinstance(node, ast.FunctionDef)
+                            and node.name.startswith("_helion_")
+                        )
+                        self.assertIn("value", [arg.arg for arg in device.args.args])
+                        self.assertNotIn("bits", [arg.arg for arg in device.args.args])
+                        self.assertIn("value = 1 << bits", code)
+                        self.assertFalse(
+                            any(
+                                isinstance(node, ast.LShift)
+                                for node in ast.walk(device)
+                            )
+                        )
+
+    @skipUnlessBackends(["cute", "triton"])
+    def test_host_integer_power_runtime_scalar_native(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def powers(x: torch.Tensor, bits: int) -> torch.Tensor:
+            value = 1 << bits
+            result = torch.empty_like(x)
+            for row in hl.tile(x.numel()):
+                result[row] = x[row] + value
+            return result
+
+        x = torch.arange(17, device=DEVICE, dtype=torch.int64)
+        for bits in (5, 31, 62):
+            with self.subTest(bits=bits):
+                torch.testing.assert_close(
+                    powers(x, bits), x + (1 << bits), rtol=0, atol=0
+                )
+
+    def test_integer_powers_preserve_full_int64_precision(self) -> None:
+        exponent = sympy.Symbol("exponent", integer=True)
+        for base, last in ((2, 62), (4, 31), (8, 20), (16, 15)):
+            expression = cast("sympy.Expr", PowByNatural(sympy.Integer(base), exponent))
+            lowered = lower_integer_powers(
+                expression, {exponent: ValueRanges(0, last)}, backend="cute"
+            )
+            rendered = cute_texpr(lowered)
+            for value in range(last + 1):
+                with self.subTest(base=base, exponent=value):
+                    actual = eval(
+                        rendered,
+                        {"__builtins__": {}},
+                        {"exponent": value, "cutlass": SimpleNamespace(Int64=int)},
+                    )
+                    self.assertEqual(actual, base**value)
+                    self.assertIsInstance(actual, int)
+
+    def test_integer_powers_reject_unproved_or_overflowing_results(self) -> None:
+        exponent = sympy.Symbol("exponent", integer=True)
+        for base, bounds in (
+            (2, ValueRanges(0, 63)),
+            (2, ValueRanges(-1, 30)),
+            (2, ValueRanges.unknown_int()),
+            (4, ValueRanges(0, 32)),
+            (8, ValueRanges(0, 21)),
+            (3, ValueRanges(0, 10)),
+            (-2, ValueRanges(0, 10)),
+        ):
+            with self.subTest(base=base, bounds=bounds):
+                expression = cast(
+                    "sympy.Expr",
+                    sympy.Function.__new__(
+                        PowByNatural, sympy.Integer(base), exponent, evaluate=False
+                    ),
+                )
+                with self.assertRaises(exc.BackendUnsupported):
+                    lower_integer_powers(expression, {exponent: bounds}, backend="cute")
+        # Unprepared powers must not fall through to Triton's floating printer.
+        with self.assertRaises(exc.BackendUnsupported):
+            cute_texpr(cast("sympy.Expr", PowByNatural(2, exponent)))
+
+    def test_integer_powers_affine_exponents_and_identity(self) -> None:
+        index = sympy.Symbol("index", integer=True)
+        for expression, bounds in (
+            (PowByNatural(2, sympy.Add(30, sympy.Mul(-1, index))), ValueRanges(0, 30)),
+            (PowByNatural(4, sympy.Add(index, -3)), ValueRanges(3, 34)),
+            (
+                sympy.Function.__new__(
+                    PowByNatural, sympy.Integer(1), index, evaluate=False
+                ),
+                ValueRanges.unknown_int(),
+            ),
+        ):
+            expression = cast("sympy.Expr", expression)
+            rendered = cute_texpr(
+                lower_integer_powers(expression, {index: bounds}, backend="cute")
+            )
+            for value in (3, 17, 30):
+                actual = eval(
+                    rendered,
+                    {"__builtins__": {}},
+                    {"index": value, "cutlass": SimpleNamespace(Int64=int)},
+                )
+                self.assertEqual(actual, expression.subs(index, value))
+        unchanged = sympy.Add(sympy.Mul(3, index), 4)
+        self.assertIs(lower_integer_powers(unchanged, {}, backend="cute"), unchanged)
+
+    @skipIfRefEager("inspects generated device code")
+    def test_scalar_loop_integer_power_range_proof(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def powers(
+            x: torch.Tensor,
+            begin: hl.constexpr,
+            end: hl.constexpr,
+            step: hl.constexpr,
+        ) -> torch.Tensor:
+            result = torch.empty((x.numel(), 64), device=x.device, dtype=torch.int64)
+            for row in hl.tile(x.numel()):
+                for exponent in range(begin, end, step):
+                    result[row, exponent] = x[row] + (1 << exponent)
+            return result
+
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        ):
+            for begin, end, step in ((0, 63, 1), (3, 63, 2), (62, -1, -1)):
+                with self.subTest(begin=begin, end=end, step=step):
+                    bound = _cpu_bind(
+                        powers, (torch.ones(5, dtype=torch.int64), begin, end, step)
+                    )
+                    code = bound.to_code(bound.config_spec.default_config())
+                    tree = ast.parse(code)
+                    shifts = [
+                        node
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.BinOp)
+                        and isinstance(node.op, ast.LShift)
+                    ]
+                    self.assertTrue(shifts)
+                    # Execute the emitted integer expression for every actual
+                    # scalar-loop index, including nonzero and descending starts.
+                    for shift in shifts:
+                        names = {
+                            node.id
+                            for node in ast.walk(shift)
+                            if isinstance(node, ast.Name) and node.id != "cutlass"
+                        }
+                        self.assertEqual(len(names), 1)
+                        name = names.pop()
+                        compiled = compile(
+                            ast.Expression(shift), "<generated shift>", "eval"
+                        )
+                        for value in range(begin, end, step):
+                            actual = eval(
+                                compiled,
+                                {"__builtins__": {}},
+                                {
+                                    name: value,
+                                    "cutlass": SimpleNamespace(Int64=int),
+                                },
+                            )
+                            self.assertEqual(actual, 1 << value)
+            bound = _cpu_bind(powers, (torch.ones(5, dtype=torch.int64), 0, 64, 1))
+            with self.assertRaisesRegex(exc.BackendUnsupported, "proved exponent"):
+                bound.to_code(bound.config_spec.default_config())
+
+    @skipUnlessBackends(["cute"])
+    def test_scalar_loop_integer_power_int32_consumer_native(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def masks(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty((x.numel(), 31), device=x.device, dtype=torch.int32)
+            for row in hl.tile(x.numel()):
+                for bit in range(31):
+                    result[row, bit] = x[row] | (1 << (30 - bit))
+            return result
+
+        x = torch.arange(17, dtype=torch.int32, device=DEVICE)
+        expected = (
+            x[:, None]
+            | torch.tensor(
+                [1 << (30 - bit) for bit in range(31)], dtype=torch.int32, device=DEVICE
+            )[None, :]
+        )
+        torch.testing.assert_close(masks(x), expected, rtol=0, atol=0)
+
+    @skipUnlessBackends(["cute"])
+    def test_scalar_loop_integer_power_native(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def powers(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty((x.numel(), 63), device=x.device, dtype=torch.int64)
+            for row in hl.tile(x.numel()):
+                for exponent in range(63):
+                    result[row, exponent] = x[row] + (1 << exponent)
+            return result
+
+        x = torch.arange(17, dtype=torch.int64, device=DEVICE)
+        expected = (
+            x[:, None]
+            + torch.tensor(
+                [1 << index for index in range(63)], dtype=torch.int64, device=DEVICE
+            )[None, :]
+        )
+        torch.testing.assert_close(powers(x), expected, rtol=0, atol=0)
+
     def test_compound_division_operands_are_parenthesized(self) -> None:
+        import operator
+
         import sympy
         from torch.utils._sympy.functions import CeilDiv
         from torch.utils._sympy.functions import CleanDiv
@@ -1452,9 +1693,13 @@ class TestHelionCutePrinter(TestCase):
         )
         for expression in expressions:
             rendered = cute_texpr(expression)
-            for value in (0, 31, 64, 129):
+            for value in (-129, -31, 0, 31, 64, 129):
                 self.assertEqual(
-                    eval(rendered, {"__builtins__": {}}, {"x": value}),
+                    eval(
+                        rendered,
+                        {"__builtins__": {}, "_cute_python_mod": operator.mod},
+                        {"x": value},
+                    ),
                     int(expression.subs(x, value)),
                 )
 
@@ -1698,6 +1943,303 @@ class TestLauncher(TestCase):
         self.assertEqual(out1.device, device1)
         torch.testing.assert_close(out0, 2 * x0)
         torch.testing.assert_close(out1, 2 * x1)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _narrow_integer_shift_chain(
+    x: torch.Tensor, shifts: torch.Tensor, tensor_count: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    chained = torch.empty(x.shape, dtype=torch.int64, device=x.device)
+    left = torch.empty_like(chained)
+    right = torch.empty_like(chained)
+    for tile in hl.tile(x.shape):
+        values = x[tile]
+        if tensor_count:
+            count = shifts[tile]
+        else:
+            count = 4
+        shifted = values << count
+        chained[tile] = (shifted >> count).to(torch.int64)
+        left[tile] = shifted.to(torch.int64)
+        right[tile] = (values >> count).to(torch.int64)
+    return chained, left, right
+
+
+def _narrow_shift_inputs(dtype, count_kind, device="cpu"):
+    # All byte payloads, plus the 16-bit overflow boundaries and a masked tail.
+    values = torch.arange(-128, 129, dtype=torch.int64)
+    if dtype == torch.int16:
+        values[:8] = torch.tensor(
+            [-32768, -32767, -4097, -2049, 2048, 4095, 32766, 32767]
+        )
+    x = values.to(device=device, dtype=dtype)
+    counts = torch.full_like(x, 4, dtype=torch.int64 if count_kind == "wide" else dtype)
+    if count_kind != "scalar":
+        counts[::3] = 1
+        counts[1::3] = 7
+    return x, counts, count_kind != "scalar"
+
+
+def _narrow_shift_reference(x, shifts, tensor_count):
+    count = shifts if tensor_count else 4
+    shifted = x << count
+    return ((shifted >> count).long(), shifted.long(), (x >> count).long())
+
+
+def _run_narrow_shift_generated(code, x, shifts):
+    # Use real CuTe scalar arithmetic: NumPy int8 arithmetic wraps eagerly and
+    # would hide CuTe's Int8/Python-int -> Int32 promotion regression.
+    cutlass = pytest.importorskip("cutlass")
+    types = {
+        torch.int8: cutlass.Int8,
+        torch.uint8: cutlass.Uint8,
+        torch.int16: cutlass.Int16,
+        torch.int64: cutlass.Int64,
+    }
+    outputs = [torch.empty_like(x, dtype=torch.int64) for _ in range(3)]
+    counts = [torch.zeros_like(x, dtype=torch.int64) for _ in outputs]
+
+    class Pointer:
+        def __init__(self, tensor, offset=0, written=None):
+            self.tensor = tensor
+            self.offset = offset
+            self.written = written
+
+        def __add__(self, offset):
+            return Pointer(self.tensor, self.offset + int(offset), self.written)
+
+        def load(self):
+            assert 0 <= self.offset < self.tensor.numel()
+            value = int(self.tensor[self.offset])
+            if self.tensor.dtype == torch.uint8:
+                # Match the SDK's signless pointer-offset reconstruction. The
+                # load lowering must restore unsignedness before arithmetic.
+                return cutlass.Int8(value if value < 128 else value - 256)
+            return types[self.tensor.dtype](value)
+
+        def store(self, value):
+            assert self.written is not None
+            assert 0 <= self.offset < self.tensor.numel()
+            self.written[self.offset] += 1
+            self.tensor[self.offset] = int(value)
+
+    def tensor(t, written=None):
+        return SimpleNamespace(
+            iterator=Pointer(t, written=written), layout=SimpleNamespace(stride=(1,))
+        )
+
+    tree = ast.parse(code)
+    device = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    device.decorator_list = []
+    constants = [n for n in tree.body if isinstance(n, ast.Assign)]
+    module = ast.Module(body=[*constants, device], type_ignores=[])
+    arch = SimpleNamespace()
+    namespace = {"cutlass": cutlass, "cute": SimpleNamespace(arch=arch)}
+    exec(
+        compile(ast.fix_missing_locations(module), "<generated narrow shifts>", "exec"),
+        namespace,
+    )
+    arguments = {"x": tensor(x), "shifts": tensor(shifts)}
+    arguments.update(
+        {
+            name: tensor(out, written)
+            for name, out, written in zip(
+                ("chained", "left", "right"), outputs, counts, strict=True
+            )
+        }
+    )
+    host = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and not n.name.startswith("_helion_")
+    )
+    launch = next(
+        n
+        for n in ast.walk(host)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_launcher"
+    )
+    block = ast.literal_eval(next(k.value for k in launch.keywords if k.arg == "block"))
+    assert block[1:] == (1, 1)
+    size = namespace["_BLOCK_SIZE_0"]
+    for pid in range((x.numel() + size - 1) // size):
+        arch.block_idx = lambda pid=pid: (pid, 0, 0)
+        for tid in range(block[0]):
+            arch.thread_idx = lambda tid=tid: (tid, 0, 0)
+            namespace[device.name](*(arguments[a.arg] for a in device.args.args))
+    for written in counts:
+        torch.testing.assert_close(written, torch.ones_like(written), rtol=0, atol=0)
+    return tuple(outputs)
+
+
+@pytest.mark.parametrize("dtype", (torch.int8, torch.uint8, torch.int16))
+@pytest.mark.parametrize("count_kind", ("scalar", "narrow", "wide"))
+def test_cute_narrow_integer_shifts_generated(dtype, count_kind):
+    args = _narrow_shift_inputs(dtype, count_kind)
+    snapshots = [a.clone() for a in args[:2]]
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_narrow_integer_shift_chain, args)
+        for block_size in (32, 128):
+            code = bound.to_code(
+                helion.Config(block_sizes=[block_size], num_threads=[32])
+            )
+            actual = _run_narrow_shift_generated(code, *args[:2])
+            torch.testing.assert_close(
+                actual, _narrow_shift_reference(*args), rtol=0, atol=0
+            )
+    for arg, snapshot in zip(args[:2], snapshots, strict=True):
+        torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+
+
+@onlyBackends(["cute"])
+class TestNarrowIntegerShifts(TestCase):
+    def test_narrow_shift_chains_native(self):
+        for dtype in (torch.int8, torch.uint8, torch.int16):
+            for count_kind in ("scalar", "narrow", "wide"):
+                args = _narrow_shift_inputs(dtype, count_kind, DEVICE)
+                originals = [a.clone() for a in args[:2]]
+                for block_size in (32, 128):
+                    with self.subTest(
+                        dtype=dtype, count_kind=count_kind, block_size=block_size
+                    ):
+                        _, actual = code_and_output(
+                            _narrow_integer_shift_chain,
+                            args,
+                            block_sizes=[block_size],
+                            num_threads=[32],
+                        )
+                        torch.testing.assert_close(
+                            actual, _narrow_shift_reference(*args), rtol=0, atol=0
+                        )
+                        for arg, original in zip(args[:2], originals, strict=True):
+                            torch.testing.assert_close(arg, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
+def test_cute_unsigned_scalar_load_sdk_type(dtype):
+    cutlass = pytest.importorskip("cutlass")
+    cute = pytest.importorskip("cutlass.cute")
+    ir = pytest.importorskip("cutlass._mlir.ir")
+    from helion._compiler.cute.backend import CuteBackend
+    from helion.language.memory_ops import _cute_scalar_load_expr
+
+    logical = cutlass.Uint8 if dtype == torch.uint8 else cutlass.Uint32
+    environment = SimpleNamespace(
+        backend=CuteBackend(), index_type=lambda: "cutlass.Int32"
+    )
+    with patch(
+        "helion._compiler.compile_environment.CompileEnvironment.current",
+        return_value=environment,
+    ):
+        expression = _cute_scalar_load_expr("x", ["1"], dtype)
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            pointer = cute.make_ptr(logical, 4096, cute.AddressSpace.gmem)
+            tensor = SimpleNamespace(
+                iterator=pointer, layout=SimpleNamespace(stride=(1,))
+            )
+            loaded = eval(expression, {"x": tensor, "cutlass": cutlass})
+            # Check the real SDK type at the masked-zero join, then the actual
+            # extension operation. Merely inspecting Torch metadata misses the
+            # signed Numeric reconstructed from a signless offset pointer.
+            assert loaded.dtype is logical
+            assert loaded.dtype is logical(0).dtype
+            cutlass.Int64(loaded)
+        assembly = str(module)
+        assert assembly.count("llvm.load") == 1
+        assert "arith.extui" in assembly
+        assert "arith.extsi" not in assembly
+
+
+def test_cute_scalar_load_non_unsigned_paths_unchanged():
+    from helion._compiler.cute.backend import CuteBackend
+    from helion.language.memory_ops import _cute_scalar_load_expr
+    from helion.language.memory_ops import _cute_scalar_pointer_expr
+
+    environment = SimpleNamespace(
+        backend=CuteBackend(), index_type=lambda: "cutlass.Int32"
+    )
+    with patch(
+        "helion._compiler.compile_environment.CompileEnvironment.current",
+        return_value=environment,
+    ):
+        for dtype in (
+            torch.bool,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ):
+            assert _cute_scalar_load_expr("x", ["1"], dtype) == (
+                _cute_scalar_pointer_expr("x", ["1"]) + ".load()"
+            )
+        assert _cute_scalar_load_expr("x", ["None"], torch.uint8) == "x[None]"
+        assert _cute_scalar_load_expr("x", ["1"], torch.float8_e4m3fn) == (
+            f"cute.arch.load({_cute_scalar_pointer_expr('x', ['1'])}, cutlass.Uint8)"
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _unsigned_scalar_widen(x):
+    out = torch.empty(x.shape, dtype=torch.int64, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile].to(torch.int64)
+    return out
+
+
+def _unsigned_load_input(dtype, device):
+    bits = torch.iinfo(dtype).bits
+    values = torch.arange(516, dtype=torch.int64)
+    boundary = torch.tensor([0, 1, 2 ** (bits - 1) - 1, 2 ** (bits - 1), 2**bits - 1])
+    values = boundary[values % 5].to(dtype=dtype, device=device)
+    return values[1:515:2]
+
+
+@pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
+def test_cute_unsigned_scalar_load_codegen(dtype):
+    x = _unsigned_load_input(dtype, "cpu")
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_unsigned_scalar_widen, (x,))
+        for size in (32, 128):
+            code = bound.to_code(helion.Config(block_sizes=[size], num_threads=[32]))
+            branches = [
+                node
+                for node in ast.walk(ast.parse(code))
+                if isinstance(node, ast.IfExp) and ".load()" in ast.unparse(node.body)
+            ]
+            assert len(branches) == 1
+            logical = "cutlass.Uint8" if dtype == torch.uint8 else "cutlass.Uint32"
+            assert isinstance(branches[0].body, ast.Call)
+            assert ast.unparse(branches[0].body.func) == logical
+            assert ast.unparse(branches[0].orelse) == f"{logical}(0)"
+
+
+@skipUnlessBackends(["cute"])
+class TestUnsignedScalarLoads(TestCase):
+    def test_unsigned_scalar_loads_preserve_high_bits_and_tails(self):
+        for dtype in (torch.uint8, torch.uint32):
+            for size in (32, 128):
+                with self.subTest(dtype=dtype, block_size=size):
+                    x = _unsigned_load_input(dtype, DEVICE)
+                    before = x.clone()
+                    _, actual = code_and_output(
+                        _unsigned_scalar_widen,
+                        (x,),
+                        block_sizes=[size],
+                        num_threads=[32],
+                    )
+                    torch.testing.assert_close(actual, x.long(), rtol=0, atol=0)
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

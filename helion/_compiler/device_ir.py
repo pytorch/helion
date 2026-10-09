@@ -401,15 +401,21 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                 )
                 if (site_id := site_ids.get(0)) is not None:
                     setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
+            from .cute.integer_loop_reduction import prepare
+
+            device_loop.integer_reduction_hoist = prepare(self, state, device_loop)
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
             ):
-                return codegen_call_with_graph(
+                result = codegen_call_with_graph(
                     state.codegen,
                     self.graph,
                     args,
                 )
+                if device_loop.integer_reduction_hoist is not None:
+                    device_loop.integer_reduction_hoist.finish(result)
+                return result
         finally:
             # pyrefly: ignore [missing-attribute]
             state.codegen._cute_active_graph_info = previous_active_graph_info
@@ -1573,7 +1579,9 @@ class DeviceIR:
             return False
         return bool(env.known_equal(block, info.size))
 
-    def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
+    def build_codegen_graphs(
+        self, config: Config, *, roll_reductions: bool = True
+    ) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling and epilogue subtiling applied.
 
         Creates a temporary DeviceIR with copied graphs, applies reduction
@@ -1583,7 +1591,8 @@ class DeviceIR:
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
-        temp._apply_rolling(config)
+        if roll_reductions:
+            temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
         temp._hoist_inband_polls()
         if CompileEnvironment.current().backend_name == "metal":
@@ -1839,6 +1848,8 @@ class WalkDeviceAST(NodeVisitor):
                 if k in writes
                 and (include_new or k in self.scope)
                 and self.scope.get(k) is not v
+                # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
+                and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
             }
         )
 
@@ -3296,11 +3307,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             rewrite_implicit_random_ops(graph.graph)
         scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.canonicalize_reductions import canonicalize_reductions
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
             from .cute.scaled_contraction import expose_scaled_contractions
 
+            canonicalize_reductions(device_ir)
             scaled_contractions = expose_scaled_contractions(device_ir)
             for graph_info in device_ir.graphs:
                 fold_noop_stores(graph_info.graph)
@@ -3433,6 +3446,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     small_biased_candidate=flash_shape.small_biased_candidate,
                     standard_dense_output=flash_shape.standard_dense_output,
                     standard_causal_output=flash_shape.standard_causal_output,
+                    tmem_rowmax_compatible=flash_shape.tmem_rowmax_compatible,
+                    causal_resident_compatible=flash_shape.causal_resident_compatible,
                     output_requires_tma=flash_shape.output_requires_tma,
                     supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
                     has_row_epilogue=flash_shape.has_row_epilogue,
@@ -3762,9 +3777,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
-                # R5: only the dynamic pipeline has cross-rank transports.
+                # Peer transports order static and dynamic schedules alike; only
+                # static ones mark guard-skipped tasks for inband scatters.
+                graph = device_ir.tile_dependency_graph
+                choices = ("static", "dynamic") if cross_rank else None
+                if any(
+                    graph.scatter_position(allocation_id) is not None
+                    for allocation_id in graph.inband_allocation_ids
+                ):
+                    choices = ("static",)
                 config_spec.enable_cross_loop_pipeline(
-                    choices=("dynamic",) if cross_rank else VALID_CROSS_LOOP_PIPELINES
+                    choices=choices or VALID_CROSS_LOOP_PIPELINES
                 )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(

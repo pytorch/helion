@@ -427,11 +427,15 @@ class TestLoops(RefEagerTestBase, TestCase):
             return out
 
         x = torch.arange(37, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
-        torch.testing.assert_close(result, x)
-        if _get_backend() == "triton":
-            self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(", code)
-            self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
+        for block_size in (4, 8, 16):
+            with self.subTest(block_size=block_size):
+                code, result = code_and_output(
+                    copy_blockwise, (x,), block_sizes=[block_size]
+                )
+                torch.testing.assert_close(result, x)
+                if _get_backend() == "triton":
+                    self.assertIn(f"_BLOCK_SIZE_0 = tl.constexpr({block_size})", code)
+                    self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"

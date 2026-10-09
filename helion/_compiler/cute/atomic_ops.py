@@ -35,11 +35,14 @@ from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..variable_origin import GridOrigin
 from ..variable_origin import NameOrigin
+from .cute_reshape import describe_rebound_block_dims
+from .cute_reshape import subscript_rebound_block_dims
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import DeviceLoopOrGridState
 
 # Lane counts of the ``red.global.add.v{N}.f32`` forms (8 and 16 bytes).
 _CUTE_VECTOR_ATOMIC_WIDTHS = (2, 4)
@@ -153,6 +156,26 @@ def _codegen_common_cute(
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
         raise exc.AtomicOnDeviceTensor(cute_func)
+    # The established slice / axis diagnostics first ("atomic slice and
+    # update value use distinct tile axes"), then the operands between the
+    # index and the memory order: ``val`` (and ``expected`` for atomic_cas).
+    # A tile whose dim the subscript binds to another block id
+    # (``hl.atomic_add(out, [tile_m, tile_n], x[...].T)``, or a lower-rank
+    # value right-aligned to the index as ``tl.atomic_*`` receives it) would
+    # need another thread's element; the per-thread RMW has no exchange.
+    indexed_block_ids = _cute_atomic_indexed_blocks(state, index)
+    for position in range(2, len(state.ast_args) - 1):
+        operand = state.proxy_arg(position)
+        if not isinstance(operand, torch.Tensor) or operand.ndim == 0:
+            continue
+        rebound = subscript_rebound_block_dims(state, target, index, operand)
+        if rebound:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{cute_func} of {list(operand.shape)} re-binds "
+                f"{describe_rebound_block_dims(rebound)}; the value must be "
+                "held by the thread that owns the destination lane",
+            )
 
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(target.dtype)
@@ -234,12 +257,23 @@ def _codegen_common_cute(
             index_exprs,
             cast_value_exprs[0],
             atomic_expr,
-            _cute_atomic_predicates(state, index, extra_predicates, atomic_expr)[0],
+            _cute_atomic_predicates(
+                state,
+                index,
+                extra_predicates,
+                atomic_expr,
+                indexed_block_ids=indexed_block_ids,
+            )[0],
         )
     ):
         return ast.Constant(value=None)
     return _guard_cute_atomic_expr(
-        state, index, target_dtype, atomic_expr, extra_predicates=extra_predicates
+        state,
+        index,
+        target_dtype,
+        atomic_expr,
+        extra_predicates=extra_predicates,
+        indexed_block_ids=indexed_block_ids,
     )
 
 
@@ -248,12 +282,15 @@ def _cute_atomic_predicates(
     index: list[object],
     extra_predicates: list[str] | None,
     atomic_expr: ast.AST | None = None,
+    *,
+    indexed_block_ids: set[int] | None,
 ) -> tuple[list[str], set[int]]:
     """The guards of an atomic at this site (bounds masks of the covered
     axes, leader threads of the uncovered ones, and any caller-supplied
     predicate) and the leader axes; records the lanes the atomic is uniform
-    along on ``atomic_expr`` for the lane-loop placement."""
-    indexed_block_ids = _cute_atomic_indexed_blocks(state, index)
+    along on ``atomic_expr`` for the lane-loop placement.
+    ``indexed_block_ids`` is the caller's ``_cute_atomic_indexed_blocks(state,
+    index)`` (``None`` when the coverage is unknown)."""
     leader_axes = _cute_unindexed_leader_axes(state, indexed_block_ids)
     if indexed_block_ids is None:
         # Without a known coverage, a tile attribute in the index
@@ -515,8 +552,12 @@ def _cute_vector_atomic_site(
     # An atomic that is uniform along a live lane loop must stay a scalar
     # atomic: the lane-loop placement pass pins that form to the loop's
     # first lane (or rejects it), whereas the flush protocol below would
-    # re-issue the reduction once per iteration of that loop.
-    if _cute_uniform_lane_vars(state, _cute_atomic_indexed_blocks(state, index)):
+    # re-issue the reduction once per iteration of that loop.  So does one
+    # adding a lane-split matmul's per-lane partials, whose K lane loop is
+    # not the vectorized axis's.
+    if _cute_per_lane_atomic_lane_vars(state) or _cute_uniform_lane_vars(
+        state, _cute_atomic_indexed_blocks(state, index)
+    ):
         return False
     lane_axes = [
         (pos, block_id)
@@ -651,9 +692,14 @@ def _guard_cute_atomic_expr(
     atomic_expr: ast.AST,
     *,
     extra_predicates: list[str] | None = None,
+    indexed_block_ids: set[int] | None,
 ) -> ast.AST:
     predicates, leader_axes = _cute_atomic_predicates(
-        state, index, extra_predicates, atomic_expr
+        state,
+        index,
+        extra_predicates,
+        atomic_expr,
+        indexed_block_ids=indexed_block_ids,
     )
     if not predicates:
         return atomic_expr
@@ -864,8 +910,9 @@ def _cute_atomic_indexed_blocks(
 ) -> set[int] | None:
     """Resolved ids of the tile axes the atomic varies along; None when unknown.
 
-    A ``BlockSizeOrigin`` index covers its tile axis, a gather index the axis
-    it was loaded along and a slice the axis the pointer lowering assigns it.
+    A ``BlockSizeOrigin`` index covers its tile axis, a gather index every
+    non-broadcast tile axis of its tensor and a slice the axis the pointer
+    lowering assigns it.
     A tile-uniform index (a constant, a tile attribute, a 0-d tensor) covers
     nothing by itself; the atomic then varies along the tile axes of its
     update value (:func:`_cute_uniform_index_value_blocks`).  ``None`` when
@@ -880,22 +927,21 @@ def _cute_atomic_indexed_blocks(
     has_block_size_index = False
     for idx in index:
         if isinstance(idx, torch.Tensor):
-            # A gather/scatter index tensor (e.g. ``output[idxs, tile_f]``)
-            # covers the tile dimension it was loaded along: the per-thread
-            # ``idxs`` value differs across that axis, so it is *indexed* and
-            # must not be collapsed to a single leader thread.
-            tensor_block_id = (
-                env.resolve_block_id(idx.shape[0]) if idx.ndim >= 1 else None
-            )
-            if tensor_block_id is not None and state.fx_node is not None:
-                has_block_size_index = True
-                indexed_block_ids.add(
-                    env.resolve_codegen_block_id(
-                        tensor_block_id,
-                        state.codegen,
-                        state.fx_node.graph,
+            # Every non-broadcast tensor-index dimension contributes, even
+            # when repeated indices intentionally collide. Restricting coverage
+            # to the first dimension would collapse other logical contributions
+            # to their leader threads.
+            for size in idx.shape:
+                tensor_block_id = env.resolve_block_id(size)
+                if tensor_block_id is not None and state.fx_node is not None:
+                    has_block_size_index = True
+                    indexed_block_ids.add(
+                        env.resolve_codegen_block_id(
+                            tensor_block_id,
+                            state.codegen,
+                            state.fx_node.graph,
+                        )
                     )
-                )
             continue
         if not isinstance(idx, torch.SymInt):
             continue
@@ -1064,9 +1110,22 @@ def _cute_unindexed_leader_axes(
     fx_graph = state.fx_node.graph if state.fx_node is not None else None
     leader_axes: set[int] = set()
     active_thread_axes: set[int] = set()
+    loop_states = _cute_loop_states(state)
 
     def collect(thread_axes: dict[int, int]) -> None:
         for candidate_block_id, thread_axis in thread_axes.items():
+            if (
+                _cute_block_thread_extent(loop_states, candidate_block_id, thread_axis)
+                == 1
+            ):
+                # The block spans one thread along the axis (a slice walked
+                # entirely by its per-thread lane loop, recorded on the grid
+                # state as well as on its own): the axis's threads are
+                # another block's elements, and that block decides whether
+                # the atomic varies along them, so it neither claims nor
+                # decides the axis.  The lane loop is the lane placement's
+                # business (``_cute_uniform_lane_vars``).
+                continue
             active_thread_axes.add(thread_axis)
             if indexed_block_ids is None or fx_graph is None:
                 # Without a known coverage there is no reliable mapping from
@@ -1081,12 +1140,8 @@ def _cute_unindexed_leader_axes(
                 continue
             leader_axes.add(thread_axis)
 
-    grid_state = state.codegen.current_grid_state
-    if grid_state is not None:
-        collect(grid_state.block_thread_axes)
-    for loops in state.codegen.active_device_loops.values():
-        for loop_state in loops:
-            collect(loop_state.block_thread_axes)
+    for loop_state in loop_states:
+        collect(loop_state.block_thread_axes)
 
     # Ghost-axis leaders: any CTA-resident thread axis (size > 1) that
     # no active loop currently owns. ``max_thread_block_dims`` tracks the
@@ -1106,6 +1161,39 @@ def _cute_unindexed_leader_axes(
         if axis not in active_thread_axes:
             leader_axes.add(axis)
     return leader_axes
+
+
+def _cute_loop_states(state: CodegenState) -> list[DeviceLoopOrGridState]:
+    """The grid state and every active device loop state, each once."""
+    states: list[DeviceLoopOrGridState] = []
+    grid_state = state.codegen.current_grid_state
+    if grid_state is not None:
+        states.append(grid_state)
+    for loops in state.codegen.active_device_loops.values():
+        for loop_state in loops:
+            if not any(loop_state is seen for seen in states):
+                states.append(loop_state)
+    return states
+
+
+def _cute_block_thread_extent(
+    loop_states: list[DeviceLoopOrGridState], block_id: int, thread_axis: int
+) -> int | None:
+    """The threads ``block_id`` spans along ``thread_axis``, or None when no
+    state records a size for the axis.
+
+    A state's ``thread_axis_sizes`` is the widest block on the axis among
+    those it records: a persistent reduction records its block on the grid
+    state too, where the axis may belong to a tile block, so the smallest
+    size any state recording the block gives is the block's own.
+    """
+    sizes = [
+        size
+        for loop_state in loop_states
+        if loop_state.block_thread_axes.get(block_id) == thread_axis
+        and (size := loop_state.thread_axis_sizes.get(thread_axis)) is not None
+    ]
+    return min(sizes, default=None)
 
 
 def _cute_leader_predicate(axes: set[int]) -> str | None:
@@ -1132,12 +1220,19 @@ def _cute_uniform_lane_vars(
     axis under every lane layout, instead of repeating it once per iteration.
     Empty when the coverage is unknown: the atomic then runs on every thread
     under every mask, as it always has.
+
+    An atomic whose value is the per-K-lane partial sum of a lane-split
+    scalar matmul (``cute/matmul_fallback.py``) varies along that K lane
+    loop although its index does not cover the K block: each lane adds its
+    own partial, and the loop is left out
+    (``CuteDeviceFunctionState.per_lane_atomic_lane_vars``).
     """
     from ..compile_environment import CompileEnvironment
     from ..tile_strategy import DeviceLoopState
 
     if indexed_block_ids is None:
         return frozenset()
+    per_lane_vars = _cute_per_lane_atomic_lane_vars(state)
     lane_loop_block_ids: dict[str, frozenset[int]] = {}
     grid_state = state.codegen.current_grid_state
     if grid_state is not None:
@@ -1151,12 +1246,22 @@ def _cute_uniform_lane_vars(
     return frozenset(
         lane_var
         for lane_var, block_ids in lane_loop_block_ids.items()
-        if not any(
+        if lane_var not in per_lane_vars
+        and not any(
             block_id >= 0
             and env.resolve_codegen_block_id(block_id, state.codegen, fx_graph)
             in indexed_block_ids
             for block_id in block_ids
         )
+    )
+
+
+def _cute_per_lane_atomic_lane_vars(state: CodegenState) -> set[str]:
+    """The K lane loops whose per-lane matmul partials this atomic adds."""
+    if state.fx_node is None:
+        return set()
+    return state.device_function.cute_state.per_lane_atomic_lane_vars.get(
+        state.fx_node, set()
     )
 
 
@@ -1434,6 +1539,7 @@ def _codegen_tensor_index_common_cute(
         target_dtype,
         atomic_expr,
         extra_predicates=site_predicates,
+        indexed_block_ids=_cute_atomic_indexed_blocks(state, index),
     )
 
 

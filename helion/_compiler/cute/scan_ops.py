@@ -95,6 +95,23 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     dim = cast("int", state.proxy_arg(2))
     reverse = bool(state.proxy_arg(3))
     is_tuple_input = bool(state.proxy_arg(4))
+    input_value = state.proxy_arg(1)
+    inputs = input_value if is_tuple_input else (input_value,)
+    assert isinstance(inputs, (tuple, list))
+    if all(
+        CompileEnvironment.current().known_equal(
+            cast("torch.Tensor", value).size(dim), 1
+        )
+        for value in inputs
+    ):
+        # A singleton inclusive scan seeds from its only element and never
+        # invokes the combine. Preserve the already-lowered value, including
+        # its source masks, dtype and payload; no scan coordinate is needed.
+        if is_tuple_input:
+            expressions = state.ast_args[1]
+            assert isinstance(expressions, (tuple, list))
+            return [cast("ast.AST", expression) for expression in expressions]
+        return state.ast_arg(1)
 
     helper_graph_info = state.get_graph(combine_graph_id)
     assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
@@ -208,7 +225,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
 
 def _cute_serial_scan_position(
-    state: CodegenState, step: str, extent: int, reverse: bool
+    state: CodegenState, step: str, extent: int | str, reverse: bool
 ) -> tuple[str, list[str]]:
     """Block-local position scanned by serial step ``step`` of the fallback.
 
@@ -222,7 +239,8 @@ def _cute_serial_scan_position(
     if not reverse:
         return step, []
     position = state.device_function.new_var("scan_index")
-    return position, [f"    {position} = cutlass.Int32({extent - 1}) - {step}"]
+    last = extent - 1 if isinstance(extent, int) else f"({extent}) - 1"
+    return position, [f"    {position} = cutlass.Int32({last}) - {step}"]
 
 
 def _cute_recover_scan_load(node: object) -> tuple[object, object] | None:
@@ -468,15 +486,16 @@ def _cute_codegen_serial_scan(
 
     ``input_nodes`` is one FX node per scanned stream (a single element for a
     scalar scan, multiple for a tuple scan).  For each output position along the
-    scan dimension this folds the user's combine graph over the global rows
-    ``0..out_pos`` (inclusive), carrying one accumulator per stream.  Returns one
-    output expression per stream.
+    scan dimension this folds the user's combine graph over local positions
+    addressed relative to the tile's global origin, carrying one accumulator
+    per stream. Returns one output expression per stream.
     """
     from torch.fx.node import Node
 
     from ..ast_extension import expr_from_string
     from ..ast_extension import statement_from_string
     from ..compile_environment import CompileEnvironment
+    from ..tile_strategy import DeviceGridState
     from .indexing import CuteSortableLoad
 
     # Fake-tensor metadata lives on the per-stream input nodes (the scan node
@@ -489,6 +508,7 @@ def _cute_codegen_serial_scan(
 
     env = CompileEnvironment.current()
     from ...language.memory_ops import _cute_active_index_var
+    from ...language.memory_ops import _cute_remap_block_id
     from ...language.memory_ops import _cute_tensor_dim_size_expr
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _resolve_dim_block_id
@@ -499,19 +519,20 @@ def _cute_codegen_serial_scan(
 
     # The scan loops over the *block-local* positions of the scan dimension; the
     # loop bound is the scan dim's block (tile) size.  Prefer the concrete block
-    # size from config (the fake tensor's scan dim may be a fresh symbol that
-    # ``size_hint`` cannot resolve to the tile size), falling back to the fake
-    # extent's size hint.
+    # size from config, preserving symbolic host constexpr values. The fake
+    # tensor's scan dim may be a fresh symbol whose hint is not the tile size.
+    # Fall back to its hint only when no configured extent is available.
     block_size = env.block_sizes[scan_block_id].from_config(
         state.device_function.config
     )
-    if isinstance(block_size, int):
-        n_hint = block_size
+    if isinstance(block_size, (int, torch.SymInt)):
+        scan_extent_expr = state.device_function.literal_expr(block_size)
     else:
         extent = first_val.shape[dim]
         n_hint = env.size_hint(extent) if isinstance(extent, torch.SymInt) else extent
-    if not isinstance(n_hint, int):
-        raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
+        if not isinstance(n_hint, int):
+            raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
+        scan_extent_expr = str(n_hint)
 
     # The current lane's block-local position along the scan dim and the
     # tile's global base, so a local position maps to the global row
@@ -572,7 +593,10 @@ def _cute_codegen_serial_scan(
         )
     state.codegen.add_statement(statement_from_string(f"{initialized} = False"))
     position, position_lines = _cute_serial_scan_position(
-        state, scan_i, n_hint, reverse
+        state,
+        scan_i,
+        block_size if isinstance(block_size, int) else scan_extent_expr,
+        reverse,
     )
 
     # Global scan row for this iteration: ``offset + position`` (the position
@@ -586,6 +610,28 @@ def _cute_codegen_serial_scan(
     # as float32 after ``idxs.float()``).  Each load is guarded so an
     # out-of-range scanned row (partial final tile) reads 0 instead of faulting.
     value_lines: list[str] = []
+    scan_bounds: list[str] = []
+    active_block = _cute_remap_block_id(state, scan_block_id)
+    active_loops = state.codegen.active_device_loops.get(active_block)
+    owner = active_loops[-1] if active_loops else state.codegen.current_grid_state
+    if owner is None or active_block not in owner.block_id_to_info:
+        raise exc.BackendUnsupported("cute", "associative_scan logical tile owner")
+    info = owner.block_id_to_info[active_block]
+    if isinstance(owner, DeviceGridState):
+        end = (
+            state.device_function.literal_expr(info.grid_end_expr)
+            if info.grid_end_expr is not None
+            else None
+        )
+    else:
+        end = info.end_var_name
+        if end is None and info.end_expr is not None:
+            end = state.device_function.literal_expr(info.end_expr)
+    if end is None:
+        raise exc.BackendUnsupported("cute", "associative_scan logical tile end")
+    # The scan coordinate is global, and its tile can end before its source.
+    tile_bound = f"({scan_row}) < cutlass.Int32({end})"
+    scan_bounds.append(tile_bound)
     for val_var, load, load_node, pos, val in zip(
         value_vars, loads, load_nodes, sort_positions, vals, strict=True
     ):
@@ -608,7 +654,9 @@ def _cute_codegen_serial_scan(
         if isinstance(load_tensor, torch.Tensor):
             size_expr = _cute_tensor_dim_size_expr(state, load_tensor, pos)
             scan_dim_mask = f"({scan_row}) < cutlass.Int32({size_expr})"
+            scan_bounds.append(scan_dim_mask)
         mask_terms: list[str] = []
+        mask_terms.append(tile_bound)
         if scan_dim_mask is not None:
             mask_terms.append(scan_dim_mask)
         if load.mask_expr is not None and scan_global_index_var is not None:
@@ -622,6 +670,12 @@ def _cute_codegen_serial_scan(
         value_lines.append(f"    {val_var} = {scan_dtype_str}({load_expr})")
 
     include_expr = f"{position} >= {out_pos}" if reverse else f"{position} <= {out_pos}"
+    if scan_bounds:
+        # Padded positions are absent from the logical input, rather than zero
+        # elements. In particular, reverse products/minima must not fold them.
+        include_expr = " and ".join(
+            f"({term})" for term in (include_expr, *dict.fromkeys(scan_bounds))
+        )
 
     # Inline the user's combine graph (one statement per node, 4-space
     # indented to sit inside the scan ``for`` loop).
@@ -649,10 +703,10 @@ def _cute_codegen_serial_scan(
         statement_from_string(
             "\n".join(
                 [
-                    f"for {scan_i} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
+                    f"for {scan_i} in range(cutlass.Int32(0), cutlass.Int32({scan_extent_expr}), cutlass.Int32(1)):",
                     *position_lines,
-                    f"    {include} = {include_expr}",
                     row_line,
+                    f"    {include} = {include_expr}",
                     *value_lines,
                     *combine_lines,
                     *fold_lines,
@@ -1000,8 +1054,8 @@ def _cute_scan_geometry(state: CodegenState, block_id: int) -> _CuteScanGeometry
     if axis is None or axis.extent <= 0:
         return None
     # Grid-owned declarations go to the kernel-scope statement list that later
-    # receives the (possibly lane-wrapped) root body; a grid without lane
-    # loops never flushes its ``outer_prefix``.
+    # receives the grid's ``outer_prefix`` and the (possibly lane-wrapped)
+    # root body.
     if isinstance(owner, DeviceGridState) and owner.hoist_parent_statements is None:
         return None
     threads = axis.threads
