@@ -11,7 +11,7 @@ from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
 from .cute_fragment_common import fragment_root_regions
-from .cute_fragment_threads import THREADS
+from .cute_fragment_threads import LEGACY_COVERAGE_THREADS
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -78,9 +78,9 @@ def register_fragment_register_loads_coverage(
         return
     spec.cute_fragment_register_loads_search_enabled = True
     generation = spec.create_config_generation()
-    # The largest existing worker domain covers the widest one-scalar-per-lane
+    # The largest legacy worker domain covers the widest one-scalar-per-lane
     # proof. This is a declared coupling, not a change to any prior seed.
-    threads = max(THREADS)
+    threads = max(LEGACY_COVERAGE_THREADS)
     requested = Config.from_dict(
         deepcopy(carrier.config) | {"cute_fragment_threads": threads}
     )
