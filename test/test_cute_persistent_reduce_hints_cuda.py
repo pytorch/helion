@@ -20,6 +20,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -84,6 +85,20 @@ def _run(
     code = bound.to_code(config)
     out, inv = bound.compile_config(config)(x, weight)
     return code, x, weight, out, inv
+
+
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+@pytest.mark.parametrize("threads,vec", [(224, 4), (480, 2)])
+def test_whole_warp_thread_request_matches_the_full_row_reference(
+    threads: int, vec: int
+) -> None:
+    # Neither requested packet layout covers all 1024 columns. The fallback
+    # must compute the complete reduction and write every output column.
+    _code, x, weight, out, inv = _run(torch.bfloat16, threads, vec, ["", ""])
+    ref_out, ref_inv = _reference(x, weight)
+    torch.testing.assert_close(inv, ref_inv, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 @skipUnlessBackends(["cute"])

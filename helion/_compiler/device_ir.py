@@ -1200,6 +1200,7 @@ class DeviceIR:
                     ReductionLoopSpec(
                         block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
+                        allow_non_power_of_two=env.backend_name == "cute",
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(

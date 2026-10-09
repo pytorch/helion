@@ -1086,7 +1086,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         from .device_ir import ReductionLoopGraphInfo
 
         env = CompileEnvironment.current()
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
         if isinstance(numel, (int, sympy.Integer)):
             size_hint = int(numel)
         elif isinstance(numel, sympy.Expr):
@@ -1431,7 +1431,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         backend = env.backend
         block_idx = self.block_index
-        numel = env.block_sizes[block_idx].numel
+        numel = env.specialize_expr(env.block_sizes[block_idx].numel)
         index_var = self.index_var(block_idx)
         mask_var = self._mask_var
         block_size_var = self.block_size_var(self.block_index)
@@ -2026,9 +2026,8 @@ class LoopedReductionStrategy(ReductionStrategy):
                     self._cute_reduction_lane_extent = (
                         self._cute_reduction_lane_extent // vec_width
                     )
-        if env.known_multiple(
-            env.block_sizes[block_index].numel, self._loop_block_size
-        ):
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if env.known_multiple(numel, self._loop_block_size):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
@@ -2107,11 +2106,6 @@ class LoopedReductionStrategy(ReductionStrategy):
             or _block_has_indexed_reduction(self.fn, self.block_index)
         ):
             return
-        # A masked roll cannot be cluster-split: the mask compares against
-        # the full extent, so a partial trailing chunk would read into the
-        # next rank's slice and double-count it.
-        if self._mask_var is not None:
-            return
         # Statements outside the roll loop execute once per cluster CTA —
         # benign for plain (idempotent) stores, but a read-modify-write
         # would repeat ``cluster_n`` times.
@@ -2126,16 +2120,18 @@ class LoopedReductionStrategy(ReductionStrategy):
             size > 1 for size in grid_axis_sizes.values()
         ):
             return
-        numel = env.block_sizes[self.block_index].numel
-        try:
-            numel_int = int(numel)
-        except (TypeError, ValueError):
+        numel = env.specialize_expr(env.block_sizes[self.block_index].numel)
+        # A partial chunk would cross its CTA's slice and double-count values.
+        # Dynamic extents may use the existing exact input-metadata guard;
+        # unbacked extents and bindings without that guard remain masked.
+        if not env.specialized_multiple(numel, cl * self._loop_block_size):
             return
-        # Each CTA must roll whole chunks of its own contiguous slice.
-        if numel_int % (cl * self._loop_block_size) != 0:
+        numel_int = shape_env_size_hint(env.shape_env, numel)
+        if numel_int <= 0:
             return
         self._cute_rolled_cluster_n = cl
         self.fn.cute_state.simt_cluster_n = cl
+        self._mask_var = None
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -2424,7 +2420,11 @@ class LoopedReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         self._maybe_apply_cute_rolled_cluster(state)
         block_index = self.block_index
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if self._cute_rolled_cluster_n > 1:
+            # Only the successfully claimed cluster needs a concrete extent.
+            # The coverage proof used this exact metadata-guarded bound value.
+            numel = sympy.Integer(shape_env_size_hint(env.shape_env, numel))
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
         block_size_var = self.block_size_var(block_index)

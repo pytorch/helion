@@ -35,6 +35,7 @@ def test_merged_reduction_preserves_backend_thread_coverage(
     env = SimpleNamespace(
         backend=backend,
         block_sizes=[SimpleNamespace(numel=first * second)],
+        specialize_expr=lambda expr: expr,
         shape_env=ShapeEnv(),
         get_block_id=block_ids.get,
     )

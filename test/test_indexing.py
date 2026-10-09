@@ -3602,13 +3602,6 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
         ),
     ):
         bound = _cpu_bind(kernel, (torch.ones(3, 65), stepped))
-        first = bound.host_function.local_types["first"].proxy()
-        second = bound.host_function.local_types["second"].proxy()
-        assert first is not second
-        assert first.untyped_storage() != second.untyped_storage()
-        with bound.env, bound.host_function:
-            assert not bound.env.known_equal(first.size(-1), 1)
-            assert not bound.env.known_equal(second.size(-1), 1)
         loads = [
             node
             for graph in bound.host_function.device_ir.graphs
@@ -3619,6 +3612,15 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
             )
         ]
         assert {node.args[0].args[0] for node in loads} == {"first", "second"}
+        # local_types describes the latest root's scope. The consumer's host
+        # tensor inputs retain the allocation metadata for earlier roots.
+        allocations = {node.args[0].args[0]: node.args[0].meta["val"] for node in loads}
+        first, second = allocations["first"], allocations["second"]
+        assert first is not second
+        assert first.untyped_storage() != second.untyped_storage()
+        with bound.env, bound.host_function:
+            assert not bound.env.known_equal(first.size(-1), 1)
+            assert not bound.env.known_equal(second.size(-1), 1)
         for block in (16, 32, 128):
             config = bound.config_spec.default_config()
             config.config["pid_type"] = (
