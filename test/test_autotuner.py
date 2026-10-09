@@ -15575,6 +15575,52 @@ class TestAutotuneBudget(TestCase):
         self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
         self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
 
+    def test_trial_timestamps_track_measurements_and_new_source_aliases(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec.backend = SimpleNamespace(
+            generated_source_hash=lambda fn: fn.source_hash,
+            should_deduplicate_generated_sources=lambda config_spec: True,
+        )
+        clock = [0.0]
+
+        def compile_config(config, allow_print):
+            def fn():
+                return None
+
+            index = config.block_sizes[0]
+            fn.source_hash = "shared" if index in (1, 3) else str(index)
+            return fn
+
+        def benchmark(config, fn):
+            clock[0] += 10.0
+            return math.inf if config.block_sizes[0] == 2 else 1.0
+
+        provider.kernel.compile_config = compile_config
+        configs = [helion.Config(block_sizes=[index]) for index in range(1, 5)]
+        with (
+            patch("time.perf_counter", lambda: clock[0]),
+            patch.object(provider, "_benchmark_function", side_effect=benchmark),
+            patch.object(provider.log, "register_config", side_effect=repr),
+            patch.object(provider.log, "record_autotune_entry") as record_entry,
+        ):
+            first = provider.benchmark(configs[:2])
+            clock[0] = 100.0
+            second = provider.benchmark(configs[2:])
+
+        self.assertEqual([result.status for result in first], ["ok", "error"])
+        self.assertEqual([result.completed_at for result in first], [10.0, 20.0])
+        self.assertEqual([result.status for result in second], ["deduplicated", "ok"])
+        self.assertEqual([result.completed_at for result in second], [100.0, 110.0])
+        terminal_entries = {
+            call.args[0].config: call.args[0]
+            for call in record_entry.call_args_list
+            if call.args[0].status != "started"
+        }
+        for result in [*first, *second]:
+            self.assertEqual(
+                terminal_entries[result.config].completed_at, result.completed_at
+            )
+
     def test_compile_config_failure_has_unstarted_source_evidence(self) -> None:
         provider = self._make_stub_provider()
         provider.settings.autotune_progress_bar = False

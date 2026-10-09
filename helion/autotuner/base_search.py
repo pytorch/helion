@@ -53,6 +53,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
+from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
@@ -788,6 +789,23 @@ class BaseSearch(BaseAutotuner):
             if candidate is not None and not self._backend_config_is_viable(candidate):
                 candidate = None
             filtered.append(candidate)
+        for config, result in zip(configs, filtered, strict=True):
+            if (
+                result is None
+                and self.log.trace_enabled
+                and (config_id := self.log.register_config(config)) is not None
+            ):
+                self.log.record_trace_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status="filtered",
+                        perf_ms=None,
+                        compile_time=None,
+                        config_id=config_id,
+                        config=config,
+                        objective_unit=self.performance_unit,
+                    )
+                )
         passing_indices = [i for i, fc in enumerate(filtered) if fc is not None]
         passing_configs = cast(
             "list[Config]",
@@ -824,6 +842,7 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries, one per input config.
         """
         passing_configs, passing_indices = self._apply_config_filter(configs)
+        filtered_at = time.perf_counter()
         # Record configs for exploration tracking. Diagnostic only; must never
         # interfere with benchmarking.
         if self._search_space_tracker is not None:
@@ -861,6 +880,7 @@ class BaseSearch(BaseAutotuner):
                             perf=inf,
                             status="filtered",
                             compile_time=None,
+                            completed_at=filtered_at,
                         )
                     )
 
@@ -905,6 +925,12 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        with self.log.autotune_tracing(type(self).__name__):
+            config = self._autotune_with_logging(skip_cache=skip_cache)
+            self.log.record_selected_config(config)
+            return config
+
+    def _autotune_with_logging(self, *, skip_cache: bool) -> Config:
         self._skip_cache = skip_cache
         self._prepare()
         start = time.perf_counter()
@@ -2379,7 +2405,11 @@ class PopulationBasedSearch(BaseSearch):
                 [member.perf for member in members],
                 desc=desc,
             )
-            self._apply_rebenchmark_timings(members, provider_timings)
+            # The provider records only fresh joint measurements; skipped work
+            # can return retained timings that must not become new trace rows.
+            self._apply_rebenchmark_timings(
+                members, provider_timings, trace_results=[None] * len(members)
+            )
             return
 
         # Size the in-process repeat from the candidates being rechecked. A
@@ -2420,6 +2450,7 @@ class PopulationBasedSearch(BaseSearch):
                     members,
                     new_timings,
                     failure_statuses=failure_statuses,
+                    trace_results=isolated_results,
                 )
                 return
             if candidate_private_args and dist.is_initialized():
@@ -2575,6 +2606,7 @@ class PopulationBasedSearch(BaseSearch):
             members,
             resolved_timings,
             failure_statuses=failure_statuses,
+            trace_results=new_timings,
         )
 
     def mirrored_rebenchmark(
@@ -2677,12 +2709,49 @@ class PopulationBasedSearch(BaseSearch):
         timings: Sequence[float],
         *,
         failure_statuses: Sequence[Literal["error", "timeout"] | None] | None = None,
+        trace_results: Sequence[IsolatedBenchmarkTiming] | None = None,
     ) -> None:
         if failure_statuses is None:
             failure_statuses = [None] * len(members)
-        for member, timing, failure_status in zip(
-            members, timings, failure_statuses, strict=True
+        if trace_results is None:
+            trace_results = timings
+        for member, timing, failure_status, trace_result in zip(
+            members, timings, failure_statuses, trace_results, strict=True
         ):
+            config_id = (
+                self.log.register_config(member.config)
+                if trace_result is not None and self.log.trace_enabled
+                else None
+            )
+            if config_id is not None and trace_result is not None:
+                trace_status = (
+                    trace_result.status
+                    if isinstance(trace_result, IsolatedBenchmarkFailure)
+                    else failure_status
+                )
+                perf = timing if trace_status is None else inf
+                self.log.record_trace_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=trace_status
+                        or ("ok" if math.isfinite(perf) else "error"),
+                        perf_ms=(
+                            perf
+                            if self.performance_unit == "ms"
+                            else self.benchmark_provider.raw_latency(member.config)
+                            if isinstance(
+                                self.benchmark_provider, MultiShapeBenchmarkProvider
+                            )
+                            else None
+                        ),
+                        compile_time=None,
+                        config_id=config_id,
+                        config=member.config,
+                        objective=perf,
+                        objective_unit=self.performance_unit,
+                    ),
+                    event="rebenchmark",
+                )
             if failure_status is not None:
                 continue
             member.perfs.append(timing)
