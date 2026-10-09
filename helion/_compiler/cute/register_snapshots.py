@@ -5,12 +5,14 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from dataclasses import field
+from functools import cache
 from typing import TYPE_CHECKING
 from typing import cast
 
 import sympy
 import torch
 from torch.fx import Node
+from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _tracing_ops
@@ -95,6 +97,319 @@ class SnapshotBinding:
     shape: tuple[int, ...]
     dtype: torch.dtype
     domain_storage: frozenset[str]
+    logical_shape: tuple[int, ...]
+
+
+def frame_snapshot_captures(
+    call: Node, graphs: list[GraphInfo], source: Node
+) -> dict[int, tuple[int, ...]]:
+    """Current-call invariant capture edges to one dominating initialized load.
+
+    A register value is never a vector carry/branch result. Every edge follows
+    the existing frame tree, with physical reads still checked by SnapshotOwner.
+    """
+    from .uniform_region_tree import uniform_local_regions
+
+    try:
+        tree = uniform_local_regions(graphs)
+    except exc.InvalidConfig:
+        return {}
+    frames = {frame.graph.graph: frame for frame in tree.frames}
+    if source.graph not in frames or call.graph not in frames:
+        return {}
+    if source.target is not memory_ops.load:
+        return {}
+    orders = {
+        graph: {node: i for i, node in enumerate(graph.nodes)} for graph in frames
+    }
+    if source not in orders[source.graph] or call not in orders[call.graph]:
+        return {}
+
+    def ancestor(value: Node) -> Node | None:
+        frame = frames.get(value.graph)
+        if frame is None:
+            return None
+        if value in frame.placeholders:
+            slot = frame.placeholders.index(value)
+            if any(carried == slot for _, carried in frame.carry_map):
+                return None
+            return frame.captures[slot]
+        if (
+            value.target in (_tracing_ops._new_var, torch.ops.aten.alias.default)
+            and len(value.args) == 1
+            and not value.kwargs
+            and isinstance(value.args[0], Node)
+            and value.args[0].graph is value.graph
+            and orders[value.graph][value.args[0]] < orders[value.graph][value]
+        ):
+            return value.args[0]
+        return None
+
+    def identity(value: Node) -> bool:
+        seen: set[Node] = set()
+        while value is not source:
+            if value in seen:
+                return False
+            seen.add(value)
+            parent = ancestor(value)
+            if parent is None:
+                return False
+            left, right = value.meta.get("val"), parent.meta.get("val")
+            if (
+                not isinstance(left, torch.Tensor)
+                or not isinstance(right, torch.Tensor)
+                or left.dtype != right.dtype
+                or left.shape != right.shape
+                or left.device != right.device
+                or left.layout != right.layout
+            ):
+                return False
+            value = parent
+        return True
+
+    # Walk outward to establish lexical dominance at the actual call site.
+    position = call
+    while position.graph is not source.graph:
+        frame = frames.get(position.graph)
+        if frame is None or frame.call is None:
+            return {}
+        position = frame.call
+    if orders[source.graph][source] >= orders[source.graph][position]:
+        return {}
+
+    # Tensor coordinates must be direct iotas (possibly invariant captures).
+    # Scalar coordinates use existing stable grid symbols, never loop carries.
+    for index in cast("list[object]", source.args[1]):
+        if not isinstance(index, Node):
+            if type(index) is not int and index is not None and index != slice(None):
+                return {}
+            continue
+        value = index
+        seen: set[Node] = set()
+        while (parent := ancestor(value)) is not None:
+            if value in seen:
+                return {}
+            seen.add(value)
+            value = parent
+        if isinstance(index.meta.get("val"), torch.Tensor):
+            if value.target is not torch.ops.prims.iota.default:
+                return {}
+        elif value.target is not _tracing_ops._get_symnode:
+            return {}
+
+    return {
+        frame.graph.graph_id: tuple(
+            slot
+            for slot, entry in enumerate(frame.captures)
+            if not any(carried == slot for _, carried in frame.carry_map)
+            and identity(entry)
+        )
+        for frame in tree.frames
+        if frame.call is call
+    }
+
+
+def frame_snapshot_recipes(
+    call: Node,
+    graphs: list[GraphInfo],
+    env: CompileEnvironment,
+    *,
+    allow_unbound: bool = False,
+) -> dict[int, dict[int, frozenset[Node]]]:
+    """Typed same-owner recipes over initialized snapshots and invariant leaves.
+
+    This proof does not turn a derived value into a load identity. The emitter
+    separately initializes its own typed register slots at this actual call.
+    Mutable carries, joins, remapped coordinates and arbitrary shared values
+    are deliberately outside the recipe grammar.
+    """
+    from .uniform_region_tree import uniform_local_regions
+
+    try:
+        tree = uniform_local_regions(graphs)
+    except exc.InvalidConfig:
+        return {}
+    frames = {frame.graph.graph: frame for frame in tree.frames}
+    orders = {
+        graph: {node: i for i, node in enumerate(graph.nodes)} for graph in frames
+    }
+    if call.graph not in orders or call not in orders[call.graph]:
+        return {}
+
+    carried_entries = {
+        frame.captures[slot]
+        for frame in tree.frames
+        if frame.call is call
+        for _, slot in frame.carry_map
+    }
+
+    def same_type(left: Node, right: Node) -> bool:
+        a, b = left.meta.get("val"), right.meta.get("val")
+        return (
+            isinstance(a, torch.Tensor)
+            and isinstance(b, torch.Tensor)
+            and a.dtype == b.dtype
+            and a.shape == b.shape
+            and a.device == b.device
+            and a.layout == b.layout
+        )
+
+    def dominates(value: Node, user: Node) -> bool:
+        while user.graph is not value.graph:
+            frame = frames.get(user.graph)
+            if frame is None or frame.call is None:
+                return False
+            user = frame.call
+        return (
+            value in orders[value.graph]
+            and orders[value.graph][value] < orders[user.graph][user]
+        )
+
+    def recipe(entry: Node) -> frozenset[Node] | None:
+        result = entry.meta.get("val")
+        if not isinstance(result, torch.Tensor) or result.ndim != 1:
+            return None
+        active: set[Node] = set()
+
+        @cache
+        def visit(value: Node) -> frozenset[Node] | None:
+            if value in active or value in carried_entries or value.graph not in frames:
+                return None
+            fake = value.meta.get("val")
+            if not isinstance(fake, torch.Tensor) or (
+                fake.device != result.device
+                or fake.layout != result.layout
+                or (fake.ndim != 0 and fake.shape != result.shape)
+            ):
+                return None
+            active.add(value)
+            try:
+                frame = frames[value.graph]
+                if value in frame.placeholders:
+                    slot = frame.placeholders.index(value)
+                    if any(carried == slot for _, carried in frame.carry_map):
+                        return None
+                    parent = frame.captures[slot]
+                    if not same_type(value, parent):
+                        return None
+                    return visit(parent)
+                if not dominates(value, call):
+                    return None
+                if value.target is memory_ops.load:
+                    if fake.ndim == 1:
+                        if (
+                            not isinstance(value.args[0], Node)
+                            or value.args[0].target is not _tracing_ops._host_tensor
+                            or not host_load_is_readonly(
+                                value, env, graphs, allow_unbound=allow_unbound
+                            )
+                            or not frame_snapshot_captures(call, graphs, value)
+                        ):
+                            return None
+                        return frozenset((value,))
+                    # Scalar host values must be readonly and addressed by a
+                    # stable row symbol/literal, never by a mutable carry.
+                    if not host_load_is_readonly(
+                        value, env, graphs, allow_unbound=allow_unbound
+                    ) or any(
+                        isinstance(index, Node)
+                        and index.target is not _tracing_ops._get_symnode
+                        for index in cast("list[object]", value.args[1])
+                    ):
+                        return None
+                    return frozenset()
+                if value.target is torch.ops.prims.iota.default:
+                    return (
+                        frozenset()
+                        if all(not isinstance(arg, Node) for arg in value.args)
+                        and all(
+                            not isinstance(arg, Node) for arg in value.kwargs.values()
+                        )
+                        else None
+                    )
+                if value.target is torch.ops.aten.scalar_tensor.default:
+                    return (
+                        frozenset()
+                        if fake.ndim == 0
+                        and len(value.args) == 1
+                        and type(value.args[0]) in (bool, int, float)
+                        and all(
+                            not isinstance(arg, Node) for arg in value.kwargs.values()
+                        )
+                        else None
+                    )
+                if value.target in (
+                    _tracing_ops._new_var,
+                    torch.ops.aten.alias.default,
+                ):
+                    if (
+                        len(value.args) != 1
+                        or value.kwargs
+                        or not isinstance(value.args[0], Node)
+                        or not same_type(value, value.args[0])
+                    ):
+                        return None
+                elif value.target is torch.ops.aten.view.dtype:
+                    source = value.args[0]
+                    if (
+                        not isinstance(source, Node)
+                        or len(value.args) != 2
+                        or value.kwargs
+                        or source.meta["val"].shape != fake.shape
+                        or source.meta["val"].element_size() != fake.element_size()
+                        or value.args[1] != fake.dtype
+                    ):
+                        return None
+                elif value.target is _tracing_ops._mask_to:
+                    if len(value.args) != 2 or type(value.args[1]) not in (
+                        int,
+                        float,
+                        bool,
+                    ):
+                        return None
+                elif isinstance(value.meta.get("lowering"), ReductionLowering):
+                    lowering = cast("ReductionLowering", value.meta["lowering"])
+                    if (
+                        fake.ndim != 0
+                        or fake.dtype not in (torch.int32, torch.int64)
+                        or lowering.reduction_type not in ("sum", "min", "max")
+                    ):
+                        return None
+                elif not (
+                    isinstance(value.target, torch._ops.OpOverload)
+                    and torch.Tag.pointwise in value.target.tags
+                    and torch.Tag.nondeterministic_seeded not in value.target.tags
+                    and not value.target._schema.is_mutable
+                ):
+                    return None
+                operands: list[Node] = []
+                map_arg((value.args, value.kwargs), lambda n: operands.append(n))
+                found: set[Node] = set()
+                for operand in operands:
+                    if operand.graph is not value.graph or not dominates(
+                        operand, value
+                    ):
+                        return None
+                    leaves = visit(operand)
+                    if leaves is None:
+                        return None
+                    found.update(leaves)
+                return frozenset(found)
+            finally:
+                active.remove(value)
+
+        return visit(entry)
+
+    return {
+        frame.graph.graph_id: {
+            slot: leaves
+            for slot, entry in enumerate(frame.captures)
+            if not any(carried == slot for _, carried in frame.carry_map)
+            and (leaves := recipe(entry))
+        }
+        for frame in tree.frames
+        if frame.call is call
+    }
 
 
 def snapshot_capture_slots(
@@ -111,7 +426,11 @@ def snapshot_capture_slots(
         plan = resident_while_plan(call, graphs)
     except exc.InvalidConfig:
         return ()
-    if plan.composed or source.graph is not plan.root.graph:
+    if plan.composed:
+        return frame_snapshot_captures(call, graphs, source).get(
+            plan.body.graph.graph_id, ()
+        )
+    if source.graph is not plan.root.graph:
         return ()
     # Limit persistent domains to the existing direct iota coordinates. A
     # loaded/remapped index can hide a shared domain dependency whose lifetime
@@ -205,7 +524,7 @@ def snapshot_chains(
 
         seen = {load}
         pending = list(load.users)
-        dead_graphs = set()
+        dead_graphs = set(branch_graphs)
         while pending:
             node = pending.pop()
             if node in seen and node.target not in (
@@ -217,11 +536,25 @@ def snapshot_chains(
             value = node.meta.get("val")
             if node.target is _tracing_ops._while_loop:
                 slots = snapshot_capture_slots(node, graphs, load)
+                recipes = frame_snapshot_recipes(
+                    node, graphs, env, allow_unbound=allow_unbound
+                )
+                slots = tuple(
+                    sorted(
+                        set(slots)
+                        | {
+                            slot
+                            for slots_by_graph in recipes.values()
+                            for slot, leaves in slots_by_graph.items()
+                            if load in leaves
+                        }
+                    )
+                )
                 if not slots:
                     return frozenset()
                 captures = cast("list[Node]", node.args[2])
-                # Any derived or mutable capture reached by this chain must
-                # stay shared; do not infer invariance from its initial bits.
+                # Every reached capture needs its own identity or typed recipe
+                # proof; initial bits never establish mutable invariance.
                 if any(
                     entry in seen and slot not in slots
                     for slot, entry in enumerate(captures)
@@ -241,19 +574,53 @@ def snapshot_chains(
                     return frozenset()
                 continue
             if node.target is _tracing_ops._if:
-                if node.users or local_buffer_conditional_inputs(node, graphs) is None:
+                try:
+                    legacy = (
+                        not node.users
+                        and local_buffer_conditional_inputs(node, graphs) is not None
+                    )
+                except exc.InvalidConfig:
+                    legacy = False
+                frame_slots = (
+                    {} if legacy else frame_snapshot_captures(node, graphs, load)
+                )
+                if not legacy:
+                    recipes = frame_snapshot_recipes(
+                        node, graphs, env, allow_unbound=allow_unbound
+                    )
+                    frame_slots = {
+                        gid: tuple(
+                            sorted(
+                                set(frame_slots.get(gid, ()))
+                                | {
+                                    slot
+                                    for slot, leaves in entries.items()
+                                    if load in leaves
+                                }
+                            )
+                        )
+                        for gid, entries in recipes.items()
+                    }
+                if not legacy and not frame_slots:
                     return frozenset()
                 for side in range(2):
                     branch = by_id[cast("int", node.args[1 + side])]
                     dead_graphs.add(branch.graph)
-                    for origin, placeholder in zip(
-                        cast("list[Node]", node.args[3 + side]),
-                        branch.graph.find_nodes(op="placeholder"),
-                        strict=True,
+                    for slot, (origin, placeholder) in enumerate(
+                        zip(
+                            cast("list[Node]", node.args[3 + side]),
+                            branch.graph.find_nodes(op="placeholder"),
+                            strict=True,
+                        )
                     ):
-                        if origin in seen and placeholder not in seen:
-                            seen.add(placeholder)
-                            pending.extend(placeholder.users)
+                        if origin in seen:
+                            if not legacy and slot not in frame_slots.get(
+                                branch.graph_id, ()
+                            ):
+                                return frozenset()
+                            if placeholder not in seen:
+                                seen.add(placeholder)
+                                pending.extend(placeholder.users)
                 continue
             if node.op == "output" and node.graph in dead_graphs:
                 continue
@@ -319,10 +686,25 @@ def snapshot_chains(
             pending.extend(node.users)
         return frozenset(seen)
 
+    from .uniform_region_tree import uniform_local_regions
+
+    try:
+        tree = uniform_local_regions(graphs)
+        frame_graphs = {frame.graph.graph for frame in tree.frames}
+        # The actual branch join proof selects scalar outputs only. Other FX
+        # output entries are dead branch temporaries, not escaping values.
+        branch_graphs = {
+            frame.graph.graph
+            for frame in tree.frames
+            if frame.role in ("if_true", "if_false")
+        }
+    except exc.InvalidConfig:
+        frame_graphs = set()
+        branch_graphs = set()
     return {
         node: found
         for graph in graphs
-        if isinstance(graph, RootGraphInfo)
+        if isinstance(graph, RootGraphInfo) or graph.graph in frame_graphs
         for node in graph.graph.nodes
         if (found := chain(node))
     }
