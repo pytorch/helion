@@ -104,6 +104,7 @@ def test_sm103_flash_target_policy() -> None:
         dtype=torch.bfloat16,
         is_causal=False,
         standard_dense_output=True,
+        target_device_capability=(10, 3),
     )
     with patch.object(
         cute_flash, "get_flash_target_policy", return_value=multi_workload_policy

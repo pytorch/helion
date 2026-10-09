@@ -8,6 +8,7 @@ import math
 import os
 from typing import TYPE_CHECKING
 from typing import cast
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -557,6 +558,67 @@ def _hybrid_runtime_config() -> dict[str, object]:
     }
 
 
+def _policy_template_seed(
+    num_kv: int, *, is_causal: bool, capability: tuple[int, int]
+) -> helion.Config:
+    """Select the policy being tested from the complete compiler template union.
+
+    Source and native correctness tests cover each existing lowering/resource
+    template explicitly. Public seed order no longer selects a historical
+    sequence-length winner.
+    """
+    seeds = cute_flash.flash_attention_seed_configs(
+        64,
+        num_kv,
+        dtype=torch.float16,
+        is_causal=is_causal,
+        standard_dense_output=not is_causal,
+        standard_causal_output=is_causal,
+        target_device_capability=capability,
+    )
+    tuning = cute_flash.get_flash_target_policy(capability).tuning
+    if is_causal:
+        causal_policy = tuning.causal_policy(num_kv)
+        expected = (
+            cute_flash._flash_causal_tuning_overrides(causal_policy)
+            if causal_policy is not None
+            else None
+        )
+    else:
+        dense_policy = tuning.dense_policy(num_kv)
+        expected = (
+            cute_flash._flash_dense_tuning_overrides(dense_policy)
+            if dense_policy is not None
+            else None
+        )
+    if expected is None:
+        # Keep generic-lowering fixtures independent of target seed ordering.
+        return helion.Config.from_dict(
+            {
+                "block_sizes": [1, 128, 128],
+                **cute_flash._flash_seed_values(
+                    64,
+                    num_kv,
+                    num_bh=None,
+                    tensor_4d_heads=None,
+                    dtype=torch.float16,
+                    is_causal=is_causal,
+                    has_kv_tile_pruning=False,
+                    requires_ws_overlap=False,
+                    small_biased_candidate=False,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                    supports_tensor_4d_tma=True,
+                ),
+            }
+        )
+    return next(
+        seed
+        for seed in seeds
+        if all(seed.config.get(key) == value for key, value in expected.items())
+    )
+
+
 def _emit_causal_resident_native_source(
     *,
     capability: tuple[int, int] = (10, 3),
@@ -571,14 +633,7 @@ def _emit_causal_resident_native_source(
     if seed_capability is None:
         seed_capability = capability
     with patch.dict(os.environ, {}, clear=True):
-        seed = cute_flash.flash_attention_seed_config(
-            64,
-            num_kv,
-            dtype=torch.float16,
-            is_causal=True,
-            standard_causal_output=True,
-            target_device_capability=seed_capability,
-        )
+        seed = _policy_template_seed(num_kv, is_causal=True, capability=seed_capability)
         assert seed is not None
         manual_overrides = dict(seed.config)
         if config_overrides is not None:
@@ -590,6 +645,10 @@ def _emit_causal_resident_native_source(
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            target_device_capability=capability,
+            tmem_rowmax_compatible=cute_flash.flash_tmem_rowmax_score_plan_supported(
+                score_plan
+            ),
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -671,13 +730,8 @@ def _emit_dense_resident_value_graph_source(
                 config_overrides=config_overrides,
             )
     with patch.dict(os.environ, {}, clear=True):
-        seed = cute_flash.flash_attention_seed_config(
-            64,
-            num_kv,
-            dtype=torch.float16,
-            is_causal=False,
-            standard_dense_output=True,
-            target_device_capability=seed_capability,
+        seed = _policy_template_seed(
+            num_kv, is_causal=False, capability=seed_capability
         )
         assert seed is not None
         manual_overrides = dict(seed.config)
@@ -690,6 +744,10 @@ def _emit_dense_resident_value_graph_source(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
+            target_device_capability=capability,
+            tmem_rowmax_compatible=cute_flash.flash_tmem_rowmax_score_plan_supported(
+                score_plan
+            ),
         )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -985,6 +1043,165 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
             and ast.unparse(node.test) == "flash_acc_log >= -8.0"
             for node in ast.walk(loop)
         )
+
+
+@pytest.mark.parametrize(
+    ("packet", "head_dim", "dtype", "is_causal", "depth", "required_helper"),
+    (
+        (_DEG2_PACKET, 128, torch.bfloat16, False, 1, "fa4_disc_exp_convert_store"),
+        (
+            _DEG2_PACKET,
+            128,
+            torch.bfloat16,
+            False,
+            2,
+            "fa4_disc_exp_convert_store_pipe",
+        ),
+        (
+            _DEG2_PACKET,
+            64,
+            torch.float16,
+            True,
+            1,
+            "fa4_disc_exp_convert_store_pipe_causal",
+        ),
+        (
+            _DEG2_PACKET,
+            64,
+            torch.float16,
+            True,
+            4,
+            "fa4_disc_exp_convert_store_pipe_causal",
+        ),
+        (_HYBRID_PACKET, 64, torch.float16, True, 1, "fa4_disc_exp_convert_store_pipe"),
+        (
+            _HYBRID_PACKET,
+            64,
+            torch.bfloat16,
+            True,
+            2,
+            "fa4_disc_exp_convert_store_pipe",
+        ),
+        (
+            _CAUSAL_HD128_RESIDENT_PACKET,
+            128,
+            torch.bfloat16,
+            True,
+            1,
+            "fa4_disc_exp_convert_store_resident3_013_prefetch2",
+        ),
+    ),
+)
+def test_disc_degree_calls_match_runtime_signatures(
+    packet: str,
+    head_dim: int,
+    dtype: torch.dtype,
+    is_causal: bool,
+    depth: int,
+    required_helper: str,
+) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        config = cute_flash.resolve_flash_config(
+            head_dim,
+            512,
+            _manual_config(
+                packet,
+                **{
+                    cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"
+                    if is_causal
+                    else "fa4_2cta",
+                    cute_flash.FLASH_DISC_PIPE_KEY: depth,
+                    cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "standard",
+                },
+            ),
+            dtype=dtype,
+            is_causal=is_causal,
+            standard_dense_output=not is_causal,
+            standard_causal_output=is_causal,
+        )
+    assert config.exp2_packet == packet
+    body = cute_flash.emit_flash_fa4_device_body(
+        cast("DeviceFunction", None),
+        head_dim=head_dim,
+        num_kv=512,
+        sequence_extent=65_536,
+        num_bh=1,
+        total_tiles=256,
+        cfg=config,
+        has_lse=False,
+        io_dtype="cutlass.BFloat16" if dtype is torch.bfloat16 else "cutlass.Float16",
+        score_plan=causal_score_plan(head_dim)
+        if is_causal
+        else dense_score_plan(head_dim),
+    )
+    calls = [
+        node
+        for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("fa4_disc_exp_convert_store")
+    ]
+    assert required_helper in {call.func.attr for call in calls}
+    degree_keywords = set()
+    for call in calls:
+        keywords = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        degree_keywords.update(key for key in keywords if key.startswith("degree"))
+        inspect.signature(getattr(_flash_runtime, call.func.attr)).bind(
+            *([None] * len(call.args)), **keywords
+        )
+    assert "degree2" in degree_keywords
+    assert ("degree1" in degree_keywords) == (packet == _HYBRID_PACKET)
+
+
+@pytest.mark.parametrize("degree2", (None, False, True))
+def test_serial_disc_forwards_degree2_to_chunk_math(degree2: bool | None) -> None:
+    controls = {} if degree2 is None else {"degree2": degree2}
+    first_arrival, final_arrival = object(), object()
+    with (
+        patch.object(_flash_runtime.cutlass, "Float32", side_effect=float),
+        patch.object(_flash_runtime.cutlass, "const_expr", side_effect=lambda x: x),
+        patch.object(_flash_runtime.cute, "make_rmem_tensor"),
+        patch.object(_flash_runtime.cute, "copy"),
+        patch.object(_flash_runtime.cute.arch, "fence_view_async_tmem_store"),
+        patch.object(_flash_runtime, "_disc_chunk_exp") as chunk_exp,
+        patch.object(_flash_runtime, "_disc_chunk_convert_store"),
+        patch.object(_flash_runtime, "_disc_chunk_rowsum", return_value=1.0),
+        patch.object(_flash_runtime, "mbarrier_arrive") as arrive,
+    ):
+        total = _flash_runtime.fa4_disc_exp_convert_store(
+            None,
+            MagicMock(),
+            MagicMock(),
+            None,
+            MagicMock(),
+            MagicMock(),
+            1.0,
+            0.0,
+            16,
+            6,
+            0,
+            first_arrival,
+            final_arrival,
+            3,
+            4,
+            pair_batch=8,
+            emu_batch=3,
+            **controls,
+        )
+    assert total == 4.0
+    assert [call.args[6] for call in chunk_exp.call_args_list] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    for call in chunk_exp.call_args_list:
+        assert call.args[7:9] == (8, 3)
+        assert call.kwargs == {"degree2": bool(degree2)}
+    assert [call.args[0] for call in arrive.call_args_list] == [
+        first_arrival,
+        final_arrival,
+    ]
 
 
 def test_sm103_packed_f16x2_rewrite_follows_the_schedule_not_the_seed() -> None:
@@ -1704,13 +1921,7 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     q = torch.randn(shape, dtype=torch.float16, device=DEVICE)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    seed = cute_flash.flash_attention_seed_config(
-        64,
-        512,
-        is_causal=True,
-        standard_causal_output=True,
-        target_device_capability=capability,
-    )
+    seed = _policy_template_seed(512, is_causal=True, capability=capability)
     assert seed is not None
     config = helion.Config(**seed.config)
     bound = _causal_attention_output.bind((q, k, v))
@@ -1764,14 +1975,7 @@ def test_causal_resident_cross_stage_matches_sdpa_without_deadlock(
     q = torch.randn(shape, dtype=torch.float16, device=DEVICE)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    seed = cute_flash.flash_attention_seed_config(
-        64,
-        num_kv,
-        dtype=torch.float16,
-        is_causal=True,
-        standard_causal_output=True,
-        target_device_capability=capability,
-    )
+    seed = _policy_template_seed(num_kv, is_causal=True, capability=capability)
     assert seed is not None
     config = helion.Config(**seed.config)
     bound = _causal_attention_output.bind((q, k, v))

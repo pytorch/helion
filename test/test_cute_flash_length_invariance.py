@@ -1977,6 +1977,14 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     assert _active_choices(
         enum_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     ) == frozenset(("ws_overlap",))
+    resident_defaults = {
+        cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
+        cute_flash.FLASH_ROWMAX_KEY: "software",
+        cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
+    }
+    for key, value in resident_defaults.items():
+        assert _active_choices(enum_fragments[key]) == frozenset((value,))
+    assert set(resident_defaults.items()) <= set(active_values)
     # 60: the ws surface pins every dimension it cannot vary to one value,
     # including the KV tile width, the query-tile height, the one-pass
     # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
@@ -1984,7 +1992,9 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # (``cute_flash_row_warps``, ``cute_flash_row_tile_m`` of the ``row_mma``
     # family); the two-warpgroup body measures both of its O epilogues
     # (``cute_flash_epi_stg``).
-    assert len(active_values) <= 60
+    # Resident-only coordinates add exactly three inactive singletons; keep
+    # the upstream bound on all other values and round-trip every value below.
+    assert len(active_values) - len(resident_defaults) <= 60
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -2219,11 +2229,16 @@ def test_local_tma_family_override_pins_persistence(family: str) -> None:
         )
 
 
-def test_compound_packet_override_pins_its_parent_schedule() -> None:
+@pytest.mark.parametrize(
+    ("head_dim", "dtype"), ((64, torch.float16), (128, torch.bfloat16))
+)
+def test_compound_packet_override_pins_its_parent_schedule(
+    head_dim: int, dtype: torch.dtype
+) -> None:
     spec = _flash_config_spec(
-        head_dim=128,
+        head_dim=head_dim,
         num_kv=48,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         is_causal=False,
     )
     packet = "deg2_16x6"
