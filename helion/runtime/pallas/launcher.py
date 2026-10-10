@@ -1573,8 +1573,8 @@ def _pallas_build_scratch_shapes(
 
     Each entry is either ``(shape, dtype_str, scratch_type)`` or the
     legacy 2-tuple ``(shape, dtype_str)`` form (``scratch_type``
-    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"`` and
-    ``"dma_semaphore"``.
+    defaults to ``"vmem"``). Supported scratch types are ``"vmem"``,
+    ``"smem"``, and ``"dma_semaphore"``.
     """
     _jnp_dtype_map = _pallas_jnp_dtype_map()
     scratch_shapes: list[object] = []
@@ -1589,9 +1589,8 @@ def _pallas_build_scratch_shapes(
         else:
             assert dtype_str is not None
             jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
-            scratch_shapes.append(
-                pltpu.VMEM(shape, jnp_dtype)  # type: ignore[union-attr]  # pyrefly: ignore[bad-argument-type]
-            )
+            memory_space = pltpu.SMEM if scratch_type == "smem" else pltpu.VMEM  # type: ignore[union-attr]
+            scratch_shapes.append(memory_space(shape, jnp_dtype))  # pyrefly: ignore[bad-argument-type]
     return scratch_shapes
 
 

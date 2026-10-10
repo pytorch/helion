@@ -1077,6 +1077,76 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_scalar_carry_with_pre_broadcast(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scale_steps(x: torch.Tensor, width: int) -> torch.Tensor:
+            width = hl.specialize(width)
+            out = torch.empty((5, *x.shape), dtype=x.dtype, device=x.device)
+            for _program in hl.grid(1):
+                vector = hl.zeros([width], dtype=x.dtype)
+                scalar = hl.zeros([1], dtype=x.dtype)
+                for step in hl.grid(5):
+                    out[step, :, :] = (vector + scalar)[:, None] * x[:, :]
+                    vector += 1
+                    scalar += 1
+            return out
+
+        x = torch.ones((128, 128), device=DEVICE, dtype=torch.float32)
+        expected = torch.stack([x.cpu() * (2 * step) for step in range(5)])
+        for width in (1, 128):
+            for loop_type in ("fori_loop", "emit_pipeline"):
+                with self.subTest(width=width, loop_type=loop_type):
+                    _, result = code_and_output(
+                        scale_steps,
+                        (x, width),
+                        pallas_loop_type=loop_type,
+                        pallas_pre_broadcast=True,
+                    )
+                    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_scalar_loop_carry_dtypes(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def repeat_scalar(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(128, dtype=x.dtype, device=x.device)
+            for _program in hl.grid(1):
+                total = hl.zeros([1], dtype=x.dtype)
+                for _step in hl.grid(5):
+                    total += x[:]
+                out[:] = total.expand(128)
+            return out
+
+        for dtype in (torch.int32, torch.float32, torch.bfloat16):
+            for loop_type in ("fori_loop", "emit_pipeline"):
+                with self.subTest(dtype=dtype, loop_type=loop_type):
+                    x = torch.tensor([2], dtype=dtype, device=DEVICE)
+                    _, result = code_and_output(
+                        repeat_scalar, (x,), pallas_loop_type=loop_type
+                    )
+                    expected = torch.full((128,), 10, dtype=dtype)
+                    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_scalar_loop_carry_singleton_shapes(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def repeat_scalar(x: torch.Tensor, rank: int) -> torch.Tensor:
+            rank = hl.specialize(rank)
+            out = torch.empty(128, dtype=x.dtype, device=x.device)
+            for _program in hl.grid(1):
+                total = hl.zeros((1,) * rank, dtype=x.dtype)
+                for _step in hl.grid(5):
+                    total += x[0]
+                out[:] = total.reshape(1).expand(128)
+            return out
+
+        for dtype in (torch.int32, torch.float32):
+            for rank in (0, 1, 2):
+                with self.subTest(dtype=dtype, rank=rank):
+                    x = torch.tensor([2], dtype=dtype, device=DEVICE)
+                    _, result = code_and_output(
+                        repeat_scalar, (x, rank), pallas_loop_type="fori_loop"
+                    )
+                    expected = torch.full((128,), 10, dtype=dtype)
+                    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
     def test_masked_store_clamps_with_value(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def copy_positive(x: torch.Tensor) -> torch.Tensor:

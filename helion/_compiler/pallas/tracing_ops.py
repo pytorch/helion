@@ -2165,6 +2165,22 @@ def _active_loop_begin_expr(state: CodegenState, block_id: int) -> str:
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
     """Read expression for a scratch buffer, slicing if padded for TPU."""
+    scratch = next(
+        (arg for arg in state.device_function._scratch_args if arg.name == sname),
+        None,
+    )
+    if (
+        scratch is not None
+        and scratch.scratch_type == "smem"
+        and all(size == 1 for size in scratch.shape)
+    ):
+        index = ", ".join("0" for _ in scratch.shape) or "()"
+        value = f"{sname}[{index}]"
+        return (
+            f"jnp.reshape({value}, {tuple(scratch.shape)!r})"
+            if scratch.shape
+            else value
+        )
     sl = state.device_function.scratch_read_slice(sname)
     return f"{sname}[{sl}]" if sl else f"{sname}[...]"
 
@@ -2175,6 +2191,19 @@ def _scratch_write_stmt(state: CodegenState, sname: str, val: ast.AST) -> ast.AS
     Always dereferences source refs with [...] or slice to avoid
     "Cannot store a Ref into another Ref" errors.
     """
+    scratch = next(
+        (arg for arg in state.device_function._scratch_args if arg.name == sname),
+        None,
+    )
+    if (
+        scratch is not None
+        and scratch.scratch_type == "smem"
+        and all(size == 1 for size in scratch.shape)
+    ):
+        index = ", ".join("0" for _ in scratch.shape) or "()"
+        return statement_from_string(
+            f"{sname}[{index}] = {{val}}.reshape(-1)[0]", val=val
+        )
     sl = state.device_function.scratch_read_slice(sname)
     idx = sl or "..."
     # Always dereference source -- it may be a scratch ref
@@ -2244,7 +2273,7 @@ def _setup_loop_carried_state(
     proxy_args: list[object],
     env: CompileEnvironment,
 ) -> tuple[list[str], list[object], set[int]]:
-    """Set up scratch VMEM buffers for loop-carried state.
+    """Set up scratch buffers for loop-carried state.
 
     Returns (scratch_names, result_vars, carried) where:
     - scratch_names[i] is the scratch buffer name for arg i (empty if not carried)
@@ -2263,8 +2292,18 @@ def _setup_loop_carried_state(
             assert isinstance(arg_ast, ast.Name)
             shape = _resolve_shape(proxy, env, state.config)
             dtype = proxy.dtype
+            scratch_type = (
+                "smem"
+                if all(isinstance(size, int) for size in shape)
+                and torch.Size(shape).numel() == 1
+                and dtype in (torch.int32, torch.float32)
+                else "vmem"
+            )
             scratch_name = state.device_function.register_scratch(
-                shape, dtype, name_hint=f"scratch_{i}"
+                shape,
+                dtype,
+                name_hint=f"scratch_{i}",
+                scratch_type=scratch_type,
             )
             # Initialize scratch with the arg value.
             state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
@@ -2497,16 +2536,33 @@ def _apply_pre_broadcast_transform(
     The transform is gated by the pallas_pre_broadcast config flag and only
     applies when each broadcast target is at most 128 or a multiple of 128.
     """
+    scratch_types = {
+        scratch.name: scratch.scratch_type
+        for scratch in state.device_function._scratch_args
+    }
+    vector_carried = {
+        index
+        for index in carried
+        if scratch_names[index] and scratch_types[scratch_names[index]] == "vmem"
+    }
     candidates = _find_pre_broadcast_candidates(
-        graph, carried, proxy_args, env, state.config
+        graph, vector_carried, proxy_args, env, state.config
     )
     if not candidates:
         return
     pre_broadcast_nodes = _compute_pre_broadcast_nodes(graph, candidates, proxy_args)
     placeholders = list(graph.find_nodes(op="placeholder"))
+    if any(
+        placeholders[index].name in pre_broadcast_nodes
+        for index in carried - vector_carried
+    ):
+        # Backward propagation can reach scalar scratch through an operation
+        # shared with a vector candidate. Do not change either the scratch or
+        # the graph's shape annotations when that component cannot be expanded.
+        return
     for i, proxy in enumerate(proxy_args):
         if (
-            i in carried
+            i in vector_carried
             and isinstance(proxy, torch.Tensor)
             and i < len(placeholders)
             and placeholders[i].name in pre_broadcast_nodes
