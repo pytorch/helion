@@ -746,7 +746,7 @@ class DeviceFunction:
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
-        if env.codegen_name == "cute":
+        if env.codegen_name in ("triton", "cute"):
             from .integer_power import prepare_integer_powers
 
             # Expressions already evaluated on the host or in a device local
