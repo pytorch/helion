@@ -1105,6 +1105,82 @@ class TestPallas(TestCase):
                 expected = x.cpu() + (scalar.cpu().float() if active else 0)
                 torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
+    def test_scalar_selected_panels_with_negative_indices(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor, ids: torch.Tensor, masked: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty(
+                (ids.numel(), *weights.shape[1:]),
+                dtype=weights.dtype,
+                device=weights.device,
+            )
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    value = hl.load(
+                        weights,
+                        [ids[group], slice(None), slice(None)],
+                        extra_mask=hl.full((), True, dtype=torch.bool)
+                        if masked
+                        else None,
+                    )
+                    out[group, :, :] = value + 1
+            return out
+
+        ids = torch.tensor([-4, -1, 0, 3], device=DEVICE, dtype=torch.int32)
+        for dtype in (torch.float32, torch.bfloat16):
+            weights = torch.randn(4, 16, 128, device=DEVICE, dtype=dtype)
+            for masked in (False, True):
+                expected = weights.cpu()[ids.cpu().long()]
+                if masked:
+                    expected[:2] = 0
+                for loop_type in ("fori_loop", "emit_pipeline"):
+                    _, result = code_and_output(
+                        select_panels,
+                        (weights, ids, masked),
+                        pallas_loop_type=loop_type,
+                        pallas_load_buffer_count=[2, 1],
+                    )
+                    torch.testing.assert_close(
+                        result.cpu(), expected + 1, rtol=0, atol=0
+                    )
+
+    def test_private_scalar_selects_pipeline_weight(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def rotate_weights(x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+            groups, rows, _ = x.shape
+            columns = weights.size(2)
+            indices = torch.empty(groups, dtype=torch.int32, device=x.device)
+            out = torch.empty(
+                (groups, rows, columns), dtype=torch.float32, device=x.device
+            )
+            for _program in hl.grid(1):
+                for group in hl.grid(groups):
+                    indices[group] = (group + 1) % groups
+                for group in hl.grid(groups):
+                    selected = indices[group]
+                    out[group, :, :] = hl.dot(
+                        x[group, :, :], weights[selected, :, :], out_dtype=torch.float32
+                    )
+            return out
+
+        x = torch.randn(4, 16, 128, dtype=torch.bfloat16, device=DEVICE)
+        weights = torch.randn(4, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+        _, result = code_and_output(
+            rotate_weights,
+            (x, weights),
+            pallas_loop_type="emit_pipeline",
+            pallas_internal_scratch=True,
+            pallas_load_buffer_count=[2, 2],
+        )
+        expected = torch.stack(
+            [
+                x.cpu()[group].float() @ weights.cpu()[(group + 1) % 4].float()
+                for group in range(4)
+            ]
+        )
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
     def test_scalar_metadata_beside_matmul(self) -> None:
         """Tensor epilogue analysis must also allow scalar metadata stores."""
 
@@ -1249,6 +1325,313 @@ class TestPallas(TestCase):
             pallas_internal_scratch=True,
         )
         torch.testing.assert_close(result.cpu(), x.cpu() * 2 + 6, rtol=0, atol=0)
+
+    def test_masked_scalar_selects_pipeline_panel(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor,
+            ids: torch.Tensor,
+            valid: torch.Tensor,
+            positions: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    selected = hl.load(
+                        ids, [positions[group]], extra_mask=valid[group] != 0
+                    )
+                    out[group, :, :] = weights[selected, :, :] + 1
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        ids = torch.tensor([1, 2, 3, 0], device=DEVICE, dtype=torch.int32)
+        for position_values, validity in (
+            ([0, 1, 2, 3], [1, 0, 1, 1]),
+            ([0, -1, 4, 1], [1, 1, 1, 0]),
+        ):
+            positions = torch.tensor(position_values, device=DEVICE, dtype=torch.int32)
+            valid = torch.tensor(validity, device=DEVICE, dtype=torch.int32)
+            _, result = code_and_output(
+                select_panels,
+                (weights, ids, valid, positions),
+                pallas_loop_type="emit_pipeline",
+                pallas_load_buffer_count=[2, 1, 1, 1],
+            )
+            position_cpu = positions.cpu()
+            selected = ids.cpu()[position_cpu.clamp(0, 3)]
+            mask = (valid.cpu() != 0) & (position_cpu >= 0) & (position_cpu < 4)
+            selected = torch.where(mask, selected, 0)
+            torch.testing.assert_close(
+                result.cpu(), weights.cpu()[selected] + 1, rtol=0, atol=0
+            )
+
+    def test_different_scalar_panel_load_sites(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor, ids: torch.Tensor, literal: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    if literal:
+                        first, second = 0, 1
+                    else:
+                        first = ids[group]
+                        second = (first + 1) % weights.size(0)
+                    out[group, :, :] = weights[first, :, :] + weights[second, :, :] + 1
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        ids = torch.tensor([1, 2, 3, 0], device=DEVICE, dtype=torch.int32)
+        for literal in (0, 1):
+            _, result = code_and_output(
+                select_panels,
+                (weights, ids, literal),
+                pallas_loop_type="emit_pipeline",
+                pallas_load_buffer_count=[2, 1],
+            )
+            first = torch.zeros_like(ids.cpu()) if literal else ids.cpu()
+            second = torch.ones_like(first) if literal else (first + 1) % 4
+            expected = weights.cpu()[first] + weights.cpu()[second] + 1
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_mixed_full_and_scalar_panel_loads(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor, ids: torch.Tensor, full_first: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    if full_first:
+                        full = weights[:, :, :]
+                        panel = weights[ids[group], :, :]
+                    else:
+                        panel = weights[ids[group], :, :]
+                        full = weights[:, :, :]
+                    out[group, :, :] = full.sum(dim=0) + panel + 1
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        ids = torch.tensor([1, 2, 3, 0], device=DEVICE, dtype=torch.int32)
+        expected = weights.cpu().sum(dim=0) + weights.cpu()[ids.cpu()] + 1
+        for full_first in (0, 1):
+            _, result = code_and_output(
+                select_panels,
+                (weights, ids, full_first),
+                pallas_loop_type="emit_pipeline",
+                pallas_load_buffer_count=[2, 1],
+            )
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_mutable_scalar_selector_keeps_source_order(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(weights: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+            groups = weights.size(0)
+            indices = torch.empty(groups, dtype=torch.int32, device=weights.device)
+            alias = indices.view(groups)
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(groups):
+                    indices[group] = 0
+                for group in hl.grid(groups):
+                    if valid[group] != 0:
+                        alias[group] = (group + 1) % groups
+                    selected = indices[group]
+                    out[group, :, :] = weights[selected, :, :] + 1
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        for flags in ([1, 1, 1, 1], [1, 0, 1, 0]):
+            valid = torch.tensor(flags, device=DEVICE, dtype=torch.int32)
+            _, result = code_and_output(
+                select_panels,
+                (weights, valid),
+                pallas_loop_type="emit_pipeline",
+                pallas_internal_scratch=True,
+                pallas_load_buffer_count=[2, 1],
+            )
+            selected = torch.where(valid.cpu() != 0, (torch.arange(4) + 1) % 4, 0)
+            torch.testing.assert_close(
+                result.cpu(), weights.cpu()[selected] + 1, rtol=0, atol=0
+            )
+
+    def test_scalar_selector_input_alias_requires_private_metadata(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(
+                pallas_loop_type="emit_pipeline",
+                pallas_load_buffer_count=[2, 1, 1],
+            ),
+        )
+        def select_panels(
+            weights: torch.Tensor, ids: torch.Tensor, updates: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    updates[group] = (group + 1) % ids.numel()
+                    out[group, :, :] = weights[ids[group], :, :] + 1
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        for alias in (False, True):
+            ids = torch.zeros(4, device=DEVICE, dtype=torch.int32)
+            updates = ids if alias else torch.empty_like(ids)
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported, "scalar address metadata may alias"
+            ):
+                select_panels(weights, ids, updates)
+
+    def test_scalar_selector_alias_refusal_with_outer_weight_use(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor, ids: torch.Tensor, updates: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                outer = weights[:, :, :].sum(dim=0)
+                for group in hl.grid(ids.numel()):
+                    updates[group] = (group + 1) % ids.numel()
+                    out[group, :, :] = weights[ids[group], :, :] + outer + 1
+            return out
+
+        weights = torch.randn(4, 16, 128, device=DEVICE)
+        ids = torch.zeros(4, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "distinct Ref"):
+            code_and_output(
+                select_panels, (weights, ids, ids), pallas_loop_type="emit_pipeline"
+            )
+
+    def test_direct_scalar_selector_alias_and_materialized_capture(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor,
+            choice: torch.Tensor,
+            updates: torch.Tensor,
+            capture: hl.constexpr,
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                selected = choice[()] if capture else choice
+                for group in hl.grid(weights.size(0)):
+                    updates[0] = (group + 1) % weights.size(0)
+                    out[group, :, :] = weights[selected, :, :] + 1
+            return out
+
+        weights = torch.randn(4, 16, 128, device=DEVICE)
+        choice = torch.tensor(0, device=DEVICE, dtype=torch.int32)
+        updates = choice.view(1)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "distinct Ref"):
+            code_and_output(
+                select_panels,
+                (weights, choice, updates, False),
+                pallas_loop_type="emit_pipeline",
+            )
+        _, result = code_and_output(
+            select_panels,
+            (weights, choice, updates, True),
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = (weights.cpu()[0] + 1).expand_as(weights.cpu())
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_scalar_selector_input_write_order(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    ids[group] = (group + 1) % ids.numel()
+                    out[group, :, :] = weights[ids[group], :, :] + 1
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        ids = torch.zeros(4, device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            select_panels,
+            (weights, ids),
+            pallas_loop_type="emit_pipeline",
+            pallas_load_buffer_count=[2, 1],
+        )
+        selected = (torch.arange(4) + 1) % 4
+        torch.testing.assert_close(
+            result.cpu(), weights.cpu()[selected] + 1, rtol=0, atol=0
+        )
+
+    def test_scalar_panel_loads_in_branches(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(
+            weights: torch.Tensor, ids: torch.Tensor, flags: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    selected = ids[group]
+                    result = weights[selected, :, :] + 1
+                    if flags[group] != 0:
+                        result += weights[(selected + 1) % weights.size(0), :, :]
+                    out[group, :, :] = result
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+        ids = torch.tensor([1, 2, 3, 0], device=DEVICE, dtype=torch.int32)
+        flags = torch.tensor([1, 0, 1, 0], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            select_panels,
+            (weights, ids, flags),
+            pallas_loop_type="emit_pipeline",
+            pallas_load_buffer_count=[2, 1, 1],
+        )
+        expected = weights.cpu()[ids.cpu()] + 1
+        expected += torch.where(
+            flags.cpu()[:, None, None] != 0,
+            weights.cpu()[(ids.cpu() + 1) % 4],
+            0,
+        )
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_pipeline_input_written_in_branch(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def update_panels(weights: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            ids = torch.empty(flags.numel(), dtype=torch.int32, device=weights.device)
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    ids[group] = group % 2
+                for group in hl.grid(ids.numel()):
+                    selected = ids[group]
+                    value = weights[selected, :, :]
+                    if flags[group] != 0:
+                        weights[selected, :, :] = value + 1
+                    out[group, :, :] = value
+            return out
+
+        panels = torch.tensor([10, 20, 30, 40], device=DEVICE, dtype=torch.float32)
+        flags = torch.ones(4, device=DEVICE, dtype=torch.int32)
+        for loop_type in ("fori_loop", "emit_pipeline"):
+            weights = panels[:, None, None].expand(4, 16, 128).contiguous()
+            _, result = code_and_output(
+                update_panels,
+                (weights, flags),
+                pallas_loop_type=loop_type,
+                pallas_internal_scratch=True,
+                pallas_load_buffer_count=[2, 1],
+            )
+            expected = torch.tensor([10, 20, 11, 21], dtype=torch.float32)
+            expected = expected[:, None, None].expand_as(weights.cpu())
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+            updated = torch.tensor([12, 22, 30, 40], dtype=torch.float32)
+            updated = updated[:, None, None].expand_as(weights.cpu())
+            torch.testing.assert_close(weights.cpu(), updated, rtol=0, atol=0)
 
     def test_configured_pad_width(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)

@@ -28,6 +28,11 @@ if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
 
 
+def normalize_negative_scalar_index(index: str, extent: str) -> str:
+    """Count a negative tensor index from the logical end, before DMA/rotation."""
+    return f"jnp.where(({index}) < 0, ({index}) + ({extent}), {index})"
+
+
 def scalar_load_bounds(
     state: CodegenState,
     node: torch.fx.Node,

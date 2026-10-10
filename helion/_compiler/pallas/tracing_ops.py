@@ -55,8 +55,11 @@ from .dma import is_tpu_dma_aligned_shape
 from .memory_access import MEMORY_ACCESS_META
 from .memory_access import MemoryAccess
 from .memory_access import MemoryAccessKind
+from .memory_effects import MEMORY_REGION_META
+from .memory_effects import MemoryRegion
 from .tensorcore_plan import DmaAccessPlan
 from .tensorcore_plan import build_dma_access_candidates
+from .vmem_scalar_load import normalize_negative_scalar_index
 
 log = logging.getLogger(__name__)
 
@@ -651,6 +654,84 @@ def _classify_loop_tensors(
     return loaded_tensors, stored_tensors
 
 
+def _check_address_ref_aliases(
+    tensor: torch.Tensor, region: MemoryRegion, state: CodegenState
+) -> None:
+    """Reject mutable address sources split across distinct generated Refs."""
+    compiler = HostFunction.current().compiler_state
+
+    def scratch_source(candidate: torch.Tensor) -> tuple[torch.Tensor, str | None]:
+        source = compiler.ssa_source(candidate)
+        source = candidate if source is None else source
+        return source, state.device_function.pallas_internal_scratch_name(source)
+
+    source, scratch = scratch_source(tensor)
+    for other in region.write_aliases(tensor):
+        if other is tensor:
+            continue
+        other_source, other_scratch = scratch_source(other)
+        if (
+            scratch is not None
+            and scratch == other_scratch
+            and source.dtype == other_source.dtype
+            and source.shape == other_source.shape
+            and source.stride() == other_source.stride()
+            and source.storage_offset() == other_source.storage_offset()
+        ):
+            continue
+        raise BackendUnsupported(
+            "pallas",
+            "scalar address metadata may alias a distinct Ref written in "
+            "the device loop; use one private metadata Ref instead",
+        )
+
+
+def _validate_address_ref_aliases(
+    accesses: Sequence[MemoryAccess], state: CodegenState
+) -> None:
+    """Check source aliases even when placement later declines prefetching."""
+    from ...language import memory_ops
+
+    pending = [
+        index
+        for access in accesses
+        for index in access.subscript
+        if isinstance(index, torch.fx.Node)
+    ]
+    seen: set[torch.fx.Node] = set()
+    while pending:
+        node = pending.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        value = node.meta.get("val")
+        if (
+            node.target is memory_ops.load
+            and isinstance(value, torch.Tensor)
+            and value.ndim == 0
+        ):
+            tensor_node = node.args[0]
+            tensor = (
+                tensor_node.meta.get("val")
+                if isinstance(tensor_node, torch.fx.Node)
+                else None
+            )
+            region = node.meta.get(MEMORY_REGION_META)
+            if isinstance(tensor, torch.Tensor) and isinstance(region, MemoryRegion):
+                _check_address_ref_aliases(tensor, region, state)
+        elif isinstance(value, torch.Tensor) and value.ndim == 0:
+            source = HostFunction.current().compiler_state.ssa_source(value)
+            if node.target is _host_tensor or (
+                node.op == "placeholder"
+                and source is not None
+                and CompileEnvironment.current().tensor_input_source(source) is not None
+            ):
+                region = node.meta.get(MEMORY_REGION_META)
+                if isinstance(region, MemoryRegion):
+                    _check_address_ref_aliases(value, region, state)
+        pending.extend(node.all_input_nodes)
+
+
 def _scalar_address_expr(
     value: object,
     *,
@@ -662,8 +743,8 @@ def _scalar_address_expr(
     iteration_indices: list[str] | None = None,
 ) -> str | None:
     """Render a scalar HBM address captured by an inner device loop."""
-    if isinstance(value, int):
-        return str(value)
+    if isinstance(value, (int, float)):
+        return state.device_function.literal_expr(value)
     if isinstance(value, torch.SymInt):
         return state.device_function.literal_expr(value)
     if not isinstance(value, torch.fx.Node):
@@ -683,6 +764,29 @@ def _scalar_address_expr(
             iteration_indices=iteration_indices,
         )
 
+    from ...language._tracing_ops import _get_symnode
+
+    if value.target is _get_symnode:
+        symbolic_value = value.meta.get("val")
+        if isinstance(symbolic_value, torch.SymInt):
+            block_id = CompileEnvironment.current().get_block_id(symbolic_value)
+            if (
+                block_id is not None
+                and block_ids is not None
+                and begin_exprs is not None
+                and iter_step_exprs is not None
+                and iteration_indices is not None
+                and block_id in block_ids
+            ):
+                position = block_ids.index(block_id)
+                return (
+                    f"({begin_exprs[position]}) + "
+                    f"({iteration_indices[position]}) * "
+                    f"({iter_step_exprs[position]})"
+                )
+            return state.device_function.literal_expr(symbolic_value)
+        return None
+
     from ...language import memory_ops
     from ...language.tile_ops import tile_begin
 
@@ -693,13 +797,16 @@ def _scalar_address_expr(
         and iter_step_exprs is not None
         and iteration_indices is not None
     ):
-        return _contiguous_range_base_expr(
-            value,
-            state=state,
-            block_ids=block_ids,
-            begin_exprs=begin_exprs,
-            iter_step_exprs=iter_step_exprs,
-            iteration_indices=iteration_indices,
+        symbolic_value = value.meta.get("val")
+        if not isinstance(symbolic_value, torch.SymInt):
+            return None
+        block_id = CompileEnvironment.current().get_block_id(symbolic_value)
+        if block_id is None or block_id not in block_ids:
+            return None
+        position = block_ids.index(block_id)
+        return (
+            f"({begin_exprs[position]}) + ({iteration_indices[position]}) * "
+            f"({iter_step_exprs[position]})"
         )
 
     if value.target is memory_ops.load:
@@ -708,6 +815,13 @@ def _scalar_address_expr(
             return None
         tensor = tensor_node.meta.get("val")
         if not isinstance(tensor, torch.Tensor):
+            return None
+        region = value.meta.get(MEMORY_REGION_META)
+        if isinstance(region, MemoryRegion):
+            _check_address_ref_aliases(tensor, region, state)
+        if not isinstance(region, MemoryRegion) or region.is_written(tensor):
+            # An index map runs before the body, potentially several iterations
+            # ahead. It cannot replay a load whose memory changes in that loop.
             return None
         if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
             return None
@@ -722,6 +836,25 @@ def _scalar_address_expr(
         )
         if index is None:
             return None
+        mask = value.args[2] if len(value.args) > 2 else None
+        mask_expr = None
+        if mask is not None:
+            mask_value = (
+                mask.meta.get("val") if isinstance(mask, torch.fx.Node) else mask
+            )
+            if isinstance(mask_value, torch.Tensor) and mask_value.ndim != 0:
+                return None
+            mask_expr = _scalar_address_expr(
+                mask,
+                state=state,
+                captured_exprs=captured_exprs,
+                block_ids=block_ids,
+                begin_exprs=begin_exprs,
+                iter_step_exprs=iter_step_exprs,
+                iteration_indices=iteration_indices,
+            )
+            if mask_expr is None:
+                return None
         captured_tensor_node = tensor_node
         while (
             captured_tensor_node.op == "call_function"
@@ -732,21 +865,50 @@ def _scalar_address_expr(
             captured_tensor_node = captured_tensor_node.args[0]
         name = captured_exprs.get(captured_tensor_node)
         if name is None:
-            name = state.device_function.tensor_arg(tensor).name
+            if captured_tensor_node.op == "placeholder":
+                return None
+            if captured_tensor_node.target is not _host_tensor:
+                return None
+            name = state.device_function.pallas_tensor_ref_name(tensor)
         from .vmem_scalar_load import classify_vmem_scalar_load
         from .vmem_scalar_load import emit_vmem_scalar_load
+        from .vmem_scalar_load import scalar_load_bounds
+
+        parts, bounds = scalar_load_bounds(state, value, tensor, subscript, [index])
 
         scalar_load = classify_vmem_scalar_load(
             state,
             tensor,
-            [index],
+            parts,
             list(value.meta.get("indexing_patterns") or ()),
         )
         if scalar_load is not None:
-            return ast.unparse(
-                emit_vmem_scalar_load(tensor, name, [index], scalar_load)
+            result = ast.unparse(
+                emit_vmem_scalar_load(tensor, name, parts, scalar_load)
             )
-        return f"{name}[{index}]"
+        else:
+            result = f"{name}[{parts[0]}]"
+        if mask_expr is not None:
+            predicate = (
+                f"({mask_expr}) & ({bounds})" if bounds is not None else mask_expr
+            )
+            result = f"jnp.where({predicate}, {result}, 0)"
+        return result
+
+    if (
+        value.target in (_not, torch.ops.aten.logical_not.default)
+        and len(value.args) == 1
+    ):
+        operand = _scalar_address_expr(
+            value.args[0],
+            state=state,
+            captured_exprs=captured_exprs,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        return f"jnp.logical_not({operand})" if operand is not None else None
 
     binary_operators = {
         operator.add: "+",
@@ -754,14 +916,44 @@ def _scalar_address_expr(
         operator.mod: "%",
         operator.mul: "*",
         operator.sub: "-",
+        operator.eq: "==",
+        operator.ne: "!=",
+        operator.lt: "<",
+        operator.le: "<=",
+        operator.gt: ">",
+        operator.ge: ">=",
+        operator.and_: "&",
+        operator.or_: "|",
+        torch.ops.aten.div.Tensor_mode: "//",
         torch.ops.aten.add.Scalar: "+",
         torch.ops.aten.add.Tensor: "+",
         torch.ops.aten.mul.Scalar: "*",
         torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.remainder.Scalar: "%",
+        torch.ops.aten.remainder.Tensor: "%",
         torch.ops.aten.sub.Scalar: "-",
         torch.ops.aten.sub.Tensor: "-",
+        torch.ops.aten.eq.Scalar: "==",
+        torch.ops.aten.eq.Tensor: "==",
+        torch.ops.aten.ne.Scalar: "!=",
+        torch.ops.aten.ne.Tensor: "!=",
+        torch.ops.aten.lt.Scalar: "<",
+        torch.ops.aten.lt.Tensor: "<",
+        torch.ops.aten.le.Scalar: "<=",
+        torch.ops.aten.le.Tensor: "<=",
+        torch.ops.aten.gt.Scalar: ">",
+        torch.ops.aten.gt.Tensor: ">",
+        torch.ops.aten.ge.Scalar: ">=",
+        torch.ops.aten.ge.Tensor: ">=",
+        torch.ops.aten.bitwise_and.Tensor: "&",
+        torch.ops.aten.bitwise_or.Tensor: "|",
     }
     if value.target not in binary_operators or len(value.args) < 2:
+        return None
+    if (
+        value.target is torch.ops.aten.div.Tensor_mode
+        and value.kwargs.get("rounding_mode") != "floor"
+    ):
         return None
     if (
         value.target
@@ -1126,98 +1318,16 @@ def _contiguous_range_base_expr(
     iter_step_exprs: Sequence[str],
     iteration_indices: list[str],
 ) -> str | None:
-    """Render a supported scalar address expression for one loop iteration."""
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, torch.SymInt):
-        return state.device_function.literal_expr(value)
-    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
-        return None
-
-    from ...language import memory_ops
-    from ...language.tile_ops import tile_begin
-
-    if value.target is tile_begin:
-        symbolic_value = value.meta.get("val")
-        if not isinstance(symbolic_value, torch.SymInt):
-            return None
-        block_id = CompileEnvironment.current().get_block_id(symbolic_value)
-        if block_id is None or block_id not in block_ids:
-            return None
-        position = block_ids.index(block_id)
-        return (
-            f"({begin_exprs[position]}) + ({iteration_indices[position]}) * "
-            f"({iter_step_exprs[position]})"
-        )
-
-    binary_operators = {
-        operator.add: "+",
-        operator.floordiv: "//",
-        operator.mod: "%",
-        operator.mul: "*",
-        operator.sub: "-",
-        torch.ops.aten.add.Scalar: "+",
-        torch.ops.aten.add.Tensor: "+",
-        torch.ops.aten.mul.Scalar: "*",
-        torch.ops.aten.mul.Tensor: "*",
-        torch.ops.aten.sub.Scalar: "-",
-        torch.ops.aten.sub.Tensor: "-",
-    }
-    if value.target in binary_operators and len(value.args) >= 2:
-        if (
-            value.target
-            in (
-                torch.ops.aten.add.Scalar,
-                torch.ops.aten.add.Tensor,
-                torch.ops.aten.sub.Scalar,
-                torch.ops.aten.sub.Tensor,
-            )
-            and value.kwargs.get("alpha", 1) != 1
-        ):
-            return None
-        lhs = _contiguous_range_base_expr(
-            value.args[0],
-            state=state,
-            block_ids=block_ids,
-            begin_exprs=begin_exprs,
-            iter_step_exprs=iter_step_exprs,
-            iteration_indices=iteration_indices,
-        )
-        rhs = _contiguous_range_base_expr(
-            value.args[1],
-            state=state,
-            block_ids=block_ids,
-            begin_exprs=begin_exprs,
-            iter_step_exprs=iter_step_exprs,
-            iteration_indices=iteration_indices,
-        )
-        if lhs is None or rhs is None:
-            return None
-        return f"({lhs}) {binary_operators[value.target]} ({rhs})"
-
-    if value.target is memory_ops.load:
-        tensor_node, subscript = value.args[:2]
-        if not isinstance(tensor_node, torch.fx.Node):
-            return None
-        tensor = tensor_node.meta.get("val")
-        if not isinstance(tensor, torch.Tensor):
-            return None
-        if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
-            return None
-        index = _contiguous_range_base_expr(
-            subscript[0],
-            state=state,
-            block_ids=block_ids,
-            begin_exprs=begin_exprs,
-            iter_step_exprs=iter_step_exprs,
-            iteration_indices=iteration_indices,
-        )
-        if index is None:
-            return None
-        name = state.device_function.tensor_arg(tensor).name
-        return f"{name}[{index}]"
-
-    return None
+    """Render a contiguous window's scalar address using the shared resolver."""
+    return _scalar_address_expr(
+        value,
+        state=state,
+        captured_exprs={},
+        block_ids=block_ids,
+        begin_exprs=begin_exprs,
+        iter_step_exprs=iter_step_exprs,
+        iteration_indices=iteration_indices,
+    )
 
 
 def _find_strategy(
@@ -3405,14 +3515,16 @@ def _build_inner_loop_window(
 ) -> InnerLoopWindow:
     """Build the iteration window for an inner tile loop."""
     loaded, stored = _classify_loop_tensors(graph_info, state)
+    accesses = [
+        *_own_memory_accesses(graph_info),
+        *_descendant_memory_accesses(graph_info, state),
+    ]
+    _validate_address_ref_aliases(accesses, state)
     _record_aligned_tiles(
         state,
         env,
         block_ids,
-        [
-            *_own_memory_accesses(graph_info),
-            *_descendant_memory_accesses(graph_info, state),
-        ],
+        accesses,
     )
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
@@ -3473,6 +3585,24 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     has_loop_state = len(args) > 0
 
     loop_window = _build_inner_loop_window(state, graph_info, block_ids, env)
+    placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+    carried_args = _loop_carried_indices(state, len(args))
+    placeholder_exprs = {
+        placeholder: ast.unparse(arg)
+        for index, (placeholder, arg) in enumerate(zip(placeholders, args, strict=True))
+        if index not in carried_args
+    }
+    scalar_index_nodes: dict[int, torch.fx.Node] = {}
+    for _fake, load_node, _subscript in loop_window.loaded.values():
+        load_indices = load_node.args[1]
+        if not isinstance(load_indices, (list, tuple)):
+            continue
+        for index_node in load_indices:
+            if not isinstance(index_node, torch.fx.Node):
+                continue
+            index_value = index_node.meta.get("val")
+            if isinstance(index_value, torch.Tensor) and index_value.ndim == 0:
+                scalar_index_nodes[id(index_value)] = index_node
 
     # A pipeline stage can move several adjacent logical tiles in one DMA.
     # The body still computes one original tile at a time from that larger
@@ -3515,6 +3645,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         loop_window.slice_size_exprs,
         env,
         state,
+        placeholder_exprs,
     )
     if not pipelined_tensor_ids:
         # There is no DMA to overlap. A plain device loop also allows a nested
@@ -3746,8 +3877,34 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 if is_scalar_index(idx_meta):
                     block_shape_parts.append("1")
                     if isinstance(idx_meta, torch.Tensor):
-                        var_name = state.device_function.tensor_arg(idx_meta).name
-                        lambda_parts.append(var_name)
+                        if group_size > 1:
+                            raise InvalidConfig(
+                                "grouped emit_pipeline does not support scalar-selected panels; use pallas_emit_pipeline_group_size=1"
+                            )
+                        index_node = scalar_index_nodes.get(id(idx_meta))
+                        offset_expr = (
+                            _scalar_address_expr(
+                                index_node,
+                                state=state,
+                                captured_exprs=placeholder_exprs,
+                                block_ids=block_ids,
+                                begin_exprs=loop_window.begin_exprs,
+                                iter_step_exprs=loop_window.iter_step_exprs,
+                                iteration_indices=lambda_params,
+                            )
+                            if index_node is not None
+                            else None
+                        )
+                        if offset_expr is None:
+                            raise InvalidConfig(
+                                "cannot render a prefetched scalar panel address"
+                            )
+                        lambda_parts.append(
+                            normalize_negative_scalar_index(
+                                offset_expr,
+                                state.device_function.literal_expr(shape[dim_idx]),
+                            )
+                        )
                     else:
                         lambda_parts.append(
                             state.device_function.literal_expr(idx_meta)
@@ -4332,6 +4489,7 @@ def _classify_pipelined_tensors(
     slice_size_exprs: Sequence[str],
     env: CompileEnvironment,
     state: CodegenState,
+    captured_exprs: dict[torch.fx.Node, str],
 ) -> tuple[
     list[tuple[torch.Tensor, tuple[object, ...], str]],
     list[tuple[int, ...]],
@@ -4423,6 +4581,49 @@ def _classify_pipelined_tensors(
             id(fake)
         ][1]
         region = memory_region(access_node)
+        selector_sites = (
+            region.load_sites(fake) if direction == "load" else (access_node,)
+        )
+        if direction == "load" and any(
+            len(site.args) > 2
+            and site.args[2] is not None
+            and any(
+                isinstance(index, torch.fx.Node)
+                and isinstance(index.meta.get("val"), torch.Tensor)
+                and index.meta["val"].ndim == 0
+                for index in _memory_subscript(site)
+            )
+            for site in selector_sites
+        ):
+            # A staged panel uses local index zero. Keep masked scalar-indexed
+            # loads source-ordered so original-index bounds survive, and no
+            # out-of-bounds panel is fetched ahead of its body mask.
+            continue
+        if any(
+            isinstance(index, torch.fx.Node)
+            and isinstance(index.meta.get("val"), torch.Tensor)
+            and index.meta["val"].ndim == 0
+            and _scalar_address_expr(
+                index,
+                state=state,
+                captured_exprs=captured_exprs,
+                block_ids=block_ids,
+                begin_exprs=["0"] * len(block_ids),
+                iter_step_exprs=["1"] * len(block_ids),
+                iteration_indices=["0"] * len(block_ids),
+            )
+            is None
+            for site in selector_sites
+            for index in _memory_subscript(site)
+        ):
+            continue
+        if direction == "store" and any(
+            isinstance(index, torch.fx.Node)
+            and isinstance(index.meta.get("val"), torch.Tensor)
+            and index.meta["val"].ndim == 0
+            for index in _memory_subscript(access_node)
+        ):
+            continue
         if region.has_outer_access(fake):
             continue
         if direction == "load" and region.is_written(fake):
@@ -4926,9 +5127,11 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     loop_window = _build_inner_loop_window(state, graph_info, block_ids, env)
     grid_parts = loop_window.grid_parts
     placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+    carried_args = _loop_carried_indices(state, len(args))
     placeholder_exprs = {
         placeholder: ast.unparse(arg)
-        for placeholder, arg in zip(placeholders, args, strict=True)
+        for index, (placeholder, arg) in enumerate(zip(placeholders, args, strict=True))
+        if index not in carried_args
     }
     scalar_index_nodes: dict[int, torch.fx.Node] = {}
     for _fake, load_node, _subscript in loop_window.loaded.values():
@@ -4981,6 +5184,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         loop_window.slice_size_exprs,
         env,
         state,
+        placeholder_exprs,
     )
     # Indirect addresses must be available before the graph body so the
     # scheduler can form the next iteration's HBM Refs. Keep their producer
@@ -5443,6 +5647,11 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                                 iter_step_exprs=loop_window.iter_step_exprs,
                                 iteration_indices=iteration_indices,
                             )
+                            if offset_expr is not None:
+                                offset_expr = normalize_negative_scalar_index(
+                                    offset_expr,
+                                    state.device_function.literal_expr(shape[dim_idx]),
+                                )
                     if offset_expr is None:
                         offset_expr = state.device_function.literal_expr(idx_meta)
                     hbm_parts.append(
