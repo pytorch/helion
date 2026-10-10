@@ -303,7 +303,7 @@ def _deepseek_v3_moe_nvfp4_tp_local(
         shared_w13_preactivation[shared_w13_tile_row] = (
             shared_w13_accumulator * torch.sum(shared_alpha1[:])
         ).to(torch.bfloat16)
-    for _topk_program in hl.grid(1):
+    with hl.device_scope():
         topk_scores = torch.sigmoid(logits[:, :].to(torch.float32))
         topk_grouped = (topk_scores + correction_bias[None, :]).view(
             topk_batch, num_groups, topk_experts_per_group

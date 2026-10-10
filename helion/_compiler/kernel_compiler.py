@@ -50,11 +50,12 @@ class KernelCompiler:
     Creates a HostFunction and drives it through the compilation steps:
 
       1. Parse source into ExtendedAST
-      2. Static loop unrolling
-      3. Backend-specific AST customizations
-      4. Type propagation
-      5. Config spec finalization
-      6. Device IR lowering
+      2. Desugar frontend sugar into core forms
+      3. Static loop unrolling
+      4. Backend-specific AST customizations
+      5. Type propagation
+      6. Config spec finalization
+      7. Device IR lowering
 
     The HostFunction is the mutable compilation state that each step
     operates on.
@@ -73,6 +74,7 @@ class KernelCompiler:
         """Run the full compilation pipeline and return the compiled HostFunction."""
         hf = self.parse(fn, fake_args, constexpr_args)
         with hf, self._compilation_context():
+            self.desugar(hf)
             self.unroll(hf)
             self.customize_ast(hf)
             self.propagate_types(hf)
@@ -117,6 +119,13 @@ class KernelCompiler:
                 params=params,
             )
             return HostFunction(definition, root._location)
+
+    def desugar(self, hf: HostFunction) -> None:
+        """Rewrite frontend sugar into core forms."""
+        from .desugar import desugar
+
+        with measure("HostFunction.desugar"):
+            desugar(hf)
 
     def unroll(self, hf: HostFunction) -> None:
         from .static_loop_unroller import unroll_static_loops
