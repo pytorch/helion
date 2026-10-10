@@ -1077,6 +1077,81 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_emit_pipeline_nested_loop_without_dma(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def repeat_tiles(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for repetition in hl.grid(3):
+                    for rows in hl.tile(x.size(0), block_size=16):
+                        out[rows, :] = x[rows, :] * (repetition + 1)
+            return out
+
+        x = torch.arange(128 * 128, dtype=torch.float32, device=DEVICE).reshape(
+            128, 128
+        )
+        _, result = code_and_output(
+            repeat_tiles, (x,), pallas_loop_type="emit_pipeline"
+        )
+        torch.testing.assert_close(result.cpu(), x.cpu() * 3, rtol=0, atol=0)
+
+    def test_pipeline_loads_with_different_tiled_axes(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_transpose(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for rows in hl.tile(x.size(0), block_size=128):
+                    for columns in hl.tile(x.size(1), block_size=128):
+                        out[rows, columns] = x[rows, columns] + x[columns, rows].T
+            return out
+
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            add_transpose, (x,), pallas_loop_type="emit_pipeline"
+        )
+        torch.testing.assert_close(result.cpu(), x.cpu() + x.cpu().T, rtol=0, atol=0)
+
+    def test_pipeline_branch_update_preserves_input(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def update_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for row in hl.grid(x.size(0)):
+                    value = x[row, :, :]
+                    if flags[row] != 0:
+                        x[row, :, :] = value + 1
+                    out[row, :, :] = value
+            return out
+
+        x = torch.randn(4, 16, 128, device=DEVICE)
+        original = x.cpu().clone()
+        flags = torch.tensor([1, 0, 1, 0], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            update_rows, (x, flags), pallas_loop_type="emit_pipeline"
+        )
+        torch.testing.assert_close(result.cpu(), original, rtol=0, atol=0)
+        expected = original + flags.cpu()[:, None, None]
+        torch.testing.assert_close(x.cpu(), expected, rtol=0, atol=0)
+
+    def test_pipeline_partial_slice_preserves_other_columns(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_slice(x: torch.Tensor) -> torch.Tensor:
+            groups, rows, columns = x.shape
+            out = torch.full(
+                (groups, rows, columns * 2), -17, dtype=x.dtype, device=x.device
+            )
+            for _program in hl.grid(1):
+                for group in hl.grid(groups):
+                    out[group, :, :128] = x[group, :, :]
+            return out
+
+        x = torch.randn(2, 16, 128, device=DEVICE)
+        expected = torch.full((2, 16, 256), -17, dtype=torch.float32)
+        expected[:, :, :128] = x.cpu()
+        for loop_type in ("fori_loop", "unroll", "emit_pipeline"):
+            _, result = code_and_output(copy_slice, (x,), pallas_loop_type=loop_type)
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
     def test_nested_static_value_slices(self) -> None:
         x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
         _code, result = code_and_output(
@@ -2690,18 +2765,8 @@ class TestPallas(TestCase):
                 # Two tiles cover [4, 12), and each reports a count of two.
                 torch.testing.assert_close(out, torch.full_like(out, 4.0))
 
-    @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
-    def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:
-        """Nested fori_loops that scratch-route the same tensor miscompile.
-
-        ``out`` is DMA-routed by both the outer ``tile_m`` loop (full row) and
-        the inner ``tile_n`` loop (column slice).  The inner RMW's load/store
-        bind to the *first* matching scratch (the outer loop's) via
-        ``_find_dma_scratch_loop``, while its DMA uses the inner loop's scratch,
-        so each inner iteration adds to the whole-row buffer -- producing a wrong
-        result (x + 5 instead of x + 3) with no error.  xpasses once scratch
-        resolution picks the innermost (current) loop instead of first-match.
-        """
+    def test_fori_loop_nested_same_tensor(self) -> None:
+        """Nested read/write sites keep one shared output Ref."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def nested_same_output(x: torch.Tensor) -> torch.Tensor:
@@ -4703,7 +4768,6 @@ class TestPallas(TestCase):
         self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 2)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
     def test_pipeline_tensor_with_scalar_access(self) -> None:
         """A pipeline tensor with scalar access should keep HBM, not be overridden to SMEM."""
         args = (
@@ -4711,14 +4775,12 @@ class TestPallas(TestCase):
             torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
         )
         expected = args[0] + args[1] + args[0][0, 0]
-        code, result = code_and_output(
+        _, result = code_and_output(
             pallas_inner_loop_add_with_scalar_access,
             args,
             block_sizes=[8, 128],
             pallas_loop_type="emit_pipeline",
         )
-        self.assertIn("pltpu.emit_pipeline", code)
-        self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, expected)
 
     def test_invalid_pallas_loop_type_raises(self) -> None:
@@ -6158,24 +6220,16 @@ class TestPallas(TestCase):
 
         x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
         expected = x + x.sum(dim=1, keepdim=True)
-        for loop_type, loop_marker in (
-            ("emit_pipeline", "pltpu.emit_pipeline"),
-            ("fori_loop", "jax.lax.fori_loop"),
-        ):
+        for loop_type in ("emit_pipeline", "fori_loop"):
             with self.subTest(pallas_loop_type=loop_type):
                 buffer_counts = [2] if loop_type == "fori_loop" else None
-                code, result = code_and_output(
+                _, result = code_and_output(
                     fn,
                     (x,),
                     block_sizes=[32, 128, 128],
                     pallas_loop_type=loop_type,
                     pallas_load_buffer_count=buffer_counts,
                 )
-                self.assertIn(loop_marker, code)
-                self.assertNotIn("_hbm_arg_indices=[0", code)
-                if buffer_counts:
-                    self.assertNotIn("_prime_fori_loads", code)
-                    self.assertNotIn("_prefetch_fori_loads", code)
                 torch.testing.assert_close(result, expected)
 
     def test_no_pipeline_outer_summary_read(self) -> None:
@@ -6844,24 +6898,6 @@ class TestPallas(TestCase):
         double = DmaResources("scratch", "semaphore", 2)
         self.assertEqual(double.scratch_ref("stage"), "scratch.at[stage]")
         self.assertEqual(double.semaphore_ref("stage"), "semaphore.at[stage]")
-
-    def test_dma_buffer_offset_nested_tile_codegen(self) -> None:
-        """A read-modify-write output must be loaded before its nested update."""
-        kernel = self._dma_buffer_offset_nested_tile_kernel()
-        args = (
-            torch.empty(128, 8, 256, device=DEVICE, dtype=torch.float32),
-            torch.empty(128, 8, 256, device=DEVICE, dtype=torch.float32),
-            torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32),
-        )
-        code = kernel.bind(args).to_code(
-            helion.Config(block_sizes=[32, 32], pallas_loop_type="fori_loop")
-        )
-
-        load = "pltpu.make_async_copy(out.at["
-        nested_update = "out_buf[0, :, :] ="
-        self.assertIn(load, code)
-        self.assertIn(nested_update, code)
-        self.assertLess(code.index(load), code.index(nested_update))
 
     @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:

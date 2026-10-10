@@ -17,6 +17,7 @@ import torch
 
 from ... import exc
 from .memory_access import tensor_origin_key
+from .memory_effects import plan_memory_regions
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -121,6 +122,7 @@ def plan_tiling(
 ) -> None:
     graph_lookup = {graph_info.graph_id: graph_info for graph_info in graphs}
     parent_ids = _collect_control_flow_parent_ids(graphs)
+    plan_memory_regions(graphs, parent_ids)
     for graph_info in graphs:
         local_access_keys = _collect_local_access_keys_with_ancestors(
             graph_info, graph_lookup, parent_ids

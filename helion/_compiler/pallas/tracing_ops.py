@@ -646,7 +646,7 @@ def _classify_loop_tensors(
                 key = id(fake)
                 if key not in stored_tensors:
                     sub_vals = tuple(_extract_subscript_vals(subscript))
-                    stored_tensors[key] = (fake, tensor_node, sub_vals)
+                    stored_tensors[key] = (fake, node, sub_vals)
 
     return loaded_tensors, stored_tensors
 
@@ -3274,7 +3274,9 @@ def _record_aligned_tiles(
             # atomic one assigns the ref in place, so the boundary fold and
             # save never run for it and its head rows are never restored.
             atomic_write_bids.update(dim_to_bid.values())
-        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+        if not dim_to_bid or not (
+            isinstance(fake, torch.Tensor) and fake.is_floating_point()
+        ):
             continue
         lane_block = _lane_tile(state, fake, dim_to_bid)
         for dim, dim_bid in dim_to_bid.items():
@@ -3458,6 +3460,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         env,
         state,
     )
+    if not pipelined_tensor_ids:
+        # There is no DMA to overlap. A plain device loop also allows a nested
+        # loop with real HBM traffic to own the pipeline scheduler.
+        return _codegen_fori_loop(state)
 
     # Build in_specs and out_specs
     in_tensors: list[tuple[torch.Tensor, str]] = []
@@ -4209,6 +4215,60 @@ def _runtime_vmem_shape_sources(
     return tuple(result)
 
 
+def _memory_subscript(node: torch.fx.Node) -> Sequence[object]:
+    subscript = node.args[1]
+    assert isinstance(subscript, (list, tuple))
+    return subscript
+
+
+def _same_scalar_selections(
+    first: Sequence[object],
+    other: Sequence[object],
+    env: CompileEnvironment,
+    config: Config,
+) -> bool:
+    """Whether loads share the same tiled axes and single-element selections."""
+    from ..._utils import is_scalar_index
+    from ..compile_environment import _to_sympy
+
+    if _get_dim_block_ids(_extract_subscript_vals(first), env) != _get_dim_block_ids(
+        _extract_subscript_vals(other), env
+    ):
+        return False
+
+    def selections(subscript: Sequence[object]) -> dict[int, object]:
+        result = {}
+        for dimension, index in enumerate(_tensor_dim_subscripts(subscript)):
+            value = index.meta.get("val") if isinstance(index, torch.fx.Node) else index
+            block_id = (
+                env.get_block_id(value) if isinstance(value, torch.SymInt) else None
+            )
+            if is_scalar_index(value) or (
+                block_id is not None
+                and env.block_sizes[block_id].from_config(config) == 1
+            ):
+                result[dimension] = value
+        return result
+
+    first_selections, other_selections = selections(first), selections(other)
+    if first_selections.keys() != other_selections.keys():
+        return False
+    for dimension, value in first_selections.items():
+        candidate = other_selections[dimension]
+        if isinstance(value, torch.Tensor):
+            if candidate is not value:
+                return False
+        elif isinstance(value, (int, torch.SymInt)):
+            if (
+                not isinstance(candidate, (int, torch.SymInt))
+                or _to_sympy(value).equals(_to_sympy(candidate)) is not True
+            ):
+                return False
+        elif candidate is not value:
+            return False
+    return True
+
+
 def _classify_pipelined_tensors(
     loaded_tensors: LoopTensors,
     stored_tensors: LoopTensors,
@@ -4246,6 +4306,9 @@ def _classify_pipelined_tensors(
     from ...language.memory_ops import store as _store_op
 
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
+    from .memory_effects import memory_region
+    from .plan_tiling import ArbitrarySlicePattern
+    from .plan_tiling import TensorIndexPattern
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
     contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
@@ -4300,9 +4363,31 @@ def _classify_pipelined_tensors(
             # second VMEM buffer and emit pointless copies from an HBM argument
             # that no longer exists.
             continue
+        access_node = (loaded_tensors if direction == "load" else stored_tensors)[
+            id(fake)
+        ][1]
+        region = memory_region(access_node)
+        if region.has_outer_access(fake):
+            continue
+        if direction == "load" and region.is_written(fake):
+            continue
+        if direction == "store":
+            if region.has_other_write(access_node, fake) or region.is_read(fake):
+                continue
+            if any(
+                isinstance(pattern, ArbitrarySlicePattern)
+                and pattern.slice != slice(None)
+                or isinstance(pattern, TensorIndexPattern)
+                and pattern.index_ndim > 0
+                for pattern in access_node.meta["indexing_patterns"]
+            ):
+                continue
+            if len(access_node.args) > 3 and access_node.args[3] is not None:
+                continue
         if direction == "load":
             first_load = loaded_tensors[id(fake)][1]
-            if int(first_load.meta.get(_PALLAS_LOOP_LOAD_COUNT_META, 1)) > 1:
+            load_sites = region.load_sites(fake)
+            if len(load_sites) > 1:
                 # Tensor-level prefetching is keyed by input tensor, not load
                 # site. Dynamic ranges can remain in HBM so each load site
                 # stages its own exact window. Ordinary tiled loads must keep
@@ -4314,6 +4399,16 @@ def _classify_pipelined_tensors(
                     state.device_function.pallas_memory_space[id(fake)] = (
                         PallasMemorySpace.HBM
                     )
+                    continue
+                if any(
+                    not _same_scalar_selections(
+                        _memory_subscript(first_load),
+                        _memory_subscript(site),
+                        env,
+                        state.config,
+                    )
+                    for site in load_sites
+                ):
                     continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         if state.device_function.is_pallas_remote_copy_operand(fake) and not set(

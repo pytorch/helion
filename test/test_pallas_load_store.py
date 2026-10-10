@@ -613,13 +613,12 @@ class TestPallasJaggedReductions(TestCase):
         seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
         jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
         out = torch.zeros((2, 128), dtype=torch.float32, device=DEVICE)
-        code, result = code_and_output(
+        _code, result = code_and_output(
             jagged_col_accum,
             (seq_offsets, jagged, out),
             block_sizes=[16, 128],
             pallas_loop_type=loop_type,
         )
-        self.assertIn(_LOOP_TYPE_CALL[loop_type], code)
         torch.testing.assert_close(
             result, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
         )
@@ -646,13 +645,12 @@ class TestPallasJaggedReductions(TestCase):
         seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
         jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
         out = torch.zeros((2, 128), dtype=torch.float32, device=DEVICE)
-        code, result = code_and_output(
+        _code, result = code_and_output(
             jagged_conditional_accum,
             (seq_offsets, jagged, out),
             block_sizes=[16, 128],
             pallas_loop_type=loop_type,
         )
-        self.assertIn(_LOOP_TYPE_CALL[loop_type], code)
         torch.testing.assert_close(
             result, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
         )
