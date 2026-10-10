@@ -8151,8 +8151,13 @@ class TileStrategy:
             if len(state.ast_args) >= 2 and isinstance(state.ast_args[1], list):
                 begin_values = state.ast_args[1]
         if isinstance(state.proxy_args, (list, tuple)):
-            if len(state.proxy_args) >= 2 and isinstance(
-                state.proxy_args[1], (list, tuple, torch.Size)
+            # Root grids pass ``(begin_or_end, end, step)``: a list in their
+            # second slot holds the ends, not the begins.
+            root_grid = state.ast_args is None and len(state.proxy_args) == 3
+            if (
+                not root_grid
+                and len(state.proxy_args) >= 2
+                and isinstance(state.proxy_args[1], (list, tuple, torch.Size))
             ):
                 proxy_begins = normalize_dim_values(state.proxy_args[1])
                 if begin_values is None:
@@ -10967,8 +10972,8 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         # which ``_cute_vector_load_ctx`` gates per tensor.
         self._cute_lane_layout: str = "blocked"
         self._cute_flat_multi: bool = len(block_ids) > 1
-        # ``pid * BLOCK`` of the lane-looped grid: the flattened index var
-        # aliases its offset var, so the tile base is recorded separately.
+        # ``begin + pid * BLOCK`` of the lane-looped grid: the flattened index
+        # var aliases its offset var, so the tile base is recorded separately.
         self._cute_tile_base_expr: str | None = None
         self._cute_lane_vec_width_by_block: dict[int, int] = {}
         self._cute_vec_lane_var_by_block: dict[int, str] = {}
@@ -11039,7 +11044,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         return self._num_threads
 
     def cute_tile_base_expr(self, block_id: int) -> str | None:
-        """Uniform ``pid * BLOCK`` of a single lane-looped flattened block.
+        """Uniform ``begin + pid * BLOCK`` of a single lane-looped flattened block.
 
         ``offset_var`` is the per-element index here (``indices = offsets``),
         so the tile base is recorded by ``codegen_grid`` instead.  ``None``
@@ -11053,7 +11058,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         # ``offset_var`` is the per-element index on this strategy, so
         # ``tile.begin`` must not fall back to it (it would broadcast
         # ``w[tile.begin]`` per element). A single lane-looped block records
-        # its uniform ``pid * BLOCK`` base; otherwise (multi-block flattened
+        # its uniform ``begin + pid * BLOCK`` base; otherwise (multi-block flattened
         # tiles, grids without a lane loop) derive the tile start from the
         # per-element index: tiles are aligned to their static block size, so
         # ``index - index % BLOCK`` is the same value for every element of the
@@ -11167,6 +11172,14 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         lane_strided = self._cute_lane_layout == "strided" and isinstance(
             thread_extent, int
         )
+        begins, ends, steps = self._extract_root_bounds(state)
+        # ``offsets`` is the element's index (``indices = offsets``), so the
+        # tile begin folds into the uniform tile base.  A tile with begins
+        # never flattens, so only a single block can start past zero; its
+        # bounds are static here (data-dependent extents take the N-D
+        # strategy).
+        assert len(block_ids) == 1 or all(begin == 0 for begin in begins)
+        begin = _to_sympy(cast("int | torch.SymInt", begins[0]))
 
         if vec_width > 1 and (
             (
@@ -11180,6 +11193,10 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             # See the matmul-fallback lane-loop-suppression and the
             # epilogue-subtile smem-staging notes in
             # ``PerThreadNDTileStrategy.codegen_grid``.
+            vec_width = 1
+        if vec_width > 1 and not env.known_multiple(begin, vec_width):
+            # A packet is V-aligned only when every lane base is: the tile
+            # begin must be a multiple of V.
             vec_width = 1
         if vec_width > 1:
             # Same outer x constexpr-V lane partition as
@@ -11269,31 +11286,35 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if mask_var is not None:
             lane_setup_statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < ({state.sympy_expr(total_numel)})"
+                    f"{mask_var} = {offsets_var} < "
+                    f"({state.sympy_expr(begin + total_numel)})"
                 )
             )
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
-        self._cute_tile_base_expr = f"({pid_var}) * ({block_size_var})"
+        tile_base = f"({pid_var}) * ({block_size_var})"
+        if begin != 0:
+            # Parenthesized: consumers splice the base into larger
+            # expressions (``tile.id`` divides it by the block size).
+            tile_base = f"(({state.sympy_expr(begin)}) + {tile_base})"
+        self._cute_tile_base_expr = tile_base
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
-        begins, _, steps = self._extract_root_bounds(state)
         self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
         if vec_width > 1 and lane_strided:
             # The strided vec base folds the thread index in itself.
-            state.add_statement(
-                f"{offsets_base_var} = ({pid_var}) * ({block_size_var})"
-            )
+            state.add_statement(f"{offsets_base_var} = {tile_base}")
         elif lane_strided:
-            # ``offsets_base = pid*BS + tid`` (per-lane term adds lane*NT).
+            # ``offsets_base = begin + pid*BS + tid`` (per-lane term adds
+            # lane*NT).
             state.add_statement(
-                f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', 1, axis=axis)}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(tile_base, 1, axis=axis)}"
             )
         else:
             state.add_statement(
-                f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(tile_base, self._elements_per_thread, axis=axis)}"
             )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -11302,7 +11323,9 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             shared_pid.codegen(state)
         else:
             state.device_function.set_pid(pids)
-        block_id_to_info = self._create_block_id_info_dict(state)
+        # Absolute ends, as in ``FlattenedTileStrategy.codegen_grid``:
+        # ``tile.end`` and ``tile.count`` read them next to ``begin``.
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         lane_loops = []
         if self._lane_var is not None:
             lane_loops = [(self._lane_var, self._elements_per_thread)]
