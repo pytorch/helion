@@ -1226,6 +1226,262 @@ class TestPallas(TestCase):
                     expected = torch.full((16, 128), 2278 + value, dtype=torch.float32)
                     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
+    def test_aligned_prefix_store_preserves_other_rows(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_prefixes(
+            x: torch.Tensor, starts: torch.Tensor, blocks: torch.Tensor
+        ) -> torch.Tensor:
+            width = hl.register_block_size(128, 256)
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(width)
+                    coordinates = hl.arange(width).unsqueeze(1).expand(width, x.size(1))
+                    mask = coordinates < blocks[work] * 8
+                    values = hl.load(x, [rows, slice(None)], extra_mask=mask)
+                    hl.store(out, [rows, slice(None)], values * 2, extra_mask=mask)
+            return out
+
+        starts = torch.tensor([0, 256, 512, 768], dtype=torch.int32, device=DEVICE)
+        blocks = torch.tensor([1, 0, 5, 16], dtype=torch.int32, device=DEVICE)
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(1024, 128, dtype=dtype, device=DEVICE)
+            expected = torch.full_like(x.cpu(), -17)
+            for start, block_count in zip(
+                starts.cpu().tolist(), blocks.cpu().tolist(), strict=True
+            ):
+                end = start + block_count * 8
+                expected[start:end] = x.cpu()[start:end] * 2
+            for width in (128, 256):
+                with self.subTest(dtype=dtype, width=width):
+                    _, result = code_and_output(
+                        copy_prefixes,
+                        (x, starts, blocks),
+                        block_sizes=[width],
+                        pallas_loop_type="emit_pipeline",
+                        pallas_load_buffer_count=[2, 1, 1],
+                    )
+                    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_masked_contiguous_store_requires_aligned_prefix(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_prefixes(
+            x: torch.Tensor,
+            starts: torch.Tensor,
+            lengths: torch.Tensor,
+            alignment: int,
+        ) -> torch.Tensor:
+            alignment = hl.specialize(alignment)
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(128)
+                    coordinates = hl.arange(128).unsqueeze(1).expand(128, x.size(1))
+                    values = hl.load(x, [rows, slice(None)])
+                    hl.store(
+                        out,
+                        [rows, slice(None)],
+                        values * 2,
+                        extra_mask=coordinates < lengths[work] * alignment,
+                    )
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE)
+        starts = torch.tensor([0, 256], dtype=torch.int32, device=DEVICE)
+        lengths = torch.tensor([13, 0], dtype=torch.int32, device=DEVICE)
+        cases = (
+            ("emit_pipeline", 1),
+            ("fori_loop", 1),
+            ("unroll", 1),
+            ("fori_loop", 8),
+        )
+        for loop_type, alignment in cases:
+            with (
+                self.subTest(loop_type=loop_type, alignment=alignment),
+                self.assertRaises(helion.exc.BackendUnsupported),
+            ):
+                code_and_output(
+                    copy_prefixes,
+                    (x, starts, lengths, alignment),
+                    pallas_loop_type=loop_type,
+                )
+
+    def test_prefix_alignment_uses_selected_config(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_prefix(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            span = hl.register_block_size(16, 128)
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(128)
+                    coordinate = hl.arange(128)[:, None].expand(128, x.size(1))
+                    mask = coordinate < span // 16 + 7
+                    values = hl.load(x, [rows, slice(None)])
+                    hl.store(out, [rows, slice(None)], values * 2, extra_mask=mask)
+            return out
+
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            copy_prefix, (x, starts), block_sizes=[16], pallas_loop_type="emit_pipeline"
+        )
+        expected = torch.full_like(x.cpu(), -17)
+        expected[:8] = x.cpu()[:8] * 2
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+        for span in (32, 64, 128):
+            with (
+                self.subTest(span=span),
+                self.assertRaises(helion.exc.BackendUnsupported),
+            ):
+                code_and_output(
+                    copy_prefix,
+                    (x, starts),
+                    block_sizes=[span],
+                    pallas_loop_type="emit_pipeline",
+                )
+
+    def test_aligned_prefix_store_three_dimensions(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_prefixes(
+            x: torch.Tensor, starts: torch.Tensor, blocks: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(128)
+                    coordinates = (
+                        hl.arange(128).unsqueeze(1).unsqueeze(2).expand(128, 16, 128)
+                    )
+                    mask = coordinates < blocks[work] * 16
+                    values = hl.load(
+                        x, [rows, slice(None), slice(None)], extra_mask=mask
+                    )
+                    hl.store(
+                        out,
+                        [rows, slice(None), slice(None)],
+                        values * 2,
+                        extra_mask=mask,
+                    )
+            return out
+
+        starts = torch.tensor([0, 256, 512, 768], dtype=torch.int32, device=DEVICE)
+        blocks = torch.tensor([1, 0, 6, 8], dtype=torch.int32, device=DEVICE)
+        x = torch.randn(1024, 16, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            copy_prefixes, (x, starts, blocks), pallas_loop_type="emit_pipeline"
+        )
+        expected = torch.full_like(x.cpu(), -17)
+        for start, count in zip(
+            starts.cpu().tolist(), blocks.cpu().tolist(), strict=True
+        ):
+            expected[start : start + count * 16] = (
+                x.cpu()[start : start + count * 16] * 2
+            )
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_contiguous_prefix_invariant_captures(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(
+            x: torch.Tensor,
+            starts: torch.Tensor,
+            lengths: torch.Tensor,
+            form: hl.constexpr,
+        ) -> torch.Tensor:
+            width = hl.register_block_size(128, 256)
+            out = torch.zeros_like(x)
+            for _program in hl.grid(1):
+                length = lengths[0]
+                for work in hl.grid(2):
+                    rows = starts[work] // 16 * 16 + hl.arange(width)
+                    if form == "expand":
+                        coordinate = hl.arange(width)[:, None].expand(width, x.size(1))
+                        mask = coordinate < length
+                    elif form == "reshape":
+                        mask = hl.arange(width).reshape(width, 1) < length
+                    elif form == "reverse":
+                        mask = length > hl.arange(width)[:, None]
+                    else:
+                        mask = hl.arange(width)[:, None] < length
+                    values = hl.load(x, [rows, slice(None)], extra_mask=mask)
+                    hl.store(out, [rows, slice(None)], values * 2)
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 256], device=DEVICE, dtype=torch.int32)
+        for length in (-8, 0, 17, 128, 512):
+            lengths = torch.tensor([length], device=DEVICE, dtype=torch.int32)
+            for width in (128, 256):
+                expected = torch.zeros_like(x.cpu())
+                live = min(width, max(0, length))
+                for start in (0, 256):
+                    expected[start : start + live] = x.cpu()[start : start + live] * 2
+                for form in ("expand", "reshape", "reverse", "implicit"):
+                    with self.subTest(length=length, width=width, form=form):
+                        _, result = code_and_output(
+                            copy_windows,
+                            (x, starts, lengths, form),
+                            block_sizes=[width],
+                            pallas_loop_type="emit_pipeline",
+                            pallas_load_buffer_count=[2, 1, 1],
+                        )
+                        torch.testing.assert_close(
+                            result.cpu(), expected, rtol=0, atol=0
+                        )
+
+    def test_contiguous_prefix_changing_length(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for _program in hl.grid(1):
+                length = hl.zeros([], dtype=torch.int32)
+                for work in hl.grid(4):
+                    length += 16
+                    rows = starts[work] // 16 * 16 + hl.arange(128)
+                    mask = hl.arange(128)[:, None] < length
+                    values = hl.load(x, [rows, slice(None)], extra_mask=mask)
+                    hl.store(out, [rows, slice(None)], values * 2)
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.arange(0, 512, 128, device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            copy_windows,
+            (x, starts),
+            pallas_loop_type="emit_pipeline",
+            pallas_load_buffer_count=[2, 1],
+        )
+        expected = torch.zeros_like(x.cpu())
+        for work in range(4):
+            start, length = work * 128, (work + 1) * 16
+            expected[start : start + length] = x.cpu()[start : start + length] * 2
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_contiguous_prefix_changing_store_length_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                count = hl.zeros([], dtype=torch.int32)
+                for work in hl.grid(starts.numel()):
+                    count += 1
+                    rows = starts[work] // 16 * 16 + hl.arange(128)
+                    values = hl.load(x, [rows, slice(None)])
+                    mask = hl.arange(128)[:, None] < count * 16
+                    hl.store(out, [rows, slice(None)], values, extra_mask=mask)
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.arange(0, 512, 128, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "prefix length that is unchanged"
+        ):
+            code_and_output(
+                copy_windows,
+                (x, starts),
+                pallas_loop_type="emit_pipeline",
+                pallas_load_buffer_count=[2, 1],
+            )
+
     def test_leading_scalar_selection(self) -> None:
         """A leading block selection preserves the tensor's packed dtype."""
 

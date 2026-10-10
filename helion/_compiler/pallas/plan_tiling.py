@@ -17,6 +17,7 @@ import torch
 
 from ... import exc
 from .memory_access import tensor_origin_key
+from .memory_effects import control_flow_child_graph_ids
 from .memory_effects import plan_memory_regions
 
 if TYPE_CHECKING:
@@ -96,6 +97,7 @@ class ContiguousRangeIndexPattern(IndexingPattern):
     base: int | torch.SymInt | torch.fx.Node
     length: int | torch.SymInt
     alignment: int
+    valid_length: torch.fx.Node | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -286,22 +288,6 @@ def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
             if isinstance(tensor, torch.Tensor):
                 local_access_keys.add(tensor_origin_key(tensor))
     return local_access_keys
-
-
-def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[object, ...]:
-    """The graph ids ``node`` traces into, or ``()`` if it is not control flow."""
-    from ...language import _tracing_ops
-
-    if _tracing_ops.is_for_loop_target(node.target):
-        # args[0] is the loop body graph_id for both for-loop variants.
-        return node.args[:1]
-    if node.target is _tracing_ops._if:
-        # args[1] and args[2] are if_graph_id and else_graph_id; args[0] is the test.
-        return node.args[1:3]
-    if node.target is _tracing_ops._while_loop:
-        # args[0] and args[1] are cond_graph_id and body_graph_id.
-        return node.args[:2]
-    return ()
 
 
 def _collect_control_flow_parent_ids(graphs: list[GraphInfo]) -> dict[int, int]:
@@ -743,6 +729,134 @@ def _iota_length(node: object) -> int | torch.SymInt | None:
     return length if isinstance(length, int) and length > 0 else None
 
 
+def _unwrap_new_var(value: object) -> object:
+    """Remove tracing-only aliases from an FX expression."""
+    from ...language._tracing_ops import _new_var
+
+    while (
+        isinstance(value, torch.fx.Node)
+        and value.op == "call_function"
+        and value.target is _new_var
+        and value.args
+    ):
+        value = value.args[0]
+    return value
+
+
+def _leading_broadcast_iota(
+    value: object,
+    access_value: torch.Tensor,
+) -> bool:
+    """Recognize integral row coordinates, including implicit broadcasting."""
+    value = _unwrap_new_var(value)
+    if not isinstance(value, torch.fx.Node):
+        return False
+    coordinate = value.meta.get("val")
+    if (
+        not isinstance(coordinate, torch.Tensor)
+        or coordinate.dtype not in (torch.int32, torch.int64)
+        or coordinate.ndim != access_value.ndim
+    ):
+        return False
+    from ...language.view_ops import subscript
+    from ..compile_environment import _to_sympy
+
+    def same_size(first: int | torch.SymInt, second: int | torch.SymInt) -> bool:
+        return _to_sympy(first).equals(_to_sympy(second)) is True
+
+    if not same_size(coordinate.shape[0], access_value.shape[0]) or any(
+        size != 1 and not same_size(size, target)
+        for size, target in zip(
+            coordinate.shape[1:], access_value.shape[1:], strict=True
+        )
+    ):
+        return False
+
+    source = value
+    if source.target is torch.ops.aten.expand.default:
+        source = _unwrap_new_var(source.args[0])
+    while (
+        isinstance(source, torch.fx.Node)
+        and source.op == "call_function"
+        and source.target
+        in (
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            subscript,
+        )
+    ):
+        shape = source.meta["val"].shape
+        if not same_size(shape[0], access_value.shape[0]) or any(
+            size != 1 for size in shape[1:]
+        ):
+            return False
+        if source.target is subscript:
+            indices = source.args[1]
+            assert isinstance(indices, (list, tuple))
+            if any(index is not None and index != slice(None) for index in indices):
+                return False
+        source = _unwrap_new_var(source.args[0])
+
+    length = _iota_length(source)
+    return length is not None and same_size(length, access_value.shape[0])
+
+
+def _leading_row_mask_extent(
+    access_node: torch.fx.Node,
+    access_value: torch.Tensor,
+    tensor_dim: int,
+    alignment: int,
+    config: Config | None,
+) -> torch.fx.Node | None:
+    """Return the integral length in an aligned leading-row prefix mask."""
+    from ...language import memory_ops
+
+    if tensor_dim != 0:
+        return None
+    mask_position = 2 if access_node.target is memory_ops.load else 3
+    if len(access_node.args) <= mask_position:
+        return None
+    mask = _unwrap_new_var(access_node.args[mask_position])
+    if (
+        not isinstance(mask, torch.fx.Node)
+        or mask.op != "call_function"
+        or mask.target
+        not in (
+            operator.lt,
+            operator.gt,
+            torch.ops.aten.lt.Scalar,
+            torch.ops.aten.lt.Tensor,
+            torch.ops.aten.gt.Scalar,
+            torch.ops.aten.gt.Tensor,
+        )
+        or len(mask.args) < 2
+    ):
+        return None
+    coordinate, extent = mask.args[:2]
+    if mask.target in (operator.gt, torch.ops.aten.gt.Scalar, torch.ops.aten.gt.Tensor):
+        coordinate, extent = extent, coordinate
+    coordinate, extent = _unwrap_new_var(coordinate), _unwrap_new_var(extent)
+    extent_value = extent.meta.get("val") if isinstance(extent, torch.fx.Node) else None
+    if (
+        not isinstance(extent, torch.fx.Node)
+        or not _is_scalar_value(extent)
+        or isinstance(extent_value, torch.Tensor)
+        and extent_value.dtype not in (torch.int32, torch.int64)
+        or not _leading_broadcast_iota(coordinate, access_value)
+    ):
+        return None
+    if (
+        access_node.target is memory_ops.store
+        and config is not None
+        and not _is_proven_multiple(extent, alignment, config)
+    ):
+        # The final DMA row block is rounded to its physical alignment. Only
+        # an aligned prefix guarantees that the transfer excludes masked rows.
+        return None
+    return extent
+
+
 def _has_other_store_site(access_node: torch.fx.Node, tensor: torch.Tensor) -> bool:
     """A pipeline BlockSpec can describe only one store window per tensor."""
     from .memory_effects import MEMORY_REGION_META
@@ -836,17 +950,34 @@ def _match_contiguous_range_index(
                 and region.is_read(tensor)
                 and region.is_written(tensor)
             ):
+                # Separate read/write windows cannot share a write-only stage.
                 return None
-            if access_node.target is memory_ops.store:
-                mask = access_node.args[3] if len(access_node.args) > 3 else None
-                if mask is not None or _has_other_store_site(access_node, tensor):
-                    # One DMA window cannot represent several stores, and an
-                    # unmasked transfer must not discard a logical store mask.
-                    return None
+            if access_node.target is memory_ops.store and _has_other_store_site(
+                access_node, tensor
+            ):
+                # Several writes retain their own indices and scatter lowering.
+                return None
+            valid_length = _leading_row_mask_extent(
+                access_node=access_node,
+                access_value=load_value,
+                tensor_dim=tensor_dim,
+                alignment=alignment,
+                config=config,
+            )
+            if (
+                access_node.target is memory_ops.store
+                and len(access_node.args) > 3
+                and access_node.args[3] is not None
+                and valid_length is None
+            ):
+                # Do not turn an unsupported masked scatter into an unmasked
+                # DMA. A store prefix must have a proven physical boundary.
+                return None
             return ContiguousRangeIndexPattern(
                 base=base,
                 length=length,
                 alignment=alignment,
+                valid_length=valid_length,
             )
     return None
 

@@ -57,6 +57,7 @@ from .memory_access import MemoryAccess
 from .memory_access import MemoryAccessKind
 from .memory_effects import MEMORY_REGION_META
 from .memory_effects import MemoryRegion
+from .plan_tiling import ContiguousRangeIndexPattern
 from .tensorcore_plan import DmaAccessPlan
 from .tensorcore_plan import build_dma_access_candidates
 from .vmem_scalar_load import normalize_negative_scalar_index
@@ -78,7 +79,6 @@ if TYPE_CHECKING:
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
     from .dma import DmaDirection
-    from .plan_tiling import ContiguousRangeIndexPattern
 
 
 @_decorators.codegen(_not, "pallas")
@@ -698,6 +698,13 @@ def _validate_address_ref_aliases(
         for index in access.subscript
         if isinstance(index, torch.fx.Node)
     ]
+    for access in accesses:
+        pending.extend(
+            pattern.valid_length
+            for pattern in access.patterns
+            if isinstance(pattern, ContiguousRangeIndexPattern)
+            and pattern.valid_length is not None
+        )
     seen: set[torch.fx.Node] = set()
     while pending:
         node = pending.pop()
@@ -3667,6 +3674,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     pipeline_out_args: list[str] = []
     deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, set[str]]] = {}
     clean_physical_mask_bounds: dict[int, set[str]] = {}
+    bounded_store_masks: set[torch.fx.Node] = set()
 
     # Map outer grid block_ids to program_id variable names.
     # Compute program_ids before emit_pipeline so the BlockSpec lambda
@@ -3741,7 +3749,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             if range_pattern is not None:
                 if group_size > 1:
                     raise InvalidConfig(
-                        "grouped emit_pipeline does not support runtime HBM windows; use pallas_emit_pipeline_group_size=1"
+                        "grouped emit_pipeline does not support runtime HBM windows; "
+                        "use pallas_emit_pipeline_group_size=1"
                     )
                 range_length = _resolve_dim_size(
                     range_pattern.length, env, state.config
@@ -3763,10 +3772,31 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     raise RuntimeError(
                         "Pallas could not render a planned contiguous HBM range"
                     )
+                size_expr = str(range_length)
+                if range_pattern.valid_length is not None:
+                    dynamic_size = _scalar_address_expr(
+                        range_pattern.valid_length,
+                        state=state,
+                        captured_exprs=placeholder_exprs,
+                        block_ids=block_ids,
+                        begin_exprs=loop_window.begin_exprs,
+                        iter_step_exprs=loop_window.iter_step_exprs,
+                        iteration_indices=lambda_params,
+                    )
+                    if dynamic_size is not None:
+                        size_expr = f"jnp.clip({dynamic_size}, 0, {range_length})"
+                        if is_store:
+                            bounded_store_masks.add(loop_window.stored[id(fake)][1])
+                    elif is_store:
+                        raise AssertionError(
+                            "store extent was not checked before staging"
+                        )
+                    # A load can keep the full configured window and apply its
+                    # original mask in the body when its length is not invariant.
                 block_shape_parts.append(f"pl.BoundedSlice({range_length})")
                 lambda_parts.append(
                     "pl.ds(pl.multiple_of("
-                    f"{base_expr}, {range_pattern.alignment}), {range_length})"
+                    f"{base_expr}, {range_pattern.alignment}), {size_expr})"
                 )
             elif bid is not None and bid in block_ids:
                 # Inner pipeline dim -- tiled by pipeline grid
@@ -3942,7 +3972,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     if isinstance(idx_meta, torch.Tensor):
                         if group_size > 1:
                             raise InvalidConfig(
-                                "grouped emit_pipeline does not support scalar-selected panels; use pallas_emit_pipeline_group_size=1"
+                                "grouped emit_pipeline does not support scalar-selected "
+                                "panels; use pallas_emit_pipeline_group_size=1"
                             )
                         index_node = scalar_index_nodes.get(id(idx_meta))
                         offset_expr = (
@@ -4239,6 +4270,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
             for node, by_block in deferred_physical_mask_bounds.items()
         },
+        _bounded_store_masks=frozenset(bounded_store_masks),
     )
 
     # For loop-carried state, remap args to scratch reads inside the body.
@@ -4588,19 +4620,9 @@ def _classify_pipelined_tensors(
     from ...language.memory_ops import store as _store_op
 
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
-    from .memory_effects import memory_region
-    from .plan_tiling import ArbitrarySlicePattern
-    from .plan_tiling import TensorIndexPattern
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
     contiguous_ranges = _contiguous_range_patterns(loaded_tensors, stored_tensors)
-    read_storages = {
-        id(fake.untyped_storage()) for fake, _, _ in loaded_tensors.values()
-    }
-    written_storages = {
-        id(fake.untyped_storage()) for fake, _, _ in stored_tensors.values()
-    }
-    read_write_storages = read_storages & written_storages
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info,
         block_ids,
@@ -4655,7 +4677,39 @@ def _classify_pipelined_tensors(
         access_node = (loaded_tensors if direction == "load" else stored_tensors)[
             id(fake)
         ][1]
-        region = memory_region(access_node)
+        region = access_node.meta[MEMORY_REGION_META]
+        assert isinstance(region, MemoryRegion)
+        if region.has_outer_access(fake):
+            continue
+        if direction == "store" and (
+            region.has_other_write(access_node, fake) or region.is_read(fake)
+        ):
+            # An output stage is not prefilled. Partial writes at other sites
+            # or reads of earlier values must keep one shared, initialized Ref.
+            continue
+        if direction == "store":
+            from .plan_tiling import ArbitrarySlicePattern
+            from .plan_tiling import TensorIndexPattern
+
+            if any(
+                isinstance(pattern, ArbitrarySlicePattern)
+                and pattern.slice != slice(None)
+                or isinstance(pattern, TensorIndexPattern)
+                and pattern.index_ndim > 0
+                for pattern in access_node.meta["indexing_patterns"]
+            ):
+                # A whole-tensor output buffer cannot be sent after writing
+                # only one sub-slice or scatter. Keep the initialized outer Ref.
+                continue
+            mask = access_node.args[3] if len(access_node.args) > 3 else None
+            if mask is not None and not any(
+                pattern.valid_length is not None
+                for pattern in contiguous_ranges.get(id(fake), {}).values()
+            ):
+                continue
+        # Every computed scalar selector must be safe to evaluate before the
+        # body's writes, with the same mask and value as the original load.
+        selector_nodes = _memory_subscript(access_node)
         selector_sites = (
             region.load_sites(fake) if direction == "load" else (access_node,)
         )
@@ -4696,26 +4750,15 @@ def _classify_pipelined_tensors(
             isinstance(index, torch.fx.Node)
             and isinstance(index.meta.get("val"), torch.Tensor)
             and index.meta["val"].ndim == 0
-            for index in _memory_subscript(access_node)
+            for index in selector_nodes
         ):
-            continue
-        if region.has_outer_access(fake):
+            # Computed scalar output destinations are not input-panel maps.
+            # Keep their established source-ordered route.
             continue
         if direction == "load" and region.is_written(fake):
+            # A child graph's update must reach the original shared Ref, not
+            # an input-only prefetch buffer with no writeback.
             continue
-        if direction == "store":
-            if region.has_other_write(access_node, fake) or region.is_read(fake):
-                continue
-            if any(
-                isinstance(pattern, ArbitrarySlicePattern)
-                and pattern.slice != slice(None)
-                or isinstance(pattern, TensorIndexPattern)
-                and pattern.index_ndim > 0
-                for pattern in access_node.meta["indexing_patterns"]
-            ):
-                continue
-            if len(access_node.args) > 3 and access_node.args[3] is not None:
-                continue
         if direction == "load":
             first_load = loaded_tensors[id(fake)][1]
             load_sites = region.load_sites(fake)
@@ -4732,6 +4775,9 @@ def _classify_pipelined_tensors(
                         PallasMemorySpace.HBM
                     )
                     continue
+                # One prefetched panel cannot serve different scalar selectors.
+                # Reusing the same scalar variable is safe; separate computed
+                # selectors retain source-ordered loads from the outer window.
                 if any(
                     not _same_scalar_selections(
                         _memory_subscript(first_load),
@@ -4777,15 +4823,46 @@ def _classify_pipelined_tensors(
                 # The load-site lowering can still stage this window, but the
                 # loop prefetcher cannot safely synthesize its next address.
                 continue
-            if (
-                state.config.get("pallas_loop_type") == "emit_pipeline"
-                and id(fake.untyped_storage()) in read_write_storages
-            ):
+            if direction == "store":
+                store_node = stored_tensors[id(fake)][1]
+                mask = store_node.args[3] if len(store_node.args) > 3 else None
+                prefix = range_patterns.get(0)
+                if prefix is not None and prefix.valid_length is not None:
+                    if (
+                        _scalar_address_expr(
+                            prefix.valid_length,
+                            state=state,
+                            captured_exprs=captured_exprs,
+                            block_ids=block_ids,
+                            begin_exprs=["0"] * len(block_ids),
+                            iter_step_exprs=["1"] * len(block_ids),
+                            iteration_indices=["0"] * len(block_ids),
+                        )
+                        is None
+                    ):
+                        raise BackendUnsupported(
+                            "pallas",
+                            "bounded DMA stores require a prefix length that is "
+                            "unchanged by the device loop",
+                        )
+                if mask is not None and (
+                    state.config.get("pallas_loop_type") != "emit_pipeline"
+                    or prefix is None
+                    or prefix.valid_length is None
+                ):
+                    # A write-only stage cannot preserve the masked-out rows.
+                    # Only a bounded, aligned prefix consumes the store mask.
+                    raise BackendUnsupported(
+                        "pallas",
+                        "masked contiguous DMA stores require an aligned "
+                        "leading-row prefix in emit_pipeline",
+                    )
+            if region.is_read(fake) and region.is_written(fake):
                 # Output stages have no input prefill. Do not treat an in-place
                 # update as a write-only window and read uninitialized scratch.
                 raise BackendUnsupported(
                     "pallas",
-                    "emit_pipeline read/write contiguous windows require shared "
+                    "read/write contiguous windows require shared "
                     "input/output staging and are not supported",
                 )
         pipelined_ids.add(id(fake))
