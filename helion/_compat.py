@@ -756,8 +756,6 @@ def torch_uses_template_producer_fusion() -> bool:
 @functools.cache
 def supports_torch_compile_fusion() -> bool:
     """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
-    if torch.xpu.is_available():
-        return False
     if not requires_torch_version("2.11"):
         return False
     try:
