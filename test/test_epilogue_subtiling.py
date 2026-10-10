@@ -178,6 +178,132 @@ def atomic_add_prev_used(
     return prev, out
 
 
+@helion.kernel
+def matmul_col_scale_first(
+    x: torch.Tensor, y: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = scale[tile_n, :].T * acc
+    return out
+
+
+@helion.kernel
+def matmul_bias_first(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = bias[tile_n] + acc
+    return out
+
+
+@helion.kernel
+def matmul_transposed_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [n, m], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_n, tile_m] = acc.T
+    return out
+
+
+@helion.kernel
+def matmul_shifted_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros(
+        [m, n + 8], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n.index + 8] = acc * 2.0
+    return out
+
+
+@helion.kernel
+def matmul_int_prefix_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros(
+        [2, m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[1, tile_m, tile_n] = acc * 2.0
+    return out
+
+
+@helion.kernel
+def matmul_strided_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros(
+        [m, 2 * n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n.index * 2] = acc * 2.0
+    return out
+
+
+@helion.kernel
+def matmul_atomic_add_shifted(
+    x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        hl.atomic_add(out, [tile_m, tile_n.index + 8], acc * 2.0)
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def store_with_tile_indexer(
+    tensor_idx: torch.Tensor, data: torch.Tensor, k: int
+) -> torch.Tensor:
+    m, _ = data.size()
+    k = hl.specialize(k)
+    out = torch.zeros([m, m, k], device=data.device, dtype=data.dtype)
+    for tile_m in hl.tile(m, block_size=4):
+        val = hl.load(data, [tile_m, hl.arange(k, dtype=torch.int32)])
+        val_3d = val[:, None, :].expand(val.size(0), val.size(0), k)
+        hl.store(
+            out,
+            [tensor_idx[tile_m], tile_m.index, hl.arange(k, dtype=torch.int32)],
+            val_3d,
+        )
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 class TestEpilogueSubtiling(TestCase):
     @skipIfRefEager("test checks generated backend code")
@@ -409,6 +535,184 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(output[1], args[0] * 2.0)
         self.assertNotIn("tl.split", code)
         self.assertEqual(code.count("tl.atomic_add("), 1)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_split_store_dim_with_transposed_scale_first(self):
+        """``scale[tile_n, :].T * acc`` splits the store along N, not M."""
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+            torch.rand([192, 1], device=DEVICE, dtype=torch.float32) + 0.5,
+        )
+        code, output = code_and_output(
+            matmul_col_scale_first,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+        )
+        torch.testing.assert_close(
+            output, args[2].T * (args[0] @ args[1]), atol=1e-1, rtol=1e-2
+        )
+        _assert_split_codegen(self, code, 2)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_descriptor_store_with_transposed_scale_first(self):
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+            torch.rand([192, 1], device=DEVICE, dtype=torch.float32) + 0.5,
+        )
+        code, output = code_and_output(
+            matmul_col_scale_first,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+            indexing=["pointer", "pointer", "pointer", "tensor_descriptor"],
+        )
+        torch.testing.assert_close(
+            output, args[2].T * (args[0] @ args[1]), atol=1e-1, rtol=1e-2
+        )
+        _assert_descriptor_store_codegen(self, code, 2)
+        self.assertIn("_desc.store([offset_0, offset_1 + 0]", code)
+        self.assertIn("_desc.store([offset_0, offset_1 + _BLOCK_SIZE_1 // 2]", code)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_split_store_dim_with_bias_first_s4(self):
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+            torch.randn([192], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_bias_first,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=4,
+        )
+        torch.testing.assert_close(
+            output, args[2] + args[0] @ args[1], atol=1e-1, rtol=1e-2
+        )
+        _assert_split_codegen(self, code, 4)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_descriptor_store_transposed_output(self):
+        """out[tile_n, tile_m] = acc.T splits the N tile, now in store dim 0."""
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_transposed_out,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+            indexing=["pointer", "pointer", "tensor_descriptor"],
+        )
+        torch.testing.assert_close(output, (args[0] @ args[1]).T, atol=1e-1, rtol=1e-2)
+        _assert_descriptor_store_codegen(self, code, 2)
+        self.assertIn("_desc.store([offset_1 + 0, offset_0]", code)
+        self.assertIn("_desc.store([offset_1 + _BLOCK_SIZE_1 // 2, offset_0]", code)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_split_store_keeps_subscript_offset(self):
+        """The piece offset is added to an existing ``tile.index + 8`` offset."""
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_shifted_out,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+        )
+        expected = torch.zeros_like(output)
+        expected[:, 8:] = 2.0 * (args[0] @ args[1])
+        torch.testing.assert_close(output, expected, atol=1e-1, rtol=1e-2)
+        _assert_split_codegen(self, code, 2)
+        self.assertIn("(offset_1 + 8 + tl.arange(", code)
+        self.assertIn("(offset_1 + 8 + _BLOCK_SIZE_1 // 2 + tl.arange(", code)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_split_store_with_int_prefix(self):
+        """out[1, tile_m, tile_n]: the split tile sits at store dim 2, value dim 1."""
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_int_prefix_out,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+        )
+        expected = torch.zeros_like(output)
+        expected[1] = 2.0 * (args[0] @ args[1])
+        torch.testing.assert_close(output, expected, atol=1e-1, rtol=1e-2)
+        _assert_split_codegen(self, code, 2)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_atomic_add_split_keeps_subscript_offset(self):
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+            torch.zeros([128, 200], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_atomic_add_shifted,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+        )
+        expected = torch.zeros_like(output)
+        expected[:, 8:] = 2.0 * (args[0] @ args[1])
+        torch.testing.assert_close(output, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("tl.split", code)
+        self.assertEqual(code.count("tl.atomic_add("), 2)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_no_split_for_non_tile_store_index(self):
+        """out[tile_m, tile_n.index * 2] has no tile position to offset per piece."""
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([128, 192], device=DEVICE, dtype=torch.float32),
+        )
+        code, output = code_and_output(
+            matmul_strided_out,
+            args,
+            block_sizes=[32, 64, 64],
+            epilogue_subtile=2,
+        )
+        expected = torch.zeros_like(output)
+        expected[:, ::2] = 2.0 * (args[0] @ args[1])
+        torch.testing.assert_close(output, expected, atol=1e-1, rtol=1e-2)
+        _assert_no_split_codegen(self, code)
+
+    @onlyBackends("triton")
+    @skipIfRefEager("test checks generated backend code")
+    def test_no_split_when_tile_also_feeds_tensor_indexer(self):
+        """idx[tile_m] would keep the full tile while the value is split."""
+        args = (
+            torch.arange(8, device=DEVICE, dtype=torch.int32),
+            torch.randn([8, 16], device=DEVICE, dtype=torch.float32),
+            16,
+        )
+        _, expected = code_and_output(store_with_tile_indexer, args)
+        code, output = code_and_output(
+            store_with_tile_indexer, args, epilogue_subtile=4
+        )
+        torch.testing.assert_close(output, expected)
+        _assert_no_split_codegen(self, code)
 
     @skipIfXPU("epilogue_subtile_autotune check uses CUDA device properties")
     def test_autotune_field_enabled_for_large_k(self):
