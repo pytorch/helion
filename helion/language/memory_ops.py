@@ -1610,6 +1610,16 @@ def _cute_register_tile_unroll_vec_hoist(
         is_grid_state = bool(loops_for_block) and isinstance(
             loops_for_block[-1], DeviceGridState
         )
+        bound_expr = numel_expr
+        if not flat_multi and loops_for_block:
+            # The lane base is a coordinate: a tile that starts past zero
+            # (``hl.tile(begin, end)``) ends at ``begin + numel``.  A
+            # flattened multi-dim tile always starts at zero.
+            info = loops_for_block[-1].block_id_to_info[block_id]
+            if info.begin_expr is not None:
+                bound_expr = state.sympy_expr(sympy.Add(info.begin_expr, numel))
+            elif info.begin_var_name is not None:
+                bound_expr = f"({info.begin_var_name}) + ({numel_expr})"
         guard_terms: list[str] = []
         if uniform_mask is not None:
             # Outer-row / gathered-coordinate bounds the caller proved uniform
@@ -1623,7 +1633,7 @@ def _cute_register_tile_unroll_vec_hoist(
                 static_bs >= numel_int or (is_grid_state and numel_int % static_bs == 0)
             )
         ):
-            guard_terms.append(f"{base_index_var} < {numel_expr}")
+            guard_terms.append(f"{base_index_var} < {bound_expr}")
         if not guard_terms:
             # Single-trip tile loop whose block provably covers the extent
             # (the strategy elided the bounds mask): every per-thread vec
