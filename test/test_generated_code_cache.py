@@ -374,7 +374,7 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
 
     def test_opaque_dependency_keeps_frontend(self) -> None:
         kernel = helion.kernel(_cached_opaque.fn, generated_code_cache=True)
-        self.assertIsNone(cache.exact_input_key(kernel, (torch.ones(16),)))
+        self.assertIsNone(cache.binding_input_key(kernel, (torch.ones(16),)))
 
     def test_global_values_invalidate_frontend_identity(self) -> None:
         def bind():

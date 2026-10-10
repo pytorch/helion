@@ -77,10 +77,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 ### Core Compilation Settings
 
 `generated_code_cache=True` (or `HELION_GENERATED_CODE_CACHE=1`) enables the
-opt-in persistent source cache for selected Triton configs. Repeated exact input
-signatures can skip frontend compilation and source generation with explicit
-configs, custom config selectors or disabled autotuning. In-memory dynamic
-binding and autotuning keys keep their ordinary behavior. Native-source handoff
+opt-in persistent source cache for selected Triton configs. Inputs that an
+earlier process's binding would accept can skip frontend compilation and source
+generation with explicit configs, custom config selectors or disabled
+autotuning. In-memory dynamic binding and autotuning keys keep their ordinary
+behavior. Native-source handoff
 and PyTorch builds without Helion's `torch.compile` integration retain frontend
 compilation. Handoff uses the ordinary backend tuning path. Generated source and
 binding entries have a shared 1 GiB disk budget; override it with

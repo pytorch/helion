@@ -284,9 +284,9 @@ def build_handoff(
     The resulting bundle contains no BoundKernel or search object.
     """
     # Runtime imports avoid the kernel -> autotuner package import cycle.
+    from ..runtime.cached_kernel import _CachedBoundKernel
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import OutputCodeOptions
-    from ..runtime.kernel import _CachedBoundKernel
     from .base_cache import AutotuneCacheBase
 
     search = (

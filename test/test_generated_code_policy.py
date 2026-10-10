@@ -85,7 +85,7 @@ class TestGeneratedCodePolicy(RefEagerTestDisabled, TestCase):
         kernel.reset()
         with (
             patch(
-                "helion.runtime.kernel.load_compiled_kernel",
+                "helion.runtime.cached_kernel.load_binding_schema",
                 side_effect=AssertionError("adaptive tuning consulted a manifest"),
             ),
             patch.object(
@@ -128,7 +128,7 @@ class TestGeneratedCodePolicy(RefEagerTestDisabled, TestCase):
         self.assertIsNone(cache.compiled_kernel_cache_key(forced, (self.x,), signature))
         with (
             patch(
-                "helion.runtime.kernel.load_compiled_kernel",
+                "helion.runtime.cached_kernel.load_binding_schema",
                 side_effect=AssertionError("force autotune consulted a manifest"),
             ),
             patch.object(

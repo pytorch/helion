@@ -43,15 +43,19 @@ that source without running `KernelCompiler.compile` or source generation.
 Triton's binary cache remains independent; a source hit can still require
 Triton's first binary compilation.
 
-The disk lookup includes exact tensor shapes, strides, dtypes, devices,
-alignment and aliases, together with scalar values. It leaves in-memory
-specialization and autotuning keys unchanged: dynamic shapes still share
-ordinary bindings as they do with the cache disabled. A source hit creates a
-lightweight runner. Changing its input signature, selecting another config or
-requesting frontend IR creates an ordinary binding on demand. Subsequent calls
-use the specialization guards established by that frontend compilation.
-Function dependencies are fingerprinted during disk lookup, rather than on
-each kernel launch; cached runners check argument metadata before executing.
+The disk lookup uses the in-memory specialization key, so it distinguishes
+inputs exactly as ordinary bindings do: `static_shapes=False` buckets shapes,
+while `static_shapes=True` keys exact sizes and strides. The binding also saves
+the guards its frontend compilation recorded, such as `hl.specialize()` values
+and tensor descriptor layout classes. A later process evaluates those guards
+before compiling, so a dynamic-shape binding serves shapes that the earlier
+process never saw, as one binding does with the cache disabled. A new guard
+value, such as another `hl.specialize()` value, compiles normally and saves a
+new binding. Kernels with runtime input specializations keep no binding entry.
+A source hit creates a lightweight runner that eager dispatch caches like an
+ordinary binding. Selecting another config or requesting frontend IR creates
+an ordinary binding on demand. Function dependencies are fingerprinted during
+disk lookup, not on each kernel launch.
 
 Custom config selectors still run. Adaptive tuning with the default selector
 retains frontend compilation so that `LocalAutotuneCache` remains authoritative

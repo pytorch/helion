@@ -20,6 +20,10 @@ from typing import cast
 from filelock import FileLock
 from filelock import Timeout
 import torch
+from torch._dynamo.source import GetItemSource
+from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 
 from .._argument_device import _find_argument_device
 from .._compat import get_device_name
@@ -40,9 +44,21 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import Hashable
 
+    from torch._guards import Source
+
     from .kernel import BoundKernel
     from .kernel import Kernel
     from .settings import Settings
+
+    # Specialization key, serialized guards, their results, compiler seed
+    # results and the input fingerprint behind generated-code cache keys.
+    GeneratedCodeInputKey = tuple[
+        tuple[Hashable, ...],
+        tuple[list[object] | None, ...],
+        tuple[Hashable, ...],
+        tuple[Hashable, ...],
+        str,
+    ]
 
 log = logging.getLogger(__name__)
 _UNCACHEABLE = object()
@@ -193,22 +209,24 @@ def _compilation_settings_key(settings: Settings) -> object:
 
 
 def _argument_key(value: object) -> object:
+    """Fingerprint argument structure, not values that dynamic bindings share.
+
+    The in-memory specialization key owns shapes, strides and constexpr values.
+    Runtime scalars specialize only through the frontend's saved guards.
+    """
     if type(value) in (torch.Tensor, torch.nn.Parameter):
         tensor = cast("torch.Tensor", value)
         return (
             "tensor",
             str(tensor.dtype),
             str(tensor.device),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            tensor.storage_offset(),
-            tensor.data_ptr() % 16,
-            tensor.requires_grad,
-            tensor.is_inference(),
+            tensor.dim(),
             tuple(sorted(getattr(tensor, "_dynamo_static_indices", ()))),
         )
+    if type(value) in (int, float, bool):
+        return type(value).__name__
     if isinstance(value, ConstExpr):
-        return _argument_key(value.value)
+        return "constexpr", _dependency_key(value.value)
     if type(value) in (tuple, list, dict):
         items = (
             value.items()
@@ -226,8 +244,8 @@ def _argument_key(value: object) -> object:
     return _dependency_key(value)
 
 
-def exact_input_key(kernel: Kernel, args: Sequence[object]) -> Hashable | None:
-    """Fingerprint an exact disk lookup, never an in-memory dispatch key."""
+def binding_input_key(kernel: Kernel, args: Sequence[object]) -> str | None:
+    """Fingerprint the kernel's dependencies and the arguments' structure."""
     if (
         not kernel.settings.generated_code_cache
         or kernel.settings.backend != "triton"
@@ -242,8 +260,12 @@ def exact_input_key(kernel: Kernel, args: Sequence[object]) -> Hashable | None:
 
 
 def compiled_kernel_cache_key(
-    kernel: Kernel, args: Sequence[object], base_spec_key: tuple[Hashable, ...]
+    kernel: Kernel,
+    args: Sequence[object],
+    base_spec_key: tuple[Hashable, ...],
+    inputs: str | None = None,
 ) -> str | None:
+    """Identify a signature's saved bindings before the frontend runs."""
     if (
         kernel.settings.force_autotune
         or kernel.settings.autotune_handoff
@@ -262,7 +284,8 @@ def compiled_kernel_cache_key(
         # Adaptive tuning must consult LocalAutotuneCache. A source manifest is
         # not authoritative when the user deletes or replaces a tuning result.
         return None
-    inputs = exact_input_key(kernel, args)
+    if inputs is None:
+        inputs = binding_input_key(kernel, args)
     if inputs is None:
         return None
     settings = _compilation_settings_key(kernel.settings)
@@ -275,7 +298,7 @@ def compiled_kernel_cache_key(
         else str(device)
     )
     payload = (
-        "helion-bound-source-v1",
+        "helion-bound-source-v2",
         sys.version_info[:3],
         helion_key(),
         torch_key_wrapper(),
@@ -344,6 +367,132 @@ def save_compiled_kernel(
                 json.dumps(entry, sort_keys=True).encode("utf-8")
             ).hexdigest(),
         },
+    )
+
+
+def source_guard(source: Source, arguments: dict[str, int]) -> list[object] | None:
+    """Serialize an argument projection read by ``BoundKernel._specialize_extra``."""
+    if (
+        isinstance(source, TensorPropertySource)
+        and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
+        and source.idx is not None
+    ):
+        base = source_guard(source.base, arguments)
+        kind = "size" if source.prop == TensorProperty.SIZE else "stride"
+        return None if base is None else [kind, base, source.idx]
+    if (
+        isinstance(source, GetItemSource)
+        and isinstance(source.index, (int, str))
+        and not source.index_is_slice
+    ):
+        base = source_guard(source.base, arguments)
+        return None if base is None else ["item", base, source.index]
+    if isinstance(source, LocalSource) and source.local_name in arguments:
+        return ["arg", arguments[source.local_name]]
+    return None
+
+
+def _valid_guard(guard: object) -> bool:
+    match guard:
+        case ["arg", int()]:
+            return True
+        case ["item", base, int() | str()]:
+            return _valid_guard(base)
+        case ["size" | "stride", base, int()]:
+            return _valid_guard(base)
+        case ["td_layout", base, int(), int(), int() | None]:
+            return _valid_guard(base)
+        case ["td_alignment", base, bool()]:
+            return _valid_guard(base)
+    return False
+
+
+def _schema_path(key: str) -> Path:
+    return get_helion_cache_dir() / "generated_code" / "schemas" / f"{key}.json"
+
+
+def load_binding_schema(key: str) -> dict[str, list[object]] | None:
+    path = _schema_path(key)
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        schema = envelope["payload"]
+        checksum = hashlib.sha256(
+            json.dumps(schema, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if envelope["sha256"] != checksum:
+            raise ValueError("binding schema checksum mismatch")
+        if not all(_valid_guard(guard) for guard in schema["guards"]):
+            raise ValueError("invalid binding guard")
+        for fact in schema["compiler_seed_facts"]:
+            match fact:
+                case [
+                    "config_num_sm" | "device_num_sm" | "input_tensor_metadata",
+                    int(),
+                ]:
+                    pass
+                case _:
+                    raise ValueError("invalid compiler seed fact")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        log.warning("Ignoring binding schema cache entry %s: %s", path, error)
+        return None
+    return schema
+
+
+def binding_variant_key(
+    key: str,
+    schema: dict[str, list[object]],
+    extra_results: tuple[Hashable, ...],
+    compiler_seed_results: tuple[Hashable, ...],
+) -> str:
+    """Identify one binding by the guard results its frontend specialized on."""
+    payload = (
+        "helion-binding-variant-v1",
+        key,
+        json.dumps(schema, sort_keys=True),
+        extra_results,
+        compiler_seed_results,
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def save_binding(
+    bound: BoundKernel, config: Config, normalized: Config, source_key: str
+) -> None:
+    """Save a binding with the guards that select it before the frontend runs.
+
+    Kernels whose specialization includes a runtime input classifier have no
+    serializable guard and keep the ordinary frontend path.
+    """
+    key = bound._generated_code_artifact_key
+    input_key = bound._generated_code_input_key
+    if key is None or input_key is None or should_skip_cache():
+        return
+    _, guards, extra_results, compiler_seed_results, _ = input_key
+    if None in guards:
+        return
+    schema: dict[str, list[object]] = {
+        "guards": list(guards),
+        "compiler_seed_facts": [
+            [extractor.fact, extractor.reserved_sms]
+            for extractor in bound._compiler_seed_specialization_extractors
+        ],
+    }
+    _save_entry(
+        _schema_path(key),
+        {
+            "payload": schema,
+            "sha256": hashlib.sha256(
+                json.dumps(schema, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        },
+    )
+    save_compiled_kernel(
+        binding_variant_key(key, schema, extra_results, compiler_seed_results),
+        config,
+        normalized,
+        source_key,
     )
 
 
