@@ -10769,8 +10769,13 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     )
     score_store_setup = ""
     if score_store_needed:
-        score_store_setup = """    flash_score_st_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+        # The modified scores are written back chunk by chunk with the load
+        # partition's chunk index, so the store atom must repeat the same
+        # number of columns as the load atom (Rep16 -> eight 16-column chunks).
+        score_store_setup = f"""    flash_score_st_atom = cute.make_copy_atom(
+        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({
+            cfg.s_load_repetition
+        })), cutlass.Float32)
     flash_tiled_score_st0 = cute_tcgen05_flash.make_tmem_copy(flash_score_st_atom, tStS0)
     flash_tiled_score_st1 = cute_tcgen05_flash.make_tmem_copy(flash_score_st_atom, tStS1)
     flash_thr_score_st0 = flash_tiled_score_st0.get_slice(flash_local_tidx)
@@ -10855,7 +10860,9 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         stage_score_store_setup = ""
         if score_store_needed:
             stage_score_store_setup = f"""    flash_score_st_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({
+                cfg.s_load_repetition
+            })), cutlass.Float32)
     flash_tiled_score_st{stage} = cute_tcgen05_flash.make_tmem_copy(
         flash_score_st_atom, tStS{stage})
     flash_thr_score_st{stage} = flash_tiled_score_st{stage}.get_slice(

@@ -4757,6 +4757,85 @@ class TestCuteBackend(TestCase):
         expected = _attention_from_log2_scores(scores, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_alibi_rep16_score_store_matches_reference(self) -> None:
+        # Rep16 S-loads split the score tile into eight 16-column chunks and the
+        # modified scores are written back with the load chunk index, so the
+        # store-back atom must use the same repetition. A Rep32 store scattered
+        # the biased scores across the wrong TMEM columns (NaNs for ALiBi).
+        q, k, v = (
+            torch.randn(2, 2, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        slopes = torch.tensor([1.02, 0.72], dtype=torch.float32, device=DEVICE)
+        code, out = code_and_output(
+            cute_alibi_attention,
+            (q, k, v, slopes),
+            block_sizes=[1, 128, 128],
+            cute_flash_s_load_rep=16,
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("add_alibi_bias_t2r", code)
+        self.assertIn("fa4_disc_exp_convert_store_sload16_pair_pipe", code)
+        self.assertIn(
+            "flash_score_st_atom = cute.make_copy_atom("
+            "cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(16)), "
+            "cutlass.Float32)",
+            code,
+        )
+        self.assertNotIn(
+            "flash_score_st_atom = cute.make_copy_atom("
+            "cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), "
+            "cutlass.Float32)",
+            code,
+        )
+        self.assertFalse(torch.isnan(out).any().item())
+        row = torch.arange(256, device=DEVICE)[:, None]
+        col = torch.arange(256, device=DEVICE)[None, :]
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * (
+            math.log2(math.e) / math.sqrt(64)
+        )
+        scores = scores + (col - row) * slopes.view(1, 2, 1, 1)
+        scores = scores.masked_fill(row < col, -torch.inf)
+        expected = _attention_from_log2_scores(scores, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_relative_bias_rep16_stage_local_matches_reference(
+        self,
+    ) -> None:
+        # Non-causal modifiers take the stage-local softmax setup, the second
+        # emission site of the score store-back atom; cover it with Rep16 too.
+        q, k, v = (
+            torch.randn(1, 2, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_relative_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_s_load_rep=16,
+            cute_flash_softmax_setup="stage_local",
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("add_relative_bias_t2r", code)
+        self.assertIn("flash_tiled_ld_coord", code)
+        self.assertIn(
+            "flash_score_st_atom = cute.make_copy_atom("
+            "cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(16)), "
+            "cutlass.Float32)",
+            code,
+        )
+        self.assertNotIn("Repetition(32)), cutlass.Float32)", code)
+        self.assertFalse(torch.isnan(out).any().item())
+        row = torch.arange(256, device=DEVICE)[:, None]
+        col = torch.arange(256, device=DEVICE)[None, :]
+        scores = (
+            torch.matmul(q.float(), k.float().transpose(-1, -2))
+            * (math.log2(math.e) / math.sqrt(64))
+            + (row - col) * 0.01
+        )
+        expected = _attention_from_log2_scores(scores, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_declines_alibi_mod_divisor_mismatch(self) -> None:
         q, k, v = (
             torch.randn(2, 2, 256, 64, dtype=torch.float16, device=DEVICE)
