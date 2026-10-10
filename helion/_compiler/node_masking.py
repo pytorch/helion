@@ -469,12 +469,18 @@ def inductor_masked_value(
             input_ranges.append(ValueRanges(val, val))
         return n
 
+    from .inductor_lowering import FakeGraphLowering
+
     input_ranges: list[ValueRangesAny] = []
     map_arg((node.args, node.kwargs), visit)
-    with V.set_ops_handler(
-        MaskedValueAnalysisInductor(
-            dict(zip(lowering.input_names, input_ranges, strict=True)),
-        )
+    # Inductor loaders read V.graph (e.g. ReinterpretView checks V.graph.constants).
+    with (
+        V.set_graph_handler(FakeGraphLowering()),
+        V.set_ops_handler(
+            MaskedValueAnalysisInductor(
+                dict(zip(lowering.input_names, input_ranges, strict=True)),
+            )
+        ),
     ):
         result = call_inner_fn(lowering.buffer.data)
         if result.is_singleton():
