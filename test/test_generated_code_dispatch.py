@@ -237,8 +237,13 @@ class TestGeneratedCodeDispatch(TestCase):
         self.assertIn("config_spec requires the Helion frontend", logs.output[0])
 
     def test_source_key_ignores_shapes_within_dynamic_bucket(self) -> None:
+        # Compiler seed heuristics (``triton_pointwise`` fires wherever the
+        # device reports an SM count, including Pallas interpret mode) size
+        # their seeds from the first binding's layout and size hints, and seeds
+        # enter the config-spec fingerprint as they do for the autotune cache.
+        # Disable them so the key reflects only the frontend's specialization.
         def key(x: torch.Tensor) -> str | None:
-            bound = self._kernel().bind((x, 2.0))
+            bound = self._kernel(disable_autotuner_heuristics=True).bind((x, 2.0))
             return cache.generated_code_cache_key(
                 bound, bound._normalized_config_copy(_CONFIG)
             )
@@ -258,12 +263,15 @@ class TestGeneratedCodeDispatchCUDA(TestCase):
         self._test_stack.enter_context(
             patch.dict(os.environ, {"HELION_CACHE_DIR": root, "HELION_SKIP_CACHE": "0"})
         )
-        # A custom selector keeps every descriptor guard active, so each
-        # power-of-two row class is its own binding, as without the cache.
+        # A custom selector keeps every descriptor guard active, so where the
+        # hardware emits them each power-of-two row class is its own binding,
+        # as without the cache; elsewhere one dynamic binding serves every m.
         kernel = _dynamic_2d_kernel()
         for m in (4, 16):
             x = torch.randn(m, 64, device=torch.device("cuda"))
             torch.testing.assert_close(kernel(x), x + 1)
+        bindings = len(kernel._bound_kernels)
+        self.assertIn(bindings, (1, 2))
         code = """
 import importlib.util
 import sys
@@ -276,14 +284,15 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 kernel = module._dynamic_2d_kernel()
 with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("frontend ran")):
-    # Unseen row counts within the saved descriptor extent classes.
+    # Unseen row counts within the row classes the cold process saved.
     for m in (5, 7, 17, 31):
         x = torch.randn(m, 64, device=torch.device("cuda"))
         torch.testing.assert_close(kernel(x), x + 1)
         torch.testing.assert_close(kernel(x), x + 1)
         assert kernel._prepared_call is not None
         assert isinstance(kernel._prepared_call.bound, module._CachedBoundKernel)
-assert len(kernel._bound_kernels) == 2
+# The saved bindings cover the same row classes as the cold process.
+assert len(kernel._bound_kernels) == int(sys.argv[3]), kernel._bound_kernels
 bound = kernel.bind((x,))
 torch.testing.assert_close(bound(x), x + 1)
 with patch.object(module.Kernel, "_bind", side_effect=AssertionError("bind")):
@@ -291,7 +300,14 @@ with patch.object(module.Kernel, "_bind", side_effect=AssertionError("bind")):
     torch.testing.assert_close(bound(x), x + 1)
 """
         subprocess.run(
-            [sys.executable, "-c", code, __file__, _add_one_2d.__module__],
+            [
+                sys.executable,
+                "-c",
+                code,
+                __file__,
+                _add_one_2d.__module__,
+                str(bindings),
+            ],
             check=True,
             timeout=60,
         )
