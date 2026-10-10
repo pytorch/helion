@@ -122,6 +122,9 @@ def test_concatenate_separates_grid_and_full_slice_thread_axes(
     # This candidate used to put the row and the second input's full slice
     # on the same axis. The serial first slice must not reserve a thread axis.
     code = bound.to_code(_concatenate_parallel_config(proven_bounds))
+    # The single-thread slice claims no axis (``_claims_thread_axis``), so the
+    # eight-thread full slice owns axis 0 and the 128-row tile axis 1.
+    assert "block=(8, 128, 1)" in code
     assert (
         "offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])"
         in code
