@@ -366,6 +366,22 @@ class ReductionStrategy(TileStrategy):
         """Return threads used for this reduction on thread-aware backends."""
         return 0
 
+    def use_shared_thread_extent(self, extent: int) -> None:
+        """Spread the reduction over ``extent`` threads of its launch axis.
+
+        See ``TileStrategyDispatch._normalize_shared_reduction_thread_extents``.
+        """
+        raise self._shared_thread_extent_error(extent)
+
+    def _shared_thread_extent_error(self, extent: int) -> exc.BackendUnsupported:
+        return exc.BackendUnsupported(
+            CompileEnvironment.current().backend_name,
+            f"reduction block {self.block_index} spans "
+            f"{self._reduction_thread_count()} lanes but its launch axis has "
+            f"{extent} threads; the surplus lanes would corrupt the cross-lane "
+            "reduction",
+        )
+
     def _claims_thread_axis(self) -> bool:
         """Whether this reduction owns a launch thread axis.
 
@@ -1455,6 +1471,21 @@ class PersistentReductionStrategy(ReductionStrategy):
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
+
+    def use_shared_thread_extent(self, extent: int) -> None:
+        if self._synthetic_cute_lane_var is not None or (
+            extent > _CUTE_WARP_REDUCTION_THREADS
+            and _block_has_indexed_reduction(self.fn, self.block_index)
+        ):
+            # The lane loop strides by the thread count, so the surplus
+            # threads would alias the elements of later lanes; argmin/argmax
+            # combine within one warp only (see ``__init__``).
+            raise self._shared_thread_extent_error(extent)
+        # One thread per element: the extent mask also drops the surplus
+        # threads, which then hold the identity through the widened combine.
+        self._thread_count = extent
+        if self._mask_var is None:
+            self._mask_var = self.fn.new_var(f"mask_{self.block_index}", dce=True)
 
     def cute_tile_base_expr(self, block_id: int) -> str | None:
         """The persistent axis covers its whole extent: the tile base is 0."""
