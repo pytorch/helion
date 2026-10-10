@@ -16,6 +16,7 @@ from ...language import _decorators
 from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
+from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from . import codegen as pallas_codegen
 
@@ -37,6 +38,7 @@ def _(state: CodegenState) -> None:
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
+    unclamped_value = value
     assert isinstance(tensor, torch.Tensor)
     arg_name = state.device_function.tensor_arg(tensor).name
     name = state.device_function.pallas_tensor_ref_name(tensor)
@@ -69,6 +71,34 @@ def _(state: CodegenState) -> None:
     is_scatter = isinstance(plan, OneHotScatterPlan)
     if is_scatter:
         value = emit_scatter_store(state, plan.plan, name, idx_str, value)
+    elif state.proxy_arg(3) is not None:
+        from ..tile_strategy import EmitPipelineLoopState
+
+        loop, _ = pallas_codegen._find_dma_scratch_loop(state, arg_name)
+        if loop is not None:
+            if (
+                not isinstance(loop, EmitPipelineLoopState)
+                or state.fx_node not in loop._bounded_store_masks
+            ):
+                raise exc.BackendUnsupported(
+                    "pallas", "masked DMA stores require an aligned bounded prefix"
+                )
+            # The prefix DMA already consumes this mask. Its untouched output
+            # stage must not be read to apply the same mask a second time.
+        else:
+            mask = expr_from_string(
+                "jnp.broadcast_to({mask}, jnp.shape({value}))",
+                mask=state.ast_arg(3),
+                value=unclamped_value,
+            )
+            mask = pallas_codegen.sliced_value_for_store(
+                state, tensor, subscript, parts, mask
+            )
+            value = expr_from_string(
+                f"jnp.where({{mask}}, {{value}}, {name}[{idx_str}])",
+                mask=mask,
+                value=value,
+            )
     from .ordered_carry import emit_carry_store
 
     if not is_scatter and state.device_function.carry_tiles:
@@ -96,7 +126,18 @@ def _(state: CodegenState) -> ast.AST:
     if tile_index_result is not None:
         return tile_index_result
 
-    return pallas_codegen.load_expr(state, list(subscript), tensor)
+    result = pallas_codegen.load_expr(state, list(subscript), tensor)
+    if state.proxy_arg(2) is not None:
+        mask = state.ast_arg(2)
+        # A bounded DMA may leave the padded part of its VMEM stage untouched.
+        # The load API still promises zero for every masked-out element.
+        expression = (
+            "jnp.logical_and({mask}, {result})"
+            if tensor.dtype is torch.bool
+            else "jnp.where({mask}, {result}, 0)"
+        )
+        result = expr_from_string(expression, mask=mask, result=result)
+    return result
 
 
 def _codegen_resident_load(state: CodegenState) -> ast.AST:

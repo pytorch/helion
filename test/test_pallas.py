@@ -1077,6 +1077,42 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_masked_store_clamps_with_value(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_positive(x: torch.Tensor) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for rows, columns in hl.tile(x.shape):
+                values = x[rows, columns]
+                hl.store(out, [rows, columns], values, extra_mask=values > 0)
+            return out
+
+        for shape in ((5, 65), (8, 128), (17, 241)):
+            x = torch.randn(shape, device=DEVICE, dtype=torch.float32)
+            _, result = code_and_output(copy_positive, (x,), block_sizes=[16, 128])
+            expected = torch.where(x.cpu() > 0, x.cpu(), -17)
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_masked_store_broadcast_masks_on_tail(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_masked(
+            x: torch.Tensor, valid: torch.Tensor, scalar: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for rows in hl.tile(x.size(0), block_size=128):
+                values = x[rows, :]
+                mask = valid[0] != 0 if scalar else hl.arange(128) < 64
+                hl.store(out, [rows, slice(None)], values, extra_mask=mask)
+            return out
+
+        x = torch.randn(93, 128, device=DEVICE)
+        for scalar in (False, True):
+            for active in (0, 1):
+                valid = torch.tensor([active], device=DEVICE, dtype=torch.int32)
+                _, result = code_and_output(copy_masked, (x, valid, scalar))
+                mask = active != 0 if scalar else torch.arange(128) < 64
+                expected = torch.where(torch.as_tensor(mask), x.cpu(), -17)
+                torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
     def test_emit_pipeline_nested_loop_without_dma(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def repeat_tiles(x: torch.Tensor) -> torch.Tensor:
@@ -1150,6 +1186,109 @@ class TestPallas(TestCase):
         expected[:, :, :128] = x.cpu()
         for loop_type in ("fori_loop", "unroll", "emit_pipeline"):
             _, result = code_and_output(copy_slice, (x,), pallas_loop_type=loop_type)
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_masked_load_with_new_axis(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_with_new_axis(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((1, *x.shape), dtype=x.dtype, device=x.device)
+            for rows in hl.tile(x.size(0), block_size=128):
+                out[:, rows, :] = hl.load(
+                    x,
+                    [None, rows, slice(None)],
+                    extra_mask=hl.full((), True, dtype=torch.bool),
+                )
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        _, result = code_and_output(copy_with_new_axis, (x,))
+        torch.testing.assert_close(result.cpu(), x.cpu()[None], rtol=0, atol=0)
+
+    def test_masked_scalar_selection_with_new_axis(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_with_new_axis(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((1, x.size(1)), dtype=x.dtype, device=x.device)
+            for columns in hl.tile(x.size(1), block_size=128):
+                out[:, columns] = hl.load(
+                    x,
+                    [None, index[0], columns],
+                    extra_mask=hl.full((), True, dtype=torch.bool),
+                )
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE)
+        for selected in (-1, 0, 7, 8):
+            index = torch.tensor([selected], device=DEVICE, dtype=torch.int32)
+            _, result = code_and_output(select_with_new_axis, (x, index))
+            expected = (
+                x.cpu()[selected][None] if 0 <= selected < 8 else torch.zeros(1, 128)
+            )
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_masked_scalar_arguments(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_scalar(
+            x: torch.Tensor, scalar: torch.Tensor, valid: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for rows in hl.tile(x.size(0), block_size=128):
+                value = hl.load(scalar, [], extra_mask=valid[0] != 0)
+                out[rows, :] = x[rows, :] + value.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        for dtype in (torch.float32, torch.int32, torch.bool):
+            scalar = torch.tensor(3, device=DEVICE, dtype=dtype)
+            for active in (0, 1):
+                valid = torch.tensor([active], device=DEVICE, dtype=torch.int32)
+                _, result = code_and_output(add_scalar, (x, scalar, valid))
+                expected = x.cpu() + (scalar.cpu().float() if active else 0)
+                torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_masked_scalar_tensor_indices(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_scalars(
+            values: torch.Tensor, positions: torch.Tensor, valid: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty(
+                (positions.numel(), 128), dtype=values.dtype, device=values.device
+            )
+            for _program in hl.grid(1):
+                for row in hl.grid(positions.numel()):
+                    value = hl.load(
+                        values, [positions[row]], extra_mask=valid[row] != 0
+                    )
+                    out[row, :] = hl.full([128], value, dtype=values.dtype)
+            return out
+
+        positions = torch.tensor([0, -1, 4, 1], device=DEVICE, dtype=torch.int32)
+        valid = torch.tensor([1, 1, 1, 0], device=DEVICE, dtype=torch.int32)
+        for dtype in (torch.int32, torch.float32):
+            values = torch.tensor([7, 12, -4, 3], device=DEVICE, dtype=dtype)
+            _, result = code_and_output(
+                copy_scalars, (values, positions, valid), pallas_loop_type="fori_loop"
+            )
+            expected = torch.tensor([7, 0, 0, 0], dtype=dtype)[:, None].expand(4, 128)
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_masked_tile_load_zeroes_other_rows(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def masked_copy(x: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for rows in hl.tile(x.size(0), block_size=128):
+                coordinates = hl.arange(128).unsqueeze(1).expand(128, x.size(1))
+                values = hl.load(
+                    x, [rows, slice(None)], extra_mask=coordinates < length[0]
+                )
+                out[rows, :] = values
+            return out
+
+        length = torch.tensor([93], dtype=torch.int32, device=DEVICE)
+        for dtype in (torch.float32, torch.bfloat16, torch.int32, torch.bool):
+            x = torch.ones(128, 128, dtype=dtype, device=DEVICE)
+            _, result = code_and_output(masked_copy, (x, length))
+            expected = x.cpu()
+            expected[93:] = 0
             torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
     def test_nested_static_value_slices(self) -> None:

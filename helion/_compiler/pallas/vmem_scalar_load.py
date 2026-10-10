@@ -23,8 +23,48 @@ from helion._compiler.ast_extension import expr_from_string
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Sequence
 
     from helion._compiler.inductor_lowering import CodegenState
+
+
+def scalar_load_bounds(
+    state: CodegenState,
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    parts: list[str],
+) -> tuple[list[str], str | None]:
+    """Clamp masked scalar tensor indices and retain their logical bounds.
+
+    This is shared by ordinary loads and pipeline address reconstruction.
+    Integer/symbolic indices retain normal Ref indexing; tensor indices in a
+    masked load follow ``hl.load``'s clamped-read, zero-outside-bounds semantics.
+    """
+    result = node.meta.get("val")
+    if (
+        not subscript
+        or not isinstance(result, torch.Tensor)
+        or len(node.args) < 3
+        or node.args[2] is None
+    ):
+        return parts, None
+    bounded = list(parts)
+    masks = []
+    # Rank-expanding None indices consume neither a tensor dim nor a Ref index.
+    tensor_indices = [index for index in subscript if index is not None]
+    for dim, (index, expression) in enumerate(zip(tensor_indices, parts, strict=True)):
+        if isinstance(index, torch.fx.Node):
+            index = index.meta.get("val")
+        if (
+            isinstance(index, torch.Tensor)
+            and index.ndim == 0
+            and index.dtype in (torch.int32, torch.int64)
+        ):
+            size = state.device_function.literal_expr(tensor.shape[dim])
+            bounded[dim] = f"jnp.clip({expression}, 0, ({size}) - 1)"
+            masks.append(f"(({expression}) >= 0) & (({expression}) < ({size}))")
+    return bounded, " & ".join(f"({mask})" for mask in masks) if masks else None
 
 
 @dataclass(frozen=True)

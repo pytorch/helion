@@ -804,8 +804,13 @@ def _one_hot_gather(
 def _one_hot_scatter(
     access: MemoryAccess, positions: list[int], _config: Config
 ) -> OneHotScatterPlan:
+    from ... import exc
     from .gather import build_scatter_plan
 
+    if len(access.node.args) > 3 and access.node.args[3] is not None:
+        raise exc.BackendUnsupported(
+            "pallas", "masked tensor-indexed stores require an aligned bounded prefix"
+        )
     plan = build_scatter_plan(
         access.tensor,
         list(access.subscript),

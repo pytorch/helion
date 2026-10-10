@@ -7034,6 +7034,9 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     _deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, tuple[str, ...]]] = (
         dataclasses.field(default_factory=dict)
     )
+    _bounded_store_masks: frozenset[torch.fx.Node] = dataclasses.field(
+        default_factory=frozenset
+    )
     # Clean-region branches prove these physical bounds all-true for this tile.
     _proven_physical_mask_block_ids: set[int] = dataclasses.field(default_factory=set)
 

@@ -105,6 +105,11 @@ def load_expr(
         indexing_patterns=patterns,
         tensor_name=arg_name,
     )
+    from .vmem_scalar_load import scalar_load_bounds
+
+    parts, scalar_bounds = scalar_load_bounds(
+        state, state.fx_node, tensor, subscript, parts
+    )
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
     if scalar_load is None:
         result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
@@ -112,6 +117,12 @@ def load_expr(
     else:
         result = emit_vmem_scalar_load(tensor, active_name, parts, scalar_load)
     mask_expr = _load_mask_expr(state, subscript, tensor)
+    if scalar_bounds is not None:
+        result = expr_from_string(
+            "jnp.where({bounds}, {value}, 0)",
+            bounds=expr_from_string(scalar_bounds),
+            value=result,
+        )
     if mask_expr is not None:
         result = expr_from_string(
             "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
@@ -151,6 +162,11 @@ def _hbm_load_expr(
         pipeline_scalar_indices_local=False,
         raw_hbm_ref=True,
     )
+    from .vmem_scalar_load import scalar_load_bounds
+
+    parts, scalar_bounds = scalar_load_bounds(
+        state, state.fx_node, tensor, subscript, parts
+    )
     scratch_shape = list(value.shape)
     for dim in reversed(none_dims):
         scratch_shape.pop(dim)
@@ -182,6 +198,12 @@ def _hbm_load_expr(
         state.codegen.add_statement(statement)
 
     result = expr_from_string(f"{resources.scratch}[...]")
+    if scalar_bounds is not None:
+        result = expr_from_string(
+            "jnp.where({bounds}, {value}, 0)",
+            bounds=expr_from_string(scalar_bounds),
+            value=result,
+        )
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(
@@ -627,6 +649,14 @@ def index_parts(
     ``jnp.expand_dims`` after loading.
     """
     if not subscript:
+        if (
+            tensor.ndim == 0
+            and state.device_function.pallas_internal_scratch_name(tensor) is None
+            and _host_tensor_arg_name(state, tensor) is not None
+        ):
+            # The launcher wraps scalar tensor arguments as one-element Refs.
+            # Device-local scalar scratch keeps its original rank-zero shape.
+            return ["0"], []
         return ["..."], []
 
     # Check if we're inside an emit_pipeline or fori_loop that pipelines
