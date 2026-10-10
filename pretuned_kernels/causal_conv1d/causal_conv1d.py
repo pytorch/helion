@@ -44,7 +44,7 @@ def _causal_conv1d_decode_kernel(
     assert kernel_size == 4
 
     out = torch.empty_like(x)
-    for _ in hl.grid(1):
+    with hl.device_scope():
         for tile_tokens in hl.tile(tokens):
             indices = hl.load(state_indices, [tile_tokens])
             selected = hl.load(

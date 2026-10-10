@@ -84,6 +84,28 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 
 `barrier()` inserts a grid-wide synchronization point between top-level `hl.tile` or `hl.grid` loops. It forces persistent kernel execution so that all blocks complete one phase before the next begins.
 
+### device_scope()
+
+```{eval-rst}
+.. autofunction:: device_scope
+```
+
+`with hl.device_scope():` runs its body as device code inside a single program. It is rewritten into a one-program `hl.grid(1)` loop before compilation, which lets a kernel contain whole-tensor device operations (``x[:, :]`` subscripts, `hl.arange`, ...) between top-level `hl.tile`/`hl.grid` loops:
+
+```python
+for tile_m in hl.tile(m_size):
+    ...  # first root
+
+with hl.device_scope():
+    scores = torch.sigmoid(logits[:, :])  # whole-tensor device ops, run once
+    ids[:, :] = scores.argmax(dim=-1)
+
+for tile_n in hl.tile(n_size):
+    ...  # later root, scheduled after the scope's stores
+```
+
+Wrapping the whole kernel body instead forces single-program execution, which serializes loops that have gather/scatter hazards on shared buffers. In ref eager mode the body simply runs eagerly.
+
 ## Memory Operations
 
 ### load()

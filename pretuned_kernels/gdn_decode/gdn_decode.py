@@ -57,7 +57,7 @@ def gdn_decode(
     assert a_log.size() == (heads, key_dim)
     assert dt_bias.size() == (heads, key_dim)
     out = torch.empty_like(v)
-    for _ in hl.grid(1):
+    with hl.device_scope():
         for tile_tokens in hl.tile(tokens):
             indices = hl.load(state_indices, [tile_tokens])
             gathered_state = hl.load(

@@ -314,6 +314,11 @@ def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "metal", reason)
 
 
+def xfailIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with metal"""
+    return xfailIfFn(lambda: _get_backend() == "metal", reason)
+
+
 def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with pallas"""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.

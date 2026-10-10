@@ -144,6 +144,10 @@ class NestedGridLoop(BaseError):
     message = "Grid loops must be at the top level of a function."
 
 
+class DeviceScopeInvalidUsage(BaseError):
+    message = "Invalid use of hl.device_scope(): {0}"
+
+
 class RankMismatch(BaseError):
     message = "Expected ndim={expected_ndim}, but got ndim={actual_ndim}{shape_part}. You have {direction}."
 
