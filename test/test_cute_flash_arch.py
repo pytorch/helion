@@ -30,6 +30,41 @@ if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
 
 
+def test_resident_causal_seed_template_is_head_dim_agnostic() -> None:
+    """RESIDENT_V1 must not inherit DEGREE2_V1's FP16/hd64 restriction.
+
+    DEGREE2_V1 pins the degree-2 compound exp2 packet, which only exists at
+    FP16/hd64. The resident lowering rewrites exp2_packet to "1x1" anyway, so a
+    resident seed carries no such restriction and may be registered for other
+    workloads (e.g. head_dim=128).
+    """
+    resident = FlashCausalTuningPolicy(
+        num_kv=512,
+        kv_stage=3,
+        seed_template=FlashCausalSeedTemplate.RESIDENT_V1,
+        softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+    )
+    assert not resident.requires_fp16_hd64
+
+    degree2 = FlashCausalTuningPolicy(num_kv=512, kv_stage=3)
+    assert degree2.seed_template is FlashCausalSeedTemplate.DEGREE2_V1
+    assert degree2.requires_fp16_hd64
+
+    # A resident seed template without a resident lowering is contradictory.
+    with pytest.raises(ValueError, match="resident causal seed template"):
+        FlashCausalTuningPolicy(
+            num_kv=512,
+            kv_stage=3,
+            seed_template=FlashCausalSeedTemplate.RESIDENT_V1,
+            softmax_lowering=FlashSoftmaxLowering.STANDARD,
+        )
+
+    # The resident template must not emit the hd64-only compound exp2 packet.
+    overrides = cute_flash._flash_causal_tuning_overrides(resident)
+    assert cute_flash.FLASH_EXP2_PACKET_KEY not in overrides
+    assert overrides[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+
+
 def test_sm103_flash_target_policy() -> None:
     target_policy = get_flash_target_policy((10, 3))
     capabilities = target_policy.hardware
@@ -46,12 +81,29 @@ def test_sm103_flash_target_policy() -> None:
         )
         is not None
     )
+    # head_dim=128 FP16 now carries causal resident-softmax seeds, so it
+    # resolves a policy identity like head_dim=64 does.
     assert (
         flash_target_policy_cache_identity(
             (10, 3), head_dim=128, torch_dtype="float16", num_kv=256
         )
-        is None
+        is not None
     )
+    hd128_tuning = target_policy.tuning_for_cute(128, "cutlass.Float16")
+    assert hd128_tuning is not None
+    assert hd128_tuning.workload == FlashTuningWorkload(
+        head_dim=128, dtype=FlashTuningDType.FLOAT16
+    )
+    assert hd128_tuning.dense_policies == ()
+    hd128_causal = hd128_tuning.causal_policy(512)
+    assert hd128_causal is not None
+    assert hd128_causal.seed_template is FlashCausalSeedTemplate.RESIDENT_V1
+    assert (
+        hd128_causal.softmax_lowering
+        is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+    )
+    # The resident template must not carry the FP16/hd64-only restriction.
+    assert not hd128_causal.requires_fp16_hd64
     assert (
         flash_target_policy_cache_identity(
             (10, 3), head_dim=64, torch_dtype="bfloat16", num_kv=256
