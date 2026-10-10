@@ -1105,6 +1105,35 @@ class TestPallas(TestCase):
                 expected = x.cpu() + (scalar.cpu().float() if active else 0)
                 torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
+    def test_scalar_metadata_beside_matmul(self) -> None:
+        """Tensor epilogue analysis must also allow scalar metadata stores."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def matmul_with_metadata(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            metadata = torch.empty(4, dtype=torch.int32, device=x.device)
+            out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+            for _program in hl.grid(1):
+                for index in hl.grid(4):
+                    metadata[index] = index
+                for row, column in hl.tile(out.shape):
+                    out[row, column] = (
+                        hl.dot(x[row, :], weight[:, column], out_dtype=torch.float32)
+                        + metadata[3]
+                    )
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        _, result = code_and_output(
+            matmul_with_metadata,
+            (x, weight),
+            block_sizes=[128, 128],
+            pallas_loop_type="fori_loop",
+            pallas_internal_scratch=True,
+        )
+        expected = x.cpu().float() @ weight.cpu().float() + 3
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
     def test_private_scalar_scan(self) -> None:
         """A private scalar table may pass results between two device loops."""
 
