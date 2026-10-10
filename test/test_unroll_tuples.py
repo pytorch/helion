@@ -1061,5 +1061,46 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         )
 
 
+class TestEmptyStaticSequences(RefEagerTestBase, TestCase):
+    """Empty-loop inference also runs on Pallas, unlike the tuple tests above."""
+
+    def test_empty_static_sequences(self) -> None:
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_with_empty_loops(x: torch.Tensor, iterations: int) -> torch.Tensor:
+            iterations = hl.specialize(iterations)
+            out = torch.empty_like(x)
+            for rows in hl.tile(x.size(0), block_size=128):
+                values = x[rows, :]
+                for _unused in hl.static_range(iterations):
+                    values = values + 100
+                for _unused in ():
+                    values = values - 200
+                out[rows, :] = values
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        _, result = code_and_output(copy_with_empty_loops, (x, 0))
+        torch.testing.assert_close(result.cpu(), x.cpu(), rtol=0, atol=0)
+
+    def test_empty_loop_else_preserves_target(self) -> None:
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def add_after_empty_loop(x: torch.Tensor, iterations: int) -> torch.Tensor:
+            iterations = hl.specialize(iterations)
+            out = torch.empty_like(x)
+            for rows in hl.tile(x.size(0), block_size=128):
+                values = x[rows, :]
+                target = 3
+                for target in hl.static_range(iterations):
+                    values += target + 100
+                else:
+                    values += target
+                out[rows, :] = values
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        _, result = code_and_output(add_after_empty_loop, (x, 0))
+        torch.testing.assert_close(result.cpu(), x.cpu() + 3, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

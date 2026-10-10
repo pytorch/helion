@@ -1073,6 +1073,15 @@ class TypePropagation(ast.NodeVisitor):
         parent_scope = self.scope
         self.push_scope()
         iter_type = self.visit(node.iter)
+        if isinstance(iter_type, SequenceType) and not iter_type.element_types:
+            # A known empty sequence never evaluates its target or body.
+            assert isinstance(node, ExtendedAST)
+            node._loop_type = (
+                LoopType.HOST if self.device_loop_depth == 0 else LoopType.DEVICE
+            )
+            self.scope.overwrite(self._body(node.orelse))
+            self.pop_scope_merge()
+            return NoType(origin=self.origin())
         self._assign(node.target, iter_type.propagate_iter(self.origin()))
         device_loop = (
             isinstance(call_node := node.iter, ast.Call)

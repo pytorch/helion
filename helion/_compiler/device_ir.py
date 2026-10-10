@@ -2318,9 +2318,14 @@ class WalkDeviceAST(NodeVisitor):
 
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
-        assert not node.orelse
         assert isinstance(node.iter, ExtendedAST)
         iter_type = node.iter._type_info
+
+        if isinstance(iter_type, SequenceType) and not iter_type.element_types:
+            self._handle_tuple_unrolling(node)
+            self._body(node.orelse)
+            return
+        assert not node.orelse
 
         # Check if we're iterating directly over a sequence (tuple unrolling)
         if isinstance(iter_type, SequenceType):
