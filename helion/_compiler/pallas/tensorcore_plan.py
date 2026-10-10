@@ -590,10 +590,15 @@ def indirect_access_modes(device_ir: DeviceIR) -> tuple[str, ...]:
     from ..device_ir import ForLoopGraphInfo
     from .gather import one_hot_access_may_fit_vmem
     from .gather import one_hot_access_supported
+    from .memory_effects import plan_memory_regions
+    from .plan_tiling import _collect_control_flow_parent_ids
     from .plan_tiling import build_pallas_memory_access
     from .view_ops import indirect_loads_requiring_resident_refs
 
     indirect_accesses: dict[torch.fx.Node, MemoryAccess] = {}
+    plan_memory_regions(
+        device_ir.graphs, _collect_control_flow_parent_ids(device_ir.graphs)
+    )
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or node.target not in (

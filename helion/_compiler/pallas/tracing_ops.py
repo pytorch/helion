@@ -1288,24 +1288,25 @@ def _get_dim_block_ids(
 
 
 def _contiguous_range_patterns(
-    loaded_tensors: LoopTensors,
+    *tensor_groups: LoopTensors,
 ) -> dict[int, dict[int, ContiguousRangeIndexPattern]]:
     """Return direct HBM range patterns keyed by tensor and tensor dimension."""
     from .plan_tiling import ContiguousRangeIndexPattern
     from .plan_tiling import NonePattern
 
     result: dict[int, dict[int, ContiguousRangeIndexPattern]] = {}
-    for fake, load_node, _subscript in loaded_tensors.values():
-        tensor_dim = 0
-        ranges: dict[int, ContiguousRangeIndexPattern] = {}
-        for pattern in load_node.meta.get("indexing_patterns", ()):
-            if isinstance(pattern, NonePattern):
-                continue
-            if isinstance(pattern, ContiguousRangeIndexPattern):
-                ranges[tensor_dim] = pattern
-            tensor_dim += 1
-        if ranges:
-            result[id(fake)] = ranges
+    for tensors in tensor_groups:
+        for fake, access_node, _subscript in tensors.values():
+            tensor_dim = 0
+            ranges: dict[int, ContiguousRangeIndexPattern] = {}
+            for pattern in access_node.meta.get("indexing_patterns", ()):
+                if isinstance(pattern, NonePattern):
+                    continue
+                if isinstance(pattern, ContiguousRangeIndexPattern):
+                    ranges[tensor_dim] = pattern
+                tensor_dim += 1
+            if ranges:
+                result.setdefault(id(fake), {}).update(ranges)
     return result
 
 
@@ -1313,6 +1314,7 @@ def _contiguous_range_base_expr(
     value: object,
     *,
     state: CodegenState,
+    captured_exprs: dict[torch.fx.Node, str],
     block_ids: list[int],
     begin_exprs: Sequence[str],
     iter_step_exprs: Sequence[str],
@@ -1322,7 +1324,7 @@ def _contiguous_range_base_expr(
     return _scalar_address_expr(
         value,
         state=state,
-        captured_exprs={},
+        captured_exprs=captured_exprs,
         block_ids=block_ids,
         begin_exprs=begin_exprs,
         iter_step_exprs=iter_step_exprs,
@@ -3603,6 +3605,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             index_value = index_node.meta.get("val")
             if isinstance(index_value, torch.Tensor) and index_value.ndim == 0:
                 scalar_index_nodes[id(index_value)] = index_node
+    contiguous_ranges = _contiguous_range_patterns(
+        loop_window.loaded, loop_window.stored
+    )
 
     # A pipeline stage can move several adjacent logical tiles in one DMA.
     # The body still computes one original tile at a time from that larger
@@ -3705,7 +3710,38 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
+            range_pattern = contiguous_ranges.get(id(fake), {}).get(dim_idx)
+            if range_pattern is not None:
+                if group_size > 1:
+                    raise InvalidConfig(
+                        "grouped emit_pipeline does not support runtime HBM windows; use pallas_emit_pipeline_group_size=1"
+                    )
+                range_length = _resolve_dim_size(
+                    range_pattern.length, env, state.config
+                )
+                if range_length is None:
+                    raise RuntimeError(
+                        "Pallas could not resolve a contiguous HBM range length"
+                    )
+                base_expr = _contiguous_range_base_expr(
+                    range_pattern.base,
+                    state=state,
+                    captured_exprs=placeholder_exprs,
+                    block_ids=block_ids,
+                    begin_exprs=loop_window.begin_exprs,
+                    iter_step_exprs=loop_window.iter_step_exprs,
+                    iteration_indices=lambda_params,
+                )
+                if base_expr is None:
+                    raise RuntimeError(
+                        "Pallas could not render a planned contiguous HBM range"
+                    )
+                block_shape_parts.append(f"pl.BoundedSlice({range_length})")
+                lambda_parts.append(
+                    "pl.ds(pl.multiple_of("
+                    f"{base_expr}, {range_pattern.alignment}), {range_length})"
+                )
+            elif bid is not None and bid in block_ids:
                 # Inner pipeline dim -- tiled by pipeline grid
                 bid_idx = block_ids.index(bid)
                 slice_size_expr = loop_window.slice_size_exprs[bid_idx]
@@ -4372,7 +4408,11 @@ def _compute_vmem_shapes(
         for dim_idx in range(len(fake.shape)):
             bid = dim_to_bid.get(dim_idx)
             if dim_idx in range_dims:
-                parts.append(range_dims[dim_idx].length)
+                range_length = _resolve_dim_size(
+                    range_dims[dim_idx].length, env, state.config
+                )
+                assert range_length is not None
+                parts.append(range_length)
             elif bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
                 block_value_sym = sympy.sympify(slice_size_exprs[bid_idx])
@@ -4525,7 +4565,14 @@ def _classify_pipelined_tensors(
     from .plan_tiling import TensorIndexPattern
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
-    contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
+    contiguous_ranges = _contiguous_range_patterns(loaded_tensors, stored_tensors)
+    read_storages = {
+        id(fake.untyped_storage()) for fake, _, _ in loaded_tensors.values()
+    }
+    written_storages = {
+        id(fake.untyped_storage()) for fake, _, _ in stored_tensors.values()
+    }
+    read_write_storages = read_storages & written_storages
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info,
         block_ids,
@@ -4689,6 +4736,7 @@ def _classify_pipelined_tensors(
                 _contiguous_range_base_expr(
                     pattern.base,
                     state=state,
+                    captured_exprs=captured_exprs,
                     block_ids=block_ids,
                     begin_exprs=["0"] * len(block_ids),
                     iter_step_exprs=["1"] * len(block_ids),
@@ -4701,6 +4749,17 @@ def _classify_pipelined_tensors(
                 # The load-site lowering can still stage this window, but the
                 # loop prefetcher cannot safely synthesize its next address.
                 continue
+            if (
+                state.config.get("pallas_loop_type") == "emit_pipeline"
+                and id(fake.untyped_storage()) in read_write_storages
+            ):
+                # Output stages have no input prefill. Do not treat an in-place
+                # update as a write-only window and read uninitialized scratch.
+                raise BackendUnsupported(
+                    "pallas",
+                    "emit_pipeline read/write contiguous windows require shared "
+                    "input/output staging and are not supported",
+                )
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
 
@@ -5144,7 +5203,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             index_value = index_node.meta.get("val")
             if isinstance(index_value, torch.Tensor) and index_value.ndim == 0:
                 scalar_index_nodes[id(index_value)] = index_node
-    contiguous_ranges = _contiguous_range_patterns(loop_window.loaded)
+    contiguous_ranges = _contiguous_range_patterns(
+        loop_window.loaded, loop_window.stored
+    )
     indirect_accesses, dma_metadata_ids = _collect_fori_indirect_accesses(
         graph_info, block_ids, state
     )
@@ -5516,9 +5577,17 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             bid = dim_to_bid.get(dim_idx)
             range_pattern = contiguous_ranges.get(id(fake), {}).get(dim_idx)
             if range_pattern is not None:
+                range_length = _resolve_dim_size(
+                    range_pattern.length, env, state.config
+                )
+                if range_length is None:
+                    raise RuntimeError(
+                        "Pallas could not resolve a contiguous HBM range length"
+                    )
                 base_expr = _contiguous_range_base_expr(
                     range_pattern.base,
                     state=state,
+                    captured_exprs=placeholder_exprs,
                     block_ids=block_ids,
                     begin_exprs=loop_window.begin_exprs,
                     iter_step_exprs=loop_window.iter_step_exprs,
@@ -5531,7 +5600,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 hbm_parts.append(
                     "pl.ds(pl.multiple_of("
                     f"{base_expr}, {range_pattern.alignment}), "
-                    f"{range_pattern.length})"
+                    f"{range_length})"
                 )
                 vmem_parts.append(":")
                 hbm_needs_slice = True

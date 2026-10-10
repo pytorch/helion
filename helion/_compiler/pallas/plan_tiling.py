@@ -94,7 +94,7 @@ class ContiguousRangeIndexPattern(IndexingPattern):
     """Aligned ``base + arange(length)`` index addressable as one HBM window."""
 
     base: int | torch.SymInt | torch.fx.Node
-    length: int
+    length: int | torch.SymInt
     alignment: int
 
 
@@ -631,46 +631,25 @@ def _is_proven_multiple(value: object, alignment: int, config: Config | None) ->
     symbolic_value = (
         value.meta.get("val") if isinstance(value, torch.fx.Node) else value
     )
-    if isinstance(value, torch.fx.Node) and isinstance(symbolic_value, torch.SymInt):
-        from ...language import _tracing_ops
-        from ..compile_environment import CompileEnvironment
-
-        if value.target is _tracing_ops._get_symnode:
-            return (
-                CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
-            )
-    tile_begin = _maybe_get_tile_begin_with_offset_info(symbolic_value)
-    if (
-        config is not None
-        and tile_begin is not None
-        and isinstance(tile_begin.offset, int)
-    ):
-        from ..compile_environment import CompileEnvironment
-
-        block_size = (
-            CompileEnvironment.current()
-            .block_sizes[tile_begin.block_id]
-            .from_config(config)
-        )
-        return (
-            isinstance(block_size, int)
-            and block_size % alignment == 0
-            and tile_begin.offset % alignment == 0
-        )
     if isinstance(symbolic_value, torch.SymInt):
         from ..compile_environment import CompileEnvironment
         from ..compile_environment import _symint_expr
-        from ..host_function import HostFunction
+        from ..device_function import find_block_size_symbols
 
         expression = _symint_expr(symbolic_value)
-        if expression is not None and all(
-            (origin := HostFunction.current().expr_to_origin.get(symbol)) is not None
-            and origin.origin.is_host()
-            for symbol in expression.free_symbols
-        ):
-            return (
-                CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
-            )
+        if expression is not None:
+            env = CompileEnvironment.current()
+            expression = env.specialize_expr(expression)
+            if config is not None:
+                blocks, _ = find_block_size_symbols(expression)
+                substitutions = {}
+                for symbol, block_id in blocks.items():
+                    size = env.block_sizes[block_id].from_config(config)
+                    if isinstance(size, int):
+                        substitutions[symbol] = sympy.Integer(size)
+                expression = expression.xreplace(substitutions)
+            if sympy.Mod(expression, alignment) == 0:
+                return True
     if not isinstance(value, torch.fx.Node) or value.op != "call_function":
         return False
 
@@ -745,7 +724,7 @@ def _may_be_aligned_tile_begin(value: object, alignment: int) -> bool:
     return spec.max_size >= alignment
 
 
-def _iota_length(node: object) -> int | None:
+def _iota_length(node: object) -> int | torch.SymInt | None:
     if (
         not isinstance(node, torch.fx.Node)
         or node.op != "call_function"
@@ -760,14 +739,26 @@ def _iota_length(node: object) -> int | None:
     if isinstance(length, torch.fx.Node):
         length = length.meta.get("val")
     if isinstance(length, torch.SymInt):
-        from ..compile_environment import CompileEnvironment
-
-        length = CompileEnvironment.current().size_hint(length)
+        return length
     return length if isinstance(length, int) and length > 0 else None
 
 
+def _has_other_store_site(access_node: torch.fx.Node, tensor: torch.Tensor) -> bool:
+    """A pipeline BlockSpec can describe only one store window per tensor."""
+    from .memory_effects import MEMORY_REGION_META
+    from .memory_effects import MemoryRegion
+
+    region = access_node.meta.get(MEMORY_REGION_META)
+    # Isolated access analysis lacks the surrounding graphs. Do not admit a
+    # write-only window without the complete scheduled-loop effects.
+    return not isinstance(region, MemoryRegion) or region.has_other_write(
+        access_node, tensor
+    )
+
+
 def _match_contiguous_range_index(
-    node: torch.fx.Node,
+    index_node: torch.fx.Node,
+    access_node: torch.fx.Node,
     tensor: torch.Tensor,
     tensor_dim: int,
     load_value: object,
@@ -779,11 +770,11 @@ def _match_contiguous_range_index(
     origin = HostFunction.current().tensor_to_origin.get(tensor)
     if (
         origin is None
-        or node.op != "call_function"
-        or node.target
+        or index_node.op != "call_function"
+        or index_node.target
         not in (operator.add, torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor)
-        or len(node.args) != 2
-        or node.kwargs.get("alpha", 1) != 1
+        or len(index_node.args) != 2
+        or index_node.kwargs.get("alpha", 1) != 1
     ):
         return None
     if not isinstance(load_value, torch.Tensor):
@@ -810,10 +801,15 @@ def _match_contiguous_range_index(
         alignment = 8
     else:
         alignment = 1
-    lhs, rhs = node.args
+    lhs, rhs = index_node.args
     for base, iota in ((lhs, rhs), (rhs, lhs)):
         length = _iota_length(iota)
-        if length is None or length % alignment != 0:
+        if length is None:
+            continue
+        length_hint = (
+            env.size_hint(length) if isinstance(length, torch.SymInt) else length
+        )
+        if length_hint % alignment != 0:
             continue
         if not isinstance(base, (int, torch.SymInt, torch.fx.Node)):
             continue
@@ -824,12 +820,29 @@ def _match_contiguous_range_index(
             aligned = _may_be_aligned_tile_begin(base, alignment)
         if not aligned:
             continue
-        value = node.meta.get("val")
+        value = index_node.meta.get("val")
         if (
             isinstance(value, torch.Tensor)
             and value.ndim == 1
-            and value.shape[0] == length
+            and env.size_hint(value.shape[0]) == length_hint
         ):
+            from ...language import memory_ops
+            from .memory_effects import MEMORY_REGION_META
+            from .memory_effects import MemoryRegion
+
+            region = access_node.meta.get(MEMORY_REGION_META)
+            if (
+                isinstance(region, MemoryRegion)
+                and region.is_read(tensor)
+                and region.is_written(tensor)
+            ):
+                return None
+            if access_node.target is memory_ops.store:
+                mask = access_node.args[3] if len(access_node.args) > 3 else None
+                if mask is not None or _has_other_store_site(access_node, tensor):
+                    # One DMA window cannot represent several stores, and an
+                    # unmasked transfer must not discard a logical store mask.
+                    return None
             return ContiguousRangeIndexPattern(
                 base=base,
                 length=length,
@@ -878,12 +891,21 @@ def _detect_indexing_pattern(
             )
         from ...language import memory_ops
 
-        if node.target is memory_ops.load:
+        if node.target in (memory_ops.load, memory_ops.store):
+            access_value = node.meta.get("val")
+            if node.target is memory_ops.store:
+                stored_value = node.args[2]
+                access_value = (
+                    stored_value.meta.get("val")
+                    if isinstance(stored_value, torch.fx.Node)
+                    else stored_value
+                )
             contiguous_range = _match_contiguous_range_index(
                 idx,
+                node,
                 tensor,
                 tensor_dim,
-                node.meta.get("val"),
+                access_value,
                 config,
             )
             if contiguous_range is not None:
@@ -1085,7 +1107,12 @@ def _resident_block_elements(
         elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):
             dim_size = 1
         elif isinstance(p, ContiguousRangeIndexPattern):
-            dim_size = p.length
+            if isinstance(p.length, torch.SymInt):
+                from ..compile_environment import CompileEnvironment
+
+                dim_size = CompileEnvironment.current().size_hint(p.length)
+            else:
+                dim_size = p.length
         elements *= dim_size
         # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
         tdim += 1

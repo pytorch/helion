@@ -822,9 +822,8 @@ def _generated_index_code(
                 "a contiguous dynamic range must address its raw HBM source"
             )
         index = _index_expr_from_ast(state, subscript_index, ast_subscripts)
-        return (
-            f"pl.ds(pl.multiple_of({index}[0], {pattern.alignment}), {pattern.length})"
-        )
+        length = state.device_function.literal_expr(pattern.length)
+        return f"pl.ds(pl.multiple_of({index}[0], {pattern.alignment}), {length})"
 
     if isinstance(pattern, TensorIndexPattern):
         # A surrounding DMA loop has already selected this scalar-addressed

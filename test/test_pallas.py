@@ -1145,6 +1145,44 @@ class TestPallas(TestCase):
                         result.cpu(), expected + 1, rtol=0, atol=0
                     )
 
+    def test_configured_contiguous_prefix_windows(self) -> None:
+        """Configured row widths and runtime lengths select one HBM window."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(
+            x: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            block = hl.register_block_size(128, 256)
+            out = torch.zeros_like(x)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(block)
+                    row_indices = hl.arange(block).unsqueeze(1).expand(block, x.size(1))
+                    mask = row_indices < lengths[work]
+                    values = hl.load(x, [rows, slice(None)], extra_mask=mask)
+                    hl.store(out, [rows, slice(None)], values * 2)
+            return out
+
+        starts = torch.tensor([0, 256, 512, 768], dtype=torch.int32, device=DEVICE)
+        lengths = torch.tensor([17, 0, 93, 128], dtype=torch.int32, device=DEVICE)
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(1024, 128, dtype=dtype, device=DEVICE)
+            expected = torch.zeros_like(x.cpu())
+            for start, length in zip(
+                starts.cpu().tolist(), lengths.cpu().tolist(), strict=True
+            ):
+                expected[start : start + length] = x.cpu()[start : start + length] * 2
+            for block in (128, 256):
+                with self.subTest(dtype=dtype, block=block):
+                    _, result = code_and_output(
+                        copy_windows,
+                        (x, starts, lengths),
+                        block_sizes=[block],
+                        pallas_loop_type="emit_pipeline",
+                        pallas_load_buffer_count=[2, 1, 1],
+                    )
+                    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
     def test_private_scalar_selects_pipeline_weight(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def rotate_weights(x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -1632,6 +1670,170 @@ class TestPallas(TestCase):
             updated = torch.tensor([12, 22, 30, 40], dtype=torch.float32)
             updated = updated[:, None, None].expand_as(weights.cpu())
             torch.testing.assert_close(weights.cpu(), updated, rtol=0, atol=0)
+
+    def test_contiguous_windows_single_store_schedulers(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            width = hl.register_block_size(128, 256)
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(width)
+                    values = hl.load(x, [rows, slice(None)])
+                    hl.store(out, [rows, slice(None)], values * 2)
+            return out
+
+        starts = torch.tensor([0, 256], device=DEVICE, dtype=torch.int32)
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(512, 128, device=DEVICE, dtype=dtype)
+            for width in (128, 256):
+                for loop_type in ("fori_loop", "unroll", "emit_pipeline"):
+                    with self.subTest(dtype=dtype, width=width, loop_type=loop_type):
+                        _, result = code_and_output(
+                            copy_windows,
+                            (x, starts),
+                            block_sizes=[width],
+                            pallas_loop_type=loop_type,
+                            pallas_load_buffer_count=[2, 1],
+                        )
+                        for start in (0, 256):
+                            torch.testing.assert_close(
+                                result.cpu()[start : start + width],
+                                x.cpu()[start : start + width] * 2,
+                                rtol=0,
+                                atol=0,
+                            )
+
+    def test_contiguous_windows_nested_stores(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(
+            x: torch.Tensor,
+            starts: torch.Tensor,
+            flags: torch.Tensor,
+            nested_loop: int,
+        ) -> torch.Tensor:
+            nested_loop = hl.specialize(nested_loop)
+            out = torch.full_like(x, -17)
+            alias = out
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    first = starts[work] // 16 * 16 + hl.arange(128)
+                    values = hl.load(x, [first, slice(None)])
+                    hl.store(out, [first, slice(None)], values * 2)
+                    second = (starts[work] // 16 * 16 + 128) + hl.arange(128)
+                    if nested_loop:
+                        for _repeat in hl.grid(flags[work]):
+                            hl.store(alias, [second, slice(None)], values * 3)
+                    elif flags[work] != 0:
+                        hl.store(alias, [second, slice(None)], values * 3)
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 256], device=DEVICE, dtype=torch.int32)
+        for flag_values in ([1, 1], [1, 0]):
+            flags = torch.tensor(flag_values, device=DEVICE, dtype=torch.int32)
+            expected = torch.full_like(x.cpu(), -17)
+            for work, start in enumerate((0, 256)):
+                expected[start : start + 128] = x.cpu()[start : start + 128] * 2
+                if flag_values[work]:
+                    expected[start + 128 : start + 256] = (
+                        x.cpu()[start : start + 128] * 3
+                    )
+            for nested_loop in (0, 1):
+                for loop_type in ("fori_loop", "emit_pipeline"):
+                    with self.subTest(
+                        flags=flag_values, nested_loop=nested_loop, loop_type=loop_type
+                    ):
+                        _, result = code_and_output(
+                            copy_windows,
+                            (x, starts, flags, nested_loop),
+                            pallas_loop_type=loop_type,
+                            pallas_load_buffer_count=[2, 1, 1],
+                        )
+                        torch.testing.assert_close(
+                            result.cpu(), expected, rtol=0, atol=0
+                        )
+
+    def test_contiguous_windows_with_captured_start(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                start = starts[0]
+                for work in hl.grid(3):
+                    rows = start // 16 * 16 + work * 128 + hl.arange(128)
+                    values = hl.load(x, [rows, slice(None)])
+                    hl.store(out, [rows, slice(None)], values * 2)
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE)
+        starts = torch.tensor([19], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            copy_windows, (x, starts), pallas_loop_type="emit_pipeline"
+        )
+        expected = torch.full_like(x.cpu(), -17)
+        expected[16:400] = x.cpu()[16:400] * 2
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_contiguous_window_alignment_ignores_runtime_hints(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(pallas_loop_type="emit_pipeline"),
+        )
+        def copy_window(x: torch.Tensor, start: int) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for _work in hl.grid(1):
+                    rows = start + hl.arange(128)
+                    values = hl.load(x, [rows, slice(None)])
+                    hl.store(out, [rows, slice(None)], values * 2)
+            return out
+
+        x = torch.randn(512, 128, device=DEVICE, dtype=torch.float32)
+        for start in (0, 3, 129):
+            result = copy_window(x, start)
+            expected = torch.full_like(x.cpu(), -17)
+            expected[start : start + 128] = x.cpu()[start : start + 128] * 2
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_emit_pipeline_grouped_runtime_addresses_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    rows = starts[work] // 16 * 16 + hl.arange(128)
+                    hl.store(out, [rows, slice(None)], hl.load(x, [rows, slice(None)]))
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panels(weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(weights)
+            for _program in hl.grid(1):
+                for group in hl.grid(ids.numel()):
+                    out[group, :, :] = weights[ids[group], :, :] + 1
+            return out
+
+        x = torch.randn(1024, 128, device=DEVICE)
+        starts = torch.arange(0, 1024, 128, device=DEVICE, dtype=torch.int32)
+        weights = torch.randn(8, 16, 128, device=DEVICE)
+        ids = torch.arange(7, -1, -1, device=DEVICE, dtype=torch.int32)
+        for kernel, args, expected in (
+            (copy_windows, (x, starts), x.cpu()),
+            (select_panels, (weights, ids), weights.cpu()[ids.cpu()] + 1),
+        ):
+            _, result = code_and_output(kernel, args, pallas_loop_type="emit_pipeline")
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig, "grouped emit_pipeline"
+            ):
+                code_and_output(
+                    kernel,
+                    args,
+                    pallas_loop_type="emit_pipeline",
+                    pallas_emit_pipeline_group_size=2,
+                )
 
     def test_configured_pad_width(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -3714,6 +3916,34 @@ class TestPallas(TestCase):
                 self.assertIn("jnp.ones_like", code)
                 self.assertIn("jnp.where", code)
                 self.assertIn("dot_general", code)
+
+    def test_contiguous_windows_multiple_stores(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def copy_windows(x: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for work in hl.grid(starts.numel()):
+                    begin = starts[work] // 16 * 16
+                    first = begin + hl.arange(128)
+                    second = (begin + 128) + hl.arange(128)
+                    values = hl.load(x, [first, slice(None)])
+                    hl.store(out, [first, slice(None)], values * 2)
+                    hl.store(out, [second, slice(None)], values * 3)
+            return out
+
+        x = torch.randn(512, 128, dtype=torch.float32, device=DEVICE)
+        starts = torch.tensor([0, 256], dtype=torch.int32, device=DEVICE)
+        expected = torch.empty_like(x.cpu())
+        for begin in (0, 256):
+            values = x.cpu()[begin : begin + 128]
+            expected[begin : begin + 128] = values * 2
+            expected[begin + 128 : begin + 256] = values * 3
+        for loop_type in ("emit_pipeline", "fori_loop"):
+            with self.subTest(loop_type=loop_type):
+                _, result = code_and_output(
+                    copy_windows, (x, starts), pallas_loop_type=loop_type
+                )
+                torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
     def test_scatter_store_duplicate_indices(self) -> None:
         values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
