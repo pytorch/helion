@@ -2322,6 +2322,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._generated_code_input_key: GeneratedCodeInputKey | None = None
         self._generated_code_artifact_key = artifact_key
         self._generated_source_cache_keys: dict[Config, str] = {}
+        # Disk entries this binding already wrote or loaded. Repeated set_config
+        # calls skip the writers' lock and eviction scan.
+        self._persisted_source_keys: set[str] = set()
+        self._persisted_binding: tuple[Config, str] | None = None
         self._compiler_seed_specialization_extractors: tuple[
             _CompilerSeedSpecializationExtractor, ...
         ] = ()
@@ -2769,7 +2773,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         source_key = None
         if cache_generated_code and not self.settings.print_output_code:
-            source_key = generated_code_cache_key(self, config)
+            source_key = self._generated_source_cache_keys.get(config)
+            if source_key is None:
+                source_key = generated_code_cache_key(self, config)
             if source_key is not None:
                 self._generated_source_cache_keys[config] = source_key
         if (rv := self._compile_cache.get(config)) is not None:
@@ -2777,6 +2783,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             # without generating it again or retaining every candidate on disk.
             if (
                 source_key is not None
+                and source_key not in self._persisted_source_keys
                 and (path := self._cache_path_map.get(config)) is not None
             ):
                 # PyCodeCache writes the supplied source unchanged; its extra
@@ -2787,6 +2794,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     log.warning("Could not read generated code %s: %s", path, error)
                 else:
                     save_generated_code(source_key, source)
+                    self._persisted_source_keys.add(source_key)
             return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
@@ -2830,8 +2838,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 device_index,
                 extra=cache_extra,
             )
-            if source_key is not None and source_miss:
-                save_generated_code(source_key, triton_code)
+            if source_key is not None:
+                if source_miss:
+                    save_generated_code(source_key, triton_code)
+                self._persisted_source_keys.add(source_key)
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -3143,8 +3153,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             normalized = self._normalized_config_copy(config)
             if (
                 source_key := self._generated_source_cache_keys.get(normalized)
-            ) is not None:
+            ) is not None and self._persisted_binding != (config, source_key):
                 save_binding(self, config, normalized, source_key)
+                self._persisted_binding = (config, source_key)
         repro_config = (
             requested_config
             if isinstance(requested_config, CuteStructuralConfig)

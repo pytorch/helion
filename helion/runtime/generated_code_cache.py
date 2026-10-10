@@ -62,6 +62,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 _UNCACHEABLE = object()
+# Running byte total of the JSON entries, guarded by the writers' lock.
+_SIZE_INDEX = ".size"
+_SIZE_INDEX_RESCAN_WRITES = 1024
 
 
 def _code_key(code: types.CodeType) -> tuple[object, ...]:
@@ -193,16 +196,23 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
     return _UNCACHEABLE
 
 
+# Settings that cannot change generated code. Search policy selects a config
+# already included in the source key, and the cache toggle is always enabled
+# when a key is computed. Every other field, including future ones, is keyed.
+_NON_CODEGEN_SETTING_PREFIXES = ("autotun",)
+_NON_CODEGEN_SETTINGS = frozenset({"generated_code_cache"})
+
+
 def _compilation_settings_key(settings: Settings) -> object:
-    # Search policy selects a config already included in the source key. Reject
-    # unknown compilation values instead of hashing an address-bearing repr.
-    # Read fields directly: to_dict() deep-copies arbitrary future values first.
+    # Reject unknown compilation values instead of hashing an address-bearing
+    # repr. Read fields directly: to_dict() deep-copies arbitrary values first.
     return _dependency_key(
         dict(
             sorted(
                 (field.name, getattr(settings, field.name))
                 for field in dataclasses.fields(settings)
-                if field.repr and not field.name.startswith("autotun")
+                if field.name not in _NON_CODEGEN_SETTINGS
+                and not field.name.startswith(_NON_CODEGEN_SETTING_PREFIXES)
             )
         )
     )
@@ -344,6 +354,7 @@ def load_compiled_kernel(key: str) -> tuple[Config, Config, str] | None:
     source = load_generated_code(source_key)
     if source is None:
         return None
+    _mark_used(path)
     counters["generated_code_cache"]["frontend_hit"] += 1
     return config, normalized, source
 
@@ -437,6 +448,7 @@ def load_binding_schema(key: str) -> dict[str, list[object]] | None:
     except (OSError, ValueError, KeyError, TypeError) as error:
         log.warning("Ignoring binding schema cache entry %s: %s", path, error)
         return None
+    _mark_used(path)
     return schema
 
 
@@ -568,8 +580,21 @@ def load_generated_code(key: str) -> str | None:
         log.warning("Ignoring generated code cache entry %s: %s", path, error)
         counters["generated_code_cache"]["miss"] += 1
         return None
+    _mark_used(path)
     counters["generated_code_cache"]["hit"] += 1
     return source
+
+
+def _mark_used(path: Path) -> None:
+    """Refresh a hit's mtime so eviction removes the least recently used entries.
+
+    Readers take no lock. A concurrent eviction or a read-only cache directory
+    only loses recency information.
+    """
+    try:
+        os.utime(path)
+    except OSError:
+        log.debug("Could not update generated code cache entry %s", path)
 
 
 def save_generated_code(key: str, source: str) -> None:
@@ -601,7 +626,7 @@ def _save_entry(path: Path, entry: dict[str, object]) -> None:
         # Serialize publication and eviction across threads/processes. Readers
         # need no lock: an evicted artifact is an ordinary cache miss.
         with FileLock(root / ".lock", timeout=1):
-            _evict_entries(root, path, len(data), limit)
+            _reserve_space(root, path, len(data), limit)
             with tempfile.NamedTemporaryFile(
                 mode="wb", dir=path.parent, delete=False
             ) as output:
@@ -618,8 +643,41 @@ def _save_entry(path: Path, entry: dict[str, object]) -> None:
                 log.debug("Could not remove temporary cache file %s", temporary)
 
 
-def _evict_entries(root: Path, target: Path, incoming: int, limit: int) -> None:
-    """Keep source and binding JSON within the shared byte budget on writes."""
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _reserve_space(root: Path, target: Path, incoming: int, limit: int) -> None:
+    """Keep source and binding JSON within the shared byte budget on writes.
+
+    Writers maintain a running total under the lock, so a write scans the cache
+    only when the total could exceed the budget, the index is missing or
+    corrupt, or a periodic rescan is due. The index is updated before the entry
+    is published: an interrupted or failed write leaves an overestimate, which
+    forces the next writer to rescan. Files removed manually have the same
+    effect, and the periodic rescan corrects files added outside the writers.
+    """
+    index = root / _SIZE_INDEX
+    try:
+        total, writes = (
+            int(value) for value in index.read_text(encoding="utf-8").split()
+        )
+    except (OSError, ValueError):
+        total, writes = -1, _SIZE_INDEX_RESCAN_WRITES
+    total -= _file_size(target)
+    if total < 0 or total + incoming > limit or writes >= _SIZE_INDEX_RESCAN_WRITES:
+        total = _evict_entries(root, target, incoming, limit)
+        writes = 0
+    else:
+        total += incoming
+    index.write_text(f"{total} {writes + 1}\n", encoding="utf-8")
+
+
+def _evict_entries(root: Path, target: Path, incoming: int, limit: int) -> int:
+    """Evict least recently used entries and return the resulting total."""
     entries: list[tuple[int, Path, int]] = []
     total = incoming
     for path in root.rglob("*.json"):
@@ -632,8 +690,10 @@ def _evict_entries(root: Path, target: Path, incoming: int, limit: int) -> None:
             continue
         entries.append((stat.st_mtime_ns, path, stat.st_size))
         total += stat.st_size
+    # Hits refresh mtime, so the oldest mtime is the least recently used entry.
     for _, path, size in sorted(entries):
         if total <= limit:
             break
         path.unlink(missing_ok=True)
         total -= size
+    return total

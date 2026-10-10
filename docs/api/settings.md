@@ -77,16 +77,18 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 ### Core Compilation Settings
 
 `generated_code_cache=True` (or `HELION_GENERATED_CODE_CACHE=1`) enables the
-opt-in persistent source cache for selected Triton configs. Inputs that an
-earlier process's binding would accept can skip frontend compilation and source
-generation with explicit configs, custom config selectors or disabled
-autotuning. In-memory dynamic binding and autotuning keys keep their ordinary
-behavior. Native-source handoff
-and PyTorch builds without Helion's `torch.compile` integration retain frontend
-compilation. Handoff uses the ordinary backend tuning path. Generated source and
-binding entries have a shared 1 GiB disk budget; override it with
-`HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES`. Oldest written entries are evicted
-on publication. See
+opt-in persistent source cache for selected Triton configs. With the default
+`@helion.kernel` and no `config=`, adaptive autotuning still runs frontend
+compilation in every process and the cache only skips source generation.
+With explicit configs, custom config selectors or disabled autotuning, inputs
+that an earlier process's binding would accept also skip frontend compilation.
+In-memory dynamic binding and autotuning keys keep their ordinary behavior.
+Native-source handoff and PyTorch builds without Helion's `torch.compile`
+integration retain frontend compilation. Handoff uses the ordinary backend
+tuning path. Missing or corrupt entries fall back to normal compilation.
+Generated source and binding entries have a shared 1 GiB disk budget; override
+it with `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES`. Least recently used
+entries are evicted when a write would exceed the budget. See
 {doc}`../deployment_autotuning` for its scope and cache controls.
 
 ```{eval-rst}

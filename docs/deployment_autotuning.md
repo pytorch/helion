@@ -24,7 +24,14 @@ and {py:class}`~helion.autotuner.local_cache.StrictLocalAutotuneCache`.
 
 For Triton kernels, opt in to caching the selected configuration's
 generated source with `generated_code_cache=True` or
-`HELION_GENERATED_CODE_CACHE=1`:
+`HELION_GENERATED_CODE_CACHE=1`.
+
+With the default `@helion.kernel` and no `config=`, the default adaptive
+autotuner selects the config, and the cache only skips source generation:
+every process still runs frontend compilation (`KernelCompiler.compile`) so
+that `LocalAutotuneCache` stays authoritative when a tuning result is deleted
+or replaced. Skipping the frontend as well requires an explicit config, a
+custom config selector or `autotune_effort="none"`:
 
 ```python
 @helion.kernel(
@@ -53,14 +60,12 @@ process never saw, as one binding does with the cache disabled. A new guard
 value, such as another `hl.specialize()` value, compiles normally and saves a
 new binding. Kernels with runtime input specializations keep no binding entry.
 A source hit creates a lightweight runner that eager dispatch caches like an
-ordinary binding. Selecting another config or requesting frontend IR creates
-an ordinary binding on demand. Function dependencies are fingerprinted during
-disk lookup, not on each kernel launch.
+ordinary binding. When a call or request needs more than that runner provides,
+such as another config or frontend IR, Helion runs frontend compilation in that
+process and continues with an ordinary binding. Function dependencies are
+fingerprinted during disk lookup, not on each kernel launch.
 
-Custom config selectors still run. Adaptive tuning with the default selector
-retains frontend compilation so that `LocalAutotuneCache` remains authoritative
-when a tuning result is deleted or replaced. Pre-frontend reuse is available
-with explicit configs, custom selectors and `autotune_effort="none"`.
+Custom config selectors still run.
 Native-source handoff (`autotune_handoff=True`) retains the ordinary frontend
 and backend tuning path so that cache hits cannot skip the requested handoff.
 PyTorch builds without Helion's `torch.compile` integration also retain frontend
@@ -76,17 +81,25 @@ retain normal compilation. Autotuning candidates are not written to this cache;
 during autotuning.
 
 `HELION_SKIP_CACHE=1` skips both reads and writes. Entries are checksummed and
-published with atomic renames. Missing, corrupt or unreadable entries fall back
-to compilation; failed writes leave the compiled kernel usable. Remove the
-`generated_code` directory to clear it. Source and binding entries share a
-1 GiB disk budget by default. Set `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES`
-to a nonnegative integer to change it; zero prevents new writes. Publication
-evicts the oldest written entries until the JSON files fit the budget. Entries
-larger than the budget are not persisted. Eviction can cause a later compilation
-miss, but does not affect already loaded kernels. Writers serialize eviction and
-atomic publication with a file lock; lock timeouts and filesystem errors skip
-the write without interrupting execution. The budget excludes temporary files
-and the lock file, so a write can briefly use additional disk space.
+published with atomic renames. Missing, corrupt or unreadable entries are
+treated as misses: Helion compiles normally, as if the cache were disabled, and
+rewrites the entry. Failed writes log a warning and leave the compiled kernel
+usable. Remove the `generated_code` directory to clear it.
+
+Source, binding and guard schema entries share a 1 GiB disk budget by default.
+Set `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES` to a nonnegative integer to
+change it; zero prevents new writes. Eviction is least recently used: each hit
+refreshes the entry's modification time, and a write that would exceed the
+budget removes the entries with the oldest modification times until the JSON
+files fit. Entries larger than the budget are not persisted. Evicting any
+part of a binding (its source, guard schema or binding entry) causes a later
+compilation miss, but does not affect already loaded kernels. Writers
+serialize eviction and atomic publication with a file lock and keep a running
+size total in a `.size` file, so a write only scans the directory when the
+budget may be exceeded, the total is missing or corrupt, or a periodic rescan
+is due. Lock timeouts and filesystem errors skip the write without interrupting
+execution. The budget excludes temporary files, the lock file and the size
+file, so a write can briefly use additional disk space.
 
 The rest of this document covers strategies for pre-tuning and deploying
 tuned configs, which is the recommended approach for production workloads.

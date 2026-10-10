@@ -24,6 +24,7 @@ from helion._utils import counters
 from helion.autotuner.base_search import BaseAutotuner
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
+from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -201,6 +202,42 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(json.loads(entries[0].read_text())["source"], sources[0])
 
+    def test_repeated_set_config_skips_persisted_entries(self) -> None:
+        bound = _bound(torch.ones(16))
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            # An autotuning candidate is compiled without being persisted.
+            bound.compile_config(config)
+            with (
+                patch.object(
+                    # helion.runtime.kernel names the decorator, not the module.
+                    sys.modules[BoundKernel.__module__],
+                    "generated_code_cache_key",
+                    side_effect=cache.generated_code_cache_key,
+                ) as source_key,
+                patch.object(
+                    sys.modules[BoundKernel.__module__],
+                    "save_binding",
+                    side_effect=cache.save_binding,
+                ) as save_binding,
+                patch.object(
+                    cache, "_save_entry", side_effect=cache._save_entry
+                ) as save_entry,
+            ):
+                for _ in range(3):
+                    bound.set_config(config)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(source_key.call_count, 1)
+        self.assertEqual(save_binding.call_count, 1)
+        # One source, guard schema and binding entry, despite repeated set_config.
+        self.assertEqual(save_entry.call_count, 3)
+        self.assertEqual(
+            len(list((self.cache_root / "generated_code").rglob("*.json"))), 3
+        )
+
     def test_search_seed_does_not_change_source_key(self) -> None:
         first = _bound(torch.ones(16), autotune_random_seed=1)
         second = _bound(torch.ones(16), autotune_random_seed=2)
@@ -336,21 +373,29 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
             self.assertEqual(compile_fn.call_count, 1)
             self.assertIsNot(rebound, fresh)
 
-    @parametrize("damaged", ["binding", "source"])
-    def test_broken_binding_artifact_compiles_normally(self, damaged: str) -> None:
+    def _binding_entry(self, part: str) -> Path:
+        directory = self.cache_root / "generated_code"
+        if part == "source":
+            return next(directory.glob("*.json"))
+        return next((directory / f"{part}s").glob("*.json"))
+
+    @parametrize("damaged", ["binding", "schema", "source"])
+    @parametrize("evicted", [False, True])
+    def test_broken_binding_artifact_compiles_normally(
+        self, damaged: str, evicted: bool
+    ) -> None:
         x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
         sources: list[str] = []
         with patch.object(
             PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
         ):
-            _bound(x).set_config(helion.Config(block_sizes=[32]))
-            directory = self.cache_root / "generated_code"
-            path = (
-                next((directory / "bindings").glob("*.json"))
-                if damaged == "binding"
-                else next(directory.glob("*.json"))
-            )
-            path.write_text("{")
+            _bound(x).set_config(config)
+            path = self._binding_entry(damaged)
+            if evicted:
+                path.unlink()
+            else:
+                path.write_text("{")
             with patch.object(
                 KernelCompiler,
                 "compile",
@@ -359,7 +404,39 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
             ) as compile_fn:
                 fresh = _bound(x)
             self.assertEqual(compile_fn.call_count, 1)
-            fresh.set_config(helion.Config(block_sizes=[32]))
+            fresh.set_config(config)
+            # The normal compilation republished the entry.
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                _bound(x).set_config(config)
+
+    def test_binding_entries_use_size_index_and_lru(self) -> None:
+        x = torch.ones(16)
+        config = helion.Config(block_sizes=[32])
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            _bound(x).set_config(config)
+            directory = self.cache_root / "generated_code"
+            paths = [
+                self._binding_entry(part) for part in ("source", "schema", "binding")
+            ]
+            # Source, guard schema and binding writes all update the size index.
+            self.assertEqual(
+                int((directory / ".size").read_text().split()[0]),
+                sum(path.stat().st_size for path in directory.rglob("*.json")),
+            )
+            for path in paths:
+                os.utime(path, ns=(1, 1))
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+            ):
+                _bound(x).set_config(config)
+        # A hit refreshes every entry it read, so eviction keeps the binding.
+        for path in paths:
+            self.assertGreater(path.stat().st_mtime_ns, 1)
 
     def test_skip_cache_does_not_publish_binding(self) -> None:
         x = torch.ones(16)
@@ -485,14 +562,22 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
         self.assertIn(cache.load_generated_code("shared"), sources)
         directory = self.cache_root / "generated_code"
         self.assertEqual(
-            sorted(path.name for path in directory.iterdir() if path.name != ".lock"),
+            sorted(
+                path.name
+                for path in directory.iterdir()
+                if path.name not in {".lock", ".size"}
+            ),
             ["shared.json"],
         )
         with patch.object(cache.os, "replace", side_effect=OSError("read-only cache")):
             cache.save_generated_code("shared", "replacement")
         self.assertIn(cache.load_generated_code("shared"), sources)
         self.assertEqual(
-            sorted(path.name for path in directory.iterdir() if path.name != ".lock"),
+            sorted(
+                path.name
+                for path in directory.iterdir()
+                if path.name not in {".lock", ".size"}
+            ),
             ["shared.json"],
         )
 
