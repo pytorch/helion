@@ -259,13 +259,16 @@ class TestPallasLoadBufferCountConfig(TestCase):
     def test_default_and_search_surface(self) -> None:
         spec = self._config_spec(2)
         field = spec._flat_fields()["pallas_load_buffer_count"]
-        self.assertEqual(field.default(), [1, 1])
-        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2], [2, 2]])
+        self.assertEqual(field.default(), [2, 2])
+        for neighbor in ([2, 1], [1, 2], [2, 2]):
+            self.assertIn(neighbor, field.pattern_neighbors([1, 1]))
+        for neighbor in ([4, 3], [3, 4]):
+            self.assertIn(neighbor, field.pattern_neighbors([3, 3]))
         self.assertIn(
             ("pallas_load_buffer_count", *field.fingerprint()),
             spec.structural_fingerprint(),
         )
-        self.assertNotIn("pallas_load_buffer_count", spec.default_config())
+        self.assertEqual(spec.default_config().pallas_load_buffer_count, [2, 2])
 
         fori_config = helion.Config(pallas_loop_type="fori_loop")
         spec.normalize(fori_config)
@@ -283,9 +286,14 @@ class TestPallasLoadBufferCountConfig(TestCase):
         spec.normalize(unroll_config)
         self.assertEqual(unroll_config.pallas_load_buffer_count, [2, 1])
 
+        pipeline_config = helion.Config(
+            pallas_loop_type="emit_pipeline", pallas_load_buffer_count=[8, 3]
+        )
+        spec.normalize(pipeline_config)
+        self.assertEqual(pipeline_config.pallas_load_buffer_count, [8, 3])
+
     def test_inactive_field_is_ignored(self) -> None:
         cases = (
-            (self._config_spec(2), "emit_pipeline", [2], True),
             (
                 self._config_spec(2, has_pallas_inner_loops=False),
                 "fori_loop",
@@ -308,6 +316,19 @@ class TestPallasLoadBufferCountConfig(TestCase):
                 )
                 spec.normalize(config)
                 self.assertNotIn("pallas_load_buffer_count", config)
+
+    def test_repair_counts_when_switching_loop_type(self) -> None:
+        spec = self._config_spec(2)
+        config = helion.Config(
+            pallas_loop_type="fori_loop", pallas_load_buffer_count=[8, 3]
+        )
+        spec.normalize(config, _fix_invalid=True)
+        self.assertEqual(config.pallas_load_buffer_count, [2, 2])
+        config = helion.Config(
+            pallas_loop_type="emit_pipeline", pallas_load_buffer_count=[8, 3]
+        )
+        spec.normalize(config, _fix_invalid=True)
+        self.assertEqual(config.pallas_load_buffer_count, [8, 3])
 
     def test_non_pallas_backend_rejects_the_field(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
@@ -335,6 +356,14 @@ class TestPallasLoadBufferCountConfig(TestCase):
                             "pallas_loop_type": "fori_loop",
                             "pallas_load_buffer_count": value,
                         }
+                    )
+                )
+
+        for value in ((2, 1), [1], [1, True], [0, 1], [9, 1]):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config(
+                        pallas_loop_type="emit_pipeline", pallas_load_buffer_count=value
                     )
                 )
 

@@ -1145,6 +1145,49 @@ class TestPallas(TestCase):
                         result.cpu(), expected + 1, rtol=0, atol=0
                     )
 
+    def test_emit_pipeline_buffer_depths_short_dynamic_loops(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_active(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+            out = torch.full_like(x, -17)
+            for _program in hl.grid(1):
+                for work in hl.grid(counts[0]):
+                    out[work, :, :] = x[work, :, :] + 1
+            return out
+
+        x = torch.randn(8, 16, 128, device=DEVICE)
+        for buffers in range(1, 9):
+            for active in (0, 1, 2, 5):
+                counts = torch.tensor([active], device=DEVICE, dtype=torch.int32)
+                _, result = code_and_output(
+                    add_active,
+                    (x, counts),
+                    pallas_loop_type="emit_pipeline",
+                    pallas_load_buffer_count=[buffers, 1],
+                )
+                expected = torch.full_like(x.cpu(), -17)
+                expected[:active] = x.cpu()[:active] + 1
+                torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_emit_pipeline_input_buffer_counts(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_tiles(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for rows in hl.tile(x.size(0), block_size=16):
+                    out[rows, :] = x[rows, :] + y[rows, :]
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        for buffers in range(1, 9):
+            _, result = code_and_output(
+                add_tiles,
+                (x, y),
+                pallas_loop_type="emit_pipeline",
+                pallas_load_buffer_count=[buffers, buffers],
+            )
+            torch.testing.assert_close(result.cpu(), x.cpu() + y.cpu(), rtol=0, atol=0)
+
     def test_configured_contiguous_prefix_windows(self) -> None:
         """Configured row widths and runtime lengths select one HBM window."""
 

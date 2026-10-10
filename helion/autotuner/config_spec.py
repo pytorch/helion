@@ -1506,7 +1506,7 @@ class ConfigSpec:
             length=0,
         )
         self.pallas_load_buffer_count = ListOf(
-            IntegerFragment(1, 2, 1),
+            IntegerFragment(1, 8, 2),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -5797,22 +5797,34 @@ class ConfigSpec:
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
-            and config.get("pallas_loop_type") in ("fori_loop", "unroll")
+            and config.get("pallas_loop_type")
+            in ("fori_loop", "unroll", "emit_pipeline")
         ):
-            values = config.setdefault(
-                "pallas_load_buffer_count", self.pallas_load_buffer_count.default()
-            )
             expected = self.pallas_load_buffer_count.length
+            is_pipeline = config.get("pallas_loop_type") == "emit_pipeline"
+            values = config.setdefault(
+                "pallas_load_buffer_count", [2 if is_pipeline else 1] * expected
+            )
+            max_buffer_count = 8 if is_pipeline else 2
+            if (
+                _fix_invalid
+                and isinstance(values, list)
+                and len(values) == expected
+                and all(type(value) is int for value in values)
+            ):
+                values = [max(1, min(value, max_buffer_count)) for value in values]
+                config["pallas_load_buffer_count"] = values
             if (
                 not isinstance(values, list)
                 or len(values) != expected
                 or any(
-                    type(value) is not int or value not in (1, 2) for value in values
+                    type(value) is not int or not 1 <= value <= max_buffer_count
+                    for value in values
                 )
             ):
                 raise InvalidConfig(
                     "pallas_load_buffer_count must be a list containing one "
-                    "buffer count (1 or 2) per input tensor "
+                    f"buffer count (1 to {max_buffer_count}) per input tensor "
                     f"(expected {expected}, got {values!r})"
                 )
             if expected == 0:

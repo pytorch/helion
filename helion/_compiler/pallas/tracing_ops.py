@@ -3675,6 +3675,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # grid_block_ids (which is logical order), so that program_id(g)
     # correctly maps to the block_id at grid dimension g.
     from ..device_function import DeviceFunction as _DF
+    from ..device_ir import LiftTensorArgs
 
     _bid_to_pid_var: dict[int, str] = {}
     device_fn = _DF.current()
@@ -3685,6 +3686,32 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 statement_from_string(f"{pid_var} = pl.program_id({g})")
             )
             _bid_to_pid_var[pid.block_id] = pid_var
+
+    input_tensors = cast(
+        "list[torch.Tensor]",
+        LiftTensorArgs(dict(HostFunction.current().params.arguments)).get_tensor_args(),
+    )
+    input_slots_by_id: dict[int, list[int]] = {}
+    input_slots_by_storage: dict[int, list[int]] = {}
+    for input_slot, input_tensor in enumerate(input_tensors):
+        input_slots_by_id.setdefault(id(input_tensor), []).append(input_slot)
+        input_slots_by_storage.setdefault(
+            id(input_tensor.untyped_storage()), []
+        ).append(input_slot)
+    configured_load_buffers = state.config.get("pallas_load_buffer_count", ())
+
+    def _load_buffer_count(fake: torch.Tensor) -> int:
+        slots = input_slots_by_id.get(
+            id(fake), input_slots_by_storage.get(id(fake.untyped_storage()))
+        )
+        if (
+            isinstance(configured_load_buffers, (list, tuple))
+            and slots is not None
+            and len(slots) == 1
+            and slots[0] < len(configured_load_buffers)
+        ):
+            return configured_load_buffers[slots[0]]
+        return 2
 
     def _make_block_spec(
         fake: torch.Tensor, subscript_meta: Sequence[object], is_store: bool = False
@@ -3952,10 +3979,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         block_shape_str = ", ".join(block_shape_parts)
         lambda_body = ", ".join(lambda_parts)
         lambda_param_str = ", ".join(lambda_params)
+        buffer_count = 2 if is_store else _load_buffer_count(fake)
         return (
             f"pl.BlockSpec(({block_shape_str},), "
             f"lambda {lambda_param_str}: ({lambda_body},), "
-            f"pipeline_mode=pl.Buffered(buffer_count=2))"
+            f"pipeline_mode=pl.Buffered(buffer_count={buffer_count}))"
         )
 
     def _make_load_block_spec(

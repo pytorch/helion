@@ -107,9 +107,10 @@ class Config(Mapping[str, object]):
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
-            pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
-                each input tensor. Tensors without an existing DMA route use the
-                ordinary path.
+            pallas_load_buffer_count: Pallas-only load buffer count for each input
+                tensor. Device loops support one or two buffers; ``emit_pipeline``
+                supports one to eight. Tensors without an existing DMA route use
+                the ordinary path.
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
                 Valid values are "", "first", and "last".
