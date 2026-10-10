@@ -6,7 +6,9 @@ a dynamic index on the second-minor dimension is legal in the ref subscript
 itself (``ref[i, :]``); the lane dimension is then selected with a static
 index after the load. Packed dtypes and dynamic lane indices instead load
 the window, pad it to the physical tile, rotate the requested element to
-index zero, widen to a 32-bit register type, and extract statically.
+index zero, widen to a 32-bit register type, and extract statically. Runtime
+indices on leading dimensions also use rotation, but select whole physical
+blocks without widening their dtype.
 
 ``classify_vmem_scalar_load`` decides whether a load needs this lowering;
 ``emit_vmem_scalar_load`` generates it.
@@ -74,12 +76,13 @@ def scalar_load_bounds(
 
 @dataclass(frozen=True)
 class VmemScalarLoad:
-    """Runtime scalar indices on the minor dims of a VMEM-resident tensor.
+    """Scalar indices selecting elements or blocks of a resident tensor.
 
     Attributes:
-        scalar_dims: Minor dims (non-negative) that are scalar-indexed.
-        extents: Extent of each scalar dim in the kernel's resident VMEM
-            window (tensor dim size capped by the configured block size).
+        scalar_dims: Tensor dimensions (non-negative) that are scalar-indexed.
+        extents: Size of each scalar-indexed dimension in the resident window.
+            Leading dimensions are reduced only by the outer program's grid,
+            not by a smaller tile in an inner device loop.
         static_indices: Normalized literal index for each scalar dim, or
             ``None`` when the index is only known at runtime.
         patterns: Per-dim indexing pattern, one entry per tensor dim.
@@ -116,16 +119,31 @@ def _resident_extent(state: CodegenState, tensor: torch.Tensor, dim: int) -> int
 
     dim_size = tensor.shape[dim]
     if not isinstance(dim_size, int):
+        from .tracing_ops import _resolve_dim_size
+
+        dim_size = _resolve_dim_size(
+            dim_size, CompileEnvironment.current(), state.config
+        )
+    if not isinstance(dim_size, int):
         raise NotImplementedError(
             "Pallas VMEM scalar load requires a static resident extent"
         )
 
-    tiling = state.device_function.pallas_tensor_dim_tilings[id(tensor)][dim]
-    if tiling.can_tile and len(tiling.block_ids) == 1:
+    tensor_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(tensor))
+    tiling = tensor_tilings[dim] if tensor_tilings is not None else None
+    if tiling is not None and tiling.can_tile and len(tiling.block_ids) == 1:
+        block_id = tiling.block_ids[0]
+        if dim < tensor.ndim - 2:
+            grid = state.device_function.pid
+            grid_block_ids = (
+                {axis.block_id for axis in grid.pid_info} if grid is not None else set()
+            )
+            if block_id not in grid_block_ids:
+                # Inner-loop indexing does not shrink the outer resident ref.
+                # A leading runtime index must still select that full axis.
+                return dim_size
         block_size = (
-            CompileEnvironment.current()
-            .block_sizes[tiling.block_ids[0]]
-            .from_config(state.config)
+            CompileEnvironment.current().block_sizes[block_id].from_config(state.config)
         )
         if not isinstance(block_size, int):
             raise NotImplementedError(
@@ -151,25 +169,24 @@ def classify_vmem_scalar_load(
 ) -> VmemScalarLoad | None:
     """Decide whether a load needs the VMEM scalar-load lowering.
 
-    ``None`` means an ordinary load: no runtime scalar index on the two minor
-    dims, or a form Mosaic already lowers (static 32-bit extracts).
+    ``None`` means an ordinary load: no scalar index, or a form Mosaic already
+    lowers directly, such as static 32-bit extracts.
     """
     from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.host_function import HostFunction
     from helion._compiler.pallas.plan_tiling import NonePattern
 
-    if (
-        tensor.dtype.itemsize > 4
-        or state.device_function.pallas_memory_space.get(id(tensor))
-        != PallasMemorySpace.VMEM
-    ):
+    memory_space = state.device_function.pallas_memory_space.get(id(tensor))
+    if tensor.dtype.itemsize > 4 or memory_space not in (None, PallasMemorySpace.VMEM):
+        return None
+    if memory_space is None and tensor in HostFunction.current().tensor_to_origin:
+        # An unplaced host allocation is not evidence of a resident value.
         return None
     patterns = tuple(p for p in indexing_patterns if not isinstance(p, NonePattern))
     if len(patterns) != tensor.ndim:
         return None
     scalar_dims = [
-        d
-        for d in range(max(0, tensor.ndim - 2), tensor.ndim)
-        if _is_scalar_index_pattern(patterns[d])
+        d for d in range(tensor.ndim) if _is_scalar_index_pattern(patterns[d])
     ]
     if not scalar_dims:
         return None
@@ -264,10 +281,31 @@ def _roll_load_expr(
         if static is not None or load.extents[dim] == 1:
             selectors[axis] = str(static if static is not None else 0)
             continue
-        alignment = 128 if dim == tensor.ndim - 1 else sublane_tiling
+        alignment = (
+            1
+            if dim < tensor.ndim - 2
+            else 128
+            if dim == tensor.ndim - 1
+            else sublane_tiling
+        )
         padded_extent = load.extents[dim] + (-load.extents[dim]) % alignment
         pads[axis] = (0, padded_extent - load.extents[dim])
-        rolls.append((axis, f"-({index_parts[dim]}) % {padded_extent}"))
+        # Other tiled accesses can pad a host argument. A leading-axis roll
+        # must use the resident Ref's actual size, not the logical tensor size.
+        roll_extent = (
+            f"({ref_name}).shape[{dim}]"
+            if dim < tensor.ndim - 2
+            else str(padded_extent)
+        )
+        index = index_parts[dim]
+        if dim < tensor.ndim - 2:
+            # Negative indices refer to logical rows, not host padding. When
+            # the Ref is unpadded, modulo already implements that convention.
+            index = (
+                f"({index} if {roll_extent} == {load.extents[dim]} else "
+                f"{normalize_negative_scalar_index(index, str(load.extents[dim]))})"
+            )
+        rolls.append((axis, f"-({index}) % ({roll_extent})"))
         selectors[axis] = "0"
     if expand_leading and rolls:
         pads[0] = (0, sublane_tiling - 1)
@@ -276,12 +314,19 @@ def _roll_load_expr(
         value = f"jnp.pad({value}, {tuple(pads)!r})"
     for axis, shift in rolls:
         value = f"pltpu.roll({value}, {shift}, axis={axis})"
-    if tensor.dtype != torch.bool and tensor.dtype.itemsize < 4:
+    # Selecting a leading block keeps whole physical sublanes and lanes. Only
+    # an extract on a packed minor dimension needs a wider element dtype.
+    needs_widening = (
+        tensor.dtype != torch.bool
+        and tensor.dtype.itemsize < 4
+        and any(dim >= tensor.ndim - 2 for dim in load.scalar_dims)
+    )
+    if needs_widening:
         widen_dtype = "jnp.float32" if tensor.dtype.is_floating_point else "jnp.int32"
         value = f"lax.convert_element_type({value}, {widen_dtype})"
 
     result = f"{value}[{', '.join(selectors)}]"
-    if _is_32bit(tensor.dtype):
+    if tensor.dtype != torch.bool and not needs_widening:
         return expr_from_string(result)
     return expr_from_string(
         f"lax.convert_element_type({result}, {env.backend.dtype_str(tensor.dtype)})"

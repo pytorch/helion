@@ -1902,23 +1902,34 @@ class TestWorklistLoopDispatch(unittest.TestCase):
             self.assertIn("< 15", line)
             self.assertNotIn("< 7", line)
 
-    def test_emit_pipeline_clamp_fails_closed_for_other_accesses(self):
-        offsets = _offsets([12, 20, 5, 30])
-        length = int(offsets[-1])
-        args = (
-            torch.randn(length, 4, 128),
-            torch.randn(length, 4, 128),
-            offsets,
-        )
+    @skipUnlessPallas("ordered loads require a real TPU")
+    def test_emit_pipeline_preserves_nested_and_scalar_loads(self):
+        sizes = [12, 20, 5, 30]
+        offsets = _offsets(sizes).to(DEVICE)
+        length = sum(sizes)
+        q = torch.randn(length, 4, 128, device=DEVICE)
+        k = torch.randn_like(q)
+        args = (q, k, offsets)
         for kernel in (_nested_ordered_load_kernel, _offset_ordered_load_kernel):
             with self.subTest(kernel=kernel.fn.__name__):
-                code = kernel.bind(args).to_triton_code(
-                    _worklist_config([8, 8], loop_type="emit_pipeline")
+                _code, result = code_and_output(
+                    kernel, args, **_worklist_config([8, 8], loop_type="emit_pipeline")
                 )
-                self.assertIn("_ds_pad_dims=[(2, 0, 8, 7)]", code)
-                if kernel is _nested_ordered_load_kernel:
-                    self.assertIn("lax.cond", code)
-                    self.assertNotIn("_region_clean", code)
+                expected = q.cpu().clone()
+                values = k.cpu()
+                start = 0
+                for size in sizes:
+                    end = start + size
+                    total = values[start:end].sum(dim=0)
+                    if kernel is _nested_ordered_load_kernel:
+                        total = total * 2
+                    else:
+                        for begin in range(start, end, 8):
+                            if begin + 7 < length:
+                                total = total + values[begin + 7]
+                    expected[start:end] += total
+                    start = end
+                torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
 
     def test_clean_region_splits_off_the_masked_tail(self):
         """A proven candidate automatically emits a guarded body pair whose

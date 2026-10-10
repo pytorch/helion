@@ -1168,6 +1168,86 @@ class TestPallas(TestCase):
                 expected[:active] = x.cpu()[:active] + 1
                 torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
+    def test_scalar_selected_panel_ragged_root_tiles(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_panel(weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                weights.shape[1:], dtype=weights.dtype, device=weights.device
+            )
+            for rows, columns in hl.tile(weights.shape[1:]):
+                value = weights[ids[0], rows, columns]
+                out[rows, columns] = value + hl.full(
+                    [rows, columns], 1, dtype=weights.dtype
+                )
+            return out
+
+        ids = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        for dtype in (torch.float32, torch.bfloat16):
+            for shape in ((4, 5, 65), (4, 16, 128)):
+                weights = torch.randn(shape, device=DEVICE, dtype=dtype)
+                _, result = code_and_output(
+                    add_panel, (weights, ids), block_sizes=[16, 128]
+                )
+                torch.testing.assert_close(
+                    result.cpu(), weights.cpu()[2] + 1, rtol=0, atol=0
+                )
+
+    def test_leading_scalar_selection_with_padded_input(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sum_and_select(
+            x: torch.Tensor, ids: torch.Tensor, masked: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty(x.shape[1:], dtype=torch.float32, device=x.device)
+            for _program in hl.grid(1):
+                total = hl.zeros([x.size(1), x.size(2)], dtype=torch.float32)
+                for rows in hl.tile(x.size(0), block_size=8):
+                    total = total + x[rows, :, :].float().sum(dim=0)
+                value = hl.load(
+                    x,
+                    [ids[0], slice(None), slice(None)],
+                    extra_mask=hl.full((), True, dtype=torch.bool) if masked else None,
+                )
+                out[:, :] = total + value.float()
+            return out
+
+        panels = torch.arange(1, 68, device=DEVICE, dtype=torch.float32)
+        for dtype in (torch.float32, torch.bfloat16):
+            x = panels[:, None, None].expand(67, 16, 128).to(dtype).contiguous()
+            for masked in (False, True):
+                selections = (-67, -1, 0, 66, 67, 72) if masked else (-67, -1, 0, 66)
+                for selected in selections:
+                    ids = torch.tensor([selected], device=DEVICE, dtype=torch.int32)
+                    _, result = code_and_output(
+                        sum_and_select, (x, ids, masked), pallas_loop_type="fori_loop"
+                    )
+                    value = (
+                        0 if masked and not 0 <= selected < 67 else selected % 67 + 1
+                    )
+                    expected = torch.full((16, 128), 2278 + value, dtype=torch.float32)
+                    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_leading_scalar_selection(self) -> None:
+        """A leading block selection preserves the tensor's packed dtype."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_block(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+            _, rows, columns = x.shape
+            out = torch.empty((rows, columns), dtype=x.dtype, device=x.device)
+            for _program in hl.grid(1):
+                values = x[:, :, :] * 2
+                out[:, :] = hl.load(values, [index[0], slice(None), slice(None)])
+            return out
+
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(8, 16, 512, dtype=dtype, device=DEVICE)
+            for selected in (0, 3, 7):
+                with self.subTest(dtype=dtype, selected=selected):
+                    index = torch.tensor([selected], dtype=torch.int32, device=DEVICE)
+                    _, result = code_and_output(select_block, (x, index))
+                    torch.testing.assert_close(
+                        result.cpu(), x.cpu()[selected] * 2, rtol=0, atol=0
+                    )
+
     def test_emit_pipeline_input_buffer_counts(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def add_tiles(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

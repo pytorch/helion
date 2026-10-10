@@ -113,9 +113,9 @@ def load_expr(
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
     if scalar_load is None:
         result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
-        result = _padded_value_for_load(state, tensor, subscript, parts, result)
     else:
         result = emit_vmem_scalar_load(tensor, active_name, parts, scalar_load)
+    result = _padded_value_for_load(state, tensor, subscript, parts, result)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if scalar_bounds is not None:
         result = expr_from_string(
@@ -313,6 +313,7 @@ def _load_mask_expr(
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -371,7 +372,11 @@ def _load_mask_expr(
 
         # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
 
-        if not isinstance(pattern, squeezing_patterns):
+        if not (
+            isinstance(pattern, squeezing_patterns)
+            or isinstance(pattern, TensorIndexPattern)
+            and pattern.index_ndim == 0
+        ):
             out_dim += 1
         tensor_dim += 1
 
@@ -448,6 +453,7 @@ def _clamped_dims(
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -477,7 +483,9 @@ def _clamped_dims(
 
         index_part = index_parts[index_part_idx]
         index_part_idx += 1
-        if isinstance(pattern, squeezing_patterns):
+        if isinstance(pattern, squeezing_patterns) or (
+            isinstance(pattern, TensorIndexPattern) and pattern.index_ndim == 0
+        ):
             tensor_dim += 1
             continue
 
