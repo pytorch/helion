@@ -511,11 +511,12 @@ def test_deepseek_v3_tp_megakernels_exchange_in_band() -> None:
             (attention.deepseek_v3_attention_nvfp4_tp, attention_args),
         ):
             code = kernel.bind(args).to_triton_code(kernel.configs[0])
-            # One store per rank pushes each word, a plain load reads each of the
-            # 4 mailboxes, one asm reloads the stale words (4 per thread), and
-            # nothing else orders the ranks.
-            assert code.count("st.relaxed.sys.global.u64") == 4
-            assert code.count("volatile=True") == 4
+            # One store per rank pushes each word pair, a plain load reads each of
+            # the 4 mailboxes and reloads it on a CTA vote, one asm reloads the
+            # stale words (4 per thread), and nothing else orders the ranks.
+            assert code.count("st.relaxed.sys.global.v2.u64") == 4
+            assert code.count("volatile=True") == 2 * 4
+            assert code.count("while inband_stale != 0:") == 1
             assert code.count("@p bra SPIN") == 1
             assert code.count("ld.volatile.global.b64") == 4 * 4
             assert "_wait_at_least" not in code
