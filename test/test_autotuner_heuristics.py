@@ -5309,6 +5309,43 @@ class TestTritonReductionHeuristicUnit(TestCase):
         self.assertEqual(seed.config["num_warps"], 8)
         self.assertEqual(seed.config["num_stages"], 1)
 
+    def test_user_tile_seed_respects_register_block_size_cap(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(
+            BlockSizeSpec(
+                block_id=0,
+                size_hint=4096,
+                min_size=32,
+                max_size=512,
+            )
+        )
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=4))
+        desc = ReductionDescriptor(
+            category=ReductionCategory.USER_TILE,
+            block_id=0,
+            graph_id=0,
+            size_hint=4096,
+            input_load_itemsize=4,
+            row_reread=True,
+        )
+        spec.reduction_kernel_fact = ReductionKernelFact(
+            reductions=(desc,),
+            live_tile_steps=(
+                (
+                    LiveTile((1, 0), (None, None), 4, "load"),
+                    LiveTile((1,), (None,), 4, "carry"),
+                ),
+            ),
+            grid_axis_block_ids=(1,),
+        )
+        env = self._reduction_env(spec)
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            seed = TritonReductionHeuristic.get_seed_config(env, MagicMock())
+        self.assertEqual(seed.config["block_sizes"], [512, 4])
+
     def test_warp_selection_descends_when_resident_warps_are_retained(
         self,
     ) -> None:
