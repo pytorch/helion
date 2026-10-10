@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import copy
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -48,6 +49,7 @@ def search(monkeypatch, phase):
     result.initial_population = 1
     result.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
     result.log = Mock()
+    result.log.autotune_tracing.return_value = nullcontext()
     result.copies = 1
     result.max_generations = 20
     result.similarity_penalty = 1.0
