@@ -848,14 +848,30 @@ class TestMetalMatmul(unittest.TestCase):
                 torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
     def test_matmul_float16(self) -> None:
-        """Float16 inputs with float32 accumulation cannot directly store fp16."""
+        """Float16 in/out with float32 accumulation stores via MPP conversion.
+
+        The cooperative store requires matching dtypes, so this mixed pair
+        takes a masked per-element convert-and-store loop instead.
+        """
+        kernel = _make_matmul_kernel([32, 32, 32])
+        for m, k, n in [(64, 64, 64), (128, 64, 256), (70, 70, 73)]:
+            with self.subTest(shape=(m, k, n)):
+                x = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
+                y = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
+                result = kernel(x, y)
+                expected = torch.mm(x, y)
+                torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
+
+    def test_matmul_float16_transposed_operand(self) -> None:
+        """Mixed fp32-acc/fp16-out store with a transposed (TN) operand."""
+        kernel = _make_matmul_kernel([32, 32, 32])
         x = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
-        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float16)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported,
-            "requires accumulator dtype to match output dtype",
-        ):
-            matmul_kernel(x, y)
+        y_base = torch.randn(128, 64, device=DEVICE, dtype=torch.float16)
+        y = y_base.t()
+        assert not y.is_contiguous()
+        result = kernel(x, y)
+        expected = torch.mm(x, y)
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
 
     def test_matmul_float16_float32_output(self) -> None:
         cfg = [helion.Config(block_sizes=[32, 32, 32], num_warps=4)]

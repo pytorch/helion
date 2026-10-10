@@ -191,6 +191,18 @@ def _emit_stmts(
                     parts,
                     indent,
                 )
+            elif _is_call_to(call, "_metal_mpp_scalar_store"):
+                # Same args as _metal_mpp_coop_store; mixed acc/out path.
+                assert isinstance(call, ast.Call)
+                setup_arg, out_name_node, out_dtype_node = call.args
+                assert isinstance(setup_arg, ast.Name)
+                _emit_mpp_scalar_store(
+                    setup_arg.id,
+                    _ast_str_value(out_name_node),
+                    _ast_str_value(out_dtype_node),
+                    parts,
+                    indent,
+                )
             elif _is_call_to(call, "_metal_mpp_threadgroup_barrier"):
                 parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_device);")
             elif _is_call_to(call, "_coop_writeback"):
@@ -605,9 +617,9 @@ def _emit_mpp_coop_store(
     *out_dtype* from the explicit MPPGraph store marker and emits
     ``_coop.store(_Cs)``.
 
-    The accumulator dtype is set in :func:`_emit_mpp_setup`; MPP handles the
-    cooperative_tensor-to-output conversion during ``store`` for supported
-    dtype combinations.
+    The accumulator dtype is set in :func:`_emit_mpp_setup`.  The
+    cooperative store requires the accumulator and output dtypes to match;
+    mixed pairs instead use :func:`_emit_mpp_scalar_store`.
     """
     pad = " " * indent
     C_var = _scoped_mpp_name(setup_name, "_C")
@@ -625,6 +637,68 @@ def _emit_mpp_coop_store(
             f"{pad}    {out_name}, dextents<int32_t, 2>({N_var}, {M_var}));",
             f"{pad}auto {Cs_var} = {C_var}.slice({tx_var} * {TILE_N_var}, {ty_var} * {TILE_M_var});",
             f"{pad}{coop_var}.store({Cs_var});",
+        ]
+    )
+
+
+def _emit_mpp_scalar_store(
+    setup_name: str,
+    out_name: str,
+    out_dtype: str,
+    parts: list[str],
+    indent: int,
+) -> None:
+    """Emit a mixed-dtype cooperative → device memory store.
+
+    Declares the same ``_C`` / ``_Cs`` output view as
+    :func:`_emit_mpp_coop_store`, then converts and stores each accumulator
+    element individually.  The cooperative ``store`` requires matching
+    dtypes, so mixed accumulator/output pairs (e.g. fp32 accumulate with
+    fp16 output) cannot use it.
+
+    Each thread visits exactly the accumulator elements it owns.  Elements are
+    written only when ``is_valid_element`` holds and the tile-local
+    coordinates are inside the matrix bounds, so partial tiles never write
+    out of bounds (unlike ``_coop.store``, the raw ``operator[]`` does no
+    destination-side masking).  Coordinates come from
+    ``get_multidimensional_index`` into the tile-local ``_Cs`` view; the
+    multidimensional index order matches the ``_Cs`` dim order, so the
+    indices transfer directly.
+    """
+    pad = " " * indent
+    C_var = _scoped_mpp_name(setup_name, "_C")
+    Cs_var = _scoped_mpp_name(setup_name, "_Cs")
+    M_var = _scoped_mpp_name(setup_name, "_M")
+    N_var = _scoped_mpp_name(setup_name, "_N")
+    TILE_M_var = _scoped_mpp_name(setup_name, "_TILE_M")
+    TILE_N_var = _scoped_mpp_name(setup_name, "_TILE_N")
+    ty_var = _scoped_mpp_name(setup_name, "_ty")
+    tx_var = _scoped_mpp_name(setup_name, "_tx")
+    coop_var = _scoped_mpp_name(setup_name, "_coop")
+    it_var = _scoped_mpp_name(setup_name, "_s_it")
+    md_var = _scoped_mpp_name(setup_name, "_s_md")
+    idx_var = _scoped_mpp_name(setup_name, "_s_idx")
+    n_base_var = _scoped_mpp_name(setup_name, "_s_n_base")
+    m_base_var = _scoped_mpp_name(setup_name, "_s_m_base")
+    parts.extend(
+        [
+            f"{pad}// MPP mixed-dtype store: convert accumulator to {out_dtype}.",
+            f"{pad}auto {C_var} = tensor<device {out_dtype}, dextents<int32_t, 2>, tensor_inline>(",
+            f"{pad}    {out_name}, dextents<int32_t, 2>({N_var}, {M_var}));",
+            f"{pad}auto {Cs_var} = {C_var}.slice({tx_var} * {TILE_N_var}, {ty_var} * {TILE_M_var});",
+            f"{pad}int {n_base_var} = (int)({tx_var} * {TILE_N_var});",
+            f"{pad}int {m_base_var} = (int)({ty_var} * {TILE_M_var});",
+            f"{pad}for (auto {it_var} = {coop_var}.begin(); {it_var} != {coop_var}.end(); ++{it_var}) {{",
+            f"{pad}    if ({coop_var}.is_valid_element({it_var})) {{",
+            f"{pad}        auto {md_var} = {coop_var}.get_multidimensional_index({it_var});",
+            f"{pad}        metal::array<int, 2> {idx_var} = {{(int){md_var}[0], (int){md_var}[1]}};",
+            # Tail elements of partial tiles address outside the matrix;
+            # operator[] performs no bounds checking, so test explicitly.
+            f"{pad}        if ({idx_var}[0] + {n_base_var} < {N_var} && {idx_var}[1] + {m_base_var} < {M_var}) {{",
+            f"{pad}            {Cs_var}[{idx_var}] = static_cast<{out_dtype}>(*{it_var});",
+            f"{pad}        }}",
+            f"{pad}    }}",
+            f"{pad}}}",
         ]
     )
 
