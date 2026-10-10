@@ -49,6 +49,7 @@ import torch
 hl: Any
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from benchmarks.cute.grouped_gemm_benchmark import GroupedGemmCase
@@ -313,6 +314,16 @@ BLOCK_M = 256
 BLOCK_N = 128
 BLOCK_K_CHOICES = (64, 128)
 BENCHMARK_LAYOUT_POLICY = f"canonical_{BENCHMARK_B_LAYOUT}_for_all_implementations"
+TIMING_PROTOCOLS = ("paired", "steady")
+DEFAULT_TIMING_PROTOCOL = "paired"
+# Steady-state timing mirrors compare_attention_backends.py: do_bench warms up
+# with the kernel under test, so every sample is taken after the GPU has
+# settled into the power state that kernel drives. The short paired window
+# instead lands inside the settling transient, which is stable for multi-ms
+# rows and bimodal for the sub-millisecond ones.
+STEADY_NUM_RUNS = 5
+STEADY_WARMUP_MS = 1000
+STEADY_REP_MS = 500
 _COMMON_PROTOCOL = {
     "capture_warmups": CAPTURE_WARMUPS,
     "thermal_warmup_ms": THERMAL_WARMUP_MS,
@@ -639,6 +650,33 @@ def _validated_capture(
     return captured, correctness
 
 
+def _bench_steady_interleaved(
+    calls: Sequence[Callable[[], object]],
+) -> list[float]:
+    """Median steady-state latencies (ms), alternating which call leads.
+
+    ``do_bench`` warms up with the call under test and then measures for
+    ``STEADY_REP_MS``, so each sample is taken after the GPU has settled.
+    Calls alternate position across runs so neither implementation always
+    measures first out of the warmup.
+    """
+
+    from triton.testing import do_bench
+
+    runs: list[list[float]] = [[] for _ in calls]
+    for run in range(STEADY_NUM_RUNS):
+        order = range(len(calls)) if run % 2 == 0 else reversed(range(len(calls)))
+        for index in order:
+            measured = do_bench(
+                calls[index],
+                warmup=STEADY_WARMUP_MS,
+                rep=STEADY_REP_MS,
+                return_mode="median",
+            )
+            runs[index].append(float(measured))
+    return [statistics.median(samples) for samples in runs]
+
+
 def run_case(
     provider: str,
     case: GroupedGemmCase,
@@ -647,6 +685,7 @@ def run_case(
     cutlass_root: Path | None,
     deepgemm_root: Path | None,
     quack_root: Path | None = None,
+    timing_protocol: str = DEFAULT_TIMING_PROTOCOL,
 ) -> dict[str, object]:
     """Validate and time one selected Helion/provider-default pair."""
 
@@ -670,11 +709,15 @@ def run_case(
             inputs.oracle,
         )
     _bench.thermal_warmup(THERMAL_WARMUP_MS)
+    replays = [helion_capture.replay, provider_capture.replay]
     with torch.random.fork_rng(devices=[device.index]):
-        helion_ms, provider_ms = _bench.bench_pre_captured_cudagraphs(
-            [helion_capture.replay, provider_capture.replay],
-            rep=BENCHMARK_REPETITIONS,
-        )
+        if timing_protocol == "steady":
+            helion_ms, provider_ms = _bench_steady_interleaved(replays)
+        else:
+            helion_ms, provider_ms = _bench.bench_pre_captured_cudagraphs(
+                replays,
+                rep=BENCHMARK_REPETITIONS,
+            )
     post_timing_checks = {
         "helion": common.check_correctness(helion_capture, inputs.oracle),
         "provider": common.check_correctness(provider_capture, inputs.oracle),
@@ -819,6 +862,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             cutlass_root=args.cutlass_root,
             deepgemm_root=args.deepgemm_root,
             quack_root=args.quack_root,
+            timing_protocol=args.timing_protocol,
         )
         for case in cases
     ]
@@ -827,6 +871,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         "schema": RESULT_SCHEMA,
         "provider": args.provider,
         "replicate": args.replicate,
+        "timing_protocol": args.timing_protocol,
         "device": device_info,
         "source": _source_identity(),
         "versions": {
@@ -989,6 +1034,7 @@ def _worker_command(
     replicate: int,
     run_dir: Path,
     roots: dict[str, Path],
+    timing_protocol: str,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1003,6 +1049,8 @@ def _worker_command(
         str(replicate),
         "--provider-run-dir",
         str(run_dir),
+        "--provider-timing-protocol",
+        timing_protocol,
     ]
     if provider in roots:
         command.extend((f"--provider-{provider}-root", str(roots[provider])))
@@ -1594,6 +1642,7 @@ def summarize_results(
     source, device, software_stack = identity
     provider_summaries = {}
     helion_configs: list[list[object]] = [[] for _ in range(row_count)]
+    timing_protocols: set[str] = set()
     for provider in PROVIDERS:
         provider_results = results_by_provider[provider]
         row_speedups: list[list[float]] = [[] for _ in range(row_count)]
@@ -1603,6 +1652,9 @@ def summarize_results(
         for result in provider_results:
             rows = cast("list[dict[str, Any]]", result["rows"])
             timing_rows = [cast("dict[str, float]", row["timings"]) for row in rows]
+            timing_protocols.add(
+                str(result.get("timing_protocol", DEFAULT_TIMING_PROTOCOL))
+            )
             helion_times = [float(timings["helion_ms"]) for timings in timing_rows]
             provider_times = [float(timings["provider_ms"]) for timings in timing_rows]
             speedups = [
@@ -1706,6 +1758,11 @@ def summarize_results(
         provider_summaries[provider] = provider_summary
     if not all(_all_equal(configs) for configs in helion_configs):
         raise RuntimeError("fixed Helion config changed across fresh workers")
+    if len(timing_protocols) != 1:
+        raise RuntimeError(
+            f"timing protocol changed across campaign workers: {sorted(timing_protocols)}"
+        )
+    timing_protocol = timing_protocols.pop()
     return {
         "schema": SUMMARY_SCHEMA,
         "providers": list(PROVIDERS),
@@ -1717,6 +1774,12 @@ def summarize_results(
         "speedup_definition": "provider_ms / helion_ms; higher favors Helion",
         "protocol": {
             **_COMMON_PROTOCOL,
+            "timing_protocol": timing_protocol,
+            "steady_runs": STEADY_NUM_RUNS if timing_protocol == "steady" else None,
+            "steady_warmup_ms": STEADY_WARMUP_MS
+            if timing_protocol == "steady"
+            else None,
+            "steady_rep_ms": STEADY_REP_MS if timing_protocol == "steady" else None,
             "rows_per_replicate": row_count,
             "row_timing_statistic": "median_ms",
             "raw_paired_samples_retained": False,
@@ -1776,7 +1839,9 @@ def _run_campaign(args: argparse.Namespace) -> int:
         run_id = f"{provider}-r{replicate}"
         run_dir = output_dir / run_id
         run_dir.mkdir()
-        command = _worker_command(provider, replicate, run_dir, roots)
+        command = _worker_command(
+            provider, replicate, run_dir, roots, args.timing_protocol
+        )
         log_path = run_dir / "worker.log"
         print(f"=== {run_id} ===", flush=True)
         returncode, run_telemetry, compute_application_samples = _run_monitored_worker(
@@ -1933,6 +1998,16 @@ def build_arg_parser(mode: str) -> argparse.ArgumentParser:
             "--provider-output-dir", dest="output_dir", type=Path, required=True
         )
         parser.add_argument(
+            "--timing-protocol",
+            dest="timing_protocol",
+            choices=TIMING_PROTOCOLS,
+            default=DEFAULT_TIMING_PROTOCOL,
+            help=(
+                "paired: interleaved cold-L2 graph replays. steady: interleaved "
+                "do_bench, which warms up with the kernel under test."
+            ),
+        )
+        parser.add_argument(
             "--cuda-visible-devices",
             default=os.environ.get("CUDA_VISIBLE_DEVICES"),
             help="one CUDA_VISIBLE_DEVICES entry (GPU UUID or index)",
@@ -1953,6 +2028,13 @@ def build_arg_parser(mode: str) -> argparse.ArgumentParser:
         dest="run_dir",
         type=Path,
         required=True,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--provider-timing-protocol",
+        dest="timing_protocol",
+        choices=TIMING_PROTOCOLS,
+        default=DEFAULT_TIMING_PROTOCOL,
         help=argparse.SUPPRESS,
     )
     return parser
