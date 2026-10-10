@@ -8,6 +8,7 @@ import contextlib
 import functools
 import math
 import os
+import sys
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
@@ -512,6 +513,17 @@ class TritonBackend(Backend):
             for x in config
             if x.startswith("_triton_config_")
         ]
+
+        from ..compile_environment import CompileEnvironment
+
+        # Generate zebin during Intel XPU compilation so parallel candidate
+        # precompilation includes native code generation, thereby reducing kernel first-launch latency.
+        if (
+            sys.platform == "linux"
+            and CompileEnvironment.current().device.type == "xpu"
+            and "_triton_config_generate_native_code" not in config
+        ):
+            args.append("generate_native_code=True")
 
         from ...autotuner.config_spec import _get_backend_tunable_keys
 
