@@ -245,14 +245,21 @@ def codegen_constant_pad_nd_pallas(ctx: LoweringContext, node: Node) -> object:
     """
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
-    pad = [int(p) for p in cast("list[int]", node.args[1])]  # static pad widths
+    pad = []
+    for width in cast("list[int | Node]", node.args[1]):
+        if isinstance(width, int):
+            pad.append(str(width))
+            continue
+        value = width.meta.get("val")
+        assert isinstance(value, (int, torch.SymInt))
+        pad.append(ctx.cg.device_function.literal_expr(value))
     value = node.args[2] if len(node.args) > 2 else node.kwargs.get("value", 0)
     ndim = node.meta["val"].ndim
     npad = len(pad) // 2
-    pad_width = [
+    pad_width: list[tuple[str, str]] = [
         (pad[2 * (ndim - 1 - j)], pad[2 * (ndim - 1 - j) + 1])
         if (ndim - 1 - j) < npad
-        else (0, 0)
+        else ("0", "0")
         for j in range(ndim)
     ]
     pw = "(" + ", ".join(f"({lo}, {hi})" for lo, hi in pad_width) + ")"

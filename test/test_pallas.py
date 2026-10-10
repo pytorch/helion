@@ -1077,6 +1077,24 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_configured_pad_width(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pad_rows(x: torch.Tensor) -> torch.Tensor:
+            width = hl.register_block_size(16, 64)
+            out = torch.empty_like(x)
+            for rows in hl.tile(x.size(0), block_size=width):
+                first_rows = hl.full([8, 128], 3, dtype=x.dtype)
+                out[rows, :] = torch.nn.functional.pad(first_rows, (0, 0, 0, width - 8))
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        for width in (16, 32, 64):
+            _, result = code_and_output(pad_rows, (x,), block_sizes=[width])
+            expected = torch.zeros_like(x.cpu())
+            for begin in range(0, 128, width):
+                expected[begin : begin + 8] = 3
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
     def test_scalar_carry_with_pre_broadcast(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def scale_steps(x: torch.Tensor, width: int) -> torch.Tensor:
