@@ -2689,6 +2689,32 @@ def cute_gqa_fixed_group_attention(q_in, k_in, v_in):
     return out.view(q_in.size())
 
 
+def _softcap_saturating_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Inputs for ``cute_softcap_attention`` whose first KV tile saturates the cap.
+
+    Queries and keys 0..127 are constant 3.0, so their raw dot product is
+    ``9 * 64 = 576`` and the log2-domain score ``576 * log2(e) / 8 ~ 104`` is
+    ``52x`` the cap of 2.0; the remaining rows and keys stay random.
+    """
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 2, 256, 64, dtype=torch.float16, device=DEVICE) for _ in range(3)
+    )
+    q[:, :, :128] = 3.0
+    k[:, :, :128] = 3.0
+    return q, k, v
+
+
+def _softcap_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * (
+        math.log2(math.e) / math.sqrt(64)
+    )
+    scores = 2.0 * torch.tanh(scores / 2.0)
+    return _attention_from_log2_scores(scores, v)
+
+
 def _flash_fired(code: str) -> bool:
     return (
         "_helion_flash_rt" in code
@@ -5663,6 +5689,54 @@ class TestCuteBackend(TestCase):
         scores = 2.0 * torch.tanh(scores / 2.0)
         expected = _attention_from_log2_scores(scores, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_softcap_saturating_scores_stay_finite(self) -> None:
+        # Scores far past the cap (``|score / cap| > 44``) overflow a naive
+        # ``exp2`` in the tanh identity; the exact path must saturate to the
+        # cap instead of turning the row NaN.
+        q, k, v = _softcap_saturating_inputs()
+        expected = _softcap_reference(q, k, v)
+        for extra in (
+            {},
+            {"cute_flash_topology": "ws_overlap", "cute_flash_packed_reduce": True},
+        ):
+            with self.subTest(**extra):
+                code, out = code_and_output(
+                    cute_softcap_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    **extra,
+                )
+                self.assertIn("softcap_t2r", code)
+                self.assertTrue(torch.isfinite(out).all().item())
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_softcap_fast_math_uses_tanh_approx(self) -> None:
+        q, k, v = _softcap_saturating_inputs()
+        # The exact path is the default; ``tanh.approx`` is tied to the
+        # ``fast_math`` setting and is never a config knob.
+        exact_code = cute_softcap_attention.bind((q, k, v)).to_triton_code(
+            helion.Config(block_sizes=[1, 128, 128])
+        )
+        self.assertRegex(exact_code, r"softcap_t2r\([^\n]*approx=False\)")
+        fast_kernel = helion.kernel(
+            cute_softcap_attention.fn,
+            backend="cute",
+            static_shapes=True,
+            fast_math=True,
+        )
+        code, out = code_and_output(
+            fast_kernel,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertRegex(code, r"softcap_t2r\([^\n]*approx=True\)")
+        self.assertNotIn("approx=False", code)
+        self.assertTrue(torch.isfinite(out).all().item())
+        torch.testing.assert_close(
+            out, _softcap_reference(q, k, v), atol=1e-2, rtol=1e-2
+        )
 
     def test_flash_attention_causal_ws_generated_bodies_parse(self) -> None:
         io_dtype = _cute_flash._flash_io_dtype_str(torch.float16)

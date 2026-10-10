@@ -53,6 +53,10 @@ class AttentionScoreModifier:
     prefix_length: int | None = None
     index_mode: str | None = None
     index_divisor: int | None = None
+    # The kernel's ``fast_math`` setting, recorded by the detector so the
+    # flash bodies can be rendered without a compile environment. Only the
+    # softcap transform reads it (``tanh.approx`` instead of the exact form).
+    fast_math: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

@@ -44,6 +44,7 @@ from ...autotuner.config_fragment import ConfigSpecFragment
 from ...autotuner.config_fragment import EnumFragment
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from ..compile_environment import CompileEnvironment
 from ..device_function import TensorArg
 from .attention_plan import ALIBI_BIAS_KIND
 from .attention_plan import CAUSAL_MASK_KIND
@@ -7509,10 +7510,14 @@ def _flash_score_transform_block(
             )
         elif modifier.kind == SOFTCAP_KIND:
             assert modifier.value_log2 is not None
+            # ``tanh.approx.f32`` is an approximation, so it follows the
+            # kernel's ``fast_math`` setting (recorded on the modifier by the
+            # detector) rather than being offered as a config knob.
             lines.append(
                 f"{indent}_helion_flash_rt.softcap_t2r("
                 f"{score_tensor}, _flash_scale_log2, "
-                f"cutlass.Float32({modifier.value_log2!r}))"
+                f"cutlass.Float32({modifier.value_log2!r}), "
+                f"approx={modifier.fast_math!r})"
             )
     if not lines:
         return ""
@@ -14169,7 +14174,6 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     ``flash_attention_tensor_plan`` gate, a False return here is a defensive
     backstop rather than an expected path.
     """
-    from ..compile_environment import CompileEnvironment
 
     df = cg.device_function
     if df.cute_state.attention_flash_block_ids is None:
