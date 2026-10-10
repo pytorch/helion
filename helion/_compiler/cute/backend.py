@@ -2061,8 +2061,10 @@ class CuteBackend(Backend):
                     and expected is not None
                     and expected.dtype == torch.float32
                 ):
-                    # Moving a recipe to its own launch must not contract a
-                    # separately rounded multiply/add across a narrowing cast.
+                    # A separately rounded multiply must not contract with a
+                    # later add across its narrowing cast: a recipe moved to
+                    # its own launch, or a product an explicit cast rounds
+                    # before more arithmetic (``mark_narrowed_fp32_multiplies``).
                     return CuteDSLOpOverrides._apply_binary_op(
                         a, b, FP32_MULTIPLY_ROUNDING_EXPR
                     )

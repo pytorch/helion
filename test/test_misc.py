@@ -57,6 +57,27 @@ from helion.runtime.settings import _get_backend
 
 @onlyBackends(["triton", "cute"])
 class TestMisc(RefEagerTestBase, TestCase):
+    def test_inplace_op_keeps_mutated_dtype(self):
+        """``half.mul_(float)`` lowers as the functional ``aten.mul`` but rounds to
+        the mutated tensor's dtype before the next op, as the in-place op does."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                acc = x[tile]
+                acc.mul_(y[tile])
+                out[tile] = acc * 1000.0
+            return out
+
+        x = torch.randn([1024], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([1024], device=DEVICE)
+        expected = x.clone()
+        expected.mul_(y)
+        expected = expected * 1000.0
+        code, result = code_and_output(fn, (x, y), block_size=128)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
 

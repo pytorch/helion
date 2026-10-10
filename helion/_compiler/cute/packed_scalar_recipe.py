@@ -11,7 +11,7 @@ from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import _clone
 from .scalar_recipe import _path
 from .scalar_recipe import _read_names
-from .scalar_recipe_rounding import is_rounded_fp32_multiply
+from .scalar_recipe import is_rounded_fp32_multiply
 
 if TYPE_CHECKING:
     from collections.abc import Callable
