@@ -1077,6 +1077,150 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_masked_private_scalar(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_scalar(
+            x: torch.Tensor, scalar: torch.Tensor, valid: torch.Tensor
+        ) -> torch.Tensor:
+            private = torch.empty((), dtype=scalar.dtype, device=scalar.device)
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                private[()] = scalar[()]
+                for rows in hl.tile(x.size(0), block_size=128):
+                    value = hl.load(private, [], extra_mask=valid[0] != 0)
+                    out[rows, :] = x[rows, :] + value.to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        for dtype in (torch.float32, torch.int32):
+            scalar = torch.tensor(3, device=DEVICE, dtype=dtype)
+            for active in (0, 1):
+                valid = torch.tensor([active], device=DEVICE, dtype=torch.int32)
+                _, result = code_and_output(
+                    add_scalar,
+                    (x, scalar, valid),
+                    pallas_internal_scratch=True,
+                    pallas_loop_type="fori_loop",
+                )
+                expected = x.cpu() + (scalar.cpu().float() if active else 0)
+                torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_private_scalar_scan(self) -> None:
+        """A private scalar table may pass results between two device loops."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def prefix_rows(counts: torch.Tensor) -> torch.Tensor:
+            entries = counts.numel()
+            prefixes = torch.empty(entries, dtype=torch.int32, device=counts.device)
+            out = torch.empty((entries, 128), dtype=torch.float32, device=counts.device)
+            for _program in hl.grid(1):
+                total = hl.zeros([1], dtype=torch.int32)
+                for entry in hl.grid(entries):
+                    total += counts[entry]
+                    prefixes[entry] = total[0]
+                for entry in hl.grid(entries):
+                    out[entry, :] = hl.full([128], prefixes[entry], dtype=torch.float32)
+            return out
+
+        for values in ([3, 0, 5, 1, 8, 2], [0, 2, 0, 11, 1, 4]):
+            counts = torch.tensor(values, dtype=torch.int32, device=DEVICE)
+            _, result = code_and_output(
+                prefix_rows,
+                (counts,),
+                pallas_loop_type="emit_pipeline",
+                pallas_internal_scratch=True,
+            )
+            expected = torch.tensor(values).cumsum(0).float()[:, None].expand(-1, 128)
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_configured_private_scalar_table(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_last_entry(x: torch.Tensor) -> torch.Tensor:
+            width = hl.register_block_size(16, 64)
+            table = torch.empty(width + 1, dtype=torch.int32, device=x.device)
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for entry in hl.grid(width + 1):
+                    table[entry] = entry * 2
+                for rows in hl.tile(x.size(0), block_size=width):
+                    out[rows, :] = x[rows, :] + table[width - 1]
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        for width in (16, 32, 64):
+            _, result = code_and_output(
+                add_last_entry,
+                (x,),
+                block_sizes=[width],
+                pallas_loop_type="emit_pipeline",
+                pallas_internal_scratch=True,
+            )
+            torch.testing.assert_close(result.cpu(), x.cpu() + (width - 1) * 2)
+
+    @skipIfPallasInterpret("Mosaic enforces physical SMEM capacity on TPU")
+    def test_private_scalar_table_target_capacity(self) -> None:
+        from jax.experimental.pallas import tpu as pltpu
+
+        from helion.runtime.pallas.launcher import _ensure_torch_tpu_cpu_export_info
+
+        _ensure_torch_tpu_cpu_export_info()
+        capacity = pltpu.get_tpu_info().smem_capacity_bytes
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def add_last_entry(x: torch.Tensor, entries: int) -> torch.Tensor:
+            entries = hl.specialize(entries)
+            table = torch.empty(entries, dtype=torch.int32, device=x.device)
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for index in hl.grid(entries):
+                    table[index] = index % 7
+                for rows, columns in hl.tile(x.shape):
+                    out[rows, columns] = x[rows, columns] + table[entries - 1]
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        fitting_entries = capacity // 4 - 4096
+        _, result = code_and_output(
+            add_last_entry,
+            (x, fitting_entries),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_internal_scratch=True,
+        )
+        torch.testing.assert_close(
+            result.cpu(), x.cpu() + (fitting_entries - 1) % 7, rtol=0, atol=0
+        )
+        with self.assertRaisesRegex(RuntimeError, "(?i)smem"):
+            _, oversized = code_and_output(
+                add_last_entry,
+                (x, capacity // 4 + 1),
+                block_sizes=[16, 128],
+                pallas_loop_type="emit_pipeline",
+                pallas_internal_scratch=True,
+            )
+            oversized.cpu()
+
+    def test_private_scratch_with_tiled_access(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def reuse_private_values(x: torch.Tensor) -> torch.Tensor:
+            table = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for entries in hl.tile(x.numel(), block_size=128):
+                    table[entries] = x[entries] * 2
+                for entries in hl.tile(x.numel(), block_size=128):
+                    out[entries] = table[entries] + table[3]
+            return out
+
+        x = torch.arange(128, dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(
+            reuse_private_values,
+            (x,),
+            pallas_loop_type="fori_loop",
+            pallas_internal_scratch=True,
+        )
+        torch.testing.assert_close(result.cpu(), x.cpu() * 2 + 6, rtol=0, atol=0)
+
     def test_configured_pad_width(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def pad_rows(x: torch.Tensor) -> torch.Tensor:
