@@ -92,6 +92,40 @@ class TileStrategyDispatch:
         if CompileEnvironment.current().backend.name == "cute":
             self._normalize_shared_tile_thread_extents()
         self._add_reduction_strategies(fn, config)
+        if CompileEnvironment.current().backend.name == "cute":
+            self._normalize_shared_reduction_thread_extents()
+
+    def _normalize_shared_reduction_thread_extents(self) -> None:
+        """Spread a reduction over a wider sibling's share of its axis.
+
+        Reductions in mutually exclusive pid branches share a thread axis
+        (``_branch_by_control_flow``) and the launch takes the widest, so a
+        narrower reduction runs surplus threads: they would read past its
+        extent, combine among themselves and race its result to the same
+        address.  As ``_normalize_shared_tile_thread_extents`` does for
+        tiles, the reduction is widened to the launch instead, masking the
+        surplus threads to its identity.  Several root loops or
+        ``hl.barrier()`` phases refuse the surplus at launch instead
+        (``_reject_multi_root_reduction_surplus``, ``_multi_phase_block_dims``),
+        and a sibling branch's free ``hl.arange`` may not widen the axis later
+        (``GenerateAST.allocate_cute_synthetic_arange_axis``).
+        """
+        device_ir = HostFunction.current().device_ir
+        if len(device_ir.grid_block_ids) != 1 or len(device_ir.phases) > 1:
+            return
+        dims = self.thread_block_dims()
+        for strategy in self.strategies:
+            if not isinstance(strategy, ReductionStrategy):
+                continue
+            count = strategy._reduction_thread_count()
+            axis = self.thread_axis_for_strategy(strategy)
+            if (
+                count > 1
+                and axis is not None
+                and axis < len(dims)
+                and dims[axis] > count
+            ):
+                strategy.use_shared_thread_extent(dims[axis])
 
     def _normalize_shared_tile_thread_extents(self) -> None:
         """Repartition sibling tile loops over their common physical launch.
