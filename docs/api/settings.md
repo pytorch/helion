@@ -82,7 +82,10 @@ signatures can skip frontend compilation and source generation with explicit
 configs, custom config selectors or disabled autotuning. In-memory dynamic
 binding and autotuning keys keep their ordinary behavior. Native-source handoff
 and PyTorch builds without Helion's `torch.compile` integration retain frontend
-compilation. Handoff uses the ordinary backend tuning path. See
+compilation. Handoff uses the ordinary backend tuning path. Generated source and
+binding entries have a shared 1 GiB disk budget; override it with
+`HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES`. Oldest written entries are evicted
+on publication. See
 {doc}`../deployment_autotuning` for its scope and cache controls.
 
 ```{eval-rst}

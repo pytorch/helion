@@ -17,6 +17,8 @@ import types
 from typing import TYPE_CHECKING
 from typing import cast
 
+from filelock import FileLock
+from filelock import Timeout
 import torch
 
 from .._argument_device import _find_argument_device
@@ -243,16 +245,13 @@ def compiled_kernel_cache_key(
     kernel: Kernel, args: Sequence[object], base_spec_key: tuple[Hashable, ...]
 ) -> str | None:
     if (
-        not kernel.settings.generated_code_cache
-        or kernel.settings.backend != "triton"
-        or kernel.settings.force_autotune
+        kernel.settings.force_autotune
         or kernel.settings.autotune_handoff
         or not supports_torch_compile_fusion()
         or kernel.settings.print_output_code
         or kernel.settings.print_repro
         or is_ref_mode_enabled(kernel.settings)
         or should_skip_cache()
-        or torch.compiler.is_compiling()
     ):
         return None
     if (
@@ -436,16 +435,31 @@ def save_generated_code(key: str, source: str) -> None:
 
 
 def _save_entry(path: Path, entry: dict[str, object]) -> None:
+    if should_skip_cache():
+        return
     temporary: Path | None = None
     try:
+        limit = int(
+            os.environ.get("HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES", str(1 << 30))
+        )
+        if limit < 0:
+            raise ValueError("HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES must be >= 0")
+        data = json.dumps(entry).encode("utf-8")
+        if len(data) > limit:
+            return
+        root = get_helion_cache_dir() / "generated_code"
         path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, delete=False
-        ) as output:
-            temporary = Path(output.name)
-            json.dump(entry, output)
-        os.replace(temporary, path)
-    except OSError as error:
+        # Serialize publication and eviction across threads/processes. Readers
+        # need no lock: an evicted artifact is an ordinary cache miss.
+        with FileLock(root / ".lock", timeout=1):
+            _evict_entries(root, path, len(data), limit)
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=path.parent, delete=False
+            ) as output:
+                temporary = Path(output.name)
+                output.write(data)
+            os.replace(temporary, path)
+    except (OSError, Timeout, ValueError) as error:
         log.warning("Could not write generated code cache entry %s: %s", path, error)
     finally:
         if temporary is not None:
@@ -453,3 +467,24 @@ def _save_entry(path: Path, entry: dict[str, object]) -> None:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 log.debug("Could not remove temporary cache file %s", temporary)
+
+
+def _evict_entries(root: Path, target: Path, incoming: int, limit: int) -> None:
+    """Keep source and binding JSON within the shared byte budget on writes."""
+    entries: list[tuple[int, Path, int]] = []
+    total = incoming
+    for path in root.rglob("*.json"):
+        if path == target:
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            # Manual cleanup can race a write despite the writers' lock.
+            continue
+        entries.append((stat.st_mtime_ns, path, stat.st_size))
+        total += stat.st_size
+    for _, path, size in sorted(entries):
+        if total <= limit:
+            break
+        path.unlink(missing_ok=True)
+        total -= size

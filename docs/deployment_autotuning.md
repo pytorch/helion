@@ -74,8 +74,15 @@ during autotuning.
 `HELION_SKIP_CACHE=1` skips both reads and writes. Entries are checksummed and
 published with atomic renames. Missing, corrupt or unreadable entries fall back
 to compilation; failed writes leave the compiled kernel usable. Remove the
-`generated_code` directory to clear it. There is no automatic eviction or size
-limit; long-running deployments should manage this directory's lifetime.
+`generated_code` directory to clear it. Source and binding entries share a
+1 GiB disk budget by default. Set `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES`
+to a nonnegative integer to change it; zero prevents new writes. Publication
+evicts the oldest written entries until the JSON files fit the budget. Entries
+larger than the budget are not persisted. Eviction can cause a later compilation
+miss, but does not affect already loaded kernels. Writers serialize eviction and
+atomic publication with a file lock; lock timeouts and filesystem errors skip
+the write without interrupting execution. The budget excludes temporary files
+and the lock file, so a write can briefly use additional disk space.
 
 The rest of this document covers strategies for pre-tuning and deploying
 tuned configs, which is the recommended approach for production workloads.
