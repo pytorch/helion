@@ -63,6 +63,10 @@ class AttentionScorePlan:
     qk_scale_log2: float
     lse_scale: float = 1.0
     modifiers: tuple[AttentionScoreModifier, ...] = ()
+    # Grouped-query attention: K/V are indexed by ``tile_b.index // kv_group``
+    # (``heads_q // heads_kv``), so they carry ``batch // kv_group`` leading
+    # entries. ``1`` is plain multi-head attention.
+    kv_group: int = 1
 
     @property
     def is_causal(self) -> bool:
