@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
@@ -457,14 +458,19 @@ class PIDInfo(NamedTuple):
         numel = int(self.numel)
         if self.block_size_var == "1":
             return numel
-        block_size = (
-            CompileEnvironment.current()
-            .block_sizes[self.block_id]
-            .from_config(DeviceFunction.current().config)
+        block_size = DeviceFunction.current().resolved_int_constexpr(
+            self.block_size_var
         )
-        if not isinstance(block_size, int) or block_size <= 0:
+        if block_size is None:
             return None
         return -(-numel // block_size)
+
+
+def _sum_pids(exprs: list[str]) -> str:
+    """Sum PID-count expressions, folding all-static terms into one literal."""
+    if exprs and all(e.isdigit() for e in exprs):
+        return str(sum(int(e) for e in exprs))
+    return " + ".join(exprs)
 
 
 @dataclasses.dataclass
@@ -488,6 +494,9 @@ class ProgramIDs(abc.ABC):
 
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for device or host."""
+        counts = [pid.static_num_pids() for pid in self.pid_info]
+        if None not in counts:
+            return str(math.prod(cast("list[int]", counts)))
         return " * ".join(
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
@@ -584,21 +593,18 @@ class ForEachProgramID(ProgramIDs):
             return []
         return [statement_from_string(f"{self.shared_pid_var} = {typed_program_id(0)}")]
 
-    def _get_cdiv_blocks(
-        self, state: CodegenState, exclude_last: bool = False
-    ) -> list[str]:
-        """Get non-empty cdiv expressions from cases."""
+    def _cdiv_sum(self, state: CodegenState, exclude_last: bool = False) -> str:
+        """Sum the non-empty cdiv expressions from cases (empty if none)."""
         cases = self.cases[:-1] if exclude_last else self.cases
-        blocks = []
-        for pid in cases:
-            cdiv = pid.total_pids_expr(is_device=True)
-            if cdiv:  # Only add non-empty cdiv expressions
-                blocks.append(cdiv)
-        return blocks
+        blocks = [
+            cdiv
+            for pid in cases
+            if (cdiv := pid.total_pids_expr(is_device=True))  # drop empty expressions
+        ]
+        return _sum_pids(blocks)
 
     def codegen_test(self, state: CodegenState) -> ast.AST:
-        blocks = self._get_cdiv_blocks(state)
-        return expr_from_string(f"{self.shared_pid_var} < ({'+ '.join(blocks)})")
+        return expr_from_string(f"{self.shared_pid_var} < ({self._cdiv_sum(state)})")
 
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
@@ -644,15 +650,13 @@ class ForEachProgramID(ProgramIDs):
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for ForEachProgramID (sum of all pids)."""
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
-        return " + ".join(cdivs)
+        return _sum_pids(cdivs)
 
     def codegen(self, state: CodegenState) -> None:
-        blocks = self._get_cdiv_blocks(state, exclude_last=True)
+        blocks = self._cdiv_sum(state, exclude_last=True)
         if blocks:
             env = CompileEnvironment.current()
-            block_expr = env.backend.cast_expr(
-                f"({'+ '.join(blocks)})", env.index_type()
-            )
+            block_expr = env.backend.cast_expr(f"({blocks})", env.index_type())
             state.codegen.statements_stack[-1].insert(
                 0,
                 statement_from_string(
@@ -669,8 +673,7 @@ class ForEachProgramID(ProgramIDs):
             return self.cases[0].codegen_grid()
 
         # When persistent kernels are not active, use the full grid size
-        host_cdivs = [pid.total_pids_expr(is_device=False) for pid in self.cases]
-        return expr_from_string(f"({'+ '.join(host_cdivs)},)")
+        return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
 
     def _prepare_persistent_body(
         self,
@@ -692,7 +695,7 @@ class ForEachProgramID(ProgramIDs):
         running = "0"
         prev_phase = self.case_phases[0]
         for idx, cdiv in enumerate(cdivs):
-            running = f"({running}) + ({cdiv})"
+            running = _sum_pids([running, cdiv])
             next_phase = (
                 self.case_phases[idx + 1]
                 if idx + 1 < len(self.case_phases)
