@@ -79,6 +79,7 @@ class GraphAnalyzer:
     def __init__(
         self,
         forward_graph: torch.fx.Graph,
+        device: torch.device,
         scalar_values: dict[str, object] | None = None,
         return_order: tuple[str, ...] | None = None,
         all_graphs: list | None = None,
@@ -86,6 +87,7 @@ class GraphAnalyzer:
         kernel_input_names: list[str] | None = None,
     ) -> None:
         self.forward_graph = forward_graph
+        self.device = device
         self.scalar_values = scalar_values or {}
         # Aligns compute-graph outputs with grad_outs (return-order).
         self.return_order = return_order
@@ -1079,7 +1081,7 @@ class GraphAnalyzer:
             device = (
                 anchor_fake.device
                 if isinstance(anchor_fake, torch.Tensor)
-                else torch.device("cuda")
+                else self.device
             )
             unit = compute_graph.call_function(
                 torch.ops.aten.zeros.default,
@@ -1404,9 +1406,7 @@ class GraphAnalyzer:
                 else:
                     resolved.append(s)
             fake = n.meta.get("val")
-            dev = (
-                fake.device if isinstance(fake, torch.Tensor) else torch.device("cuda")
-            )
+            dev = fake.device if isinstance(fake, torch.Tensor) else self.device
             fn = cg.call_function(
                 torch.ops.aten.full.default,
                 (resolved, fill_value),
@@ -1737,7 +1737,7 @@ class GraphAnalyzer:
         # empty (no stores, or xs not needed for recomputation), the backward
         # scan_op call does bw_xs[0].shape[0] to get scan_length and raises
         # IndexError.  The dummy ensures bw_xs is non-empty.
-        dummy_device: object = torch.device("cuda")
+        dummy_device: object = self.device
         if carry_phs_in_cg:
             anchor_fake = carry_phs_in_cg[0].meta.get("val")
             if isinstance(anchor_fake, torch.Tensor):
@@ -5549,6 +5549,7 @@ def backward(
                 )
         analyzer = GraphAnalyzer(
             fwd_graph,
+            bound.env.device,
             scalar_values=scalar_values,
             return_order=return_order,
             all_graphs=list(graphs),
