@@ -14,6 +14,7 @@ from torch._inductor import inductor_prims
 from torch._prims_common import is_integer_dtype
 from torch.overrides import BaseTorchFunctionMode
 
+from .. import exc
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import NoCurrentEnvironment
 from .._compiler.compile_environment import tls as ce_tls
@@ -66,10 +67,64 @@ def dispatch_reference(
 ) -> object:
     """Keep backend-selected semantic policies consistent in eager validation."""
     env = CompileEnvironment.current()
-    matched, result = env.backend.reference_override(function, args)
-    if matched:
-        return result
-    return reference(*args)
+    context = RefModeContext.current()
+    context.ref_impl_depth += 1
+    try:
+        matched, result = env.backend.reference_override(function, args)
+        if matched:
+            return result
+        return reference(*args)
+    finally:
+        context.ref_impl_depth -= 1
+
+
+# Names a device load in the error for a store into it.
+DEVICE_LOAD_NAME = "<loaded inside hl.tile/hl.grid>"
+# Marks the copies ``device_load`` returns.
+_DEVICE_LOAD_ATTR = "_helion_ref_device_load"
+
+
+def device_load(value: torch.Tensor) -> torch.Tensor:
+    """``value``, a subscript of a tensor in device code, as a load.
+
+    A load is a value in compiled code; a view would change with later stores
+    to (or in-place ops on) its base.  A view is copied, and the copy marked
+    so a store into it can be refused, as compiled code refuses a store into
+    a device tensor.
+    """
+    if not value._is_view():
+        return value
+    copy = value.clone()
+    setattr(copy, _DEVICE_LOAD_ATTR, True)
+    return copy
+
+
+def is_device_load(target: object) -> bool:
+    """Whether ``target`` is a copy ``device_load`` returned: a value, which a
+    store or atomic cannot target."""
+    return getattr(target, _DEVICE_LOAD_ATTR, False)
+
+
+def cartesian_indices(indices: list[Any]) -> list[Any]:
+    """Expand two or more one-dimensional integer index tensors to their product.
+
+    Compiled Helion indexes with several one-dimensional tensors as a
+    cartesian tile, one dim per indexer (as ``hl.load`` / ``hl.store`` do in
+    ref mode); plain PyTorch indexing would pair them elementwise.  Any other
+    index list is returned unchanged.
+    """
+    positions = [
+        i
+        for i, idx in enumerate(indices)
+        if type(idx) is torch.Tensor and is_integer_dtype(idx.dtype)
+    ]
+    if len(positions) < 2 or any(indices[i].ndim != 1 for i in positions):
+        return indices
+    grids = torch.meshgrid(*(indices[i] for i in positions), indexing="ij")
+    indices = [*indices]
+    for i, grid in zip(positions, grids, strict=True):
+        indices[i] = grid
+    return indices
 
 
 class NoCurrentRefModeContext(RuntimeError):
@@ -87,6 +142,12 @@ class RefModeContext:
         self.device_ctx = torch.device(env.device)  # pyrefly: ignore[read-only]
         self.config = config
         self.rng_seed_slot_count = 0
+        # How many device loops (``hl.tile`` / ``hl.grid``) enclose the code
+        # running now; zero in host code.
+        self.device_loop_depth = 0
+        # How many Helion API reference implementations are running; what
+        # they index internally is never a value of the kernel.
+        self.ref_impl_depth = 0
         self._initial_rng_state: torch.Tensor | None = None
         self._rng_seed_buffer: torch.Tensor | None = None
 
@@ -483,13 +544,17 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         tensor = cast("torch.Tensor", args[0])
         indices: Any = args[1]
         is_tuple = isinstance(indices, tuple)
-        indices_list = list(indices) if is_tuple else [indices]
+        indices_list = cartesian_indices(list(indices) if is_tuple else [indices])
 
         for dim, idx in enumerate(indices_list):
             if self._is_int_tensor(idx):
                 indices_list[dim] = torch.clamp(idx, min=0, max=tensor.size(dim) - 1)
 
-        return tensor[tuple(indices_list) if is_tuple else indices_list[0]]
+        result = tensor[tuple(indices_list) if is_tuple else indices_list[0]]
+        context = RefModeContext.current()
+        if context.device_loop_depth and not context.ref_impl_depth:
+            return device_load(result)
+        return result
 
     def _handle_setitem(
         self,
@@ -500,8 +565,10 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         tensor = cast("torch.Tensor", args[0])
         indices: Any = args[1]
         value: Any = args[2]
+        if is_device_load(tensor):
+            raise exc.DeviceTensorSubscriptAssignmentNotAllowed(DEVICE_LOAD_NAME)
         is_tuple = isinstance(indices, tuple)
-        indices_list = list(indices) if is_tuple else [indices]
+        indices_list = cartesian_indices(list(indices) if is_tuple else [indices])
 
         # Clamp int-tensor indices and record which were in bounds
         bounds_mask: torch.Tensor | None = None

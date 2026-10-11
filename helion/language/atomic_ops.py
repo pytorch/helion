@@ -62,6 +62,13 @@ def _to_ast_values(values: list[object]) -> list[ast.AST]:
     return out
 
 
+def _refuse_device_load_target(target: torch.Tensor, op: str) -> None:
+    from ..runtime.ref_mode import is_device_load
+
+    if is_device_load(target):
+        raise exc.AtomicOnDeviceTensor(op)
+
+
 def _ref_atomic_binop(
     target: torch.Tensor,
     index: list[object],
@@ -102,6 +109,7 @@ def _ref_apply(
     apply_fn: Callable[[torch.Tensor, tuple, object], None],
     value: object,
 ) -> None:
+    from ..runtime.ref_mode import cartesian_indices
     from .ref_tile import RefTile
 
     # Convert indices to proper format
@@ -121,7 +129,31 @@ def _ref_apply(
         if isinstance(idx, torch.Tensor) and idx.numel() > 1
     ]
 
-    if tensor_indices:
+    if len(tensor_indices) > 1:
+        # Several tensor indices broadcast together (Helion indexes several
+        # 1-D tensors as a cartesian product), so the value is indexed by the
+        # joint position.  Apply element by element so repeated indices
+        # accumulate.
+        joint_index = cartesian_indices(processed_index)
+        positions = torch.arange(target.numel(), device=target.device).view(
+            target.shape
+        )[tuple(joint_index)]  # pyrefly: ignore [bad-index]
+        values = (
+            value.expand(positions.shape).reshape(-1)
+            if isinstance(value, torch.Tensor) and value.numel() > 1
+            else None
+        )
+        for flat, position in enumerate(positions.reshape(-1).tolist()):
+            target_coords: list[int] = []
+            for size in reversed(target.shape):
+                position, coord = divmod(position, size)
+                target_coords.append(coord)
+            apply_fn(
+                target,
+                tuple(reversed(target_coords)),
+                value if values is None else values[flat],
+            )
+    elif tensor_indices:
         # Element-wise processing for tensor indices (handle first tensor index)
         i, tensor_idx = tensor_indices[0]
 
@@ -227,6 +259,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_add")
     from .ref_tile import RefTile
 
     # Convert indices for shape computation and fast path detection
@@ -331,6 +364,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_xchg")
     return _ref_atomic_binop(target, index, value, lambda old, val: val)
 
 
@@ -384,6 +418,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_and")
     return _ref_atomic_binop(target, index, value, torch.bitwise_and)
 
 
@@ -434,6 +469,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_or")
     return _ref_atomic_binop(target, index, value, torch.bitwise_or)
 
 
@@ -484,6 +520,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_xor")
     return _ref_atomic_binop(target, index, value, torch.bitwise_xor)
 
 
@@ -538,6 +575,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_max")
     return _ref_atomic_binop(target, index, value, torch.maximum)
 
 
@@ -589,6 +627,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_min")
     return _ref_atomic_binop(target, index, value, torch.minimum)
 
 
@@ -660,6 +699,7 @@ def _(
     sem: str = "relaxed",
 ) -> torch.Tensor:
     _validate_sem(sem)
+    _refuse_device_load_target(target, "atomic_cas")
     from .ref_tile import RefTile
 
     processed_index: list[object] = []
