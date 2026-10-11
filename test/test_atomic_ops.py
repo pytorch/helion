@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -23,6 +24,10 @@ from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+# Triton lowers these through tensor-descriptor (TMA) reductions and their
+# pointer fallbacks; CuTe has no tensor-descriptor indexing.
+_TENSOR_DESCRIPTOR_ATOMICS = "checks Triton tensor-descriptor atomic codegen"
 
 
 @helion.kernel()
@@ -505,7 +510,8 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(3, 4, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute", "triton"])
+    @skipIfTileIR("TileIR's atomic_rmw addf takes only f16, f32 and f64")
     def test_atomic_add_f32_into_bf16(self):
         """atomic_add of a float32 value into a bfloat16 output tensor."""
         x = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -1053,7 +1059,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 self.assertEqual(barrier, -1)
             self.assertEqual(code.find("tl.debug_barrier()", atomic) != -1, after)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton("checks the drain of a Triton TMA store before a release")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1084,7 +1090,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotEqual(drain, -1)
         self.assertLess(drain, code.index("tl.atomic_add("))
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_td_fallbacks(self):
@@ -1144,7 +1150,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotIn("desc.atomic_add(", code2)
         self.assertNotIn("cp.async.bulk.wait_group", code2)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1183,7 +1189,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotIn("out1_desc", code)
         self.assertNotIn("tl.atomic_add(out2", code)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1260,7 +1266,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_xchg", code)
             self.assertNotIn("desc.atomic_xchg", code)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1287,7 +1293,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertIn("x_desc.atomic_add(", code)
         self.assertNotIn("tl.atomic_add(", code)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")

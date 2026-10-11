@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -83,7 +84,13 @@ def _supports_fp16_dot_scaled() -> bool:
     return True
 
 
-@onlyBackends(["triton"])
+# The CuTe backend has no hl.dot_scaled lowering (BackendImplementationMissing):
+# its block-scaled tcgen05 path is matched from NVFP4 dequantize-then-dot
+# programs, not from this op.  The argument validation is backend-independent.
+_NO_CUTE_DOT_SCALED = "hl.dot_scaled has no CuTe lowering yet"
+
+
+@onlyBackends(["triton", "cute"])
 class TestDotScaled(TestCase):
     def _skip_if_fp16_dot_scaled_unsupported(self) -> None:
         if not _supports_fp16_dot_scaled():
@@ -163,6 +170,7 @@ class TestDotScaled(TestCase):
             y_scale = torch.ones(2, 4, 64, device=DEVICE, dtype=torch.float32)
             bad_3d_kernel(x, x_scale, y, y_scale)
 
+    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_codegen_contains_dot_scaled(self):
@@ -210,6 +218,7 @@ class TestDotScaled(TestCase):
         code, result = code_and_output(scaled_kernel, (x, x_scale, y, y_scale))
         self.assertIn("tl.dot_scaled(", code)
 
+    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_with_accumulator(self):
@@ -255,6 +264,7 @@ class TestDotScaled(TestCase):
         self.assertIn("tl.dot_scaled(", code)
         self.assertIn("acc=", code)
 
+    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_out_dtype_float32(self):
@@ -304,6 +314,7 @@ class TestDotScaled(TestCase):
         self.assertIn("tl.dot_scaled(", code)
         self.assertIn("out_dtype=tl.float32", code)
 
+    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_no_acc_codegen(self):
@@ -346,6 +357,7 @@ class TestDotScaled(TestCase):
         code, result = code_and_output(scaled_no_acc_kernel, (x, x_scale, y, y_scale))
         self.assertIn("tl.dot_scaled(", code)
 
+    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     def test_numerical_correctness_fp16(self):
         """Verify dot_scaled with fp16 format produces correct output.
@@ -392,6 +404,7 @@ class TestDotScaled(TestCase):
         expected = torch.mm(x.float(), y.float())
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     def test_numerical_correctness_e4m3(self):
         """Verify dot_scaled with e4m3 format produces correct output.

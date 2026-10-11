@@ -541,7 +541,10 @@ class TestDot(RefEagerTestBase, TestCase):
 
     # torch.baddbmm codegen shape is covered indirectly by broader matmul tests; skipping a brittle code-inspection here
 
-    @skipIfNotTriton("triton-specific codegen assertions")
+    @skipIfNotTriton(
+        "debug_dtype_asserts emits Triton tl.cast/tl.static_assert; the test "
+        "checks those strings and no numerics"
+    )
     @skipIfRefEager("Debug dtype codegen checks rely on compiled code")
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/772")
     def test_baddbmm_pipeline_debug_dtype_asserts(self):

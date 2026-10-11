@@ -13,7 +13,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -1217,7 +1216,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         "promoted-seed reduction_loops is only materialized in compiled mode"
     )
     @skipIfTileIR("TileIR reduction tiling differs")
-    @skipIfCute("reduction seed is Triton-only; CuTe uses its own reduction tiling")
     def test_scan_in_reduction_default_config_not_looped(self) -> None:
         """Regression: a scan (cumsum) inside a reduction over an axis co-resident with
         a wide feature must not be emitted as a LOOPED reduction. The looped path

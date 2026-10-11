@@ -415,6 +415,15 @@ class CompileEnvironment:
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
         self._backend.validate_environment()
+        if (
+            settings.debug_dtype_asserts
+            and not self._backend.supports_debug_dtype_asserts
+        ):
+            raise exc.BackendUnsupported(
+                self._backend.name,
+                "debug_dtype_asserts=True (it emits Triton tl.cast / "
+                "tl.static_assert checks)",
+            )
         if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 

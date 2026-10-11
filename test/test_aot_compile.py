@@ -15,6 +15,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion.autotuner.aot_compile import generate_standalone_file
 import helion.language as hl
@@ -35,7 +36,15 @@ def {kernel_name}(x):
 """
 
 
-@onlyBackends(["triton"])
+# The AOT file embeds the Triton launcher (default_launcher shim); CuTe AOT
+# output keeps its helion launcher import (test_cute_structural_aot*.py cover it).
+_TRITON_RUNTIME_EMBEDDING = (
+    "checks the embedded Triton launcher; CuTe AOT keeps its helion launcher"
+)
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfCute(_TRITON_RUNTIME_EMBEDDING)
 class TestAOTRuntimeEmbedding(TestCase):
     def test_invalid_runtime_contract_is_rejected(self) -> None:
         cases = (
@@ -78,7 +87,8 @@ def _aot_add_one(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
+@skipIfCute(_TRITON_RUNTIME_EMBEDDING)
 @skipIfNotCUDA()
 class TestAOTStandaloneRuntime(RefEagerTestDisabled, TestCase):
     def test_multiple_configs_share_and_execute_canonical_runtime(self) -> None:

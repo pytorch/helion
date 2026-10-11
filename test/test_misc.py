@@ -44,6 +44,7 @@ from helion._testing import code_and_output
 from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
@@ -1341,6 +1342,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertEqual(result.shape, a.shape)
 
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    @skipIfCute("inspects the Triton lowering's libdevice fp32 round-trip")
     def test_gelu_tanh_approx_bf16_triton_dtype_cast(self):
         """``F.gelu(x, approximate="tanh")`` on a bf16 input renders the
         fp32 round-trip *and* the trailing cast back to ``tl.bfloat16``.
@@ -1354,11 +1356,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         from ``libdevice.tanh`` and break callers that rely on the
         FX-level dtype.
         """
-        if _get_backend() == "cute":
-            self.skipTest(
-                "cute backend has its own splice path; this is a "
-                "triton-only dtype contract test"
-            )
 
         @helion.kernel(autotune_effort="none")
         def gelu_tanh_approx_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -1381,7 +1378,11 @@ class TestMisc(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
-    @onlyBackends(["triton"])
+    @skipIfCute(
+        "the threads of the first root race on out inside `if tile_m.begin < m`; "
+        "CuTe cannot place a CTA barrier inside a branch"
+    )
+    @onlyBackends(["triton", "cute"])
     def test_device_symint_local_not_lifted_as_host_arg(self):
         """A SymInt local assigned in an earlier root's device code leaks into
         the locals seen at the next top-level loop.  It must not be given a
@@ -1803,7 +1804,7 @@ class TestHelionTritonPrinter(TestCase):
             self.assertIn("div_floor_integer", result)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestLauncher(TestCase):
     """Launcher-agnostic contract tests — every launcher
     implementation must satisfy these regardless of which Triton
@@ -1880,6 +1881,10 @@ class TestLauncher(TestCase):
     @skipIfRefEager(
         "Inspects the bound kernel's Triton JITFunction, which doesn't "
         "exist in ref-eager mode"
+    )
+    @skipIfCute(
+        "mutates the used_global_vals guard of the kernel's Triton JITFunction; "
+        "a CuTe kernel has none"
     )
     def test_used_global_vals_mutation_raises(self) -> None:
         """Mutating a tracked global (e.g. a ``_BLOCK_SIZE_*``

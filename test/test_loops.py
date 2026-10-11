@@ -364,8 +364,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "range loop hints are only exercised on Triton and CuTe",
+    )
     def test_fixed_block_unroll_and_pipeline(self):
         @helion.kernel(static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -662,7 +664,9 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
-        "register-block-size reduction kernel exceeds CuTe thread-layout limits",
+        "CuTe cannot prove the full-slice loss_sum[:, :] rows (64) own the "
+        "lanes of the tile_bt store (BackendUnsupported: reduction lane owner "
+        "is not proven)",
     )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
@@ -997,7 +1001,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
 
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_unroll_factors(self):
         # Test configuration validation - that range_unroll_factors works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1021,7 +1028,10 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_warp_specialize(self):
         # Test configuration validation - that range_warp_specialize works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1065,7 +1075,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("warp_specialize=False", code_false)
 
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_num_stages(self):
         # Test configuration validation - that range_num_stages works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1154,7 +1167,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn(4, valid_block_ids)
 
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1195,7 +1211,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=True", code_false)
 
     @skipIfTileIR("tileir backend will ignore `range_flattens` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_flatten(self):
         # Test configuration validation - that range_flatten works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1246,7 +1265,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("shape = (32, 16)", code)
 
     @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
-    @skipIfNotTriton("static_range is Triton-specific")
+    @skipIfNotTriton(
+        "asserts tl.static_range; CuTe accepts static_ranges but emits the same loop"
+    )
     def test_static_range_2d(self):
         @helion.kernel()
         def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:
@@ -1302,7 +1323,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.static_range", code_true)
 
     @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
-    @skipIfNotTriton("static_range is Triton-specific")
+    @skipIfNotTriton(
+        "asserts tl.static_range; CuTe accepts static_ranges but emits the same loop"
+    )
     def test_static_range_scalar(self):
         @helion.kernel()
         def nested_loop_kernel_scalar(x: torch.Tensor) -> torch.Tensor:
@@ -1352,15 +1375,17 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.range", code_false)
         self.assertIn("tl.static_range", code_true)
 
-    @unittest.skip("TODO(joydddd): handle constexpr type casting.")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "static_ranges is only exercised on Triton and CuTe",
+    )
     def test_static_range_casting(self):
         @helion.kernel()
         def nested_loop_kernel_w_casting(x: torch.Tensor) -> torch.Tensor:
             world_size = 4
-            # Outer loop becomes grid (no tl.range)
             for tile_outer in hl.tile(x.size(0)):
-                # Inner loop becomes device loop with tl.range / tl.static_range
-                # Specialize on x.size(1) to allow range_staitic
+                # A static range makes ``rank`` a compile-time int, which the
+                # float add must cast.
                 for rank in range(world_size):
                     x[tile_outer] = x[tile_outer] + rank
             return x
@@ -1375,10 +1400,15 @@ class TestLoops(RefEagerTestBase, TestCase):
             static_ranges=[True],
         )
 
-        torch.testing.assert_close(result, x + 5)
-        self.assertIn("tl.static_range", code)
+        torch.testing.assert_close(result, x + 6)
+        if _get_backend() == "triton":
+            # CuTe accepts static_ranges but emits the same loop either way.
+            self.assertIn("tl.static_range", code)
 
-    @skipIfNotTriton("L2 grouping is Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the L2-grouped program id mapping Triton and CuTe share",
+    )
     def test_l2_grouping_3d(self):
         """Test L2 grouping with 3D tensors - grouping should apply to innermost 2 dimensions."""
 
@@ -1407,7 +1437,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("group_id", code)
         self.assertIn("inner_2d_pid", code)
 
-    @skipIfNotTriton("L2 grouping is Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the L2-grouped program id mapping Triton and CuTe share",
+    )
     def test_l2_grouping_4d(self):
         """Test L2 grouping with 4D tensors - grouping should apply to innermost 2 dimensions."""
 
@@ -1441,7 +1474,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("pid_1 = inner_2d_pid % num_pid_in_group // group_size_m", code)
         # L2 grouping should be working correctly now
 
-    @skipIfNotTriton("L2 grouping is Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the L2-grouped program id mapping Triton and CuTe share",
+    )
     def test_l2_grouping_with_loop_order(self):
         """Test L2 grouping with loop order permutation - should apply to fastest varying dims."""
 
@@ -1606,7 +1642,10 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts how Triton's num_stages and tl.range unroll/pipeline hints "
+        "interact; CuTe accepts the keys but emits no such hints"
+    )
     @skipIfXPU("Accuracy issue on XPU backend")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
@@ -1703,9 +1742,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(fn(x), x)
 
     @skipIfRefEager("inspects generated code; ref eager never lowers a kernel")
-    @skipIfNotTriton(
-        "asserts on Triton's rendered bound; Pallas lowers a dependent tile "
-        "bound through its own loop codegen and never reaches this path"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts on the rendered bound; Pallas lowers a dependent tile "
+        "bound through its own loop codegen and never reaches this path",
     )
     def test_min_max_over_derived_tile_edge_keeps_its_own_formula(self):
         """A tile edge folded into ``min``/``max`` must keep its own formula.
@@ -1766,11 +1806,23 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Each edge renders its own formula; the offset alone would mean begin.
         # The id case also pins the parenthesization: unbracketed, ``2 *
         # offset_0 // BLOCK`` would floor-divide the product instead.
+        if _get_backend() == "cute":
+            end, count, tile_id = (
+                "tile_offset_0 + _BLOCK_SIZE_0",
+                "(200 - begin_0 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0",
+                "2 * (tile_offset_0 // _BLOCK_SIZE_0)",
+            )
+        else:
+            end, count, tile_id = (
+                "offset_0 + _BLOCK_SIZE_0",
+                "tl.cdiv(",
+                "2 * (offset_0 // _BLOCK_SIZE_0)",
+            )
         for label, kernel, fragment in (
-            ("end/min", end_min, "offset_0 + _BLOCK_SIZE_0"),
-            ("end/max", end_max, "offset_0 + _BLOCK_SIZE_0"),
-            ("count", count_min, "tl.cdiv("),
-            ("id", id_min, "2 * (offset_0 // _BLOCK_SIZE_0)"),
+            ("end/min", end_min, end),
+            ("end/max", end_max, end),
+            ("count", count_min, count),
+            ("id", id_min, tile_id),
         ):
             with self.subTest(edge=label):
                 # Codegen the declared config, not the spec default: the
@@ -1829,7 +1881,10 @@ class TestLoops(RefEagerTestBase, TestCase):
             self.assertIn("tl.debug_barrier()", code)
 
     @skipIfRefEager("reduction rolling is a codegen-time transformation")
-    @skipIfNotTriton("rolled reduction loops are Triton codegen-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the rolled loop in Triton/CuTe codegen",
+    )
     def test_reduction_loop_rolling_emits_inner_for_loop(self):
         """With ``reduction_loop`` set, the per-tile reduction is rolled into
         an explicit inner Triton for-loop over chunks of the reduction dim.
@@ -1857,12 +1912,18 @@ class TestLoops(RefEagerTestBase, TestCase):
             reduction_loop=32,
         )
         # Rolled reductions emit an inner ``for r0_<n> in tl.range(...)`` loop
-        # walking chunks of the reduction dim; the un-rolled path computes the
-        # whole reduction with a single ``tl.sum`` and has no such for-loop.
+        # (CuTe: ``for roffset_<n> in range(...)``) walking chunks of the
+        # reduction dim; the un-rolled path computes the whole reduction with a
+        # single ``tl.sum`` and has no such for-loop.
+        rolled_loop = (
+            r"for\s+roffset_\d+\s+in\s+range\("
+            if _get_backend() == "cute"
+            else r"for\s+\w+\s+in\s+tl\.range\("
+        )
         self.assertRegex(
             code,
-            r"for\s+\w+\s+in\s+tl\.range\(",
-            msg="expected an inner reduction for-loop in the generated Triton code",
+            rolled_loop,
+            msg="expected an inner reduction for-loop in the generated code",
         )
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 

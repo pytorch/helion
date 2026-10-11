@@ -14,7 +14,6 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -1028,9 +1027,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     @unittest.skipIf(
         "PYTEST_XDIST_WORKER" in os.environ,
         "Benchmark timing unreliable under pytest-xdist",
-    )
-    @skipIfCute(
-        "register caching does not beat re-gather on cute: runtime dominated by two-stage shared reductions"
     )
     @skipIfMTIA(
         "Triton-MTIA: both layernorm kernels exceed the 14 circular-buffer limit; see T280008478"

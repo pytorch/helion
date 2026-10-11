@@ -19,9 +19,11 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessPallas
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 _FREE = helion.OutputCodeOptions(allow_helion_deps=False)
 _JAX = helion.OutputCodeOptions(allow_helion_deps=False, jax_fn=True)
@@ -145,17 +147,36 @@ def _import_code(code: str, name: str, tmp: str) -> Any:
     return mod
 
 
-@onlyBackends(["triton"])
-@skipIfRefEager("to_code compiles real Triton code; not meaningful in ref-eager")
-class TestToCodeTriton(TestCase):
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("to_code compiles real kernels; not meaningful in ref-eager")
+class TestToCode(TestCase):
     def test_default_still_has_helion_deps(self) -> None:
         x = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
         # options=None (default) keeps the original to_code behavior, which still
         # depends on helion at runtime (here: the launcher import).
         code = add.bind((x, y)).to_code()
-        self.assertIn("from helion.runtime import default_launcher", code)
+        launcher = (
+            "default_cute_launcher" if _get_backend() == "cute" else "default_launcher"
+        )
+        self.assertIn(f"from helion.runtime import {launcher}", code)
 
+    def test_to_triton_code_alias_unchanged(self) -> None:
+        x = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
+        bound = add.bind((x, y))
+        # Back-compat: to_triton_code is an alias for to_code's default behavior.
+        self.assertEqual(bound.to_triton_code(), bound.to_code())
+
+
+# Helion-free output needs a dependency-free launcher; CuTe's launcher and the
+# device helpers its kernels import still live in helion
+# (CuteBackend inherits Backend.dependency_free_launcher_info, which raises
+# NotImplementedError).
+@onlyBackends(["triton", "cute"])
+@skipIfCute("to_code(allow_helion_deps=False) needs a helion-free CuTe launcher")
+@skipIfRefEager("to_code compiles real Triton code; not meaningful in ref-eager")
+class TestToCodeTriton(TestCase):
     def test_allow_helion_deps_false_has_no_helion_import(self) -> None:
         x = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
@@ -177,13 +198,6 @@ class TestToCodeTriton(TestCase):
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         code = add.bind((x, y)).to_code(options=_FREE)
         _run_add_no_helion(code, "add", (128, 128))
-
-    def test_to_triton_code_alias_unchanged(self) -> None:
-        x = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
-        y = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
-        bound = add.bind((x, y))
-        # Back-compat: to_triton_code is an alias for to_code's default behavior.
-        self.assertEqual(bound.to_triton_code(), bound.to_code())
 
     def test_persistent_kernel_get_num_sm_via_shim(self) -> None:
         """A persistent kernel calls ``helion.runtime.get_num_sm`` to size its

@@ -65,6 +65,10 @@ class TritonBackend(Backend):
         return False
 
     @property
+    def supports_debug_dtype_asserts(self) -> bool:
+        return True
+
+    @property
     def supports_eager_prepared_call(self) -> bool:
         return True
 
