@@ -31,6 +31,8 @@ from ...language import _decorators
 from ...language import _tracing_ops
 from ...language.atomic_ops import ATOMIC_OPS
 from ...language.creation_ops import full
+from ...language.matmul_ops import dot as hl_dot
+from ...language.matmul_ops import dot_scaled as hl_dot_scaled
 from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
@@ -70,6 +72,8 @@ from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
+from .cute_fx_walk import build_inner_outputs_index
+from .cute_fx_walk import reach_matmul_anchors
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
 from .cute_reshape import _resolve_tile_extent
 from .cute_reshape import check_memory_mask_rebound
@@ -2957,6 +2961,10 @@ def _(state: CodegenState) -> ast.AST:
         maybe_value_node = state.fx_node.args[2]
         if isinstance(maybe_value_node, torch.fx.Node):
             value_node = maybe_value_node
+    if value_node is None or not reach_tcgen05_matmul_anchors(state, value_node):
+        # The matmul's own store (its epilogue) is taken over with its
+        # addressing; any other store must not read a placeholder.
+        reject_reads_of_collective_placeholders(state, "a store")
 
     # Before any store path: a subscript that binds a value dim to another
     # block id needs the exchanged value, whichever path stores it.  On a
@@ -5590,6 +5598,51 @@ def _cute_load_eviction_slot(state: CodegenState) -> int:
     return slot
 
 
+_CUTE_MATMUL_TARGETS = frozenset(
+    {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+        hl_dot,
+        hl_dot_scaled,
+    }
+)
+
+
+def reject_reads_of_collective_placeholders(state: CodegenState, what: str) -> None:
+    """Refuse an access computed from a load a collective matmul reads itself.
+
+    Such a load (an operand, or a worklist entry its grouped scheduler reads
+    from its own tables) stands in as a zero placeholder, so any other
+    statement computed from it, a side store of ``worklist[work_id, 3]`` for
+    instance, would read 0.
+    """
+    node = state.fx_node
+    handled = state.device_function.cute_state.collective_handled_loads
+    if node is None or not handled:
+        return
+    # A matmul's result is not a read of its operands: stop the walk there.
+    matmuls = {
+        candidate
+        for graph_info in state.codegen.codegen_graphs
+        for candidate in graph_info.graph.nodes
+        if candidate.target in _CUTE_MATMUL_TARGETS
+    }
+    inner_outputs = build_inner_outputs_index(state)
+    for operand in node.all_input_nodes:
+        if reached := handled & reach_matmul_anchors(
+            operand,
+            target_fx_nodes={*handled, *matmuls},
+            inner_outputs_by_graph_id=inner_outputs,
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{what} reads {min(n.name for n in reached)}, a load the "
+                "collective matmul reads itself (only a placeholder here)",
+            )
+
+
 def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
     """Whether a collective matmul makes this load a placeholder.
 
@@ -5606,6 +5659,7 @@ def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
     cute_state = state.device_function.cute_state
     if cute_state.is_collective_handled_load(node):
         return True
+    reject_reads_of_collective_placeholders(state, f"{node.name}'s index")
     if not cute_state.suppress_root_lane_loops:
         return False
     val = node.meta["val"]

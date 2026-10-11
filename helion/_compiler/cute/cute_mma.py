@@ -2845,6 +2845,70 @@ def _owned_scalar_statement_pass_rewrite_plan(
     return tuple(replacement_plan)
 
 
+def _grouped_scaffold_value_escapes(
+    cg: GenerateAST, node: Node, matmul_node: Node
+) -> bool:
+    """Whether ``node`` reaches a statement the grouped matmul does not take over.
+
+    The grouped worklist schedule reads the worklist from its own tables and
+    rewrites the scalar scaffolding the kernel computed from it to constants.
+    That is only sound while the scaffolding feeds nothing but the matmul (its
+    operand loads and their masks) and the store of its result (addressing
+    and mask): a side statement of ``store_m`` would read the constant.
+    """
+    from ...language import _tracing_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ...language.memory_ops import store
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import reach_matmul_anchors
+
+    graphs = {graph.graph_id: graph for graph in cg.codegen_graphs}
+    inner_outputs = build_inner_outputs_index_from_graphs(cg.codegen_graphs)
+    seen: set[Node] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        for user in current.users:
+            if user is matmul_node or user in seen:
+                continue
+            seen.add(user)
+            if user.target is store or user.target in ATOMIC_OPS:
+                value = user.args[2]
+                if not (
+                    isinstance(value, Node)
+                    and reach_matmul_anchors(
+                        value,
+                        target_fx_nodes={matmul_node},
+                        inner_outputs_by_graph_id=inner_outputs,
+                    )
+                ):
+                    return True
+                continue
+            if user.op == "call_function" and _tracing_ops.is_for_loop_target(
+                user.target
+            ):
+                graph_id, _begin, _end, loop_args = user.args[:4]
+                assert isinstance(graph_id, int) and isinstance(loop_args, list)
+                placeholders = list(graphs[graph_id].graph.find_nodes(op="placeholder"))
+                stack.extend(
+                    placeholder
+                    for arg, placeholder in zip(loop_args, placeholders, strict=False)
+                    if arg is current
+                )
+                continue
+            if (
+                user.op != "call_function"
+                or user.target is _tracing_ops._if
+                or (
+                    isinstance(user.target, torch._ops.OpOverload)
+                    and user.target._schema.is_mutable
+                )
+            ):
+                return True
+            stack.append(user)
+    return False
+
+
 def _apply_owned_scalar_statement_pass_rewrite(
     cg: GenerateAST,
     replacement_plan: tuple[tuple[int, list[ast.AST], int, ast.AST], ...],
@@ -4956,18 +5020,24 @@ def _mma_epi_tidx_expr(*, lane_idx: str, warp_idx: str, epi_active: str) -> str:
     )
 
 
-def _block_axis_mma_role_coordinate_plan(
-    cg: GenerateAST,
+def _launch_axis_mma_role_coordinate_plan(
     *,
-    m_block_id: int,
-    n_block_id: int,
     mma_m_thread_extent: int,
     mma_active_n_threads: int,
 ) -> _MmaRoleCoordinatePlan:
-    """Return the current block-axis-backed MMA role-coordinate plan."""
+    """Return MMA role coordinates on the tcgen05 role launch.
+
+    The launch is ``(physical_m_threads, launched_warps, 1)``
+    (``CuteTcgen05MatmulPlan.block_shape``): the M row on x and the role warps
+    on y, whichever thread axes the root tile strategy gave the M and N
+    blocks.  A loop order that swaps them (``loop_orders=[[1, 0]]``) launches
+    the same shape, so reading the blocks' own axes would put the M
+    coordinate on the warp index (the edge-tile operand copies then filled
+    shared memory from the wrong threads).
+    """
     return _MmaRoleCoordinatePlan(
-        mma_m_coord=_physical_mma_coord_expr(cg, m_block_id),
-        mma_n_coord=_physical_mma_coord_expr(cg, n_block_id),
+        mma_m_coord="cutlass.Int32(cute.arch.thread_idx()[0])",
+        mma_n_coord="cutlass.Int32(cute.arch.thread_idx()[1])",
         mma_m_thread_extent=mma_m_thread_extent,
         mma_active_n_threads=mma_active_n_threads,
     )
@@ -9951,6 +10021,16 @@ def _emit_mma_pipeline(
                         rhs_rank3_worklist_store_info.extent_load: "cutlass.Int32(0)",
                     }
                 )
+        assert fx_node is not None
+        if escaped := [
+            scaffold.name
+            for scaffold in segment_scalar_replacements
+            if _grouped_scaffold_value_escapes(cg, scaffold, fx_node)
+        ]:
+            return _unsupported_schedule(
+                f"the worklist scaffolding ({', '.join(sorted(escaped))}) the "
+                "schedule replaces feeds statements beside the matmul"
+            )
         segment_expr_rewrite_plan = _owned_scalar_statement_expr_rewrite_plan(
             cg,
             segment_scalar_replacements,
@@ -11349,10 +11429,7 @@ def _emit_mma_pipeline(
                     mma_active_n_threads=mma_phys_n,
                 )
             else:
-                mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
-                    cg,
-                    m_block_id=m_block_id,
-                    n_block_id=n_block_id,
+                mma_role_coordinates = _launch_axis_mma_role_coordinate_plan(
                     mma_m_thread_extent=mma_physical_m_threads,
                     mma_active_n_threads=mma_phys_n,
                 )
