@@ -1701,6 +1701,7 @@ class CuteBackend(Backend):
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cross_loop_pipeline"
             or key
             in (
                 "cute_split_k_workspace",
@@ -1736,6 +1737,13 @@ class CuteBackend(Backend):
         ):
             return True
         return super().supports_config_key(key)
+
+    def cross_loop_pipelines(self) -> tuple[str, ...]:
+        # Implicit tile dependencies lower like explicit ``hl.barrier()``
+        # phases (persistent phase loops + grid barrier).  The static/dynamic
+        # pipelines' readiness counters, task events and outlined roots are
+        # Triton codegen.
+        return ("barrier",)
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (

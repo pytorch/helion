@@ -39,6 +39,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
@@ -1237,7 +1238,75 @@ def guarded_row_pair(
     return out1, out2, total
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+class TestCrossLoopBarrierPipeline(RefEagerTestBase, TestCase):
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_default_pipeline_orders_roots_with_a_grid_barrier(self) -> None:
+        x = torch.arange(2 * 96, device=DEVICE, dtype=torch.float32).reshape(2, 96)
+        row = torch.arange(64, device=DEVICE, dtype=torch.float32).reshape(1, 64)
+        wide = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        flat = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        views = torch.arange(32 * 128, device=DEVICE, dtype=torch.float32)
+        views = views.reshape(32, 128)
+        cases = (
+            (nested_store_chain, (x[:, :64],), [], (x[:, :64] + 1) * 2),
+            (nested_load_store_chain, (wide,), [1, 16], (wide + 1) * 2 + 3),
+            (cartesian_affine_chain, (x[:, :64],), [1, 16, 1, 32], (x[:, :64] + 1) * 2),
+            (
+                three_way_affine_chain,
+                (x,),
+                [1, 16, 1, 16],
+                (x[:, :32] + x[:, 32:64] + x[:, 64:]) + 3,
+            ),
+            (
+                multi_producer_join,
+                (flat, flat + 3),
+                [16, 16, 16],
+                flat + 1 + (flat + 3) * 2,
+            ),
+            (singleton_root_join, (row,), [1, 16, 1, 16], torch.sum(row * 2, dim=-1)),
+            (
+                streamed_singleton_reduction,
+                (wide,),
+                [1, 16],
+                torch.sum(wide + 1, dim=-1) + wide[:, 0] + 1,
+            ),
+            (size_one_view_chain, (views,), [4, 1, 4, 32], ((views + 1) * 2)[None]),
+        )
+        for kernel, args, block_sizes, expected in cases:
+            with self.subTest(kernel=kernel.name):
+                code, out = code_and_output(
+                    kernel,
+                    args,
+                    block_sizes=block_sizes,
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                torch.testing.assert_close(out, expected)
+                self.assertIn("grid_barrier(", code)
+                self.assertNotIn("tile_dependency_", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_zero_task_roots_do_not_allocate_task_events(self) -> None:
+        x = torch.empty((0, 64), device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            cartesian_affine_chain,
+            (x,),
+            block_sizes=[1, 16, 1, 32],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        self.assertEqual(out.shape, x.shape)
+        self.assertNotIn("tile_dependency_", code)
+
+
+@skipIfNotTriton("static/dynamic cross-loop pipelines are Triton-only codegen")
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     def assertUsesExactReadiness(self, code: str) -> None:
         self.assertTrue(
@@ -2441,22 +2510,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1).reshape(4, 2).sum(dim=-1) * 2)
         self.assertIn("tl.cast(2, tl.uint32) - 1", code)
         self.assertNotIn("tl.cast(1, tl.uint32) - 1", code)
-
-    @skipIfNotCUDA()
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_zero_task_roots_do_not_allocate_task_events(self) -> None:
-        x = torch.empty((0, 64), device=DEVICE, dtype=torch.float32)
-        code, out = code_and_output(
-            cartesian_affine_chain,
-            (x,),
-            block_sizes=[1, 16, 1, 32],
-            pid_type="persistent_blocked",
-            num_sm_multiplier=1,
-            num_warps=1,
-        )
-
-        self.assertEqual(out.shape, x.shape)
-        self.assertNotIn("tile_dependency_", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
