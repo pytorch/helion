@@ -170,6 +170,17 @@ def _double_bf16(w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _unsigned_to_f32_and_flag(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty(w.shape, dtype=torch.float32, device=w.device)
+    big = torch.empty(w.shape, dtype=torch.int32, device=w.device)
+    for tk, tn in hl.tile(w.shape):
+        v = w[tk, tn]
+        out[tk, tn] = v.to(torch.float32)
+        big[tk, tn] = (v > 100).to(torch.int32)
+    return out, big
+
+
 @onlyBackends(["cute"])
 class TestCutePointwiseVec(TestCase):
     def test_nd_grid_vec_bf16(self) -> None:
@@ -553,6 +564,29 @@ class TestCutePointwiseVec(TestCase):
         )
         _, out32 = code_and_output(_sigmoid1d, (xs,), block_sizes=[8])
         torch.testing.assert_close(out32, torch.sigmoid(xs), equal_nan=True)
+
+    def test_unsigned_loads_keep_their_unsigned_type(self) -> None:
+        """A plain ``(ptr).load()`` of a uint8 / uint32 element yields the
+        signed integer of its width in CuTe DSL; values with the top bit set
+        must still convert and compare as unsigned, scalar or vectorized."""
+        torch.manual_seed(0)
+        for dtype, high in ((torch.uint8, 2**8), (torch.uint32, 2**32)):
+            w = torch.randint(0, high, (64, 1024), device=DEVICE).to(dtype)
+            wide = w.to(torch.int64)
+            for config in (
+                {"block_sizes": [8, 64]},
+                {
+                    "block_sizes": [8, 1024],
+                    "num_threads": [8, 128],
+                    "cute_vector_widths": [1, 4],
+                },
+            ):
+                with self.subTest(dtype=dtype, config=config):
+                    _, (out, big) = code_and_output(
+                        _unsigned_to_f32_and_flag, (w,), **config
+                    )
+                    torch.testing.assert_close(out, wide.to(torch.float32))
+                    torch.testing.assert_close(big, (wide > 100).to(torch.int32))
 
     def test_int16_packet_cast_to_bf16_is_bitwise_exact(self) -> None:
         """Every int16 value rides a V=8 Uint16 packet, is bitcast back to

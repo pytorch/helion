@@ -266,7 +266,11 @@ class _Interpreter:
                     (kw.arg, self.expression(kw.value).node)
                     for kw in expression.keywords
                 )
-                if any(kw.arg != "propagate_nan" for kw in expression.keywords):
+                if any(
+                    kw.arg
+                    != ("nan" if function == "cute.arch.fmax" else "propagate_nan")
+                    for kw in expression.keywords
+                ):
                     raise _Decline
                 dtype = (
                     values[0].dtype if values[0].dtype == values[1].dtype else "unknown"

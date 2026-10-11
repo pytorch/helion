@@ -375,7 +375,13 @@ def _is_allowed_pure_call(call: ast.Call) -> bool:
         return True
     if path == "cute.arch.load":
         return _is_generated_arch_load(call)
-    if path in {"cute.arch.block_idx", "cute.arch.lane_idx", "cute.arch.thread_idx"}:
+    if path in {
+        "cute.arch.block_idx",
+        "cute.arch.fmax",
+        "cute.arch.fmin",
+        "cute.arch.lane_idx",
+        "cute.arch.thread_idx",
+    }:
         return True
     if path in _PURE_WARP_REDUCTION_CALLS:
         return True

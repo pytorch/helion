@@ -127,6 +127,17 @@ class TestCuteVloopSink(TestCase):
             ),
         )
         self.assertIn("'max', cutlass.Float32(float('-inf'))", code)
+        # The sunk per-lane combine keeps torch.amax's NaN propagation.
+        x[17, 5] = float("nan")
+        x[900, 640] = float("nan")
+        _, out = code_and_output(
+            col_reduce_max_dynamic,
+            (x,),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        torch.testing.assert_close(out, _col_max(x), equal_nan=True)
 
     def test_float32_input(self) -> None:
         x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.float32)

@@ -15,17 +15,43 @@ def _warp_reduce_sum(value: cute.Numeric, *, threads_in_group: int) -> cute.Nume
     return cute.arch.warp_reduction_sum(value, threads_in_group=threads_in_group)
 
 
+def _smem_read(tensor: cute.Tensor, index: cutlass.Int32, dtype: type) -> cute.Numeric:
+    """``tensor[index]`` of a shared-memory buffer of ``dtype`` elements.
+
+    CuTe DSL 4.7 allocates an unsigned integer buffer (Uint8, Uint32) as the
+    signed integer of its width and reads it back as such: the value would
+    not join with an unsigned identity (``TYPE_UNSTABLE_JOIN``) and would
+    compare with the top bit set as negative.  The conversion keeps the bits.
+    """
+    value = tensor[index]
+    return value if type(value) is dtype else dtype(value)
+
+
+def _cute_nan_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    """``max`` that propagates NaN like torch.amax (see ``nan_extremum_expr``)."""
+    if type(a) is cutlass.Float32:
+        return cute.arch.fmax(a, b, nan=True)
+    return cute.math.max(a, b, propagate_nan=True)
+
+
+def _cute_nan_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    """``min`` that propagates NaN like torch.amin (see ``nan_extremum_expr``)."""
+    if type(a) is cutlass.Float32:
+        return cute.arch.fmin(a, b, nan=True)
+    return cute.math.min(a, b, propagate_nan=True)
+
+
 @cute.jit
 def _warp_reduce_max(value: cute.Numeric, *, threads_in_group: int) -> cute.Numeric:
-    return cute.arch.warp_reduction_max(value, threads_in_group=threads_in_group)
+    return cute.arch.warp_reduction(
+        value, _cute_nan_max, threads_in_group=threads_in_group
+    )
 
 
 @cute.jit
 def _warp_reduce_min(value: cute.Numeric, *, threads_in_group: int) -> cute.Numeric:
     return cute.arch.warp_reduction(
-        value,
-        lambda a, b: min(b, a),
-        threads_in_group=threads_in_group,
+        value, _cute_nan_min, threads_in_group=threads_in_group
     )
 
 
@@ -192,7 +218,9 @@ def _cute_grouped_reduce_shared_two_stage_sum(
 
         if warp_in_group == 0:
             stage2_input = (
-                smem[partials_base + p * warps_per_group + lane_in_warp]
+                _smem_read(
+                    smem, partials_base + p * warps_per_group + lane_in_warp, dtype
+                )
                 if lane_in_warp < warps_per_group
                 else identity
             )
@@ -201,7 +229,7 @@ def _cute_grouped_reduce_shared_two_stage_sum(
                 smem[results_base + p] = group_result
         cute.arch.sync_threads()
 
-    return smem[results_base + lane_mod_pre_var]
+    return _smem_read(smem, results_base + lane_mod_pre_var, dtype)
 
 
 @cute.jit
@@ -239,7 +267,9 @@ def _cute_grouped_reduce_shared_two_stage_max(
 
         if warp_in_group == 0:
             stage2_input = (
-                smem[partials_base + p * warps_per_group + lane_in_warp]
+                _smem_read(
+                    smem, partials_base + p * warps_per_group + lane_in_warp, dtype
+                )
                 if lane_in_warp < warps_per_group
                 else identity
             )
@@ -248,7 +278,7 @@ def _cute_grouped_reduce_shared_two_stage_max(
                 smem[results_base + p] = group_result
         cute.arch.sync_threads()
 
-    return smem[results_base + lane_mod_pre_var]
+    return _smem_read(smem, results_base + lane_mod_pre_var, dtype)
 
 
 @cute.jit
@@ -286,7 +316,9 @@ def _cute_grouped_reduce_shared_two_stage_min(
 
         if warp_in_group == 0:
             stage2_input = (
-                smem[partials_base + p * warps_per_group + lane_in_warp]
+                _smem_read(
+                    smem, partials_base + p * warps_per_group + lane_in_warp, dtype
+                )
                 if lane_in_warp < warps_per_group
                 else identity
             )
@@ -295,7 +327,7 @@ def _cute_grouped_reduce_shared_two_stage_min(
                 smem[results_base + p] = group_result
         cute.arch.sync_threads()
 
-    return smem[results_base + lane_mod_pre_var]
+    return _smem_read(smem, results_base + lane_mod_pre_var, dtype)
 
 
 @cute.jit
@@ -333,7 +365,9 @@ def _cute_grouped_reduce_shared_two_stage_prod(
 
         if warp_in_group == 0:
             stage2_input = (
-                smem[partials_base + p * warps_per_group + lane_in_warp]
+                _smem_read(
+                    smem, partials_base + p * warps_per_group + lane_in_warp, dtype
+                )
                 if lane_in_warp < warps_per_group
                 else identity
             )
@@ -342,7 +376,7 @@ def _cute_grouped_reduce_shared_two_stage_prod(
                 smem[results_base + p] = group_result
         cute.arch.sync_threads()
 
-    return smem[results_base + lane_mod_pre_var]
+    return _smem_read(smem, results_base + lane_mod_pre_var, dtype)
 
 
 _TWO_STAGE_DISPATCH = {
@@ -386,29 +420,11 @@ def _cute_grouped_reduce_shared_serial_body(
     if lane_in_warp == 0:
         smem[warp] = warp_partial
     cute.arch.sync_threads()
-    result = smem[0]
+    result = _smem_read(smem, 0, dtype)
     for w in cutlass.range_constexpr(1, warps):
-        result = combine(result, smem[w])
+        result = combine(result, _smem_read(smem, w, dtype))
     cute.arch.sync_threads()
     return result
-
-
-def _cute_scalar_combine_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
-    return cute.arch.fmax(a, b)
-
-
-@cute.jit
-def _cute_scalar_combine_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
-    return min(b, a)
-
-
-def _cute_scalar_combine_f32_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
-    return cute.arch.fmin(a, b)
-
-
-@cute.jit
-def _cute_scalar_combine_generic_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
-    return max(b, a)
 
 
 _SERIAL_DISPATCH = {
@@ -417,24 +433,12 @@ _SERIAL_DISPATCH = {
 }
 
 
-def _cute_scalar_combine(reduction_type: str, identity: cute.Numeric) -> object:
-    """The scalar combine of ``reduction_type`` for ``identity``'s dtype.
-
-    ``cute.arch.fmax``/``fmin`` are one FMNMX for fp32; Python ``max``/``min``
-    lower to compare+select for the other dtypes.
-    """
+def _cute_scalar_combine(reduction_type: str) -> object:
+    """The scalar combine of ``reduction_type``."""
     if reduction_type == "max":
-        return (
-            _cute_scalar_combine_max
-            if type(identity) is cutlass.Float32
-            else _cute_scalar_combine_generic_max
-        )
+        return _cute_nan_max
     if reduction_type == "min":
-        return (
-            _cute_scalar_combine_f32_min
-            if type(identity) is cutlass.Float32
-            else _cute_scalar_combine_min
-        )
+        return _cute_nan_min
     entry = _SERIAL_DISPATCH.get(reduction_type)
     if entry is None:
         raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
@@ -463,7 +467,7 @@ def _cute_grouped_reduce_shared_serial(
         if entry is None:
             raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
         warp_op = entry[0]
-    combine = _cute_scalar_combine(reduction_type, identity)
+    combine = _cute_scalar_combine(reduction_type)
     return _cute_grouped_reduce_shared_serial_body(
         input_value,
         warp_op,
@@ -547,7 +551,10 @@ def _cute_grouped_reduce_shared_columns(
         for column in range(width):
             total = identity
             for warp_index in range(warps_per_group):
-                total = combine(total, smem[group_base + warp_index * width + column])
+                total = combine(
+                    total,
+                    _smem_read(smem, group_base + warp_index * width + column, dtype),
+                )
             results.append(total)
         cute.arch.sync_threads()
         return results
@@ -565,7 +572,10 @@ def _cute_grouped_reduce_shared_columns(
         total = identity
         for reduce_index in range(reduce_extent):
             total = combine(
-                total, smem[sibling_base + reduce_index * (pre * width) + column]
+                total,
+                _smem_read(
+                    smem, sibling_base + reduce_index * (pre * width) + column, dtype
+                ),
             )
         results.append(total)
     cute.arch.sync_threads()
@@ -640,17 +650,17 @@ def _cute_grouped_reduce_shared_tree_sum(
                 lane_in_group_var % (stride * 2) == 0
                 and lane_in_group_var + stride < group_span
             ):
-                smem[lane_var] = (
-                    smem[lane_var] + smem[group_base + lane_in_group_var + stride]
+                smem[lane_var] = _smem_read(smem, lane_var, dtype) + _smem_read(
+                    smem, group_base + lane_in_group_var + stride, dtype
                 )
             cute.arch.sync_threads()
             stride *= 2
 
         if lane_in_group_var == 0:
-            smem[result_base + p] = smem[lane_var]
+            smem[result_base + p] = _smem_read(smem, lane_var, dtype)
         cute.arch.sync_threads()
 
-    return smem[result_base + lane_mod_pre_var]
+    return _smem_read(smem, result_base + lane_mod_pre_var, dtype)
 
 
 @cute.jit
@@ -683,17 +693,17 @@ def _cute_grouped_reduce_shared_tree_max(
                 lane_in_group_var % (stride * 2) == 0
                 and lane_in_group_var + stride < group_span
             ):
-                lhs = smem[lane_var]
-                rhs = smem[group_base + lane_in_group_var + stride]
-                smem[lane_var] = max(rhs, lhs)
+                lhs = _smem_read(smem, lane_var, dtype)
+                rhs = _smem_read(smem, group_base + lane_in_group_var + stride, dtype)
+                smem[lane_var] = _cute_nan_max(lhs, rhs)
             cute.arch.sync_threads()
             stride *= 2
 
         if lane_in_group_var == 0:
-            smem[result_base + p] = smem[lane_var]
+            smem[result_base + p] = _smem_read(smem, lane_var, dtype)
         cute.arch.sync_threads()
 
-    return smem[result_base + lane_mod_pre_var]
+    return _smem_read(smem, result_base + lane_mod_pre_var, dtype)
 
 
 @cute.jit
@@ -726,17 +736,17 @@ def _cute_grouped_reduce_shared_tree_min(
                 lane_in_group_var % (stride * 2) == 0
                 and lane_in_group_var + stride < group_span
             ):
-                lhs = smem[lane_var]
-                rhs = smem[group_base + lane_in_group_var + stride]
-                smem[lane_var] = min(rhs, lhs)
+                lhs = _smem_read(smem, lane_var, dtype)
+                rhs = _smem_read(smem, group_base + lane_in_group_var + stride, dtype)
+                smem[lane_var] = _cute_nan_min(lhs, rhs)
             cute.arch.sync_threads()
             stride *= 2
 
         if lane_in_group_var == 0:
-            smem[result_base + p] = smem[lane_var]
+            smem[result_base + p] = _smem_read(smem, lane_var, dtype)
         cute.arch.sync_threads()
 
-    return smem[result_base + lane_mod_pre_var]
+    return _smem_read(smem, result_base + lane_mod_pre_var, dtype)
 
 
 @cute.jit
@@ -769,17 +779,17 @@ def _cute_grouped_reduce_shared_tree_prod(
                 lane_in_group_var % (stride * 2) == 0
                 and lane_in_group_var + stride < group_span
             ):
-                smem[lane_var] = (
-                    smem[lane_var] * smem[group_base + lane_in_group_var + stride]
+                smem[lane_var] = _smem_read(smem, lane_var, dtype) * _smem_read(
+                    smem, group_base + lane_in_group_var + stride, dtype
                 )
             cute.arch.sync_threads()
             stride *= 2
 
         if lane_in_group_var == 0:
-            smem[result_base + p] = smem[lane_var]
+            smem[result_base + p] = _smem_read(smem, lane_var, dtype)
         cute.arch.sync_threads()
 
-    return smem[result_base + lane_mod_pre_var]
+    return _smem_read(smem, result_base + lane_mod_pre_var, dtype)
 
 
 _TREE_DISPATCH = {
@@ -827,20 +837,23 @@ def _cute_argmax_index_impl(
     stride: cutlass.Int32,
     *,
     extent: cutlass.Constexpr[int],
+    dtype: cutlass.Constexpr,
 ) -> cutlass.Int64:
     best_index = cutlass.Int64(0)
-    best_value = smem[start_idx]
-    best_valid = valid_smem[start_idx]
+    best_value = _smem_read(smem, start_idx, dtype)
+    best_valid = _smem_read(valid_smem, start_idx, cutlass.Int32)
     for candidate_index in cutlass.range_constexpr(1, extent):
         candidate_offset = start_idx + stride * candidate_index
-        candidate = smem[candidate_offset]
-        candidate_valid = valid_smem[candidate_offset]
+        candidate = _smem_read(smem, candidate_offset, dtype)
+        candidate_valid = _smem_read(valid_smem, candidate_offset, cutlass.Int32)
         better = candidate_valid != cutlass.Int32(0) and (
             best_valid == cutlass.Int32(0)
             or (
                 best_valid != cutlass.Int32(0)
                 and (
                     candidate > best_value
+                    # A NaN wins over every number, the first NaN over later ones.
+                    or (candidate != candidate and best_value == best_value)
                     or (
                         candidate == best_value
                         and cutlass.Int64(candidate_index) < best_index
@@ -863,20 +876,23 @@ def _cute_argmin_index_impl(
     stride: cutlass.Int32,
     *,
     extent: cutlass.Constexpr[int],
+    dtype: cutlass.Constexpr,
 ) -> cutlass.Int64:
     best_index = cutlass.Int64(0)
-    best_value = smem[start_idx]
-    best_valid = valid_smem[start_idx]
+    best_value = _smem_read(smem, start_idx, dtype)
+    best_valid = _smem_read(valid_smem, start_idx, cutlass.Int32)
     for candidate_index in cutlass.range_constexpr(1, extent):
         candidate_offset = start_idx + stride * candidate_index
-        candidate = smem[candidate_offset]
-        candidate_valid = valid_smem[candidate_offset]
+        candidate = _smem_read(smem, candidate_offset, dtype)
+        candidate_valid = _smem_read(valid_smem, candidate_offset, cutlass.Int32)
         better = candidate_valid != cutlass.Int32(0) and (
             best_valid == cutlass.Int32(0)
             or (
                 best_valid != cutlass.Int32(0)
                 and (
                     candidate < best_value
+                    # A NaN wins over every number, the first NaN over later ones.
+                    or (candidate != candidate and best_value == best_value)
                     or (
                         candidate == best_value
                         and cutlass.Int64(candidate_index) < best_index
@@ -905,11 +921,12 @@ def _cute_argreduce_index(
     *,
     extent: int,
     reduction_type: str,
+    dtype: type,
 ) -> cutlass.Int64:
     impl = _ARGREDUCE_DISPATCH.get(reduction_type)
     if impl is None:
         raise ValueError(f"unsupported CuTe argreduce type: {reduction_type!r}")
-    return impl(smem, valid_smem, start_idx, stride, extent=extent)
+    return impl(smem, valid_smem, start_idx, stride, extent=extent, dtype=dtype)
 
 
 # Per-thread V-fold helpers for vectorized loads.  Used by the looped
@@ -930,7 +947,7 @@ def _cute_pre_vec_fold_max(vec: object, *, V: cutlass.Constexpr[int]) -> object:
     acc = vec[0]
     for i in cutlass.range_constexpr(1, V):
         candidate = vec[i]
-        acc = max(acc, candidate)
+        acc = _cute_nan_max(acc, candidate)
     return acc
 
 
@@ -939,7 +956,7 @@ def _cute_pre_vec_fold_min(vec: object, *, V: cutlass.Constexpr[int]) -> object:
     acc = vec[0]
     for i in cutlass.range_constexpr(1, V):
         candidate = vec[i]
-        acc = min(acc, candidate)
+        acc = _cute_nan_min(acc, candidate)
     return acc
 
 
@@ -1022,8 +1039,8 @@ def _cute_grouped_reduce_cluster_body(
 
 _CLUSTER_DISPATCH = {
     "sum": (_warp_reduce_sum, operator.add),
-    "max": (_warp_reduce_max, _cute_scalar_combine_max),
-    "min": (_warp_reduce_min, _cute_scalar_combine_min),
+    "max": (_warp_reduce_max, _cute_nan_max),
+    "min": (_warp_reduce_min, _cute_nan_min),
 }
 
 
@@ -1261,13 +1278,18 @@ def _cute_grouped_reduce_shared_two_stage_fragment_body(
             )
     cute.arch.sync_threads()
     if lane_in_group_var < slots:
-        total = smem[partials_base + lane_in_group_var]
+        total = _smem_read(smem, partials_base + lane_in_group_var, dtype)
         for w in cutlass.range_constexpr(1, warps_per_group):
-            total = combine(total, smem[partials_base + w * slots + lane_in_group_var])
+            total = combine(
+                total,
+                _smem_read(smem, partials_base + w * slots + lane_in_group_var, dtype),
+            )
         smem[results_base + lane_in_group_var] = total
     cute.arch.sync_threads()
     for i in cutlass.range_constexpr(count):
-        results[i] = smem[results_base + lane_mod_pre_var * count + i]
+        results[i] = _smem_read(
+            smem, results_base + lane_mod_pre_var * count + i, dtype
+        )
 
 
 def _cute_grouped_reduce_shared_two_stage_fragment(
@@ -1289,7 +1311,7 @@ def _cute_grouped_reduce_shared_two_stage_fragment(
     _cute_grouped_reduce_shared_two_stage_fragment_body(
         values,
         results,
-        _cute_scalar_combine(reduction_type, identity),
+        _cute_scalar_combine(reduction_type),
         identity,
         lane_var,
         lane_in_group_var,

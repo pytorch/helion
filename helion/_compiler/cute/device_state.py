@@ -670,6 +670,12 @@ class CuteDeviceFunctionState:
         # are visited in.  A second scan over the same lane loop must agree
         # or it falls back to the serial lowering (see ``cute/scan_ops.py``).
         self.scan_lane_directions: dict[str, bool] = {}
+        # Constexpr V-loop variables that enclose a reduction over ANOTHER block
+        # (``s[tile] = x[tile, :].sum(-1)`` with a vector width on ``tile``):
+        # each V lane is a different output element, so
+        # ``cute/hoist_warp_reduce.py`` must not fold the lanes into one
+        # accumulator before the cross-thread reduce.
+        self.unfoldable_vec_lanes: set[str] = set()
         # Rolled reductions over a symbolic extent expose their trip count as
         # a host-computed ``cutlass.Constexpr`` kernel parameter so the
         # two-pass load fuser can size a per-thread register cache that is

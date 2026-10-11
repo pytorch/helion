@@ -89,6 +89,8 @@ _TWO_STAGE_REDUCE_FRAGMENT = "_cute_grouped_reduce_shared_two_stage_fragment"
 _DTYPE_PRESERVING_CALLS = (
     "cute.arch.warp_reduction",
     "_cute_grouped_reduce_",
+    "cute.arch.fmax",
+    "cute.arch.fmin",
     "cute.math.",
     "math.",
 )

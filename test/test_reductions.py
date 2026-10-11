@@ -1537,6 +1537,236 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected_y = (y_f * inv_rms_y[:, None] * w2.float()).half()
         torch.testing.assert_close(out_y, expected_y, rtol=1e-2, atol=1e-2)
 
+    @skipUnlessBackends(["triton", "cute"])
+    def test_bool_and_int_sums_accumulate_in_int64(self):
+        """torch promotes bool and int32 sums to int64 on every reduction path."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def counts(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, _ = x.shape
+            positives = torch.empty([m], dtype=torch.int64, device=x.device)
+            argmaxes = torch.empty([m], dtype=torch.int64, device=x.device)
+            sums = torch.empty([m], dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                argmaxes[tile_m] = row.argmax(-1)
+                positives[tile_m] = (row > 0).sum(-1)
+                sums[tile_m] = y[tile_m, :].sum(-1)
+            return positives, argmaxes, sums
+
+        torch.manual_seed(0)
+        # n=1000 combines across warps; reduction_loops rolls the reduction.
+        for n, extra in ((64, {}), (1000, {}), (1000, {"reduction_loops": [32]})):
+            x = torch.randn(8, n, device=DEVICE)
+            # 2**30 per element overflows an int32 accumulator.
+            y = torch.full((8, n), 2**30, device=DEVICE, dtype=torch.int32)
+            _code, (positives, argmaxes, sums) = code_and_output(
+                counts, (x, y), block_sizes=[2], **extra
+            )
+            torch.testing.assert_close(positives, (x > 0).sum(-1))
+            torch.testing.assert_close(argmaxes, x.argmax(-1))
+            torch.testing.assert_close(sums, y.sum(-1))
+
+    @skipUnlessBackends(["triton", "cute"])
+    def test_extremum_reductions_propagate_nan(self):
+        """amax/amin return NaN and argmax/argmin the first NaN, as in torch."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def extrema_2d(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, _ = x.shape
+            maxes = torch.empty([m], dtype=x.dtype, device=x.device)
+            mins = torch.empty([m], dtype=x.dtype, device=x.device)
+            argmaxes = torch.empty([m], dtype=torch.int64, device=x.device)
+            argmins = torch.empty([m], dtype=torch.int64, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                maxes[tile_m] = row.amax(-1)
+                mins[tile_m] = row.amin(-1)
+                argmaxes[tile_m] = row.argmax(-1)
+                argmins[tile_m] = row.argmin(-1)
+            return maxes, mins, argmaxes, argmins
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def extrema_3d(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            a, b, _ = x.shape
+            maxes = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            mins = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            argmaxes = torch.empty([a, b], dtype=torch.int64, device=x.device)
+            argmins = torch.empty([a, b], dtype=torch.int64, device=x.device)
+            for tile_a in hl.tile(a):
+                rows = x[tile_a, :, :]
+                maxes[tile_a, :] = rows.amax(-1)
+                mins[tile_a, :] = rows.amin(-1)
+                argmaxes[tile_a, :] = rows.argmax(-1)
+                argmins[tile_a, :] = rows.argmin(-1)
+            return maxes, mins, argmaxes, argmins
+
+        cases = [
+            # One warp, across warps, rolled.
+            (extrema_2d, (8, 32), {}),
+            (extrema_2d, (8, 1000), {}),
+            (extrema_2d, (8, 1000), {"reduction_loops": [32]}),
+            # A reduced dim above a sibling thread axis; across synthetic lanes.
+            (extrema_3d, (4, 8, 32), {}),
+            (extrema_3d, (2, 2, 1024), {}),
+        ]
+        for kernel, shape, extra in cases:
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                torch.manual_seed(0)
+                x = torch.randn(shape, device=DEVICE, dtype=dtype)
+                rows = x.view(-1, shape[-1])
+                rows[0::2, 3] = float("nan")
+                rows[0::4, shape[-1] - 2] = float("nan")
+                code, out = code_and_output(kernel, (x,), block_sizes=[2], **extra)
+                if _get_backend() == "triton":
+                    # One max.NaN/min.NaN per combine step, not the four or
+                    # five compares and selects of Inductor's max2/min2.
+                    self.assertIn("helion_triton_helpers.max_propagate_nan", code)
+                    self.assertIn("helion_triton_helpers.min_propagate_nan", code)
+                expected = (x.amax(-1), x.amin(-1), x.argmax(-1), x.argmin(-1))
+                for actual, reference in zip(out, expected, strict=True):
+                    torch.testing.assert_close(actual, reference, equal_nan=True)
+
+    @skipUnlessBackends(["triton", "cute"])
+    @skipIfRefEager(
+        "tile positions depend on block_sizes, which ref mode does not apply"
+    )
+    def test_tile_argreduce_counts_from_the_tile_start(self):
+        """argmax/argmin over ``x[tm, tn]`` return positions in the tile, as
+        torch does on the tile tensor; ``+ tn.begin`` makes them global."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def chunked_row_argmax(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.int64, device=x.device)
+            for tm in hl.tile(m):
+                best = hl.full([tm], float("-inf"), dtype=torch.float32)
+                idx = hl.zeros([tm], dtype=torch.int64)
+                for tn in hl.tile(n):
+                    v = x[tm, tn]
+                    v_max = v.amax(1)
+                    v_idx = torch.argmax(v, dim=1) + tn.begin
+                    better = v_max > best
+                    idx = torch.where(better, v_idx, idx)
+                    best = torch.where(better, v_max, best)
+                out[tm] = idx
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def tile_argreduce(
+            x: torch.Tensor, local: torch.Tensor, shifted: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            for tm, tn in hl.tile([x.size(0), x.size(1)]):
+                local[tm, tn.id] = torch.argmax(x[tm, tn], dim=1)
+                shifted[tm, tn.id] = torch.argmin(x[tm, tn], dim=1) + tn.begin
+            return local, shifted
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def row_tile_argmax(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tm, tn in hl.tile([x.size(0), x.size(1)]):
+                out[tm.id, tn] = torch.argmax(x[tm, tn], dim=0)
+            return out
+
+        def per_tile(x: torch.Tensor, block: int, fn: object) -> torch.Tensor:
+            m, n = x.shape
+            tiles = -(-n // block)
+            pad = torch.full((m, tiles * block - n), float("nan"), device=x.device)
+            grouped = torch.cat([x, pad], 1).view(m, tiles, block)
+            # NaN padding never wins against the distinct finite values below.
+            grouped = grouped.nan_to_num(nan=-1e30 if fn is torch.argmax else 1e30)
+            return fn(grouped, dim=2)  # pyrefly: ignore [not-callable]
+
+        configs = [{"block_sizes": [4, 32]}, {"block_sizes": [1, 64]}]
+        if _get_backend() == "cute":
+            # The column tile on 16 threads x 4 lanes, and one column per thread.
+            configs += [
+                {"block_sizes": [4, 64], "num_threads": [0, 16]},
+                {"block_sizes": [4, 1]},
+            ]
+        x = torch.randperm(32 * 200, device=DEVICE).float().view(32, 200)
+        for config in configs:
+            with self.subTest(**config):
+                bm, bn = config["block_sizes"]
+                _, out = code_and_output(chunked_row_argmax, (x,), **config)
+                torch.testing.assert_close(out, x.argmax(1), atol=0, rtol=0)
+
+                tiles = -(-200 // bn)
+                local = torch.zeros(32, tiles, dtype=torch.int64, device=DEVICE)
+                shifted = torch.zeros_like(local)
+                _, (local, shifted) = code_and_output(
+                    tile_argreduce, (x, local, shifted), **config
+                )
+                begins = torch.arange(tiles, device=DEVICE)[None, :] * bn
+                torch.testing.assert_close(
+                    local, per_tile(x, bn, torch.argmax), atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    shifted, per_tile(x, bn, torch.argmin) + begins, atol=0, rtol=0
+                )
+
+                rows = torch.zeros(32 // bm, 200, dtype=torch.int64, device=DEVICE)
+                _, rows = code_and_output(row_tile_argmax, (x, rows), **config)
+                torch.testing.assert_close(
+                    rows, x.view(32 // bm, bm, 200).argmax(1), atol=0, rtol=0
+                )
+
+    @skipUnlessBackends(["triton", "cute"])
+    @skipIfRefEager("compiles specific reduction configs")
+    def test_half_precision_sum_accumulates_in_float32(self):
+        """An fp16/bf16 row sum is as accurate as torch's (which accumulates in
+        fp32): summing in the half dtype is off by several output ulps."""
+
+        @helion.kernel(static_shapes=True)
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(m):
+                out[tile] = x[tile, :].sum(-1)
+            return out
+
+        torch.manual_seed(0)
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.randn(64, 8192, device=DEVICE).to(dtype)
+            expected = x.double().sum(-1)
+            torch_error = (x.sum(-1).double() - expected).abs().max().item()
+            bound = row_sum.bind((x,))
+            for config in (
+                helion.Config(block_sizes=[1]),
+                helion.Config(block_sizes=[1], reduction_loops=[1024]),
+            ):
+                result = bound.compile_config(config)(x)
+                error = (result.double() - expected).abs().max().item()
+                self.assertLessEqual(error, 1.5 * torch_error, (dtype, config))
+
+    @skipUnlessBackends(["triton", "cute"])
+    @skipIfRefEager(
+        "checks the rolled loop's fp32 accumulator; ref mode has no rolled loop and"
+        " rounds the fp16 elementwise result as eager does"
+    )
+    def test_rolled_half_precision_prod(self):
+        """A rolled fp16 prod keeps its fp32 loop-carried accumulator."""
+
+        @helion.kernel(static_shapes=True)
+        def row_prod(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(m):
+                out[tile] = (1.0 + x[tile, :] * 0.001).prod(-1)
+            return out
+
+        x = torch.randn(64, 1000, device=DEVICE).half()
+        _, result = code_and_output(
+            row_prod, (x,), block_sizes=[1], reduction_loops=[64]
+        )
+        expected = (1.0 + x.float() * 0.001).prod(-1).half()
+        torch.testing.assert_close(result, expected, rtol=2e-3, atol=0)
+
     @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")
     def test_double_sum_of_two_full_slices(self):
         """``x[i, :, :].sum(-1).sum(-1)``: both ``:`` dims spread over threads,

@@ -787,6 +787,8 @@ _PURE_CUTLASS_SCALAR_CALLS = frozenset(
 _PURE_CUTE_ARCH_CALLS = frozenset(
     (
         "block_idx",
+        "fmax",
+        "fmin",
         "lane_idx",
         "thread_idx",
         "warp_idx",

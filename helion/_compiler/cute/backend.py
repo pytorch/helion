@@ -34,6 +34,8 @@ from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
+from .math_templates import argreduce_candidate_expr
+from .math_templates import nan_extremum_expr
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -2001,6 +2003,8 @@ class CuteBackend(Backend):
             "_cute_checked_block_dims": "from helion._compiler.cute.thread_budget import checked_thread_block_dims as _cute_checked_block_dims",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_cute_nan_max": "from helion._compiler.cute.reduce_helpers import _cute_nan_max",
+            "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
@@ -2569,10 +2573,10 @@ class CuteBackend(Backend):
             return (
                 f"cutlass.Int32(cute.math.{reduction_type}({lhs}, {rhs}) ^ {sign_bit})"
             )
-        if reduction_type == "max":
-            return f"({acc}) if ({acc}) > ({val}) else ({val})"
-        if reduction_type == "min":
-            return f"({acc}) if ({acc}) < ({val}) else ({val})"
+        if reduction_type in ("max", "min"):
+            return nan_extremum_expr(
+                reduction_type, acc, val, float32=dtype == torch.float32
+            )
         if reduction_type == "prod":
             return f"({acc} * {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
@@ -2645,12 +2649,12 @@ class CuteBackend(Backend):
         if reduction_type == "sum":
             return f"cute.arch.warp_reduction_sum({input_name}{tg})"
         if reduction_type == "max":
-            return f"cute.arch.warp_reduction_max({input_name}{tg})"
+            # ``op`` swaps the partial's NaN-quiet fmax for the NaN-propagating
+            # max torch.amax has; the call stays a ``warp_reduction_max`` for
+            # the passes that recognize it.
+            return f"cute.arch.warp_reduction_max({input_name}, op=_cute_nan_max{tg})"
         if reduction_type == "min":
-            return (
-                f"cute.arch.warp_reduction("
-                f"{input_name}, lambda a, b: (a if a < b else b){tg})"
-            )
+            return f"cute.arch.warp_reduction({input_name}, _cute_nan_min{tg})"
         if reduction_type == "prod":
             return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
@@ -2702,7 +2706,9 @@ class CuteBackend(Backend):
         )
         index_dtype_str = self.index_type_str(index_dtype)
         max_index = self.cast_expr(repr(torch.iinfo(index_dtype).max), index_dtype_str)
-        candidate_index = f"({index_value}) if (({input_name}) == ({reduced_value})) else ({max_index})"
+        candidate_index = argreduce_candidate_expr(
+            index_value, input_name, reduced_value, max_index
+        )
         reduced_index = self.reduction_expr(
             candidate_index,
             "min",
@@ -2722,16 +2728,20 @@ class CuteBackend(Backend):
         index: str,
         dtype: torch.dtype | None = None,
     ) -> list[str]:
-        if reduction_type == "argmin":
-            better = (
-                f"(({value}) < ({acc})) | "
-                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
-            )
-        else:
-            better = (
-                f"(({value}) > ({acc})) | "
-                f"((({value}) == ({acc})) & (({index}) < ({acc_index})))"
-            )
+        if dtype is not None:
+            # Both arms of the select must have the accumulator's type (fp32
+            # for an fp16 input).
+            value = self.cast_expr(value, self.dtype_str(dtype))
+        compare = "<" if reduction_type == "argmin" else ">"
+        # torch returns the first NaN: a NaN beats every number, and only an
+        # earlier NaN beats a NaN accumulator.
+        better = (
+            f"((({acc}) == ({acc})) & "
+            f"((({value}) {compare} ({acc})) | (({value}) != ({value})))) | "
+            f"(((({value}) == ({acc})) | "
+            f"((({value}) != ({value})) & (({acc}) != ({acc})))) & "
+            f"(({index}) < ({acc_index})))"
+        )
         return [
             (
                 f"{acc}, {acc_index} = "

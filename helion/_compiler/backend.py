@@ -902,8 +902,9 @@ class Backend(abc.ABC):
     ) -> str:
         """Generate the cross-thread reduction expression.
 
-        ``dtype`` is the accumulation dtype
-        (``get_computation_dtype(input.dtype)``) when the caller knows it.
+        ``dtype`` is the accumulation dtype (``reduction_acc_dtype``: the
+        output's computation dtype, the input's for argmin/argmax) when the
+        caller knows it.
         Backends that allocate typed scratch storage for the reduction (e.g.
         Metal's ``threadgroup`` buffers) need it; the rest ignore it.
         """
