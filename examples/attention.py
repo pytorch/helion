@@ -181,7 +181,10 @@ def _baseline_unless_tpu(fn: Callable[..., Any]) -> Callable[..., Any] | None:
     return None if DEVICE.type == "tpu" else fn
 
 
+# fast_math: approximate exp2 in the online softmax and division in the
+# final normalization.
 @helion.kernel(
+    fast_math=True,
     # Static shapes provides a speedup for attention
     static_shapes=True,
     autotune_baseline_fn=_baseline_unless_tpu(_attention_baseline),
@@ -368,7 +371,10 @@ def attention_output(
     return out.view(q_in.size())
 
 
+# fast_math: approximate exp2 in the online softmax and division in the
+# final normalization.
 @helion.kernel(
+    fast_math=True,
     static_shapes=True,
     autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_output_baseline),
     autotune_baseline_atol=5e-2,
@@ -585,7 +591,9 @@ def biased_attention(
     return out.view(q_in.size()), lse.view(q_in.size()[:-1])
 
 
+# fast_math: approximate exp and division.
 @helion.kernel(
+    fast_math=True,
     static_shapes=True,
     autotune_baseline_fn=_biased_attention_output_baseline,
     autotune_baseline_atol=5e-2,

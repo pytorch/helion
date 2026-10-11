@@ -24,7 +24,8 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp and division.
+@helion.kernel(fast_math=True)
 def softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Simple Helion kernel wrapping PyTorch's softmax function.
@@ -41,7 +42,8 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp and division.
+@helion.kernel(fast_math=True)
 def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     """
     Helion kernel implementing softmax by decomposing into max, exp, and normalization steps.
@@ -63,7 +65,9 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp and division; CuTe hoists the row's 1 / sum out of
+# the column loop.
+@helion.kernel(fast_math=True)
 def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     """
     Numerically optimized Helion kernel performing softmax in two passes.

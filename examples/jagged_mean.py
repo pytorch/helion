@@ -28,7 +28,8 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate division by each row's length.
+@helion.kernel(fast_math=True)
 def jagged_mean_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,

@@ -1165,9 +1165,11 @@ def _cute_grouped_reduce_cluster_online_pair_body(
     if cutlass.const_expr(cluster_n <= 8):
         # Serial fold over the received pairs: no shuffles, and the small
         # LDS burst (<= 8 pairs) stays under the live-set peak.
+        # NaN-propagating like the CTA-local max and torch.amax: a NaN in
+        # any CTA's slice makes the row max NaN.
         group_max = vals[0]
         for w in cutlass.range_constexpr(1, cluster_n):
-            group_max = cute.arch.fmax(group_max, vals[2 * w])
+            group_max = cute.arch.fmax(group_max, vals[2 * w], nan=True)
         group_sum = cutlass.Float32(0.0)
         for w in cutlass.range_constexpr(cluster_n):
             group_sum = group_sum + vals[2 * w + 1] * cute.math.exp2(
@@ -1186,7 +1188,9 @@ def _cute_grouped_reduce_cluster_online_pair_body(
         if lane_in_warp >= cluster_n:
             pair_max = -cutlass.Float32.inf
             pair_sum = cutlass.Float32(0.0)
-        group_max = cute.arch.warp_reduction_max(pair_max, threads_in_group=32)
+        group_max = cute.arch.warp_reduction_max(
+            pair_max, op=_cute_nan_max, threads_in_group=32
+        )
         rescaled = pair_sum * cute.math.exp2(
             (pair_max - group_max) * scale, fastmath=fastmath
         )

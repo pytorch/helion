@@ -1606,12 +1606,14 @@ class DeviceFunction:
             from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
 
             kernel_body = fuse_fp8_pair_decode(kernel_body)
-            # Hoist loop-invariant floating-point divisions out of inner
-            # tile loops, replacing each ``x / scalar`` with a hoisted
-            # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
-            # B200 div is ~22 cycles vs ~2 for multiply, so the softmax
-            # consume sweep (~12672 divides per row) sees a measured
-            # +20% bench gain on (4096, 12672) fp16.
+            # Under fast_math, hoist loop-invariant floating-point
+            # divisions out of inner tile loops, replacing each
+            # ``x / scalar`` with a hoisted ``inv = 1.0 / scalar`` +
+            # ``x * inv`` in the loop body.  B200 div is ~22 cycles vs ~2
+            # for multiply, so the softmax consume sweep (~12672 divides
+            # per row) sees a measured +20% bench gain on (4096, 12672)
+            # fp16.  The rewrite rounds differently and fires only in the
+            # loops a config creates, so it needs the setting.
             from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
 
             # Pass the post-renames map so the invariance analysis can
@@ -1622,7 +1624,9 @@ class DeviceFunction:
             # loop and capture its stale initial value.
             rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
             kernel_body = hoist_loop_invariant_recips(
-                kernel_body, rename_groups=rename_groups
+                kernel_body,
+                rename_groups=rename_groups,
+                fast_math=CompileEnvironment.current().settings.fast_math,
             )
             # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
             # ``cute.math.fma`` (the DSL's arith ops carry no contract
@@ -1909,11 +1913,12 @@ class DeviceFunction:
             )
             # Fuse an online-softmax (max, sum) pair of cluster reduces into
             # ONE packed DSM exchange: the max reduce relocalizes to a
-            # CTA-local block reduce, the sum site exchanges the
+            # CTA-local block reduce, and the sum site exchanges the
             # ``(local_max, local_sum)`` pair once and folds with the
-            # online-softmax rescale, and the write sweep reuses the sum
-            # sweep's cached exp values.  Saves a full cluster round-trip
-            # per row (+5..9% at cluster_n 2..16 on B200 softmax).
+            # online-softmax rescale.  Under fast_math the write sweep also
+            # reuses the sum sweep's cached exp values; otherwise it keeps
+            # computing them exactly.  Saves a full cluster round-trip per
+            # row (+5..9% at cluster_n 2..16 on B200 softmax).
             from .cute.cluster_online_pair import fuse_cluster_online_pair
 
             kernel_body = fuse_cluster_online_pair(

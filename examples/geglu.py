@@ -47,7 +47,8 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate tanh in the GELU.
+@helion.kernel(fast_math=True)
 def _geglu(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.

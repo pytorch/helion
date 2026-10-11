@@ -33,7 +33,9 @@ import helion.language as hl
 
 
 # %%
+# fast_math: approximate exp and division.
 @helion.kernel(
+    fast_math=True,
     # Validate autotuning against eager softmax (the ground truth) rather than
     # the kernel's default config, which loads the whole last dim and so can be
     # too large to compile as the baseline before autotuning shrinks the block.
