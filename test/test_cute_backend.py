@@ -14169,6 +14169,69 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(row_sums, a.sum(-1), rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(argmaxes, b.argmax(-1))
 
+    def test_branch_reduction_lane_loops_move_into_their_branches(self) -> None:
+        """At the default config each branch's reduction walks its row with a
+        lane loop, and those loops wrapped the whole grid body: a branch's
+        reduction also sat in the other branch's lane loop and was refused,
+        and a branch's own lane loop held the guard above the tile loop the
+        serial-loop interchange must see.  Each lane loop now runs inside only
+        the branches that read it.
+        """
+        for (da, db), block_sizes in [
+            ((32, 64), None),
+            ((64, 32), None),
+            ((32, 32), None),
+            ((33, 65), None),
+            ((32, 64), [2, 8]),
+        ]:
+            a = torch.randn(16, da, device=DEVICE)
+            b = torch.randn(16, db, device=DEVICE)
+            kwargs = {} if block_sizes is None else {"block_sizes": block_sizes}
+            code, (row_sums, row_maxes) = code_and_output(
+                cute_branch_row_sum_and_max, (a, b), **kwargs
+            )
+            msg = f"da={da} db={db} block_sizes={block_sizes}"
+            self.assertIn("for synthetic_lane_", code, msg)
+            torch.testing.assert_close(
+                row_sums, a.sum(-1), rtol=1e-4, atol=1e-4, msg=msg
+            )
+            torch.testing.assert_close(row_maxes, b.amax(-1), rtol=0, atol=0, msg=msg)
+        for da, db in [(32, 64), (32, 32)]:
+            a = torch.randn(16, da, device=DEVICE)
+            b = torch.randn(16, db, device=DEVICE)
+            c = torch.randn(16, da + db, device=DEVICE)
+            _code, (row_sums, row_maxes, row_mins) = code_and_output(
+                cute_branch_row_sum_max_and_min, (a, b, c)
+            )
+            msg = f"da={da} db={db}"
+            torch.testing.assert_close(
+                row_sums, a.sum(-1), rtol=1e-4, atol=1e-4, msg=msg
+            )
+            torch.testing.assert_close(row_maxes, b.amax(-1), rtol=0, atol=0, msg=msg)
+            torch.testing.assert_close(row_mins, c.amin(-1), rtol=0, atol=0, msg=msg)
+            _code, (normalized, centered) = code_and_output(
+                cute_branch_row_normalize_and_center, (a, b)
+            )
+            torch.testing.assert_close(
+                normalized, a / a.sum(-1, keepdim=True), rtol=1e-4, atol=1e-4
+            )
+            torch.testing.assert_close(
+                centered, b - b.amax(-1, keepdim=True), rtol=0, atol=0
+            )
+
+    def test_branch_atomic_keeps_its_lane_loop(self) -> None:
+        """An atomic over a lane-distributed row adds once per lane though it
+        reads none of the lane's coordinates (its index and value are
+        constants), so its branch keeps the lane loop when the loop moves into
+        the branches.
+        """
+        a = torch.randn(16, 64, device=DEVICE)
+        counter = torch.zeros(1, device=DEVICE)
+        code, row_sums = code_and_output(cute_branch_row_sum_and_count, (a, counter))
+        self.assertIn("for synthetic_lane_", code)
+        torch.testing.assert_close(row_sums, a.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(counter, torch.full_like(counter, a.numel()))
+
 
 @helion.kernel(backend="cute", static_shapes=False)
 def cute_branch_free_arange_reduction(
@@ -14220,6 +14283,48 @@ def cute_branch_row_sum_and_max(
             for tile_b in hl.tile(m):
                 out_b[tile_b] = b[tile_b, :].amax(-1)
     return out_a, out_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_row_sum_max_and_min(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = a.size(0)
+    out_a = torch.empty([m], device=a.device, dtype=a.dtype)
+    out_b = torch.empty([m], device=a.device, dtype=a.dtype)
+    out_c = torch.empty([m], device=a.device, dtype=a.dtype)
+    for pid in hl.grid(3):
+        if pid == 0:
+            for tile_a in hl.tile(m):
+                out_a[tile_a] = a[tile_a, :].sum(-1)
+        elif pid == 1:
+            for tile_b in hl.tile(m):
+                out_b[tile_b] = b[tile_b, :].amax(-1)
+        else:
+            for tile_c in hl.tile(m):
+                out_c[tile_c] = c[tile_c, :].amin(-1)
+    return out_a, out_b, out_c
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_row_sum_and_count(
+    a: torch.Tensor, counter: torch.Tensor
+) -> torch.Tensor:
+    m = a.size(0)
+    n = hl.specialize(a.size(1))
+    out_a = torch.empty([m], device=a.device, dtype=a.dtype)
+    for pid in hl.grid(2):
+        if pid == 0:
+            for tile_a in hl.tile(m):
+                out_a[tile_a] = a[tile_a, :].sum(-1)
+        else:
+            for tile_b in hl.tile(m):
+                hl.atomic_add(
+                    counter,
+                    [hl.zeros([tile_b, n], dtype=torch.int64)],
+                    hl.full([tile_b, n], 1.0, dtype=torch.float32),
+                )
+    return out_a
 
 
 @helion.kernel(backend="cute", static_shapes=True)
