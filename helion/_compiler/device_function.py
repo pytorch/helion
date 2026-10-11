@@ -2327,12 +2327,15 @@ class DeviceFunction:
         Remove variables that are not used in the function body.
         """
 
+        rename_groups = {
+            name: aliases[0] for name, aliases in self._variable_renames.items()
+        }
         for _ in range(8):
             rw = ReadWrites.from_list([*self.preamble, *self.body])
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
-            dead_lane_loop_elimination(self.body)
-            dead_lane_loop_elimination(self.preamble)
+            dead_lane_loop_elimination(self.body, rename_groups)
+            dead_lane_loop_elimination(self.preamble, rename_groups)
         rw = ReadWrites.from_list([*self.preamble, *self.body])
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor

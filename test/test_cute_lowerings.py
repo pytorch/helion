@@ -14725,6 +14725,27 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("indices_0", code)
         self.assertIn("out = 1", code)
 
+    def test_dead_lane_loop_elimination_keeps_a_carried_accumulator(self) -> None:
+        # The split's per-lane accumulation of a reduction whose input ignores
+        # the lane (``hl.full(...).sum()``) reads no lane coordinate, but each
+        # iteration adds one lane's element: splicing it counted one lane.
+        body: list[ast.AST] = [
+            _create_lane_loop(
+                "synthetic_lane_0",
+                4,
+                [
+                    statement_from_string("full = cutlass.Float32(1.0)"),
+                    statement_from_string("acc = acc + full"),
+                ],
+            )
+        ]
+
+        self.assertFalse(dead_lane_loop_elimination(body))
+        self.assertIn(
+            "for synthetic_lane_0 in range(4)",
+            ast.unparse(ast.Module(body=body, type_ignores=[])),
+        )
+
     def test_wrap_body_skips_unreferenced_lane_loop(self) -> None:
         grid = DeviceGridState(
             strategy=_FakeLoopStrategy([0]),

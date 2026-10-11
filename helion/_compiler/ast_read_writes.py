@@ -9,6 +9,8 @@ from typing import TypeVar
 from .ast_extension import ExtendedAST
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     _A = TypeVar("_A", bound=ast.AST)
 
 
@@ -260,9 +262,10 @@ def ast_delete_assignments(body: list[ast.AST], to_remove: set[str]) -> list[ast
 
 
 class _DeleteDeadLaneLoops(ast.NodeTransformer):
-    def __init__(self) -> None:
+    def __init__(self, rename_groups: Mapping[str, str]) -> None:
         super().__init__()
         self.changed = False
+        self.rename_groups = rename_groups
 
     def _visit_stmt_list(self, body: list[ast.stmt]) -> list[ast.stmt]:
         new_body: list[ast.stmt] = []
@@ -293,21 +296,109 @@ class _DeleteDeadLaneLoops(ast.NodeTransformer):
             or node.target.id != lane_var
         ):
             return node
-        if lane_var in ReadWrites.from_list(node.body).reads:
+        if lane_var in ReadWrites.from_list(node.body).reads or _carries_a_value(
+            node.body, self.rename_groups
+        ):
             return node
         self.changed = True
         return node.body
 
 
-def dead_lane_loop_elimination(body: list[ast.AST]) -> bool:
+def _carries_a_value(body: list[ast.stmt], rename_groups: Mapping[str, str]) -> bool:
+    """Whether an iteration of ``body`` reads a variable an earlier one wrote.
+
+    A variable the body writes (a register array through a subscript store
+    too) and reads before the iteration itself defines it.  Names compare
+    through ``rename_groups``, the device function's aliases of each carried
+    value, which only the final rename pass merges.
+    """
+    exposed: set[str] = set()
+    written: set[str] = set()
+
+    def canonical(name: str) -> str:
+        return rename_groups.get(name, name)
+
+    def read(node: ast.AST | None, defined: set[str]) -> None:
+        if node is None:
+            return
+        exposed.update(
+            canonical(child.id)
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name)
+            and isinstance(child.ctx, ast.Load)
+            and canonical(child.id) not in defined
+        )
+
+    def store(target: ast.expr, defined: set[str], *, update: bool) -> None:
+        if isinstance(target, ast.Name):
+            if update:
+                read(ast.Name(id=target.id, ctx=ast.Load()), defined)
+            written.add(canonical(target.id))
+            defined.add(canonical(target.id))
+        elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            # An element write: the array is not defined by it.
+            if update:
+                read(target.value, defined)
+            read(target.slice, defined)
+            written.add(canonical(target.value.id))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                store(element, defined, update=update)
+        else:
+            read(target, defined)
+
+    def visit(statements: list[ast.stmt], defined: set[str]) -> set[str]:
+        for stmt in statements:
+            if isinstance(stmt, ast.Assign):
+                read(stmt.value, defined)
+                for target in stmt.targets:
+                    store(target, defined, update=False)
+            elif isinstance(stmt, ast.AnnAssign):
+                read(stmt.value, defined)
+                store(stmt.target, defined, update=False)
+            elif isinstance(stmt, ast.AugAssign):
+                read(stmt.value, defined)
+                store(stmt.target, defined, update=True)
+            elif isinstance(stmt, ast.If):
+                read(stmt.test, defined)
+                defined |= visit(stmt.body, set(defined)) & visit(
+                    stmt.orelse, set(defined)
+                )
+            elif isinstance(stmt, ast.For):
+                # The body may not run: its definitions stay inside.
+                read(stmt.iter, defined)
+                inner = set(defined)
+                store(stmt.target, inner, update=False)
+                visit(stmt.body, inner)
+                visit(stmt.orelse, set(defined))
+            else:
+                read(stmt, defined)
+                written.update(
+                    canonical(child.id)
+                    for child in ast.walk(stmt)
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+                )
+        return defined
+
+    visit(body, set())
+    return bool(exposed & written)
+
+
+def dead_lane_loop_elimination(
+    body: list[ast.AST], rename_groups: Mapping[str, str] | None = None
+) -> bool:
     """Splice generated lane loops whose lane variable became dead.
 
     CuTe lane loops are compiler-generated scalarization loops whose target
     variable is expected to feed lane-dependent indices. Normal DCE can remove
     those index assignments, leaving an invariant loop that repeats identical
     side effects. Only loops explicitly marked by codegen are eligible here.
+    A loop whose body carries a variable from one iteration to the next
+    repeats no identical effect and stays: the per-lane accumulation of a
+    reduction whose input ignores the lane (``hl.full(...).sum()``) counts
+    every lane.
     """
-    transformer = _DeleteDeadLaneLoops()
+    transformer = _DeleteDeadLaneLoops(rename_groups or {})
     new_body: list[ast.AST] = []
     for node in body:
         new_node = transformer.visit(node)

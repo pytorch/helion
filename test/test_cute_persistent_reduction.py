@@ -2357,6 +2357,51 @@ dependent = outer_lane + fallback
     assert inner < fallback < dependent
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _guarded_constant_row_sum(
+    state_indices: torch.Tensor, a: torch.Tensor
+) -> torch.Tensor:
+    batch = state_indices.size(0)
+    width = hl.specialize(a.size(1))
+    out = torch.empty([batch], dtype=a.dtype, device=a.device)
+    for tile_batch in hl.tile(batch, block_size=1):
+        state_index = state_indices[tile_batch.id]
+        if state_index < 0:
+            out[tile_batch] = hl.full([tile_batch, width], 1.0, dtype=a.dtype).sum(-1)
+        else:
+            out[tile_batch] = a[tile_batch, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _guarded_broadcast_row_sum(
+    state_indices: torch.Tensor, a: torch.Tensor
+) -> torch.Tensor:
+    batch = state_indices.size(0)
+    width = hl.specialize(a.size(1))
+    out = torch.empty([batch], dtype=a.dtype, device=a.device)
+    for tile_batch in hl.tile(batch, block_size=1):
+        state_index = state_indices[tile_batch.id]
+        if state_index < 0:
+            first = a[tile_batch, 0]
+            row = first[:, None] + hl.zeros([tile_batch, width], dtype=a.dtype)
+            out[tile_batch] = row.sum(-1)
+        else:
+            out[tile_batch] = a[tile_batch, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _constant_row_sum_plus_rows(a: torch.Tensor) -> torch.Tensor:
+    m = a.size(0)
+    width = hl.specialize(a.size(1))
+    out = torch.empty_like(a)
+    for tile_m in hl.tile(m):
+        constant = hl.full([tile_m, width], 2.0, dtype=a.dtype)
+        out[tile_m, :] = a[tile_m, :] + constant.sum(-1, keepdim=True)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCutePersistentReduction(TestCase):
     def test_persistent_subwarp_vector_topology(self) -> None:
@@ -2437,3 +2482,42 @@ class TestCutePersistentReduction(TestCase):
         )
         self.assertIn("_cute_store_u16_vec", code)
         self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+
+    def test_lane_invariant_reduction_counts_every_lane(self) -> None:
+        # With fewer threads than the row, each thread's lane loop adds its
+        # lanes' elements.  A row whose values ignore the lane (a constant,
+        # a broadcast scalar) left an accumulation that reads no lane
+        # coordinate, and the dead-lane-loop splice ran it for one lane:
+        # 32 instead of 128 per row.
+        state_indices = torch.tensor([1, -1, -3], dtype=torch.int64, device=DEVICE)
+        a = torch.randn(3, 128, device=DEVICE)
+        negative = (state_indices < 0)[:, None]
+        for kernel, args, expected in [
+            (
+                _guarded_constant_row_sum,
+                (state_indices, a),
+                torch.where(negative, 128.0, a.sum(-1, keepdim=True))[:, 0],
+            ),
+            (
+                _guarded_broadcast_row_sum,
+                (state_indices, a),
+                torch.where(negative, 128 * a[:, :1], a.sum(-1, keepdim=True))[:, 0],
+            ),
+            (_constant_row_sum_plus_rows, (a,), a + 256.0),
+        ]:
+            bound = kernel.bind(args)
+            env = bound.env
+            reduction_block = next(
+                block_id
+                for block_id, block in enumerate(env.block_sizes)
+                if block.reduction
+            )
+            config = bound.config_spec.default_config().config
+            config["num_threads"] = [
+                32 if block_id == reduction_block else 0
+                for block_id in env.config_spec.num_threads.valid_block_ids()
+            ]
+            out = bound.compile_config(helion.Config(**config))(*args)
+            torch.testing.assert_close(
+                out, expected, rtol=1e-4, atol=1e-4, msg=kernel.name
+            )
