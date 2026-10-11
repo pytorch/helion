@@ -13,23 +13,11 @@ if TYPE_CHECKING:
 INTRA_LOOP_RAW_BARRIER_META = "_needs_debug_barrier_before"
 
 
-def collect_host_tensor_aliases(body: list[ast.stmt]) -> dict[str, str]:
-    """Collect conservative base-storage aliases from host-wrapper statements."""
-    aliases: dict[str, str] = {}
-    for stmt in body:
-        if not isinstance(stmt, ast.For):
-            _update_host_aliases(stmt, aliases)
-    return aliases
-
-
-def canonical_host_tensor_name(name: str, aliases: dict[str, str]) -> str:
-    """Resolve ``name`` through aliases collected by collect_host_tensor_aliases."""
-    return _canonical_alias(name, aliases)
-
-
 # A root shared by every kernel argument: the caller may pass one tensor twice
 # or overlapping views, so two arguments are never provably distinct storage.
 HOST_ARGUMENT_ROOT = "<argument>"
+# With ``distinct_arguments`` each argument gets ``<argument NAME>`` instead.
+_ARGUMENT_ROOT_PREFIX = "<argument"
 # A value whose storage cannot be traced (e.g. computed from globals only).
 HOST_UNKNOWN_ROOT = "<unknown>"
 
@@ -64,12 +52,19 @@ _FRESH_TENSOR_METHODS = frozenset(
 )
 
 
+def is_host_argument_root(root: str) -> bool:
+    """Whether ``root`` (of ``collect_host_tensor_roots``) is a kernel argument."""
+    return root.startswith(_ARGUMENT_ROOT_PREFIX)
+
+
 def collect_host_tensor_roots(
-    body: list[ast.stmt], arg_names: set[str]
+    body: list[ast.stmt], arg_names: set[str], *, distinct_arguments: bool = False
 ) -> dict[str, frozenset[str]]:
     """Conservative storage roots of every name the host code binds.
 
-    A root is :data:`HOST_ARGUMENT_ROOT`, an allocation site (a call listed in
+    A root is :data:`HOST_ARGUMENT_ROOT` (``<argument NAME>`` per argument when
+    ``distinct_arguments``, for callers that may assume the caller passes
+    distinct tensors), an allocation site (a call listed in
     ``_FRESH_TORCH_FUNCTIONS`` / ``_FRESH_TENSOR_METHODS``), or
     :data:`HOST_UNKNOWN_ROOT`.  Any other value is assumed to alias every
     tensor it is computed from: a view, a no-op conversion or an unknown op
@@ -104,10 +99,20 @@ def collect_host_tensor_roots(
             bind(node.optional_vars, node.context_expr)
 
     roots: dict[str, frozenset[str]] = {
-        name: frozenset({HOST_ARGUMENT_ROOT}) for name in arg_names
+        name: frozenset(
+            {f"<argument {name}>" if distinct_arguments else HOST_ARGUMENT_ROOT}
+        )
+        for name in arg_names
     }
     for name, _value in bindings:
         roots.setdefault(name, frozenset())
+
+    def name_roots(name: ast.Name) -> frozenset[str]:
+        # A shape, a size or another scalar cannot share tensor storage, so
+        # ``x.view(rows, cols)`` aliases x and not the tensor ``rows`` came from.
+        if _holds_no_storage(name):
+            return frozenset()
+        return roots.get(name.id, frozenset())
 
     def expr_roots(expr: ast.expr) -> frozenset[str]:
         if isinstance(expr, ast.Call) and _is_fresh_allocation(expr):
@@ -115,7 +120,7 @@ def collect_host_tensor_roots(
         result: frozenset[str] = frozenset()
         for child in ast.iter_child_nodes(expr):
             if isinstance(child, ast.Name):
-                result |= roots.get(child.id, frozenset())
+                result |= name_roots(child)
             elif isinstance(child, ast.expr):
                 result |= expr_roots(child)
         return result
@@ -125,9 +130,7 @@ def collect_host_tensor_roots(
         changed = False
         for name, value in bindings:
             value_roots = (
-                roots.get(value.id, frozenset())
-                if isinstance(value, ast.Name)
-                else expr_roots(value)
+                name_roots(value) if isinstance(value, ast.Name) else expr_roots(value)
             )
             merged = roots[name] | value_roots
             if merged != roots[name]:
@@ -139,6 +142,29 @@ def collect_host_tensor_roots(
     }
 
 
+def _holds_no_storage(name: ast.Name) -> bool:
+    """Whether type propagation proved ``name`` holds no tensor storage."""
+    from .ast_extension import ExtendedAST
+    from .type_info import CollectionType
+    from .type_info import LiteralType
+    from .type_info import NumericType
+    from .type_info import StringType
+    from .type_info import TileIndexType
+
+    def scalar(type_info: object) -> bool:
+        if isinstance(type_info, (NumericType, LiteralType, StringType, TileIndexType)):
+            return True
+        if isinstance(type_info, CollectionType):
+            elements = type_info.element_types
+            if isinstance(elements, dict):
+                return all(scalar(element) for element in elements.values())
+            if isinstance(elements, (list, tuple)):
+                return all(scalar(element) for element in elements)
+        return False
+
+    return isinstance(name, ExtendedAST) and scalar(name._type_info)
+
+
 def _is_fresh_allocation(call: ast.Call) -> bool:
     func = call.func
     if not isinstance(func, ast.Attribute):
@@ -146,162 +172,6 @@ def _is_fresh_allocation(call: ast.Call) -> bool:
     if isinstance(func.value, ast.Name) and func.value.id == "torch":
         return func.attr in _FRESH_TORCH_FUNCTIONS
     return func.attr in _FRESH_TENSOR_METHODS
-
-
-# Methods (and ``torch.*`` functions) whose result may share its input's
-# storage: views, and conversions that return the input itself when they have
-# nothing to do (``contiguous`` of a contiguous tensor, ``to``/``float`` to the
-# same dtype/device).  In-place methods (``x.mul_(2)``) return their receiver.
-_ALIAS_PRESERVING_METHODS = frozenset(
-    {
-        "as_strided",
-        "bfloat16",
-        "bool",
-        "byte",
-        "char",
-        "chunk",
-        "contiguous",
-        "cpu",
-        "cuda",
-        "detach",
-        "diagonal",
-        "double",
-        "expand",
-        "expand_as",
-        "flatten",
-        "float",
-        "half",
-        "int",
-        "long",
-        "movedim",
-        "narrow",
-        "permute",
-        "reshape",
-        "reshape_as",
-        "select",
-        "short",
-        "split",
-        "squeeze",
-        "swapaxes",
-        "swapdims",
-        "t",
-        "tensor_split",
-        "to",
-        "transpose",
-        "type",
-        "type_as",
-        "unbind",
-        "unflatten",
-        "unfold",
-        "unsqueeze",
-        "view",
-        "view_as",
-    }
-)
-
-
-def _is_alias_preserving_method(name: str) -> bool:
-    return name in _ALIAS_PRESERVING_METHODS or (
-        name.endswith("_") and not name.startswith("_")
-    )
-
-
-def _canonical_alias(name: str, aliases: dict[str, str]) -> str:
-    """Resolve a host name to the base storage name tracked by the analysis."""
-    path: list[str] = []
-    while (base := aliases.get(name)) is not None and base != name:
-        path.append(name)
-        name = base
-    for alias in path:
-        aliases[alias] = name
-    return name
-
-
-def _alias_base_name(expr: ast.expr, aliases: dict[str, str]) -> str | None:
-    """Return the conservative base name for a host-side tensor alias expression.
-
-    Basic slicing and the standard view-like tensor methods preserve storage.
-    Treating an advanced-indexing subscript as an alias is conservative: it can
-    add a dependency but cannot remove one.
-    """
-    if isinstance(expr, ast.Name):
-        return _canonical_alias(expr.id, aliases)
-    if isinstance(expr, ast.Subscript):
-        return _alias_base_name(expr.value, aliases)
-    if isinstance(expr, ast.Attribute) and expr.attr in {"T", "mT", "H", "mH", "data"}:
-        return _alias_base_name(expr.value, aliases)
-    if isinstance(expr, ast.Call):
-        if (
-            isinstance(expr.func, ast.Attribute)
-            and isinstance(expr.func.value, ast.Name)
-            and expr.func.value.id == "torch"
-            and _is_alias_preserving_method(expr.func.attr)
-            and expr.args
-        ):
-            return _alias_base_name(expr.args[0], aliases)
-        if isinstance(expr.func, ast.Attribute) and _is_alias_preserving_method(
-            expr.func.attr
-        ):
-            return _alias_base_name(expr.func.value, aliases)
-    return None
-
-
-def _target_names(target: ast.expr) -> tuple[str, ...]:
-    if isinstance(target, ast.Name):
-        return (target.id,)
-    if isinstance(target, (ast.List, ast.Tuple)):
-        return tuple(name for element in target.elts for name in _target_names(element))
-    return ()
-
-
-def _update_alias_target(
-    target: ast.expr,
-    value: ast.expr,
-    aliases: dict[str, str],
-) -> None:
-    """Apply one host assignment to the conservative storage-alias map."""
-    if isinstance(target, ast.Name):
-        base = _alias_base_name(value, aliases)
-        if base is None:
-            aliases.pop(target.id, None)
-        else:
-            aliases[target.id] = base
-        return
-
-    if not isinstance(target, (ast.List, ast.Tuple)):
-        return
-
-    # Pairwise tuple/list assignment preserves the more precise base for each
-    # element.  Calls such as ``q, k, v = qkv.unbind(0)`` return multiple views
-    # of one storage, so every unpacked name conservatively aliases the call's
-    # receiver even though the RHS is not an AST tuple.
-    if isinstance(value, (ast.List, ast.Tuple)) and len(target.elts) == len(value.elts):
-        for target_element, value_element in zip(target.elts, value.elts, strict=True):
-            _update_alias_target(target_element, value_element, aliases)
-        return
-
-    base = _alias_base_name(value, aliases)
-    for name in _target_names(target):
-        if base is None:
-            aliases.pop(name, None)
-        else:
-            aliases[name] = base
-
-
-def _update_host_aliases(stmt: ast.stmt, aliases: dict[str, str]) -> None:
-    """Update base-storage aliases from a host-wrapper assignment."""
-    value: ast.expr | None = None
-    targets: tuple[ast.expr, ...] = ()
-    if isinstance(stmt, ast.Assign):
-        targets = tuple(stmt.targets)
-        value = stmt.value
-    elif isinstance(stmt, ast.AnnAssign):
-        targets = (stmt.target,)
-        value = stmt.value
-    if value is None:
-        return
-    for target in targets:
-        _update_alias_target(target, value, aliases)
 
 
 def mark_intra_loop_raw_barriers(

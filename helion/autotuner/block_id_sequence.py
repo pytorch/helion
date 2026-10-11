@@ -46,6 +46,10 @@ class _BlockIdItem:
     ) -> object:
         return fn(self._fragment(base))
 
+    def _omitted_from_legacy_configs(self) -> bool:
+        """Whether configs saved by older versions leave out this item's value."""
+        return False
+
     def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
         """Encode a normalized Config value into its flat-slot representation.
 
@@ -229,6 +233,15 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
             raise InvalidConfig(
                 f"Too many values for config[{name!r}], expected {size}, got {len(values)}"
             )
+        omitted = [spec._omitted_from_legacy_configs() for spec in self._data]
+        if omitted.count(True) and len(values) == omitted.count(False):
+            # A config saved without the omitted items: put its values back
+            # at the positions of the items it does have.
+            given = iter(values)
+            values = [
+                spec._fill_missing() if skip else next(given)
+                for spec, skip in zip(self._data, omitted, strict=True)
+            ]
         if len(values) < size:
             try:
                 for spec in self._data[len(values) :]:

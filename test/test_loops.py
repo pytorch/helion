@@ -77,6 +77,59 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel()
+def store_through_nested_if_alias(x: torch.Tensor) -> torch.Tensor:
+    # y is x itself whenever the branch runs: the loop reads and writes x.
+    y = torch.empty_like(x)
+    if x.size(0) > 1:
+        y = x.moveaxis(0, 0)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
+@helion.kernel()
+def store_through_conditional_expression_alias(x: torch.Tensor) -> torch.Tensor:
+    y = x.ravel().view(x.shape) if x.size(0) > 1 else torch.empty_like(x)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
+@helion.kernel()
+def store_through_broadcast_to_alias(x: torch.Tensor) -> torch.Tensor:
+    y = torch.broadcast_to(x, x.shape)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
+@helion.kernel()
+def store_to_nested_if_fresh_buffer(x: torch.Tensor) -> torch.Tensor:
+    # Both bindings are fresh allocations: the loop never writes x.
+    y = torch.empty_like(x)
+    if x.size(0) > 1:
+        y = torch.zeros_like(x)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return y
+
+
+@helion.kernel()
+def store_to_view_sized_by_argument(x: torch.Tensor) -> torch.Tensor:
+    # y views a fresh buffer; only its shape comes from x.
+    rows, cols = x.shape
+    y = torch.empty([rows * cols], device=x.device, dtype=x.dtype).view(rows, cols)
+    for tile_outer in hl.tile(rows):
+        for tile_inner in hl.tile(cols):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return y
+
+
+@helion.kernel()
 def inplace_then_independent_reduction(
     x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1163,13 +1216,51 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn([16], device=DEVICE)
         out = torch.empty_like(x)
         spec = store_with_output_read.bind((x, out)).config_spec
-        self.assertEqual(len(spec.range_num_stages), 0)
+        self.assertTrue(all(item.pinned for item in spec.range_num_stages))
 
     @skipIfRefEager("not supported in ref eager mode")
-    def test_range_num_stages_removed_for_inplace_kernel(self):
+    def test_range_num_stages_pinned_for_inplace_kernel(self):
+        # triton#8259: every loop of the in-place nest keeps its slot (the
+        # config shape does not depend on the alias analysis) pinned to 0.
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = inplace_nested_loop_kernel.bind(args).config_spec
-        self.assertEqual(len(spec.range_num_stages), 0)
+        self.assertTrue(all(item.pinned for item in spec.range_num_stages))
+        slots = len(spec.range_num_stages)
+        normalized = spec.normalized_config(
+            helion.Config(block_sizes=[16, 16], range_num_stages=[3] * slots)
+        )
+        self.assertEqual(normalized.range_num_stages, [0] * slots)
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_pinned_for_host_aliases(self):
+        # triton#8259: a store through a host alias of x in a loop that reads
+        # x, whether the alias is bound in a nested ``if``, a conditional
+        # expression or by an op the analysis does not list.
+        args = (torch.randn([16, 16], device=DEVICE),)
+        for kernel in (
+            store_through_nested_if_alias,
+            store_through_conditional_expression_alias,
+            store_through_broadcast_to_alias,
+        ):
+            with self.subTest(kernel=kernel.name):
+                spec = kernel.bind(args).config_spec
+                self.assertTrue(all(item.pinned for item in spec.range_num_stages))
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_preserved_for_fresh_host_buffers(self):
+        # A nested-if rebinding to another fresh buffer, and a view of a fresh
+        # buffer whose shape arguments come from x (scalars share no storage).
+        args = (torch.randn([16, 16], device=DEVICE),)
+        for kernel in (
+            store_to_nested_if_fresh_buffer,
+            store_to_view_sized_by_argument,
+        ):
+            with self.subTest(kernel=kernel.name):
+                spec = kernel.bind(args).config_spec
+                self.assertGreater(len(spec.range_num_stages), 0)
+                self.assertFalse(any(item.pinned for item in spec.range_num_stages))
 
     @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
@@ -1181,7 +1272,12 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.randn([16, 16], device=DEVICE),
         )
         spec = inplace_then_independent_reduction.bind(args).config_spec
-        self.assertGreater(len(spec.range_num_stages), 0)
+        pinned = {
+            block_id: item.pinned
+            for item in spec.range_num_stages
+            for block_id in item.block_ids
+        }
+        self.assertEqual(pinned, {0: True, 1: False, 2: False, 3: False})
 
     @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
@@ -1193,9 +1289,35 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.randn([16, 16], device=DEVICE),
         )
         spec = atomic_then_independent_reduction.bind(args).config_spec
-        valid_block_ids = spec.range_num_stages.valid_block_ids()
-        self.assertNotIn(1, valid_block_ids)
-        self.assertIn(4, valid_block_ids)
+        stages = spec.range_num_stages
+        self.assertTrue(stages.block_id_lookup(1).pinned)
+        self.assertFalse(stages.block_id_lookup(4).pinned)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_config_saved_without_pinned_slots_still_loads(self):
+        # Before pinning, the triton#8259 workaround removed the atomic nest's
+        # slots: such a config lists only the free loops' values, and they
+        # must land on those loops rather than shift onto the pinned ones.
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = atomic_then_independent_reduction.bind(args).config_spec
+        pinned = [item.pinned for item in spec.range_num_stages]
+        self.assertEqual(pinned, [True, True, False, False])
+        for saved in ([1, 3], [2, 2, 1, 3]):
+            with self.subTest(saved=saved):
+                normalized = spec.normalized_config(
+                    helion.Config(
+                        block_sizes=[16, 16, 16, 16, 16],
+                        pid_type="persistent_blocked",
+                        range_num_stages=saved,
+                    )
+                )
+                self.assertEqual(normalized.range_num_stages, [0, 0, 1, 3])
 
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
     @skipIfNotTriton(

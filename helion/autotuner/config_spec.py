@@ -7624,8 +7624,24 @@ class RangeWarpSpecializeSpec(_OptionalBoolSpec):
 
 
 class RangeNumStagesSpec(_OptionalIntSpec):
+    # Set by ``CompileEnvironment._pin_range_num_stages_for_aliasing``
+    # (triton#8259) for a loop that reads and writes argument storage: the slot
+    # stays, so the config shape does not depend on the alias analysis, but
+    # its value is pinned to 0 (no per-loop ``num_stages``).
+    pinned: bool = False
+
     def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        if self.pinned:
+            return IntegerFragment(0, 0, 0)
         return IntegerFragment(0, 4, 0)
+
+    def _normalize(self, name: str, value: object) -> int:
+        value = super()._normalize(name, value)
+        return 0 if self.pinned else value
+
+    def _omitted_from_legacy_configs(self) -> bool:
+        # The workaround used to remove a pinned loop's slot outright.
+        return self.pinned
 
 
 class RangeMultiBufferSpec(_OptionalBoolSpec):

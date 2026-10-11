@@ -1184,7 +1184,7 @@ class CompileEnvironment:
 
         for shape in self.kernel_tensor_sizes:
             FlattenedTileStrategy.update_allow_flattened(shape)
-        self._disable_range_num_stages_for_aliasing()
+        self._pin_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
         self.backend.adjust_block_size_constraints(
             list(self.config_spec.block_sizes),
@@ -1321,11 +1321,20 @@ class CompileEnvironment:
             extent = self.backend.static_rdim_size(extent)
         return extent
 
-    def _disable_range_num_stages_for_aliasing(self) -> None:
+    def _pin_range_num_stages_for_aliasing(self) -> None:
         """
-        Disable pipelining only on loops that read and write the same argument.
+        Pin range_num_stages to 0 on loops that read and write the same argument.
 
-        Workaround for https://github.com/triton-lang/triton/issues/8259
+        Workaround for https://github.com/triton-lang/triton/issues/8259: such a
+        loop gets no per-loop ``num_stages``.  The slot stays in the config
+        space (``RangeNumStagesSpec.pinned``), so a saved config keeps its
+        shape whatever the alias analysis finds.  A device loop is unsafe when
+        a host tensor it reads and a host tensor it writes may share storage
+        that comes from a kernel argument, by
+        ``collect_host_tensor_roots`` with each argument its own root: any
+        view, conversion or unknown op on an argument is assumed to alias it,
+        bindings in nested host blocks count, and a tensor of unknown
+        provenance may alias anything.
         """
 
         if not self.config_spec.range_num_stages:
@@ -1334,40 +1343,77 @@ class CompileEnvironment:
         from .ast_extension import ExtendedAST
         from .ast_read_writes import ReadWrites
         from .host_function import HostFunction
-        from .loop_dependency_checker import canonical_host_tensor_name
-        from .loop_dependency_checker import collect_host_tensor_aliases
+        from .loop_dependency_checker import HOST_UNKNOWN_ROOT
+        from .loop_dependency_checker import collect_host_tensor_roots
+        from .loop_dependency_checker import is_host_argument_root
         from .type_info import IterType
         from .type_info import SequenceType
+        from .type_info import TensorType
         from .type_info import TileIndexType
 
         host_fn = HostFunction.current()
-        arg_names = set(host_fn.params.arguments.keys())
-        aliases = collect_host_tensor_aliases(host_fn.body)
+        module = ast.Module(body=host_fn.body, type_ignores=[])
+        roots = collect_host_tensor_roots(
+            host_fn.body,
+            set(host_fn.params.arguments.keys()),
+            distinct_arguments=True,
+        )
+        device_loops = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.For)
+            and isinstance(node, ExtendedAST)
+            and isinstance(node.iter, ExtendedAST)
+            and isinstance(node.iter._type_info, IterType)
+        ]
+        # Names bound inside a device loop are tiles, not host tensors.
+        device_names = {
+            name.id
+            for loop in device_loops
+            for name in ast.walk(loop)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
+        }
+        tensor_names = {
+            name.id
+            for name in ast.walk(module)
+            if isinstance(name, ast.Name)
+            and isinstance(name, ExtendedAST)
+            and isinstance(name._type_info, TensorType)
+        } - device_names
+        unknown = frozenset({HOST_UNKNOWN_ROOT})
+
+        def argument_storage(names: set[str]) -> frozenset[str]:
+            result: frozenset[str] = frozenset()
+            for name in names & tensor_names:
+                result |= roots.get(name, unknown)
+            return result
+
         unsafe_block_ids: set[int] = set()
-        for node in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
-            if not isinstance(node, ast.For) or not isinstance(node, ExtendedAST):
-                continue
+        for node in device_loops:
             rw = ReadWrites.from_list(node.body)
             # Name traversal sees the target passed to an in-place store and
             # host-side tensor metadata as reads, but neither reads storage.
-            reads = {
-                canonical_host_tensor_name(name, aliases)
-                for name, count in rw.reads.items()
-                if count
-                > rw.inplace_writes.get(name, 0) + rw.tensor_metadata_reads.get(name, 0)
-            }
-            reads.update(
-                canonical_host_tensor_name(name, aliases) for name in rw.atomic_reads
+            reads = argument_storage(
+                {
+                    name
+                    for name, count in rw.reads.items()
+                    if count
+                    > rw.inplace_writes.get(name, 0)
+                    + rw.tensor_metadata_reads.get(name, 0)
+                }
+                | set(rw.atomic_reads)
             )
-            writes = {canonical_host_tensor_name(name, aliases) for name in rw.writes}
-            if not (reads & writes & arg_names):
+            writes = argument_storage(set(rw.writes))
+            if not (
+                (reads and HOST_UNKNOWN_ROOT in writes)
+                or (writes and HOST_UNKNOWN_ROOT in reads)
+                or any(is_host_argument_root(root) for root in reads & writes)
+            ):
                 continue
             iter_node = node.iter
-            if not isinstance(iter_node, ExtendedAST):
-                continue
+            assert isinstance(iter_node, ExtendedAST)
             iter_type = iter_node._type_info
-            if not isinstance(iter_type, IterType):
-                continue
+            assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
                 unsafe_block_ids.update(
@@ -1377,9 +1423,9 @@ class CompileEnvironment:
                 )
             elif isinstance(inner, TileIndexType):
                 unsafe_block_ids.add(inner.block_id)
-        for block_id in unsafe_block_ids:
-            if block_id in self.config_spec.range_num_stages.valid_block_ids():
-                self.config_spec.range_num_stages.disable_block_id(block_id)
+        for spec in self.config_spec.range_num_stages:
+            if unsafe_block_ids.intersection(spec.block_ids):
+                spec.pinned = True
 
     def allocate_block_size(
         self,
