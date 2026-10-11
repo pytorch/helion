@@ -83,6 +83,29 @@ def _(state: CodegenState) -> list[object]:
     assert isinstance(else_args, list)
     assert all(isinstance(x, ast.AST) for x in if_args)
     assert all(isinstance(x, ast.AST) for x in else_args)
+    assert graph_info.else_branch is not None
+    else_graph = state.get_graph(graph_info.else_branch)
+    assert isinstance(else_graph, ElseGraphInfo)
+
+    # As in ``IfGraphInfo.codegen``, a condition that depends only on block
+    # sizes is a constant for this config.  Emit only the live branch, inline:
+    # CuTe DSL stages even ``if False:`` bodies, so the dead branch (whose
+    # shapes and tile plans need not fit this config) must not be emitted.
+    constexpr_test = state.device_function.evaluate_constexpr_condition(
+        state.proxy_arg(0)
+    )
+    if constexpr_test is not None:
+        live_graph, live_args = (
+            (graph_info.graph, if_args)
+            if constexpr_test
+            else (else_graph.graph, else_args)
+        )
+        live_outputs = codegen_call_with_graph(state.codegen, live_graph, [*live_args])
+        # The ``_phi`` nodes merging the two sides see the live names on both.
+        live_return_names = graph_info.get_branch_return_names(
+            state, live_outputs, 0 if constexpr_test else 1
+        )
+        return [expr_from_string(n) for n in live_return_names * 2]
 
     # Tag each branch with the dynamic ``_if`` node identity so synthetic
     # ``hl.arange`` axes allocated in mutually-exclusive branches can share a
@@ -101,10 +124,8 @@ def _(state: CodegenState) -> list[object]:
         if_outputs = codegen_call_with_graph(
             state.codegen, graph_info.graph, [*if_args]
         )
+        if_outputs = graph_info.copy_outer_outputs(state, if_outputs, 0)
 
-    assert graph_info.else_branch is not None
-    else_graph = state.get_graph(graph_info.else_branch)
-    assert isinstance(else_graph, ElseGraphInfo)
     else_body_stmts: list[ast.AST] = []
     with (
         state.codegen.set_statements(else_body_stmts),
@@ -113,30 +134,75 @@ def _(state: CodegenState) -> list[object]:
         else_outputs = codegen_call_with_graph(
             state.codegen, else_graph.graph, [*else_args]
         )
+        else_outputs = graph_info.copy_outer_outputs(state, else_outputs, 1)
 
-    # Pre-declare any variable that is first defined inside both branches in the
-    # outer scope so CuTe DSL can resolve it after the if/else. The phi pass
-    # later renames the else-branch's name to match the if-branch's name, so we
-    # use the if-branch output name as the canonical pre-declared name.
-    if graph_info.branches_outputs is not None:
-        if_output_node = graph_info.graph.find_nodes(op="output")[0]
-        if_graph_outputs = cast("tuple[object, ...]", if_output_node.args[0])
-        backend = CompileEnvironment.current().backend
-        for if_entry, else_entry in graph_info.branches_outputs:
-            if not (isinstance(if_entry, int) and isinstance(else_entry, int)):
-                continue
-            if_name_node = if_outputs[if_entry]
-            assert isinstance(if_name_node, ast.Name)
-            fx_out = if_graph_outputs[if_entry]
-            if not isinstance(fx_out, torch.fx.Node):
-                continue
-            val = fx_out.meta.get("val")
-            if not isinstance(val, torch.Tensor):
-                continue
+    # CuTe DSL requires a variable assigned in a branch to keep the type it
+    # had before the if, but emitted values keep their DSL type (index math
+    # on Int64 shape arguments, fp32 math on 16-bit tensors), which can
+    # differ from the FX dtype.  A variable first defined inside both
+    # branches is pre-declared with its FX dtype in the outer scope (so CuTe
+    # DSL can also resolve it after the if/else) and both branches cast to
+    # that dtype; the phi pass later renames the else-branch's name to match
+    # the if-branch's name, so the if-branch name is the canonical one.  A
+    # variable one branch leaves unchanged keeps its type, which is only
+    # known at trace time, so the other branch casts its new value to the
+    # type of the value from before the if.  Each cast binds a fresh name:
+    # later passes read ``x = f(x)`` as a value carried across lanes.
+    assert graph_info.branches_outputs is not None
+    backend = CompileEnvironment.current().backend
+    graph_outputs = [
+        cast("tuple[object, ...]", graph.find_nodes(op="output")[0].args[0])
+        for graph in (graph_info.graph, else_graph.graph)
+    ]
+    outputs = ([*if_outputs], [*else_outputs])
+    statements = (if_body_stmts, else_body_stmts)
+    if_return_names, else_return_names = graph_info.get_branches_return_names(
+        state, if_outputs, else_outputs
+    )
+    for entries, if_name, else_name in zip(
+        graph_info.branches_outputs, if_return_names, else_return_names, strict=True
+    ):
+        indices = {
+            branch: entry
+            for branch, entry in enumerate(entries)
+            if isinstance(entry, int)
+        }
+        if not indices:
+            continue
+        branch, index = next(iter(indices.items()))
+        fx_out = graph_outputs[branch][index]
+        val = fx_out.meta.get("val") if isinstance(fx_out, torch.fx.Node) else None
+        if not isinstance(val, torch.Tensor):
+            continue
+        if len(indices) == 2:
+            values = {
+                side: backend.cast_ast(cast("ast.AST", outputs[side][entry]), val.dtype)
+                for side, entry in indices.items()
+            }
+        else:
+            live_in = (if_name, else_name)[1 - branch]
+            before = state.device_function.new_var(f"{live_in}_before_if")
+            state.add_statement(statement_from_string(f"{before} = {live_in}"))
+            values = {
+                branch: expr_from_string(
+                    f"_cute_join_cast({{value}}, {before})",
+                    value=cast("ast.AST", outputs[branch][index]),
+                )
+            }
+        for branch, value in values.items():
+            joined = state.device_function.new_var((if_name, else_name)[branch])
+            with state.codegen.set_statements(statements[branch]):
+                state.codegen.add_statement(
+                    statement_from_string(f"{joined} = {{value}}", value=value)
+                )
+            outputs[branch][indices[branch]] = expr_from_string(joined)
+        if len(indices) == 2:
+            joined = cast("ast.Name", outputs[0][indices[0]]).id
             dtype_str = backend.dtype_str(val.dtype)
-            state.add_statement(
-                statement_from_string(f"{if_name_node.id} = {dtype_str}(0)")
-            )
+            state.add_statement(statement_from_string(f"{joined} = {dtype_str}(0)"))
+    if_return_names, else_return_names = graph_info.get_branches_return_names(
+        state, *outputs
+    )
 
     if not if_body_stmts:
         if_body_stmts.append(ast.Pass())
@@ -147,9 +213,6 @@ def _(state: CodegenState) -> list[object]:
         setattr(if_ast_node, HELION_BLOCK_UNIFORM_ATTR, True)
     state.add_statement(if_ast_node)
 
-    if_return_names, else_return_names = graph_info.get_branches_return_names(
-        state, if_outputs, else_outputs
-    )
     return cast(
         "list[object]",
         [expr_from_string(n) for n in if_return_names]

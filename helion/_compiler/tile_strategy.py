@@ -32,7 +32,7 @@ from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.register_tile_admission import RegisterTileUnsupported
-from .cute.scalar_recipe import PURE_DECODE_HELPERS
+from .cute.scalar_recipe import PURE_HELPERS
 from .cute.scalar_recipe import is_rounded_fp32_multiply
 from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
@@ -5530,7 +5530,7 @@ def _is_proven_relocatable_call(
     name = _qualified_name(call.func)
     if name is None:
         return False
-    if name in _PURE_RELOCATABLE_NAMES or name in PURE_DECODE_HELPERS:
+    if name in _PURE_RELOCATABLE_NAMES or name in PURE_HELPERS:
         return True
     if name.startswith("cutlass."):
         member = name.rsplit(".", 1)[-1]

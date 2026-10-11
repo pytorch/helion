@@ -2230,6 +2230,9 @@ def _integer_loop_model(source, x, *, return_scratch=False):
         ),
         "_cute_grouped_reduce_shared_two_stage": collective,
         "_cute_python_mod": operator.mod,
+        "_cute_join_cast": lambda value, like: np.asarray(
+            value, dtype=np.asarray(like).dtype
+        ),
     }
     for node in tree.body:
         if (

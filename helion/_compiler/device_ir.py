@@ -56,6 +56,7 @@ from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
 from .ast_extension import create
 from .ast_extension import expr_from_string
+from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .cute.register_tile_admission import register_tile_body_admitted
@@ -87,6 +88,7 @@ from .type_info import TypeInfo
 from .type_info import _eval_binary
 from .type_info import _eval_compare
 from .type_info import _eval_unary
+from .type_info import tensor_may_have_many_elements
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -100,6 +102,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import MemoryOpFact
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
     from .cute.layout import CuTeGridExecutionPlan
+    from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
     from .tile_dependency import TaskFamily
     from .tile_dependency import TileDependencyGraph
@@ -404,21 +407,85 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             from .cute.integer_loop_reduction import prepare
 
             device_loop.integer_reduction_hoist = prepare(self, state, device_loop)
+            joins = self._cute_carried_type_joins(state)
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
             ):
-                result = codegen_call_with_graph(
-                    state.codegen,
-                    self.graph,
-                    args,
-                )
-                if device_loop.integer_reduction_hoist is not None:
-                    device_loop.integer_reduction_hoist.finish(result)
-                return result
+                outputs = [
+                    *codegen_call_with_graph(
+                        state.codegen,
+                        self.graph,
+                        args,
+                    )
+                ]
+                hoist = device_loop.integer_reduction_hoist
+                if hoist is not None and hoist.final_call is not None:
+                    # The CTA collective after the loop finalizes the carry
+                    # from the per-thread partial the body carries.
+                    hoist.finish(outputs)
+                    return outputs
+                device_function = state.device_function
+                for index, initial in joins.items():
+                    value = cast("ast.AST", outputs[index])
+                    if isinstance(
+                        value, ast.Name
+                    ) and device_function.cute_state.get_tcgen05_store_value(
+                        device_function.variable_aliases(value.id)
+                    ):
+                        # A tcgen05 accumulator: the MMA lowering owns its type.
+                        continue
+                    # The loop statement follows the enclosing statements
+                    # once its body is complete.
+                    before = device_function.new_var(f"{initial}_before_loop")
+                    state.codegen.statements_stack[-2].append(
+                        statement_from_string(f"{before} = {initial}")
+                    )
+                    joined = device_function.new_var(f"{before}_join")
+                    state.codegen.add_statement(
+                        statement_from_string(
+                            f"{joined} = _cute_join_cast({{value}}, {before})",
+                            value=value,
+                        )
+                    )
+                    outputs[index] = expr_from_string(joined)
+                return outputs
         finally:
             # pyrefly: ignore [missing-attribute]
             state.codegen._cute_active_graph_info = previous_active_graph_info
+
+    def _cute_carried_type_joins(self, state: CodegenState) -> dict[int, str]:
+        """The initial variable of each carried value CuTe DSL may retype.
+
+        CuTe DSL requires a loop-carried variable to keep the type it had
+        before the loop, but a value's DSL type can differ from its FX dtype:
+        a 16-bit value combined with a Python float becomes Float32, and int32
+        index math on Int64 shape arguments becomes Int64.  The end of the
+        body casts such a value to the type of an alias of its initial value,
+        which only tracing knows (``_cute_join_cast``, as for a value one
+        branch of a dynamic if reassigns).  fp32/fp64 values keep their DSL
+        type, so their loops (accumulators) stay as emitted.  Returns the
+        initial variable per loop output.
+        """
+        if CompileEnvironment.current().backend_name != "cute" or state.fx_node is None:
+            return {}
+        joins: dict[int, str] = {}
+        for user in state.fx_node.users:
+            if user.target is not operator.getitem:
+                continue
+            val = user.meta.get("val")
+            if not isinstance(val, torch.Tensor) or val.dtype in (
+                torch.float32,
+                torch.float64,
+            ):
+                continue
+            for phi in user.users:
+                if phi.target is not _tracing_ops._phi or phi.args[1] is not user:
+                    continue
+                initial = state.env.get(cast("torch.fx.Node", phi.args[0]))
+                if isinstance(initial, ast.Name):
+                    joins[cast("int", user.args[1])] = initial.id
+        return joins
 
 
 def control_flow_parent_entries(
@@ -500,9 +567,94 @@ class IfGraphInfo(NodeArgsGraphInfo):
             "branches_outputs": self.branches_outputs,
         }
 
+    def copy_outer_outputs(
+        self, state: CodegenState, outputs: list[object], branch: int
+    ) -> list[object]:
+        """Copy branch outputs that name a variable the branch did not assign.
+
+        The phi after the if merges each output name with the other branch's
+        output, so an outer name (for example ``tile.index``) would otherwise
+        be overwritten by the other branch and every later use of it would see
+        that value.  Call inside the branch's ``set_statements``.
+        """
+        assert self.branches_outputs is not None
+        assigned = {
+            node.id
+            for statement in state.codegen.statements_stack[-1]
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        outputs = [*outputs]
+        for entry in self.branches_outputs:
+            index = entry[branch]
+            if not isinstance(index, int):
+                continue
+            output = outputs[index]
+            if isinstance(output, ast.Name) and output.id not in assigned:
+                copy_name = state.device_function.new_var(f"{output.id}_copy")
+                state.codegen.add_statement(
+                    statement_from_string(f"{copy_name} = {output.id}")
+                )
+                outputs[index] = expr_from_string(copy_name)
+        return outputs
+
+    def join_reassigned_live_ins(
+        self,
+        state: CodegenState,
+        outputs: list[object],
+        branch: int,
+        graph: torch.fx.Graph,
+    ) -> list[object]:
+        """Cast a variable a branch reassigns to the type it had before the if.
+
+        The variable must keep one type where the branches join, but the
+        branch's new value may carry another (``Backend.join_cast_template``).
+        The branch first aliases the old value, which it has not overwritten
+        yet.  Call inside the branch's ``set_statements``.
+        """
+        assert self.branches_outputs is not None
+        template = CompileEnvironment.current().backend.join_cast_template()
+        if template is None:
+            return outputs
+        graph_outputs = cast(
+            "tuple[object, ...]", graph.find_nodes(op="output")[0].args[0]
+        )
+        live_in_names = self._outer_arg_names(state)
+        statements = state.codegen.statements_stack[-1]
+        outputs = [*outputs]
+        for entry in self.branches_outputs:
+            index, other = entry[branch], entry[1 - branch]
+            if not isinstance(index, int) or isinstance(other, int):
+                continue
+            live_in = live_in_names[other]
+            fx_out = graph_outputs[index]
+            val = fx_out.meta.get("val") if isinstance(fx_out, torch.fx.Node) else None
+            if not isinstance(val, torch.Tensor):
+                continue
+            before = state.device_function.new_var(f"{live_in}_before_if")
+            statements.insert(0, statement_from_string(f"{before} = {live_in}"))
+            joined = state.device_function.new_var(live_in)
+            value = expr_from_string(
+                template,
+                x=cast("ast.AST", outputs[index]),
+                like=expr_from_string(before),
+            )
+            state.codegen.add_statement(
+                statement_from_string(f"{joined} = {{value}}", value=value)
+            )
+            outputs[index] = expr_from_string(joined)
+        return outputs
+
     def get_branches_return_names(
         self, state: CodegenState, if_outputs: list[object], else_outputs: list[object]
     ) -> tuple[list[str], list[str]]:
+        return (
+            self.get_branch_return_names(state, if_outputs, 0),
+            self.get_branch_return_names(state, else_outputs, 1),
+        )
+
+    def _outer_arg_names(self, state: CodegenState) -> dict[str, str]:
+        """The outer variable each branch argument (by FX name) reads."""
         if_args = state.ast_args[3]
         assert isinstance(if_args, list)
         assert all(isinstance(x, ast.AST) for x in if_args)
@@ -512,25 +664,23 @@ class IfGraphInfo(NodeArgsGraphInfo):
 
         assert self.if_arg_names is not None
         assert self.else_arg_names is not None
+
+        return {self.if_arg_names[i]: if_args[i].id for i in range(len(if_args))} | {
+            self.else_arg_names[i]: else_args[i].id for i in range(len(else_args))
+        }
+
+    def get_branch_return_names(
+        self, state: CodegenState, outputs: list[object], side: int
+    ) -> list[str]:
+        """The names one branch (0 = if, 1 = else) leaves its merged outputs in."""
         assert self.branches_outputs is not None
-
-        arg_node_name_to_ast_name = {
-            self.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
-        } | {self.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
-
-        if_return_names = [
-            cast("ast.Name", if_outputs[o]).id
+        arg_node_name_to_ast_name = self._outer_arg_names(state)
+        return [
+            cast("ast.Name", outputs[o]).id
             if isinstance(o, int)
             else arg_node_name_to_ast_name[o]
-            for (o, _) in self.branches_outputs
+            for o in (entry[side] for entry in self.branches_outputs)
         ]
-        else_return_names = [
-            cast("ast.Name", else_outputs[o]).id
-            if isinstance(o, int)
-            else arg_node_name_to_ast_name[o]
-            for (_, o) in self.branches_outputs
-        ]
-        return if_return_names, else_return_names
 
     def codegen(self, state: CodegenState) -> list[object]:
         from .generate_ast import GenerateAST
@@ -572,6 +722,8 @@ class IfGraphInfo(NodeArgsGraphInfo):
 
         with divergent(), state.codegen.set_statements(body_stmts):
             if_outputs = codegen_call_with_graph(state.codegen, self.graph, if_args)
+            if_outputs = self.copy_outer_outputs(state, if_outputs, 0)
+            if_outputs = self.join_reassigned_live_ins(state, if_outputs, 0, self.graph)
 
         else_outputs = []
         if self.else_branch is not None:
@@ -580,6 +732,10 @@ class IfGraphInfo(NodeArgsGraphInfo):
             with divergent(), state.codegen.set_statements(orelse_stmts):
                 else_outputs = codegen_call_with_graph(
                     state.codegen, else_graph.graph, else_args
+                )
+                else_outputs = self.copy_outer_outputs(state, else_outputs, 1)
+                else_outputs = self.join_reassigned_live_ins(
+                    state, else_outputs, 1, else_graph.graph
                 )
 
         if len(body_stmts) == 0:
@@ -948,6 +1104,7 @@ class DeviceIR:
 
     def reduction_block_id_branch_paths(
         self,
+        fn: DeviceFunction,
     ) -> dict[int, list[list[tuple[int, int]]]]:
         """Map each reduction block id to the control-flow branch path(s) it runs in.
 
@@ -961,6 +1118,10 @@ class DeviceIR:
         and may therefore share a CUDA thread axis. Returns ``{}`` when no
         reduction lives under a dynamic branch (the common, non-branching case),
         so callers leave the default thread-axis assignment untouched.
+
+        A branch whose test is a constant for ``fn``'s config
+        (``DeviceFunction.evaluate_constexpr_condition``) is no decision: only
+        its taken side runs, and it is walked without extending the path.
         """
         from .inductor_lowering import ReductionLowering
 
@@ -981,7 +1142,11 @@ class DeviceIR:
                     if path not in result[lowering.block_index]:
                         result[lowering.block_index].append(list(path))
                 if node.target is _tracing_ops._if and len(node.args) >= 3:
-                    _, if_graph_id, else_graph_id, *_rest = node.args
+                    live_graph_id = fn.constexpr_taken_graph_id(node)
+                    if live_graph_id is not None:
+                        walk(live_graph_id, path)
+                        continue
+                    _test, if_graph_id, else_graph_id, *_rest = node.args
                     if_node_key = id(node)
                     if isinstance(if_graph_id, int):
                         walk(if_graph_id, [*path, (if_node_key, 0)])
@@ -1918,7 +2083,25 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_binary(node.op, left, right)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> object:
-        return _eval_unary(node.op, self.visit(node.operand))
+        operand = self.visit(node.operand)
+        if isinstance(node.op, ast.Not):
+            return self._trace_not(operand)
+        return _eval_unary(node.op, operand)
+
+    @staticmethod
+    def _trace_not(operand: object) -> object:
+        """``not operand``, traced like ``and``/``or`` (visit_BoolOp) instead
+        of decided with bool() at trace time (SymInt and SymFloat compare
+        with zero in ``_eval_unary``).  A tensor holds one element here (type
+        propagation rejects others) and is compared with zero first, since
+        Triton's ``not`` only accepts int1 operands."""
+        if isinstance(operand, torch.SymBool):
+            return _tracing_ops._not(operand)
+        if isinstance(operand, torch.Tensor):
+            if operand.dtype != torch.bool:
+                operand = operand != 0
+            return _tracing_ops._not(operand)
+        return _eval_unary(ast.Not(), operand)
 
     def visit_Compare(self, node: ast.Compare) -> object:
         lhs = self.visit(node.left)
@@ -2295,7 +2478,19 @@ class WalkDeviceAST(NodeVisitor):
                 self.scope[name] = value
 
     def visit_If(self, node: ast.If) -> object:
-        test_proxy = self.visit(node.test)
+        test = node.test
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            operand = self.visit(test.operand)
+            if isinstance(operand, torch.Tensor) and tensor_may_have_many_elements(
+                operand
+            ):
+                # ``if not t:`` is ``if t:`` with the branches swapped, so a
+                # tensor predicate stays one (predicate_is_tensor).
+                self._create_if_subgraph(operand, node.orelse, node.body)
+                return
+            test_proxy = self._trace_not(operand)
+        else:
+            test_proxy = self.visit(test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):
             body = node.body if test_proxy else node.orelse
             if body:

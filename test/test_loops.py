@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import functools
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ import helion
 from helion import _compat
 from helion._compat import use_tileir_tunables
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
+from helion._compiler.static_loop_unroller import unroll_static_loops
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -187,6 +189,57 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
         hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
+@helion.kernel(autotune_effort="none")
+def long_elif_chain(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        if op == 0:
+            out[tile] = x[tile] + 0
+        elif op == 1:
+            out[tile] = x[tile] + 1
+        elif op == 2:
+            out[tile] = x[tile] + 2
+        elif op == 3:
+            out[tile] = x[tile] + 3
+        elif op == 4:
+            out[tile] = x[tile] + 4
+        elif op == 5:
+            out[tile] = x[tile] + 5
+        elif op == 6:
+            out[tile] = x[tile] + 6
+        elif op == 7:
+            out[tile] = x[tile] + 7
+        elif op == 8:
+            out[tile] = x[tile] + 8
+        elif op == 9:
+            out[tile] = x[tile] + 9
+        elif op == 10:
+            out[tile] = x[tile] + 10
+        elif op == 11:
+            out[tile] = x[tile] + 11
+        elif op == 12:
+            out[tile] = x[tile] + 12
+        elif op == 13:
+            out[tile] = x[tile] + 13
+        elif op == 14:
+            out[tile] = x[tile] + 14
+        elif op == 15:
+            out[tile] = x[tile] + 15
+        elif op == 16:
+            out[tile] = x[tile] + 16
+        elif op == 17:
+            out[tile] = x[tile] + 17
+        elif op == 18:
+            out[tile] = x[tile] + 18
+        elif op == 19:
+            out[tile] = x[tile] + 19
+        elif op == 20:
+            out[tile] = x[tile] + 20
+        else:
+            out[tile] = x[tile]
+    return out
+
+
 def _thread_barrier() -> str:
     """The block-wide barrier the backend emits between racing accesses."""
     if _get_backend() == "cute":
@@ -245,6 +298,47 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(len(unrolled), 4)
         self.assertTrue(all(isinstance(stmt, ast.AugAssign) for stmt in unrolled))
         self.assertEqual(env["j"], 2)
+
+    @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
+    def test_static_unroller_keeps_loop_with_break_in_if_rolled(self) -> None:
+        source = (
+            "for i in [1, 2]:\n"
+            "    if a:\n"
+            "        y = i\n"
+            "    elif b:\n"
+            "        break\n"
+            "for j in [3, 4]:\n"
+            "    z = j\n"
+        )
+        holder = SimpleNamespace(body=ast.parse(source).body)
+        unroll_static_loops(holder)
+        # The loop with the break stays a loop; the other one unrolls.
+        self.assertIsInstance(holder.body[0], ast.For)
+        self.assertEqual(len(holder.body), 5)
+
+    @skipIfRefEager("counts the static loop unroller's visits")
+    def test_long_elif_chain_unrolls_linearly(self) -> None:
+        # Static loop unrolling visits each branch of an if/elif chain a fixed
+        # number of times: doubling the chain doubles the visits, and a 21-way
+        # chain binds and runs.
+        def visits(length: int) -> int:
+            source = "for i in range(n):\n" + "".join(
+                f"    {'el' if k else ''}if op == {k}:\n        y = {k}\n"
+                for k in range(length)
+            )
+            holder = SimpleNamespace(body=ast.parse(source).body)
+            with patch.object(
+                StaticLoopUnroller,
+                "visit_If",
+                autospec=True,
+                side_effect=StaticLoopUnroller.visit_If,
+            ) as visit_if:
+                unroll_static_loops(holder)
+            return visit_if.call_count
+
+        self.assertEqual(visits(10), 2 * visits(5))
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(long_elif_chain(x, 20), x + 20)
 
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)

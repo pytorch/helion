@@ -127,7 +127,7 @@ _OPERATOR_CALLS = frozenset(
 _BUILTINS = frozenset({"abs", "bool", "float", "int", "max", "min", "round"})
 # Quantized decode helpers from ``quantized_helpers.py``: side-effect-free PTX
 # ``cvt`` inline asm over a register operand, so a call may be replayed or moved
-# across lane-loop scopes.  Shared with ``tile_strategy``'s relocation proofs.
+# across lane-loop scopes.
 PURE_DECODE_HELPERS = frozenset(
     {
         "_cute_float4_e2m1fn_x2_to_float32",
@@ -135,12 +135,15 @@ PURE_DECODE_HELPERS = frozenset(
         "_cute_fp8e4m3fn_x2_to_float32",
     }
 )
-_HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod"}
+# Every pure helper generated code may call: the decode helpers, Python's
+# modulo and the trace-time numeric conversion at a dynamic if-join
+# (``join_cast.py``).  Shared with ``tile_strategy``'s relocation proofs.
+PURE_HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod", "_cute_join_cast"}
 # ``_cute_inline_asm_elementwise`` enters a recipe only as the rounded FP32
 # product ``is_rounded_fp32_multiply`` recognizes (``_PureExpression.visit_Call``).
 _GLOBALS = (
     _BUILTINS
-    | _HELPERS
+    | PURE_HELPERS
     | {"cutlass", "cute", "math", "operator", "_cute_inline_asm_elementwise"}
 )
 _METADATA = frozenset({"iterator", "layout", "shape", "stride", "element_type"})
@@ -297,7 +300,7 @@ class _PureExpression(ast.NodeVisitor):
         path = _path(node.func)
         pure_global = path is not None and (
             len(path) == 1
-            and path[0] in _BUILTINS | _HELPERS
+            and path[0] in _BUILTINS | PURE_HELPERS
             or len(path) == 2
             and path[0] == "cutlass"
             and path[1] in _NUMERIC_TYPES | {"min", "max"}

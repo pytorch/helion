@@ -361,6 +361,11 @@ class TensorType(TypeInfo):
         if origin.is_host():
             warning(exc.TensorOperationInWrapper)
         if isinstance(op, ast.Not):
+            # Host code runs as Python, where PyTorch raises this itself.
+            if origin.is_device() and tensor_may_have_many_elements(self.fake_value):
+                raise exc.TypeInferenceError(
+                    f"Boolean value of {self!s} with more than one value is ambiguous"
+                )
             return SymBoolType.new_unbacked(origin)
         try:
             return TypeInfo.from_example(_eval_unary(op, self.fake_value), origin)
@@ -1930,8 +1935,20 @@ class SliceType(CollectionType):
         )
 
 
+def tensor_may_have_many_elements(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` is not known to hold exactly one element (a tile's
+    extent is a block size, which may exceed 1)."""
+    env = CompileEnvironment.current()
+    return not all(env.known_equal(size, 1) for size in tensor.shape)
+
+
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
+        # ``not`` would call bool() and guard a symbolic value on its hint.
+        if isinstance(value, torch.SymBool):
+            return torch.sym_not(value)
+        if isinstance(value, (torch.SymInt, torch.SymFloat)):
+            return value == 0
         return not value
     if isinstance(op, ast.UAdd):
         # pyrefly: ignore [unsupported-operation]

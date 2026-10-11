@@ -619,7 +619,20 @@ class TypePropagation(ast.NodeVisitor):
         return self.visit(node.value)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> TypeInfo:
-        return self.visit(node.operand).propagate_unary(node.op, self.origin())
+        operand = self.visit(node.operand)
+        active_nodes = ExtendedAST.current()
+        if (
+            isinstance(node.op, ast.Not)
+            and self.device_loop_depth > 0
+            and isinstance(operand, TensorType)
+            and len(active_nodes) >= 2
+            and isinstance(parent := active_nodes[-2], ast.If)
+            and parent.test is node
+        ):
+            # ``if not t:`` is ``if t:`` with the branches swapped
+            # (WalkDeviceAST.visit_If), also for a tensor of many elements.
+            return SymBoolType.new_unbacked(self.origin())
+        return operand.propagate_unary(node.op, self.origin())
 
     def visit_BinOp(self, node: ast.BinOp) -> TypeInfo:
         left = self.visit(node.left)

@@ -267,6 +267,11 @@ class TritonBackend(Backend):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"tl.cast({expr_str}, {dtype_str})"
 
+    def join_cast_template(self) -> str | None:
+        # A 16-bit true division stays fp32 (the consumer casts), so a value
+        # can hold fp32 although its FX dtype is fp16/bf16.
+        return "{x}.to({like}.dtype)"
+
     def arange_expr(
         self,
         offsets_var: str,
