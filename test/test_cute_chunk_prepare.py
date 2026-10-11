@@ -767,7 +767,7 @@ def test_prepare_rejects_changed_aq_physical_index_constants(
 
 
 @pytest.mark.parametrize("tensor_name", ("q_rows", "k_rows", "gate_rows", "beta_rows"))
-def test_prepare_rejects_nondefault_masked_load_other(tensor_name: str) -> None:
+def test_prepare_rejects_explicit_load_eviction_policy(tensor_name: str) -> None:
     from helion.language import memory_ops
 
     def mutate(device_ir: DeviceIR) -> None:
@@ -778,7 +778,7 @@ def test_prepare_rejects_nondefault_masked_load_other(tensor_name: str) -> None:
             and node.target is memory_ops.load
             and node.args[0].args[0] == tensor_name
         )
-        load.args = (*load.args[:3], 1.0)
+        load.args = (*load.args[:3], "evict_last")
 
     assert _captured_plan_after_mutation(mutate) is None
 

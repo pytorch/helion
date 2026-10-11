@@ -5328,6 +5328,21 @@ def cute_reindexed_scalar_load_expr(
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
+def _cute_load_eviction_slot(state: CodegenState) -> int:
+    """The load_eviction_policies slot of this load site: the next one in
+    site order, or the one the node already took when it is lowered again."""
+    device_fn = state.device_function
+    slots = device_fn.cute_state.load_eviction_slots
+    node = state.fx_node
+    if node is not None and node in slots:
+        return slots[node]
+    slot = device_fn.device_load_index
+    device_fn.device_load_index += 1
+    if node is not None:
+        slots[node] = slot
+    return slot
+
+
 @_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
     # A store to this tensor earlier in the same loop body followed by this
@@ -5342,6 +5357,17 @@ def _(state: CodegenState) -> object:
         INTRA_LOOP_RAW_BARRIER_META
     ):
         state.add_statement(statement_from_string("cute.arch.sync_threads()"))
+
+    # Every load without an explicit eviction policy owns a
+    # load_eviction_policies slot (``_load_needs_eviction_tunable``), whichever
+    # form below lowers it: take it before the early returns, as the Triton
+    # lowering does, so the later loads keep their slots.
+    explicit_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    eviction_slot = (
+        _cute_load_eviction_slot(state)
+        if explicit_policy is None and state.codegen.on_device
+        else None
+    )
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -5476,15 +5502,25 @@ def _(state: CodegenState) -> object:
     # L1 eviction priorities; "streaming" is the ``ld.global.cs`` cache
     # operator (evict-first at both L1 and L2 — single-use streaming reads
     # stop displacing useful L2 lines).  Same site-order indexing scheme as
-    # the Triton backend.
+    # the Triton backend: a scalar policy applies to every load, and an
+    # explicit ``hl.load(eviction_policy=...)`` (Triton's ``evict_*`` L1
+    # priority spelling, which ``cute.arch.load`` shares) wins over the tunable
+    # and owns no tunable slot.
     eviction_suffix = ""
     if state.codegen.on_device:
-        device_fn = state.device_function
-        load_idx = device_fn.device_load_index
-        device_fn.device_load_index += 1
-        policies = state.config.load_eviction_policies
-        if load_idx < len(policies):
-            policy = policies[load_idx]
+        if explicit_policy is not None:
+            assert isinstance(explicit_policy, str)
+            if explicit_policy:
+                eviction_suffix = f", level1_eviction_priority={explicit_policy!r}"
+        else:
+            assert eviction_slot is not None
+            policies = state.config.load_eviction_policies
+            if isinstance(policies, str):
+                policy = policies
+            else:
+                policy = (
+                    policies[eviction_slot] if eviction_slot < len(policies) else ""
+                )
             if policy == "streaming":
                 eviction_suffix = ", cop='cs'"
             elif policy in ("l2_last", "l1_l2_first", "l1_l2_last"):

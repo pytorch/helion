@@ -691,6 +691,10 @@ class CuteDeviceFunctionState:
         # not cover the loop's block, so the atomic lowering does not record
         # it as uniform along the loop (``atomic_ops._cute_uniform_lane_vars``).
         self.per_lane_atomic_lane_vars: dict[Node, set[str]] = {}
+        # The load_eviction_policies slot each load node took
+        # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
+        # matmul operand re-lowered under a block remap) keeps its slot.
+        self.load_eviction_slots: dict[Node, int] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).
