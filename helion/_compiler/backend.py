@@ -1278,6 +1278,30 @@ class Backend(abc.ABC):
                 result.add(block_id)
         return result
 
+    def _cute_matmul_contraction_extents(self, tile_block_ids: list[int]) -> list[int]:
+        """Size hints of the matmul-contraction reduction axes (above one)
+        that are *not* one of ``tile_block_ids``, i.e. handled by a separate
+        reduction strategy, not this tile strategy."""
+        from .._compat import shape_env_size_hint
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        tile_ids = set(tile_block_ids)
+        extents: list[int] = []
+        for block_id in self._cute_matmul_contraction_reduction_block_ids():
+            if block_id in tile_ids:
+                continue
+            numel = env.block_sizes[block_id].numel
+            if isinstance(numel, (int, sympy.Integer)):
+                size_hint = int(numel)
+            elif isinstance(numel, sympy.Expr):
+                size_hint = shape_env_size_hint(env.shape_env, numel)
+            else:
+                size_hint = env.size_hint(numel)
+            if size_hint > 1:
+                extents.append(size_hint)
+        return extents
+
     def _cute_matmul_contraction_thread_reserve(
         self, fn: DeviceFunction, tile_block_ids: list[int]
     ) -> int:
@@ -1290,27 +1314,11 @@ class Backend(abc.ABC):
         """
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-        from .._compat import shape_env_size_hint
-        from .compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
         max_reduction_threads = self.max_reduction_threads()
         if max_reduction_threads is None:
             return 1
-        tile_ids = set(tile_block_ids)
         reserve = 1
-        for block_id in self._cute_matmul_contraction_reduction_block_ids():
-            if block_id in tile_ids:
-                continue
-            numel = env.block_sizes[block_id].numel
-            if isinstance(numel, (int, sympy.Integer)):
-                size_hint = int(numel)
-            elif isinstance(numel, sympy.Expr):
-                size_hint = shape_env_size_hint(env.shape_env, numel)
-            else:
-                size_hint = env.size_hint(numel)
-            if size_hint <= 1:
-                continue
+        for size_hint in self._cute_matmul_contraction_extents(tile_block_ids):
             reserve *= next_power_of_2(min(size_hint, max_reduction_threads))
         return reserve
 

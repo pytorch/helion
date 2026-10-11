@@ -2362,14 +2362,9 @@ def _split_staged_matmul_lane_reductions(
         for index in collective_indices:
             statement = body[index]
             assert isinstance(statement, ast.Assign)
-            call = statement.value
-            if not (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id in _CHUNK_REDUCTION_HELPERS
-                and len(call.args) >= 3
-                and _dtype_ctor_from_identity(ast.unparse(call.args[2]))
-                == "cutlass.Float32"
+            if (
+                _stashed_collective_dtype(statement.value, body[:index])
+                != "cutlass.Float32"
             ):
                 return None
             name = names[index]
@@ -2534,6 +2529,44 @@ def _split_dependent_lane_reductions(
 
 
 _LANE_STASH_COUNTER = itertools.count()
+
+
+def _stashed_collective_dtype(value: ast.AST, before: Sequence[ast.AST]) -> str | None:
+    """The dtype constructor of a collective reduction a lane stash may hold.
+
+    A grouped helper names its accumulator dtype in its identity argument; a
+    ``cute.arch.warp_reduction_*`` returns its input's type, proven when the
+    input is a dtype constructor call or a name ``before`` last binds to one.
+    Anything else (a matmul, an unrecognized collective) is ``None``.
+    """
+    if not isinstance(value, ast.Call):
+        return None
+    name = _qualified_name(value.func)
+    if name in _CHUNK_REDUCTION_HELPERS and len(value.args) >= 3:
+        return _dtype_ctor_from_identity(ast.unparse(value.args[2]))
+    if name is None or not name.startswith("cute.arch.warp_reduction_"):
+        return None
+    if not value.args:
+        return None
+    reduced = value.args[0]
+    if isinstance(reduced, ast.Name):
+        definitions = [
+            statement.value
+            for statement in before
+            if isinstance(statement, ast.Assign)
+            and _plain_assignment_name(statement) == reduced.id
+        ]
+        if not definitions:
+            return None
+        reduced = definitions[-1]
+    if (
+        isinstance(reduced, ast.Call)
+        and (ctor := _qualified_name(reduced.func)) is not None
+        and ctor.startswith("cutlass.")
+        and len(reduced.args) == 1
+    ):
+        return ctor
+    return None
 
 
 def _stash_dtype_for_value(
@@ -5897,6 +5930,7 @@ def hoist_lane_invariant_chunk_recurrence(
     *,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    required: set[str] | None = None,
 ) -> list[ast.AST]:
     """Restructure ``for chunk: for lane: <dot_acc recurrence>`` nests so the
     lane-invariant rescale, chunk-entry stores, and final accumulator combine
@@ -5905,18 +5939,28 @@ def hoist_lane_invariant_chunk_recurrence(
     Tightly gated: only fires on a serial chunk loop whose single inner lane
     loop has the verified dataflow described by :func:`_find_dot_acc_recurrence`
     and whose running-sum reset sits in the same statement list before it.
+    ``required`` names the running sums that are only exact restructured
+    (``CuteDeviceFunctionState.chunk_recurrence_running_sums``); one left
+    as emitted is rejected.
     """
-    if running_sums is not None and not running_sums:
-        return body
-
-    thread_axes_before, scalar_defs_before = _collect_statement_provenance(body)
-    return _hoist_lane_invariant_chunk_recurrence(
-        body,
-        rename_groups or {},
-        running_sums,
-        thread_axes_before,
-        scalar_defs_before,
-    )
+    rewritten: set[str] = set()
+    if running_sums is None or running_sums:
+        thread_axes_before, scalar_defs_before = _collect_statement_provenance(body)
+        body = _hoist_lane_invariant_chunk_recurrence(
+            body,
+            rename_groups or {},
+            running_sums,
+            thread_axes_before,
+            scalar_defs_before,
+            rewritten,
+        )
+    if required is not None and required - rewritten:
+        raise exc.BackendUnsupported(
+            "cute",
+            "a matmul accumulator recurrence in a K loop is not restructured to "
+            "update once per tile",
+        )
+    return body
 
 
 def _hoist_lane_invariant_chunk_recurrence(
@@ -5925,6 +5969,7 @@ def _hoist_lane_invariant_chunk_recurrence(
     running_sums: set[str] | None,
     thread_axes_before: dict[int, dict[str, frozenset[int]]],
     scalar_defs_before: dict[int, dict[str, ast.AST]],
+    rewritten: set[str],
 ) -> list[ast.AST]:
     from .ast_read_writes import ReadWrites
 
@@ -5943,6 +5988,7 @@ def _hoist_lane_invariant_chunk_recurrence(
                         running_sums,
                         thread_axes_before,
                         scalar_defs_before,
+                        rewritten,
                     ),
                 )
 
@@ -5995,6 +6041,7 @@ def _hoist_lane_invariant_chunk_recurrence(
             )
         new_body.pop(reset_idx)
         assert isinstance(stmt, ast.For)
+        rewritten.add(info.dot_acc_var)
         new_body.append(
             _rewrite_chunk_recurrence(
                 stmt,
@@ -7210,6 +7257,18 @@ class DeviceGridState(DeviceLoopOrGridState):
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
+
+    def lane_defined_names(self) -> set[str]:
+        """The names only the lane loops define: the lane variables, the vec
+        lanes' own, and the per-lane index / mask definitions."""
+        from .ast_read_writes import ReadWrites
+
+        names = {lane_var for lane_var, _extent in self.lane_loops}
+        for wrapper in self.vec_lane_wrappers.values():
+            names.update((wrapper.vec_lane_var, wrapper.base_index_var))
+        for stmt in self.lane_setup_statements:
+            names.update(ReadWrites.from_ast(stmt).writes)
+        return names
 
     def add_lane_loop(
         self,

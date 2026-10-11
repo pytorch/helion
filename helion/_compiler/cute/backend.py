@@ -3531,6 +3531,8 @@ class CuteBackend(Backend):
         from ..host_function import HostFunction
         from ..tile_strategy import PerThreadFlattenedTileStrategy
         from ..tile_strategy import PerThreadNDTileStrategy
+        from .matmul_utils import cute_kernel_has_half_precision_matmul
+        from .matmul_utils import cute_matmul_contraction_block_ids
 
         if len(set(block_ids)) != len(block_ids):
             # ``hl.tile([m, n], block_size=[bs, bs])`` with one registered
@@ -3961,6 +3963,44 @@ class CuteBackend(Backend):
             # Auto thread budget exceeds the 1024-per-CTA cap: fall back to a
             # lane loop (each thread owns block_size // 1024 elements).
             flat_num_threads = MAX_THREADS_PER_BLOCK
+        if (
+            isinstance(block_size, int)
+            and flat_num_threads > 1
+            and all_auto
+            # A tile that is itself a contraction axis (``x[tile, :].T @
+            # g[tile, :]``) keeps its threads: the fallback reduces it across
+            # threads only, not across a flattened tile's lane loop.
+            and not cute_matmul_contraction_block_ids().intersection(
+                env.canonical_block_id(block_id) for block_id in block_ids
+            )
+            # A 16-bit matmul may take the direct grouped-N warp-MMA plan,
+            # which needs one tile row per thread.
+            and not cute_kernel_has_half_precision_matmul()
+        ):
+            # A flattened tile reserves a matmul's contraction axis its full
+            # thread extent (see the N-D branch above), so ``x[tile, :] @
+            # w[:, :]`` keeps K on real threads and the tile takes the lane
+            # loop, rather than splitting K into synthetic lanes.  A
+            # contraction past the thread cap is folded serially whatever its
+            # threads (``PersistentReductionStrategy`` gives it one): the tile
+            # keeps its threads then.
+            contraction_extents = self._cute_matmul_contraction_extents(block_ids)
+            reserved_contraction_threads = (
+                self._cute_matmul_contraction_thread_reserve(fn, block_ids)
+                if max(contraction_extents, default=0) <= MAX_THREADS_PER_BLOCK
+                else 1
+            )
+            if reserved_contraction_threads > 1:
+                free_budget = max(
+                    1, MAX_THREADS_PER_BLOCK // reserved_contraction_threads
+                )
+                free_axes = self._cute_free_auto_thread_axis_count(fn, config)
+                per_axis_limit = free_budget
+                while per_axis_limit > 1 and per_axis_limit**free_axes > free_budget:
+                    per_axis_limit //= 2
+                flat_num_threads = _largest_divisor_at_most(
+                    block_size, min(flat_num_threads, per_axis_limit)
+                )
         if isinstance(block_size, int) and flat_num_threads > 0:
             check_thread_limit(flat_num_threads, context=str(block_size))
         return PerThreadFlattenedTileStrategy(

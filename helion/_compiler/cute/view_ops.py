@@ -25,8 +25,8 @@ from ...language.view_ops import subscript
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ..compile_environment import CompileEnvironment
-from ..loop_dependency_checker import canonical_host_tensor_name
-from ..loop_dependency_checker import collect_host_tensor_aliases
+from ..loop_dependency_checker import HOST_UNKNOWN_ROOT
+from ..loop_dependency_checker import collect_host_tensor_roots
 
 if TYPE_CHECKING:
     import ast
@@ -71,28 +71,31 @@ def _host_tensor_root_name(debug_name: str) -> str:
 def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
     """True unless no store or atomic in the kernel can target the loaded tensor.
 
-    The re-read for ``hl.split`` happens after the load, so any write to the
-    same storage (in this graph or a nested loop graph, before or after the
-    load) could change what it observes; be conservative and refuse the fold
-    whenever the tensor may be written at all.  Host tensor names are resolved
-    through the host-side view aliases (``y = x.view(...)``) before they are
-    compared, and two distinct kernel arguments are never provably distinct
-    storage (the caller may pass one tensor twice), so a loaded argument is
-    treated as written when any argument is.  A loaded value that is not a
-    host tensor is treated as written.
+    The re-reads for ``hl.split`` and the serial-K matmul happen after the
+    load, at elements other threads loaded, so any write to the same storage
+    (in this graph or a nested loop graph, before or after the load, by any
+    thread) could change what they observe; be conservative and refuse the
+    re-read whenever the tensor may be written at all.  Default-deny: a write
+    counts unless its host tensor is provably distinct from the loaded one by
+    ``collect_host_tensor_roots`` (every kernel argument shares one root, and
+    a host value of unknown provenance may alias anything).  A loaded value
+    that is not a host tensor is treated as written, and so is any tensor when
+    the kernel stores through a stack tensor's pointer table.
     """
     tensor = load_node.args[0]
     if not (isinstance(tensor, torch.fx.Node) and tensor.target is _host_tensor):
         return True
     host_fn = cg.host_function
-    aliases = collect_host_tensor_aliases(host_fn.body)
-    arg_names = set(host_fn.params.arguments.keys())
+    roots = collect_host_tensor_roots(
+        host_fn.body, set(host_fn.params.arguments.keys())
+    )
+    unknown = frozenset({HOST_UNKNOWN_ROOT})
 
-    def is_argument(name: str) -> bool:
-        return _host_tensor_root_name(name) in arg_names
+    def tensor_roots(node: torch.fx.Node) -> frozenset[str]:
+        name = _host_tensor_root_name(_host_tensor_name(node))
+        return roots.get(name, unknown)
 
-    name = canonical_host_tensor_name(_host_tensor_name(tensor), aliases)
-    loaded_argument = is_argument(name)
+    loaded = tensor_roots(tensor)
     for graph_info in cg.codegen_graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or not node.args:
@@ -103,9 +106,9 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
             if not (
                 isinstance(target, torch.fx.Node) and target.target is _host_tensor
             ):
-                continue
-            written = canonical_host_tensor_name(_host_tensor_name(target), aliases)
-            if written == name or (loaded_argument and is_argument(written)):
+                return True
+            written = tensor_roots(target)
+            if HOST_UNKNOWN_ROOT in loaded | written or loaded & written:
                 return True
     return False
 

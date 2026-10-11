@@ -3358,8 +3358,20 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_masking(graph.graph)
 
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.dot_scaled_scales import expose_dot_scaled_scales
             from .cute.promote_output_axis import promote_partitioned_output_axis
 
+            # After validate_host_tensor_usage: the rewired scale is a host tensor.
+            if any(
+                [expose_dot_scaled_scales(graph.graph) for graph in device_ir.graphs]
+            ):
+                from .cute.active_blocks import active_block_ids
+
+                device_ir.codegen_active_block_ids = active_block_ids(
+                    device_ir.graphs,
+                    (block_id for ids in device_ir.grid_block_ids for block_id in ids),
+                    CompileEnvironment.current(),
+                )
             promote_partitioned_output_axis(func, device_ir, visitor.root_nodes)
 
             if CompileEnvironment.current().cute_fission_plan is not None:

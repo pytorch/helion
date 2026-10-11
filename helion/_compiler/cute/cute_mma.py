@@ -44,7 +44,6 @@ from ..dtype_utils import cast_ast
 from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
 from ..indexing_strategy import subscript_tile_info
-from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import analyze_tcgen05_matmul_store_chains
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
@@ -91,7 +90,12 @@ from .grouped_row_union import resident_ctas_supported
 from .grouped_row_union import schedule_supported as row_union_schedule_supported
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
+from .matmul_utils import _cute_matmul_reread_unsafe
 from .matmul_utils import analyze_direct_grouped_n_loads
+from .matmul_utils import cute_f32_mma_matches_dot
+from .matmul_utils import loop_carries
+from .matmul_utils import reads_loop_carry
+from .matmul_utils import strip_new_vars
 from .mma_support import cute_fp32_dot_uses_tf32
 from .mma_support import get_cute_mma_support
 from .mma_support import tcgen05_supports_input_dtype
@@ -245,6 +249,7 @@ _DTYPE_TRACE_EXTRA_TARGETS = {
 }
 _MMA_OUTPUT_STORE_ANALYSIS_META_KEY = "cute_mma_output_store_analysis"
 _MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY = "cute_mma_requires_accumulator_seed"
+_MMA_ACCUMULATES_LOOP_CARRY_META_KEY = "cute_mma_accumulates_loop_carry"
 
 # Register reallocation budget for tcgen05 warp-specialized kernels.
 # Producer warps (TMA loads, scheduler) only do address arithmetic and
@@ -798,7 +803,7 @@ def _register_collective_handled_loads(
             load_node, collective_dependency_nodes, terminal_load_nodes
         )
         cute_state.register_collective_handled_load(
-            load_node.name,
+            load_node,
             dependency_nodes=dependency_nodes,
         )
 
@@ -3750,9 +3755,6 @@ def can_codegen_cute_mma_dot(node: Node) -> bool:
     rhs_val = rhs_node.meta.get("val")
     if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
         return False
-    if not _needs_f32_accumulator(lhs_val.dtype, rhs_val.dtype):
-        return True
-
     acc_dtype: torch.dtype | None = None
     if len(node.args) > 2 and isinstance(node.args[2], Node):
         acc_val = node.args[2].meta.get("val")
@@ -3761,7 +3763,7 @@ def can_codegen_cute_mma_dot(node: Node) -> bool:
     out_dtype = node.args[3] if len(node.args) > 3 else None
     if out_dtype is not None and not isinstance(out_dtype, torch.dtype):
         return False
-    return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
+    return cute_f32_mma_matches_dot(lhs_val.dtype, rhs_val.dtype, acc_dtype, out_dtype)
 
 
 @dataclass(frozen=True)
@@ -3874,6 +3876,13 @@ def _decode_cute_mma_target(
         is_dot = True
 
     if not isinstance(lhs, Node) or not isinstance(rhs, Node):
+        return None
+    if _mma_result_can_be_deferred(node) and not _mma_accumulates_its_loop_carry(
+        node,
+        acc if isinstance(acc, Node) else None,
+        device_ir=device_ir,
+        graphs=graphs,
+    ):
         return None
     requires_accumulator_seed = False
     if isinstance(acc, Node):
@@ -4076,15 +4085,13 @@ def analyze_cute_mma_node(
             if acc_val.ndim not in valid_acc_ranks:
                 return None
             acc_dtype = acc_val.dtype
-    if target.is_dot and _needs_f32_accumulator(
+    if target.is_dot and not cute_f32_mma_matches_dot(
         operands.lhs.source_fake.dtype,
         operands.rhs.source_fake.dtype,
+        acc_dtype,
+        cast("torch.dtype | None", target.out_dtype),
     ):
-        if target.out_dtype not in (None, torch.float32) or acc_dtype not in (
-            None,
-            torch.float32,
-        ):
-            return None
+        return None
     return _CuteMmaNode(
         lhs=target.lhs,
         rhs=target.rhs,
@@ -4804,6 +4811,47 @@ def _trace_acc_init_node(
             continue
         return current
     return None
+
+
+def _mma_accumulates_its_loop_carry(
+    node: Node,
+    acc: Node | None,
+    *,
+    device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
+) -> bool:
+    """Whether a deferred MMA may keep its accumulator in one fragment across its loop.
+
+    The MMA lowerings seed one accumulator fragment from ``acc`` in the
+    first iteration and read it out after the loop, which is the program
+    only for ``carry = mma(..., acc=carry)``.  An accumulator computed from
+    a loop carry in the body (``acc * alpha``, another carry) would be read
+    once and dropped in every later iteration; the scalar fallback lowers
+    those recurrences instead.  A bare ``bmm`` or ``hl.dot`` reduces the
+    whole K extent, and a loop-invariant accumulator seeds that reduction
+    (``_decode_cute_mma_target``), as does any MMA outside a loop body or in
+    a body whose loop statement is not among the graphs.  Codegen copies the
+    graphs, so the device-IR answer is cached on the node like
+    ``requires_accumulator_seed``.
+    """
+    cached = node.meta.get(_MMA_ACCUMULATES_LOOP_CARRY_META_KEY)
+    if isinstance(cached, bool):
+        return cached
+    active_graphs = (
+        graphs
+        if graphs is not None
+        else (
+            HostFunction.current().device_ir if device_ir is None else device_ir
+        ).graphs
+    )
+    carries = None if acc is None else loop_carries(node.graph, active_graphs)
+    if acc is None or carries is None or not reads_loop_carry(acc, carries):
+        accumulates = True
+    else:
+        accumulates = carries.get(node) is strip_new_vars(acc)
+    if device_ir is not None:
+        node.meta[_MMA_ACCUMULATES_LOOP_CARRY_META_KEY] = accumulates
+    return accumulates
 
 
 def _is_zero_init_acc_node(
@@ -16065,6 +16113,11 @@ def codegen_cute_mma_direct_mm(
         return None
     lhs_load, _, lhs_fake = lhs_info
     rhs_load, _, rhs_fake = rhs_info
+    # The grouped-N tiles re-read both operands from global memory at the mm.
+    if _cute_matmul_reread_unsafe(ctx.cg, lhs_load) or _cute_matmul_reread_unsafe(
+        ctx.cg, rhs_load
+    ):
+        return None
     lhs_val = lhs_node.meta.get("val")
     rhs_val = rhs_node.meta.get("val")
     if (

@@ -15,7 +15,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -36,6 +35,9 @@ def requires_sm100(fn: Callable) -> Callable:
 
 @functools.lru_cache(maxsize=1)
 def _supports_fp16_dot_scaled() -> bool:
+    if _get_backend() == "cute":
+        # The CuTe fallback dequantizes fp16 operands itself.
+        return True
     if _get_backend() not in ("triton", "tileir"):
         return False
     import triton
@@ -84,10 +86,26 @@ def _supports_fp16_dot_scaled() -> bool:
     return True
 
 
-# The CuTe backend has no hl.dot_scaled lowering (BackendImplementationMissing):
-# its block-scaled tcgen05 path is matched from NVFP4 dequantize-then-dot
-# programs, not from this op.  The argument validation is backend-independent.
-_NO_CUTE_DOT_SCALED = "hl.dot_scaled has no CuTe lowering yet"
+def _assert_scaled_dot_codegen(test: TestCase, code: str) -> None:
+    if _get_backend() == "cute":
+        # The CuTe fallback dequantizes each operand element by the e8m0 scale
+        # of its K group before the scalar dot.
+        test.assertIn("cute.arch.load(x_scale.iterator", code)
+        test.assertIn("cute.arch.load(y_scale.iterator", code)
+        test.assertIn("cute.math.exp2(", code)
+        return
+    test.assertIn("tl.dot_scaled(", code)
+
+
+def _reference_dot_scaled(
+    x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
+) -> torch.Tensor:
+    """``x[m, k] * 2**(x_scale[m, k // g] - 127)`` times the same for ``y[k, n]``
+    with ``y_scale[n, k // g]``, summed over ``k``."""
+    group = x.shape[1] // x_scale.shape[1]
+    x_factor = torch.exp2(x_scale.float() - 127).repeat_interleave(group, dim=1)
+    y_factor = torch.exp2(y_scale.float() - 127).repeat_interleave(group, dim=1)
+    return (x.float() * x_factor) @ (y.float() * y_factor.T)
 
 
 @onlyBackends(["triton", "cute"])
@@ -170,7 +188,6 @@ class TestDotScaled(TestCase):
             y_scale = torch.ones(2, 4, 64, device=DEVICE, dtype=torch.float32)
             bad_3d_kernel(x, x_scale, y, y_scale)
 
-    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_codegen_contains_dot_scaled(self):
@@ -216,9 +233,8 @@ class TestDotScaled(TestCase):
         )
 
         code, result = code_and_output(scaled_kernel, (x, x_scale, y, y_scale))
-        self.assertIn("tl.dot_scaled(", code)
+        _assert_scaled_dot_codegen(self, code)
 
-    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_with_accumulator(self):
@@ -261,10 +277,10 @@ class TestDotScaled(TestCase):
         )
 
         code, result = code_and_output(scaled_acc_kernel, (x, x_scale, y, y_scale))
-        self.assertIn("tl.dot_scaled(", code)
-        self.assertIn("acc=", code)
+        _assert_scaled_dot_codegen(self, code)
+        if _get_backend() != "cute":
+            self.assertIn("acc=", code)
 
-    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_out_dtype_float32(self):
@@ -311,10 +327,10 @@ class TestDotScaled(TestCase):
         code, result = code_and_output(
             scaled_out_dtype_kernel, (x, x_scale, y, y_scale)
         )
-        self.assertIn("tl.dot_scaled(", code)
-        self.assertIn("out_dtype=tl.float32", code)
+        _assert_scaled_dot_codegen(self, code)
+        if _get_backend() != "cute":
+            self.assertIn("out_dtype=tl.float32", code)
 
-    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_no_acc_codegen(self):
@@ -355,9 +371,8 @@ class TestDotScaled(TestCase):
         )
 
         code, result = code_and_output(scaled_no_acc_kernel, (x, x_scale, y, y_scale))
-        self.assertIn("tl.dot_scaled(", code)
+        _assert_scaled_dot_codegen(self, code)
 
-    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     def test_numerical_correctness_fp16(self):
         """Verify dot_scaled with fp16 format produces correct output.
@@ -404,7 +419,6 @@ class TestDotScaled(TestCase):
         expected = torch.mm(x.float(), y.float())
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
-    @skipIfCute(_NO_CUTE_DOT_SCALED)
     @requires_sm100
     def test_numerical_correctness_e4m3(self):
         """Verify dot_scaled with e4m3 format produces correct output.
@@ -452,6 +466,51 @@ class TestDotScaled(TestCase):
         result = scaled_kernel(x, x_scale, y, y_scale)
         expected = torch.mm(x.float(), y.float())
         torch.testing.assert_close(result, expected, atol=0.5, rtol=0.1)
+
+    @requires_sm100
+    def test_numerical_correctness_random_scales(self):
+        """Distinct per-group scales (including bytes above 127) must be read
+        at each element's own K group: x_scale[m, k // 32] and y_scale[n, k // 32]."""
+        M, N, K = 64, 64, 128
+        SCALE_FACTOR = 32
+
+        @helion.kernel(config=helion.Config(block_sizes=[32, 32]))
+        def scaled_kernel(
+            x: torch.Tensor,
+            x_scale: torch.Tensor,
+            y: torch.Tensor,
+            y_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                acc = hl.dot_scaled(
+                    x[tile_m, :],
+                    x_scale[tile_m, :],
+                    "e4m3",
+                    y[:, tile_n],
+                    y_scale[tile_n, :],
+                    "e4m3",
+                    acc=acc,
+                )
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = (torch.randn(M, K, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        y = (torch.randn(K, N, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        x_scale = torch.randint(
+            120, 136, (M, K // SCALE_FACTOR), device=DEVICE, dtype=torch.uint8
+        )
+        y_scale = torch.randint(
+            120, 136, (N, K // SCALE_FACTOR), device=DEVICE, dtype=torch.uint8
+        )
+
+        result = scaled_kernel(x, x_scale, y, y_scale)
+        expected = _reference_dot_scaled(x, x_scale, y, y_scale)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-3)
 
 
 if __name__ == "__main__":

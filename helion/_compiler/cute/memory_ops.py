@@ -28,6 +28,7 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _decorators
+from ...language import _tracing_ops
 from ...language.atomic_ops import ATOMIC_OPS
 from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
@@ -5343,6 +5344,72 @@ def _cute_load_eviction_slot(state: CodegenState) -> int:
     return slot
 
 
+def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
+    """Whether a collective matmul makes this load a placeholder.
+
+    The matmul reads its operand loads itself.  Once it has suppressed the
+    root lane loops, the rest of the tile body runs once per thread: a load
+    with a scalar result (``w[0]``, ``w[tile.id]``) is uniform across the tile
+    and is lowered, but a per-element load has no lane coordinates to read.
+    It may only feed the matmul's fused epilogue, which re-reads it per
+    accumulator element; anything else is refused.
+    """
+    node = state.fx_node
+    if node is None:
+        return False
+    cute_state = state.device_function.cute_state
+    if cute_state.is_collective_handled_load(node):
+        return True
+    if not cute_state.suppress_root_lane_loops:
+        return False
+    val = node.meta["val"]
+    if isinstance(val, torch.Tensor) and val.ndim == 0:
+        return False
+    if _cute_value_reaches_beyond_matmul_epilogue(state, node):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{node.name} reads per-element tile coordinates beside a "
+            "collective matmul, which runs the rest of the tile body once per "
+            "thread; only the matmul's fused epilogue can consume such a load",
+        )
+    return True
+
+
+def _cute_value_reaches_beyond_matmul_epilogue(
+    state: CodegenState, node: torch.fx.Node
+) -> bool:
+    """Whether a value computed from ``node`` reaches anything but the value
+    of a store or atomic whose value depends on a collective matmul: another
+    store or atomic, an address, control flow or a graph output."""
+    seen: set[torch.fx.Node] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        for user in current.users:
+            if user.target is store or user.target in ATOMIC_OPS:
+                addressing: list[torch.fx.Node] = []
+                map_arg((user.args[:2], user.args[3:]), addressing.append)
+                if current in addressing or not reach_tcgen05_matmul_anchors(
+                    state, cast("torch.fx.Node", user.args[2])
+                ):
+                    return True
+                continue
+            if (
+                user.op != "call_function"
+                or _tracing_ops.is_for_loop_target(user.target)
+                or user.target is _tracing_ops._if
+                or (
+                    isinstance(user.target, torch._ops.OpOverload)
+                    and user.target._schema.is_mutable
+                )
+            ):
+                return True
+            if user not in seen:
+                seen.add(user)
+                stack.append(user)
+    return False
+
+
 @_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
     # A store to this tensor earlier in the same loop body followed by this
@@ -5457,11 +5524,7 @@ def _(state: CodegenState) -> object:
             )
         return expr_from_string(index_var)
 
-    cute_state = state.device_function.cute_state
-    if cute_state.suppress_root_lane_loops or (
-        state.fx_node is not None
-        and cute_state.is_collective_handled_load(state.fx_node.name)
-    ):
+    if _cute_load_has_placeholder_value(state):
         zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
 

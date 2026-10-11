@@ -20,6 +20,7 @@ if _get_backend() in ("triton", "tileir"):
 import helion
 from helion import _compat
 from helion._compat import min_dot_size
+from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -32,6 +33,7 @@ from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -157,16 +159,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
                 dot_kernel_acc_arg, (x, y, acc_dtype), **extra_kwargs
             )
 
-        # Check if this combination should fail
-        if (
-            _get_backend() == "cute"
-            and input_dtype == torch.float32
-            and acc_dtype == torch.float16
-        ):
-            with self.assertRaises(helion.exc.BackendUnsupported):
-                run_kernel()
-            return
-
         if combo in EXPECTED_FAILURES:
             expected_exceptions = [
                 RuntimeError,
@@ -228,7 +220,9 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 @onlyBackends(["triton", "cute"])
 class TestDot(RefEagerTestBase, TestCase):
-    @skipIfNotTriton("triton-specific codegen assertions")
+    @skipIfNotTriton(
+        "asserts the tl.dot/tl.cast codegen; test_input_* cover the numerics"
+    )
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_codegen_acc_differs_uses_addition(self):
         # Test case 1: fused accumulation (acc_dtype = float32, common dtype = bfloat16)
@@ -269,7 +263,7 @@ class TestDot(RefEagerTestBase, TestCase):
         # Check that we cast the result to acc_dtype
         self.assertIn("tl.cast", code3)
 
-    @skipIfNotTriton("triton-specific codegen assertions")
+    @skipIfTileIR("not yet verified on TileIR")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_hl_dot_out_dtype_argument(self):
         @helion.kernel(
@@ -301,7 +295,34 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertEqual(result.dtype, torch.float16)
         expected = (x @ y).to(torch.float16)
         torch.testing.assert_close(result, expected, atol=3 * 1e-2, rtol=3 * 1e-2)
-        self.assertIn("out_dtype=tl.float16", code)
+        if _get_backend() == "triton":
+            self.assertIn("out_dtype=tl.float16", code)
+
+    @skipIfRefEager("float16 accumulator not supported for f32 in ref eager mode")
+    def test_hl_dot_square_k_float16_accumulator(self):
+        """An fp32 dot whose K is the full M (the serial-K lowering on CuTe)
+        into an fp16 accumulator sums in fp32 and rounds once: rounding every
+        step to fp16 is off by several ulps over K=64."""
+
+        @helion.kernel(static_shapes=True)
+        def dot_acc16(t: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            bhn = k.size(0)
+            m = hl.specialize(t.size(1))
+            d = k.size(2)
+            out = torch.empty([bhn, m, d], dtype=torch.float16, device=k.device)
+            for tile_bhn in hl.tile(bhn):
+                for tile_d in hl.tile(d):
+                    acc = hl.zeros([tile_bhn, m, tile_d], dtype=torch.float16)
+                    acc = hl.dot(t[tile_bhn, :, :], k[tile_bhn, :, tile_d], acc=acc)
+                    out[tile_bhn, :, tile_d] = acc
+            return out
+
+        torch.manual_seed(0)
+        t = torch.randn(4, 64, 64, device=DEVICE) * 8
+        k = torch.randn(4, 64, 16, device=DEVICE) * 8
+        _, out = code_and_output(dot_acc16, (t, k), block_sizes=[1, 16])
+        expected = torch.bmm(t.double(), k.double()).half()
+        torch.testing.assert_close(out, expected, rtol=2e-3, atol=0.5)
 
     def test_torch_matmul_3d(self):
         @helion.kernel(static_shapes=True)
@@ -332,7 +353,7 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = torch.bmm(A, B).to(result.dtype) * 2
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
-    @skipIfNotTriton("3D hl.dot regression targets Triton and ref eager")
+    @skipIfTileIR("not yet verified on TileIR")
     def test_hl_dot_3d_out_dtype(self):
         @helion.kernel(
             config=helion.Config(block_sizes=[1, 16, 16]),
@@ -1241,7 +1262,9 @@ class TestDot(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, ref, atol=1.0, rtol=0.02)
 
     @skipIfRefEager("tests generated code")
-    @skipIfNotTriton("workaround is triton-specific")
+    @skipIfNotTriton(
+        "asserts Triton's sm100 TMEM-LHS dot workaround (tl.join of two M halves)"
+    )
     @patch.object(_compat, "_sm100_dot_tmem_lhs_broken", lambda device: True)
     def test_chained_dot_wide_n_split_m_codegen(self):
         # With the sm100 workaround forced on, a dot-derived LHS with N=512
@@ -1414,7 +1437,7 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
     setattr(TestDot, test_name, _test_func)
 
 
-@onlyBackends(["triton", "pallas"])
+@onlyBackends(["triton", "pallas", "cute"])
 class TestDotPrecision(TestCase):
     @parametrize(
         "backend, env_var, env_val, expected",
@@ -1485,13 +1508,23 @@ class TestDotPrecision(TestCase):
         self, helion_precision: str, expected_triton: str, expected_pallas: str
     ) -> None:
         backend = _get_backend()
+        if backend == "cute" and not get_cute_mma_support().tcgen05_tf32:
+            self.skipTest(
+                "CuTe only maps dot_precision onto the tcgen05 tf32 MMA; this "
+                "GPU has none, so every precision emits the same exact code"
+            )
+        # CuTe keeps a 32x32 fp32 tile on its exact scalar path whatever the
+        # precision; a tcgen05-sized tile shows the tf32 mapping.
+        size, block_sizes = (
+            (256, [128, 128, 32]) if backend == "cute" else (32, [32, 32, 32])
+        )
 
-        x = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
-        y = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
+        x = torch.randn(size, size, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(size, size, device=DEVICE, dtype=torch.float32)
 
         def make_kernel(precision: str):
             @helion.kernel(
-                config=helion.Config(block_sizes=[32, 32, 32]),
+                config=helion.Config(block_sizes=block_sizes),
                 dot_precision=precision,
             )
             def matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1512,6 +1545,11 @@ class TestDotPrecision(TestCase):
             self.assertIn(expected_triton, code)
         elif backend == "pallas":
             self.assertIn(expected_pallas, code)
+        elif backend == "cute":
+            # Only tf32 may take the tf32 tcgen05 MMA; the others stay exact.
+            self.assertEqual(
+                "cutlass.TFloat32" in code, expected_triton == self._PR_TF32
+            )
 
 
 instantiate_parametrized_tests(TestDotPrecision)

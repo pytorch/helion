@@ -1973,8 +1973,13 @@ class FragmentCompiler:
         out_dtype = cast("torch.dtype | None", node.args[3]) or _compute_out_dtype(
             lhs.dtype, rhs.dtype, acc.dtype if acc is not None else None
         )
+        # A narrow float accumulator still sums in fp32 and rounds once, as
+        # the other hl.dot lowerings do.
         compute_dtype = (
-            torch.float32 if _needs_f32_accumulator(lhs.dtype, rhs.dtype) else out_dtype
+            torch.float32
+            if _needs_f32_accumulator(lhs.dtype, rhs.dtype)
+            or (out_dtype.is_floating_point and out_dtype.itemsize < 4)
+            else out_dtype
         )
         result = self.allocate(Fragment(shape, out_dtype, lambda _: "0"))
 

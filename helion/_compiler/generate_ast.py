@@ -21,6 +21,7 @@ from ..runtime.config import Config
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
+from .ast_extension import clone_ast
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -117,6 +118,134 @@ def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
     return result
 
 
+_PURE_SCALAR_CALL_MODULES = frozenset({"cutlass", "operator"})
+
+
+def _is_pure_scalar_expr(expr: ast.expr) -> bool:
+    """Whether ``expr`` only combines names and constants: arithmetic,
+    comparisons, ``operator`` calls and ``cutlass`` scalar casts."""
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id in _PURE_SCALAR_CALL_MODULES
+                and not node.keywords
+            ):
+                return False
+        elif not isinstance(
+            node,
+            (
+                ast.Name,
+                ast.Constant,
+                ast.Attribute,
+                ast.BinOp,
+                ast.UnaryOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.IfExp,
+                ast.Tuple,
+                ast.expr_context,
+                ast.operator,
+                ast.unaryop,
+                ast.boolop,
+                ast.cmpop,
+            ),
+        ):
+            return False
+    return True
+
+
+def _drop_dead_lane_derived_assignments(
+    body: list[ast.AST], preamble: list[ast.AST], lane_names: set[str]
+) -> None:
+    """Delete the dead assignments computed from lane-loop definitions.
+
+    Once a collective matmul has suppressed the root lane loops, the generic
+    lowering of what it took over (the masks of its operand loads and of the
+    store its epilogue performs, the K loop's copies of them) still reads the
+    per-element coordinates, which nothing defines any more: executed, those
+    statements fail at launch.  Only pure scalar assignments that no
+    statement reads are deleted (each becomes ``pass``).
+    """
+    from .ast_read_writes import ReadWrites
+
+    def target(node: ast.AST) -> str | None:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and _is_pure_scalar_expr(node.value)
+        ):
+            return node.targets[0].id
+        return None
+
+    module = ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[])
+    derived = set(lane_names)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(module):
+            name = target(node)
+            if (
+                name is not None
+                and name not in derived
+                and set(ReadWrites.from_ast(cast("ast.Assign", node).value).reads)
+                & derived
+            ):
+                derived.add(name)
+                changed = True
+    removable = derived - lane_names
+
+    class DropDead(ast.NodeTransformer):
+        def __init__(self, reads: set[str]) -> None:
+            self.reads = reads
+            self.changed = False
+
+        def visit_Assign(self, node: ast.Assign) -> ast.AST:
+            name = target(node)
+            if name in removable and name not in self.reads:
+                self.changed = True
+                return ast.copy_location(ast.Pass(), node)
+            return node
+
+    while True:
+        drop = DropDead(set(ReadWrites.from_list([*preamble, *body]).reads))
+        drop.visit(module)
+        if not drop.changed:
+            break
+
+
+def _reject_lane_reads_without_lane_loops(
+    body: list[ast.AST], lane_names: set[str], dce_vars: list[str]
+) -> None:
+    """Refuse a kernel that reads a lane-loop definition of a root whose lane
+    loops a collective matmul suppressed.
+
+    That root's body is emitted once per thread, so only statements over
+    values uniform across the tile can stay: a per-element load or store
+    beside the matmul (``out2[tile_m, tile_n] = x[tile_m, tile_n]``) would read
+    an index that nothing defines any more.  Dead compiler temporaries are
+    dropped first, as the kernel's dead-code elimination will.  Runs once
+    codegen is done, after the checks the epilogue chains defer.
+    """
+    from .ast_read_writes import ReadWrites
+
+    live = cast("list[ast.AST]", clone_ast(body))
+    dead_assignment_elimination(live, dce_vars)
+    dead_expression_elimination(live)
+    read = set(ReadWrites.from_list(live).reads)
+    if missing := sorted(read & lane_names):
+        raise exc.BackendUnsupported(
+            "cute",
+            "statements beside a collective matmul read per-element tile "
+            f"coordinates ({', '.join(missing)}) that only the root lane loops "
+            "the collective path removes define; only values uniform across "
+            "the tile can be read or written there",
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class ResidentPrepLowering:
     hoist: ResidentPrepHoist
@@ -166,6 +295,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        # The names only the lane loops of roots emitted without them define
+        # (a collective matmul suppressed them): dead reads are dropped
+        # (``_drop_dead_lane_derived_assignments``) and live ones refused once
+        # codegen is done (``_reject_lane_reads_without_lane_loops``).
+        self.suppressed_lane_names: set[str] = set()
         self.divergent_control_flow_depth = 0
         self.current_root_graph_info: GraphInfo | None = None
         self.max_thread_block_dims = [1, 1, 1]
@@ -1775,6 +1909,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_prefix
                                 )
                                 if self.device_function.cute_state.consume_root_lane_loop_suppression():
+                                    self.suppressed_lane_names |= (
+                                        grid_state.lane_defined_names()
+                                    )
                                     self.statements_stack[-1].extend(wrapped_body)
                                 else:
                                     self.statements_stack[-1].extend(
@@ -1830,6 +1967,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
             if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                if self.suppressed_lane_names:
+                    _drop_dead_lane_derived_assignments(
+                        self.device_function.body,
+                        self.device_function.preamble,
+                        self.suppressed_lane_names,
+                    )
                 if self.device_function.pid is not None:
                     persistent_body = self.device_function.pid.setup_persistent_kernel(
                         self.device_function
@@ -2046,6 +2189,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             for name, aliases in self.device_function._variable_renames.items()
                         },
                         running_sums=self.device_function.cute_matmul_running_sums,
+                        required=self.device_function.cute_state.chunk_recurrence_running_sums,
                     )
                     # Interchange a grid constexpr vector loop into the serial
                     # reduction nest it wraps (column sums): one vector load
@@ -2655,6 +2799,12 @@ def _generate_ast(
             # store drained (chains ending in an atomic or a specialized
             # store path).
             run_deferred_rebound_checks(codegen)
+            if codegen.suppressed_lane_names:
+                _reject_lane_reads_without_lane_loops(
+                    codegen.device_function.body,
+                    codegen.suppressed_lane_names,
+                    codegen.device_function.dce_vars,
+                )
             if _bounded_cache_request is None:
                 kernel_def = codegen.device_function.codegen_function_def()
             else:
