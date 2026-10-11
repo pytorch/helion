@@ -2041,6 +2041,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         interchange_lane_outside_serial_reductions,
                     )
                     from .tile_strategy import restore_unprocessed_lane_reduce_markers
+                    from .tile_strategy import sink_lane_loops_into_uniform_branches
                     from .tile_strategy import split_lane_loop_reductions
                     from .tile_strategy import validate_lane_reduce_owners
 
@@ -2155,33 +2156,33 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     )
                     from .cute.nested_lane_reductions import resolve_pruned_lane_owners
 
+                    # The kernel arguments are uniform across the CTA; the
+                    # passes below copy the set before extending it.
+                    lane_uniform_names = {
+                        *(argument.name for argument in self.device_function.arguments),
+                        *self._extra_params,
+                    }
+                    lane_rename_groups = {
+                        name: aliases[0]
+                        for name, aliases in self.device_function._variable_renames.items()
+                    }
                     resolve_pruned_lane_owners(
                         list(self.device_function.body),
                         self.device_function.cute_state.reshape_lane_fallbacks,
                         physical_fallbacks=self.device_function.cute_state.reshape_physical_fallbacks,
-                        uniform_names={
-                            *(
-                                argument.name
-                                for argument in self.device_function.arguments
-                            ),
-                            *self._extra_params,
-                        },
+                        uniform_names=lane_uniform_names,
+                    )
+                    self.device_function.body = sink_lane_loops_into_uniform_branches(
+                        list(self.device_function.body),
+                        uniform_names=lane_uniform_names,
+                        rename_groups=lane_rename_groups,
                     )
                     self.device_function.body = normalize_nested_lane_reductions(
                         list(self.device_function.body),
-                        uniform_names={
-                            *(
-                                argument.name
-                                for argument in self.device_function.arguments
-                            ),
-                            *self._extra_params,
-                        },
+                        uniform_names=lane_uniform_names,
                         proven_disjoint_tensor_pairs=proven_disjoint_pairs,
                         proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
-                        rename_groups={
-                            name: aliases[0]
-                            for name, aliases in self.device_function._variable_renames.items()
-                        },
+                        rename_groups=lane_rename_groups,
                     )
                     validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = interchange_lane_outside_serial_reductions(
@@ -2197,13 +2198,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
-                        uniform_names={
-                            *(
-                                argument.name
-                                for argument in self.device_function.arguments
-                            ),
-                            *self._extra_params,
-                        },
+                        uniform_names=lane_uniform_names,
                         proven_disjoint_tensor_pairs=proven_disjoint_pairs,
                         proven_tensor_stride_values=(
                             self.device_function.proven_tensor_stride_values()
