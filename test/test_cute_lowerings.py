@@ -25185,6 +25185,71 @@ def _cute_tile_plus_transpose(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def _cute_blockwise_transpose_in_branch(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        # Nothing in the kernel writes ``flags`` (only the fresh ``out``):
+        # every thread of the CTA loads the same flag.
+        if flags[tile_m.id] > 0:
+            out[tile_m, tile_n] = x[tile_m, tile_n].T
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_blockwise_transpose_in_divergent_branch(
+    x: torch.Tensor, out: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    for tile_m, tile_n in hl.tile(x.size()):
+        # ``flags`` may alias ``out``, which the kernel writes: the threads
+        # may load the flag before and after another CTA's store.
+        if flags[tile_m.id] > 0:
+            out[tile_m, tile_n] = x[tile_m, tile_n].T
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tile_plus_transpose_in_branch(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        # Nothing in the kernel writes ``flags``: the branch is CTA-uniform.
+        if flags[tile_m.id] > 0:
+            t = x[tile_m, tile_n]
+            out[tile_m, tile_n] = t + t.T
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tile_plus_transpose_in_divergent_branch(
+    x: torch.Tensor, out: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    for tile_m, tile_n in hl.tile(x.size()):
+        # ``flags`` may alias ``out``, which the kernel writes.
+        if flags[tile_m.id] > 0:
+            t = x[tile_m, tile_n]
+            out[tile_m, tile_n] = t + t.T
+    return out
+
+
+def _flags_aliasing(out: torch.Tensor, count: int) -> torch.Tensor:
+    """``count`` int32 flags that are a view of ``out``'s storage."""
+    return out.view(torch.int32).view(-1)[:count]
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_tile_plus_transpose_in_uniform_branch(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        if tile_m.id > 0:
+            t = x[tile_m, tile_n]
+            out[tile_m, tile_n] = t + t.T
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def _cute_atomic_add_transposed(x: torch.Tensor) -> torch.Tensor:
     M, N = x.shape
     out = torch.zeros_like(x)
@@ -25689,9 +25754,9 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
     positions other lane iterations write at other times.  Helion's tiles are
     positional, so ``out[tile_m, tile_n] = x[tile_m, tile_n].T`` (equal block
     sizes) is a within-tile transpose that does need another thread's element:
-    the store exchanges it through shared memory when every element has its
-    own thread and is refused inside lane loops; a pointwise operand re-bound
-    the same way (``t + t.T``) is refused.
+    the store, a pointwise or ``torch.where`` operand re-bound the same way
+    (``t + t.T``) and a load mask exchange it through shared memory when every
+    element has its own thread, and are refused inside lane loops.
     """
 
     _LANE_LOOP = r"for (?:vec_)?lane_\d+ in"
@@ -25783,6 +25848,84 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
                 self.assertIn("rebind_smem", code)
                 self.assertIn("cute.arch.sync_threads()", code)
 
+    def _rebinding_kernels(
+        self,
+    ) -> list[tuple[helion.Kernel, tuple[torch.Tensor, ...], torch.Tensor]]:
+        """One kernel per exchange kind (store, pointwise operand, where
+        operand, load mask) with its arguments and positional reference."""
+        torch.manual_seed(0)
+        x = torch.randn(32, 32, device=DEVICE)
+        c = torch.rand(32, 32, device=DEVICE) > 0.5
+        row = torch.randn(32, device=DEVICE)
+        return [
+            (_cute_blockwise_transpose, (x,), _blockwise_transpose(x, 16)),
+            (_cute_tile_plus_transpose, (x,), x + _blockwise_transpose(x, 16)),
+            (
+                _cute_where_lower_rank_operand,
+                (c, x, row),
+                torch.where(c, x, _positional_row_vector_store(row, 32, 32, 16)),
+            ),
+            (
+                _cute_load_with_transposed_mask,
+                (x, c),
+                torch.where(_blockwise_transpose(c, 16), x, torch.zeros_like(x)),
+            ),
+        ]
+
+    def test_rebinding_kernels_do_not_offer_flatten_loops(self) -> None:
+        # cute re-registers flatten_loops for pure pointwise kernels, but a
+        # flattened tile is a run of the flat iteration space, not the
+        # per-block tile a re-binding consumer pairs elements within; a
+        # relabel without re-binding keeps the choice.
+        for kernel, args, reference in self._rebinding_kernels():
+            with self.subTest(kernel=kernel.name):
+                spec = kernel._bind_isolated(args).config_spec
+                self.assertEqual(len(spec.flatten_loops), 0)
+                _, out = code_and_output(kernel, args, block_sizes=[16, 16])
+                torch.testing.assert_close(out, reference)
+        x = torch.randn(32, 32, device=DEVICE)
+        spec = _cute_live_transpose._bind_isolated((x,)).config_spec
+        self.assertEqual(len(spec.flatten_loops), 1)
+
+    def test_exchange_over_flattened_tiles_rejected(self) -> None:
+        # Backstop for a flattened tile that still reaches an exchange.
+        for kernel, args, _reference in self._rebinding_kernels():
+            fresh = helion.kernel(kernel.fn, backend="cute", static_shapes=True)
+            with (
+                self.subTest(kernel=kernel.name),
+                patch(
+                    "helion._compiler.cute.cute_reshape.kernel_may_rebind_block_ids",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "re-binds .* over a flattened tile"
+                ),
+            ):
+                code_and_output(fresh, args, block_sizes=[16, 16], flatten_loops=[True])
+
+    def test_exchange_of_uint8_values(self) -> None:
+        # The element read of a Uint8 buffer is an Int8; the exchange casts it
+        # back to the storage type.
+        x = torch.randint(0, 100, (32, 32), device=DEVICE, dtype=torch.uint8)
+        for kernel, reference in (
+            (_cute_blockwise_transpose, _blockwise_transpose(x, 16)),
+            (_cute_tile_plus_transpose, x + _blockwise_transpose(x, 16)),
+        ):
+            with self.subTest(kernel=kernel.name):
+                _, out = code_and_output(kernel, (x,), block_sizes=[16, 16])
+                torch.testing.assert_close(out, reference)
+
+    def test_blockwise_transpose_store_of_bools(self) -> None:
+        # A Boolean shared-memory buffer cannot be allocated; bools are staged
+        # as Uint8.
+        torch.manual_seed(0)
+        m = torch.rand(64, 64, device=DEVICE) > 0.5
+        code, out = code_and_output(
+            _cute_blockwise_transpose, (m,), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(out, _blockwise_transpose(m, 16))
+        self.assertIn("cute.arch.alloc_smem(cutlass.Uint8", code)
+
     def test_blockwise_transpose_store_ragged_tiles(self) -> None:
         torch.manual_seed(0)
         x = torch.randn(40, 24, device=DEVICE)
@@ -25809,12 +25952,84 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
             ):
                 code_and_output(_cute_blockwise_transpose, (x,), **config)
 
-    def test_pointwise_rebound_operand_rejected(self) -> None:
+    def test_blockwise_transpose_store_in_divergent_branch_rejected(self) -> None:
+        # The exchange's barriers need every thread of the CTA, so it is
+        # refused inside a branch whose loaded condition the compiler cannot
+        # prove uniform (the flag aliases the output the kernel writes).
         x = torch.randn(64, 64, device=DEVICE)
+        out = torch.zeros_like(x)
         with self.assertRaisesRegex(
-            exc.BackendUnsupported, "at the position of another block's lane"
+            exc.BackendUnsupported, "store of .* re-binds .* inside a branch or loop"
         ):
-            code_and_output(_cute_tile_plus_transpose, (x,), block_sizes=[16, 16])
+            code_and_output(
+                _cute_blockwise_transpose_in_divergent_branch,
+                (x, out, _flags_aliasing(out, 4)),
+                block_sizes=[16, 16],
+            )
+
+    def test_blockwise_transpose_store_in_unwritten_flag_branch(self) -> None:
+        # A flag nothing in the kernel writes is one value per CTA, so the
+        # exchange's barriers stay inside the branch.
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, device=DEVICE)
+        flags = torch.tensor([1, 0, 1, 1], device=DEVICE, dtype=torch.int32)
+        code, out = code_and_output(
+            _cute_blockwise_transpose_in_branch, (x, flags), block_sizes=[16, 16]
+        )
+        rows = flags.repeat_interleave(16).bool()[:, None]
+        torch.testing.assert_close(
+            out, torch.where(rows, _blockwise_transpose(x, 16), torch.zeros_like(x))
+        )
+        self.assertIn("cute.arch.sync_threads()", code)
+
+    def test_pointwise_rebound_operand_exchanges(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(40, 24, device=DEVICE)
+        for config in ({"block_sizes": [16, 16]}, {"block_sizes": [32, 32]}):
+            with self.subTest(config=config):
+                code, out = code_and_output(_cute_tile_plus_transpose, (x,), **config)
+                block = config["block_sizes"][0]
+                torch.testing.assert_close(out, x + _blockwise_transpose(x, block))
+                self.assertIn("rebind_smem", code)
+
+    def test_pointwise_rebound_operand_in_branches(self) -> None:
+        # The exchange's barriers need every thread: a branch on block-uniform
+        # values (the grid tile's id, or a flag nothing in the kernel writes)
+        # keeps it, a flag the kernel may overwrite is refused.
+        torch.manual_seed(0)
+        x = torch.randn(64, 64, device=DEVICE)
+        expected = x + _blockwise_transpose(x, 16)
+        expected[:16] = 0
+        code, out = code_and_output(
+            _cute_tile_plus_transpose_in_uniform_branch, (x,), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(out, expected)
+        self.assertIn("rebind_smem", code)
+        flags = torch.tensor([0, 1, 1, 1], device=DEVICE, dtype=torch.int32)
+        code, out = code_and_output(
+            _cute_tile_plus_transpose_in_branch, (x, flags), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(out, expected)
+        self.assertIn("rebind_smem", code)
+        out = torch.zeros_like(x)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "re-binds .* inside a branch or loop"
+        ):
+            code_and_output(
+                _cute_tile_plus_transpose_in_divergent_branch,
+                (x, out, _flags_aliasing(out, 4)),
+                block_sizes=[16, 16],
+            )
+
+    def test_pointwise_rebound_operand_in_lane_loops_rejected(self) -> None:
+        x = torch.randn(64, 64, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "re-binds .* lane loop"):
+            code_and_output(
+                _cute_tile_plus_transpose,
+                (x,),
+                block_sizes=[16, 16],
+                num_threads=[8, 8],
+            )
 
     def test_atomic_rebound_value_rejected(self) -> None:
         x = torch.randn(64, 64, device=DEVICE)
@@ -25884,29 +26099,32 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
                 _cute_atomic_add_lower_rank_value, (a, b), block_sizes=[16, 16]
             )
 
-    def test_reordered_lower_rank_operand_rejected(self) -> None:
+    def test_reordered_lower_rank_operand_exchanges(self) -> None:
         # Triton adds the [t1, t0] tile positionally (see
         # test_views.test_reordered_lower_rank_operand); the per-thread
-        # lowering would add b at its block-id coordinates instead, so it is
-        # refused rather than silently different.
+        # lowering holds b at its block-id coordinates, so the operand is
+        # exchanged, staged once per element (from t2 == 0).
+        torch.manual_seed(0)
         a = torch.randn(16, 16, 8, device=DEVICE)
         b = torch.randn(16, 16, device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "at the position of another block's lane"
-        ):
-            code_and_output(
-                _cute_reordered_lower_rank_operand, (a, b), block_sizes=[8, 8, 8]
-            )
+        code, out = code_and_output(
+            _cute_reordered_lower_rank_operand, (a, b), block_sizes=[8, 8, 8]
+        )
+        torch.testing.assert_close(out, _positional_reordered_operand(a, b, 8))
+        self.assertIn("rebind_smem", code)
 
-    def test_where_and_stack_operands_rebinding_rejected(self) -> None:
+    def test_where_and_stack_operands_rebinding(self) -> None:
         # where and stack have custom lowerings; both combined each thread's
         # own scalars (returning x where Triton computes the blockwise t.T).
+        # The where operand is exchanged; stack has no exchange.
+        torch.manual_seed(0)
         x = torch.randn(64, 64, device=DEVICE)
         c = torch.rand(64, 64, device=DEVICE) > 0.5
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "aten.where.self .* at the position of another"
-        ):
-            code_and_output(_cute_where_transposed, (c, x), block_sizes=[16, 16])
+        code, out = code_and_output(
+            _cute_where_transposed, (c, x), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(out, torch.where(c, x, _blockwise_transpose(x, 16)))
+        self.assertIn("rebind_smem", code)
         with self.assertRaisesRegex(
             exc.BackendUnsupported, "aten.stack.default .* at the position of another"
         ):
@@ -25978,19 +26196,39 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
                 block_sizes=[16, 16],
             )
 
-    def test_load_extra_mask_rebinding_rejected(self) -> None:
+    def test_load_extra_mask_rebinding_exchanges(self) -> None:
         # Triton ANDs the extra mask positionally into the index masks
         # (test_views.test_load_extra_mask_is_positional); the per-thread
-        # lowering tested each thread's own mask element and is refused.
+        # lowering held each thread's own mask element, so the mask is
+        # exchanged: m.T masks with the blockwise transpose, row[tm] with
+        # row[m0 + j].  Inside lane loops it is refused.
+        torch.manual_seed(0)
         x = torch.randn(64, 64, device=DEVICE)
         m = torch.rand(64, 64, device=DEVICE) > 0.5
         row = torch.rand(64, device=DEVICE) > 0.5
-        with self.assertRaisesRegex(exc.BackendUnsupported, "load mask .* re-binds"):
+        zeros = torch.zeros_like(x)
+        code, out = code_and_output(
+            _cute_load_with_transposed_mask, (x, m), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(
+            out, torch.where(_blockwise_transpose(m, 16), x, zeros)
+        )
+        self.assertIn("rebind_smem", code)
+        code, out = code_and_output(
+            _cute_load_with_row_mask, (x, row), block_sizes=[16, 16]
+        )
+        row_mask = _positional_row_vector_store(row, 64, 64, 16)
+        torch.testing.assert_close(out, torch.where(row_mask, x, zeros))
+        self.assertIn("rebind_smem", code)
+        with self.assertRaises(exc.ShapeMismatch):
+            code_and_output(_cute_load_with_row_mask, (x, row), block_sizes=[16, 32])
+        with self.assertRaisesRegex(exc.BackendUnsupported, "load mask .* lane loop"):
             code_and_output(
-                _cute_load_with_transposed_mask, (x, m), block_sizes=[16, 16]
+                _cute_load_with_transposed_mask,
+                (x, m),
+                block_sizes=[16, 16],
+                num_threads=[8, 8],
             )
-        with self.assertRaisesRegex(exc.BackendUnsupported, "load mask .* re-binds"):
-            code_and_output(_cute_load_with_row_mask, (x, row), block_sizes=[16, 16])
 
     def test_gather_transposed_index_rejected(self) -> None:
         # The gather reads its index per thread and addresses the input by the
@@ -26087,17 +26325,19 @@ class TestCuteLivePermuteKeepsThreadElement(unittest.TestCase):
     def test_where_lower_rank_operand_is_positional(self) -> None:
         # tl.where receives its operands unexpanded, so a rank-1 row[tm] is
         # right-aligned to the tn axis (test_views.test_where_lower_rank_operand
-        # pins Triton's values); the per-thread lowering read row at its own
-        # tm coordinate and must refuse instead.
+        # pins Triton's values); the per-thread lowering holds row at its own
+        # tm coordinate, so the operand is exchanged, staged from tn == 0.
+        torch.manual_seed(0)
         c = torch.rand(64, 64, device=DEVICE) > 0.5
         x = torch.randn(64, 64, device=DEVICE)
         row = torch.randn(64, device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "aten.where.self .* at the position of another"
-        ):
-            code_and_output(
-                _cute_where_lower_rank_operand, (c, x, row), block_sizes=[16, 16]
-            )
+        code, out = code_and_output(
+            _cute_where_lower_rank_operand, (c, x, row), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(
+            out, torch.where(c, x, _positional_row_vector_store(row, 64, 64, 16))
+        )
+        self.assertIn("rebind_smem", code)
         with self.assertRaises(exc.ShapeMismatch):
             code_and_output(
                 _cute_where_lower_rank_operand, (c, x, row), block_sizes=[16, 32]

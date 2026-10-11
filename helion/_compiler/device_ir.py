@@ -3873,17 +3873,24 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Only when NO flatten spec survived: appending next to survivors
         # would scramble the positional ``flatten_loops`` config semantics
         # for multi-loop kernels.  Sorted by block id == declaration order.
+        # Not for a kernel that may re-bind a tile dim to another block (a
+        # blockwise transpose, a right-aligned lower-rank operand): its
+        # exchange pairs elements within the unflattened per-block tile.
         env = CompileEnvironment.current()
         spec = env.config_spec
         if (
             env.backend_name == "cute"
             and spec.pointwise_facts
             and not len(spec.flatten_loops)
+            and spec.cute_reflatten_candidates
         ):
-            for fspec in sorted(
-                spec.cute_reflatten_candidates, key=lambda f: f.block_ids[0]
-            ):
-                spec.flatten_loops.append(fspec)
+            from .cute.cute_reshape import kernel_may_rebind_block_ids
+
+            if not kernel_may_rebind_block_ids(device_ir.graphs):
+                for fspec in sorted(
+                    spec.cute_reflatten_candidates, key=lambda f: f.block_ids[0]
+                ):
+                    spec.flatten_loops.append(fspec)
 
         return device_ir
 

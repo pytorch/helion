@@ -504,9 +504,10 @@ class TestUniformBranchBarriers(RefEagerTestBase, TestCase):
     def test_uniform_branch_orders_racing_accesses(self):
         # Inside the branch, the full-row store and the per-column update
         # address ``out`` through different threads.  The condition (a grid
-        # tile's begin or an ``hl.grid`` index against a kernel argument) is
-        # one value per CTA, so CuTe can order them with a block-wide barrier
-        # inside the branch instead of rejecting the kernel.
+        # tile's begin or an ``hl.grid`` index against a kernel argument, or a
+        # flag nothing in the kernel writes) is one value per CTA, so CuTe can
+        # order them with a block-wide barrier inside the branch instead of
+        # rejecting the kernel.
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def by_tile(x: torch.Tensor, rows: int) -> torch.Tensor:
             m, n = x.size()
@@ -529,12 +530,30 @@ class TestUniformBranchBarriers(RefEagerTestBase, TestCase):
                         out[i, tile_n] += x[i, tile_n]
             return out
 
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def by_loaded_flag(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(m, block_size=8):
+                # Nothing in the kernel can write ``flags`` (only the fresh
+                # ``out`` is written): every thread loads the same flag.
+                if flags[tile_m.begin] > 0:
+                    out[tile_m, :] = x[tile_m, :] + 1
+                    for tile_n in hl.tile(n, block_size=8):
+                        out[tile_m, tile_n] += x[tile_m, tile_n]
+            return out
+
         x = torch.randn(32, 16, device=DEVICE)
+        flags = (torch.arange(32, device=DEVICE) < 16).to(torch.float32)
         expected = torch.zeros_like(x)
         expected[:16] = 2 * x[:16] + 1
-        for kernel in (by_tile, by_grid):
+        for kernel, args in (
+            (by_tile, (x, 16)),
+            (by_grid, (x, 16)),
+            (by_loaded_flag, (x, flags)),
+        ):
             with self.subTest(kernel=kernel.name):
-                code, result = code_and_output(kernel, (x, 16))
+                code, result = code_and_output(kernel, args)
                 torch.testing.assert_close(result, expected)
                 if _get_backend() == "cute":
                     self.assertTrue(

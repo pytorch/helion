@@ -831,10 +831,30 @@ def test_atomic_result_is_broadcast_from_the_leader_thread() -> None:
 
 
 def test_atomic_result_in_a_branch_rejects_the_config() -> None:
-    # The broadcast's barriers cannot sit where a thread may skip them.
-    args = (torch.empty((8, 64)), torch.zeros(1, dtype=torch.int32), torch.ones(1))
+    # The broadcast's barriers cannot sit where a thread may skip them: the
+    # flag aliases the counter the atomic writes, so the threads may read it
+    # before and after another CTA's increment.
+    counter = torch.zeros(1, dtype=torch.int32)
+    args = (torch.empty((8, 64)), counter, counter.view(torch.float32))
     with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
         _generate(_flagged_count_then_offset_the_copy, args, **_ONE_PER_THREAD)
+
+
+def test_atomic_result_in_an_unwritten_flag_branch_is_broadcast() -> None:
+    # Nothing writes the flag in this launch (the bound kernel's storage
+    # disjointness fact keeps it apart from the counter), so every thread
+    # takes the branch alike and the broadcast's barriers sit inside it.
+    args = (torch.empty((8, 64)), torch.zeros(1, dtype=torch.int32), torch.ones(1))
+    code = _generate(_flagged_count_then_offset_the_copy, args, **_ONE_PER_THREAD)
+    function = _kernel_function(code)
+    (branch,) = (
+        node
+        for node in function.body
+        if isinstance(node, ast.If) and "atomic_add" in ast.unparse(node)
+    )
+    body = ast.unparse(branch.body)
+    assert "_atomic_prev_smem" in body, code
+    assert body.count("cute.arch.sync_threads()") == 2, code
 
 
 # The lane loops around the atomic (innermost first) and the ones it varies

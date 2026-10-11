@@ -30,6 +30,7 @@ import numpy as np
 
 from ... import exc
 from ..compile_environment import CompileEnvironment
+from ..tile_strategy import FlattenedTileStrategy
 
 if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
@@ -91,6 +92,28 @@ def _collect_definitions(
             ):
                 definitions[stmt.targets[0].id] = stmt.value
     return definitions
+
+
+def emitted_definitions(
+    cg: GenerateAST, grid_state: DeviceGridState
+) -> dict[str, ast.expr]:
+    """The ``name = expr`` assignments emitted so far around the current body.
+
+    The enclosing statement lists, the root body, the grid's prefix, its
+    per-lane index setup and its vectorized lane wrappers.
+    """
+    return _collect_definitions(
+        [
+            *cg.statements_stack,
+            cg.device_function.body,
+            grid_state.outer_prefix,
+            grid_state.lane_setup_statements,
+            *(
+                list(wrapper.outer_for.body)
+                for wrapper in grid_state.vec_lane_wrappers.values()
+            ),
+        ]
+    )
 
 
 def _dotted_name(node: ast.AST) -> str | None:
@@ -247,19 +270,16 @@ def verify_split_smem_exchange(
         size = df.resolved_block_size(info.block_id)
         if name is not None and isinstance(size, int):
             constants[name] = size
-    statement_lists: list[list[ast.AST]] = [
-        *cg.statements_stack,
-        df.body,
-        grid_state.outer_prefix,
-        grid_state.lane_setup_statements,
-        *(
-            list(wrapper.outer_for.body)
-            for wrapper in grid_state.vec_lane_wrappers.values()
-        ),
-    ]
+    for strategy in df.tile_strategy.strategies:
+        # The blocks of a flattened tile share one variable, the product of
+        # their sizes.
+        if isinstance(strategy, FlattenedTileStrategy) and isinstance(
+            strategy.block_size, int
+        ):
+            constants[strategy.block_size_var(-1)] = strategy.block_size
     grid_shape, thread_ids = _thread_ids(grid_state)
     evaluator = _IndexEvaluator(
-        _collect_definitions(statement_lists), constants, thread_ids
+        emitted_definitions(cg, grid_state), constants, thread_ids
     )
     expressions = [
         ast.parse(expr, mode="eval").body for expr in (write_index, *read_indices)
