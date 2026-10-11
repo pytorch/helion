@@ -6,6 +6,7 @@
 
 The renderer (``flash_score_mod.py``) emits calls to these helpers through the
 backend's library-import table (``_cute_flex_tanh``, ``_cute_flex_load_vec``,
+``_cute_flex_load_window``,
 ``_cute_flex_fmod``, ``_cute_flex_remainder``); everything else in a rendered
 hook is plain CuTe DSL scalar code.
 """
@@ -64,6 +65,24 @@ def load_vec(ptr: object, width: int, dtype: type) -> list:
     numeric = cast("Any", dtype)
     vec = cute.arch.load(ptr, ir.VectorType.get([width], numeric.mlir_type))
     return [numeric(cast("Any", vec)[j]) for j in range(width)]
+
+
+def load_window(
+    ptr: object, last_ptr: object, count: int, width: int, dtype: type
+) -> list:
+    """``count`` consecutive ``width``-lane vectors from ``ptr`` as a flat list.
+
+    The last vector is read at ``last_ptr`` (the renderer clamps it to the
+    table end: its lanes are only selected when the thread's window is
+    misaligned, in which case it lies inside the table).  ``ptr`` must be
+    aligned to the vector's byte size.
+    """
+    values: list = []
+    base = cast("Any", ptr)
+    for k in range(count - 1):
+        values.extend(load_vec(base + width * k, width, dtype))
+    values.extend(load_vec(last_ptr, width, dtype))
+    return values
 
 
 def fmod(a: object, b: object) -> object:

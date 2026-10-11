@@ -2180,6 +2180,7 @@ class CuteBackend(Backend):
             "_cute_python_mod": "from helion._compiler.cute.integer_helpers import python_mod as _cute_python_mod",
             "_cute_flex_tanh": "from helion._compiler.cute.flex_score_mod_runtime import tanh_f32 as _cute_flex_tanh",
             "_cute_flex_load_vec": "from helion._compiler.cute.flex_score_mod_runtime import load_vec as _cute_flex_load_vec",
+            "_cute_flex_load_window": "from helion._compiler.cute.flex_score_mod_runtime import load_window as _cute_flex_load_window",
             "_cute_flex_fmod": "from helion._compiler.cute.flex_score_mod_runtime import fmod as _cute_flex_fmod",
             "_cute_flex_remainder": "from helion._compiler.cute.flex_score_mod_runtime import remainder_f32 as _cute_flex_remainder",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
