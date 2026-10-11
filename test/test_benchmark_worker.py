@@ -2239,9 +2239,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(measured.perfs, [0.8, 0.75])
 
 
-# Subprocess benchmarking depends on Backend.supports_precompile(); only the
-# Triton backend supports it (Pallas/CuTe return False).
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_with_subprocess_bench(self) -> None:

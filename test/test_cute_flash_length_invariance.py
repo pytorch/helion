@@ -27,6 +27,7 @@ from helion._compiler.cute import cute_flash_row_mma
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._testing import skipUnlessBackends
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from helion._compiler.device_function import DeviceFunction
+
+pytestmark = skipUnlessBackends(["cute"])
 
 # Length-invariance is an equality chain, so comparing the two extreme lengths
 # of a legality class gives the same guarantee as comparing every member;

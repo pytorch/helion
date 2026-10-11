@@ -1138,8 +1138,9 @@ def _(
             scale_f32 = scale_f32.repeat_interleave(repeat_factor, dim=-1)
         return data_f32 * scale_f32
 
+    # Scales run along K: mat1_scale is [M, K // group], mat2_scale [N, K // group].
     mat1_dequant = _dequant(mat1, mat1_scale, mat1_format)
-    mat2_dequant = _dequant(mat2, mat2_scale, mat2_format)
+    mat2_dequant = _dequant(mat2.T, mat2_scale, mat2_format).T
 
     result = torch.mm(mat1_dequant, mat2_dequant)
     resolved_dtype = out_dtype or torch.float32

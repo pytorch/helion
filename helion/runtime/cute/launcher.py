@@ -77,6 +77,7 @@ from ..._compiler.cute.tcgen05_constants import (
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
+from .source_dependencies import referenced_helper_sources
 from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
@@ -758,6 +759,10 @@ def _append_cute_wrapper_plan(
         seq = plan_int("seq")
         head_dim = plan_int("head_dim")
         batch = plan_int("batch")
+        # Grouped-query attention: K/V hold ``batch // kv_group`` batch heads
+        # (the device body reads them at ``bh // kv_group``); Q/O keep ``batch``.
+        kv_group = plan_int("kv_group", default=1)
+        kv_batch = batch // kv_group
         scale_log2 = plan["scale_log2"]
         assert isinstance(scale_log2, float)
         score_bias_scale = plan.get("score_bias_scale", 0.0)
@@ -825,6 +830,19 @@ def _append_cute_wrapper_plan(
                 f"cute.make_layout(({hd}, {seq}, {batch}), "
                 f"stride=(1, {hd}, {seq * hd}))"
             )
+        # K/V layouts span their own (grouped) batch-head count.
+        if kv_group == 1:
+            sdb_kv = sdb
+            dsb_kv = dsb
+        else:
+            sdb_kv = (
+                f"cute.make_layout(({seq}, {hd}, {kv_batch}), "
+                f"stride=({hd}, 1, {seq * hd}))"
+            )
+            dsb_kv = (
+                f"cute.make_layout(({hd}, {seq}, {kv_batch}), "
+                f"stride=(1, {hd}, {seq * hd}))"
+            )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
         )
@@ -835,9 +853,9 @@ def _append_cute_wrapper_plan(
         sel = "cute.select"
         flash_lines = [
             f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
-            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb_kv})",
             # V is MN-major: (D, S, B).
-            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb_kv})",
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
             f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
@@ -2925,7 +2943,9 @@ def _cute_disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, external compiled-helper sources, full input
+    generated device-kernel source, external compiled-helper sources, the
+    sources of the Helion helper modules the kernel's globals reference
+    (``referenced_helper_sources``), full input
     specialization (dtypes, ranks,
     pointer alignments, baked shapes/strides, constexpr values), launch shape
     (block/cluster), preferred shared-memory carveout, CuTe compile options,
@@ -2955,6 +2975,12 @@ def _cute_disk_cache_key(
     helper_sources = wrapper_source_dependencies(helper_kinds)
     if helper_sources is None:
         return None
+    kernel_globals = getattr(
+        getattr(cute_kernel, "__wrapped__", cute_kernel), "__globals__", {}
+    )
+    called_helper_sources = referenced_helper_sources(kernel_globals)
+    if called_helper_sources is None:
+        return None
     try:
         import cutlass
 
@@ -2963,9 +2989,10 @@ def _cute_disk_cache_key(
         cutlass_version = ""
     payload = repr(
         (
-            "helion-cute-cache-v2",
+            "helion-cute-cache-v3",
             source_hash,
             helper_sources,
+            called_helper_sources,
             schema_key,
             block,
             wrapper_plans,

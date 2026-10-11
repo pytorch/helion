@@ -67,9 +67,15 @@ class FullTilePlan:
             guards.append(f"{tensor}.layout.stride[0] == 1")
             if tensor != self.relation.tensor:
                 guards.append(f"cute.size({tensor}, mode=[0]) == {extent}")
-        return ast.parse(
-            f"cutlass.const_expr({' and '.join(guards)})", mode="eval"
-        ).body
+        # Nest to the right: the SDK preprocessor repeats the accumulated
+        # left operand of a flat ``and`` four times per term, so a flat chain
+        # of these guards (14 for three tensors) grew an exponential tree and
+        # took minutes to preprocess.  Values and short-circuit order are
+        # unchanged.
+        condition = guards[-1]
+        for guard in reversed(guards[:-1]):
+            condition = f"{guard} and ({condition})"
+        return ast.parse(f"cutlass.const_expr({condition})", mode="eval").body
 
 
 def _host_linear(

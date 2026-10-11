@@ -10,12 +10,17 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+_DESCRIPTOR_SPLIT_REASON = (
+    "checks Triton tensor-descriptor epilogue splits; CuTe has no tensor descriptors"
+)
 
 
 def _supports_epilogue_subtile_autotune() -> bool:
@@ -287,7 +292,7 @@ class TestEpilogueSubtiling(TestCase):
         torch.testing.assert_close(out_s2, out_s4, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(out_none, out_s2, atol=1e-1, rtol=1e-2)
 
-    @onlyBackends("triton")
+    @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_descriptor_atomic_add_codegen_s2(self):
@@ -309,7 +314,7 @@ class TestEpilogueSubtiling(TestCase):
         )
         _assert_descriptor_atomic_codegen(self, code, 2)
 
-    @onlyBackends("triton")
+    @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_descriptor_atomic_add_static_slice_codegen_s4(self):
@@ -328,7 +333,7 @@ class TestEpilogueSubtiling(TestCase):
         _assert_descriptor_atomic_codegen(self, code, 4)
         self.assertIn("_desc.atomic_add([offset_0, 32]", code)
 
-    @onlyBackends("triton")
+    @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_descriptor_store_tiled_dims_codegen_s2(self):
@@ -351,7 +356,7 @@ class TestEpilogueSubtiling(TestCase):
         self.assertIn("_desc.store([offset_0, offset_1 + 0]", code)
         self.assertIn("_desc.store([offset_0, offset_1 + _BLOCK_SIZE_1 // 2]", code)
 
-    @onlyBackends("triton")
+    @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_descriptor_store_static_slice_codegen_s2(self):
@@ -370,7 +375,7 @@ class TestEpilogueSubtiling(TestCase):
         self.assertIn("_desc.store([offset_0, 64]", code)
         self.assertNotIn("_desc.store([offset_0 + _BLOCK_SIZE_0 // 2, 0]", code)
 
-    @onlyBackends("triton")
+    @skipIfCute(_DESCRIPTOR_SPLIT_REASON)
     @skipIfRefEager("test checks generated backend code")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_mixed_descriptor_pointer_outputs_choose_split_per_output(self):
@@ -392,7 +397,6 @@ class TestEpilogueSubtiling(TestCase):
         self.assertIn("tl.store(out_pointer + ((offset_0 +", code)
         self.assertNotIn("_desc.store([offset_0 + _BLOCK_SIZE_0 // 2, 0]", code)
 
-    @onlyBackends("triton")
     @skipIfRefEager("test checks generated backend code")
     def test_atomic_add_with_return_value_is_not_epilogue_subtiled(self):
         args = (
@@ -407,8 +411,11 @@ class TestEpilogueSubtiling(TestCase):
         )
         torch.testing.assert_close(output[0], torch.zeros_like(args[1]))
         torch.testing.assert_close(output[1], args[0] * 2.0)
-        self.assertNotIn("tl.split", code)
-        self.assertEqual(code.count("tl.atomic_add("), 1)
+        _assert_no_split_codegen(self, code)
+        atomic_call = (
+            "cute.arch.atomic_add(" if _get_backend() == "cute" else "tl.atomic_add("
+        )
+        self.assertEqual(code.count(atomic_call), 1)
 
     @skipIfXPU("epilogue_subtile_autotune check uses CUDA device properties")
     def test_autotune_field_enabled_for_large_k(self):

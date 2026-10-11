@@ -67,6 +67,9 @@ class _Compiled:
 
 
 class _Backend:
+    def supports_precompile(self) -> bool:
+        return True
+
     def generated_source_hash(self, fn: object) -> str | None:
         return cast("_Compiled", fn).source_hash
 

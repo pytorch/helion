@@ -56,6 +56,7 @@ from helion._testing import get_test_float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -484,7 +485,7 @@ class TestMismatchTolerance(TestCase):
                 )
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
@@ -1516,7 +1517,7 @@ class TestConfigFragmentCardinality(TestCase):
         self.assertIsNone(unknown.cardinality(None))
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuner(RefEagerTestDisabled, TestCase):
     def setUp(self):
         super().setUp()
@@ -1530,6 +1531,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @skipIfCute("golden snapshot of the Triton config space")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -1552,6 +1554,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @skipIfCute("golden snapshot of the Triton config space")
     def test_config_fragment1(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -1575,6 +1578,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @skipIfCute("golden snapshot of the Triton config space")
     def test_config_warp_specialize_unroll(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -1595,6 +1599,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
     @skipIfTileIR("block-size overshoot is gated to the triton backend")
+    @skipIfCute("block-size overshoot is gated to the triton backend")
     def test_small_dim_block_size_overshoot(self):
         # All dims are 16, smaller than SMALL_DIM_BLOCK_SIZE_OVERSHOOT, so the
         # generated configs may use block sizes larger than the dimensions
@@ -1610,6 +1615,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @skipIfCute("overrides the Triton-only 'indexing' config key")
     def test_config_generation_overrides(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -2573,6 +2579,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(pair_neighbors, [])
 
+    @staticmethod
+    def _scalar_override() -> tuple[str, int, int]:
+        """A scalar tunable of ``basic_kernels.add`` on the active backend.
+
+        Returns ``(key, override_value, other_value)``; the override value is
+        not the key's default.
+        """
+        if _get_backend() == "cute":
+            return "cute_min_blocks_per_mp", 2, 1
+        return "num_warps", 8, 4
+
     def test_differential_mutation_skips_overridden_indices(self):
         """Differential mutation does not mutate overridden indices."""
         random.seed(42)
@@ -2581,12 +2598,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 512, 512], device=DEVICE),
         )
         spec = basic_kernels.add.bind(args).config_spec
-        overrides = {"num_warps": 8}
-        gen = ConfigGeneration(spec, overrides=overrides)
+        key, value, _ = self._scalar_override()
+        gen = ConfigGeneration(spec, overrides={key: value})
 
-        # Find the num_warps flat index
-        warp_idx = gen.num_warps_index
-        self.assertIn(warp_idx, gen.overridden_flat_indices)
+        # Find the overridden key's flat index
+        (key_idx,), _ = gen._key_to_flat_indices[key]
+        self.assertIn(key_idx, gen.overridden_flat_indices)
 
         base = gen.default_flat()
         a = gen.random_flat()
@@ -2596,7 +2613,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Run many mutations — overridden index should never change
         for _ in range(50):
             result = gen.differential_mutation(base, a, b, c, crossover_rate=0.9)
-            self.assertEqual(result[warp_idx], base[warp_idx])
+            self.assertEqual(result[key_idx], base[key_idx])
 
     def test_population_member_canonicalizes_overridden_flat_values(self):
         args = (
@@ -2604,7 +2621,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 512, 512], device=DEVICE),
         )
         spec = basic_kernels.add.bind(args).config_spec
-        gen = ConfigGeneration(spec, overrides={"num_warps": 8})
+        key, value, other = self._scalar_override()
+        gen = ConfigGeneration(spec, overrides={key: value})
+        (key_idx,), _ = gen._key_to_flat_indices[key]
         raw_flat = gen.default_flat()
         original_flat = copy.deepcopy(raw_flat)
         search = PopulationBasedSearch.__new__(PopulationBasedSearch)
@@ -2617,15 +2636,15 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         assert member is not None
         self.assertEqual(raw_flat, original_flat)
         self.assertIsNot(member.flat_values, raw_flat)
-        self.assertEqual(member.config.num_warps, 8)
-        self.assertEqual(member.flat_values[gen.num_warps_index], 8)
+        self.assertEqual(member.config[key], value)
+        self.assertEqual(member.flat_values[key_idx], value)
         self.assertEqual(member.flat_values, gen.flatten(member.config))
         gen.encode_config(member.flat_values)
 
         [(seed_flat, seed_config)] = gen.user_seed_flat_config_pairs(
-            [helion.Config(num_warps=4)]
+            [helion.Config(**{key: other})]
         )
-        self.assertEqual(seed_config.num_warps, 8)
+        self.assertEqual(seed_config[key], value)
         self.assertEqual(seed_flat, gen.flatten(seed_config))
 
     def test_initial_population_refills_backend_rejections(self):
@@ -2653,6 +2672,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(population, [[2], [4], [6]])
         self.assertEqual(config_gen.random_flat.call_count, 4)
 
+    @skipIfCute("overrides the Triton-only 'indexing' config key")
     def test_scalar_list_override_has_encodable_flat_values(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -2680,7 +2700,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.benchmark_provider = SimpleNamespace(take_effective_source_repairs=dict)
         member = search.make_unbenchmarked(search.config_gen.default_flat())
         assert member is not None
-        replacement = helion.Config.from_dict({**member.config.config, "num_warps": 8})
+        key, value, _ = self._scalar_override()
+        replacement = helion.Config.from_dict({**member.config.config, key: value})
         result = SimpleNamespace(
             config=replacement,
             perf=float("inf"),
@@ -2694,10 +2715,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         self.assertIs(member.config, replacement)
         self.assertEqual(member.flat_values, search.config_gen.flatten(replacement))
-        self.assertEqual(
-            member.flat_values[search.config_gen.num_warps_index],
-            8,
-        )
+        (key_idx,), _ = search.config_gen._key_to_flat_indices[key]
+        self.assertEqual(member.flat_values[key_idx], value)
         search.config_gen.encode_config(member.flat_values)
 
     def test_lfbo_pattern_search_skips_overridden_indices(self):
@@ -9482,7 +9501,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                         )
 
         run_mode("fork", expect_error=False)
-        if check_spawn:
+        # CuTe has no precompile step (the search clears autotune_precompile),
+        # so nothing is serialized for a spawn worker.
+        if check_spawn and _get_backend() != "cute":
             run_mode("spawn", expect_error=True)
 
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
@@ -9827,10 +9848,24 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         A smaller config would fail the same way, so the error surfaces on the
         reference config right away, as it did before the backoff existed.
         """
-        for error in (
-            RuntimeError("unsupported op"),
-            RuntimeError("CUDA error: an illegal memory access was encountered"),
-        ):
+        errors = [RuntimeError("CUDA error: an illegal memory access was encountered")]
+        if _get_backend() == "cute":
+            # CuteBackend.classify_autotune_exception skips (rather than
+            # raises) every non-fatal config failure, so the backoff keeps
+            # shrinking past one and only unrecoverable runtime errors stop it.
+            attempted: list[int] = []
+            search, _, reference_block = self._rejecting_baseline_search(
+                lambda block, reference: True, attempted, RuntimeError("unsupported op")
+            )
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig,
+                "Autotuning reference config failed while computing baseline",
+            ):
+                search._prepare()
+            self.assertEqual(len(attempted), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+        else:
+            errors.insert(0, RuntimeError("unsupported op"))
+        for error in errors:
             with self.subTest(error=str(error)):
                 attempted: list[int] = []
                 search, _, reference_block = self._rejecting_baseline_search(
@@ -13024,7 +13059,7 @@ class TestCuteAutotuner(TestCase):
                 self.assertLessEqual(general, set(fragment.choices))
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
         search_capture: dict[str, RecordingRandomSearch] = {}
@@ -13757,7 +13792,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         self.assertNotEqual(suffix_lookalike.stable_hash(), policy.stable_hash())
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
     """Best-of-K multi-seed autotune selection — cache key + K-loop coverage.
 
@@ -14782,7 +14817,7 @@ class TestSeedPopulationFallback(TestCase):
 
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigFilter(TestCase):
     """Tests for the autotune_config_filter setting."""
 
@@ -15451,6 +15486,7 @@ class TestAutotuneBudget(TestCase):
         config_spec = SimpleNamespace(
             compiler_seed_timeout_retry_repetitions=3,
             create_config_generation=Mock(return_value=config_gen),
+            backend=SimpleNamespace(supports_precompile=lambda: True),
         )
         kernel = SimpleNamespace(
             settings=settings,

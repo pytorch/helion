@@ -832,3 +832,102 @@ def test_an_atomic_consumer_of_an_interchanged_lane_reduction_runs_once(
     else:
         expected = sum(x[r : r + 8].mean(dim=0) for r in range(0, 37, 8))
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+
+def _first_column_then_overwrite_beside_row_sums(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    sums = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile(x.shape):
+        first = out[tile_m, tile_n.begin]
+        sums[tile_m] = x[tile_m, tile_n].sum(dim=1) + first
+        out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+    return sums
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("num_threads", "refused"),
+    [([1, 64], True), ([2, 32], True), ([1, 1], False), ([4, 1], False)],
+)
+def test_a_read_before_a_row_overwrite_beside_a_lane_reduction(
+    num_threads: list[int], refused: bool
+) -> None:
+    """Threads along the reduced row read its first element before thread 0
+    overwrites it.  The barrier between them cannot be placed in the body the
+    reduction split rewrites, so a shared row axis is refused; one thread per
+    row has nothing to order."""
+    x = torch.randn(64, 256, device=DEVICE)
+    out = torch.randn(64, 256, device=DEVICE)
+    bound = _jagged_kernel(
+        _first_column_then_overwrite_beside_row_sums, static_shapes=True
+    ).bind((x, out))
+    config = helion.Config(block_sizes=[4, 256], num_threads=num_threads)
+    if refused:
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="a body a later pass rewrites"
+        ):
+            bound.to_code(config)
+        return
+    sums = bound.compile_config(config)(x, out.clone())
+    torch.testing.assert_close(sums, x.sum(dim=1) + out[:, 0], rtol=1e-4, atol=1e-3)
+
+
+def _column_zeroed_then_copied_beside_row_sums(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(x)
+    sums = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile(x.shape):
+        v = x[tile_m, tile_n]
+        out[tile_m, 200] = 0.0
+        out[tile_m, tile_n] = v
+        sums[tile_m] = v.sum(dim=1)
+    return out, sums
+
+
+def _column_zeroed_then_copied(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.shape):
+        v = x[tile_m, tile_n]
+        out[tile_m, 200] = 0.0
+        out[tile_m, tile_n] = v
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("threads", [64, 128])
+def test_a_column_zeroed_before_its_copy_beside_a_row_sum_rejects_the_config(
+    threads: int,
+) -> None:
+    """Every thread of the row stores the zero, then the thread owning column
+    200 copies it.  The row sum's reduction split rewrites the body, where the
+    barrier between them cannot be placed, and without it another warp's zero
+    can land after the copy, so the config is refused."""
+    x = torch.randn(4096, 256, device=DEVICE)
+    bound = _jagged_kernel(
+        _column_zeroed_then_copied_beside_row_sums, static_shapes=True
+    ).bind((x,))
+    config = helion.Config(block_sizes=[1, 256], num_threads=[1, threads])
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="a body a later pass rewrites"
+    ):
+        bound.to_code(config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a_column_zeroed_before_its_copy_is_never_left_zero() -> None:
+    """Without the row sum the same body gets its barrier, and one thread per
+    row has nothing to order: neither ever leaves the copied column zero."""
+    x = torch.randn(4096, 256, device=DEVICE)
+    for fn, threads in (
+        (_column_zeroed_then_copied, 128),
+        (_column_zeroed_then_copied_beside_row_sums, 1),
+    ):
+        bound = _jagged_kernel(fn, static_shapes=True).bind((x,))
+        config = helion.Config(block_sizes=[1, 256], num_threads=[1, threads])
+        compiled = bound.compile_config(config)
+        for _ in range(100):
+            result = compiled(x)
+            out = result[0] if isinstance(result, tuple) else result
+            torch.testing.assert_close(out, x, rtol=0, atol=0)

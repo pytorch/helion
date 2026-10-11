@@ -294,6 +294,7 @@ def emit_flash_row_mma_device_body(
     row_tile_m: int,
     relu_output: bool,
     row_epilogue: FlashRowEpilogueEmit | None = None,
+    kv_group: int = 1,
 ) -> list[ast.AST]:
     """Render the row-program kernel body for one (batch*heads, seq, head_dim)
     problem with contiguous ``(B, S, D)`` inputs.
@@ -301,6 +302,8 @@ def emit_flash_row_mma_device_body(
     ``row_epilogue`` carries a fused row program with its aux tensors named
     as kernel parameters of the same ``(B, S, D)`` geometry and its symbolic
     scalar expressions; the program replaces the identity store.
+    ``kv_group`` is the grouped-query divisor: K/V carry ``num_bh // kv_group``
+    entries and the program reads them at batch head ``rm_bh // kv_group``.
     """
     aux_dtypes = () if row_epilogue is None else tuple(row_epilogue.aux_dtypes)
     aux_elem_bytes = [_row_mma_dtype_bytes(dtype) for dtype in aux_dtypes]
@@ -592,8 +595,15 @@ def emit_flash_row_mma_device_body(
             # passes 2**31 bytes well inside the flash surface's element bound.
             f"rm_bh_off = cutlass.Int64(rm_bh) * {seq * row_bytes}",
             f"rm_q_tile = {q_name}.iterator.toint() + rm_bh_off + cutlass.Int64(rm_row0) * {row_bytes}",
-            f"rm_k_slice = {k_name}.iterator.toint() + rm_bh_off + cutlass.Int64(rm_key0) * {row_bytes}",
-            f"rm_v_slice = {v_name}.iterator.toint() + rm_bh_off + cutlass.Int64(rm_key0) * {row_bytes}",
+            *(
+                ()
+                if kv_group == 1
+                else (
+                    f"rm_kv_bh_off = cutlass.Int64(rm_bh // {kv_group}) * {seq * row_bytes}",
+                )
+            ),
+            f"rm_k_slice = {k_name}.iterator.toint() + {'rm_bh_off' if kv_group == 1 else 'rm_kv_bh_off'} + cutlass.Int64(rm_key0) * {row_bytes}",
+            f"rm_v_slice = {v_name}.iterator.toint() + {'rm_bh_off' if kv_group == 1 else 'rm_kv_bh_off'} + cutlass.Int64(rm_key0) * {row_bytes}",
         )
     )
     # ---- a fused row epilogue's aux rows: every epilogue thread stages the

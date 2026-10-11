@@ -184,6 +184,72 @@ def cute_minimum_maximum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_sign(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sign(x[tile])
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_cancelling_math(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([4, *x.shape], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        out[0, tile] = torch.erfc(value)
+        out[1, tile] = torch.expm1(value)
+        out[2, tile] = torch.log1p(value)
+        out[3, tile] = torch.exp2(value)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_modulus(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([4, *x.shape], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        divisor = y[tile]
+        out[0, tile] = torch.remainder(value, divisor)
+        out[1, tile] = torch.fmod(value, divisor)
+        out[2, tile] = value % -3
+        out[3, tile] = torch.fmod(value, -3)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_frac(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.frac(x[tile])
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_hyperbolic(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([5, *x.shape], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        out[0, tile] = torch.sinh(value)
+        out[1, tile] = torch.cosh(value)
+        out[2, tile] = torch.asinh(value)
+        out[3, tile] = torch.acosh(value)
+        out[4, tile] = torch.atanh(value)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_rounding(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([4, *x.shape], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile(x.size()):
+        value = x[tile_m, tile_n]
+        out[0, tile_m, tile_n] = torch.floor(value)
+        out[1, tile_m, tile_n] = torch.ceil(value)
+        out[2, tile_m, tile_n] = torch.trunc(value)
+        out[3, tile_m, tile_n] = torch.round(value)
+    return out
+
+
 @helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
@@ -2433,6 +2499,286 @@ def cute_softcap_attention(q_in, k_in, v_in):
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_gqa_causal_attention(q_in, k_in, v_in):
+    """Grouped-query causal attention: K/V heads are shared by ``group`` query
+    heads, so their batch index is ``tile_b.index // group``."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    heads_q = hl.specialize(q_in.size(1))
+    heads_kv = hl.specialize(k_in.size(1))
+    group = heads_q // heads_kv
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kv_b = tile_b.index // group
+            kt = k_view[kv_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            qk = torch.where(
+                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                qk,
+                float("-inf"),
+            )
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[kv_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_gqa_dense_attention(q_in, k_in, v_in):
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    heads_q = hl.specialize(q_in.size(1))
+    heads_kv = hl.specialize(k_in.size(1))
+    group = heads_q // heads_kv
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kv_b = tile_b.index // group
+            kt = k_view[kv_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[kv_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_gqa_softcap_sliding_window_attention(q_in, k_in, v_in):
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    heads_q = hl.specialize(q_in.size(1))
+    heads_kv = hl.specialize(k_in.size(1))
+    group = heads_q // heads_kv
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kv_b = tile_b.index // group
+            kt = k_view[kv_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            qk = 2.0 * torch.tanh(qk / 2.0)
+            delta = tile_m.index[None, :, None] - tile_n.index[None, None, :]
+            qk = torch.where((delta >= 0) & (delta <= 64), qk, float("-inf"))
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[kv_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_gqa_mismatched_group_attention(q_in, k_in, v_in):
+    """K and V use different grouping divisors: not a flash envelope."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    heads_q = hl.specialize(q_in.size(1))
+    group_k = heads_q // hl.specialize(k_in.size(1))
+    group_v = heads_q // hl.specialize(v_in.size(1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b.index // group_k, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            qk = torch.where(
+                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                qk,
+                float("-inf"),
+            )
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b.index // group_v, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_gqa_causal_attention_with_lse(q_in, k_in, v_in):
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    heads_q = hl.specialize(q_in.size(1))
+    heads_kv = hl.specialize(k_in.size(1))
+    group = heads_q // heads_kv
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    lse = torch.empty([q_view.size(0), m_dim], device=q_in.device, dtype=torch.float32)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kv_b = tile_b.index // group
+            kt = k_view[kv_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            qk = torch.where(
+                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                qk,
+                float("-inf"),
+            )
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[kv_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        lse[tile_b, tile_m] = m_i + torch.log2(l_i)
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size()), lse.view(q_in.size()[:-1])
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_gqa_fixed_group_attention(q_in, k_in, v_in):
+    """K/V grouped by a literal divisor, independent of the K/V head count."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kv_b = tile_b.index // 4
+            kt = k_view[kv_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[kv_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+def _softcap_saturating_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Inputs for ``cute_softcap_attention`` whose first KV tile saturates the cap.
+
+    Queries and keys 0..127 are constant 3.0, so their raw dot product is
+    ``9 * 64 = 576`` and the log2-domain score ``576 * log2(e) / 8 ~ 104`` is
+    ``52x`` the cap of 2.0; the remaining rows and keys stay random.
+    """
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 2, 256, 64, dtype=torch.float16, device=DEVICE) for _ in range(3)
+    )
+    q[:, :, :128] = 3.0
+    k[:, :, :128] = 3.0
+    return q, k, v
+
+
+def _softcap_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * (
+        math.log2(math.e) / math.sqrt(64)
+    )
+    scores = 2.0 * torch.tanh(scores / 2.0)
+    return _attention_from_log2_scores(scores, v)
 
 
 def _flash_fired(code: str) -> bool:
@@ -4757,6 +5103,85 @@ class TestCuteBackend(TestCase):
         expected = _attention_from_log2_scores(scores, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_alibi_rep16_score_store_matches_reference(self) -> None:
+        # Rep16 S-loads split the score tile into eight 16-column chunks and the
+        # modified scores are written back with the load chunk index, so the
+        # store-back atom must use the same repetition. A Rep32 store scattered
+        # the biased scores across the wrong TMEM columns (NaNs for ALiBi).
+        q, k, v = (
+            torch.randn(2, 2, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        slopes = torch.tensor([1.02, 0.72], dtype=torch.float32, device=DEVICE)
+        code, out = code_and_output(
+            cute_alibi_attention,
+            (q, k, v, slopes),
+            block_sizes=[1, 128, 128],
+            cute_flash_s_load_rep=16,
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("add_alibi_bias_t2r", code)
+        self.assertIn("fa4_disc_exp_convert_store_sload16_pair_pipe", code)
+        self.assertIn(
+            "flash_score_st_atom = cute.make_copy_atom("
+            "cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(16)), "
+            "cutlass.Float32)",
+            code,
+        )
+        self.assertNotIn(
+            "flash_score_st_atom = cute.make_copy_atom("
+            "cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), "
+            "cutlass.Float32)",
+            code,
+        )
+        self.assertFalse(torch.isnan(out).any().item())
+        row = torch.arange(256, device=DEVICE)[:, None]
+        col = torch.arange(256, device=DEVICE)[None, :]
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * (
+            math.log2(math.e) / math.sqrt(64)
+        )
+        scores = scores + (col - row) * slopes.view(1, 2, 1, 1)
+        scores = scores.masked_fill(row < col, -torch.inf)
+        expected = _attention_from_log2_scores(scores, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_relative_bias_rep16_stage_local_matches_reference(
+        self,
+    ) -> None:
+        # Non-causal modifiers take the stage-local softmax setup, the second
+        # emission site of the score store-back atom; cover it with Rep16 too.
+        q, k, v = (
+            torch.randn(1, 2, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_relative_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_s_load_rep=16,
+            cute_flash_softmax_setup="stage_local",
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("add_relative_bias_t2r", code)
+        self.assertIn("flash_tiled_ld_coord", code)
+        self.assertIn(
+            "flash_score_st_atom = cute.make_copy_atom("
+            "cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(16)), "
+            "cutlass.Float32)",
+            code,
+        )
+        self.assertNotIn("Repetition(32)), cutlass.Float32)", code)
+        self.assertFalse(torch.isnan(out).any().item())
+        row = torch.arange(256, device=DEVICE)[:, None]
+        col = torch.arange(256, device=DEVICE)[None, :]
+        scores = (
+            torch.matmul(q.float(), k.float().transpose(-1, -2))
+            * (math.log2(math.e) / math.sqrt(64))
+            + (row - col) * 0.01
+        )
+        expected = _attention_from_log2_scores(scores, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_declines_alibi_mod_divisor_mismatch(self) -> None:
         q, k, v = (
             torch.randn(2, 2, 256, 64, dtype=torch.float16, device=DEVICE)
@@ -4766,6 +5191,344 @@ class TestCuteBackend(TestCase):
         bound = cute_alibi_attention.bind((q, k, v, slopes))
         code = bound.to_triton_code(helion.Config(block_sizes=[1, 128, 128]))
         self.assertFalse(_flash_fired(code))
+
+    def _gqa_qkv(
+        self,
+        seq: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        *,
+        batch: int = 2,
+        heads_q: int = 8,
+        heads_kv: int = 2,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        q = torch.randn(batch, heads_q, seq, head_dim, dtype=dtype, device=DEVICE)
+        k, v = (
+            torch.randn(batch, heads_kv, seq, head_dim, dtype=dtype, device=DEVICE)
+            for _ in range(2)
+        )
+        return q, k, v
+
+    def test_flash_attention_gqa_causal_fp16_fires_and_matches_sdpa(self) -> None:
+        """Grouped-query causal attention (hq 8 / hkv 2): the K/V matcher
+        accepts ``tile_b.index // group`` and every family reads K/V at
+        ``flash_bh // group`` from tensors with ``batch // group`` entries."""
+        for head_dim, seq in ((64, 512), (128, 256)):
+            with self.subTest(head_dim=head_dim, seq=seq):
+                q, k, v = self._gqa_qkv(seq, head_dim, torch.float16)
+                code, out = code_and_output(
+                    cute_gqa_causal_attention, (q, k, v), block_sizes=[1, 128, 128]
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("flash_bh // 4", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_causal_bf16_fires_and_matches_sdpa(self) -> None:
+        for head_dim, seq in ((64, 256), (128, 512)):
+            with self.subTest(head_dim=head_dim, seq=seq):
+                q, k, v = self._gqa_qkv(seq, head_dim, torch.bfloat16)
+                code, out = code_and_output(
+                    cute_gqa_causal_attention, (q, k, v), block_sizes=[1, 128, 128]
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("flash_bh // 4", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+    def test_flash_attention_gqa_dense_default_family_matches_sdpa(self) -> None:
+        q, k, v = self._gqa_qkv(512, 64, torch.float16)
+        code, out = code_and_output(
+            cute_gqa_dense_attention, (q, k, v), block_sizes=[1, 128, 128]
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("flash_bh // 4", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, enable_gqa=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_causal_ws_overlap_matches_sdpa(self) -> None:
+        cases = (
+            (torch.float16, 64, 256, {}),
+            (torch.bfloat16, 128, 256, {"cute_flash_persistent": True}),
+        )
+        for dtype, head_dim, seq, extra in cases:
+            with self.subTest(dtype=str(dtype), head_dim=head_dim, extra=extra):
+                q, k, v = self._gqa_qkv(seq, head_dim, dtype)
+                code, out = code_and_output(
+                    cute_gqa_causal_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family="ws_overlap",
+                    **extra,
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("flash_shared_storage", code)
+                self.assertNotIn("flash_fa4_shared_storage", code)
+                self.assertIn("tKgK_kdl[None, None, 0, flash_bh // 4]", code)
+                self.assertIn("tVgV_dkl[None, 0, None, flash_bh // 4]", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
+                torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+    def test_flash_attention_gqa_causal_two_cta_matches_sdpa(self) -> None:
+        q, k, v = self._gqa_qkv(512, 64, torch.float16, batch=1)
+        code, out = code_and_output(
+            cute_gqa_causal_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta_causal",
+            cute_flash_kv_stage=2,
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("cute.arch.cluster_idx()[0]", code)
+        self.assertIn("cute_tcgen05_flash.CtaGroup.TWO", code)
+        self.assertIn("tKgK_kdl[None, None, 0, flash_bh // 4]", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_softcap_sliding_window_matches_reference(
+        self,
+    ) -> None:
+        q, k, v = self._gqa_qkv(512, 64, torch.float16, batch=1)
+        code, out = code_and_output(
+            cute_gqa_softcap_sliding_window_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("softcap_t2r", code)
+        self.assertIn("sliding_window_mask_t2r", code)
+        self.assertIn("flash_bh // 4", code)
+        k_rep = k.repeat_interleave(4, dim=1)
+        v_rep = v.repeat_interleave(4, dim=1)
+        row = torch.arange(512, device=DEVICE)[:, None]
+        col = torch.arange(512, device=DEVICE)[None, :]
+        delta = row - col
+        scores = torch.matmul(q.float(), k_rep.float().transpose(-1, -2)) * (
+            math.log2(math.e) / math.sqrt(64)
+        )
+        scores = 2.0 * torch.tanh(scores / 2.0)
+        scores = scores.masked_fill((delta < 0) | (delta > 64), -torch.inf)
+        expected = _attention_from_log2_scores(scores, v_rep)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_declines_gqa_kv_divisor_mismatch(self) -> None:
+        """K grouped by 4 and V grouped by 2 share no K/V batch head: the
+        matcher declines and the kernel keeps the generic body."""
+        q = torch.randn(2, 8, 256, 64, dtype=torch.float16, device=DEVICE)
+        k = torch.randn(2, 2, 256, 64, dtype=torch.float16, device=DEVICE)
+        v = torch.randn(2, 4, 256, 64, dtype=torch.float16, device=DEVICE)
+        bound = cute_gqa_mismatched_group_attention.bind((q, k, v))
+        code = bound.to_triton_code(helion.Config(block_sizes=[1, 128, 128]))
+        self.assertFalse(_flash_fired(code))
+
+    def test_flash_attention_declines_gqa_kv_shape_divisor_mismatch(self) -> None:
+        """A literal ``// 4`` over a single K/V head: ``batch // 4`` (2) is not
+        the K/V batch count (1), so the fused path would read past K/V. The
+        plan declines and the kernel keeps the generic body."""
+        q = torch.randn(1, 8, 256, 64, dtype=torch.float16, device=DEVICE)
+        k, v = (
+            torch.randn(1, 1, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(2)
+        )
+        bound = cute_gqa_fixed_group_attention.bind((q, k, v))
+        code = bound.to_triton_code(helion.Config(block_sizes=[1, 128, 128]))
+        self.assertFalse(_flash_fired(code))
+        self.assertNotIn("_flash_mKt", code)
+
+    def test_flash_attention_mqa_causal_matches_sdpa(self) -> None:
+        """Multi-query attention: one K/V head shared by all eight query heads."""
+        q, k, v = self._gqa_qkv(256, 64, torch.float16, heads_kv=1)
+        code, out = code_and_output(
+            cute_gqa_causal_attention, (q, k, v), block_sizes=[1, 128, 128]
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("flash_bh // 8", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_causal_lse_matches_reference(self) -> None:
+        q, k, v = self._gqa_qkv(256, 64, torch.float16, batch=1)
+        code, (out, lse) = code_and_output(
+            cute_gqa_causal_attention_with_lse, (q, k, v), block_sizes=[1, 128, 128]
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("flash_bh // 4", code)
+        self.assertIn("_flash_mLSE", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=True
+        )
+        k_rep = k.repeat_interleave(4, dim=1)
+        scores = torch.matmul(q.float(), k_rep.float().transpose(-1, -2)) / math.sqrt(
+            64
+        )
+        causal_mask = torch.ones(256, 256, dtype=torch.bool, device=DEVICE).tril()
+        expected_lse = torch.logsumexp(
+            scores.masked_fill(~causal_mask, -torch.inf), dim=-1
+        ) * math.log2(math.e)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_gqa_causal_single_stage_ws_matches_sdpa(self) -> None:
+        q, k, v = self._gqa_qkv(256, 64, torch.float16)
+        code, out = code_and_output(
+            cute_gqa_causal_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_s_stage=1,
+            cute_flash_topology="ws_overlap",
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("flash_mma_s_prod", code)
+        self.assertIn("tKgK_kdl[None, None, 0, flash_bh // 4]", code)
+        self.assertIn("tVgV_dkl[None, 0, None, flash_bh // 4]", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_dense_cluster_families_match_sdpa(self) -> None:
+        """Dense GQA on the cluster-scheduled fa4 variants: the paired CTAs
+        decode one ``flash_bh`` and both read K/V at ``flash_bh // 4``."""
+        cases = (
+            ("fa4_2cta", torch.float16, 64, ("cute_tcgen05_flash.CtaGroup.TWO",)),
+            ("fa4_2cta", torch.bfloat16, 128, ("cute_tcgen05_flash.CtaGroup.TWO",)),
+            ("fa4_cga2_local", torch.float16, 64, ("flash_cga2_local_rank",)),
+        )
+        for family, dtype, head_dim, markers in cases:
+            with self.subTest(family=family, dtype=str(dtype), head_dim=head_dim):
+                q, k, v = self._gqa_qkv(512, head_dim, dtype)
+                code, out = code_and_output(
+                    cute_gqa_dense_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family=family,
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("cute.arch.cluster_idx()[0]", code)
+                for marker in markers:
+                    self.assertIn(marker, code)
+                self.assertIn("tKgK_kdl[None, None, 0, flash_bh // 4]", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, enable_gqa=True
+                )
+                tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
+                torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+    def test_flash_attention_gqa_dense_persistent_families_match_sdpa(self) -> None:
+        """Dense GQA on the CLC, local-TMA and deep one-CTA fa4 variants."""
+        cases = (
+            (
+                "fa4_clc",
+                {"cute_flash_clc_heads_per_batch": 4},
+                ("flash_clc_work", "tKgK_kdl[None, None, 0, flash_bh // 4]"),
+            ),
+            (
+                "fa4_local_tma",
+                {},
+                ("_flash_mKt[None, None, flash_bh // 4]", "cute.local_tile("),
+            ),
+            (
+                "fa4_deep_1cta",
+                {},
+                ("flash_v_prod.tail()", "tKgK_kdl[None, None, 0, flash_bh // 4]"),
+            ),
+        )
+        for family, extra, markers in cases:
+            with self.subTest(family=family):
+                q, k, v = self._gqa_qkv(512, 64, torch.float16)
+                code, out = code_and_output(
+                    cute_gqa_dense_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family=family,
+                    **extra,
+                )
+                self.assertTrue(_flash_fired(code))
+                for marker in markers:
+                    self.assertIn(marker, code)
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, enable_gqa=True
+                )
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_dense_row_mma_matches_sdpa(self) -> None:
+        q, k, v = self._gqa_qkv(512, 64, torch.float16, batch=1)
+        code, out = code_and_output(
+            cute_gqa_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="row_mma",
+        )
+        self.assertIn("_helion_flash_rowmma", code)
+        self.assertIn("rm_kv_bh_off = cutlass.Int64(rm_bh // 4) * 65536", code)
+        self.assertIn("rm_k_slice = ", code)
+        self.assertIn("rm_kv_bh_off + cutlass.Int64(rm_key0) * 128", code)
+        self.assertIn("rm_q_tile = ", code)
+        self.assertIn("rm_bh_off + cutlass.Int64(rm_row0) * 128", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, enable_gqa=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_dense_fa4_alt_matches_sdpa(self) -> None:
+        q, k, v = self._gqa_qkv(512, 128, torch.float16, batch=1)
+        code, out = code_and_output(
+            cute_gqa_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_alt",
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("_helion_flash_alt_rt", code)
+        self.assertIn("tKgK_kdl[None, None, 0, flash_bh // 4]", code)
+        self.assertIn("tKgKn = tKgK_kdl[None, None, 0, flash_bh_next // 4]", code)
+        self.assertIn("tQgQn = tQgQ_qdl[None, None, 0, flash_bh_next]", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, enable_gqa=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_gqa_softcap_sliding_window_bf16_hd128_matches_reference(
+        self,
+    ) -> None:
+        q, k, v = self._gqa_qkv(512, 128, torch.bfloat16, batch=1)
+        code, out = code_and_output(
+            cute_gqa_softcap_sliding_window_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("softcap_t2r", code)
+        self.assertIn("sliding_window_mask_t2r", code)
+        self.assertIn("flash_bh // 4", code)
+        k_rep = k.repeat_interleave(4, dim=1)
+        v_rep = v.repeat_interleave(4, dim=1)
+        row = torch.arange(512, device=DEVICE)[:, None]
+        col = torch.arange(512, device=DEVICE)[None, :]
+        delta = row - col
+        scores = torch.matmul(q.float(), k_rep.float().transpose(-1, -2)) * (
+            math.log2(math.e) / math.sqrt(128)
+        )
+        scores = 2.0 * torch.tanh(scores / 2.0)
+        scores = scores.masked_fill((delta < 0) | (delta > 64), -torch.inf)
+        expected = _attention_from_log2_scores(scores, v_rep)
+        torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
 
     def test_flash_attention_sliding_window_fires_and_matches_reference(self) -> None:
         q, k, v = (
@@ -4992,6 +5755,54 @@ class TestCuteBackend(TestCase):
         scores = 2.0 * torch.tanh(scores / 2.0)
         expected = _attention_from_log2_scores(scores, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_softcap_saturating_scores_stay_finite(self) -> None:
+        # Scores far past the cap (``|score / cap| > 44``) overflow a naive
+        # ``exp2`` in the tanh identity; the exact path must saturate to the
+        # cap instead of turning the row NaN.
+        q, k, v = _softcap_saturating_inputs()
+        expected = _softcap_reference(q, k, v)
+        for extra in (
+            {},
+            {"cute_flash_topology": "ws_overlap", "cute_flash_packed_reduce": True},
+        ):
+            with self.subTest(**extra):
+                code, out = code_and_output(
+                    cute_softcap_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    **extra,
+                )
+                self.assertIn("softcap_t2r", code)
+                self.assertTrue(torch.isfinite(out).all().item())
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_softcap_fast_math_uses_tanh_approx(self) -> None:
+        q, k, v = _softcap_saturating_inputs()
+        # The exact path is the default; ``tanh.approx`` is tied to the
+        # ``fast_math`` setting and is never a config knob.
+        exact_code = cute_softcap_attention.bind((q, k, v)).to_triton_code(
+            helion.Config(block_sizes=[1, 128, 128])
+        )
+        self.assertRegex(exact_code, r"softcap_t2r\([^\n]*approx=False\)")
+        fast_kernel = helion.kernel(
+            cute_softcap_attention.fn,
+            backend="cute",
+            static_shapes=True,
+            fast_math=True,
+        )
+        code, out = code_and_output(
+            fast_kernel,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertRegex(code, r"softcap_t2r\([^\n]*approx=True\)")
+        self.assertNotIn("approx=False", code)
+        self.assertTrue(torch.isfinite(out).all().item())
+        torch.testing.assert_close(
+            out, _softcap_reference(q, k, v), atol=1e-2, rtol=1e-2
+        )
 
     def test_flash_attention_causal_ws_generated_bodies_parse(self) -> None:
         io_dtype = _cute_flash._flash_io_dtype_str(torch.float16)
@@ -6797,6 +7608,148 @@ class TestCuteBackend(TestCase):
                     )
                 self.assertIn("cute.math.max", code)
                 self.assertIn("cute.math.min", code)
+
+    def test_pointwise_sign(self) -> None:
+        special = torch.tensor([float("nan"), -0.0, 0.0, float("inf"), -float("inf")])
+        cases = (
+            torch.cat([special, torch.randn(27)]).to(DEVICE).view(4, 8),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.bfloat16),
+            torch.randint(-3, 4, (4, 8), device=DEVICE, dtype=torch.int32),
+            torch.rand(4, 8, device=DEVICE) > 0.5,
+        )
+        for x in cases:
+            with self.subTest(dtype=str(x.dtype)):
+                code, out = code_and_output(cute_sign, (x,))
+                # NaN and -0.0 both map to +0, as in torch.sign.
+                torch.testing.assert_close(out, torch.sign(x), rtol=0, atol=0)
+                if x.is_floating_point():
+                    self.assertFalse(torch.signbit(out[out == 0]).any())
+
+    def test_pointwise_rounding(self) -> None:
+        special = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, float("nan"), float("inf")]
+        for dtype in (torch.float32, torch.bfloat16, torch.float16, torch.int32):
+            with self.subTest(dtype=str(dtype)):
+                if dtype.is_floating_point:
+                    x = torch.randn(65, 23, device=DEVICE) * 8
+                    x[0, : len(special)] = torch.tensor(special)
+                    x = x.to(dtype)
+                else:
+                    x = torch.randint(-100, 100, (65, 23), device=DEVICE, dtype=dtype)
+                code, out = code_and_output(cute_rounding, (x,))
+                expected = torch.stack(
+                    [torch.floor(x), torch.ceil(x), torch.trunc(x), torch.round(x)]
+                )
+                torch.testing.assert_close(
+                    out, expected, rtol=0, atol=0, equal_nan=True
+                )
+                if dtype.is_floating_point:
+                    # torch.round rounds half to even.
+                    for name in ("floor", "ceil", "trunc", "roundeven"):
+                        self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_hyperbolic(self) -> None:
+        # Domain edges: acosh(x < 1) and atanh(|x| > 1) are NaN, atanh(+-1) is
+        # +-inf, sinh/cosh overflow, and NaN/inf propagate.
+        special = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0, 1.0]
+        special += [-1.0, 0.5, 2.0, 1e-4, 100.0, -100.0, 12.0]
+        for dtype, tol in (
+            (torch.float32, 1e-5),
+            (torch.float16, 2e-3),
+            (torch.bfloat16, 2e-2),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                x = torch.cat(
+                    [
+                        torch.tensor(special, device=DEVICE),
+                        torch.rand(1000, device=DEVICE) * 2.2 - 1.1,
+                        torch.rand(1000, device=DEVICE) * 20 - 10,
+                    ]
+                ).to(dtype)
+                code, out = code_and_output(cute_hyperbolic, (x,))
+                expected = torch.stack(
+                    [
+                        torch.sinh(x),
+                        torch.cosh(x),
+                        torch.asinh(x),
+                        torch.acosh(x),
+                        torch.atanh(x),
+                    ]
+                )
+                torch.testing.assert_close(
+                    out, expected, rtol=tol, atol=tol, equal_nan=True
+                )
+                for name in ("sinh", "cosh", "asinh", "acosh", "atanh"):
+                    self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_math_without_cancellation(self) -> None:
+        # 1 - erf(x), exp(x) - 1 and log(1 + x) lose every digit for large x
+        # (erfc) and tiny x (expm1, log1p); exp(x * ln2) double-rounds exp2.
+        tiny = torch.logspace(-30, -2, 512, device=DEVICE)
+        x = torch.cat(
+            [
+                tiny,
+                -tiny,
+                torch.linspace(-30, 30, 2048, device=DEVICE),
+                torch.rand(512, device=DEVICE) - 1.0,
+                torch.randn(1024, device=DEVICE) * 3,
+            ]
+        )
+        code, out = code_and_output(cute_cancelling_math, (x,))
+        expected = torch.stack(
+            [torch.erfc(x), torch.expm1(x), torch.log1p(x), torch.exp2(x)]
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-6, atol=0, equal_nan=True)
+        for name in ("erfc", "expm1", "log1p", "exp2"):
+            self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_remainder_and_fmod(self) -> None:
+        # remainder takes the divisor's sign (Python), fmod the dividend's (C);
+        # CuTe DSL's % is the C one.
+        for dtype in (torch.float32, torch.int32, torch.int64):
+            with self.subTest(dtype=str(dtype)):
+                if dtype.is_floating_point:
+                    x = torch.randn(4096, device=DEVICE) * 8
+                    y = torch.randn(4096, device=DEVICE) * 3
+                    x[:4] = torch.tensor([6.0, -6.0, 0.0, -0.0])
+                    y[:4] = torch.tensor([-3.0, 3.0, -3.0, 3.0])
+                else:
+                    x = torch.randint(-50, 50, (4096,), device=DEVICE, dtype=dtype)
+                    y = torch.randint(1, 9, (4096,), device=DEVICE, dtype=dtype)
+                    y *= (
+                        torch.randint(0, 2, (4096,), device=DEVICE, dtype=dtype) * 2 - 1
+                    )
+                code, out = code_and_output(cute_modulus, (x, y))
+                expected = torch.stack(
+                    [
+                        torch.remainder(x, y),
+                        torch.fmod(x, y),
+                        x % -3,
+                        torch.fmod(x, -3),
+                    ]
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                if dtype.is_floating_point:
+                    self.assertTrue(
+                        torch.equal(torch.signbit(out), torch.signbit(expected))
+                    )
+                else:
+                    # Only the loaded divisors, which may be zero, are guarded.
+                    self.assertEqual(code.count(" != 0 else _cute_join_cast(1, "), 2)
+
+    def test_pointwise_frac(self) -> None:
+        # torch.frac decomposes to x - sign(x) * floor(abs(x)), or to
+        # x - trunc(x) in newer PyTorch.
+        special = [0.5, -2.5, 3.75, -3.75, -0.0, float("nan"), float("inf")]
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            with self.subTest(dtype=str(dtype)):
+                x = torch.randn(65, 23, device=DEVICE) * 8
+                x[0, : len(special)] = torch.tensor(special)
+                x = x.to(dtype)
+                code, out = code_and_output(cute_frac, (x,))
+                torch.testing.assert_close(
+                    out, torch.frac(x), rtol=0, atol=0, equal_nan=True
+                )
+                self.assertRegex(code, r"cute\.math\.(floor|trunc)\(")
 
     def test_rms_norm_uses_native_rsqrt(self) -> None:
         x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)
@@ -10589,13 +11542,16 @@ class TestCuteBackend(TestCase):
         )
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported,
-            "strided slices .* are not supported",
+            "only supports contiguous direct-load operands",
         ):
             code_and_output(grouped_n_matmul, args)
 
-    def test_matmul_direct_grouped_n_negative_rhs_offset_rejects_cleanly(
+    def test_matmul_direct_grouped_n_negative_rhs_offset_is_normalized(
         self,
     ) -> None:
+        # Negative slice bounds count from the end as in PyTorch: on 160
+        # columns ``-144:-16`` is ``16:144``, the contiguous operand of
+        # test_matmul_direct_grouped_n_rhs_offset_uses_mma.
         @helion.kernel(
             backend="cute",
             config=helion.Config(block_sizes=[32], indexing="block_ptr"),
@@ -10612,11 +11568,11 @@ class TestCuteBackend(TestCase):
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 160, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported,
-            "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
-        ):
-            code_and_output(grouped_n_matmul, args)
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1][:, 16:144].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertNotIn("dot_serial_result", code)
 
     def test_matmul_direct_grouped_n_multiple_mms_fall_back_cleanly(self) -> None:
         @helion.kernel(

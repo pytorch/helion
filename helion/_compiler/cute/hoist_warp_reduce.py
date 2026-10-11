@@ -62,8 +62,8 @@ _REDUCE_IDENTITY: dict[str, str] = {
 # ``b`` is the per-iter contribution.
 _REDUCE_COMBINE: dict[str, str] = {
     "warp_reduction_sum": "({a}) + ({b})",
-    "warp_reduction_max": "max(({a}), ({b}))",
-    "warp_reduction_min": "min(({a}), ({b}))",
+    "warp_reduction_max": "cute.math.max(({a}), ({b}), propagate_nan=True)",
+    "warp_reduction_min": "cute.math.min(({a}), ({b}), propagate_nan=True)",
 }
 
 
@@ -501,14 +501,13 @@ def _try_hoist_one_vloop(
             "cutlass.Float16",
             "cutlass.BFloat16",
         ):
-            # Python ``max``/``min`` lower to a compare + select (2 SASS
-            # insts); the hardware FMNMX is one.  fmax/fmin drop NaN
-            # instead of propagating it, matching quack's row_reduce (the
-            # warp shuffle reduction already uses the same semantics).
+            # ``cute.math.max(propagate_nan=True)`` lowers to compares and
+            # selects; the hardware FMNMX.NaN is one instruction and, like the
+            # warp shuffle reduction, propagates NaN as torch.amax does.
             if op == "warp_reduction_max":
-                combine_template = "cute.arch.fmax(({a}), ({b}))"
+                combine_template = "cute.arch.fmax(({a}), ({b}), nan=True)"
             elif op == "warp_reduction_min":
-                combine_template = "cute.arch.fmin(({a}), ({b}))"
+                combine_template = "cute.arch.fmin(({a}), ({b}), nan=True)"
         # Decide how to hoist the reduce.  Three cases:
         #
         #  (b) The input is a matmul-fallback PER-THREAD RUNNING SUM, flagged
@@ -702,18 +701,30 @@ def _replace_reduce_input(
 
 
 def _hoist_in_body(
-    body: list[ast.stmt], acc_counter: list[int], running_sums: set[str]
+    body: list[ast.stmt],
+    acc_counter: list[int],
+    running_sums: set[str],
+    unfoldable_vec_lanes: set[str],
 ) -> list[ast.stmt]:
     """Walk ``body`` recursively; for each constexpr V-loop containing warp
-    reductions, replace it with the V-fold + hoisted-reduce form.
+    reductions, replace it with the V-fold + hoisted-reduce form.  A V-loop
+    named in ``unfoldable_vec_lanes`` iterates another block than its
+    reductions reduce (one output element per V lane) and is left alone.
     """
+
+    def walk(stmts: list[ast.stmt]) -> list[ast.stmt]:
+        return _hoist_in_body(stmts, acc_counter, running_sums, unfoldable_vec_lanes)
+
     new_body: list[ast.stmt] = []
     for stmt in body:
         if isinstance(stmt, ast.For):
-            stmt.body = _hoist_in_body(stmt.body, acc_counter, running_sums)
-            stmt.orelse = _hoist_in_body(stmt.orelse, acc_counter, running_sums)
+            stmt.body = walk(stmt.body)
+            stmt.orelse = walk(stmt.orelse)
             match = _is_constexpr_v_loop(stmt)
-            if match is not None:
+            if match is not None and not (
+                isinstance(stmt.target, ast.Name)
+                and stmt.target.id in unfoldable_vec_lanes
+            ):
                 vloop, v = match
                 replacement = _try_hoist_one_vloop(vloop, v, acc_counter, running_sums)
                 if replacement is not None:
@@ -721,11 +732,11 @@ def _hoist_in_body(
                     continue
             new_body.append(stmt)
         elif isinstance(stmt, ast.If):
-            stmt.body = _hoist_in_body(stmt.body, acc_counter, running_sums)
-            stmt.orelse = _hoist_in_body(stmt.orelse, acc_counter, running_sums)
+            stmt.body = walk(stmt.body)
+            stmt.orelse = walk(stmt.orelse)
             new_body.append(stmt)
         elif isinstance(stmt, (ast.With, ast.FunctionDef)):
-            stmt.body = _hoist_in_body(stmt.body, acc_counter, running_sums)
+            stmt.body = walk(stmt.body)
             new_body.append(stmt)
         else:
             new_body.append(stmt)
@@ -737,6 +748,7 @@ def hoist_warp_reduce_from_vloop(
     *,
     running_sum_accumulators: set[str] | None = None,
     rename_groups: dict[str, str] | None = None,
+    unfoldable_vec_lanes: set[str] | None = None,
 ) -> list[ast.stmt]:
     """Apply the hoist pass to a list of kernel-body statements.
 
@@ -751,6 +763,10 @@ def hoist_warp_reduce_from_vloop(
     that the value already accumulates across V-lanes, so we don't re-derive it
     by pattern-matching the AST.
 
+    ``unfoldable_vec_lanes`` names the V-loops that enclose a reduction over
+    another block (recorded by the reduction lowering): their lanes are
+    distinct output elements, which a V-fold would combine.
+
     After the per-V-loop hoist, a second walk collapses the remaining
     per-lane-iteration reduces: a static lane loop that runs ``REDUCE`` +
     ``carry = combine(carry, result)`` once per iteration is rewritten to
@@ -758,7 +774,9 @@ def hoist_warp_reduce_from_vloop(
     ONCE after the loop.  For multi-warp grouped reductions this removes
     ``L-1`` two-barrier shared-memory reductions per sweep.
     """
-    new_body = _hoist_in_body(body, [0], running_sum_accumulators or set())
+    new_body = _hoist_in_body(
+        body, [0], running_sum_accumulators or set(), unfoldable_vec_lanes or set()
+    )
     import os
 
     if os.environ.get("HELION_DISABLE_LANE_REDUCE_COLLAPSE") != "1":
@@ -838,7 +856,10 @@ def _match_carry_update(
                 op_kind == "max"
                 and func_text in ("max", "cute.math.max", "cute.arch.fmax")
             )
-            or (op_kind == "min" and func_text in ("min", "cute.math.min"))
+            or (
+                op_kind == "min"
+                and func_text in ("min", "cute.math.min", "cute.arch.fmin")
+            )
         ) and len(rhs.args) == 2:
             operands = list(rhs.args)
     if operands is None:
