@@ -25,7 +25,7 @@ def _copy_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAdvancedCompilerConfiguration(TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_configuration_apply_controls_flag(self) -> None:
@@ -146,7 +146,7 @@ class TestAdvancedCompilerConfiguration(TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x)
-        self.assertNotIn("ptx_options", code)
+        self.assertNotIn("--apply-controls", code)
 
     def test_empty_string_appended_when_missing(self) -> None:
         """When autotune_search_acf omits "", it is appended automatically so

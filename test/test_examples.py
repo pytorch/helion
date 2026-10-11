@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import typing
 import unittest
@@ -8,6 +9,8 @@ from unittest.mock import patch
 from packaging import version
 import pytest
 import torch
+from torch._decomp.decompositions import silu as core_silu
+import torch._inductor.decomposition as inductor_decomp
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -75,6 +78,31 @@ def _compile_only(
         bound._config = config
         return bound
     return bound.compile_config(config)
+
+
+@contextlib.contextmanager
+def _core_silu_decomposition() -> typing.Iterator[None]:
+    """Trace ``aten.silu`` with the core decomposition instead of Inductor's.
+
+    Inductor's custom silu decomposition (pytorch PR #171723) changes the
+    codegen between torch 2.9 and nightly.  ``fast_random_decomps()`` caches
+    a copy of the decomposition table, so the cache is cleared on entry, for
+    the patch to take effect, and again on exit: otherwise every later kernel
+    in the process traces silu with the core decomposition.
+    """
+
+    def clear_cache() -> None:
+        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
+            inductor_decomp.fast_random_decomps.cache_clear()
+
+    clear_cache()
+    try:
+        with patch.dict(
+            inductor_decomp.decompositions, {torch.ops.aten.silu.default: core_silu}
+        ):
+            yield
+    finally:
+        clear_cache()
 
 
 def setUpModule() -> None:
@@ -1653,6 +1681,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
+    @skipIfRefEager("checks the decomposition cache; runs no kernel")
+    def test_core_silu_decomposition_does_not_outlive_its_patch(self):
+        # A patched decomposition table left in fast_random_decomps()'s cache
+        # changed the codegen of every later kernel in the process (the CuTe
+        # flash_gated tests failed after the HSTU examples).
+        silu = torch.ops.aten.silu.default
+        inductor_silu = inductor_decomp.select_decomp_table()[silu]
+        with _core_silu_decomposition():
+            self.assertIs(inductor_decomp.select_decomp_table()[silu], core_silu)
+        self.assertIs(inductor_decomp.select_decomp_table()[silu], inductor_silu)
+
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -1705,17 +1744,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             q, k, v, seq_offsets, None, max_seq_len
         )
 
-        # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-        # This ensures consistent codegen both torch 2.9 (stable) and nightly versions.
-        from torch._decomp.decompositions import silu
-        import torch._inductor.decomposition as inductor_decomp
-
-        # Clear cache since fast_random_decomps() caches a copy of decompositions
-        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-            inductor_decomp.fast_random_decomps.cache_clear()
-        with patch.dict(
-            inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-        ):
+        with _core_silu_decomposition():
             check_example(
                 "jagged_hstu_attn",
                 args,
@@ -1767,23 +1796,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
             expected = mod.reference_jagged_hstu_attention(*args)
 
-            # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-            # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
-            from torch._decomp.decompositions import silu
-            import torch._inductor.decomposition as inductor_decomp
-
-            if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-                inductor_decomp.fast_random_decomps.cache_clear()
-
             with (
                 patch.object(
                     mod.jagged_hstu_attention.settings,
                     "dot_precision",
                     helion_precision,
                 ),
-                patch.dict(
-                    inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-                ),
+                _core_silu_decomposition(),
             ):
                 # Clear the cache to ensure the modified settings are used.
                 mod.jagged_hstu_attention._bound_kernels.clear()

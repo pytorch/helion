@@ -666,6 +666,18 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertEqual(code, code2)
         torch.testing.assert_close(result2, x + 10)
 
+    def test_kernel_launch_without_tensor_args(self):
+        """A device loop whose loads are dead launches a kernel with no args."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_returns_scalars(x: torch.Tensor, a: int, b: int) -> tuple[int, int]:
+            for tile in hl.tile(x.size()):
+                _ = x[tile]
+            return a * 2, b * 3
+
+        x = torch.randn(4, 8, device=DEVICE)
+        torch.testing.assert_close(kernel_returns_scalars(x, 10, 20), (20, 60))
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_tuple_literal_subscript(self):

@@ -6,6 +6,9 @@ import operator
 import cutlass
 import cutlass.cute as cute
 
+from .cluster_helpers import store_shared_remote_f32
+from .cluster_helpers import store_shared_remote_f32x2
+
 
 @cute.jit
 def _warp_reduce_sum(value: cute.Numeric, *, threads_in_group: int) -> cute.Numeric:
@@ -992,8 +995,6 @@ def _cute_grouped_reduce_cluster_body(
     ``identity``'s dtype must be Float32 (the hoist pass rewrites the
     identity to the fp32 accumulator dtype).
     """
-    from helion._compiler.cute.cluster_helpers import store_shared_remote_f32
-
     warps = group_span // 32
     slots = warps * cluster_n
     buf = cute.make_tensor(buf_ptr, (slots,))
@@ -1115,8 +1116,6 @@ def _cute_grouped_reduce_cluster_online_pair_body(
     rescaled into the ``group_max`` frame — ``sum_j exp2(f(x_j) -
     group_max * scale)`` over the whole cluster row.
     """
-    from helion._compiler.cute.cluster_helpers import store_shared_remote_f32x2
-
     cta_sum = _cute_grouped_reduce_shared_two_stage(
         local_sum,
         "sum",

@@ -77,6 +77,7 @@ from ..._compiler.cute.tcgen05_constants import (
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
+from .source_dependencies import referenced_helper_sources
 from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
@@ -2942,7 +2943,9 @@ def _cute_disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, external compiled-helper sources, full input
+    generated device-kernel source, external compiled-helper sources, the
+    sources of the Helion helper modules the kernel's globals reference
+    (``referenced_helper_sources``), full input
     specialization (dtypes, ranks,
     pointer alignments, baked shapes/strides, constexpr values), launch shape
     (block/cluster), preferred shared-memory carveout, CuTe compile options,
@@ -2972,6 +2975,12 @@ def _cute_disk_cache_key(
     helper_sources = wrapper_source_dependencies(helper_kinds)
     if helper_sources is None:
         return None
+    kernel_globals = getattr(
+        getattr(cute_kernel, "__wrapped__", cute_kernel), "__globals__", {}
+    )
+    called_helper_sources = referenced_helper_sources(kernel_globals)
+    if called_helper_sources is None:
+        return None
     try:
         import cutlass
 
@@ -2980,9 +2989,10 @@ def _cute_disk_cache_key(
         cutlass_version = ""
     payload = repr(
         (
-            "helion-cute-cache-v2",
+            "helion-cute-cache-v3",
             source_hash,
             helper_sources,
+            called_helper_sources,
             schema_key,
             block,
             wrapper_plans,

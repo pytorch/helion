@@ -6,12 +6,19 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
+import helion
 from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import lower_full_tile_bounds
 from helion._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
+from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 
 def _plan(
@@ -192,6 +199,55 @@ def test_guard_covers_positive_divisible_equal_contiguous_int32_domain(
         {**_sdk(), "x": _tensor(length, stride), "y": _tensor(out_length, out_stride)},
     )
     assert value is expected
+
+
+def test_guard_stays_linear_through_the_sdk_boolean_expansion():
+    """The CuTe DSL preprocessor rewrites ``a and b`` into an expression that
+    repeats ``a`` four times, so a flat chain of guards grows exponentially
+    (three tensors give 14 guards, which took minutes to preprocess).  The
+    guard is a right-nested chain: two operands per ``and``, the first never
+    a chain."""
+    plan = FullTilePlan(
+        TensorLayoutRelation("n", "x", "size", 0), 4096, (8, 1, 1), ("x", "w", "out")
+    )
+    predicate = plan.predicate()
+    chains = [node for node in ast.walk(predicate) if isinstance(node, ast.BoolOp)]
+    assert len(chains) == 13
+    for chain in chains:
+        assert len(chain.values) == 2
+        assert not isinstance(chain.values[0], ast.BoolOp)
+    preprocessor_module = pytest.importorskip("cutlass.base_dsl.ast_preprocessor")
+    preprocessor = preprocessor_module.DSLPreprocessor(["cutlass"])
+    with preprocessor.get_session():
+        expanded = preprocessor.visit(ast.Expression(predicate))
+    assert sum(1 for _ in ast.walk(expanded)) < 3000
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _reciprocal_times(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.reciprocal(x[tile]) * w[tile]
+    return out
+
+
+@skipIfRefEager("compiles the generated kernel")
+@skipIfNotCUDA()
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("threads", [8, 512])
+def test_three_tensor_guard_compiles_with_dynamic_shapes(threads):
+    """A dynamic-shape kernel over three tensors gets the 14-term guard; it
+    took minutes in the SDK preprocessor while the chain was flat."""
+    x = torch.randn(4099, device=DEVICE, dtype=torch.float16)
+    w = torch.randn(4099, device=DEVICE, dtype=torch.float16)
+    bound = _reciprocal_times.bind((x, w))
+    config = helion.Config(
+        block_sizes=[4096], num_threads=[threads], cute_proven_bounds=True
+    )
+    assert "cute.is_static(out.layout.stride) and (" in bound.to_code(config)
+    torch.testing.assert_close(
+        bound.compile_config(config)(x, w), torch.reciprocal(x) * w
+    )
 
 
 SOURCE = """

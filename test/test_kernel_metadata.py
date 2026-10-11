@@ -211,7 +211,7 @@ class TestAutotuneLogSink(TestCase):
         self.assertEqual(cell("run_id"), sidecar["run_id"])
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAutotuneDatasetE2E(TestCase):
     @skipIfRefEager("Autotuning not supported in ref eager mode")
     def test_autotune_writes_dataset_sidecar(self) -> None:
