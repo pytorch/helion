@@ -2330,7 +2330,48 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src2_result, expected_src2)
         torch.testing.assert_close(dst2_result, expected_dst2)
 
-    @skipIfCute("CuTe negative indexes can poison the CUDA context")
+    def test_strided_slice_tile_values(self):
+        """Strided slices pair element ``j`` with ``start + step * j``, for tile values too."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def spread(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(24, device=x.device, dtype=x.dtype)
+            for _ in hl.grid(1):
+                out[1:24:3] = x[:] * 2
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def strided_columns(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            out = torch.zeros(x.size(0), 24, device=x.device, dtype=x.dtype)
+            sums = x.new_empty(x.size(0))
+            for tile in hl.tile(x.size(0)):
+                out[tile, 0:16:2] = x[tile, 2:26:3] + 1
+                sums[tile] = x[tile, 0:32:2].sum(-1)
+            return out, sums
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def strided_rows(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(20, x.size(1), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size(1)):
+                out[0:20:2, tile] = x[1:31:3, tile] * 2
+            return out
+
+        x = torch.randn([8], device=DEVICE)
+        expected = torch.zeros(24, device=DEVICE)
+        expected[1:24:3] = x * 2
+        torch.testing.assert_close(spread(x), expected)
+
+        x = torch.randn([40, 32], device=DEVICE)
+        out, sums = strided_columns(x)
+        expected = torch.zeros(40, 24, device=DEVICE)
+        expected[:, 0:16:2] = x[:, 2:26:3] + 1
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(sums, x[:, 0:32:2].sum(-1))
+
+        expected = torch.zeros(20, 32, device=DEVICE)
+        expected[0:20:2] = x[1:31:3] * 2
+        torch.testing.assert_close(strided_rows(x), expected)
+
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
@@ -2356,7 +2397,22 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfCute("CuTe negative indexes can poison the CUDA context")
+    def test_negative_indexing_dynamic_shapes(self):
+        """Negative indexes count back from a dynamic dimension size."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            (rows,) = x.shape[:1]
+            for tile_r in hl.tile(rows):
+                x[tile_r, -2] = x[tile_r, -1] + 1.0
+            return x
+
+        for shape in ([64, 128], [33, 50]):
+            x = torch.randn(shape, device=DEVICE)
+            expected = x.clone()
+            expected[:, -2] = expected[:, -1] + 1.0
+            torch.testing.assert_close(kernel(x), expected)
+
     def test_negative_indexing_multidim(self):
         """Test negative indexing on multiple dimensions: x[-1, -1]"""
 
@@ -2374,7 +2430,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected[-1, -1] = 42.0
         torch.testing.assert_close(result, expected)
 
-    @skipIfCute("CuTe negative indexes can poison the CUDA context")
     def test_negative_indexing_with_tile(self):
         """Test mixed tile and negative index: x[tile, -1]"""
 
@@ -2757,6 +2812,225 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_dst = expected_src.clone()
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_slice_bounds_clamp_like_pytorch(self):
+        """Slice bounds follow PyTorch on a 48-wide dim: a stop past the end
+        and negative bounds are clamped to the dim (``16:100`` reads and writes
+        32 columns), for loads, stores and atomics, static and dynamic."""
+
+        def loads(
+            q: torch.Tensor,
+            past_end: torch.Tensor,
+            from_end: torch.Tensor,
+            to_end: torch.Tensor,
+            before_start: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            for tile in hl.tile(q.size(0)):
+                past_end[tile, :] = q[tile, 16:100]
+                from_end[tile, :] = q[tile, -16:]
+                to_end[tile, :] = q[tile, :-8]
+                before_start[tile, :] = q[tile, -100:20]
+            return past_end, from_end, to_end, before_start
+
+        def stores(
+            q: torch.Tensor, v: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out = torch.zeros_like(q)
+            acc = torch.zeros_like(q)
+            for tile in hl.tile(q.size(0)):
+                out[tile, 16:100] = v[tile, :]
+                hl.atomic_add(acc, [tile, slice(-32, None)], v[tile, :])
+            return out, acc
+
+        q = torch.randn([64, 48], device=DEVICE)
+        v = torch.randn([64, 32], device=DEVICE)
+        expected_out = torch.zeros_like(q)
+        expected_out[:, 16:] = v
+        for static_shapes in (True, False):
+            with self.subTest(static_shapes=static_shapes):
+                expected = (q[:, 16:100], q[:, -16:], q[:, :-8], q[:, -100:20])
+                outs = tuple(torch.empty_like(columns) for columns in expected)
+                kernel = helion.kernel(static_shapes=static_shapes)(loads)
+                _, results = code_and_output(kernel, (q, *outs), block_sizes=[16])
+                for result, columns in zip(results, expected, strict=True):
+                    torch.testing.assert_close(result, columns)
+                kernel = helion.kernel(static_shapes=static_shapes)(stores)
+                _, (out, acc) = code_and_output(kernel, (q, v), block_sizes=[16])
+                torch.testing.assert_close(out, expected_out)
+                torch.testing.assert_close(acc, expected_out)
+
+    def test_slice_start_past_end_is_empty(self):
+        """A start at or past the end (or past the stop) selects nothing."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(q: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            sums = torch.empty([q.size(0)], dtype=q.dtype, device=q.device)
+            out = q.clone()
+            for tile in hl.tile(q.size(0)):
+                sums[tile] = q[tile, 60:100].sum(-1) + q[tile, 30:10].sum(-1)
+                out[tile, 60:] = v[tile, :]
+            return sums, out
+
+        q = torch.randn([64, 48], device=DEVICE)
+        v = torch.randn([64, 0], device=DEVICE)
+        _, (sums, out) = code_and_output(fn, (q, v), block_sizes=[16])
+        torch.testing.assert_close(sums, torch.zeros_like(sums))
+        torch.testing.assert_close(out, q)
+
+    def test_strided_slice_bounds_clamp_like_pytorch(self):
+        """Strided slices clamp their bounds too: ``8:100:2`` and ``-30::3``
+        on 48 elements."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            src1: torch.Tensor,
+            dst1: torch.Tensor,
+            src2: torch.Tensor,
+            dst2: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            for _ in hl.grid(1):
+                dst1[8:100:2] = 1.0
+                src1[8:100:2] = dst1[8:100:2]
+                dst2[-30::3] = 2.0
+                src2[-30::3] = dst2[-30::3]
+            return src1, dst1, src2, dst2
+
+        N = 48
+        args = [torch.zeros([N], device=DEVICE) for _ in range(4)]
+        src1, dst1, src2, dst2 = kernel(*args)
+        expected1 = torch.zeros([N], device=DEVICE)
+        expected1[8:100:2] = 1.0
+        expected2 = torch.zeros([N], device=DEVICE)
+        expected2[-30::3] = 2.0
+        torch.testing.assert_close(src1, expected1)
+        torch.testing.assert_close(dst1, expected1)
+        torch.testing.assert_close(src2, expected2)
+        torch.testing.assert_close(dst2, expected2)
+
+    def test_size_one_slices(self):
+        """A one-element slice is indexed by its start: ``47:48``, ``-1:`` and
+        ``:-47`` on 48 columns (a one-element vector in the Triton pointer
+        index, not a scalar)."""
+
+        def loads(
+            x: torch.Tensor,
+            last: torch.Tensor,
+            from_end: torch.Tensor,
+            first: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            for tile in hl.tile(x.size(0)):
+                last[tile, :] = x[tile, 47:48]
+                from_end[tile, :] = x[tile, -1:]
+                first[tile, :] = x[tile, :-47]
+            return last, from_end, first
+
+        @helion.kernel(static_shapes=True)
+        def stores(v: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(out.size(0)):
+                out[tile, 47:48] = v[tile, :]
+                out[tile, :-47] = v[tile, :] * 2
+            return out
+
+        x = torch.randn([64, 48], device=DEVICE)
+        for static_shapes in (True, False):
+            with self.subTest(static_shapes=static_shapes):
+                outs = tuple(torch.empty([64, 1], device=DEVICE) for _ in range(3))
+                kernel = helion.kernel(static_shapes=static_shapes)(loads)
+                _, (last, from_end, first) = code_and_output(
+                    kernel, (x, *outs), block_sizes=[16]
+                )
+                torch.testing.assert_close(last, x[:, 47:48])
+                torch.testing.assert_close(from_end, x[:, -1:])
+                torch.testing.assert_close(first, x[:, :1])
+        v = torch.randn([64, 1], device=DEVICE)
+        out = torch.zeros([64, 48], device=DEVICE)
+        expected = out.clone()
+        expected[:, 47:48] = v
+        expected[:, :1] = v * 2
+        _, result = code_and_output(stores, (v, out), block_sizes=[16])
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("ref eager raises PyTorch's ValueError")
+    def test_slice_non_positive_step_is_rejected(self):
+        """PyTorch indexing rejects a step <= 0, and so does Helion at bind
+        time."""
+
+        @helion.kernel(static_shapes=True)
+        def reversed_columns(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, ::-1]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def descending(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0), 30], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, 40:10:-1]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def zero_step(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, ::0]
+            return out
+
+        x = torch.randn([64, 48], device=DEVICE)
+        for kernel in (reversed_columns, descending, zero_step):
+            with (
+                self.subTest(kernel=kernel.name),
+                self.assertRaisesRegex(
+                    exc.InvalidSliceStep, "step must be greater than zero"
+                ),
+            ):
+                kernel.bind((x,))
+
+    @skipIfRefEager("ref eager slices with the loaded value as PyTorch does")
+    def test_tensor_slice_bound_is_rejected(self):
+        """A loaded value as a slice bound has no compile-time extent; it is
+        rejected with a ``TensorSliceBound`` error that points to hl.arange."""
+
+        @helion.kernel(static_shapes=True)
+        def window(q: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([q.size(0), 16], dtype=q.dtype, device=q.device)
+            for tile in hl.tile(q.size(0)):
+                start = offsets[0]
+                out[tile, :] = q[tile, start : start + 16]
+            return out
+
+        q = torch.randn([64, 48], device=DEVICE)
+        offsets = torch.tensor([8], device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(exc.TensorSliceBound, "hl.arange"):
+            window.bind((q, offsets))
+
+    def test_symbolic_slice_bound_clamps_like_pytorch(self):
+        """A single symbolic bound (an int argument ``k``) is clamped to the
+        dim, and counted from the end when negative, at runtime: ``:100``
+        reads the 48 columns and ``-8:`` the last 8."""
+
+        @helion.kernel(static_shapes=True)
+        def head(q: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty([q.size(0)], dtype=q.dtype, device=q.device)
+            for tile in hl.tile(q.size(0)):
+                out[tile] = q[tile, :k].sum(-1)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def tail(q: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty([q.size(0)], dtype=q.dtype, device=q.device)
+            for tile in hl.tile(q.size(0)):
+                out[tile] = q[tile, k:].sum(-1)
+            return out
+
+        q = torch.randn([64, 48], device=DEVICE)
+        for k in (16, 100, -8, -100):
+            for kernel, columns in ((head, q[:, :k]), (tail, q[:, k:])):
+                with self.subTest(kernel=kernel.name, k=k):
+                    _, result = code_and_output(kernel, (q, k), block_sizes=[16])
+                    torch.testing.assert_close(
+                        result, columns.sum(-1), rtol=1e-4, atol=1e-4
+                    )
 
     def test_range_slice_dynamic(self):
         """Test both [i:i+1] = scalar and [i] = [i:i+1] patterns"""
@@ -4153,10 +4427,6 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
                         int(expression.subs(bound.env.block_sizes[0].symbol(), block))
                         == expected
                     )
-            if backend == "cute" and stepped:
-                with pytest.raises(exc.BackendUnsupported, match="strided slices"):
-                    bound.to_code(config)
-                continue
             code = bound.to_code(config)
             # Native execution below checks values; here the independently
             # allocated buffers must still have partition-dependent stores.
@@ -4200,8 +4470,6 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
 @pytest.mark.parametrize("stepped", [False, True])
 @pytest.mark.parametrize("block", [16, 32, 128])
 def test_partition_allocation_slice_values(block, stepped):
-    if stepped and _get_backend() == "cute":
-        pytest.skip("CuTe rejects stepped slices; CPU test checks that rejection")
     x = torch.arange(3 * 65, device=DEVICE, dtype=torch.float32).reshape(3, 65)
     before = x.clone()
     bound = _partition_allocations.bind((x, stepped))

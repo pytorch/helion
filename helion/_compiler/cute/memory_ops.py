@@ -2260,6 +2260,15 @@ def _codegen_cute_strided_slice_store(
         if source_tensor.dtype is torch.bool:
             value_expr = f"({value_expr} != cutlass.Uint8(0))"
     elif isinstance(value, ast.AST):
+        # The loop writes the one per-thread value to every slot, so only a
+        # value with a single element is broadcast here; a tile value
+        # (``out[0:16:2] = x[:] * 2``) takes the generic store, which pairs
+        # slot ``j`` with the value's element ``j``.
+        value_proxy = value_node.meta.get("val") if value_node is not None else None
+        if isinstance(value_proxy, torch.Tensor) and not all(
+            env.known_equal(size, 1) for size in value_proxy.shape
+        ):
+            return None
         value_expr = ast.unparse(value)
     elif isinstance(value, (int, float, bool)):
         value_expr = repr(value)

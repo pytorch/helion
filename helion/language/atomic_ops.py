@@ -11,6 +11,7 @@ from torch.fx import has_side_effect
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.indexing_strategy import SubscriptIndexing
+from .._compiler.utils import normalize_index_slices
 from . import _decorators
 
 __all__ = [
@@ -48,6 +49,7 @@ def _prepare_mem_args(
     _validate_sem(sem)
     index = Tile._prepare_index(index)
     index = Tile._tiles_to_sizes_for_index(index)
+    index = normalize_index_slices(target.shape, index)
     return (target, index, *values, sem)
 
 

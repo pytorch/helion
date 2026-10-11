@@ -171,6 +171,18 @@ class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
+class InvalidSliceStep(BaseError):
+    message = "Slice step must be greater than zero, as in PyTorch indexing; got {0!s}."
+
+
+class TensorSliceBound(BaseError):
+    message = (
+        "A slice bound inside a device loop must be an int (a literal, size, int "
+        "argument or tile attribute), not the tensor value {0!s}; index with a "
+        "tensor instead, e.g. ``x[tile, start + hl.arange(n)]``."
+    )
+
+
 class DotBatchDimensionMismatch(BaseError):
     message = (
         "hl.dot requires matching batch dimensions (or broadcasting with 1s), "

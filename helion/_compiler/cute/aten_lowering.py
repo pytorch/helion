@@ -1094,6 +1094,41 @@ def _wrap_iota_coord_expr(
     )
 
 
+def _cute_inactive_loop_block_coord(cg: GenerateAST, block_id: int) -> str | None:
+    """The lane coordinate of ``block_id`` where its device loop is not running.
+
+    A value with a dim of that block keeps it on the loop's thread axis, as
+    the accumulator ``acc = hl.zeros([tile_m, bn])`` of ``for tile_n in
+    hl.tile(n, block_size=bn)`` does after the loop, so ``out[tile_m, 0:bn] =
+    acc`` must index the range by that axis rather than by a synthetic one.
+    ``None`` when no strategy of the running grid owns a thread axis for the
+    block.
+    """
+    tile_strategy = cg.device_function.tile_strategy
+    grid_state = cg.current_grid_state
+    axis = tile_strategy.thread_axis_for_block_id(block_id)
+    if axis is None or grid_state is None:
+        return None
+    owners = [s for s in tile_strategy.strategies if block_id in s.block_ids]
+    if not owners or not tile_strategy.strategies_can_coexecute(
+        grid_state.strategy, owners[0]
+    ):
+        return None
+    if len(owners[0].block_ids) != 1 or tile_strategy.thread_extent_for_block_id(
+        block_id
+    ) != cg.device_function.resolved_block_size(block_id):
+        # Outside its loop, a value of the block has one register per
+        # thread: a lane loop or a multi-block layout has no coordinate for
+        # each of its elements there.
+        raise exc.BackendUnsupported(
+            "cute",
+            f"a slice or hl.arange() over block_id={block_id} read outside its "
+            "device loop, where each thread holds several elements of the block "
+            "in one value (a lane loop or a multi-block tile)",
+        )
+    return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+
+
 def _cute_iota_expr(
     ctx: LoweringContext,
     *,
@@ -1399,6 +1434,8 @@ def _cute_iota_expr(
                     break
         if thread_axis is not None:
             expr = _grid_local_coord_expr(cg, block_id, thread_axis)
+        elif (coord := _cute_inactive_loop_block_coord(cg, block_id)) is not None:
+            expr = coord
         elif (active_expr := active_iota_expr()) is not None:
             return active_expr
         elif (

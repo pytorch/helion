@@ -11358,13 +11358,16 @@ class TestCuteBackend(TestCase):
         )
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported,
-            "strided slices .* are not supported",
+            "only supports contiguous direct-load operands",
         ):
             code_and_output(grouped_n_matmul, args)
 
-    def test_matmul_direct_grouped_n_negative_rhs_offset_rejects_cleanly(
+    def test_matmul_direct_grouped_n_negative_rhs_offset_is_normalized(
         self,
     ) -> None:
+        # Negative slice bounds count from the end as in PyTorch: on 160
+        # columns ``-144:-16`` is ``16:144``, the contiguous operand of
+        # test_matmul_direct_grouped_n_rhs_offset_uses_mma.
         @helion.kernel(
             backend="cute",
             config=helion.Config(block_sizes=[32], indexing="block_ptr"),
@@ -11381,11 +11384,11 @@ class TestCuteBackend(TestCase):
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 160, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported,
-            "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
-        ):
-            code_and_output(grouped_n_matmul, args)
+        code, out = code_and_output(grouped_n_matmul, args)
+        expected = args[0].float() @ args[1][:, 16:144].float()
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm", code)
+        self.assertNotIn("dot_serial_result", code)
 
     def test_matmul_direct_grouped_n_multiple_mms_fall_back_cleanly(self) -> None:
         @helion.kernel(

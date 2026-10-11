@@ -89,6 +89,7 @@ from .type_info import _eval_binary
 from .type_info import _eval_compare
 from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
+from .type_info import tile_spanned_by_slice
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2772,7 +2773,7 @@ class WalkDeviceAST(NodeVisitor):
         values = [self.visit(value) for value in node.values]
         return dict(zip(keys, values, strict=False))
 
-    def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor:
+    def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor | torch.SymInt:
         if node.lower is None:
             lower = None
         else:
@@ -2790,6 +2791,11 @@ class WalkDeviceAST(NodeVisitor):
         # dynamic bounds.  Static bounds don't need that and stay a real slice.
         if step not in (None, 1) or lower is None or upper is None:
             return slice(lower, upper, step)
+
+        if (tile := tile_spanned_by_slice(lower, upper)) is not None:
+            # ``tile.begin:tile.end`` indexes what the tile does; as a range
+            # its length would be a device value, which no range can take.
+            return tile
 
         if not (_is_static_slice_bound(lower) and _is_static_slice_bound(upper)):
             # pyrefly: ignore [bad-argument-type]

@@ -279,12 +279,10 @@ class ReductionRoller:
             return 0
         from .indexing_strategy import SubscriptIndexing
 
-        # FX records traced SymInt/Tensor index args as torch.fx.Node references;
-        # compute_shape wants the underlying values, the same form it receives at
-        # register_fake time (memory_ops.load).
-        normalized = [
-            k.meta["val"] if isinstance(k, torch.fx.Node) else k for k in index
-        ]
+        # FX records traced SymInt/Tensor index args (and symbolic slice bounds)
+        # as torch.fx.Node references; compute_shape wants the underlying values,
+        # the same form it receives at register_fake time (memory_ops.load).
+        normalized = [*torch.fx.node.map_arg(index, lambda node: node.meta["val"])]
         shape = SubscriptIndexing.compute_shape(target_val, normalized)
         env = CompileEnvironment.current()
         rdim_block_id = self.rdim.block_id

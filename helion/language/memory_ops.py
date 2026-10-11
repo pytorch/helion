@@ -84,6 +84,7 @@ from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.indexing_strategy import exact_tile_block_ids
 from .._compiler.utils import compute_slice_size
+from .._compiler.utils import normalize_index_slices
 from .._compiler.variable_origin import BlockSizeOrigin
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
@@ -251,9 +252,11 @@ def _(
     index = Tile._tiles_to_sizes_for_index(index)
 
     if isinstance(tensor, StackTensor):
+        index = normalize_index_slices(tensor.tensor_like.shape, index)
         return (tuple(tensor), index, value, extra_mask)
 
     if isinstance(tensor, torch.Tensor):
+        index = normalize_index_slices(tensor.shape, index)
         return (tensor, index, value, extra_mask)
 
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
@@ -530,6 +533,13 @@ def _maybe_codegen_cute_packed_affine_lhs_load(
     return CutePackedAffineLoad(tuple(terms))
 
 
+def _cute_wrap_negative_index(idx: object, dim_size: int | torch.SymInt) -> object:
+    """``idx`` with a negative constant counted back from ``dim_size`` (``x[-1]``)."""
+    if isinstance(idx, int) and not isinstance(idx, bool) and idx < 0:
+        return idx + dim_size
+    return idx
+
+
 def _cute_index_exprs(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -734,7 +744,13 @@ def _cute_index_exprs(
             result.append(symint_index_expr(idx, used_block_ids))
             tensor_dim += 1
         elif isinstance(idx, int):
-            result.append(str(idx))
+            if idx >= 0:
+                result.append(str(idx))
+            elif tensor is None:
+                raise exc.BackendUnsupported("cute", "negative index without tensor")
+            else:
+                wrapped = _cute_wrap_negative_index(idx, tensor.shape[tensor_dim])
+                result.append(state.device_function.literal_expr(wrapped))
             tensor_dim += 1
         elif isinstance(idx, torch.Tensor):
             from .._compiler.cute.indexing import CuteAffineRangeIndex
@@ -782,8 +798,11 @@ def _cute_index_exprs(
                 )
             result.append(inactive_slice_expr)
             tensor_dim += 1
-        elif isinstance(idx, slice) and (idx.step is None or idx.step == 1):
-            # Partial slice (e.g. :16, 16:, or 5:20)
+        elif isinstance(idx, slice) and (
+            idx.step is None or (isinstance(idx.step, int) and idx.step > 0)
+        ):
+            # Partial slice (e.g. :16, 16:, 5:20, or 1:16:3): element ``j`` of
+            # the slice is ``start + step * j``.
             if tensor is None:
                 raise exc.BackendUnsupported(
                     "cute", "partial slice indexing without tensor"
@@ -791,6 +810,7 @@ def _cute_index_exprs(
             dim_size = tensor.shape[tensor_dim]
             slice_size = compute_slice_size(idx, dim_size)
             start = idx.start if idx.start is not None else 0
+            step = idx.step if idx.step is not None else 1
             block_id = _cute_resolve_active_slice_block_id(
                 state, slice_size, used_block_ids
             )
@@ -798,6 +818,8 @@ def _cute_index_exprs(
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
                 used_block_ids.add(block_id)
+                if step != 1:
+                    idx_var = f"cutlass.Int32({step}) * {idx_var}"
                 if start == 0:
                     result.append(idx_var)
                 else:
@@ -821,7 +843,7 @@ def _cute_index_exprs(
             )
         elif isinstance(idx, slice):
             raise exc.BackendUnsupported(
-                "cute", f"strided slices (step={idx.step}) are not supported"
+                "cute", f"slices of step {idx.step} are not supported"
             )
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
@@ -931,6 +953,7 @@ def _cute_access_regions(
         ):
             regions.append((sympy.Integer(0), sympy.Integer(1)))
             continue
+        idx = _cute_wrap_negative_index(idx, dim_size)
         tile_info = _get_tile_with_offset_info(
             idx, getattr(state, "fx_node", None), pos
         )
@@ -2594,7 +2617,12 @@ def _codegen_cute_store_tcgen05_tile(
             _cute_tile_begin_expr(state, subscript[1]),
         ]
     else:
-        base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
+        base_indices = [
+            _cute_tile_begin_expr(
+                state, _cute_wrap_negative_index(idx, tensor.shape[dim])
+            )
+            for dim, idx in enumerate(subscript)
+        ]
     leading_index = base_indices[0] if leading_passthrough_output else None
     m_index, n_index = base_indices[-2:]
     m_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 2)
@@ -7250,8 +7278,10 @@ def _(
 
     index = Tile._tiles_to_sizes_for_index(index)
     if isinstance(tensor, StackTensor):
+        index = normalize_index_slices(tensor.tensor_like.shape, index)
         return (tuple(tensor), index, extra_mask, eviction_policy)
     assert isinstance(tensor, torch.Tensor)
+    index = normalize_index_slices(tensor.shape, index)
     return (tensor, index, extra_mask, eviction_policy)
 
 
