@@ -13,6 +13,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import matchesBackends
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -259,6 +260,33 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         scale = torch.randn(256, device=DEVICE)
         code, out = code_and_output(fn, (a, scale), block_sizes=[64, 64])
         torch.testing.assert_close(out, a * scale[:, None])
+
+    @skipIfPallas("Pallas does not support broadcasting on store")
+    def test_store_broadcast_only_value(self):
+        """The stored value carries one tile axis; the store writes both."""
+
+        @helion.kernel
+        def rows(g, x):
+            out = torch.empty_like(x)
+            for tile0, tile1 in hl.tile(out.size()):
+                out[tile0, tile1] = g[tile0, None]
+            return out
+
+        @helion.kernel
+        def cols(g, x):
+            out = torch.empty_like(x)
+            for tile0, tile1 in hl.tile(out.size()):
+                out[tile0, tile1] = g[None, tile1]
+            return out
+
+        # Non-square: equal extents would alias the two tile axes.
+        x = torch.randn(64, 32, device=DEVICE)
+        g0 = torch.randn(64, device=DEVICE)
+        g1 = torch.randn(32, device=DEVICE)
+        code, out = code_and_output(rows, (g0, x), block_sizes=[32, 32])
+        torch.testing.assert_close(out, g0[:, None].expand_as(x))
+        code, out = code_and_output(cols, (g1, x), block_sizes=[32, 32])
+        torch.testing.assert_close(out, g1[None, :].expand_as(x))
 
 
 if __name__ == "__main__":

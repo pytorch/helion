@@ -39,9 +39,11 @@ from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .thread_budget import check_thread_block_dims
 from .thread_budget import check_thread_limit
+from .thread_budget import thread_idx_axis
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from collections.abc import Mapping
 
     from torch._inductor.ops_handler import OpsHandler
 
@@ -53,6 +55,7 @@ if TYPE_CHECKING:
     from ..device_function import Argument
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
+    from ..generate_ast import GenerateAST
     from ..host_function import HostFunction
     from ..tile_dispatch import TileStrategyDispatch
     from ..tile_strategy import TileStrategy
@@ -226,33 +229,6 @@ def _symbolic_axes_text(axes: dict[int, str]) -> str:
     return ", ".join(f"{axis} ({expr})" for axis, expr in sorted(axes.items()))
 
 
-def _thread_idx_axis(node: ast.AST) -> int | None:
-    """The axis of a ``cute.arch.thread_idx()[k]`` subscript, else ``None``."""
-    if not (
-        isinstance(node, ast.Subscript)
-        and isinstance(node.slice, ast.Constant)
-        and isinstance(node.slice.value, int)
-    ):
-        return None
-    call = node.value
-    if not (
-        isinstance(call, ast.Call)
-        and not call.args
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "thread_idx"
-    ):
-        return None
-    owner = call.func.value
-    if (
-        isinstance(owner, ast.Attribute)
-        and owner.attr == "arch"
-        and isinstance(owner.value, ast.Name)
-        and owner.value.id == "cute"
-    ):
-        return node.slice.value
-    return None
-
-
 def _thread_axes_read_outside_leader_guards(statements: Sequence[ast.AST]) -> set[int]:
     """The launch axes whose thread index the body reads, leader guards aside.
 
@@ -269,16 +245,101 @@ def _thread_axes_read_outside_leader_guards(statements: Sequence[ast.AST]) -> se
                 and isinstance(node.ops[0], ast.Eq)
                 and isinstance(node.comparators[0], ast.Constant)
                 and node.comparators[0].value == 0
-                and _thread_idx_axis(node.left) is not None
+                and thread_idx_axis(node.left) is not None
             ):
                 guards.add(id(node.left))
     axes: set[int] = set()
     for statement in statements:
         for node in ast.walk(statement):
-            axis = _thread_idx_axis(node)
+            axis = thread_idx_axis(node)
             if axis is not None and id(node) not in guards:
                 axes.add(axis)
     return axes
+
+
+def launch_drops_root_threads(
+    dims: Sequence[int], roots: Sequence[Mapping[int, int]]
+) -> tuple[int, int] | None:
+    """The first ``(axis, extent)`` of a root loop's read axes that ``dims``
+    launches narrower than its extent, or ``None``.
+
+    ``roots`` holds, per root loop, the thread extent of each launch axis
+    the root's own statements read (``GenerateAST.root_read_axis_sizes``).
+    An axis a root never reads (a tile whose index is unused) is absent and
+    may launch one thread, whatever extent a sibling root records for it.
+    """
+    for root in roots:
+        for axis, extent in sorted(root.items()):
+            if axis < len(dims) and dims[axis] < extent:
+                return axis, extent
+    return None
+
+
+def _reject_dropped_root_threads(
+    dims: Sequence[int], roots: Sequence[Mapping[int, int]]
+) -> None:
+    """Refuse a launch that never runs some of a root tile's threads.
+
+    A root tile's threads index its rows and columns directly on the axes its
+    statements read; a launch narrower than them never runs the rows past the
+    launch, leaving their outputs unwritten.
+    """
+    dropped = launch_drops_root_threads(dims, roots)
+    if dropped is not None:
+        axis, live = dropped
+        raise exc.BackendUnsupported(
+            "cute",
+            f"launch block {tuple(dims)} drops threads of a root tile that "
+            f"reads {live} threads on axis {axis}",
+        )
+
+
+def _reduced_block_ids(codegen: GenerateAST) -> set[int]:
+    """The block ids some lowered reduction of the kernel reduces over."""
+    # Local import: see ``_multi_phase_block_dims``.
+    from ..inductor_lowering import ReductionLowering
+
+    return {
+        lowering.block_index
+        for graph in codegen.codegen_graphs
+        for node in graph.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+    }
+
+
+def _reject_multi_root_reduction_surplus(
+    device_function: DeviceFunction, dims: Sequence[int]
+) -> None:
+    """Refuse a multi-root launch whose width on a reduction's axis differs
+    from the reduction's own lane count.
+
+    Root loops share one launch, the elementwise max of their thread shapes,
+    so a root reducing over fewer lanes than another root runs on that axis
+    runs surplus lanes: they index past the reduced extent, reduce among
+    themselves and race the reduction's result to the same address.  As for
+    ``hl.barrier()`` phases (``_multi_phase_block_dims``), such a reduction is
+    rejected rather than folded with the surplus lanes.
+    """
+    from ..reduction_strategy import ReductionStrategy
+
+    tile_strategy = device_function.tile_strategy
+    reduced_block_ids = _reduced_block_ids(device_function.codegen)
+    for strategy in tile_strategy.strategies:
+        if (
+            not isinstance(strategy, ReductionStrategy)
+            or strategy.block_index not in reduced_block_ids
+        ):
+            continue
+        count = strategy._reduction_thread_count()
+        axis = tile_strategy.thread_axis_for_strategy(strategy)
+        if count > 1 and axis is not None and axis < len(dims) and dims[axis] != count:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"reduction block {strategy.block_index} spans {count} lanes on "
+                f"thread axis {axis} but the launch {tuple(dims)} shared by the "
+                f"kernel's root loops runs {dims[axis]} there; the surplus lanes "
+                "would corrupt the cross-lane reduction",
+            )
 
 
 def _multi_phase_block_dims(
@@ -299,7 +360,6 @@ def _multi_phase_block_dims(
     # Local imports: these modules import ``compile_environment``, which
     # reaches this module back through ``backend_registry`` -> ``..backend``
     # before ``CompileEnvironment`` exists.
-    from ..inductor_lowering import ReductionLowering
     from ..reduction_strategy import ReductionStrategy
     from ..tile_strategy import PerThreadNDTileStrategy
 
@@ -340,12 +400,7 @@ def _multi_phase_block_dims(
             "lanes of another phase would corrupt the cross-lane reduction",
         )
 
-    reduced_block_ids = {
-        lowering.block_index
-        for graph in codegen.codegen_graphs
-        for node in graph.graph.nodes
-        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
-    }
+    reduced_block_ids = _reduced_block_ids(codegen)
     for strategy in tile_strategy.strategies:
         base_axis = tile_strategy.thread_axis_for_strategy(strategy)
         if base_axis is None:
@@ -1173,13 +1228,16 @@ def _graph_used_block_ids(
     fn: DeviceFunction,
     block_ids: list[int],
 ) -> set[int]:
+    from ...language import memory_ops
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
+    from ..variable_origin import BlockSizeOrigin
     from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
-    device_ir = HostFunction.current().device_ir
+    host_function = HostFunction.current()
+    device_ir = host_function.device_ir
     candidate_block_ids = set(block_ids)
     used: set[int] = set()
 
@@ -1263,6 +1321,22 @@ def _graph_used_block_ids(
             # A root coordinate can first be read inside a captured device
             # scope. Its thread distribution must remain live there as well.
             pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
+            if node.target is memory_ops.store:
+                # A store has no value; its index names every tile axis it
+                # writes, including axes a broadcast value does not carry.
+                # Like ``SubscriptIndexing.compute_shape``, only a tile itself
+                # spans its block; ``tile.id`` / ``tile.begin`` drop the dim.
+                for index in node.args[1]:
+                    if not isinstance(index, torch.fx.Node):
+                        continue
+                    index_value = index.meta.get("val")
+                    if not isinstance(index_value, torch.SymInt):
+                        continue
+                    origin = host_function.expr_to_origin.get(index_value._sympy_())
+                    if origin is not None and isinstance(
+                        origin.origin, BlockSizeOrigin
+                    ):
+                        visit_value(index_value)
             value = node.meta.get("val")
             if is_tensor_like_value(value):
                 visit_value(value)
@@ -3043,6 +3117,13 @@ class CuteBackend(Backend):
                 "kernel argument and the kernel's strategies share no single "
                 "launch shape",
             )
+        # The axes each root loop reads with their thread extents.  An axis the
+        # final kernel no longer reads (an index dead-code elimination removed)
+        # drops nothing.
+        root_read_axes = [
+            {axis: size for axis, size in root.items() if axis in final_thread_axes}
+            for root in codegen.root_read_axis_sizes
+        ]
         static_threads = functools.reduce(operator.mul, static_dims, 1)
         dynamic_threads = functools.reduce(operator.mul, dims, 1)
         has_nested_device_loops = any(
@@ -3083,6 +3164,7 @@ class CuteBackend(Backend):
             # separate strategy branches, which share no single launch
             # shape expression, so ``symbolic_axes`` declined above.
             check_thread_block_dims(phase_dims, context=str(phase_dims))
+            _reject_dropped_root_threads(phase_dims, root_read_axes)
             return launcher_args_with_compile_options(
                 f"block=({phase_dims[0]}, {phase_dims[1]}, {phase_dims[2]})"
             )
@@ -3152,6 +3234,9 @@ class CuteBackend(Backend):
             # the strategy's ``static_dims`` does not know about, so do not fall
             # back to ``static_dims`` (which would drop them) when they are live.
             and not codegen.cute_synthetic_arange_axis_sizes
+            # Nor when it is narrower than the root tile's live threads: the
+            # final launch guard below would refuse it.
+            and launch_drops_root_threads(static_dims, root_read_axes) is None
         ):
             dims = static_dims
         if (
@@ -3303,6 +3388,19 @@ class CuteBackend(Backend):
                             ),
                         )
 
+        if (
+            len(device_ir.grid_block_ids) > 1
+            and tcgen05_compact_dims is None
+            and not specialized_root_tcgen05
+            and not kernel_has_mma
+        ):
+            _reject_multi_root_reduction_surplus(device_function, dims)
+        if (
+            tcgen05_compact_dims is None
+            and not specialized_root_tcgen05
+            and not kernel_has_mma
+        ):
+            _reject_dropped_root_threads(dims, root_read_axes)
         if tcgen05_compact_dims is not None and any(
             launched < planned
             for launched, planned in zip(dims, tcgen05_compact_dims, strict=True)

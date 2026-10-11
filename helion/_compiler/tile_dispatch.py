@@ -568,15 +568,21 @@ class TileStrategyDispatch:
         warp-per-row layout would assign one axis per inner tile loop
         and bury M on axis 2 or 3.
 
+        This is the launch-side copy of the layout the kernel body emits
+        (``BlockSizeTileStrategy._compute_thread_axis_offset``): a reduction
+        claims an axis only when it spreads across threads, and tiles start
+        above the kernel-wide reduction reservation
+        (:meth:`reserved_reduction_axes`).
+
         A reduction that claims no axis (a single live thread on CuTe,
         ``ReductionStrategy._claims_thread_axis``) is parked on the lowest
-        axis no threaded reduction of the branch (or of another
-        ``hl.barrier()`` phase) holds.  It indexes with the constant 0 and
-        records no thread coordinate, so sharing that axis with a tile is
-        harmless, whereas sharing a threaded reduction's axis would let a
-        lookup of the block's axis extent read the other reduction's threads.
+        axis no threaded reduction of the branch (or of the kernel-wide
+        reservation) holds.  It indexes with the constant 0 and records no
+        thread coordinate, so sharing that axis with a tile is harmless,
+        whereas sharing a threaded reduction's axis would let a lookup of the
+        block's axis extent read the other reduction's threads.
         """
-        reserved_axes = self._multi_phase_reserved_reduction_axes()
+        reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
         )
@@ -608,9 +614,10 @@ class TileStrategyDispatch:
                 ):
                     # Mirror ``BlockSizeTileStrategy._compute_thread_axis_offset``:
                     # the body keeps the kernel-wide reduction axes reserved in
-                    # every ``hl.barrier()`` phase, so a phase without its own
-                    # reduction must place its tiles above them too or the
-                    # launch block dims would disagree with the body's axes.
+                    # every branch (another root loop, an ``hl.barrier()``
+                    # phase, a pid branch), so a branch with fewer reductions
+                    # must place its tiles above them too or the launch block
+                    # dims would disagree with the body's axes.
                     axis = max(axis, reserved_axes)
                 key = tuple(sorted(strategy.block_ids))
                 cached = seen_block_id_sets.get(key)
@@ -640,16 +647,16 @@ class TileStrategyDispatch:
             return target_axis
         return None
 
-    def _multi_phase_reserved_reduction_axes(self) -> int:
-        """Reduction axes every ``hl.barrier()`` phase keeps reserved.
+    def reserved_reduction_axes(self) -> int:
+        """Leading thread axes the kernel body reserves for reductions.
 
-        Same count as ``BlockSizeTileStrategy._compute_thread_axis_offset``
-        plans: one axis per reduction that spreads across threads, at least one
-        when any reduction claims an axis.  ``0`` for single-phase kernels,
-        whose branches already agree with the body's bookkeeping.
+        One axis per reduction that spreads across threads, at least one when
+        any reduction claims an axis, counted over the whole kernel (every root
+        loop, ``hl.barrier()`` phase and branch).  Tiles start above them both
+        in the body (``BlockSizeTileStrategy._compute_thread_axis_offset``) and
+        in the launch layout (:meth:`thread_axis_for_strategy`).  ``0`` when
+        the backend does not place reductions first.
         """
-        if len(HostFunction.current().device_ir.phases) <= 1:
-            return 0
         if not CompileEnvironment.current().backend.reduction_axis_first():
             return 0
         reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]

@@ -40,6 +40,8 @@ from .tile_strategy import PerThreadFlattenedTileStrategy
 from .tile_strategy import PerThreadNDTileStrategy
 from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
+from .tile_strategy import _grouped_two_stage_reduce_stmts
+from .tile_strategy import _grouped_warp_reduce_expr
 from .tile_strategy import _to_sympy
 
 if TYPE_CHECKING:
@@ -1710,6 +1712,25 @@ class PersistentReductionStrategy(ReductionStrategy):
         )
         return result_var
 
+    def _live_thread_axis_sizes(self, state: CodegenState) -> dict[int, int]:
+        """Thread extent per launch axis over the active loops and the grid."""
+        axis_sizes: dict[int, int] = {}
+        codegen = state.codegen
+        seen: set[int] = set()
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        current_grid = codegen.current_grid_state
+        if current_grid is not None:
+            for axis, size in current_grid.thread_axis_sizes.items():
+                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        return axis_sizes
+
     def _sibling_axis_group_params(
         self, state: CodegenState
     ) -> tuple[int, int, str, int, str] | None:
@@ -1741,21 +1762,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         if reduce_extent <= 1:
             return None
         reduce_axis = self._get_thread_axis()
-        axis_sizes: dict[int, int] = {}
-        codegen = state.codegen
-        seen: set[int] = set()
-        for loops in codegen.active_device_loops.values():
-            for loop_state in loops:
-                key = id(loop_state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                for axis, size in loop_state.thread_axis_sizes.items():
-                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
-        current_grid = codegen.current_grid_state
-        if current_grid is not None:
-            for axis, size in current_grid.thread_axis_sizes.items():
-                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        axis_sizes = self._live_thread_axis_sizes(state)
         if axis_sizes.get(reduce_axis, reduce_extent) != reduce_extent:
             # Another block shares the reduce axis with a different extent;
             # the linear-lane stride math below would not isolate this axis.
@@ -1814,6 +1821,119 @@ class PersistentReductionStrategy(ReductionStrategy):
                 return None
         return pre, group_span, lane_expr, num_threads // group_span, ""
 
+    def _cute_sibling_axis_reduction_expr(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
+        default_value: float | bool,
+    ) -> str | None:
+        """Thread combine for a reduce axis above live sibling thread axes.
+
+        A plain ``warp_reduction_*`` (or the ``pre=1`` cross-warp reduce)
+        folds consecutive linear lanes, which here are the sibling rows below
+        the reduce axis -- e.g. ``x[tile, :, :].sum(-1)`` with the middle full
+        slice on thread axis 0 -- rather than this axis.  Use the grouped
+        reductions that keep the ``pre`` interleaved sibling lanes distinct.
+        Returns ``None`` when the reduce axis is at the bottom of the lanes.
+        """
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if (
+            backend.name != "cute"
+            or self._thread_count <= 1
+            or self._synthetic_cute_lane_var is not None
+        ):
+            return None
+        reduce_axis = self._get_thread_axis()
+        axis_sizes = self._live_thread_axis_sizes(state)
+        pre = 1
+        for axis in range(reduce_axis):
+            pre *= axis_sizes.get(axis, 1)
+        if pre <= 1:
+            return None
+        params = self._sibling_axis_group_params(state)
+        if params is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{reduction_type} over thread axis {reduce_axis} interleaved "
+                f"with {pre} sibling lanes below it (thread axes {axis_sizes})",
+            )
+        pre, group_span, lane_expr, group_count, _ = params
+        # The warp combine needs the launch to match the axes up to this one
+        # (they order the warp lanes); the two-stage combine keys shared
+        # memory on the linear thread index, so it needs every launch axis.
+        planned_dims = self._planned_thread_dims()
+        checked_axes = (
+            range(reduce_axis + 1)
+            if group_span <= _CUTE_WARP_REDUCTION_THREADS
+            else range(len(planned_dims))
+        )
+        if any(axis_sizes.get(axis, 1) != planned_dims[axis] for axis in checked_axes):
+            launch = (
+                "hl.barrier() launch"
+                if len(HostFunction.current().device_ir.phases) > 1
+                else "launch"
+            )
+            raise exc.BackendUnsupported(
+                "cute",
+                f"persistent reduction over {self._thread_count} lanes cannot "
+                f"prove its thread group under the {launch} {planned_dims}",
+            )
+
+        def grouped_reduce(value: str, combine: str, identity: str) -> str:
+            if group_span <= _CUTE_WARP_REDUCTION_THREADS:
+                return _grouped_warp_reduce_expr(
+                    combine, value, identity, lane_expr, pre=pre, group_span=group_span
+                )
+            result_var = self.fn.new_var("persistent_reduce_result", dce=True)
+            for stmt in _grouped_two_stage_reduce_stmts(
+                result_var,
+                combine,
+                value,
+                identity,
+                lane_expr,
+                pre=pre,
+                group_span=group_span,
+                group_count=group_count,
+            ):
+                state.add_statement(stmt)
+            return result_var
+
+        indexed = backend.is_indexed_reduction(reduction_type)
+        # The input already carries the reduction promotion (bool sum ->
+        # Int64), so non-indexed combines run in the output's dtype.
+        dtype_str = _dtype_str(
+            get_computation_dtype((fake_input if indexed else fake_output).dtype)
+        )
+        identity_expr = backend.cast_expr(constant_repr(default_value), dtype_str)
+        input_expr = backend.cast_expr(input_name, dtype_str)
+        if not indexed:
+            return grouped_reduce(input_expr, reduction_type, identity_expr)
+        # argmin/argmax: the winning value, then the lowest index holding it.
+        value_var = self.fn.new_var("persistent_reduce_value", dce=True)
+        state.add_statement(
+            f"{value_var} = "
+            + grouped_reduce(
+                input_expr,
+                "min" if reduction_type == "argmin" else "max",
+                identity_expr,
+            )
+        )
+        index_dtype_str = backend.index_type_str(env.index_dtype)
+        max_index = backend.cast_expr(
+            repr(torch.iinfo(env.index_dtype).max), index_dtype_str
+        )
+        index = self.broadcast_str(self.index_var(self.block_index), fake_input, dim)
+        candidate = f"({index}) if (({input_expr}) == ({value_var})) else ({max_index})"
+        return backend.cast_expr(
+            grouped_reduce(candidate, "min", max_index),
+            backend.dtype_str(fake_output.dtype),
+        )
+
     def codegen_reduction(
         self,
         state: CodegenState,
@@ -1849,7 +1969,6 @@ class PersistentReductionStrategy(ReductionStrategy):
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
             self._synthetic_cute_lane_var is not None
-            and not backend.is_indexed_reduction(reduction_type)
             and isinstance(default, (float, int, bool))
             and not self._lane_reduce_marker_unsupported(state)
             and (threads := self._lane_reduce_threads_in_group()) is not None
@@ -1861,8 +1980,15 @@ class PersistentReductionStrategy(ReductionStrategy):
             # warp-combine across ``threads`` -> consume) structure.
             from .tile_strategy import _lane_reduce_marker_expr
 
+            # The input already carries the reduction promotion (bool sum ->
+            # Int64), which the accumulator dtype (the identity's) must match.
+            marker_dtype = (
+                acc_dtype
+                if backend.is_indexed_reduction(reduction_type)
+                else get_computation_dtype(fake_output.dtype)
+            )
             identity_expr = backend.cast_expr(
-                constant_repr(default), _dtype_str(acc_dtype)
+                constant_repr(default), _dtype_str(marker_dtype)
             )
             group_params = self._reshape_merged_reduction_group_params()
             physical_group = self._reshape_physical_reduction_group_params(state)
@@ -1876,51 +2002,103 @@ class PersistentReductionStrategy(ReductionStrategy):
                         "cute", "reshape reduction has conflicting physical groups"
                     )
             owner_lane = self._lane_reduce_owner(state, reshape_group=group_params)
-            if group_params is not None:
-                group_pre, group_span, group_lane_expr = group_params
-                expr = _lane_reduce_marker_expr(
-                    input_name,
-                    reduction_type,
-                    identity_expr,
-                    threads,
-                    group_pre=group_pre,
-                    group_span=group_span,
-                    group_lane_expr=group_lane_expr,
-                    owner_lane=owner_lane,
+            sibling_params = (
+                self._sibling_axis_group_params(state) if group_params is None else None
+            )
+
+            def marker(value: str, combine: str, identity: str) -> str:
+                if group_params is not None:
+                    group_pre, group_span, group_lane_expr = group_params
+                    return _lane_reduce_marker_expr(
+                        value,
+                        combine,
+                        identity,
+                        threads,
+                        group_pre=group_pre,
+                        group_span=group_span,
+                        group_lane_expr=group_lane_expr,
+                        owner_lane=owner_lane,
+                    )
+                if sibling_params is not None:
+                    (
+                        group_pre,
+                        group_span,
+                        group_lane_expr,
+                        group_count,
+                        shared_lane_expr,
+                    ) = sibling_params
+                    return _lane_reduce_marker_expr(
+                        value,
+                        combine,
+                        identity,
+                        threads,
+                        group_pre=group_pre,
+                        group_span=group_span,
+                        group_lane_expr=group_lane_expr,
+                        group_count=group_count,
+                        owner_lane=owner_lane,
+                        shared_lane_expr=shared_lane_expr,
+                    )
+                return _lane_reduce_marker_expr(
+                    value, combine, identity, threads, owner_lane=owner_lane
                 )
-            elif (sibling_params := self._sibling_axis_group_params(state)) is not None:
-                (
-                    group_pre,
-                    group_span,
-                    group_lane_expr,
-                    group_count,
-                    shared_lane_expr,
-                ) = sibling_params
-                expr = _lane_reduce_marker_expr(
-                    input_name,
-                    reduction_type,
-                    identity_expr,
-                    threads,
-                    group_pre=group_pre,
-                    group_span=group_span,
-                    group_lane_expr=group_lane_expr,
-                    group_count=group_count,
-                    owner_lane=owner_lane,
-                    shared_lane_expr=shared_lane_expr,
-                )
+
+            if not backend.is_indexed_reduction(reduction_type):
+                expr = marker(input_name, reduction_type, identity_expr)
             else:
-                expr = _lane_reduce_marker_expr(
-                    input_name,
-                    reduction_type,
-                    identity_expr,
-                    threads,
-                    owner_lane=owner_lane,
+                # argmin/argmax: the winning value across the lanes, then the
+                # lowest index holding it, as two dependent lane reductions.
+                # The post-pass slices each marker's input by name, so it
+                # stays a plain variable; the accumulator applies the cast.
+                value_var = self.fn.new_var("lane_reduce_value", dce=True)
+                state.add_statement(
+                    f"{value_var} = "
+                    + marker(
+                        input_name,
+                        "min" if reduction_type == "argmin" else "max",
+                        identity_expr,
+                    )
+                )
+                max_index = backend.cast_expr(
+                    repr(torch.iinfo(env.index_dtype).max),
+                    backend.index_type_str(env.index_dtype),
+                )
+                index = self.broadcast_str(
+                    self.index_var(self.block_index), fake_input, dim
+                )
+                input_expr = backend.cast_expr(input_name, _dtype_str(acc_dtype))
+                candidate_var = self.fn.new_var("lane_reduce_index", dce=True)
+                state.add_statement(
+                    f"{candidate_var} = ({index}) if (({input_expr}) == "
+                    f"({value_var})) else ({max_index})"
+                )
+                expr = backend.cast_expr(
+                    marker(candidate_var, "min", max_index),
+                    backend.dtype_str(fake_output.dtype),
                 )
             return expr_from_string(
                 self.maybe_reshape(expr, dim, fake_input, fake_output)
             )
+        if self._synthetic_cute_lane_var is not None and backend.is_indexed_reduction(
+            reduction_type
+        ):
+            # Without the lane marker each synthetic lane would overwrite the
+            # previous lane's result.
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{reduction_type} over a reduction axis split across synthetic "
+                "lanes whose lane reduction cannot be split into two passes",
+            )
         if isinstance(default, (float, int, bool)):
-            cross_warp = self._cute_cross_warp_reduction_expr(
+            cross_warp = self._cute_sibling_axis_reduction_expr(
+                state,
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+                default,
+            ) or self._cute_cross_warp_reduction_expr(
                 state, input_name, reduction_type, default, acc_dtype
             )
         else:

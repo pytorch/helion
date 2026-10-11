@@ -14,11 +14,20 @@ A single-thread reduction also claims no thread axis of its own
 head dim differs from the q/k head dim holds four reduction dims (the two head
 dims plus the two tile-sized dims its causal mask's ``tile.index[...]`` slices
 allocate), and handing each a private axis ran past the three hardware axes.
+
+The launch layout (``TileStrategyDispatch.thread_axis_for_strategy``, which
+sizes the launch block) must not count an axis for it either:
+``x[tile, :] @ w[:, :]`` with a 32-thread K reduction beside a one-thread N
+lane put the row tile on axis 1 in the body and on axis 2 in the launch, which
+ran ``block=(32, 1, 32)`` and stored one row per tile.  The launch also
+reserves the kernel-wide reduction axes in a root loop without reductions, as
+the body does.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from unittest.mock import patch
 
 import pytest
@@ -28,6 +37,12 @@ from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion import exc
+from helion._compiler.cute.backend import launch_drops_root_threads
+from helion._compiler.reduction_strategy import ReductionStrategy
+from helion._compiler.tile_dispatch import TileStrategyDispatch
+from helion._compiler.tile_strategy import BlockSizeTileStrategy
+from helion._compiler.tile_strategy import TileStrategy
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -56,6 +71,85 @@ def _row_sum(x: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(x.size(0)):
         out[tile_m] = x[tile_m, :].sum(-1)
     return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _full_slice_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), w.size(1)], device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m, :] = x[tile_m, :] @ w[:, :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _softmax_full_slice_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), w.size(1)], device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        p = torch.softmax(x[tile_m, :], dim=-1)
+        out[tile_m, :] = p @ w[:, :] + x[tile_m, :].sum(-1, keepdim=True)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _scaled_rows_and_inner_tiles(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(y)
+    shifted = torch.empty_like(z)
+    for tile_m in hl.tile(x.size(0)):
+        rows = x[tile_m, :]
+        out[tile_m, :] = y[tile_m, :] * rows.sum(-1, keepdim=True)
+        for tile_d in hl.tile(z.size(1)):
+            shifted[tile_m, tile_d] = z[tile_m, tile_d] + 1
+    return out, shifted
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _doubled_then_incremented(x: torch.Tensor) -> torch.Tensor:
+    doubled = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        doubled[tile] = x[tile] * 2
+    hl.barrier()
+    for tile in hl.tile(x.size(0)):
+        out[tile] = doubled[tile] + 1
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _row_sums_then_doubled(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sums = torch.empty([x.size(0)], device=x.device)
+    doubled = torch.empty_like(y)
+    for tile_m in hl.tile(x.size(0)):
+        sums[tile_m] = x[tile_m, :].sum(-1)
+    for tile_n in hl.tile(y.size(0)):
+        doubled[tile_n] = y[tile_n] * 2
+    return sums, doubled
+
+
+def _root_launch_threads(code: str) -> tuple[int, int]:
+    """The launch's thread count on the root tile's axis and the root block size."""
+    axis = re.search(
+        r"_BLOCK_SIZE_0 \+ cutlass\.Int32\(cute\.arch\.thread_idx\(\)\[(\d)\]\)",
+        code,
+    )
+    block_size = re.search(r"^_BLOCK_SIZE_0 = (\d+)$", code, re.MULTILINE)
+    launch = re.search(r"block=\((\d+), (\d+), (\d+)\)", code)
+    assert axis is not None and block_size is not None and launch is not None, code
+    return int(launch.group(int(axis.group(1)) + 1)), int(block_size.group(1))
+
+
+_plan_thread_axis = TileStrategyDispatch.thread_axis_for_strategy
+
+
+def _shift_tile_axes(self: TileStrategyDispatch, target: TileStrategy) -> int | None:
+    """A launch layout one axis too high for every tile."""
+    axis = _plan_thread_axis(self, target)
+    if axis is not None and not isinstance(target, ReductionStrategy):
+        return axis + 1
+    return axis
 
 
 def _synthetic_lane_index_lines(code: str) -> list[str]:
@@ -296,3 +390,112 @@ class TestCuteSingleThreadReduction(TestCase):
         torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
         self.assertIn("block=(256, 4, 1)", code)
         self.assertNotIn("thread_idx()[3]", code)
+
+    def test_full_slice_matmul_launches_every_row(self) -> None:
+        # The 32-thread K reduction claims axis 0 and the N lane (one thread
+        # once K x rows fill the budget) claims none, so the rows are on
+        # axis 1 for the body and the launch alike.
+        for m, k, n in ((64, 32, 16), (32, 32, 8), (37, 20, 10), (128, 32, 3)):
+            torch.manual_seed(0)
+            x = torch.randn(m, k, device=DEVICE)
+            w = torch.randn(k, n, device=DEVICE)
+            with self.subTest(m=m, k=k, n=n):
+                code, out = code_and_output(_full_slice_matmul, (x, w))
+                torch.testing.assert_close(out, x @ w, rtol=1e-4, atol=1e-4)
+                launched, rows = _root_launch_threads(code)
+                self.assertEqual(launched, rows, code)
+
+    def test_full_slice_matmul_after_reductions_launches_every_row(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(64, 32, device=DEVICE)
+        w = torch.randn(32, 16, device=DEVICE)
+        code, out = code_and_output(_softmax_full_slice_matmul, (x, w))
+        expected = torch.softmax(x, dim=-1) @ w + x.sum(-1, keepdim=True)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        launched, rows = _root_launch_threads(code)
+        self.assertEqual(launched, rows, code)
+
+    def test_inner_tile_loop_beside_single_thread_reduction(self) -> None:
+        # The 32-thread x reduction and the one-thread y slice are both live
+        # when the inner tile loop is placed: it goes right above the rows, as
+        # in the launch layout, not one axis higher per live reduction.
+        torch.manual_seed(0)
+        x = torch.randn(64, 32, device=DEVICE)
+        y = torch.randn(64, 64, device=DEVICE)
+        z = torch.randn(64, 16, device=DEVICE)
+        for block_sizes in ([32, 4], [64, 2], [8, 4]):
+            with self.subTest(block_sizes=block_sizes):
+                code, (out, shifted) = code_and_output(
+                    _scaled_rows_and_inner_tiles, (x, y, z), block_sizes=block_sizes
+                )
+                torch.testing.assert_close(
+                    out, y * x.sum(-1, keepdim=True), rtol=1e-4, atol=1e-4
+                )
+                torch.testing.assert_close(shifted, z + 1)
+
+    def test_root_without_reduction_beside_a_reducing_root(self) -> None:
+        # The body places the second root's 256 threads above the first
+        # root's reduction axis; the launch used to put them on axis 0.
+        torch.manual_seed(0)
+        x = torch.randn(64, 32, device=DEVICE)
+        y = torch.randn(100, device=DEVICE)
+        code, (sums, doubled) = code_and_output(
+            _row_sums_then_doubled, (x, y), block_sizes=[1, 256]
+        )
+        torch.testing.assert_close(sums, x.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(doubled, y * 2)
+        self.assertIn("block=(4, 256, 1)", code)
+
+    def test_launch_layout_mismatch_is_rejected(self) -> None:
+        # A launch layout that disagrees with the body is refused where the
+        # body places the tile, and, past that check, by the launch guard
+        # rather than launching too few rows.
+        x = torch.randn(64, 32, device=DEVICE)
+        w = torch.randn(32, 16, device=DEVICE)
+        with patch.object(
+            TileStrategyDispatch, "thread_axis_for_strategy", _shift_tile_axes
+        ):
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "thread-axis layout mismatch"
+            ):
+                code_and_output(_full_slice_matmul, (x, w), block_sizes=[32])
+            with (
+                patch.object(
+                    BlockSizeTileStrategy,
+                    "_check_launch_thread_axis",
+                    lambda self, offset: offset,
+                ),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "drops threads of a root tile"
+                ),
+            ):
+                code_and_output(_full_slice_matmul, (x, w), block_sizes=[32])
+
+    def test_barrier_launch_dropping_root_threads_is_rejected(self) -> None:
+        # hl.barrier() kernels size their launch separately
+        # (``_multi_phase_block_dims``); the root guard checks that shape too.
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
+        _code, out = code_and_output(
+            _doubled_then_incremented, (x,), block_sizes=[32, 32]
+        )
+        torch.testing.assert_close(out, x * 2 + 1)
+        with (
+            patch(
+                "helion._compiler.cute.backend._multi_phase_block_dims",
+                return_value=(1, 1, 1),
+            ),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported, "drops threads of a root tile"
+            ),
+        ):
+            code_and_output(_doubled_then_incremented, (x,), block_sizes=[32, 32])
+
+    def test_launch_drops_root_threads(self) -> None:
+        self.assertEqual(launch_drops_root_threads((32, 1, 32), [{1: 32}]), (1, 32))
+        self.assertIsNone(launch_drops_root_threads((32, 32, 1), [{1: 32}]))
+        # A wider sibling root that never reads axis 1 records no extent for
+        # it; the narrower reader's 8 threads are launched.
+        self.assertIsNone(launch_drops_root_threads((8, 8, 1), [{1: 8}, {0: 8, 1: 4}]))
+        self.assertEqual(
+            launch_drops_root_threads((8, 2, 1), [{1: 8}, {0: 8, 1: 4}]), (1, 8)
+        )

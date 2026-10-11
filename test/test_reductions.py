@@ -1413,6 +1413,56 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected_y = (y_f * inv_rms_y[:, None] * w2.float()).half()
         torch.testing.assert_close(out_y, expected_y, rtol=1e-2, atol=1e-2)
 
+    @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")
+    def test_double_sum_of_two_full_slices(self):
+        """``x[i, :, :].sum(-1).sum(-1)``: both ``:`` dims spread over threads,
+        so the second reduction combines lanes strided by the first's."""
+
+        @helion.kernel(autotune_effort="none")
+        def double_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.grid(x.size(0)):
+                out[i] = x[i, :, :].sum(-1).sum(-1)
+            return out
+
+        for shape in [(3, 4, 8), (3, 16, 32)]:
+            x = torch.randn(shape, device=DEVICE)
+            _, out = code_and_output(double_sum, (x,))
+            torch.testing.assert_close(out, x.sum((1, 2)), rtol=1e-4, atol=1e-4)
+
+    @skipIfPallas("Pallas TPU cannot write the int64 count and argmax outputs")
+    @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")
+    def test_reduce_last_of_two_full_slices(self):
+        """Reduce the last of two ``:`` dims; the middle one stays a live axis."""
+
+        @helion.kernel(autotune_effort="none")
+        def reduce_last(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            a, b, _c = x.shape
+            sums = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            maxes = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            positives = torch.empty([a, b], dtype=torch.int64, device=x.device)
+            argmaxes = torch.empty([a, b], dtype=torch.int64, device=x.device)
+            for tile_a in hl.tile(a):
+                tile = x[tile_a, :, :]
+                sums[tile_a, :] = tile.sum(-1)
+                maxes[tile_a, :] = tile.amax(-1)
+                positives[tile_a, :] = (tile > 0).sum(-1)
+                argmaxes[tile_a, :] = tile.argmax(-1)
+            return sums, maxes, positives, argmaxes
+
+        # (2, 2, 1024) splits the reduced dim across synthetic lanes.
+        for shape in [(4, 8, 32), (8, 2, 16), (2, 64, 4), (2, 2, 1024)]:
+            x = torch.randn(shape, device=DEVICE)
+            _code, (sums, maxes, positives, argmaxes) = code_and_output(
+                reduce_last, (x,), block_sizes=[2]
+            )
+            torch.testing.assert_close(sums, x.sum(-1), rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(maxes, x.amax(-1))
+            torch.testing.assert_close(positives, (x > 0).sum(-1))
+            torch.testing.assert_close(argmaxes, x.argmax(-1))
+
     @skipIfNotCUDA()
     @skipIfRefEager(
         "promoted-seed reduction_loops is only materialized in compiled mode"

@@ -7192,6 +7192,10 @@ class DeviceGridState(DeviceLoopOrGridState):
     # loops OUTSIDE the one-vector tile wrappers (register-tile reductions,
     # see ``nest_reduction_lane_outside_vector_tiles``).
     constexpr_lane_vars: set[str] = dataclasses.field(default_factory=set)
+    # The thread extents of the root tile's own axes when the grid became
+    # active, before the body's reductions added theirs to
+    # ``thread_axis_sizes`` (``GenerateAST.set_active_loops``).
+    root_axis_sizes: dict[int, int] = dataclasses.field(default_factory=dict)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -8197,45 +8201,38 @@ class BlockSizeTileStrategy(TileStrategy):
                 if env.backend.reduction_axis_first() and isinstance(
                     loop_state.strategy, ReductionStrategy
                 ):
-                    active_reduction_axes += axes
+                    # A reduction with one live thread reserves no axis (see
+                    # ``planned_reduction_axes`` below).
+                    if loop_state.strategy._reduction_thread_count() > 1:
+                        active_reduction_axes += axes
                 else:
                     active_non_reduction_axes += axes
 
         if not env.backend.reduction_axis_first():
             return active_non_reduction_axes + active_reduction_axes
 
-        # Reserve through the highest axis assigned to a coexecuting
-        # multi-thread reduction or full slice. Counting strategies can miss
-        # gaps in those assignments and make tile indices overlap a reduction
-        # axis. Single-thread reductions use constant zero and need no axis.
-        reduction_strategies = [
-            strategy
-            for strategy in self.fn.tile_strategy.strategies
-            if isinstance(strategy, ReductionStrategy)
-        ]
-        planned_reduction_axes = max(
-            max(
-                (
-                    axis + strategy.thread_axes_used()
-                    for strategy in reduction_strategies
-                    if strategy._reduction_thread_count() > 1
-                    and self.fn.tile_strategy.strategies_can_coexecute(self, strategy)
-                    and (
-                        axis := self.fn.tile_strategy.thread_axis_for_strategy(strategy)
-                    )
-                    is not None
-                ),
-                default=0,
-            ),
-            1
-            if any(strategy.thread_axes_used() > 0 for strategy in reduction_strategies)
-            else 0,
-        )
+        # Reduction strategies claim axes 0..n-1 in creation order
+        # (``_get_thread_axis``), so reserving only one axis when two
+        # multi-thread reductions are live would place this strategy on the
+        # same axis as the second reduction. That collision double-books the
+        # axis (e.g. a tile axis planned for 2 threads sharing thread_idx[1]
+        # with a 4-thread reduction), making the generated tile indices span
+        # more elements than the tile holds. Reserve one axis per reduction
+        # that actually spreads across threads; single-thread reductions
+        # (thread_idx is constant 0 on their axis) may share an axis safely.
+        # The reservation is kernel-wide (it also counts reductions of other
+        # root loops and ``hl.barrier()`` phases);
+        # ``TileStrategyDispatch.thread_axis_for_strategy`` applies the same
+        # reservation so the launch block dims agree with the axes the body
+        # indexes.
+        planned_reduction_axes = self.fn.tile_strategy.reserved_reduction_axes()
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
             for block_id in self.block_ids
         ):
-            return active_non_reduction_axes + active_reduction_axes
+            return self._check_launch_thread_axis(
+                active_non_reduction_axes + active_reduction_axes
+            )
         reserved_reduction_axes = max(planned_reduction_axes, active_reduction_axes)
         offset = reserved_reduction_axes + active_non_reduction_axes
         tile_axes = set(range(offset, offset + self.thread_axes_used()))
@@ -8260,6 +8257,29 @@ class BlockSizeTileStrategy(TileStrategy):
                     f"{self.block_ids} and reduction/slice block "
                     f"{strategy.block_index} both require axis {axes}",
                 )
+        return self._check_launch_thread_axis(offset)
+
+    def _check_launch_thread_axis(self, offset: int) -> int:
+        """Return ``offset``, the first thread axis the body gives this
+        strategy, after checking that the launch layout agrees.
+
+        The launch block dims, the surplus-thread masks and every shared
+        memory exchange read the layout from
+        ``TileStrategyDispatch.thread_axis_for_strategy``; a body indexing
+        another axis would run with the wrong thread counts (rows of the tile
+        never launched, or launched without their masks).
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name != "cute" or self.thread_axes_used() == 0:
+            return offset
+        planned = self.fn.tile_strategy.thread_axis_for_strategy(self)
+        if planned is not None and planned != offset:
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"thread-axis layout mismatch: the kernel body places tile "
+                f"blocks {self.block_ids} on thread axis {offset} but the launch "
+                f"layout plans axis {planned}",
+            )
         return offset
 
     def select_pid_strategy(self) -> ProgramIDs:
@@ -10317,6 +10337,37 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             vec_lane_wrappers=vec_wrappers,
         )
 
+    def _lane_nesting_order(self, state: CodegenState) -> list[int]:
+        """Block ids of this device loop's serial lanes, outermost first.
+
+        A thread visits the same elements in any lane nesting, so follow
+        ``loop_order`` except that a lane whose block is reduced in the loop
+        body nests inside the others: the lane reduction lowering finalizes a
+        reduction in its owner lane, which must be the innermost rolled lane
+        (``validate_lane_reduce_owners``).
+        """
+        from .inductor_lowering import ReductionLowering
+
+        env = CompileEnvironment.current()
+        graph_info = getattr(state.codegen, "_cute_active_graph_info", None)
+        reduced = (
+            set()
+            if graph_info is None
+            else {
+                env.canonical_block_id(lowering.block_index)
+                for node in graph_info.graph.nodes
+                if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+            }
+        )
+        return sorted(
+            (
+                block_id
+                for block_id in (self.block_ids[i] for i in self.loop_order)
+                if block_id in self._lane_var_by_block
+            ),
+            key=lambda block_id: env.canonical_block_id(block_id) in reduced,
+        )
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         self._demote_blocks_beyond_thread_axes(state)
         if (
@@ -10341,9 +10392,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         # inner constexpr loop, so per-thread bytes-per-load grow from
         # ``sizeof(dtype)`` to ``V * sizeof(dtype)`` (LDG.64 / LDG.128).
         lane_loops_meta: list[tuple[int, str, int, int]] = []
-        for block_id in (self.block_ids[i] for i in self.loop_order):
-            if block_id not in self._lane_var_by_block:
-                continue
+        for block_id in self._lane_nesting_order(state):
             lane_var = self._lane_var_by_block[block_id]
             extent = self._elements_per_thread_for_block(block_id)
             vec_width = self._cute_lane_vec_width_by_block.get(block_id, 1)

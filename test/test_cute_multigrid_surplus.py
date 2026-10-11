@@ -61,6 +61,19 @@ def _two_fixed_axes(
     return out, other
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sums_and_row_maxes(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sums = torch.empty([x.size(0)], device=x.device)
+    maxes = torch.empty([y.size(0)], device=y.device)
+    for tile in hl.tile(x.size(0)):
+        sums[tile] = x[tile, :].sum(-1)
+    for tile in hl.tile(y.size(0)):
+        maxes[tile] = y[tile, :].amax(-1)
+    return sums, maxes
+
+
 def _config(
     *,
     second_tile: int = 512,
@@ -391,3 +404,32 @@ def test_multigrid_no_lane_root_keeps_coordinate_setup(reverse, tail, wide_first
     torch.testing.assert_close(first_storage, expected_first, rtol=0, atol=0)
     torch.testing.assert_close(second_storage, expected_second, rtol=0, atol=0)
     torch.testing.assert_close((x, y), before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("x_shape", "y_shape"), [((16, 8), (8, 40)), ((64, 32), (32, 16))]
+)
+def test_reduction_narrower_than_the_shared_launch_is_rejected(
+    x_shape: tuple[int, int], y_shape: tuple[int, int]
+) -> None:
+    # Each root reduces its rows over its own lane count, but the roots share
+    # the widest launch: the narrower reduction's surplus lanes read past its
+    # row, reduce among themselves and race the row's result.
+    with pytest.raises(exc.BackendUnsupported, match="surplus lanes"):
+        _code(
+            _row_sums_and_row_maxes,
+            (torch.empty(x_shape), torch.empty(y_shape)),
+            helion.Config(block_sizes=[1, 1]),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_reductions_spanning_the_shared_launch_run() -> None:
+    x = torch.randn(64, 32, device=DEVICE)
+    y = torch.randn(48, 32, device=DEVICE)
+    run = _row_sums_and_row_maxes._bind_isolated((x, y)).compile_config(
+        helion.Config(block_sizes=[1, 1])
+    )
+    sums, maxes = run(x, y)
+    torch.testing.assert_close(sums, x.sum(-1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(maxes, y.amax(-1))

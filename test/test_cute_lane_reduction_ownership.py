@@ -2554,3 +2554,30 @@ def test_tile_id_source_load_keeps_uniform_value_with_store_owner_masks(complete
     assert any(("mask_1" in (mask or "")) != complete for mask in writes)
     actual, _launches = _execute_pointwise_thread_program(source, (x, weights))
     torch.testing.assert_close(actual, weights, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _group_absmax(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    groups = n // 128
+    out = torch.empty([m, groups], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m, block_size=1):
+        for tile_g, tile_n in hl.tile([groups, 128], block_size=[None, 128]):
+            columns = tile_g.index[:, None] * 128 + tile_n.index[None, :]
+            values = x[tile_m.index[:, None, None], columns[None, :, :]].abs()
+            out[tile_m, tile_g] = torch.amax(values, dim=-1)
+    return out
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("loop_order", [[0, 1], [1, 0]])
+def test_reduced_device_loop_lane_nests_innermost(loop_order: list[int]) -> None:
+    """Both blocks of the inner loop run as serial lanes on one thread.  The
+    lane of the reduced ``tile_n`` nests inside the ``tile_g`` lane for either
+    ``loop_order``: the lane reduction finalizes in its innermost owner."""
+    x = torch.randn(4, 2048, device=DEVICE)
+    code, out = code_and_output(
+        _group_absmax, (x,), block_sizes=[16], loop_orders=[loop_order]
+    )
+    torch.testing.assert_close(out, x.view(4, 16, 128).abs().amax(-1))
+    assert code.index("for lane_1 in range(") < code.index("for lane_2 in range(")

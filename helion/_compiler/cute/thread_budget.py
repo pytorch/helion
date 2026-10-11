@@ -10,8 +10,10 @@ import math
 from typing import TYPE_CHECKING
 
 from ... import exc
+from .simplify_proven_bounds import _axis_index
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -34,6 +36,11 @@ CUTE_REGISTER_TILE_MAX_ELEMENTS = 64
 # every reduction, one register each.  Three full tiles already approach the
 # 255-register file; wider tiles reject the config instead of spilling.
 CUTE_REGISTER_TILE_MAX_LIVE_VALUES = 3 * CUTE_REGISTER_TILE_MAX_ELEMENTS
+
+
+def thread_idx_axis(node: ast.AST) -> int | None:
+    """The axis of a ``cute.arch.thread_idx()[k]`` subscript, else ``None``."""
+    return _axis_index(node, "thread_idx")
 
 
 def tile_loop_thread_count(
