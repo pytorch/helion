@@ -481,8 +481,13 @@ def save_binding(
     input_key = bound._generated_code_input_key
     if key is None or input_key is None or should_skip_cache():
         return
-    _, guards, extra_results, compiler_seed_results, _ = input_key
-    if None in guards:
+    signature, guards, extra_results, compiler_seed_results, _ = input_key
+    # The binding is only valid under the schema its signature published in
+    # this process: the frontend may have keyed guards this binding cannot
+    # serialize (``None``), or a dynamic-shape compile may have added guard
+    # facts after binding. Either way the saved guards would accept inputs
+    # the generated code was not compiled for, so the binding is not saved.
+    if None in guards or bound.kernel._published_guards.get(signature) != guards:
         return
     schema: dict[str, list[object]] = {
         "guards": list(guards),

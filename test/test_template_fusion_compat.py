@@ -16,6 +16,7 @@ def clear_version_caches():
     def clear():
         _compat.requires_torch_version.cache_clear()
         _compat.torch_uses_template_producer_fusion.cache_clear()
+        _compat.supports_torch_compile_template_lowering.cache_clear()
         _compat.supports_torch_compile_fusion.cache_clear()
 
     clear()

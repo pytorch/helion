@@ -1484,7 +1484,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(),
+            config_spec=SimpleNamespace(
+                backend=SimpleNamespace(supports_precompile=lambda: True)
+            ),
         )
         with patch.dict(
             os.environ,
@@ -1616,7 +1618,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(compiler_seed_timeout_retry_repetitions=None),
+            config_spec=SimpleNamespace(
+                compiler_seed_timeout_retry_repetitions=None,
+                backend=SimpleNamespace(supports_precompile=lambda: True),
+            ),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)
@@ -1841,7 +1846,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(compiler_seed_timeout_retry_repetitions=None),
+            config_spec=SimpleNamespace(
+                compiler_seed_timeout_retry_repetitions=None,
+                backend=SimpleNamespace(supports_precompile=lambda: True),
+            ),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)

@@ -12,12 +12,45 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+# CuTe walks virtual pids with a typed Python range() and takes _NUM_SM as a
+# cutlass constexpr; everything else is shared persistent-kernel codegen.
+if _get_backend() == "cute":
+    _PID_LOOP = "for virtual_pid in range("
+    _BLOCKED_PID_LOOP = (
+        "for virtual_pid in range(cutlass.Int32(start_pid), cutlass.Int32(end_pid)):"
+    )
+    _NUM_SM_PARAM = "_NUM_SM: cutlass.Constexpr"
+else:
+    _PID_LOOP = "for virtual_pid in tl.range"
+    _BLOCKED_PID_LOOP = "for virtual_pid in tl.range(start_pid, end_pid):"
+    _NUM_SM_PARAM = "_NUM_SM: tl.constexpr"
+
+
+def _blocked_pid_chunk(grid: str) -> str:
+    """Return the per-worker chunk size of a blocked loop over ``grid`` workers."""
+    if _get_backend() == "cute":
+        divisor = grid if grid == "_NUM_SM" else f"({grid})"
+        return f"(total_pids + {grid} - 1) // {divisor}"
+    return f"tl.cdiv(total_pids, {grid})"
+
+
+def _interleaved_pid_range(step: str) -> str:
+    """Return the range header of an interleaved loop striding by ``step``."""
+    if _get_backend() == "cute":
+        return (
+            "cutlass.Int32(cute.arch.block_idx()[0])), cutlass.Int32(total_pids), "
+            f"cutlass.Int32({step})"
+        )
+    return f"tl.range(tl.program_id(0), total_pids, {step}"
 
 
 # Global kernel definitions to avoid duplication
@@ -60,7 +93,7 @@ def add1_kernel(x: torch.Tensor) -> torch.Tensor:
     return result
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestPersistentKernels(RefEagerTestBase, TestCase):
     """Test persistent kernel codegen with different PID strategies."""
 
@@ -129,8 +162,12 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         expected = torch.matmul(args[0], args[1])
         torch.testing.assert_close(result_persistent, expected, atol=1e-1, rtol=1e-2)
 
-        # Check that code contains persistent loop structure
-        self.assertIn("for virtual_pid in tl.range", code_persistent)
+        # Check that code contains persistent loop structure.  CuTe matmuls
+        # walk their tiles with the tcgen05 static persistent tile scheduler.
+        if _get_backend() == "cute":
+            self.assertIn("StaticPersistentTileScheduler", code_persistent)
+        else:
+            self.assertIn(_PID_LOOP, code_persistent)
         self.assertIn("virtual_pid", code_persistent)
 
     def test_persistent_interleaved_matmul(self):
@@ -164,8 +201,12 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         expected = torch.matmul(args[0], args[1])
         torch.testing.assert_close(result_persistent, expected, atol=1e-1, rtol=1e-2)
 
-        # Check that code contains persistent loop structure
-        self.assertIn("for virtual_pid in tl.range", code_persistent)
+        # Check that code contains persistent loop structure.  CuTe matmuls
+        # walk their tiles with the tcgen05 static persistent tile scheduler.
+        if _get_backend() == "cute":
+            self.assertIn("StaticPersistentTileScheduler", code_persistent)
+        else:
+            self.assertIn(_PID_LOOP, code_persistent)
         self.assertIn("virtual_pid", code_persistent)
 
     def test_persistent_blocked_3d(self):
@@ -484,11 +525,11 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_persistent_l2, expected)
 
         # Check that persistent + L2 grouping code contains both features
-        self.assertIn("for virtual_pid in tl.range", code_persistent_l2)
+        self.assertIn(_PID_LOOP, code_persistent_l2)
         self.assertIn("num_pid_in_group", code_persistent_l2)
         self.assertIn("group_id", code_persistent_l2)
         # Check that NUM_SM is used in device code and get_num_sm() in host code
-        self.assertIn("_NUM_SM: tl.constexpr", code_persistent_l2)
+        self.assertIn(_NUM_SM_PARAM, code_persistent_l2)
         self.assertIn("helion.runtime.get_num_sm(", code_persistent_l2)
 
     def test_shared_program_id_with_persistent_basic_functionality(self):
@@ -534,9 +575,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Check that code contains persistent loop with ForEachProgramID structure
         # The new implementation correctly combines persistent kernels with ForEachProgramID
-        self.assertIn(
-            "for virtual_pid in tl.range(start_pid, end_pid)", code_persistent_shared
-        )
+        self.assertIn(_BLOCKED_PID_LOOP, code_persistent_shared)
         self.assertIn("pid_shared = virtual_pid", code_persistent_shared)
         self.assertIn("if pid_shared <", code_persistent_shared)
         # Should have the combined total calculation
@@ -546,7 +585,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         )
         # Grid should use SM count for persistent kernels
         # Check that NUM_SM is used in device code and get_num_sm() in host code
-        self.assertIn("_NUM_SM: tl.constexpr", code_persistent_shared)
+        self.assertIn(_NUM_SM_PARAM, code_persistent_shared)
         self.assertIn("helion.runtime.get_num_sm(", code_persistent_shared)
 
     def test_simple_persistent_kernels_work(self):
@@ -573,9 +612,9 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Verify correct grid size and loop structure
         # Check that NUM_SM is used in device code and get_num_sm() in host code
-        self.assertIn("_NUM_SM: tl.constexpr", code_blocked)
+        self.assertIn(_NUM_SM_PARAM, code_blocked)
         self.assertIn("helion.runtime.get_num_sm(", code_blocked)
-        self.assertIn("for virtual_pid in tl.range", code_blocked)
+        self.assertIn(_PID_LOOP, code_blocked)
 
         # Test persistent_interleaved
         code_interleaved, result_interleaved = code_and_output(
@@ -585,9 +624,9 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Verify correct grid size and loop structure
         # Check that NUM_SM is used in device code and get_num_sm() in host code
-        self.assertIn("_NUM_SM: tl.constexpr", code_interleaved)
+        self.assertIn(_NUM_SM_PARAM, code_interleaved)
         self.assertIn("helion.runtime.get_num_sm(", code_interleaved)
-        self.assertIn("for virtual_pid in tl.range", code_interleaved)
+        self.assertIn(_PID_LOOP, code_interleaved)
 
     def test_persistent_reserved_sms_setting_applies(self):
         """Ensure persistent_reserved_sms is threaded into host code for persistent kernels."""
@@ -759,7 +798,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_blocked, expected)
 
         # Should have the correct loop structure
-        self.assertIn("for virtual_pid in tl.range(start_pid, end_pid):", code_blocked)
+        self.assertIn(_BLOCKED_PID_LOOP, code_blocked)
         self.assertIn("pid_0 = virtual_pid %", code_blocked)
         self.assertIn("pid_1 = virtual_pid //", code_blocked)
 
@@ -770,10 +809,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_interleaved, expected)
 
         # Should have the correct loop structure
-        self.assertIn(
-            "for virtual_pid in tl.range(tl.program_id(0), total_pids, _NUM_SM):",
-            code_interleaved,
-        )
+        self.assertIn(f"{_interleaved_pid_range('_NUM_SM')}):", code_interleaved)
         self.assertIn("pid_0 = virtual_pid %", code_interleaved)
         self.assertIn("pid_1 = virtual_pid //", code_interleaved)
 
@@ -792,6 +828,12 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             torch.randn([1024], device=DEVICE),
         )
         expected = args[0] + args[1]
+        # CuTe's default config flattens the 1D tile, naming its pid pid_flat
+        pid_assign = (
+            "pid_flat = virtual_pid"
+            if _get_backend() == "cute"
+            else "pid_0 = virtual_pid"
+        )
 
         # Test persistent_blocked with 1D
         code_blocked, result_blocked = code_and_output(
@@ -800,8 +842,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_blocked, expected)
 
         # Verify 1D persistent loop structure
-        self.assertIn("for virtual_pid in tl.range", code_blocked)
-        self.assertIn("pid_0 = virtual_pid", code_blocked)
+        self.assertIn(_PID_LOOP, code_blocked)
+        self.assertIn(pid_assign, code_blocked)
         self.assertNotIn("pid_1", code_blocked)  # Should not have pid_1 for 1D
 
         # Test persistent_interleaved with 1D
@@ -811,8 +853,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_interleaved, expected)
 
         # Verify 1D persistent loop structure
-        self.assertIn("for virtual_pid in tl.range", code_interleaved)
-        self.assertIn("pid_0 = virtual_pid", code_interleaved)
+        self.assertIn(_PID_LOOP, code_interleaved)
+        self.assertIn(pid_assign, code_interleaved)
         self.assertNotIn("pid_1", code_interleaved)  # Should not have pid_1 for 1D
 
         # Test correctness vs flat
@@ -846,7 +888,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify code contains persistent_interleaved feature
-        self.assertIn("for virtual_pid in tl.range", code)
+        self.assertIn(_PID_LOOP, code)
         self.assertIn("_NUM_SM", code)
 
         # Verify L2 grouping features are present
@@ -900,7 +942,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[1], expected2)
 
         # Verify code contains persistent_interleaved features combined with ForEachProgramID
-        self.assertIn("for virtual_pid in tl.range", code)
+        self.assertIn(_PID_LOOP, code)
 
         # Verify ForEachProgramID features (multiple loops)
         self.assertIn("pid_shared", code)
@@ -951,7 +993,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[2], expected3)
 
         # Verify code contains persistent_interleaved features
-        self.assertIn("for virtual_pid in tl.range", code)
+        self.assertIn(_PID_LOOP, code)
         self.assertIn("_NUM_SM", code)
 
         # Verify L2 grouping features are present
@@ -1010,18 +1052,21 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_blocked, expected)
         torch.testing.assert_close(result_interleaved, expected)
 
-        # Verify tensor descriptor features in code
-        self.assertIn(get_tensor_descriptor_fn_name(), code_blocked)
-        self.assertIn(get_tensor_descriptor_fn_name(), code_interleaved)
+        # Verify tensor descriptor features in code (a Triton indexing strategy;
+        # CuTe only uses it to pick TMA for tcgen05 matmul operands)
+        if _get_backend() != "cute":
+            self.assertIn(get_tensor_descriptor_fn_name(), code_blocked)
+            self.assertIn(get_tensor_descriptor_fn_name(), code_interleaved)
 
         # Verify persistent kernel features
-        self.assertIn("for virtual_pid in tl.range", code_blocked)
-        self.assertIn("for virtual_pid in tl.range", code_interleaved)
+        self.assertIn(_PID_LOOP, code_blocked)
+        self.assertIn(_PID_LOOP, code_interleaved)
 
         # Verify both produce identical results
         torch.testing.assert_close(result_blocked, result_interleaved, atol=0, rtol=0)
 
     @skipIfTileIR("tileir backend will ignore `range_*` hints")
+    @skipIfCute("range_* hints are tl.range kwargs; CuTe has no loop-hint equivalent")
     def test_persistent_kernels_with_range_config_options(self):
         """Test that range configuration options work with persistent kernels."""
 
@@ -1216,20 +1261,24 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         expected[:64] = x[:64] + 1
         torch.testing.assert_close(result, expected)
 
-        # Verify that the code uses tl.load for the data-dependent bound
-        self.assertIn("tl.load(num_elements)", code)
+        # Verify that the code loads the data-dependent bound on device
+        self.assertIn(
+            "num_elements[0]" if _get_backend() == "cute" else "tl.load(num_elements)",
+            code,
+        )
 
         # Verify persistent kernel structure
         self.assertIn("total_pids", code)
         self.assertIn("virtual_pid", code)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
     """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
 
     @skipIfNotCUDA()
     @skipIfRefEager("Compilation options are not used in ref eager mode")
+    @skipIfCute("maxnreg is a Triton launch option; CuTe kernels do not take it")
     def test_explicit_intermediate_maxnreg(self):
         args = (
             torch.randn([128, 256], device=DEVICE),
@@ -1258,14 +1307,14 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=1
         )
         self.assertIn("(_NUM_SM,)", code_m1)
-        self.assertIn("tl.cdiv(total_pids, _NUM_SM)", code_m1)
+        self.assertIn(_blocked_pid_chunk("_NUM_SM"), code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=2
         )
         self.assertIn("(_NUM_SM * 2,)", code_m2)
-        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 2)", code_m2)
+        self.assertIn(_blocked_pid_chunk("_NUM_SM * 2"), code_m2)
 
         # Explicit configs may choose an intermediate occupancy point even
         # though the autotuner's default search grid remains powers of two.
@@ -1273,14 +1322,14 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=3
         )
         self.assertIn("(_NUM_SM * 3,)", code_m3)
-        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 3)", code_m3)
+        self.assertIn(_blocked_pid_chunk("_NUM_SM * 3"), code_m3)
 
         # Test with multiplier=4
         code_m4, result_m4 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=4
         )
         self.assertIn("(_NUM_SM * 4,)", code_m4)
-        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 4)", code_m4)
+        self.assertIn(_blocked_pid_chunk("_NUM_SM * 4"), code_m4)
 
         # All should produce the same result
         expected = args[0] + args[1]
@@ -1302,21 +1351,21 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=1
         )
         self.assertIn("(_NUM_SM,)", code_m1)
-        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM", code_m1)
+        self.assertIn(_interleaved_pid_range("_NUM_SM"), code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=2
         )
         self.assertIn("(_NUM_SM * 2,)", code_m2)
-        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 2", code_m2)
+        self.assertIn(_interleaved_pid_range("_NUM_SM * 2"), code_m2)
 
         # Test with multiplier=8
         code_m8, result_m8 = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=8
         )
         self.assertIn("(_NUM_SM * 8,)", code_m8)
-        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 8", code_m8)
+        self.assertIn(_interleaved_pid_range("_NUM_SM * 8"), code_m8)
 
         # All should produce the same result
         expected = args[0] + args[1]

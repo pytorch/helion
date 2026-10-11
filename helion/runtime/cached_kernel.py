@@ -202,9 +202,8 @@ def load_cached_kernel(
     schema = load_binding_schema(artifact_key)
     if schema is None:
         return None
-    extractors = tuple(
-        _guard_extractor(cast("list[object]", guard)) for guard in schema["guards"]
-    )
+    guards = tuple(cast("list[list[object]]", schema["guards"]))
+    extractors = tuple(_guard_extractor(guard) for guard in guards)
     compiler_seed_extractors = tuple(
         _CompilerSeedSpecializationExtractor(
             cast("CompilerHeuristicSpecializationFact", fact), reserved_sms
@@ -234,6 +233,7 @@ def load_cached_kernel(
         args,
         signature,
         artifact,
+        guards,
         extractors,
         compiler_seed_extractors,
         compiler_seed_results,
@@ -283,12 +283,14 @@ class _CachedBoundKernel(Generic[_R]):
         args: tuple[object, ...],
         signature: tuple[Hashable, ...],
         artifact: tuple[Config, Config, str],
+        guards: tuple[list[object], ...],
         extractors: tuple[Callable[[Sequence[object]], Hashable], ...],
         compiler_seed_extractors: tuple[_CompilerSeedSpecializationExtractor, ...],
         compiler_seed_results: tuple[Hashable, ...],
     ) -> None:
         self.kernel = kernel
         self._base_spec_key = signature
+        self._serialized_guards: tuple[list[object] | None, ...] | None = guards
         self._reset_generation = kernel._reset_generation
         self._cache_managed = True
         self._dispatch_generation: int | None = None
@@ -451,6 +453,7 @@ class _CachedBoundKernel(Generic[_R]):
                     self.kernel._compiler_seed_specialize_extra[signature] = (
                         compiler_seed_fns
                     )
+                    self.kernel._published_guards[signature] = normal._serialized_guards
                     for alias_signature, alias in aliases.items():
                         self.kernel._specialize_extra[alias_signature] = [alias]
                         self.kernel._compiler_seed_specialize_extra[alias_signature] = (
@@ -475,6 +478,8 @@ class _CachedBoundKernel(Generic[_R]):
                 normal, args, signature, snapshot_runtime_results=True
             )
             self.kernel._bound_kernels[cache_key] = normal
+            # Key the input-shape guards this compile recorded, as _bind does.
+            normal._publish_guarded_input_facts()
             self._delegate = normal
             # Launches now go through the delegate. Clear the direct callable so
             # stale dispatch state cannot keep using this facade.

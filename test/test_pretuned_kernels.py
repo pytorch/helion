@@ -32,6 +32,7 @@ from helion._testing import TestCase
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
@@ -472,7 +473,10 @@ def test_deepseek_v3_attention_nvfp4_tp_exchanges_natively() -> None:
 
 
 @skipIfRefEager("tile dependencies are built only in compiled mode")
-@skipIfNotTriton("in-band polling assertions inspect Triton PTX codegen")
+@skipIfNotTriton(
+    "the TP4 megakernels are pinned to backend='triton'; the in-band polling "
+    "assertions inspect their Triton PTX"
+)
 def test_deepseek_v3_tp_megakernels_exchange_in_band() -> None:
     if _current_compute_capability() != "sm100":
         pytest.skip("the TP4 megakernels are pretuned for SM100")
@@ -935,7 +939,12 @@ _PRODUCTION_GEOMEAN_FLOOR = {
 _GEOMEAN_NOISE_BAND = 0.10
 
 
-@onlyBackends(["triton"])
+# The SM100 megakernels pass backend="triton" to their decorator, so a cute run
+# would repeat the Triton run.
+_PINNED_TO_TRITON = "megakernel is pinned to backend='triton'"
+
+
+@onlyBackends(["triton", "cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedKernelsCorrectness(TestCase):
     """Numerical correctness vs. PyTorch eager."""
@@ -1022,9 +1031,13 @@ class TestPretunedKernelsCorrectness(TestCase):
     def test_per_token_group_fp8_quant(self):
         self._run_vllm_ported_correctness("per_token_group_fp8_quant")
 
+    # CuTe compiles these kernels cold in ~40-50s on B200.
+    @pytest.mark.timeout(300)
     def test_rms_norm_dynamic_per_token_quant(self):
         self._run_vllm_ported_correctness("rms_norm_dynamic_per_token_quant")
 
+    # CuTe compiles these kernels cold in ~40-50s on B200.
+    @pytest.mark.timeout(300)
     def test_rms_norm_per_block_quant(self):
         self._run_vllm_ported_correctness("rms_norm_per_block_quant")
 
@@ -1035,6 +1048,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_kda_decode(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("kda_decode is pretuned for NVIDIA SM100.")
@@ -1044,6 +1058,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_qwen3_decode_layer(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("qwen3_decode_layer is pretuned for NVIDIA SM100.")
@@ -1053,6 +1068,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_gemma4_a4b_moe(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("gemma4_a4b_moe is pretuned for NVIDIA SM100.")
@@ -1062,6 +1078,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(300)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_gpt_oss_moe(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("gpt_oss_moe is pretuned for NVIDIA SM100.")
@@ -1071,6 +1088,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(600)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_flash_mla(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("flash_mla is pretuned for NVIDIA SM100.")
@@ -1080,6 +1098,7 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_TRITON)
     def test_deepseek_v3_moe_nvfp4(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("deepseek_v3_moe_nvfp4 is pretuned for NVIDIA SM100.")
@@ -1457,6 +1476,8 @@ class TestPretunedCuteCodegen(TestCase):
                 self.assertLess(tmem_copy, aux_load)
 
 
+# The perf targets were measured with the Triton backend running the checked-in
+# Triton-tuned heuristics; a cute run of those configs has no calibrated target.
 @onlyBackends(["triton"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedKernelsPerformance(TestCase):

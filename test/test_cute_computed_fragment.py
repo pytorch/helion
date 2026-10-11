@@ -1127,7 +1127,15 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
             "cute": SimpleNamespace(
-                math=SimpleNamespace(min=np.minimum, max=np.maximum, tanh=np.tanh),
+                math=SimpleNamespace(
+                    min=lambda a, b, propagate_nan=False: (
+                        np.minimum(a, b) if propagate_nan else np.fmin(a, b)
+                    ),
+                    max=lambda a, b, propagate_nan=False: (
+                        np.maximum(a, b) if propagate_nan else np.fmax(a, b)
+                    ),
+                    tanh=np.tanh,
+                ),
                 make_layout=lambda shape: shape,
                 make_rmem_tensor=lambda layout, dtype: Shared(dtype, layout),
                 make_tensor=lambda iterator, layout: SimpleNamespace(
@@ -1140,6 +1148,12 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
                     thread_idx=lambda: (0, 0, 0),
                     block_idx=lambda block=block: (block, 0, 0),
                     sync_threads=lambda: None,
+                    fmax=lambda a, b, nan=False: (
+                        np.maximum(a, b) if nan else np.fmax(a, b)
+                    ),
+                    fmin=lambda a, b, nan=False: (
+                        np.minimum(a, b) if nan else np.fmin(a, b)
+                    ),
                 ),
             ),
         }
@@ -1260,7 +1274,10 @@ def _native_same_axis_statistic(
     return out
 
 
-def test_same_axis_statistic_broadcast_preserves_native_owner():
+def test_same_axis_statistic_broadcast_from_another_lane_owner_is_refused():
+    # The amax's lanes belong to the free hl.arange, not to the row tile's
+    # lane loop that consumes the broadcast statistic; lowering it there gave
+    # wrong values (17 and 1000 columns).
     with (
         _mock_cuda_unavailable(),
         _target(),
@@ -1276,9 +1293,10 @@ def test_same_axis_statistic_broadcast_preserves_native_owner():
         )
         config = bound.config_spec.default_config()
         config.config["reduction_loops"] = [None]
-        source = bound.to_code(config)
-    assert "fragment_smem" not in source
-    assert "warp_reduction_max" in source
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="nested in a different lane owner"
+        ):
+            bound.to_code(config)
 
 
 def test_independent_full_reduction_records_dynamic_metadata_before_projection():
@@ -1921,12 +1939,25 @@ def _simulate_fragment_warp_reduction(
                 utils=SimpleNamespace(SmemAllocator=Allocator),
             ),
             "cute": SimpleNamespace(
-                math=SimpleNamespace(min=np.minimum, max=np.maximum),
+                math=SimpleNamespace(
+                    min=lambda a, b, propagate_nan=False: (
+                        np.minimum(a, b) if propagate_nan else np.fmin(a, b)
+                    ),
+                    max=lambda a, b, propagate_nan=False: (
+                        np.maximum(a, b) if propagate_nan else np.fmax(a, b)
+                    ),
+                ),
                 make_layout=lambda shape: shape,
                 arch=SimpleNamespace(
                     thread_idx=lambda: (0, 0, 0),
                     block_idx=lambda block=block: (block, 0, 0),
                     sync_threads=lambda: None,
+                    fmax=lambda a, b, nan=False: (
+                        np.maximum(a, b) if nan else np.fmax(a, b)
+                    ),
+                    fmin=lambda a, b, nan=False: (
+                        np.minimum(a, b) if nan else np.fmin(a, b)
+                    ),
                 ),
             ),
         }

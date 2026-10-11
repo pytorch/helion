@@ -128,11 +128,13 @@ def _(state: CodegenState) -> ast.AST:
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
 
     device_fn = state.device_function
-    load_idx = device_fn.device_load_index
-    device_fn.device_load_index += 1
 
-    # If no explicit eviction_policy and we're in device code, use tunable
+    # If no explicit eviction_policy and we're in device code, use tunable.
+    # Only such loads own a load_eviction_policies slot (see
+    # _load_needs_eviction_tunable).
     if eviction_policy is None and state.codegen.on_device:
+        load_idx = device_fn.device_load_index
+        device_fn.device_load_index += 1
         policies = state.config.load_eviction_policies
         if isinstance(policies, str):
             policy_value = policies

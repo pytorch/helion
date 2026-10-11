@@ -200,6 +200,16 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def supports_debug_dtype_asserts(self) -> bool:
+        """Whether ``Settings.debug_dtype_asserts`` can run on this backend.
+
+        The setting emits Triton ``tl.cast`` / ``tl.static_assert`` checks
+        after every device node, so only backends that generate Triton support
+        it.
+        """
+        return False
+
+    @property
     def supports_eager_prepared_call(self) -> bool:
         """Whether eager calls may reuse a resolved ``BoundKernel`` directly.
 
@@ -207,6 +217,42 @@ class Backend(abc.ABC):
         only bypasses Helion's repeated binding and specialization lookup.  The
         default is conservative because some backends own call-time behavior in
         :meth:`Kernel.__call__` before the wrapper is reached.
+        """
+        return False
+
+    @property
+    def supports_inductor_fusion(self) -> bool:
+        """Whether generated kernels apply Inductor's prologue/epilogue hooks.
+
+        ``torch.compile`` fusion splices Inductor-generated Triton code into the
+        kernel through ``load_transform``/``store_transform``.  A backend that
+        does not honor those hooks must lower its kernels unfused; otherwise
+        Inductor would drop the fused producers and consumers.
+        """
+        return False
+
+    @property
+    def dynamo_captures_kernel_launch(self) -> bool:
+        """Whether Dynamo may trace a kernel call inline down to its launch.
+
+        On PyTorch builds without Helion's fusion entrypoints, ``torch.compile``
+        traces ``Kernel.__call__`` and the generated host wrapper.  That is how
+        Dynamo captures Triton launches (as user-defined Triton kernels) and
+        where Pallas's compile capture hooks in, so it stays the default.
+        Backends whose launch Dynamo cannot trace return False and are captured
+        as the Helion kernel HOP instead.
+        """
+        return True
+
+    @property
+    def dynamo_inline_capture_loses_view_writes(self) -> bool:
+        """Whether Dynamo's inline capture drops a launch's write through a view.
+
+        A Triton launch is captured as a user-defined Triton kernel, whose
+        functionalization clones a mutated view's base-storage span from the
+        materialized view and so loses the write.  On builds with the template
+        lowering, a call that writes an input through a view is captured as
+        the Helion kernel HOP instead.
         """
         return False
 
@@ -498,6 +544,16 @@ class Backend(abc.ABC):
         from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
 
         return key not in BACKEND_SPECIFIC_KEYS
+
+    def cross_loop_pipelines(self) -> tuple[str, ...]:
+        """``cross_loop_pipeline`` values this backend can lower.
+
+        Consulted only when the backend supports the ``cross_loop_pipeline``
+        config key.
+        """
+        from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
+
+        return VALID_CROSS_LOOP_PIPELINES
 
     def supports_block_ptr_indexing(self) -> bool:
         return True
@@ -882,8 +938,9 @@ class Backend(abc.ABC):
     ) -> str:
         """Generate the cross-thread reduction expression.
 
-        ``dtype`` is the accumulation dtype
-        (``get_computation_dtype(input.dtype)``) when the caller knows it.
+        ``dtype`` is the accumulation dtype (``reduction_acc_dtype``: the
+        output's computation dtype, the input's for argmin/argmax) when the
+        caller knows it.
         Backends that allocate typed scratch storage for the reduction (e.g.
         Metal's ``threadgroup`` buffers) need it; the rest ignore it.
         """
@@ -954,6 +1011,29 @@ class Backend(abc.ABC):
             self.cast_expr("{x}", self.dtype_str(target_dtype)),
             x=x,
         )
+
+    def join_cast_template(self) -> str | None:
+        """An ``expr_from_string`` template casting ``{x}`` to ``{like}``'s type.
+
+        A dynamic if whose branch reassigns a variable joins the new value
+        with the old one, which must have one type.  Backends whose emitted
+        values can carry a type other than their FX dtype return a cast here;
+        ``None`` emits no join (CuTe joins in its own if codegen).
+        """
+        return None
+
+    def scalar_float_operand_ast(
+        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+    ) -> ast.AST:
+        """``x`` computes ``value``, a SymFloat operand (a Python-float host
+        scalar) of an Inductor op.
+
+        The op computes with it as a float32 scalar, as torch rounds such a
+        scalar to float32 (also the opmath of fp16/bf16 math, see
+        ``opmath_scalar_dtype``) unless the op's math is float64.  Backends
+        whose emitted scalar can carry another type cast it here.
+        """
+        return x
 
     def cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         """Cast a plain scalar (e.g. a bare number lifted from an index expr) to
@@ -1100,14 +1180,15 @@ class Backend(abc.ABC):
         """Return the warp count the backend will actually launch."""
         return config.num_warps
 
-    def customize_ast(self, hf: HostFunction) -> None:
+    def customize_ast(self, hf: HostFunction) -> bool:
         """Run backend-specific AST customizations.
 
         Called after static loop unrolling but before type propagation
         and tracing.  Backends can override this to rewrite the user's
         AST for algorithmic transformations that change loop structure.
+        Returns whether the AST was rewritten.
         """
-        return None
+        return False
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Return a backend-owned lowering that must bypass Inductor IR.
@@ -1221,6 +1302,30 @@ class Backend(abc.ABC):
                 result.add(block_id)
         return result
 
+    def _cute_matmul_contraction_extents(self, tile_block_ids: list[int]) -> list[int]:
+        """Size hints of the matmul-contraction reduction axes (above one)
+        that are *not* one of ``tile_block_ids``, i.e. handled by a separate
+        reduction strategy, not this tile strategy."""
+        from .._compat import shape_env_size_hint
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        tile_ids = set(tile_block_ids)
+        extents: list[int] = []
+        for block_id in self._cute_matmul_contraction_reduction_block_ids():
+            if block_id in tile_ids:
+                continue
+            numel = env.block_sizes[block_id].numel
+            if isinstance(numel, (int, sympy.Integer)):
+                size_hint = int(numel)
+            elif isinstance(numel, sympy.Expr):
+                size_hint = shape_env_size_hint(env.shape_env, numel)
+            else:
+                size_hint = env.size_hint(numel)
+            if size_hint > 1:
+                extents.append(size_hint)
+        return extents
+
     def _cute_matmul_contraction_thread_reserve(
         self, fn: DeviceFunction, tile_block_ids: list[int]
     ) -> int:
@@ -1233,27 +1338,11 @@ class Backend(abc.ABC):
         """
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-        from .._compat import shape_env_size_hint
-        from .compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
         max_reduction_threads = self.max_reduction_threads()
         if max_reduction_threads is None:
             return 1
-        tile_ids = set(tile_block_ids)
         reserve = 1
-        for block_id in self._cute_matmul_contraction_reduction_block_ids():
-            if block_id in tile_ids:
-                continue
-            numel = env.block_sizes[block_id].numel
-            if isinstance(numel, (int, sympy.Integer)):
-                size_hint = int(numel)
-            elif isinstance(numel, sympy.Expr):
-                size_hint = shape_env_size_hint(env.shape_env, numel)
-            else:
-                size_hint = env.size_hint(numel)
-            if size_hint <= 1:
-                continue
+        for size_hint in self._cute_matmul_contraction_extents(tile_block_ids):
             reserve *= next_power_of_2(min(size_hint, max_reduction_threads))
         return reserve
 

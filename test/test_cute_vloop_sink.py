@@ -569,12 +569,13 @@ def test_a_lane_invariant_scalar_redefined_inside_the_segment_stays_per_lane(
     assert statements[0] == definition
     assert "v_2 = acc_frag[vec_lane_1] * s" in statements
     (conditional,) = [stmt for stmt in epilogue.body if isinstance(stmt, ast.If)]
-    assert "s = s_copy_0 * v_5" in ast.unparse(conditional)
-    assert "v_7 = acc_frag[vec_lane_1] * s" in statements
+    assert "s = _cute_join_cast(v_6, s_before_if)" in ast.unparse(conditional)
+    assert "v_8 = acc_frag[vec_lane_1] * s" in statements
     assert (
         statements.index("v_2 = acc_frag[vec_lane_1] * s")
+        < statements.index("s_before_if = s")
         < epilogue.body.index(conditional)
-        < statements.index("v_7 = acc_frag[vec_lane_1] * s")
+        < statements.index("v_8 = acc_frag[vec_lane_1] * s")
     )
     # The pure single-definition constant of the ``!= 0`` test is hoisted.
     assert "v_3 = 0" not in statements
@@ -582,50 +583,21 @@ def test_a_lane_invariant_scalar_redefined_inside_the_segment_stays_per_lane(
 
 
 @skipUnlessBackends(["cute"])
-def test_a_load_after_a_bound_atomic_stays_per_lane(cpu_only: None) -> None:
+def test_a_load_after_a_bound_atomic_rejects_the_config(cpu_only: None) -> None:
     """``old = hl.atomic_add(count, [tile_n], 1); first = count[tile.id * B]``:
-    with its result used and no guard, the atomic is an assignment rather
-    than a store statement, yet it is a memory effect of the segment.  The
-    lane-invariant load of ``count`` stays in the V-loop after it (lane 0 must
-    observe its own increment) while the row loop still sinks."""
+    threads 1-3 read the element thread 0's atomic bumps, a race no barrier
+    can order in the body the reduction split rewrites, so the config is
+    refused."""
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
     count = torch.empty(1024, dtype=torch.float32)
-    code = _cpu_code(
-        col_reduce_sum_atomic_then_load_static,
-        (x, count),
-        **_sink_config(block_sizes=[1024, 16], num_threads=[1, 4], vec=[1, 4]),
-    )
-    _assert_defined_before_use(code)
-    assert "_vsink_vec" in code
-    kernel = _kernel_def(code)
-    every_statement = [
-        ast.unparse(stmt) for stmt in ast.walk(kernel) if isinstance(stmt, ast.stmt)
-    ]
-    (prologue,) = [
-        loop
-        for loop in ast.walk(kernel)
-        if isinstance(loop, ast.For)
-        and "range_constexpr" in ast.unparse(loop.iter)
-        and "cute.arch.atomic_add(" in ast.unparse(loop)
-    ]
-    statements = [ast.unparse(stmt) for stmt in prologue.body]
-    (atomic,) = [
-        text for text in statements if text.startswith("old = cute.arch.atomic_add(")
-    ]
-    (load,) = [
-        text
-        for text in statements
-        if text.startswith("first = (count.iterator") and text.endswith(".load()")
-    ]
-    # The load is issued once per lane, after that lane's atomic, and nowhere
-    # else (not widened, not run once ahead of the V-loop).
-    assert statements.index(atomic) < statements.index(load)
-    assert every_statement.count(load) == 1
-    assert sum(text.startswith("first = ") for text in every_statement) == 1
-    assert "v_0_frag[vec_lane_1] = old * first" in statements
-    # The pure tile-origin arithmetic of the load's address is still hoisted.
-    assert "mul = _BLOCK_SIZE_1 * tile_id" not in statements
-    assert "mul = _BLOCK_SIZE_1 * tile_id" in every_statement
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="a body a later pass rewrites"
+    ):
+        _cpu_code(
+            col_reduce_sum_atomic_then_load_static,
+            (x, count),
+            **_sink_config(block_sizes=[1024, 16], num_threads=[1, 4], vec=[1, 4]),
+        )
 
 
 @skipUnlessBackends(["cute"])

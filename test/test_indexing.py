@@ -34,7 +34,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
-from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -42,7 +41,6 @@ from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 
@@ -391,11 +389,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         i = torch.arange(4, n, device=DEVICE)
         torch.testing.assert_close(result[4:], scale[(i // 4) * 512 + i % 4])
 
-    @pytest.mark.xfail(
-        _get_backend() == "cute",
-        reason="CuTe matmul fallback with non-power-of-two static dimensions can generate invalid shared-memory indexing",
-        run=False,
-    )
     def test_hl_arange_non_power_of_2(self):
         @helion.kernel
         def _matmul_layernorm_bwd_dxdy(
@@ -517,6 +510,27 @@ class TestIndexing(RefEagerTestBase, TestCase):
             indexing="tensor_descriptor",
         )
         expected = x[1:-2] + x[3:]
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("ref-mode hl.store with an extra_mask takes no slice entries")
+    def test_store_full_slice(self):
+        # ``hl.store`` with a ``:`` entry and no other slice of that width
+        # allocates its reduction dim as ``out[tile, :] = v`` does.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def store_rows(s: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([s.size(0), 8], device=s.device, dtype=s.dtype)
+            for tile in hl.tile(s.size(0)):
+                hl.store(
+                    out,
+                    [tile, slice(None)],
+                    (s[tile] * 2)[:, None].expand(-1, 8),
+                    extra_mask=(s[tile] > 0)[:, None],
+                )
+            return out
+
+        s = torch.randn([65], device=DEVICE)
+        _code, result = code_and_output(store_rows, (s,), block_size=32)
+        expected = torch.where((s > 0)[:, None], (s * 2)[:, None].expand(-1, 8), 0.0)
         torch.testing.assert_close(result, expected)
 
     def test_mask_store(self):
@@ -1244,6 +1258,293 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.arange(16, dtype=torch.int32, device=DEVICE).repeat(4)
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_arange_extent_matching_tile_block_size(self):
+        """hl.arange(n) counts from 0 when n equals the block size of a tile."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def add_aranges(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0), block_size=4):
+                for tile_n in hl.tile(x.size(1), block_size=32):
+                    out[tile_m, tile_n] = (
+                        x[tile_m, tile_n]
+                        + hl.arange(4).to(torch.float32)[:, None] * 100
+                        + hl.arange(32).to(torch.float32)[None, :]
+                    )
+            return out
+
+        x = torch.randn([64, 128], device=DEVICE)
+        code, result = code_and_output(add_aranges, (x,))
+        rows = torch.arange(64, device=DEVICE) % 4
+        cols = torch.arange(128, device=DEVICE) % 32
+        expected = x + rows[:, None] * 100.0 + cols[None, :]
+        torch.testing.assert_close(result, expected)
+
+    def test_arange_length_matching_grid_extent(self):
+        """hl.arange(16) under a size-1 tile whose loop extent is also 16."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def double_rows_grid(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty_like(x)
+            for row in hl.grid(n // 16):
+                columns = row * 16 + hl.arange(16)
+                out[columns] = x[columns] * 2
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def double_rows_tile(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty_like(x)
+            for row in hl.tile(n // 16, block_size=1):
+                columns = row.begin * 16 + hl.arange(16)
+                out[columns] = x[columns] * 2
+            return out
+
+        x = torch.randn([256], device=DEVICE)
+        for fn in (double_rows_grid, double_rows_tile):
+            _code, result = code_and_output(fn, (x,))
+            torch.testing.assert_close(result, x * 2)
+
+    def test_arange_index_beside_tile(self):
+        """hl.arange(k) as a second index dim, whatever k is to the tile's block."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_columns(
+            x: torch.Tensor, out: torch.Tensor, k: hl.constexpr
+        ) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, hl.arange(k)] = x[tile_m, hl.arange(k)] * 2
+            return out
+
+        x = torch.randn([40, 64], device=DEVICE)
+        for k, block_size in ((4, 32), (16, 16), (32, 32), (8, 32)):
+            with self.subTest(k=k, block_size=block_size):
+                expected = torch.zeros_like(x)
+                expected[:, :k] = x[:, :k] * 2
+                _code, result = code_and_output(
+                    copy_columns, (x, torch.zeros_like(x), k), block_sizes=[block_size]
+                )
+                torch.testing.assert_close(result, expected)
+
+    def test_arange_gathers_meeting_in_one_lane(self):
+        """Two dims of one access whose aranges meet elsewhere in the kernel."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def merged_gather(
+            p: torch.Tensor,
+            q: torch.Tensor,
+            x: torch.Tensor,
+            a: torch.Tensor,
+            pairs: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            for _ in hl.tile(1):
+                r1 = hl.arange(0, 4)
+                r2 = hl.arange(2, 6)
+                pairs[r1] = a[r1] + a[r2]
+                i = p[r1]
+                j = q[r2]
+                out[i, j] = x[i, j]
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def distinct_gather(
+            p: torch.Tensor, q: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for _ in hl.tile(1):
+                i = p[hl.arange(0, 4)]
+                j = q[hl.arange(2, 6)]
+                out[i, j] = x[i, j]
+            return out
+
+        p = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=DEVICE)
+        q = torch.tensor([7, 5, 3, 1, 6, 4, 2, 0], device=DEVICE)
+        x = torch.randn([8, 8], device=DEVICE)
+        a = torch.randn([8], device=DEVICE)
+        rows, cols = p[0:4, None], q[None, 2:6]
+        expected = torch.zeros_like(x)
+        expected[rows, cols] = x[rows, cols]
+
+        result = distinct_gather(p, q, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        if _get_backend() == "cute":
+            # r1 and r2 share a lane (their loads are added), so the cartesian
+            # gather would need two coordinates of that one lane.
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "share a free hl.arange"
+            ):
+                merged_gather(p, q, x, a, torch.zeros_like(a), torch.zeros_like(x))
+        else:
+            pairs = torch.zeros_like(a)
+            result = merged_gather(p, q, x, a, pairs, torch.zeros_like(x))
+            torch.testing.assert_close(result, expected)
+            torch.testing.assert_close(pairs[0:4], a[0:4] + a[2:6])
+
+    def test_arange_indexes_with_different_starts(self):
+        """hl.arange index dims meet by position, whatever their start and step."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def shifted_copy(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, hl.arange(2, 6)] = x[tile_m, hl.arange(1, 9, 2)] * 2
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def shifted_transpose(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[hl.arange(3, 7), tile_m] = (x[tile_m, hl.arange(0, 4)] * 2).T
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def shifted_cartesian(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for _ in hl.tile(1):
+                out[hl.arange(1, 5), hl.arange(0, 4)] = (
+                    x[hl.arange(0, 4), hl.arange(4, 8)] * 2
+                )
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def outer_sum(
+            a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for _ in hl.tile(1):
+                out[hl.arange(0, 4), hl.arange(0, 4)] = (
+                    a[hl.arange(0, 4)][:, None] + b[hl.arange(4, 8)][None, :]
+                )
+            return out
+
+        x = torch.randn([40, 16], device=DEVICE)
+        expected = torch.zeros([40, 16], device=DEVICE)
+        expected[:, 2:6] = x[:, 1:9:2] * 2
+        result = shifted_copy(x, torch.zeros_like(expected))
+        torch.testing.assert_close(result, expected)
+
+        expected = torch.zeros([16, 40], device=DEVICE)
+        expected[3:7, :] = (x[:, 0:4] * 2).T
+        result = shifted_transpose(x, torch.zeros_like(expected))
+        torch.testing.assert_close(result, expected)
+
+        x = torch.randn([8, 8], device=DEVICE)
+        expected = torch.zeros([8, 8], device=DEVICE)
+        expected[1:5, 0:4] = x[0:4, 4:8] * 2
+        result = shifted_cartesian(x, torch.zeros_like(expected))
+        torch.testing.assert_close(result, expected)
+
+        a = torch.randn([8], device=DEVICE)
+        b = torch.randn([8], device=DEVICE)
+        expected = torch.zeros([8, 8], device=DEVICE)
+        expected[0:4, 0:4] = a[0:4, None] + b[None, 4:8]
+        result = outer_sum(a, b, torch.zeros_like(expected))
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_arange_tile_with_lane_loop(self):
+        """hl.arange over a tile whose threads each walk several elements."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def add_arange(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + hl.arange(64).to(torch.float32)
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def add_tile_range(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                positions = tile.begin + hl.arange(tile.block_size)
+                out[tile] = x[tile] + positions.to(torch.float32)
+            return out
+
+        x = torch.randn([512], device=DEVICE)
+        positions = torch.arange(512, device=DEVICE, dtype=torch.float32)
+        configs = [{}, {"num_threads": [16]}]
+        if _get_backend() == "cute":
+            configs += [
+                {"num_threads": [16], "cute_lane_layouts": ["strided"]},
+                {"num_threads": [8], "cute_vector_widths": [4]},
+                # One thread walks the whole tile: no thread axis records the
+                # block.
+                {"num_threads": [1]},
+            ]
+        for fn, expected in (
+            (add_arange, x + positions % 64),
+            (add_tile_range, x + positions),
+        ):
+            for config in configs:
+                with self.subTest(fn=fn.fn.__name__, **config):
+                    _code, result = code_and_output(
+                        fn, (x,), block_sizes=[64], **config
+                    )
+                    torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("config_spec is not supported in ref eager mode")
+    def test_arange_of_block_size_is_not_flattened(self):
+        """hl.arange(tile.block_size) counts in a rectangular tile."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def add_tile_positions(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                cols = hl.arange(tile_n.block_size).to(torch.float32)
+                rows = hl.arange(tile_m.block_size).to(torch.float32)
+                out[tile_m, tile_n] = (
+                    x[tile_m, tile_n] + cols[None, :] + 1000 * rows[:, None]
+                )
+            return out
+
+        x = torch.randn([40, 192], device=DEVICE)
+        bound = add_tile_positions.bind((x,))
+        self.assertEqual(len(bound.env.config_spec.flatten_loops), 0)
+        for block_sizes in ([8, 64], [32, 32]):
+            with self.subTest(block_sizes=block_sizes):
+                rows = torch.arange(40, device=DEVICE) % block_sizes[0]
+                cols = torch.arange(192, device=DEVICE) % block_sizes[1]
+                expected = x + cols[None, :] + 1000.0 * rows[:, None]
+                _code, result = code_and_output(
+                    add_tile_positions, (x,), block_sizes=block_sizes
+                )
+                torch.testing.assert_close(result, expected)
+
+    def test_padded_arange_reduction(self):
+        """A reduction over a non-power-of-2 hl.arange excludes the padding lanes."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gathered_sums(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            sums = x.new_empty([x.size(0), 4])
+            for tile in hl.tile(x.size(0)):
+                shifted = x[tile, hl.arange(1, 6)]
+                out[tile, hl.arange(0, 5)] = shifted
+                sums[tile, 0] = shifted.sum(-1)
+                sums[tile, 1] = x[tile, hl.arange(0, 10, 2)].sum(-1)
+                sums[tile, 2] = x[tile, hl.arange(6, 1, -1)].sum(-1)
+                sums[tile, 3] = x[tile, hl.arange(0, 5) + 2].sum(-1)
+            return sums
+
+        x = torch.rand([32, 12], device=DEVICE)
+        x[:, 5:] += 100.0
+        out = torch.zeros_like(x)
+        sums = gathered_sums(x, out)
+        expected = torch.stack(
+            [
+                x[:, 1:6].sum(-1),
+                x[:, 0:10:2].sum(-1),
+                x[:, 2:7].sum(-1),
+                x[:, 2:7].sum(-1),
+            ],
+            dim=-1,
+        )
+        torch.testing.assert_close(sums, expected)
+        expected_out = torch.zeros_like(x)
+        expected_out[:, 0:5] = x[:, 1:6]
+        torch.testing.assert_close(out, expected_out)
+
     def test_arange_two_args(self):
         @helion.kernel(autotune_effort="none")
         def arange_two_args(x: torch.Tensor) -> torch.Tensor:
@@ -1319,6 +1620,200 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         expected = torch.arange(128, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
+
+    def test_padded_arange_index_pair_with_offset_and_step(self):
+        """A static non-power-of-2 hl.arange is padded to a power-of-2 range,
+        and its padding lanes are masked by arange position, which keeps the
+        last valid rows/columns when start > 0 or step > 1 (a mask on the
+        index value would drop them)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_scatter(
+            w: torch.Tensor,
+            gathered: torch.Tensor,
+            scattered: torch.Tensor,
+            derived: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            for _ in hl.tile(1):
+                gathered[0:3, 0:5] = (
+                    hl.load(w, [hl.arange(1, 7, 2), hl.arange(2, 7)]) * 2
+                )
+                hl.store(
+                    scattered,
+                    [hl.arange(1, 4), hl.arange(1, 11, 2)],
+                    w[0:3, 0:5] * 3,
+                )
+                rows = hl.arange(0, 3)
+                cols = hl.arange(0, 5)
+                hl.store(derived, [rows * 2 + 1, cols + 2], w[0:3, 0:5] * 4)
+            return gathered, scattered, derived
+
+        w = torch.randn(16, 16, device=DEVICE)
+        gathered = torch.zeros(3, 5, device=DEVICE)
+        scattered = torch.zeros(16, 16, device=DEVICE)
+        derived = torch.zeros(16, 16, device=DEVICE)
+        expected_scattered = torch.zeros_like(scattered)
+        expected_scattered[1:4, 1:11:2] = w[0:3, 0:5] * 3
+        expected_derived = torch.zeros_like(derived)
+        expected_derived[1:7:2, 2:7] = w[0:3, 0:5] * 4
+        gathered, scattered, derived = gather_scatter(w, gathered, scattered, derived)
+        torch.testing.assert_close(gathered, w[1:7:2, 2:7] * 2)
+        torch.testing.assert_close(scattered, expected_scattered)
+        torch.testing.assert_close(derived, expected_derived)
+
+    def test_padded_arange_atomic_with_offset_and_step(self):
+        """Padded hl.arange atomic indices with start > 0 or step > 1 keep
+        every valid row (a mask on the index value would skip out[3] for
+        hl.arange(1, 4))."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def accumulate(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            n = hl.specialize(n)
+            out = torch.zeros([4, n], device=x.device)
+            for tile_m in hl.tile(m):
+                upd = w[1:4, :] * x[tile_m, :].sum(0)[None, :]
+                hl.atomic_add(out, [hl.arange(1, 4), hl.arange(0, n)], upd)
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def accumulate_strided(w: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for _ in hl.tile(1):
+                hl.atomic_add(
+                    out, [hl.arange(1, 7, 2), hl.arange(1, 11, 2)], w[0:3, 0:5]
+                )
+            return out
+
+        x = torch.randn(40, 6, device=DEVICE)
+        w = torch.randn(6, 6, device=DEVICE)
+        expected = torch.zeros(4, 6, device=DEVICE)
+        expected[1:4] = w[1:4] * x.sum(0)[None, :]
+        torch.testing.assert_close(accumulate(x, w), expected, rtol=1e-4, atol=1e-4)
+
+        w = torch.randn(16, 16, device=DEVICE)
+        expected = torch.zeros(16, 16, device=DEVICE)
+        expected[1:7:2, 1:11:2] = w[0:3, 0:5]
+        torch.testing.assert_close(
+            accumulate_strided(w, torch.zeros(16, 16, device=DEVICE)), expected
+        )
+
+    @skipIfCute("cute lowers hl.arange only on an active tile/reduction axis")
+    def test_padded_arange_broadcast_indices(self):
+        """The padding mask follows a padded hl.arange through ``[:, None]``
+        subscripts and pointwise ops into 2-D indices; without it the padded
+        lanes of the 3x5 region loaded, stored and accumulated outside it."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_scatter(
+            x: torch.Tensor,
+            out: torch.Tensor,
+            flat_x: torch.Tensor,
+            flat_out: torch.Tensor,
+            acc: torch.Tensor,
+            upd: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            for _ in hl.grid(1):
+                rows = hl.arange(1, 4)
+                cols = hl.arange(0, 5)
+                out[rows[:, None], cols[None, :]] = x[rows[:, None], cols[None, :]] * 2
+                idx = rows[:, None] * 9 + cols[None, :]
+                flat_out[idx] = flat_x[idx] * 3
+                hl.atomic_add(
+                    acc,
+                    [rows[:, None], cols[None, :]],
+                    upd[rows[:, None] - 1, cols[None, :]],
+                )
+            return out, flat_out, acc
+
+        x = torch.randn(6, 9, device=DEVICE)
+        flat_x = torch.randn(54, device=DEVICE)
+        upd = torch.randn(3, 5, device=DEVICE)
+        out, flat_out, acc = gather_scatter(
+            x,
+            torch.zeros(6, 9, device=DEVICE),
+            flat_x,
+            torch.zeros(54, device=DEVICE),
+            torch.zeros(6, 9, device=DEVICE),
+            upd,
+        )
+        expected = torch.zeros(6, 9, device=DEVICE)
+        expected[1:4, 0:5] = x[1:4, 0:5] * 2
+        torch.testing.assert_close(out, expected)
+        expected = torch.zeros(6, 9, device=DEVICE)
+        expected[1:4, 0:5] = flat_x.view(6, 9)[1:4, 0:5] * 3
+        torch.testing.assert_close(flat_out.view(6, 9), expected)
+        expected = torch.zeros(6, 9, device=DEVICE)
+        expected[1:4, 0:5] = upd
+        torch.testing.assert_close(acc, expected)
+
+    def test_padded_arange_derived_single_index(self):
+        """A lone padded hl.arange index beside a tile gets a padding mask, and
+        so does an index computed lane-wise from one: ``cols + 1`` writes no
+        column past its range."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_columns(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            for tile_m in hl.tile(m):
+                cols = hl.arange(0, 5)
+                out[tile_m, cols + 1] = x[tile_m, cols * 2 + 1] * 2
+            return out
+
+        x = torch.randn(40, 16, device=DEVICE)
+        expected = torch.zeros(40, 16, device=DEVICE)
+        expected[:, 1:6] = x[:, 1:11:2] * 2
+        torch.testing.assert_close(
+            copy_columns(x, torch.zeros(40, 16, device=DEVICE)), expected
+        )
+
+    def test_arange_index_stored_into_full_slice(self):
+        """The first type-propagation pass types ``x[tile, hl.arange(1, 6)]``
+        as [tile, 5]; the ``:`` slice it is stored into then allocates a
+        reduction dimension for that size, so the fixed-point pass types the
+        same load as [tile, rdim].  Both name one dim and must merge."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_columns(
+            x: torch.Tensor, shifted: torch.Tensor, strided: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, _ = x.shape
+            for tile_m in hl.tile(m):
+                shifted[tile_m, :] = x[tile_m, hl.arange(1, 6)] * 2
+                strided[tile_m, :] = x[tile_m, hl.arange(1, 11, 2)] * 3
+            return shifted, strided
+
+        x = torch.randn(40, 16, device=DEVICE)
+        shifted, strided = gather_columns(
+            x, torch.zeros(40, 5, device=DEVICE), torch.zeros(40, 5, device=DEVICE)
+        )
+        torch.testing.assert_close(shifted, x[:, 1:6] * 2)
+        torch.testing.assert_close(strided, x[:, 1:11:2] * 3)
+
+    def test_padded_arange_single_index_with_offset_and_step(self):
+        """A lone padded hl.arange index beside a tile gets a padding mask:
+        arange(0, 5) writes no column past a 5-wide row, and a strided or
+        negative-step arange reads and writes only its range."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_columns(
+            x: torch.Tensor, exact: torch.Tensor, strided: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, _ = x.shape
+            for tile_m in hl.tile(m):
+                exact[tile_m, hl.arange(0, 5)] = x[tile_m, hl.arange(6, 1, -1)] * 2
+                strided[tile_m, hl.arange(3, 13, 2)] = (
+                    x[tile_m, hl.arange(1, 11, 2)] * 3
+                )
+            return exact, strided
+
+        x = torch.randn(40, 16, device=DEVICE)
+        exact = torch.zeros(40, 5, device=DEVICE)
+        strided = torch.zeros(40, 16, device=DEVICE)
+        expected_strided = torch.zeros_like(strided)
+        expected_strided[:, 3:13:2] = x[:, 1:11:2] * 3
+        exact, strided = copy_columns(x, exact, strided)
+        torch.testing.assert_close(exact, x[:, [6, 5, 4, 3, 2]] * 2)
+        torch.testing.assert_close(strided, expected_strided)
 
     def test_slice_block_size_multiple(self):
         """Test that tile.block_size * constant works as slice bounds"""
@@ -1731,11 +2226,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @unittest.skip("takes 5+ minutes to run")
     def test_1d_indexed_value_from_slice(self):
         """buf2[i] = buf[:] - Assign slice to indexed value"""
 
-        @helion.kernel
+        @helion.kernel(autotune_effort="none")
         def getter_kernel(buf: torch.Tensor, buf2: torch.Tensor) -> torch.Tensor:
             N = buf2.shape[0]
             for i in hl.grid(N):
@@ -1839,7 +2333,271 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src2_result, expected_src2)
         torch.testing.assert_close(dst2_result, expected_dst2)
 
-    @skipIfCute("CuTe negative indexes can poison the CUDA context")
+    def test_strided_slice_tile_values(self):
+        """Strided slices pair element ``j`` with ``start + step * j``, for tile values too."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def spread(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(24, device=x.device, dtype=x.dtype)
+            for _ in hl.grid(1):
+                out[1:24:3] = x[:] * 2
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def strided_columns(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            out = torch.zeros(x.size(0), 24, device=x.device, dtype=x.dtype)
+            sums = x.new_empty(x.size(0))
+            for tile in hl.tile(x.size(0)):
+                out[tile, 0:16:2] = x[tile, 2:26:3] + 1
+                sums[tile] = x[tile, 0:32:2].sum(-1)
+            return out, sums
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def strided_rows(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(20, x.size(1), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size(1)):
+                out[0:20:2, tile] = x[1:31:3, tile] * 2
+            return out
+
+        x = torch.randn([8], device=DEVICE)
+        expected = torch.zeros(24, device=DEVICE)
+        expected[1:24:3] = x * 2
+        torch.testing.assert_close(spread(x), expected)
+
+        x = torch.randn([40, 32], device=DEVICE)
+        out, sums = strided_columns(x)
+        expected = torch.zeros(40, 24, device=DEVICE)
+        expected[:, 0:16:2] = x[:, 2:26:3] + 1
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(sums, x[:, 0:32:2].sum(-1))
+
+        expected = torch.zeros(20, 32, device=DEVICE)
+        expected[0:20:2] = x[1:31:3] * 2
+        torch.testing.assert_close(strided_rows(x), expected)
+
+    @skipIfXPU("XPU returns wrong values for these slice sorts and top-ks")
+    def test_sort_and_scan_of_strided_and_offset_slices(self):
+        """Sorts, top-k and scans of a slice read element ``j`` at ``start + step * j``.
+
+        The rank sort and the serial scan re-read their input from global
+        memory, so they must address the slice as its load does on every config.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def sort_slices(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            vals = torch.zeros(m, n // 2, device=x.device, dtype=x.dtype)
+            idx = torch.zeros(m, n // 2, device=x.device, dtype=torch.int64)
+            top = torch.zeros(m, 4, device=x.device, dtype=x.dtype)
+            top_idx = torch.zeros(m, 4, device=x.device, dtype=torch.int64)
+            for tile in hl.tile(m):
+                sorted_vals, sorted_idx = torch.sort(x[tile, 1::2], dim=-1)
+                vals[tile, :] = sorted_vals
+                idx[tile, :] = sorted_idx
+                top_vals, top_pos = torch.topk(x[tile, n // 2 :], 4, dim=-1)
+                top[tile, :] = top_vals
+                top_idx[tile, :] = top_pos
+            return vals, idx, top, top_idx
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def scan_slices(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            sums = torch.zeros(m, n // 2, device=x.device, dtype=x.dtype)
+            prods = torch.zeros(m, n // 2, device=x.device, dtype=x.dtype)
+            for tile in hl.tile(m):
+                sums[tile, :] = torch.cumsum(x[tile, 1::2], dim=-1)
+                prods[tile, :] = torch.cumprod(x[tile, n // 2 :], dim=-1)
+            return sums, prods
+
+        x = torch.randn([40, 64], device=DEVICE)
+        xp = torch.rand([40, 64], device=DEVICE) * 0.5 + 0.75
+        sort_expected = (
+            *torch.sort(x[:, 1::2], dim=-1),
+            *torch.topk(x[:, 32:], 4, dim=-1),
+        )
+        scan_expected = (torch.cumsum(xp[:, 1::2], -1), torch.cumprod(xp[:, 32:], -1))
+        configs: list[dict[str, object]] = [{"block_sizes": [8]}]
+        if _get_backend() == "cute":
+            # Lane loops and vector widths take the serial gmem-reload scan.
+            configs += [
+                {"block_sizes": [32], "num_threads": [8, 8]},
+                {
+                    "block_sizes": [32],
+                    "num_threads": [8, 8],
+                    "cute_vector_widths": [4, 1],
+                },
+                {
+                    "block_sizes": [1],
+                    "num_threads": [1, 8],
+                    "cute_vector_widths": [1, 4],
+                },
+            ]
+        for config in configs:
+            with self.subTest(**config):
+                _code, result = code_and_output(sort_slices, (x,), **config)
+                for actual, expected in zip(result, sort_expected, strict=True):
+                    torch.testing.assert_close(actual, expected)
+                _code, result = code_and_output(scan_slices, (xp,), **config)
+                for actual, expected in zip(result, scan_expected, strict=True):
+                    torch.testing.assert_close(actual, expected)
+
+    @skipIfRefEager("the tile a sort ranks within follows block_sizes")
+    def test_tile_sort_with_a_partial_row_block(self):
+        """A sort over a tiled dim ranks within each tile, not the whole row."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def sort_tiles(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                vals, _ = torch.sort(x[tile_m, tile_n], dim=-1)
+                out[tile_m, tile_n] = vals
+            return out
+
+        x = torch.randn([40, 64], device=DEVICE)
+        for block_n in (16, 32):
+            with self.subTest(block_n=block_n):
+                _code, result = code_and_output(
+                    sort_tiles, (x,), block_sizes=[8, block_n]
+                )
+                expected = torch.sort(x.reshape(40, 64 // block_n, block_n), dim=-1)[0]
+                torch.testing.assert_close(result, expected.reshape(40, 64))
+
+    def test_scan_walks_only_the_tile_elements(self):
+        """A reverse scan walks the elements of its tile: a slice shorter than
+        its block's lanes (dynamic shapes) or a tile range shorter than the
+        tensor leaves no element in the positions past its end."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def offset_slice(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            suffix = torch.zeros(m, 24, device=x.device, dtype=x.dtype)
+            total = torch.zeros(m, device=x.device, dtype=x.dtype)
+            for tile in hl.tile(m):
+                row = x[tile, 8:32]
+                suffix[tile, :] = hl.cumsum(row, dim=1, reverse=True)
+                total[tile] = row.sum(-1)
+            return suffix, total
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def bounded_tiles(x: torch.Tensor, nvalid: int) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m, tile_n in hl.tile([x.size(0), nvalid], block_size=[8, 16]):
+                out[tile_m, tile_n] = hl.cumsum(x[tile_m, tile_n], dim=1, reverse=True)
+            return out
+
+        x = torch.randn([40, 64], device=DEVICE)
+        configs: list[dict[str, object]] = [{"block_sizes": [8]}]
+        if _get_backend() == "cute":
+            # Lane loops take the serial gmem-reload scan.
+            configs.append({"block_sizes": [32], "num_threads": [8, 8]})
+        row = x[:, 8:32]
+        expected = (torch.flip(torch.cumsum(torch.flip(row, [1]), 1), [1]), row.sum(-1))
+        for config in configs:
+            with self.subTest(**config):
+                _code, result = code_and_output(offset_slice, (x,), **config)
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+        expected = torch.zeros_like(x)
+        for start in range(0, 40, 16):
+            chunk = x[:, start : min(start + 16, 40)]
+            expected[:, start : start + chunk.size(1)] = torch.flip(
+                torch.cumsum(torch.flip(chunk, [1]), 1), [1]
+            )
+        _code, result = code_and_output(bounded_tiles, (x, 40))
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager(
+        "the tiles kernel sorts and scans each 32-wide tile, so the result depends"
+        " on block_sizes, which ref mode does not apply"
+    )
+    def test_sort_and_scan_skip_the_padded_positions(self):
+        """Positions past the end of a tile hold no element: a 24-long slice
+        on 32 lanes (dynamic shapes) or the 16-element last tile of a 48-wide
+        row neither take a rank nor fold a padded zero into a product."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def sort_offset_slice(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            vals = torch.zeros(m, 24, device=x.device, dtype=x.dtype)
+            for tile in hl.tile(m):
+                sorted_row, _ = torch.sort(x[tile, 8:32], dim=-1)
+                vals[tile, :] = sorted_row
+            return vals
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def tiles(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            vals = torch.zeros_like(x)
+            prods = torch.zeros_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                sorted_tile, _ = torch.sort(x[tile_m, tile_n], dim=-1)
+                vals[tile_m, tile_n] = sorted_tile
+                prods[tile_m, tile_n] = hl.cumprod(
+                    x[tile_m, tile_n], dim=1, reverse=True
+                )
+            return vals, prods
+
+        x = torch.randn([40, 64], device=DEVICE)
+        _code, result = code_and_output(sort_offset_slice, (x,), block_sizes=[8])
+        torch.testing.assert_close(result, torch.sort(x[:, 8:32], dim=-1)[0])
+
+        x = torch.rand([37, 48], device=DEVICE) * 0.5 + 0.75
+        halves = (x[:, :32], x[:, 32:])
+        expected = (
+            torch.cat([torch.sort(h, dim=-1)[0] for h in halves], -1),
+            torch.cat(
+                [torch.flip(torch.cumprod(torch.flip(h, [1]), 1), [1]) for h in halves],
+                -1,
+            ),
+        )
+        _code, result = code_and_output(tiles, (x,), block_sizes=[8, 32])
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["cute"])
+    def test_serial_rereads_refuse_what_they_cannot_address(self):
+        """A serial re-read needs the tile's uniform base and a mask it can
+        evaluate at every position: a flattened 2-D tile and an extra_mask
+        along the walked dim are refused (the former would read negative
+        columns)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def sort_tiles(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                vals, _ = torch.sort(x[tile_m, tile_n], dim=-1)
+                out[tile_m, tile_n] = vals
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def sort_masked(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros_like(x)
+            for tile, tile_n in hl.tile([m, n], block_size=[None, n]):
+                v = hl.load(x, [tile, tile_n], extra_mask=(tile_n.index < 20)[None, :])
+                vals, _ = torch.sort(v, dim=-1)
+                out[tile, tile_n] = vals
+            return out
+
+        x = torch.randn([40, 64], device=DEVICE)
+        for loop_order in ([1, 0], [0, 1]):
+            with (
+                self.subTest(loop_order=loop_order),
+                self.assertRaisesRegex(exc.BackendUnsupported, "flattened multi-dim"),
+            ):
+                code_and_output(
+                    sort_tiles,
+                    (x,),
+                    block_sizes=[16, 4],
+                    flatten_loops=[True],
+                    loop_orders=[loop_order],
+                    num_threads=[0, 4],
+                    cute_vector_widths=[2, 1],
+                )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "extra_mask"):
+            code_and_output(sort_masked, (x[:, :32].contiguous(),), block_sizes=[8])
+
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
@@ -1865,7 +2623,22 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfCute("CuTe negative indexes can poison the CUDA context")
+    def test_negative_indexing_dynamic_shapes(self):
+        """Negative indexes count back from a dynamic dimension size."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            (rows,) = x.shape[:1]
+            for tile_r in hl.tile(rows):
+                x[tile_r, -2] = x[tile_r, -1] + 1.0
+            return x
+
+        for shape in ([64, 128], [33, 50]):
+            x = torch.randn(shape, device=DEVICE)
+            expected = x.clone()
+            expected[:, -2] = expected[:, -1] + 1.0
+            torch.testing.assert_close(kernel(x), expected)
+
     def test_negative_indexing_multidim(self):
         """Test negative indexing on multiple dimensions: x[-1, -1]"""
 
@@ -1883,7 +2656,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected[-1, -1] = 42.0
         torch.testing.assert_close(result, expected)
 
-    @skipIfCute("CuTe negative indexes can poison the CUDA context")
     def test_negative_indexing_with_tile(self):
         """Test mixed tile and negative index: x[tile, -1]"""
 
@@ -2035,9 +2807,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ):
             code_and_output(kernel, (x,))
 
-    @skipIfNormalMode(
-        "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
-    )
     def test_multi_dim_slice(self):
         """Test both setter from scalar and getter for [:, :, i]"""
 
@@ -2245,7 +3014,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode("InternalError: Unexpected type <class 'slice'>")
     def test_range_slice(self):
         """Test both setter from scalar and getter for [10:20]"""
 
@@ -2271,7 +3039,225 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @xfailIfCute("incorrect results on cute backend")
+    def test_slice_bounds_clamp_like_pytorch(self):
+        """Slice bounds follow PyTorch on a 48-wide dim: a stop past the end
+        and negative bounds are clamped to the dim (``16:100`` reads and writes
+        32 columns), for loads, stores and atomics, static and dynamic."""
+
+        def loads(
+            q: torch.Tensor,
+            past_end: torch.Tensor,
+            from_end: torch.Tensor,
+            to_end: torch.Tensor,
+            before_start: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            for tile in hl.tile(q.size(0)):
+                past_end[tile, :] = q[tile, 16:100]
+                from_end[tile, :] = q[tile, -16:]
+                to_end[tile, :] = q[tile, :-8]
+                before_start[tile, :] = q[tile, -100:20]
+            return past_end, from_end, to_end, before_start
+
+        def stores(
+            q: torch.Tensor, v: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out = torch.zeros_like(q)
+            acc = torch.zeros_like(q)
+            for tile in hl.tile(q.size(0)):
+                out[tile, 16:100] = v[tile, :]
+                hl.atomic_add(acc, [tile, slice(-32, None)], v[tile, :])
+            return out, acc
+
+        q = torch.randn([64, 48], device=DEVICE)
+        v = torch.randn([64, 32], device=DEVICE)
+        expected_out = torch.zeros_like(q)
+        expected_out[:, 16:] = v
+        for static_shapes in (True, False):
+            with self.subTest(static_shapes=static_shapes):
+                expected = (q[:, 16:100], q[:, -16:], q[:, :-8], q[:, -100:20])
+                outs = tuple(torch.empty_like(columns) for columns in expected)
+                kernel = helion.kernel(static_shapes=static_shapes)(loads)
+                _, results = code_and_output(kernel, (q, *outs), block_sizes=[16])
+                for result, columns in zip(results, expected, strict=True):
+                    torch.testing.assert_close(result, columns)
+                kernel = helion.kernel(static_shapes=static_shapes)(stores)
+                _, (out, acc) = code_and_output(kernel, (q, v), block_sizes=[16])
+                torch.testing.assert_close(out, expected_out)
+                torch.testing.assert_close(acc, expected_out)
+
+    def test_slice_start_past_end_is_empty(self):
+        """A start at or past the end (or past the stop) selects nothing."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(q: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            sums = torch.empty([q.size(0)], dtype=q.dtype, device=q.device)
+            out = q.clone()
+            for tile in hl.tile(q.size(0)):
+                sums[tile] = q[tile, 60:100].sum(-1) + q[tile, 30:10].sum(-1)
+                out[tile, 60:] = v[tile, :]
+            return sums, out
+
+        q = torch.randn([64, 48], device=DEVICE)
+        v = torch.randn([64, 0], device=DEVICE)
+        _, (sums, out) = code_and_output(fn, (q, v), block_sizes=[16])
+        torch.testing.assert_close(sums, torch.zeros_like(sums))
+        torch.testing.assert_close(out, q)
+
+    def test_strided_slice_bounds_clamp_like_pytorch(self):
+        """Strided slices clamp their bounds too: ``8:100:2`` and ``-30::3``
+        on 48 elements."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            src1: torch.Tensor,
+            dst1: torch.Tensor,
+            src2: torch.Tensor,
+            dst2: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            for _ in hl.grid(1):
+                dst1[8:100:2] = 1.0
+                src1[8:100:2] = dst1[8:100:2]
+                dst2[-30::3] = 2.0
+                src2[-30::3] = dst2[-30::3]
+            return src1, dst1, src2, dst2
+
+        N = 48
+        args = [torch.zeros([N], device=DEVICE) for _ in range(4)]
+        src1, dst1, src2, dst2 = kernel(*args)
+        expected1 = torch.zeros([N], device=DEVICE)
+        expected1[8:100:2] = 1.0
+        expected2 = torch.zeros([N], device=DEVICE)
+        expected2[-30::3] = 2.0
+        torch.testing.assert_close(src1, expected1)
+        torch.testing.assert_close(dst1, expected1)
+        torch.testing.assert_close(src2, expected2)
+        torch.testing.assert_close(dst2, expected2)
+
+    def test_size_one_slices(self):
+        """A one-element slice is indexed by its start: ``47:48``, ``-1:`` and
+        ``:-47`` on 48 columns (a one-element vector in the Triton pointer
+        index, not a scalar)."""
+
+        def loads(
+            x: torch.Tensor,
+            last: torch.Tensor,
+            from_end: torch.Tensor,
+            first: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            for tile in hl.tile(x.size(0)):
+                last[tile, :] = x[tile, 47:48]
+                from_end[tile, :] = x[tile, -1:]
+                first[tile, :] = x[tile, :-47]
+            return last, from_end, first
+
+        @helion.kernel(static_shapes=True)
+        def stores(v: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(out.size(0)):
+                out[tile, 47:48] = v[tile, :]
+                out[tile, :-47] = v[tile, :] * 2
+            return out
+
+        x = torch.randn([64, 48], device=DEVICE)
+        for static_shapes in (True, False):
+            with self.subTest(static_shapes=static_shapes):
+                outs = tuple(torch.empty([64, 1], device=DEVICE) for _ in range(3))
+                kernel = helion.kernel(static_shapes=static_shapes)(loads)
+                _, (last, from_end, first) = code_and_output(
+                    kernel, (x, *outs), block_sizes=[16]
+                )
+                torch.testing.assert_close(last, x[:, 47:48])
+                torch.testing.assert_close(from_end, x[:, -1:])
+                torch.testing.assert_close(first, x[:, :1])
+        v = torch.randn([64, 1], device=DEVICE)
+        out = torch.zeros([64, 48], device=DEVICE)
+        expected = out.clone()
+        expected[:, 47:48] = v
+        expected[:, :1] = v * 2
+        _, result = code_and_output(stores, (v, out), block_sizes=[16])
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("ref eager raises PyTorch's ValueError")
+    def test_slice_non_positive_step_is_rejected(self):
+        """PyTorch indexing rejects a step <= 0, and so does Helion at bind
+        time."""
+
+        @helion.kernel(static_shapes=True)
+        def reversed_columns(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, ::-1]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def descending(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0), 30], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, 40:10:-1]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def zero_step(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = x[tile, ::0]
+            return out
+
+        x = torch.randn([64, 48], device=DEVICE)
+        for kernel in (reversed_columns, descending, zero_step):
+            with (
+                self.subTest(kernel=kernel.name),
+                self.assertRaisesRegex(
+                    exc.InvalidSliceStep, "step must be greater than zero"
+                ),
+            ):
+                kernel.bind((x,))
+
+    @skipIfRefEager("ref eager slices with the loaded value as PyTorch does")
+    def test_tensor_slice_bound_is_rejected(self):
+        """A loaded value as a slice bound has no compile-time extent; it is
+        rejected with a ``TensorSliceBound`` error that points to hl.arange."""
+
+        @helion.kernel(static_shapes=True)
+        def window(q: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([q.size(0), 16], dtype=q.dtype, device=q.device)
+            for tile in hl.tile(q.size(0)):
+                start = offsets[0]
+                out[tile, :] = q[tile, start : start + 16]
+            return out
+
+        q = torch.randn([64, 48], device=DEVICE)
+        offsets = torch.tensor([8], device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(exc.TensorSliceBound, "hl.arange"):
+            window.bind((q, offsets))
+
+    def test_symbolic_slice_bound_clamps_like_pytorch(self):
+        """A single symbolic bound (an int argument ``k``) is clamped to the
+        dim, and counted from the end when negative, at runtime: ``:100``
+        reads the 48 columns and ``-8:`` the last 8."""
+
+        @helion.kernel(static_shapes=True)
+        def head(q: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty([q.size(0)], dtype=q.dtype, device=q.device)
+            for tile in hl.tile(q.size(0)):
+                out[tile] = q[tile, :k].sum(-1)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def tail(q: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty([q.size(0)], dtype=q.dtype, device=q.device)
+            for tile in hl.tile(q.size(0)):
+                out[tile] = q[tile, k:].sum(-1)
+            return out
+
+        q = torch.randn([64, 48], device=DEVICE)
+        for k in (16, 100, -8, -100):
+            for kernel, columns in ((head, q[:, :k]), (tail, q[:, k:])):
+                with self.subTest(kernel=kernel.name, k=k):
+                    _, result = code_and_output(kernel, (q, k), block_sizes=[16])
+                    torch.testing.assert_close(
+                        result, columns.sum(-1), rtol=1e-4, atol=1e-4
+                    )
+
     def test_range_slice_dynamic(self):
         """Test both [i:i+1] = scalar and [i] = [i:i+1] patterns"""
 
@@ -2393,11 +3379,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
-    )
-    @pytest.mark.xfail(
-        _get_backend() == "cute",
-        reason="CuTe attention dot lowering with tile-offset K/V loads is incorrect",
-        run=False,
     )
     def test_tile_with_offset_from_expr(self):
         @helion.kernel(
@@ -3011,6 +3992,210 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
+    def test_broadcast_tile_store_of_a_shifted_or_gathered_load(self):
+        """The broadcast store writes element ``j`` at its own index tensor's
+        ``j``-th entry, not at the coordinate the value was loaded from."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def store_shifted(
+            data: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor
+        ) -> torch.Tensor:
+            m = data.size(0)
+            out = torch.zeros([m, m, 4], device=data.device, dtype=data.dtype)
+            for tile_m in hl.tile(m, block_size=4):
+                val = hl.load(data, [rows[tile_m], hl.arange(4) + 4])
+                val_3d = val[:, None, :].expand(val.size(0), val.size(0), 4)
+                hl.store(out, [cols[tile_m], tile_m.index, hl.arange(4)], val_3d)
+            return out
+
+        m = 8
+        data = torch.randn(m, 8, device=DEVICE)
+        rows = torch.randperm(m, device=DEVICE, dtype=torch.int32)
+        cols = torch.randperm(m, device=DEVICE, dtype=torch.int32)
+        _code, result = code_and_output(store_shifted, (data, rows, cols))
+        expected = torch.zeros([m, m, 4], device=DEVICE)
+        for tile_start in range(0, m, 4):
+            for a in range(tile_start, tile_start + 4):
+                expected[cols[a], tile_start : tile_start + 4] = data[rows[a], 4:]
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("the broadcast covers the tile that block_sizes picks")
+    def test_broadcast_tile_store_under_a_lane_loop(self):
+        """One thread walking the whole tile writes every row of the
+        broadcast, and only the rows of the tile range: the output dim may be
+        wider than the tile."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def store_broadcast(data: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+            m = data.size(0)
+            out = torch.zeros([m, 2 * m, 4], device=data.device, dtype=data.dtype)
+            for tile_m in hl.tile(m):
+                val = hl.load(data, [tile_m, hl.arange(4)])
+                val_3d = val[:, None, :].expand(val.size(0), val.size(0), 4)
+                hl.store(out, [rows[tile_m], tile_m.index, hl.arange(4)], val_3d)
+            return out
+
+        m = 10
+        data = torch.randn(m, 4, device=DEVICE)
+        rows = torch.randperm(m, device=DEVICE, dtype=torch.int32)
+        expected = torch.zeros([m, 2 * m, 4], device=DEVICE)
+        for tile_start in range(0, m, 8):
+            tile_end = min(tile_start + 8, m)
+            for a in range(tile_start, tile_end):
+                expected[rows[a], tile_start:tile_end] = data[a]
+        configs: list[dict[str, object]] = [{}]
+        if _get_backend() == "cute":
+            configs += [
+                {"num_threads": [1]},
+                {"num_threads": [2]},
+                {"num_threads": [1], "cute_lane_layouts": ["strided"]},
+                {
+                    "num_threads": [1],
+                    "cute_vector_widths": [4],
+                    "cute_lane_layouts": ["strided"],
+                },
+            ]
+        for config in configs:
+            with self.subTest(**config):
+                _code, result = code_and_output(
+                    store_broadcast, (data, rows), block_sizes=[8], **config
+                )
+                torch.testing.assert_close(result, expected)
+
+    @skipIfXPU("XPU returns wrong values for these slice sorts and top-ks")
+    def test_topk_stored_into_slices(self):
+        """Top-k values and indices land at a slice's start and step."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def topk_slices(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            vals = torch.full((m, 8), 7.0, device=x.device, dtype=x.dtype)
+            idx = torch.full((m, 8), 7, device=x.device, dtype=torch.int64)
+            for tile in hl.tile(m):
+                top_vals, top_idx = torch.topk(x[tile, 1::2], 4, dim=-1)
+                vals[tile, 1::2] = top_vals
+                idx[tile, 2:6] = top_idx
+            return vals, idx
+
+        x = torch.randn([40, 64], device=DEVICE)
+        top_vals, top_idx = torch.topk(x[:, 1::2], 4, dim=-1)
+        vals = torch.full((40, 8), 7.0, device=DEVICE)
+        idx = torch.full((40, 8), 7, device=DEVICE, dtype=torch.int64)
+        vals[:, 1::2] = top_vals
+        idx[:, 2:6] = top_idx
+        configs: list[dict[str, object]] = [{"block_sizes": [8]}]
+        if _get_backend() == "cute":
+            configs.append({"block_sizes": [8], "num_threads": [8, 8]})
+        for config in configs:
+            with self.subTest(**config):
+                _code, result = code_and_output(topk_slices, (x,), **config)
+                torch.testing.assert_close(result, (vals, idx))
+
+    @skipIfXPU("XPU returns wrong values for these slice sorts and top-ks")
+    def test_topk_stored_through_aranges(self):
+        """Top-k element ``j`` stored through an affine hl.arange index lands
+        at the arange's ``j``-th entry."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def topk_arange(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            vals = torch.empty([x.size(0), 4], dtype=x.dtype, device=x.device)
+            idx = torch.empty([x.size(0), 4], dtype=torch.int64, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                top_vals, top_idx = torch.topk(x[tile, :], 4, dim=-1)
+                vals[tile, hl.arange(4)] = top_vals
+                idx[tile, hl.arange(4)] = top_idx
+            return vals, idx
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def topk_affine(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            spread = torch.full([x.size(0), 12], 7.0, dtype=x.dtype, device=x.device)
+            idx = torch.full([x.size(0), 12], 7, dtype=torch.int64, device=x.device)
+            flipped = torch.zeros([x.size(0), 4], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                low_vals, low_idx = torch.topk(x[tile, :], 4, dim=-1, largest=False)
+                spread[tile, hl.arange(1, 9, 2)] = low_vals
+                idx[tile, hl.arange(4) * 2 + 3] = low_idx
+                flipped[tile, 3 - hl.arange(4)] = low_vals
+            return spread, idx, flipped
+
+        x = torch.randn([37, 50], device=DEVICE)
+        top_vals, top_idx = torch.topk(x, 4, dim=-1)
+        low_vals, low_idx = torch.topk(x, 4, dim=-1, largest=False)
+        spread = torch.full((37, 12), 7.0, device=DEVICE)
+        spread[:, 1:9:2] = low_vals
+        idx = torch.full((37, 12), 7, device=DEVICE, dtype=torch.int64)
+        idx[:, 3:11:2] = low_idx
+        configs: list[dict[str, object]] = [{"block_sizes": [4]}]
+        if _get_backend() == "cute":
+            configs.append({"block_sizes": [8], "num_threads": [8, 8]})
+        for config in configs:
+            with self.subTest(**config):
+                _code, result = code_and_output(topk_arange, (x,), **config)
+                torch.testing.assert_close(result, (top_vals, top_idx))
+                _code, result = code_and_output(topk_affine, (x,), **config)
+                torch.testing.assert_close(
+                    result, (spread, idx, torch.flip(low_vals, [1]))
+                )
+
+    @onlyBackends(["cute"])
+    def test_topk_feeding_a_computation_is_refused(self):
+        """Top-k output sits on the lanes of the sorted input dim, which only
+        a store addresses; a reduction of it would fold the wrong lanes, and a
+        store index other than a slice or an affine arange cannot address it."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def topk_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros(m, device=x.device, dtype=x.dtype)
+            for tile in hl.tile(m):
+                top_vals, _ = torch.topk(x[tile, :], 4, dim=-1)
+                out[tile] = top_vals.sum(-1)
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def topk_gathered(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0), 8], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                top_vals, _ = torch.topk(x[tile, :], 4, dim=-1)
+                out[tile, cols[hl.arange(4)]] = top_vals
+            return out
+
+        x = torch.randn([40, 64], device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "torch.topk output"):
+            code_and_output(topk_sum, (x,), block_sizes=[8])
+        # A gathered store index is no affine arange of the output position.
+        cols = torch.tensor([7, 2, 5, 0], device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "affine hl.arange"):
+            code_and_output(topk_gathered, (x, cols), block_sizes=[8])
+
+    @onlyBackends(["cute"])
+    def test_free_arange_beside_a_one_thread_vector_lane_tile(self):
+        """A one-thread tile's strided vector lane loop still addresses thread
+        axis 0 in its lane base, so a free hl.arange must take another axis."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def copy_columns(data: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([data.size(0), 4], device=data.device, dtype=data.dtype)
+            for tile_m in hl.tile(data.size(0)):
+                val = hl.load(data, [tile_m, hl.arange(4)])
+                hl.store(out, [tile_m, hl.arange(4)], val * 2)
+            return out
+
+        data = torch.randn(8, 8, device=DEVICE)
+        for vector_width in (2, 4):
+            with self.subTest(vector_width=vector_width):
+                _code, result = code_and_output(
+                    copy_columns,
+                    (data,),
+                    block_sizes=[8],
+                    num_threads=[1],
+                    cute_vector_widths=[vector_width],
+                    cute_lane_layouts=["strided"],
+                )
+                torch.testing.assert_close(result, data[:, :4] * 2)
+
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
@@ -3325,11 +4510,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRocm("ROCm exposes an unrelated cross-loop dependency in this codegen test")
     @skipIfTileIR("TileIR does not support cross-loop persistent synchronization")
     @skipIfXPU("XPU exposes an unrelated cross-loop dependency in this codegen test")
-    @skipIfRefEager("Test checks generated Triton code")
+    @skipIfRefEager("Test checks generated code")
     def test_dynamic_internal_strides_remain_literal(self):
         @helion.kernel(
             autotune_effort="none",
@@ -3349,11 +4534,14 @@ class TestIndexing(RefEagerTestBase, TestCase):
         x = torch.randn([2, 32], device=DEVICE)
         code, result = code_and_output(two_stage, (x,))
         torch.testing.assert_close(result, x + 1)
-        # User-input layout remains generic, while compiler-owned contiguous
-        # layouts must not pollute Triton's do-not-specialize set.
-        self.assertIn("'x_stride_0'", code)
-        self.assertNotIn("'tmp_stride_", code)
-        self.assertNotIn("'out_stride_", code)
+        # The implicit dependency defaults to the grid-barrier pipeline.
+        self.assertIn("grid_barrier(", code)
+        if _get_backend() == "triton":
+            # User-input layout remains generic, while compiler-owned contiguous
+            # layouts must not pollute Triton's do-not-specialize set.
+            self.assertIn("'x_stride_0'", code)
+            self.assertNotIn("'tmp_stride_", code)
+            self.assertNotIn("'out_stride_", code)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Test checks generated Triton code")
@@ -3642,10 +4830,6 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
                         int(expression.subs(bound.env.block_sizes[0].symbol(), block))
                         == expected
                     )
-            if backend == "cute" and stepped:
-                with pytest.raises(exc.BackendUnsupported, match="strided slices"):
-                    bound.to_code(config)
-                continue
             code = bound.to_code(config)
             # Native execution below checks values; here the independently
             # allocated buffers must still have partition-dependent stores.
@@ -3689,8 +4873,6 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
 @pytest.mark.parametrize("stepped", [False, True])
 @pytest.mark.parametrize("block", [16, 32, 128])
 def test_partition_allocation_slice_values(block, stepped):
-    if stepped and _get_backend() == "cute":
-        pytest.skip("CuTe rejects stepped slices; CPU test checks that rejection")
     x = torch.arange(3 * 65, device=DEVICE, dtype=torch.float32).reshape(3, 65)
     before = x.clone()
     bound = _partition_allocations.bind((x, stepped))

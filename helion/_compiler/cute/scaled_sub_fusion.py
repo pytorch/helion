@@ -1,8 +1,9 @@
 """Make the existing distributed-scale FP32 contraction choice explicit.
 
-The reciprocal/scale hoister already changes ``(a - b) * c`` into the
-FMA-friendly ``a * c - scaled_b``. Leaving the latter as ordinary arithmetic
-makes ptxas contraction depend on intervening masked loads or register reuse.
+Under the ``fast_math`` setting, the reciprocal/scale hoister changes
+``(a - b) * c`` into the FMA-friendly ``a * c - scaled_b``. Leaving the
+latter as ordinary arithmetic makes ptxas contraction depend on intervening
+masked loads or register reuse.
 Only nodes marked by that existing transformation are handled here, under
 the existing non-matmul ``fuse_fma`` policy (which permits contraction with
 either fast-math setting). No division, approximation, integer arithmetic,

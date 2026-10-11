@@ -288,7 +288,8 @@ def codegen_cute_tile_argreduce(
         statement_from_string(
             f"{best_index} = _cute_argreduce_index("
             f"{smem}, {valid_smem}, {start_expr}, {stride_expr}, "
-            f"extent={extent}, reduction_type={reduction_type!r})"
+            f"extent={extent}, reduction_type={reduction_type!r}, "
+            f"dtype={dtype_str})"
         ),
         statement_from_string(
             f"{result} = {backend.cast_expr(best_index, output_dtype_str)}"

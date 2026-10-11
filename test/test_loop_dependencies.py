@@ -13,9 +13,11 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import is_cuda
+from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
@@ -296,7 +298,7 @@ class TestTileDependencyAnalysis(TestCase):
 
     @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_implicit_dependency_lowering_is_rejected_when_unsupported(self) -> None:
-        if _get_backend() == "triton" and is_cuda():
+        if _get_backend() in ("triton", "cute") and is_cuda():
             self.skipTest("implicit dependency lowering is supported")
 
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
@@ -307,39 +309,47 @@ class TestTileDependencyAnalysis(TestCase):
             implicit_tile_dependency_chain.bind((x,))
 
 
-@skipIfNotTriton("tile-dependency lowering requires the Triton backend")
+@onlyBackends(["triton", "cute"])
+@skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
 @skipIfNotCUDA()
 @skipIfRefEager("tile-dependency lowering is unavailable in ref eager mode")
-class TestTritonTileDependencyLowering(TestCase):
+class TestTileDependencyBarrierLowering(TestCase):
+    def assertGridBarrier(self, code: str) -> None:
+        if _get_backend() == "cute":
+            self.assertIn("_cute_grid_barrier(", code)
+        else:
+            self.assertIn("triton_helpers.x_grid_barrier(", code)
+            self.assertIn("launch_cooperative_grid=True", code)
+            self.assertNotIn("_minimum_resident_programs=", code)
+
     def test_implicit_dependency_exposes_cross_loop_pipeline(self) -> None:
         x = torch.empty(8, device=DEVICE)
         bound = implicit_tile_dependency_chain.bind((x,))
         fragment = bound.config_spec._flat_fields()["cross_loop_pipeline"]
         self.assertIsInstance(fragment, EnumFragment)
         assert isinstance(fragment, EnumFragment)
-        self.assertEqual(fragment.choices, ("barrier", "static", "dynamic"))
+        # The static/dynamic pipelines are Triton codegen.
+        self.assertEqual(
+            fragment.choices,
+            ("barrier",)
+            if _get_backend() == "cute"
+            else ("barrier", "static", "dynamic"),
+        )
         self.assertEqual(
             bound.config_spec.default_config()["cross_loop_pipeline"],
             "barrier",
         )
-
-    def test_flat_dense_load_preserves_grouped_readiness(self) -> None:
-        x = torch.arange(32, device=DEVICE, dtype=torch.float32).reshape(2, 8, 2)
-        code, output = code_and_output(
-            grouped_store_flat_dense_load,
-            (x,),
-            block_sizes=[2, 4],
-            pid_type="persistent_blocked",
-            cross_loop_pipeline="dynamic",
-            num_sm_multiplier=1,
-            num_warps=1,
-        )
-        torch.testing.assert_close(
-            output,
-            (x + 1).sum(dim=(1, 2), keepdim=True).expand(2, 1, 4).reshape(2, 4),
-        )
-        self.assertIn("tile_dependency_nested_loop_wait", code)
-        self.assertNotIn("tile_dependency_root_barrier_wait", code)
+        if _get_backend() == "cute":
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, r"must be one of \('barrier',\), got 'static'"
+            ):
+                bound.to_code(
+                    helion.Config(
+                        block_sizes=[8, 8],
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline="static",
+                    )
+                )
 
     def test_implicit_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
@@ -350,9 +360,7 @@ class TestTritonTileDependencyLowering(TestCase):
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("triton_helpers.x_grid_barrier(", code)
-        self.assertIn("launch_cooperative_grid=True", code)
-        self.assertNotIn("_minimum_resident_programs=", code)
+        self.assertGridBarrier(code)
 
     def test_atomic_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
@@ -363,8 +371,7 @@ class TestTritonTileDependencyLowering(TestCase):
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, x + 1)
-        self.assertIn("triton_helpers.x_grid_barrier(", code)
-        self.assertNotIn("_minimum_resident_programs=", code)
+        self.assertGridBarrier(code)
 
     def test_dynamic_shape_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(65, device=DEVICE, dtype=torch.float32)
@@ -388,9 +395,74 @@ class TestTritonTileDependencyLowering(TestCase):
             num_warps=1,
         )
         torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("triton_helpers.x_grid_barrier(", code)
-        self.assertIn("launch_cooperative_grid=True", code)
-        self.assertNotIn("_minimum_resident_programs=", code)
+        self.assertGridBarrier(code)
+
+    def test_matmul_chain_defaults_to_grid_barrier(self) -> None:
+        a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
+        b = torch.eye(16, device=DEVICE)
+        c = torch.eye(16, device=DEVICE)
+        code, output = code_and_output(
+            implicit_tile_dependency_matmul_chain,
+            (a, b, c),
+            block_sizes=[16, 16, 16, 16, 16, 16],
+            pid_type="persistent_blocked",
+            num_warps=4,
+        )
+        torch.testing.assert_close(output, a, atol=0, rtol=0)
+        self.assertGridBarrier(code)
+
+    def test_fixed_capacity_specialization_reuses_existing_buckets(self) -> None:
+        first_x = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        first_metadata = torch.zeros_like(first_x)
+        first = fixed_capacity_runtime_metadata_chain.bind((first_x, first_metadata))
+
+        same_capacity = fixed_capacity_runtime_metadata_chain.bind(
+            (torch.ones_like(first_x), torch.ones_like(first_metadata))
+        )
+        self.assertIs(first, same_capacity)
+
+        second_x = torch.arange(97, device=DEVICE, dtype=torch.float32)
+        second_capacity = fixed_capacity_runtime_metadata_chain.bind(
+            (second_x, torch.zeros_like(second_x))
+        )
+        self.assertIsNot(first, second_capacity)
+
+        strided_storage = torch.arange(130, device=DEVICE, dtype=torch.float32)
+        strided_x = strided_storage[::2]
+        strided_metadata = torch.zeros_like(strided_storage)[::2]
+        different_stride = fixed_capacity_runtime_metadata_chain.bind(
+            (strided_x, strided_metadata)
+        )
+        self.assertIsNot(first, different_stride)
+        self.assertIs(
+            first,
+            fixed_capacity_runtime_metadata_chain.bind(
+                (torch.full_like(first_x, 2), torch.full_like(first_metadata, 3))
+            ),
+        )
+
+
+@skipIfNotTriton("static/dynamic cross-loop pipelines are Triton-only codegen")
+@skipIfNotCUDA()
+@skipIfRefEager("tile-dependency lowering is unavailable in ref eager mode")
+class TestTritonTileDependencyLowering(TestCase):
+    def test_flat_dense_load_preserves_grouped_readiness(self) -> None:
+        x = torch.arange(32, device=DEVICE, dtype=torch.float32).reshape(2, 8, 2)
+        code, output = code_and_output(
+            grouped_store_flat_dense_load,
+            (x,),
+            block_sizes=[2, 4],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        torch.testing.assert_close(
+            output,
+            (x + 1).sum(dim=(1, 2), keepdim=True).expand(2, 1, 4).reshape(2, 4),
+        )
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier_wait", code)
 
     def test_implicit_dependency_static_pipeline(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
@@ -522,36 +594,6 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertEqual(first_hashes, second_hashes)
         self.assertEqual(len(first_hashes), 1)
         self.assertIn("runtime_metadata", code)
-
-    def test_fixed_capacity_specialization_reuses_existing_buckets(self) -> None:
-        first_x = torch.arange(65, device=DEVICE, dtype=torch.float32)
-        first_metadata = torch.zeros_like(first_x)
-        first = fixed_capacity_runtime_metadata_chain.bind((first_x, first_metadata))
-
-        same_capacity = fixed_capacity_runtime_metadata_chain.bind(
-            (torch.ones_like(first_x), torch.ones_like(first_metadata))
-        )
-        self.assertIs(first, same_capacity)
-
-        second_x = torch.arange(97, device=DEVICE, dtype=torch.float32)
-        second_capacity = fixed_capacity_runtime_metadata_chain.bind(
-            (second_x, torch.zeros_like(second_x))
-        )
-        self.assertIsNot(first, second_capacity)
-
-        strided_storage = torch.arange(130, device=DEVICE, dtype=torch.float32)
-        strided_x = strided_storage[::2]
-        strided_metadata = torch.zeros_like(strided_storage)[::2]
-        different_stride = fixed_capacity_runtime_metadata_chain.bind(
-            (strided_x, strided_metadata)
-        )
-        self.assertIsNot(first, different_stride)
-        self.assertIs(
-            first,
-            fixed_capacity_runtime_metadata_chain.bind(
-                (torch.full_like(first_x, 2), torch.full_like(first_metadata, 3))
-            ),
-        )
 
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)

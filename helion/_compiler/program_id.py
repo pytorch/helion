@@ -2844,6 +2844,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 partition, post_loop_stmts
             )
         )
+        if (
+            use_validated_role_local_body
+            and not omit_shared_loop
+            and not self._tcgen05_uses_grouped_static_persistent()
+        ):
+            # The residual statements would run in a second, shared
+            # work-tile loop after the role-local ones, and that launch hangs
+            # (even for one constant store).  Running them in the epilogue
+            # role's loop instead would have to replace the shared loop's
+            # CTA-wide barriers; refuse until it does.
+            raise exc.BackendUnsupported(
+                "cute",
+                "a statement beside the warp roles of a persistent tcgen05 "
+                "matmul would run in a shared work-tile loop after them, "
+                "which hangs; use a non-persistent pid_type",
+            )
         if self._tcgen05_uses_staged_work_tile_mailbox() and not omit_shared_loop:
             raise exc.InvalidConfig(
                 f"{TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY}=2 requires omitted "
@@ -6832,6 +6848,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "cute.arch.load",
             # Reading a thread coordinate has no observable side effect.
             "cute.arch.thread_idx",
+            # Scalar arithmetic and comparisons the FX lowering spells as
+            # ``operator`` calls (``group_id >= 0``) are pure as well.
+            "operator.add",
+            "operator.sub",
+            "operator.mul",
+            "operator.floordiv",
+            "operator.mod",
+            "operator.neg",
+            "operator.eq",
+            "operator.ne",
+            "operator.lt",
+            "operator.le",
+            "operator.gt",
+            "operator.ge",
         }
     )
 

@@ -1548,7 +1548,12 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
     def _make_search(
         llm_stage: _StageSearch, second_stage: _StageSearch
     ) -> tuple[LLMSeededSearch, list[bool]]:
-        kernel = SimpleNamespace(settings=Settings(), config_spec=SimpleNamespace())
+        kernel = SimpleNamespace(
+            settings=Settings(),
+            config_spec=SimpleNamespace(
+                backend=SimpleNamespace(supports_precompile=lambda: True)
+            ),
+        )
         search = LLMSeededSearch(
             kernel,
             _make_carrier(((object(), ()),)),

@@ -222,6 +222,44 @@ class TestGeneratedCodeDispatch(TestCase):
                 [extractor(args) for extractor in native_extractors],
             )
 
+    def test_baked_shape_guards_are_not_saved_and_rebind_runners(self) -> None:
+        # A static_shapes=False compile bound at a size-1 dim bakes ``size == 1``
+        # into its code and keys it as a guard fact the saved guards cannot
+        # express: the binding is not saved, and once the fact is published a
+        # disk runner of the signature rebinds instead of serving the key.
+        x = torch.ones(8, 32)
+        one = torch.ones(1, 64)
+        self._kernel(_specialized_rows)(x, 2)
+        kernel = self._kernel(_specialized_rows)
+        signature = kernel._base_specialization_key((x, 2))
+        with patch.object(
+            KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+        ):
+            torch.testing.assert_close(kernel(x, 2), x * 2)
+        runner = kernel.bind((x, 2))
+        self.assertIsInstance(runner, _CachedBoundKernel)
+        self.assertEqual(kernel._published_guards[signature], runner._serialized_guards)
+        with self._frontend_count() as compile_fn:
+            torch.testing.assert_close(kernel(one, 2), one * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+            self.assertIsNone(kernel._published_guards[signature])
+            self.assertGreater(len(kernel._specialize_extra[signature]), 2)
+            self.assertNotIn(runner, kernel._bound_kernels.values())
+            self.assertIsNone(runner._delegate)
+            # The runner's key no longer covers the schema; its inputs rebind.
+            torch.testing.assert_close(kernel(x, 2), x * 2)
+            self.assertEqual(compile_fn.call_count, 2)
+            torch.testing.assert_close(
+                kernel(torch.ones(3, 32), 2), torch.ones(3, 32) * 2
+            )
+            self.assertEqual(compile_fn.call_count, 2)
+        # Neither binding of the fact-keyed signature was saved for later
+        # processes; the size-1 compile runs again.
+        with self._frontend_count() as compile_fn:
+            fresh = self._kernel(_specialized_rows)
+            torch.testing.assert_close(fresh(one, 2), one * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+
     def test_unknown_attributes_do_not_compile(self) -> None:
         x = torch.ones(16)
         self._kernel()(x, 2.0)

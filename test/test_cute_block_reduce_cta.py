@@ -163,7 +163,17 @@ def _execute(code, x, operation):
                 block_idx=lambda: (bid[0], 0, 0),
                 thread_idx=lambda: (tid[0] % block[0], tid[0] // block[0], 0),
                 lane_idx=lambda: tid[0] % 32,
-            )
+                fmax=lambda a, b, nan=False: np.maximum(a, b) if nan else np.fmax(a, b),
+                fmin=lambda a, b, nan=False: np.minimum(a, b) if nan else np.fmin(a, b),
+            ),
+            math=SimpleNamespace(
+                max=lambda a, b, propagate_nan=False: (
+                    np.maximum(a, b) if propagate_nan else np.fmax(a, b)
+                ),
+                min=lambda a, b, propagate_nan=False: (
+                    np.minimum(a, b) if propagate_nan else np.fmin(a, b)
+                ),
+            ),
         ),
     )
     exec(
