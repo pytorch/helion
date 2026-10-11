@@ -25,6 +25,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
+from .ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from .compile_environment import CompileEnvironment
@@ -52,6 +53,7 @@ from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
@@ -2083,6 +2085,9 @@ def _lift_lane_invariant_if(
     lane_var: str,
     uniform_names: set[str],
     rename_groups: Mapping[str, str] | None = None,
+    *,
+    unlooped: Collection[str] = (),
+    lane_setup: Collection[int] = (),
 ) -> list[ast.AST] | None:
     """Lift one lane-invariant guard that hides reduction markers.
 
@@ -2102,6 +2107,10 @@ def _lift_lane_invariant_if(
     guard ("lane reduction under a guard whose thread uniformity cannot be
     proven") or re-raises the register-tile failure, rather than restoring
     them.
+
+    The branches named in ``unlooped`` (``"body"``, ``"orelse"``) run without
+    the lane loop and without the statements of the loop body at the
+    ``lane_setup`` indices (``_sink_lane_loop_into_branches``).
     """
     from .ast_read_writes import ReadWrites
 
@@ -2144,15 +2153,24 @@ def _lift_lane_invariant_if(
         return None
 
     condition_index_set = set(condition_indices)
-    lane_prefix = [
-        _clone_stmt(stmt)
-        for idx, stmt in enumerate(prefix)
-        if idx not in condition_index_set
-    ]
+    lane_prefix = [idx for idx in range(len(prefix)) if idx not in condition_index_set]
 
-    def branch_loop(statements: list[ast.AST]) -> list[ast.stmt]:
+    def branch_loop(field: str) -> list[ast.stmt]:
+        statements = [_clone_stmt(stmt) for stmt in getattr(branch, field)]
+        if field in unlooped:
+            unlooped_body = [
+                *(
+                    _clone_stmt(prefix[idx])
+                    for idx in lane_prefix
+                    if idx not in lane_setup
+                ),
+                *statements,
+            ]
+            if unlooped_body:
+                return cast("list[ast.stmt]", unlooped_body)
+            return [ast.Pass()] if field == "body" else []
         branch_body = [
-            *(_clone_stmt(stmt) for stmt in lane_prefix),
+            *(_clone_stmt(prefix[idx]) for idx in lane_prefix),
             *statements,
         ]
         if not branch_body:
@@ -2167,10 +2185,124 @@ def _lift_lane_invariant_if(
     lifted_if = create(
         ast.If,
         test=_clone_expr(branch.test),
-        body=branch_loop([_clone_stmt(stmt) for stmt in branch.body]),
-        orelse=branch_loop([_clone_stmt(stmt) for stmt in branch.orelse]),
+        body=branch_loop("body"),
+        orelse=branch_loop("orelse"),
     )
+    if getattr(branch, HELION_BLOCK_UNIFORM_ATTR, False):
+        setattr(lifted_if, HELION_BLOCK_UNIFORM_ATTR, True)
     return [*(_clone_stmt(stmt) for stmt in condition_nodes), lifted_if]
+
+
+def sink_lane_loops_into_uniform_branches(
+    body: list[ast.AST],
+    *,
+    uniform_names: set[str],
+    rename_groups: Mapping[str, str],
+) -> list[ast.AST]:
+    """Move each synthetic lane loop into the uniform branches it encloses.
+
+    Synthetic reduction lanes wrap the complete grid body, so a reduction
+    under a thread-uniform guard (``if pid == 0:`` in an ``hl.grid``) sits
+    below the guard inside its lane loop, out of reach of the serial-loop
+    interchange that runs before the splitter lifts the guard
+    (``_lift_lane_invariant_if``).  The reductions of mutually exclusive
+    branches also each sit in the other branch's lane loop, whose lane they
+    never read: the owner check rejects such a marker, and the full nest
+    would repeat its branch once per foreign lane.  Lift such a guard ahead
+    of both, and run a branch that reads none of the loop's coordinates
+    outside the loop.  Bottom-up, so in a nest every loop ends up around only
+    the branches that read it.
+    """
+    if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
+        return body
+
+    def visit(statements: list[ast.AST], uniform: set[str]) -> list[ast.AST]:
+        result: list[ast.AST] = []
+        for stmt in statements:
+            for field in ("body", "orelse", "finalbody"):
+                children = getattr(stmt, field, None)
+                if isinstance(children, list) and all(
+                    isinstance(child, ast.stmt) for child in children
+                ):
+                    setattr(stmt, field, visit(children, set(uniform)))
+            lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+            emitted: list[ast.AST] = [stmt]
+            if (
+                isinstance(stmt, ast.For)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == lane_var
+            ):
+                sunk = _sink_lane_loop_into_branches(
+                    stmt, stmt.target.id, uniform, rename_groups
+                )
+                if sunk is not None:
+                    # A loop kept around a branch may end in that branch's
+                    # own guard (an ``elif`` chain).
+                    emitted = visit(sunk, set(uniform))
+            for statement in emitted:
+                _update_proven_uniform_names(statement, uniform)
+            result.extend(emitted)
+        return result
+
+    return visit(body, {*_CUTE_UNIFORM_GLOBAL_NAMES, *uniform_names})
+
+
+def _sink_lane_loop_into_branches(
+    loop: ast.For,
+    lane_var: str,
+    uniform_names: set[str],
+    rename_groups: Mapping[str, str],
+) -> list[ast.AST] | None:
+    """``loop`` moved into the branches of its final guard, or None.
+
+    The guard must hold a reduction marker.  A branch runs outside the loop,
+    without the lane setup the loop body computes before the guard, when
+    that setup is pure and the branch and the rest of the loop body read
+    none of the loop's coordinates (its lane and the names computed from it,
+    across iterations too) and keep their effect run once instead of once
+    per lane (``runs_once_outside_lane``).
+    """
+    from .ast_read_writes import ReadWrites
+    from .cute.lane_loop_distribution import runs_once_outside_lane
+
+    if not loop.body or not isinstance(guard := loop.body[-1], ast.If):
+        return None
+    if not any(_find_lane_reduce_call(node) is not None for node in ast.walk(guard)):
+        return None
+    prefix = loop.body[:-1]
+    # The guard is lane-invariant: every iteration runs the same branch.
+    coordinates = _forward_live_names(
+        [*prefix, *guard.body, *guard.orelse], {lane_var}, rename_groups
+    )
+
+    def reads_lane(stmt: ast.AST) -> bool:
+        return any(
+            rename_groups.get(name, name) in coordinates
+            for name in ReadWrites.from_ast(stmt).reads
+        )
+
+    def runs_outside(statements: Iterable[ast.AST]) -> bool:
+        return all(
+            not reads_lane(stmt) and runs_once_outside_lane(stmt, lane_var)
+            for stmt in statements
+        )
+
+    lane_setup = {idx for idx, stmt in enumerate(prefix) if reads_lane(stmt)}
+    unlooped: list[str] = []
+    if not any(_has_side_effect(prefix[idx]) for idx in lane_setup) and runs_outside(
+        stmt for idx, stmt in enumerate(prefix) if idx not in lane_setup
+    ):
+        unlooped = [
+            field for field in ("body", "orelse") if runs_outside(getattr(guard, field))
+        ]
+    return _lift_lane_invariant_if(
+        loop,
+        lane_var,
+        uniform_names,
+        rename_groups,
+        unlooped=unlooped,
+        lane_setup=lane_setup,
+    )
 
 
 def _is_proven_uniform_name(name: str, uniform_names: set[str]) -> bool:
@@ -5010,21 +5142,28 @@ def _clone_expr(node: ast.AST) -> ast.AST:
     return expr_from_string(ast.unparse(node))
 
 
-def _forward_live_names(body: list[ast.AST], roots: set[str]) -> set[str]:
+def _forward_live_names(
+    body: list[ast.AST],
+    roots: set[str],
+    rename_groups: Mapping[str, str] | None = None,
+) -> set[str]:
     """Names produced by the forward slice that (transitively) consumes any
-    name in ``roots`` within ``body``."""
+    name in ``roots`` within ``body``, compared through ``rename_groups``
+    (canonical names, see ``_backward_slice``) when given."""
     from .ast_read_writes import ReadWrites
 
-    tainted = set(roots)
+    renames = rename_groups or {}
+    tainted = {renames.get(name, name) for name in roots}
     changed = True
     while changed:
         changed = False
         for stmt in body:
             rw = ReadWrites.from_ast(stmt)
-            if set(rw.reads) & tainted:
-                for w in rw.writes:
-                    if w not in tainted:
-                        tainted.add(w)
+            if {renames.get(name, name) for name in rw.reads} & tainted:
+                for write in rw.writes:
+                    name = renames.get(write, write)
+                    if name not in tainted:
+                        tainted.add(name)
                         changed = True
     return tainted
 
