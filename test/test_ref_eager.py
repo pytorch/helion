@@ -254,6 +254,139 @@ class TestRefEagerMisc(TestCase):
             result = kernel(x)
             torch.testing.assert_close(result, x)
 
+    def test_load_is_a_value_not_a_view(self):
+        """A device load keeps its values when the kernel later stores to the
+        loaded region, as in compiled code."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def swap_strided(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            for tile in hl.tile(m):
+                a = x[tile, 0::2]
+                b = x[tile, 1::2]
+                x[tile, 0::2] = b
+                x[tile, 1::2] = a
+            return x
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def swap_halves(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            for i in hl.grid(m):
+                a = x[i, 0 : n // 2]
+                b = x[i, n // 2 : n]
+                x[i, 0 : n // 2] = b
+                x[i, n // 2 : n] = a
+            return x
+
+        with assert_ref_eager_mode():
+            x = torch.arange(64, device=DEVICE, dtype=torch.float32).reshape(8, 8)
+            torch.testing.assert_close(
+                swap_strided(x.clone()), x.view(8, 4, 2).flip(-1).reshape(8, 8)
+            )
+            torch.testing.assert_close(
+                swap_halves(x.clone()), x.view(8, 2, 4).flip(1).reshape(8, 8)
+            )
+
+    def test_inplace_op_on_load_leaves_input(self):
+        """An in-place op on a loaded value does not write the input."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                v = x[tile, :]
+                v += 1
+                out[tile, :] = v
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.randn(8, 8, device=DEVICE)
+            x_before = x.clone()
+            torch.testing.assert_close(kernel(x), x_before + 1)
+            torch.testing.assert_close(x, x_before)
+
+    def test_host_slice_still_aliases(self):
+        """A slice taken in host code stays a view of the argument."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            left = x[:, : n // 2]
+            for tile in hl.tile(m):
+                left[tile, :] = left[tile, :] + 1
+            return x
+
+        with assert_ref_eager_mode():
+            x = torch.zeros(8, 8, device=DEVICE)
+            expected = x.clone()
+            expected[:, :4] = 1
+            torch.testing.assert_close(kernel(x), expected)
+
+    def test_grid_scalar_swap(self):
+        """A 0-d load is a value too: reversing in place with scalar loads."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def reverse_subscript(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            for i in hl.grid(n // 2):
+                a = x[i]
+                b = x[n - 1 - i]
+                x[i] = b
+                x[n - 1 - i] = a
+            return x
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def reverse_hl_load(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            for i in hl.grid(n // 2):
+                a = hl.load(x, [i])
+                b = hl.load(x, [n - 1 - i])
+                x[i] = b
+                x[n - 1 - i] = a
+            return x
+
+        with assert_ref_eager_mode():
+            x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+            torch.testing.assert_close(reverse_subscript(x.clone()), x.flip(0))
+            torch.testing.assert_close(reverse_hl_load(x.clone()), x.flip(0))
+
+    def test_store_into_load_raises(self):
+        """A store or atomic into a load raises as in compiled code, rather
+        than writing into the copy the load is."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def hl_store_into_load(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for t in hl.tile(x.size(0)):
+                hl.store(out[0], [t], x[t])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def atomic_into_load(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for t in hl.tile(x.size(0)):
+                hl.atomic_add(out[0], [t], x[t])
+            return out
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def setitem_into_load(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for t in hl.tile(x.size(0)):
+                left = out[:, :4]
+                left[t, :] = x[t, :4]
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.randn(8, 8, device=DEVICE)
+            out = torch.zeros(8, 8, device=DEVICE)
+            with self.assertRaises(
+                helion.exc.DeviceTensorSubscriptAssignmentNotAllowed
+            ):
+                hl_store_into_load(x[0], out)
+            with self.assertRaises(helion.exc.AtomicOnDeviceTensor):
+                atomic_into_load(x[0], out)
+            with self.assertRaises(
+                helion.exc.DeviceTensorSubscriptAssignmentNotAllowed
+            ):
+                setitem_into_load(x, out)
+
 
 if __name__ == "__main__":
     unittest.main()

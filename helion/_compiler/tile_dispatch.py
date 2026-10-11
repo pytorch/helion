@@ -72,14 +72,21 @@ class TileStrategyDispatch:
         config: Config,
     ) -> None:
         super().__init__()
+        self._device_function = fn
         self.strategies: list[TileStrategy] = []
         self.block_id_to_strategy = BlockIDStrategyMapping()
         self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        self._constexpr_live_graph_ids: frozenset[int] | None = None
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.loop_nesting import constexpr_live_graph_ids
             from .cute.loop_nesting import tile_loop_paths
 
+            device_ir = HostFunction.current().device_ir
             self._cute_tile_loop_paths = tile_loop_paths(
-                HostFunction.current().device_ir, fn.codegen.codegen_graphs
+                device_ir, fn.codegen.codegen_graphs
+            )
+            self._constexpr_live_graph_ids = constexpr_live_graph_ids(
+                device_ir, fn.codegen.codegen_graphs, fn
             )
         self._add_loop_strategies(fn, config)
         if CompileEnvironment.current().backend.name == "cute":
@@ -131,6 +138,10 @@ class TileStrategyDispatch:
                 isinstance(graph, ForLoopGraphInfo)
                 and not isinstance(graph, ReductionLoopGraphInfo)
                 and graph.block_ids
+                and (
+                    self._constexpr_live_graph_ids is None
+                    or graph.graph_id in self._constexpr_live_graph_ids
+                )
             ):
                 block_ids = [*graph.block_ids]
                 self._add_loop_strategy(block_ids, fn, config)
@@ -156,6 +167,28 @@ class TileStrategyDispatch:
         max_threads = env.backend.max_reduction_threads()
         active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
         inactive_aliases = self._inactive_cute_broadcast_aliases(fn)
+
+        if self._constexpr_live_graph_ids is not None:
+            from .cute.active_blocks import active_block_ids as live_block_ids
+
+            # A reduction dim used only on the untaken side of a constant
+            # branch is never emitted; its strategy would only claim an axis.
+            live = live_block_ids(
+                [
+                    graph
+                    for graph in fn.codegen.codegen_graphs
+                    if graph.graph_id in self._constexpr_live_graph_ids
+                ],
+                (
+                    block_id
+                    for ids in HostFunction.current().device_ir.grid_block_ids
+                    for block_id in ids
+                ),
+                env,
+            )
+            active_block_ids = (
+                live if active_block_ids is None else active_block_ids & live
+            )
         rdims = [
             bs.block_id
             for bs in env.block_sizes
@@ -512,8 +545,7 @@ class TileStrategyDispatch:
 
         if CompileEnvironment.current().backend.name != "cute":
             return None
-        device_ir = HostFunction.current().device_ir
-        red_paths = device_ir.reduction_block_id_branch_paths()
+        red_paths = self.reduction_branch_paths()
         if len(red_paths) < 2:
             return None
 
@@ -557,6 +589,12 @@ class TileStrategyDispatch:
                 groups.append([candidate])
         return [[*shared, *group] for group in groups]
 
+    def reduction_branch_paths(self) -> dict[int, list[list[tuple[int, int]]]]:
+        """``DeviceIR.reduction_block_id_branch_paths`` for this config."""
+        return HostFunction.current().device_ir.reduction_block_id_branch_paths(
+            self._device_function
+        )
+
     def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
         """Return the starting thread-axis index for a strategy in its branch.
 
@@ -567,12 +605,31 @@ class TileStrategyDispatch:
         they map to the same hardware lane.  Without this dedup the
         warp-per-row layout would assign one axis per inner tile loop
         and bury M on axis 2 or 3.
+
+        This is the launch-side copy of the layout the kernel body emits
+        (``BlockSizeTileStrategy._compute_thread_axis_offset``): a reduction
+        claims an axis only when it spreads across threads, and tiles start
+        above the kernel-wide reduction reservation
+        (:meth:`reserved_reduction_axes`).
+
+        A reduction that claims no axis (a single live thread on CuTe,
+        ``ReductionStrategy._claims_thread_axis``) is parked on the lowest
+        axis no threaded reduction of the branch (or of the kernel-wide
+        reservation) holds.  It indexes with the constant 0 and records no
+        thread coordinate, so sharing that axis with a tile is harmless,
+        whereas sharing a threaded reduction's axis would let a lookup of the
+        block's axis extent read the other reduction's threads.
         """
-        reserved_axes = self._multi_phase_reserved_reduction_axes()
+        reserved_axes = self.reserved_reduction_axes()
+        reduction_axis_first = (
+            CompileEnvironment.current().backend.reduction_axis_first()
+        )
         for branch in self._strategy_branches():
             if target not in branch:
                 continue
             axis = 0
+            target_axis: int | None = None
+            threaded_reduction_axes: set[int] = set(range(reserved_axes))
             seen_block_id_sets: dict[tuple[int, ...], int] = {}
             plan = (
                 self.current_cute_grid_execution_plan(
@@ -595,9 +652,10 @@ class TileStrategyDispatch:
                 ):
                     # Mirror ``BlockSizeTileStrategy._compute_thread_axis_offset``:
                     # the body keeps the kernel-wide reduction axes reserved in
-                    # every ``hl.barrier()`` phase, so a phase without its own
-                    # reduction must place its tiles above them too or the
-                    # launch block dims would disagree with the body's axes.
+                    # every branch (another root loop, an ``hl.barrier()``
+                    # phase, a pid branch), so a branch with fewer reductions
+                    # must place its tiles above them too or the launch block
+                    # dims would disagree with the body's axes.
                     axis = max(axis, reserved_axes)
                 key = tuple(sorted(strategy.block_ids))
                 cached = seen_block_id_sets.get(key)
@@ -606,24 +664,37 @@ class TileStrategyDispatch:
                     # they're mutually exclusive in time so they share
                     # the axis.
                     if strategy is target:
-                        return cached
+                        target_axis = cached
                     continue
                 if strategy is target:
-                    return axis
+                    target_axis = axis
                 seen_block_id_sets[key] = axis
-                axis += strategy.thread_axes_used()
+                used = strategy.thread_axes_used()
+                if isinstance(strategy, ReductionStrategy):
+                    threaded_reduction_axes.update(range(axis, axis + used))
+                axis += used
+            if (
+                reduction_axis_first
+                and isinstance(target, ReductionStrategy)
+                and target.thread_axes_used() == 0
+            ):
+                free_axis = 0
+                while free_axis in threaded_reduction_axes:
+                    free_axis += 1
+                return free_axis
+            return target_axis
         return None
 
-    def _multi_phase_reserved_reduction_axes(self) -> int:
-        """Reduction axes every ``hl.barrier()`` phase keeps reserved.
+    def reserved_reduction_axes(self) -> int:
+        """Leading thread axes the kernel body reserves for reductions.
 
-        Same count as ``BlockSizeTileStrategy._compute_thread_axis_offset``
-        plans: one axis per reduction that spreads across threads, at least one
-        when any reduction claims an axis.  ``0`` for single-phase kernels,
-        whose branches already agree with the body's bookkeeping.
+        One axis per reduction that spreads across threads, at least one when
+        any reduction claims an axis, counted over the whole kernel (every root
+        loop, ``hl.barrier()`` phase and branch).  Tiles start above them both
+        in the body (``BlockSizeTileStrategy._compute_thread_axis_offset``) and
+        in the launch layout (:meth:`thread_axis_for_strategy`).  ``0`` when
+        the backend does not place reductions first.
         """
-        if len(HostFunction.current().device_ir.phases) <= 1:
-            return 0
         if not CompileEnvironment.current().backend.reduction_axis_first():
             return 0
         reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]

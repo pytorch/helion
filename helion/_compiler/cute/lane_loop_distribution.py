@@ -69,12 +69,19 @@ the same tensor interleaves with it in an order the repetition changes: a
 lane-invariant atomic accumulates once per iteration, an invariant store that
 a later per-lane store overwrites is applied again by the next iteration, and
 an invariant load re-reads what an earlier iteration's per-lane store wrote.
-A device loop of the body whose values depend on the lane loop runs whole
-once per lane, so the accesses inside it whose values do not are repeated
-with every iteration of it between two repetitions: a load of a tensor the
-loop stores to, or a store to one it loads or stores per lane, is observable
-there in any order, the first pass's later iterations coming before the
-second pass's earlier ones.
+A device loop (or a ``while`` loop) of the body whose values depend on the
+lane loop runs whole once per lane, so the accesses inside it whose values
+do not are repeated with every iteration of it between two repetitions: a
+load of a tensor the loop stores to, or a store to one it loads or stores
+per lane, is observable there in any order, the first pass's later
+iterations coming before the second pass's earlier ones; against the
+statements around the loop each repetition sits at the loop's place, as a
+lane-invariant statement of the list would.  A branch whose values depend
+on the lane loop is emitted whole inside it too (its sides are not
+distributed): a statement of its sides whose values do not is repeated once
+per lane between the per-lane statements of the passes, and is checked like
+a statement of the loop's own list (a first-column load beside the per-lane
+update of its row re-reads what lane 0 stored).
 Such a body is rejected (``BackendUnsupported``) rather than compiled into a
 nest that computes something other than the program, and an atomic placed in
 a loop its values ignore is pinned or rejected on every path.  A placement is
@@ -152,8 +159,10 @@ base's plus the V-loop's variable, so the packet's later elements are
 compared as much as its first.
 
 Memory dependences key on the generated tensor names, as the rest of the
-lane-loop lowering does: two kernel arguments that view the same storage are
-not ordered against each other.  A tensor the body builds itself (the
+lane-loop lowering does.  The rename groups map a kernel argument viewing
+another's storage (a host-side ``x.view(...)``) to that argument's name;
+arguments that alias only at runtime (one tensor passed twice) are not
+ordered against each other.  A tensor the body builds itself (the
 shared-memory view of the epilogue subtile's staging, the register array
 carrying a scan's prefix) is accessed by subscript: ``smem[i] = v`` is a
 plain store of it and ``smem[i] += v`` a read-modify-write.  The name also
@@ -245,9 +254,11 @@ symbolic bounds exempt no pair inside a repeated device loop;
 already ordered by a barrier closing an inner loop's body may get another
 at the enclosing loop; a branch on a literal condition (an emitter's
 ``if True:`` scope) is divergent like any other, so a pair racing inside
-it is rejected rather than barriered.  Known gaps (programs accepted
-whose nest is not the program): a store through a value loaded per thread
-or per lane (``x[base[t0] + tk.begin]``, a jagged tile's rows beginning at
+it is rejected rather than barriered (only an ``hl.if`` whose condition
+``cute/block_uniform.py`` proves the same for the whole CTA is not).
+Known gaps (programs accepted whose nest is not the program): a store
+through a value loaded per thread or per lane (``x[base[t0] +
+tk.begin]``, a jagged tile's rows beginning at
 an offset loaded per row) is not paired with itself, since the terms do
 not model it and rejecting it would reject every jagged store (a base
 every thread and lane loads alike, a segment's start by the block's
@@ -266,6 +277,7 @@ import logging
 import operator
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from typing import cast
 
 import sympy
 
@@ -275,14 +287,19 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from ..ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
+from ..ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
+from ..ast_read_writes import HELION_FENCE_BARRIER_ATTR
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ..ast_read_writes import ReadWrites
+from ..tile_strategy import _HELION_LANE_REDUCE_MARKER
+from ..tile_strategy import _is_lane_reduce_marker_assign
 from ..tile_strategy import _is_proven_relocatable_call
 from ..tile_strategy import _memory_write_calls
 from .access_regions import access_address
 from .address_maps import AddressMaps
 from .address_maps import Load
+from .address_maps import _tighter
 from .address_maps import flat_terms
 from .address_maps import iteration_symbol
 from .address_maps import loop_symbol
@@ -376,6 +393,9 @@ _PERSISTENT_VEC_STORE_ADDRESS = 3
 _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 # Float max / min emulated with integer atomics (``cute/atomic_helpers.py``).
 _ATOMIC_HELPERS = frozenset({"_cute_atomic_max_float32", "_cute_atomic_min_float32"})
+# The relaxed ``red.global.add.v{2,4}.f32`` flush of a vectorized atomic site
+# (``cute/atomic_ops.py``): one packet of consecutive elements.
+_VECTOR_ATOMIC_HELPERS = frozenset({"_cute_red_add_f32_vec"})
 # The vector type argument of a 16-byte ``cute.arch.load``, the store
 # protocol's register-only conversion of a whole byte packet and the layout
 # arithmetic of an atomic's address.
@@ -388,15 +408,21 @@ _PURE_CALLS = frozenset(
 _METADATA_ATTRS = frozenset({"shape", "layout", "stride", "element_type", "alignment"})
 
 
-def contains_compiler_marker(body: list[ast.AST]) -> bool:
-    """Whether a later pass still has to expand a ``_helion_*`` placeholder."""
-    return any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id.startswith("_helion_")
+def _compiler_markers(body: list[ast.AST]) -> set[str]:
+    """The ``_helion_*`` placeholders a later pass still has to expand."""
+    return {
+        node.func.id
         for statement in body
         for node in ast.walk(statement)
-    )
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id.startswith("_helion_")
+    }
+
+
+def contains_compiler_marker(body: list[ast.AST]) -> bool:
+    """Whether a later pass still has to expand a ``_helion_*`` placeholder."""
+    return bool(_compiler_markers(body))
 
 
 def _is_persistent_vec_access(call: ast.Call, marker: str) -> bool:
@@ -444,7 +470,9 @@ def _is_atomic_call(call: ast.Call) -> bool:
         return call.func.attr.startswith("atomic_") and (
             ast.unparse(call.func.value) == "cute.arch"
         )
-    return isinstance(call.func, ast.Name) and call.func.id in _ATOMIC_HELPERS
+    return isinstance(call.func, ast.Name) and (
+        call.func.id in _ATOMIC_HELPERS or call.func.id in _VECTOR_ATOMIC_HELPERS
+    )
 
 
 def _uniform_lanes_of(call: ast.Call) -> frozenset[str]:
@@ -457,6 +485,8 @@ def _uniform_lanes_of(call: ast.Call) -> frozenset[str]:
 
 
 def _is_relaxed_atomic(call: ast.Call) -> bool:
+    if isinstance(call.func, ast.Name) and call.func.id in _VECTOR_ATOMIC_HELPERS:
+        return True
     return any(
         keyword.arg == "sem"
         and isinstance(keyword.value, ast.Constant)
@@ -715,8 +745,10 @@ def _is_device_loop(node: ast.AST) -> bool:
 def _is_packet_call(call: ast.Call) -> bool:
     """A vector load or store of consecutive elements through its pointer operand."""
     if isinstance(call.func, ast.Name):
-        return call.func.id in _PLAIN_STORE_HELPERS or call.func.id in (
-            _PLAIN_LOAD_HELPERS
+        return (
+            call.func.id in _PLAIN_STORE_HELPERS
+            or call.func.id in _PLAIN_LOAD_HELPERS
+            or call.func.id in _VECTOR_ATOMIC_HELPERS
         )
     return ast.unparse(call.func) in ("cute.arch.load", "cute.arch.store") and any(
         isinstance(argument, ast.Call)
@@ -841,12 +873,23 @@ def _pointer_access(
             and owner.attr in ("load", "store")
         ):
             return _Access(address, True)
+        if isinstance(call, ast.Call) and _is_packet_call(call):
+            # A vector atomic flush through ``p.llvm_ptr``: its packet.
+            vector, base = packets.get(id(call), (None, None))
+            return _Access(address, False, vector, base)
         if isinstance(call, ast.Call) and _is_atomic_call(call):
             # ``cute.arch.atomic_add(p.llvm_ptr, ...)``: one element.
             return _Access(address, True)
         return _Access(address, False)
     if isinstance(owner, ast.Call):
         if _is_atomic_call(owner):
+            return _Access(address, True)
+        if _is_persistent_vec_access(
+            owner, _PERSISTENT_VEC_LOAD
+        ) or _is_persistent_vec_access(owner, _PERSISTENT_VEC_STORE):
+            # A persistent-reduction marker stands for its lane's scalar
+            # access; the later pass makes the lanes' exact fragment one
+            # vector transaction of the same thread.
             return _Access(address, True)
         if _is_packet_call(owner):
             vector, base = packets.get(id(owner), (None, None))
@@ -1067,7 +1110,8 @@ class _Statement:
     fence: bool
     # The lane loops the statement is placed in (``_propagate_lanes``): the
     # loops whose values it reads, the loops those loops nest inside and, for
-    # a name it writes, the loops of every other definition of that name.
+    # a name it writes, the loops of every other definition of that name; for
+    # a release / acquire atomic's barrier, the atomic's loops.
     lanes: set[str] = dataclasses.field(default_factory=set)
     # The lane loops whose iteration changes the statement's values
     # (``_propagate_dataflow_lanes``): the coordinates it reads, transitively
@@ -1098,6 +1142,10 @@ class _Statement:
     # among ``writes`` (the name carries the stored values to later loads)
     # without the statement depending on its own result.
     subscripted: frozenset[str] = frozenset()
+    # The names among ``reads`` the statement may read before it assigns
+    # them itself (``_exposed_reads``): a temporary a branch of an ``if``
+    # assigns and then reads carries nothing from an earlier run.
+    exposed_reads: frozenset[str] = frozenset()
     # The tensors mentioned inside a call the pass cannot see through (a
     # helper of unknown purity), which may read or write them however it
     # likes; a pinned statement without such a call (one of a form the pass
@@ -1126,9 +1174,171 @@ class _Statement:
         return (self.index,) if self.index >= 0 else self.sites
 
 
+def _exposed_reads(
+    statements: Sequence[ast.AST],
+    defined: frozenset[str],
+    renames: Mapping[str, str],
+    *,
+    loop_bodies: bool = False,
+) -> frozenset[str]:
+    """Canonical names ``statements`` may read before assigning them.
+
+    Only a plain assignment of a whole name defines it, and an ``if`` defines
+    what both of its branches do; any other compound statement (a loop) is
+    treated as reading everything it reads first, or with ``loop_bodies``
+    what its header and its body do (a body reading a name it assigned
+    before reads that iteration's value; what it assigns may never run).
+    """
+
+    def canonical(names: Iterable[str]) -> frozenset[str]:
+        return frozenset(renames.get(name, name) for name in names)
+
+    exposed: set[str] = set()
+    for statement in statements:
+        if isinstance(statement, ast.If):
+            exposed |= canonical(ReadWrites.from_ast(statement.test).reads) - defined
+            exposed |= _exposed_reads(
+                statement.body, defined, renames, loop_bodies=loop_bodies
+            )
+            exposed |= _exposed_reads(
+                statement.orelse, defined, renames, loop_bodies=loop_bodies
+            )
+            defined |= _assigned_names(statement.body, renames) & _assigned_names(
+                statement.orelse, renames
+            )
+        elif loop_bodies and isinstance(statement, ast.For):
+            exposed |= canonical(ReadWrites.from_ast(statement.iter).reads) - defined
+            exposed |= _exposed_reads(
+                [*statement.body, *statement.orelse],
+                defined | canonical(ReadWrites.from_ast(statement.target).writes),
+                renames,
+                loop_bodies=True,
+            )
+        elif loop_bodies and isinstance(statement, ast.While):
+            exposed |= canonical(ReadWrites.from_ast(statement.test).reads) - defined
+            exposed |= _exposed_reads(
+                [*statement.body, *statement.orelse],
+                defined,
+                renames,
+                loop_bodies=True,
+            )
+        else:
+            exposed |= canonical(ReadWrites.from_ast(statement).reads) - defined
+            if isinstance(statement, ast.Assign):
+                defined |= _assigned_names([statement], renames)
+    return frozenset(exposed)
+
+
+def _carried_writes(
+    statements: Sequence[ast.AST], renames: Mapping[str, str]
+) -> list[frozenset[str]]:
+    """Per statement of one loop iteration, the canonical names it assigns
+    that the iteration may have read before assigning them.
+
+    The next iteration reads the value such a statement leaves, so repeating
+    it once per lane updates a loop-carried variable once per lane: with the
+    phi's names merged (``DeviceLoopState.carried_names``), ``c_copy = c``
+    ... ``c = c_copy + 1.0``.  A plain copy back of the variable's own value
+    from before the iteration (``c = c_copy``) changes nothing and is left
+    out, and so is a value a later statement reassigns before anything
+    reads it: the default an if-join assigns before an ``if`` whose two
+    branches both assign the variable never reaches the next iteration.
+    """
+
+    def canonical(name: str) -> str:
+        return renames.get(name, name)
+
+    # The names each statement's successors reassign before reading them.
+    overwritten: list[frozenset[str]] = []
+    dead: frozenset[str] = frozenset()
+    for statement in reversed(statements):
+        overwritten.append(dead)
+        if isinstance(statement, ast.Assign):
+            assigned = _assigned_names([statement], renames)
+        elif isinstance(statement, ast.If):
+            assigned = _assigned_names(statement.body, renames) & _assigned_names(
+                statement.orelse, renames
+            )
+        else:
+            assigned = frozenset()
+        reads = _exposed_reads([statement], frozenset(), renames, loop_bodies=True)
+        dead = (dead - reads) | assigned
+    overwritten.reverse()
+
+    result: list[frozenset[str]] = []
+    defined: frozenset[str] = frozenset()
+    exposed: set[str] = set()
+    written: set[str] = set()
+    # Locals holding a variable's value from before the iteration.
+    entry_values: dict[str, str] = {}
+    for statement in statements:
+        # ``_exposed_reads`` of the statements so far, one at a time.
+        exposed |= _exposed_reads([statement], defined, renames, loop_bodies=True)
+        if isinstance(statement, ast.Assign):
+            defined |= _assigned_names([statement], renames)
+        elif isinstance(statement, ast.If):
+            defined |= _assigned_names(statement.body, renames) & _assigned_names(
+                statement.orelse, renames
+            )
+        writes = {canonical(name) for name in ReadWrites.from_ast(statement).writes}
+        target = source = None
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and isinstance(statement.value, ast.Name)
+        ):
+            target = canonical(statement.targets[0].id)
+            value = canonical(statement.value.id)
+            source = entry_values.get(value, None if value in written else value)
+        carried = (writes & exposed) - overwritten[len(result)]
+        if target is not None and source == target:
+            carried.discard(target)
+        result.append(frozenset(carried))
+        written |= writes
+        for name in writes:
+            entry_values.pop(name, None)
+        if target is not None and source is not None:
+            entry_values[target] = source
+    return result
+
+
+def _assigned_names(
+    statements: Sequence[ast.AST], renames: Mapping[str, str]
+) -> frozenset[str]:
+    """Canonical names a plain top-level assignment in ``statements`` binds."""
+    return frozenset(
+        renames.get(target.id, target.id)
+        for statement in statements
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    )
+
+
 def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statement:
     def canonical(names: Iterable[str]) -> frozenset[str]:
         return frozenset(renames.get(name, name) for name in names)
+
+    if getattr(node, HELION_FENCE_BARRIER_ATTR, False):
+        # A release / acquire atomic's barrier: a fence touching no tensor and
+        # reading no lane, placed in its atomic's lane loops
+        # (``_propagate_lanes``) on the atomic's side of every memory access
+        # instead of repeating inside every lane loop.
+        empty: frozenset[str] = frozenset()
+        return _Statement(
+            index,
+            node,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            pinned=False,
+            register_only=False,
+            atomic=False,
+            fence=True,
+        )
 
     rw = ReadWrites.from_ast(node)
     read, written = _tensor_accesses(node)
@@ -1183,6 +1393,7 @@ def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statemen
         uniform_lanes=uniform_lanes,
         partly_uniform_lanes=partly_uniform_lanes,
         subscripted=canonical(set(plain) | updated),
+        exposed_reads=_exposed_reads([node], frozenset(), renames),
         opaque=canonical(opaque),
         visible=canonical(visible),
         regions={
@@ -1235,7 +1446,8 @@ def _propagate_lanes(
 
     A statement runs inside the loops whose values it reads, inside every
     loop when its effects are unknown, inside the loops of every other
-    definition of a name it writes, and inside the loops that the loops it
+    definition of a name it writes (a release / acquire atomic's barrier
+    inside the atomic's loops), and inside the loops that the loops it
     runs in nest inside (``LaneScope.requires``, the loops whose values a
     loop's attached statements read, and the outer loops of any loop a
     statement shares with them, since each loop is materialized once).
@@ -1273,9 +1485,17 @@ def _propagate_lanes(
             if statement.reads & scope.names:
                 statement.lanes.add(scope.lane_var)
         close(statement.lanes)
+    fence_partners = _fence_barrier_partners(statements)
     changed = True
     while changed:
         changed = False
+        # A release / acquire atomic's barrier runs in the atomic's loops,
+        # every thread the same number of times: once per atomic, between
+        # the accesses the atomic orders and the atomic itself.
+        for barrier, atomic in fence_partners:
+            size = len(barrier.lanes)
+            barrier.lanes |= atomic.lanes
+            changed = changed or len(barrier.lanes) != size
         name_lanes: dict[str, set[str]] = {}
         for statement in statements:
             for name in statement.writes:
@@ -1309,6 +1529,39 @@ def _propagate_lanes(
         for lane_var, outers in requires.items()
         for outer in outers
     )
+
+
+def _fence_barrier_partners(
+    statements: list[_Statement],
+) -> list[tuple[_Statement, _Statement]]:
+    """Each release / acquire barrier with the atomic statement it orders.
+
+    The atomic codegen emits a release barrier right before the atomic's
+    statements and an acquire barrier right after them
+    (``HELION_FENCE_BARRIER_ATTR``), with nothing but its register
+    computations in between: the nearest atomic, fence or statement of
+    unknown effects after or before the barrier, when that is an atomic.
+    """
+    partners: list[tuple[_Statement, _Statement]] = []
+    for position, statement in enumerate(statements):
+        role = getattr(statement.node, HELION_FENCE_BARRIER_ATTR, None)
+        if role == "release":
+            following = statements[position + 1 :]
+        elif role == "acquire":
+            following = statements[:position][::-1]
+        else:
+            continue
+        partner = next(
+            (
+                other
+                for other in following
+                if other.atomic or other.fence or other.pinned
+            ),
+            None,
+        )
+        if partner is not None and partner.atomic:
+            partners.append((statement, partner))
+    return partners
 
 
 def _propagate_dataflow_lanes(
@@ -1458,6 +1711,13 @@ def _propagate_thread_axes(everything: list[_Statement], masks: frozenset[str]) 
         everything, _propagate_dependence(everything, seeds, masks), strict=True
     ):
         statement.thread_axes = axes
+
+
+def _repeated_carry(statement: _Statement, names: frozenset[str], lane_var: str) -> str:
+    return (
+        f"{ast.unparse(statement.node)} updates the loop-carried "
+        f"{', '.join(sorted(names))} and would repeat once per {lane_var}"
+    )
 
 
 def _repeated_atomic(statement: _Statement, lane_var: str) -> str:
@@ -1639,10 +1899,8 @@ def _pin_repeated_atomics(
         runs_in = set(order) if full_nest else statement.lanes
         repeated = runs_in - statement.dataflow_lanes - statement.uniform_lanes
         if repeated:
-            raise exc.BackendUnsupported(
-                "cute",
-                "the lane loop nest is not the tile program: "
-                + _repeated_atomic(statement, min(repeated, key=order.__getitem__)),
+            raise inexact_nest_error(
+                _repeated_atomic(statement, min(repeated, key=order.__getitem__))
             )
         pinned = (runs_in & statement.partly_uniform_lanes) - statement.pinned_lanes
         if not pinned:
@@ -1653,19 +1911,15 @@ def _pin_repeated_atomics(
                 statement, lane_var, statements, scopes, attached, full_nest=full_nest
             )
             if reason is not None:
-                raise exc.BackendUnsupported(
-                    "cute", f"the lane loop nest is not the tile program: {reason}"
-                )
+                raise inexact_nest_error(reason)
         predicate = " and ".join(by_lane[lane_var].first_lane for lane_var in lane_vars)
         node = _pinned(statement.node, predicate)
         if node is None:
             raise exc.BackendUnsupported("cute", _unpinnable(statement.node, lane_vars))
         varying = pinned & statement.dataflow_lanes
         if varying:
-            raise exc.BackendUnsupported(
-                "cute",
-                "the lane loop nest is not the tile program: "
-                + _varying_pin(statement, sorted(varying, key=order.__getitem__)),
+            raise inexact_nest_error(
+                _varying_pin(statement, sorted(varying, key=order.__getitem__))
             )
         body[statement.index] = node
         statement.node = node
@@ -1686,6 +1940,161 @@ def _pin_repeated_atomics(
                     HELION_ATOMIC_UNIFORM_LANES_ATTR,
                     _uniform_lanes_of(call) - pinned,
                 )
+
+
+def pin_atomics_left_in_lane_loops(body: list[ast.AST]) -> None:
+    """Issue every atomic uniform along an enclosing lane loop at its first lane.
+
+    Runs on the nest ``tile_strategy.split_lane_loop_reductions`` rebuilds for
+    a body holding ``_helion_lane_reduce`` markers.  The split hoists the
+    statements that read no lane out of its per-lane passes, but an atomic
+    uniform along a loop whose statement reads a lane's copy of a value (a
+    cached load) stays inside it and would run once per iteration.  Pinned
+    before the split, an atomic would read the lane through its guard and
+    lose the hoist.  Each such statement directly inside a lane loop's body
+    is pinned (``_pin_uniform_atomics``); one nested deeper (in a branch or a
+    device loop) rejects the body.  ``body`` is updated in place.
+    """
+
+    def visit(statements: list[ast.AST], loops: list[ast.For]) -> None:
+        lane_vars = [ast.unparse(loop.target) for loop in loops]
+        direct = bool(loops) and statements is loops[-1].body
+        for position, node in enumerate(statements):
+            if isinstance(node, ast.For) and getattr(
+                node, HELION_LANE_LOOP_VAR_ATTR, None
+            ) == ast.unparse(node.target):
+                visit(cast("list[ast.AST]", node.body), [*loops, node])
+                continue
+            guarded = _pin_uniform_atomics(
+                node,
+                {
+                    lane_var: f"{lane_var} == 0" if direct else ""
+                    for lane_var in lane_vars
+                },
+                {ast.unparse(loop.target): loop.body for loop in loops},
+            )
+            if guarded is not None:
+                statements[position] = guarded
+                continue
+            for field in ("body", "orelse", "finalbody"):
+                children = getattr(node, field, None)
+                if isinstance(children, list) and children:
+                    visit(children, loops)
+
+    visit(body, [])
+
+
+def _pin_atomics_beside_compiler_markers(
+    body: list[ast.AST], scopes: list[LaneScope], markers: set[str]
+) -> None:
+    """Pin the atomics of a body the distribution leaves to a later pass.
+
+    A body holding ``_helion_*`` placeholders (``markers``: a collective
+    matmul's ``_helion_pending_collective_mma``) is neither redistributed nor
+    checked; its caller wraps the full nest of ``scopes`` around it.  Each
+    top-level statement of ``body`` with an atomic uniform along one of those
+    loops (a tile counter beside the matmul's epilogue) is pinned to their
+    first lanes (``_pin_uniform_atomics``, ``LaneScope.first_lane``).  A body
+    holding only ``_helion_lane_reduce`` markers is left to the split that
+    rebuilds its loops (``pin_atomics_left_in_lane_loops``).  ``body`` is
+    updated in place.
+    """
+    if markers <= {_HELION_LANE_REDUCE_MARKER}:
+        return
+    first_lanes = {scope.lane_var: scope.first_lane for scope in scopes}
+    bodies = dict.fromkeys(first_lanes, body)
+    for index, node in enumerate(body):
+        guarded = _pin_uniform_atomics(node, first_lanes, bodies)
+        if guarded is not None:
+            body[index] = guarded
+
+
+def _pin_uniform_atomics(
+    node: ast.AST,
+    first_lanes: Mapping[str, str],
+    bodies: Mapping[str, Sequence[ast.AST]],
+) -> ast.AST | None:
+    """``node`` with its uniform atomics issued at their loops' first lanes.
+
+    ``first_lanes`` maps the variables of the lane loops around ``node``,
+    outermost first, to their first-lane tests ("" where ``node`` cannot take
+    one), and ``bodies`` maps them to the statements a pin to that loop may
+    reorder ``node`` against.  None when no atomic of ``node`` is recorded as
+    uniform along those loops (``HELION_ATOMIC_UNIFORM_LANES_ATTR``).  A
+    missing test, a statement ``_pinned`` cannot guard, or a pin
+    ``_rebuilt_pin_conflict`` finds observable rejects the body.  The pinned
+    atomics are uniform along those loops no longer.
+    """
+    calls = [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and _is_atomic_call(call)
+        and _uniform_lanes_of(call) & first_lanes.keys()
+    ]
+    if not calls:
+        return None
+    pinned = [
+        lane_var
+        for lane_var in first_lanes
+        if any(lane_var in _uniform_lanes_of(call) for call in calls)
+    ]
+    tests = [first_lanes[lane_var] for lane_var in pinned]
+    guarded = _pinned(node, " and ".join(tests)) if all(tests) else None
+    if guarded is None:
+        raise exc.BackendUnsupported("cute", _unpinnable(node, pinned))
+    reason = _rebuilt_pin_conflict(node, bodies[pinned[0]], pinned[0])
+    if reason is not None:
+        raise exc.BackendUnsupported("cute", reason)
+    for call in calls:
+        setattr(
+            call,
+            HELION_ATOMIC_UNIFORM_LANES_ATTR,
+            _uniform_lanes_of(call) - set(pinned),
+        )
+    return guarded
+
+
+def _rebuilt_pin_conflict(
+    node: ast.AST, loop_body: Sequence[ast.AST], lane_var: str
+) -> str | None:
+    """Why issuing the atomic statement ``node`` at its loop's first lane is observable.
+
+    Conservative ``_pin_conflict`` for the pins of a body a later pass still
+    expands (``pin_atomics_left_in_lane_loops``,
+    ``_pin_atomics_beside_compiler_markers``): any other access in
+    ``loop_body`` of a tensor the atomic writes, or of any tensor for a
+    fence, may be another lane's that the program orders after (or before)
+    the atomic.  A call of unknown effects reaches only the tensors it
+    mentions, except that a fence orders its unknown effects too.
+    """
+    atomic = _analyze(-1, node, {})
+    tensors = ", ".join(sorted(atomic.tensors_written))
+
+    def others(statements: Sequence[ast.AST]) -> Iterator[ast.AST]:
+        for statement in statements:
+            if statement is node:
+                continue
+            if any(child is node for child in ast.walk(statement)):
+                for field in ("body", "orelse", "finalbody"):
+                    yield from others(getattr(statement, field, None) or [])
+            else:
+                yield statement
+
+    for statement in others(loop_body):
+        other = _analyze(-1, statement, {})
+        if atomic.fence and (other.tensors or other.pinned):
+            return (
+                f"a lane-invariant atomic on {tensors} issued at the first "
+                f"{lane_var} would not order the other lanes' accesses around it"
+            )
+        if other.tensors & atomic.tensors_written:
+            return (
+                f"a lane-invariant atomic on {tensors} issued at the first "
+                f"{lane_var} would run beside another access of its tensors "
+                "in the loop"
+            )
+    return None
 
 
 def _attribute_sites(
@@ -1863,16 +2272,41 @@ def _repetition_conflict(
     return None
 
 
+def _pointer_tensors(node: ast.AST, renames: Mapping[str, str]) -> frozenset[str]:
+    """The tensors ``node`` addresses through their pointers (``t.iterator``).
+
+    Those are the kernel's tensors as the memory-op codegen loads and stores
+    them; a shared-memory view or register array an emitter builds itself is
+    indexed by subscript.  A metadata query (``t.iterator.alignment``) is no
+    access.
+    """
+    queried = {
+        id(child.value)
+        for child in ast.walk(node)
+        if isinstance(child, ast.Attribute) and child.attr in _METADATA_ATTRS
+    }
+    return frozenset(
+        renames.get(child.value.id, child.value.id)
+        for child in ast.walk(node)
+        if isinstance(child, ast.Attribute)
+        and child.attr == "iterator"
+        and isinstance(child.value, ast.Name)
+        and id(child) not in queried
+    )
+
+
 def _inexact_repeated_loop(
     loop: _Statement,
     statements: list[_Statement],
     scope: LaneScope,
     attached: list[_Statement],
     renames: Mapping[str, str],
+    surrounding: Sequence[tuple[int, _Statement, bool]],
 ) -> str | None:
     """Why repeating ``loop``, whose values change with ``scope``'s lane, once per lane is observable inside it.
 
-    A loop of the body (a device loop) that reads the lane's values runs
+    A loop of the body (a device loop, or a ``while`` loop) that reads the
+    lane's values, or that a barrier or a call of unknown effects pins, runs
     whole in every iteration of the lane loop: the second lane's pass begins
     after the first pass ran every iteration of it.  A statement of its body
     whose values ignore the lane -- transitively, from the lane's coordinates
@@ -1885,13 +2319,26 @@ def _inexact_repeated_loop(
     first pass's accesses of it, which the program orders the other way
     round; and a load and a store of one tensor in one statement accumulate
     once per pass.  Two lane-invariant stores re-apply the same values in
-    the same order.  Registers are the placement's business: the loop's
-    accumulators are initialized within the pass.  A statement of unknown
-    effects whose operands ignore the lane may read or write its tensors in
-    every pass: it meets any other access of them in the loop.  The
-    per-lane accesses are the barrier pass's business, which pairs them
-    through their address mappings (``add_thread_barriers``): the check here
-    knows the names an access reads, not whether they change its element.
+    the same order.  Registers are the placement's business when
+    the loop's accumulators are initialized within the pass; one
+    carried in from outside the lane loop (an enclosing device loop's
+    carry, read before the pass assigns it) is updated once per pass
+    (``_carried_writes``).  A statement of unknown effects whose
+    operands ignore the lane may read or write its tensors in every
+    pass: it meets any other access of them in the loop.  Each pass
+    also runs between the statements around the loop (``surrounding``: each
+    with the loop's position in its numbering and whether it varies with the
+    lane), and a lane-invariant statement of the body is checked against them
+    like a lane-invariant statement at the loop's place
+    (``_repetition_conflict``; a load of ``x[r, c0]`` in the loop re-reads,
+    in the second pass, what the first pass's per-lane store after the loop
+    wrote), on the tensors it addresses through their pointers
+    (``_pointer_tensors``): an array an emitter builds and indexes itself (a
+    warp-MMA accumulator fragment zeroed and read out around its K loop) is
+    its scratch, filled again within each pass.  The per-lane accesses are
+    the barrier pass's business, which pairs them through their address
+    mappings (``add_thread_barriers``): the check here knows the names an
+    access reads, not whether they change its element.
     """
     lane_var = scope.lane_var
     inside = [
@@ -1912,18 +2359,43 @@ def _inexact_repeated_loop(
     ]
     dependences = _propagate_dependence(everything, seeds, scope.masks)
     varying = [lane_var in lanes for lanes in dependences[-len(inside) :]]
-    for statement, varies in zip(inside, varying, strict=True):
+    # A variable the pass reads before assigning it is carried in from
+    # outside the lane loop, where no pass initializes it again.
+    prefix = sorted(
+        (other for _, other, _ in surrounding if 0 <= other.index < loop.index),
+        key=operator.attrgetter("index"),
+    )
+    carried = _carried_writes(
+        [*(other.node for other in prefix), *(statement.node for statement in inside)],
+        renames,
+    )[len(prefix) :]
+    for statement, varies, updated in zip(inside, varying, carried, strict=True):
         if varies:
             continue
         if statement.pinned:
             # A call of unknown effects whose operands ignore the lane runs
             # again in every pass, between every iteration's accesses of its
-            # tensors: it may read what a later iteration of the first pass
-            # stored, or store over it.
-            for other, other_varies in zip(inside, varying, strict=True):
-                if other is statement or not (statement.tensors & other.tensors):
+            # tensors and the accesses around the loop: it may read what a
+            # later iteration of the first pass stored, or store over it.
+            for other_varies, shared in [
+                *(
+                    (other_varies, statement.tensors & other.tensors)
+                    for other, other_varies in zip(inside, varying, strict=True)
+                    if other is not statement
+                ),
+                *(
+                    (
+                        other_varies,
+                        statement.tensors
+                        & other.tensors
+                        & _pointer_tensors(statement.node, renames),
+                    )
+                    for _, other, other_varies in surrounding
+                ),
+            ]:
+                if not shared:
                     continue
-                tensor = min(statement.tensors & other.tensors)
+                tensor = min(shared)
                 return (
                     f"a call of unknown effects on {tensor} in a loop repeated "
                     f"whole once per {lane_var} meets "
@@ -1937,6 +2409,11 @@ def _inexact_repeated_loop(
             return (
                 f"{ast.unparse(statement.node)} depends on its own result and "
                 f"would repeat once per {lane_var}"
+            )
+        if updated := updated - statement.subscripted:
+            return (
+                f"{_repeated_carry(statement, updated, lane_var)} from a loop "
+                "repeated whole"
             )
         for other, other_varies in zip(inside, varying, strict=True):
             if other is statement:
@@ -1963,6 +2440,155 @@ def _inexact_repeated_loop(
                     f"meets a{' per-lane' if other_varies else 'nother'} "
                     f"{other_access} it across the passes"
                 )
+        pointed = _pointer_tensors(statement.node, renames)
+        for position, other, other_varies in surrounding:
+            shared = statement.tensors & other.tensors & pointed
+            if not shared:
+                continue
+            reason = _repetition_conflict(
+                dataclasses.replace(statement, index=position, sites=()),
+                other,
+                other_varies,
+                shared,
+            )
+            if reason is not None:
+                return f"{reason} once per {lane_var} from a loop repeated whole"
+    return None
+
+
+def _branch_items(
+    node: ast.If, guards: frozenset[str] = frozenset()
+) -> list[tuple[ast.AST, frozenset[str]]]:
+    """The statements of ``node``'s sides in program order, nested branches flattened.
+
+    Each comes with the conjuncts of the branches around it inside ``node``,
+    ``guards`` included (``_guarded_statements``); a loop is one statement.
+    """
+    items: list[tuple[ast.AST, frozenset[str]]] = []
+    for children, inside in (
+        (node.body, guards | _conjuncts(node.test)),
+        (node.orelse, guards),
+    ):
+        for child in children:
+            if isinstance(child, ast.If):
+                items.extend(_branch_items(child, inside))
+            else:
+                items.append((child, inside))
+    return items
+
+
+def _inexact_repeated_branch(
+    branch: _Statement,
+    executed: list[tuple[_Statement, bool]],
+    statements: list[_Statement],
+    scope: LaneScope,
+    attached: list[_Statement],
+    renames: Mapping[str, str],
+) -> str | None:
+    """Why repeating ``branch``, whose values change with ``scope``'s lane, once per lane is observable inside it.
+
+    A branch is emitted whole inside the lane loop: its statements are not
+    distributed, so every lane's pass runs each statement of its sides.  One
+    whose values ignore the lane -- transitively, from the lane's
+    coordinates through the setup and the definitions around and inside the
+    branch -- is repeated once per lane between the per-lane statements of
+    the passes, inside the branch as outside it, exactly like a
+    lane-invariant statement of the loop's own list (``_inexact_nest``): a
+    load of ``x[r, c0]`` before a per-lane store to ``x[r, c]`` re-reads, in
+    the second lane's pass, the element the first pass stored.  The sides'
+    statements (nested branches flattened, a device loop kept whole and
+    checked as one, ``_inexact_repeated_loop``) are checked in program order
+    against each other and, from the branch's position, against the loop's
+    other statements; a side some lanes skip only drops repetitions, and a
+    statement guarded by the loop's first-lane predicate (an atomic
+    ``_pin_repeated_atomics`` pinned) runs once.
+    """
+    lane_var = scope.lane_var
+    items = _branch_items(cast("ast.If", branch.node))
+    inside = [
+        _analyze(position, node, renames)
+        for position, (node, _guards) in enumerate(items)
+    ]
+    first_lane = (
+        _conjuncts(cast("ast.expr", expr_from_string(scope.first_lane)))
+        if scope.first_lane
+        else None
+    )
+    around = [
+        _analyze(-1, node, renames)
+        for statement in statements
+        if statement is not branch
+        for node in _simple_statements(statement.node)
+    ]
+    setup = [_analyze(-1, node, renames) for node in scope.setup]
+    everything = [*around, *setup, *attached, *inside]
+    seeds = [
+        {lane_var} if statement.reads & scope.coordinates else set()
+        for statement in everything
+    ]
+    dependences = _propagate_dependence(everything, seeds, scope.masks)
+    varying = [
+        statement.pinned or lane_var in lanes
+        for statement, lanes in zip(inside, dependences[-len(inside) :], strict=True)
+    ]
+    for statement, varies, (_node, guards) in zip(inside, varying, items, strict=True):
+        if varies:
+            if isinstance(statement.node, (ast.For, ast.While)):
+                context = [
+                    *(other for other in statements if other is not branch),
+                    *(other for other in inside if other is not statement),
+                ]
+                surrounding = [
+                    *(
+                        (statement.index, other, other_varies)
+                        for other, other_varies in zip(inside, varying, strict=True)
+                        if other is not statement
+                    ),
+                    *(
+                        (branch.index, other, other_varies)
+                        for other, other_varies in executed
+                        if other is not branch
+                    ),
+                ]
+                reason = _inexact_repeated_loop(
+                    statement, context, scope, attached, renames, surrounding
+                )
+                if reason is not None:
+                    return reason
+            continue
+        if first_lane is not None and first_lane <= guards:
+            # Issued at the loop's first lane only.
+            continue
+        if statement.atomic:
+            return _repeated_atomic(statement, lane_var)
+        if (statement.reads & statement.writes) - statement.subscripted or (
+            statement.tensors_read & statement.tensors_written
+        ):
+            return (
+                f"{ast.unparse(statement.node)} depends on its own result and "
+                f"would repeat once per {lane_var} inside a branch"
+            )
+        # Against the loop's other statements the branch's position orders it.
+        at_branch = dataclasses.replace(statement, index=branch.index)
+        pairs = [
+            *(
+                (statement, other, other_varies)
+                for other, other_varies in zip(inside, varying, strict=True)
+                if other is not statement
+            ),
+            *(
+                (at_branch, other, other_varies)
+                for other, other_varies in executed
+                if other is not branch
+            ),
+        ]
+        for repeated, other, other_varies in pairs:
+            shared = repeated.tensors & other.tensors
+            if not shared:
+                continue
+            reason = _repetition_conflict(repeated, other, other_varies, shared)
+            if reason is not None:
+                return f"{reason} once per {lane_var} inside a branch"
     return None
 
 
@@ -1981,12 +2607,15 @@ def _inexact_nest(
     it (every statement when the full nest is kept) that reads only the loop's
     mask or that the loop of a packet load it reads dragged in, an attached
     statement of an inner loop nested in the loop's instance that reads none
-    of the loop's values.  A loop of the body whose values depend on the lane
-    loop, or that a barrier or a call of unknown effects inside it pins,
-    still repeats the accesses inside it that do not, with every iteration of
-    it between two repetitions (``_inexact_repeated_loop``).  Any other
-    statement with unknown effects stays where the structure pins it and is
-    not checked for repetition; it still orders the checked statements around
+    of the loop's values.  A loop of the body (a device loop or a ``while``
+    loop) whose values depend on the lane loop, or that a barrier or a call
+    of unknown effects inside it pins, still repeats the accesses inside it
+    that do not, with every iteration of it between two repetitions and
+    between the loop list's statements around it (``_inexact_repeated_loop``);
+    so does a branch whose values depend on the lane loop, with its sides'
+    statements (``_inexact_repeated_branch``).  Any other statement
+    with unknown effects stays where the structure pins it and is not
+    checked for repetition; it still orders the checked statements around
     it.  Run for the nest the caller emits: the original one, or the
     placement, in which a statement runs inside the loops of ``lanes`` and an
     inner loop's instance nests inside an outer loop's when a statement runs
@@ -1999,6 +2628,14 @@ def _inexact_nest(
         nested = inner if full_nest else _used_inner(inside, inner)
         executed = [(s, s.pinned or lane_var in s.dataflow_lanes) for s in inside]
         executed.extend((s, True) for s in attached[lane_var])
+        body = [s for s in inside if s.index >= 0]
+        carried = dict(
+            zip(
+                (id(s) for s in body),
+                _carried_writes([s.node for s in body], renames),
+                strict=True,
+            )
+        )
         for other in scopes[depth + 1 :]:
             if other.lane_var in nested:
                 executed.extend(
@@ -2007,22 +2644,48 @@ def _inexact_nest(
                 )
         for statement, varies in executed:
             if varies:
-                if statement.index >= 0 and isinstance(statement.node, ast.For):
+                if statement.index >= 0 and isinstance(
+                    statement.node, (ast.For, ast.While)
+                ):
                     reason = _inexact_repeated_loop(
-                        statement, statements, scope, attached[lane_var], renames
+                        statement,
+                        statements,
+                        scope,
+                        attached[lane_var],
+                        renames,
+                        [
+                            (statement.index, other, other_varies)
+                            for other, other_varies in executed
+                            if other is not statement
+                        ],
+                    )
+                    if reason is not None:
+                        return reason
+                elif statement.index >= 0 and isinstance(statement.node, ast.If):
+                    reason = _inexact_repeated_branch(
+                        statement,
+                        executed,
+                        statements,
+                        scope,
+                        attached[lane_var],
+                        renames,
                     )
                     if reason is not None:
                         return reason
                 continue
             if statement.atomic:
                 return _repeated_atomic(statement, lane_var)
-            if (statement.reads & statement.writes) - statement.subscripted or (
+            if (statement.exposed_reads & statement.writes) - statement.subscripted or (
                 statement.tensors_read & statement.tensors_written
             ):
                 return (
                     f"{ast.unparse(statement.node)} depends on its own result and "
                     f"would repeat once per {lane_var}"
                 )
+            if updated := carried.get(id(statement), frozenset()) - (
+                statement.subscripted
+            ):
+                return _repeated_carry(statement, updated, lane_var)
             for other, other_varies in executed:
                 if other is statement:
                     continue
@@ -2047,9 +2710,7 @@ def _require_exact_nest(
         statements, scopes, attached, full_nest=full_nest, renames=renames
     )
     if reason is not None:
-        raise exc.BackendUnsupported(
-            "cute", f"the lane loop nest is not the tile program: {reason}"
-        )
+        raise inexact_nest_error(reason)
 
 
 def _prepare(
@@ -2115,9 +2776,14 @@ def distribute_lane_loops(
     values ignore it around per-lane accesses of the same tensor, or an
     atomic sits in a loop its values ignore without being uniform along it
     (see the module docstring).  An atomic pinned to a loop's first lane
-    replaces its statement in ``body``.
+    replaces its statement in ``body``.  A body holding a ``_helion_*``
+    placeholder is left to the pass expanding it, only its atomics pinned
+    (``_pin_atomics_beside_compiler_markers``).
     """
-    if not body or not scopes or contains_compiler_marker(body):
+    if not body or not scopes:
+        return None
+    if markers := _compiler_markers(body):
+        _pin_atomics_beside_compiler_markers(body, scopes, markers)
         return None
     statements, scopes, attached = _prepare(body, scopes, rename_groups)
     placement = None
@@ -2161,20 +2827,46 @@ def check_full_nest(
     """Raise ``BackendUnsupported`` unless the full lane loop nest of ``body`` is exact.
 
     For a caller that falls back to that nest after a placement it cannot
-    use, and for a nest built around ``body`` before it existed (a device
-    loop's lane loops, ``DeviceLoopState.check_lane_loop_nest``);
-    ``distribute_lane_loops`` performs the same check itself whenever it
+    use; ``distribute_lane_loops`` performs the same check itself whenever it
     keeps the nest.  Pins the atomics of ``body`` like that function does.
     """
-    if not body or not scopes or contains_compiler_marker(body):
-        return
+    reason = full_nest_inexactness(body, scopes, rename_groups=rename_groups)
+    if reason is not None:
+        raise inexact_nest_error(reason)
+
+
+def inexact_nest_error(reason: str) -> exc.BackendUnsupported:
+    """The error for a lane loop nest that does not run the tile program."""
+    return exc.BackendUnsupported(
+        "cute", f"the lane loop nest is not the tile program: {reason}"
+    )
+
+
+def full_nest_inexactness(
+    body: list[ast.AST],
+    scopes: list[LaneScope],
+    *,
+    rename_groups: Mapping[str, str],
+) -> str | None:
+    """Why the full lane loop nest of ``body`` is not the tile program, or None.
+
+    ``check_full_nest`` without the raise, for a nest built around ``body``
+    before it existed (a device loop's lane loops,
+    ``DeviceLoopState.check_lane_loop_nest``), which is redistributed when
+    inexact.  Pins the atomics of ``body`` the same way.
+    """
+    if not body or not scopes:
+        return None
+    if markers := _compiler_markers(body):
+        _pin_atomics_beside_compiler_markers(body, scopes, markers)
+        return None
     statements, scopes, attached = _prepare(body, scopes, rename_groups)
     _propagate_lanes(statements, scopes, attached)
     _pin_repeated_atomics(
         body, statements, scopes, attached, rename_groups, full_nest=True
     )
     _attribute_sites(statements, scopes, attached)
-    _require_exact_nest(
+    return _inexact_nest(
         statements, scopes, attached, full_nest=True, renames=rename_groups
     )
 
@@ -2297,7 +2989,8 @@ class _Block:
     ``placement.barriers`` positions are applied when the loop is
     materialized), or the body of a branch or while loop among the items.
     The last is ``divergent``: its condition may vary per thread, so no
-    barrier can be placed in it (nor in anything nested in it).
+    barrier can be placed in it (nor in anything nested in it), unless the
+    branch is marked uniform across the CTA (``HELION_BLOCK_UNIFORM_ATTR``).
     """
 
     divergent: bool
@@ -2375,13 +3068,20 @@ def _leaves(
 
     A branch or while loop among the items is not a statement of its own but
     the divergent block of its body statements (a ``hl.if`` body is emitted
-    inside the lane nest without passing through it); a device loop, a
-    guard or any other statement is one leaf.  A vectorized loop's wrapper
-    block is the body of its lane loop, whose iteration changes every
-    coordinate of the scope and whose variable is the lane variable; the
-    placement's items are the body of its V-loop, whose iteration changes
-    the coordinates its attached statements do not read (the V-loop
-    variable, its variable), or of the plain lane loop.
+    inside the lane nest without passing through it), unless the branch's
+    condition is proven the same for every thread of the CTA
+    (``HELION_BLOCK_UNIFORM_ATTR``): its sides then take the divergence of
+    the enclosing list, and a barrier placed in one is inserted into the
+    branch itself.  Inside a lane loop the sides stay in one iteration of
+    it, like the loop's own list: the exactness check reads their
+    lane-invariant statements (``_inexact_repeated_branch``) and the pairs
+    across the lanes are paired below as anywhere in the loop.  A device
+    loop, a guard or any other statement is one leaf.  A vectorized
+    loop's wrapper block is the body of its lane loop, whose iteration
+    changes every coordinate of the scope and whose variable is the lane
+    variable; the placement's items are the body of its V-loop, whose
+    iteration changes the coordinates its attached statements do not
+    read (the V-loop variable, its variable), or of the plain lane loop.
     """
     block = _Block(
         divergent,
@@ -2396,6 +3096,7 @@ def _leaves(
     for index, item in enumerate(items):
         here = (*path, (block, index))
         if isinstance(item, (ast.If, ast.While)):
+            uniform = _uniform_branch(item)
             branches = [
                 (
                     item.body,
@@ -2405,13 +3106,15 @@ def _leaves(
             ]
             for branch, test in branches:
                 _leaves(
-                    list(branch),
+                    cast("list[ast.AST | LanePlacement]", branch)
+                    if uniform
+                    else list(branch),
                     scopes,
                     renames,
                     here,
                     blocks,
                     leaves,
-                    divergent=True,
+                    divergent=divergent or not uniform,
                     conjuncts=test,
                 )
             continue
@@ -2457,6 +3160,35 @@ def _leaves(
             leaves.append(
                 _Leaf(_analyze(-1, node, renames), (*here, (wrapper, position)), scope)
             )
+
+
+def _uniform_branch(item: object) -> bool:
+    """Whether ``item`` is a branch every thread of the CTA takes alike."""
+    return isinstance(item, ast.If) and getattr(item, HELION_BLOCK_UNIFORM_ATTR, False)
+
+
+def _exclusive_sides(first: _Leaf, second: _Leaf) -> bool:
+    """Whether the leaves sit on the two (non-divergent) sides of a uniform branch.
+
+    The whole CTA takes one side of such a branch, so the two never run in
+    one pass of the statements around it.
+    """
+    parent: tuple[_Block, int] | None = None
+    for (block, index), (other, other_index) in zip(
+        first.path, second.path, strict=False
+    ):
+        if block is not other:
+            assert parent is not None
+            items = parent[0].items
+            return (
+                not block.divergent
+                and items is not None
+                and _uniform_branch(items[parent[1]])
+            )
+        if index != other_index:
+            return False
+        parent = (block, index)
+    return False
 
 
 def _common_block(first: _Leaf, second: _Leaf) -> tuple[_Block, int, int]:
@@ -2536,7 +3268,10 @@ def add_thread_barriers(
     A pair whose barrier would sit in control flow a thread may skip, where
     a block-wide barrier deadlocks (the body of a branch or while loop among
     the items, or the whole nest without ``allow_barriers``), is rejected
-    with ``BackendUnsupported`` instead.
+    with ``BackendUnsupported`` instead; a branch marked uniform across the
+    CTA is no such control flow, and a pair on its two sides never meets.
+    So is any pair needing a barrier in a body holding a ``_helion_*``
+    placeholder (``_compiler_markers``), which a later pass rewrites.
 
     Every loop of the nest runs its body once per iteration on every thread
     with nothing between the iterations.  The device loop whose body the
@@ -2593,8 +3328,12 @@ def add_thread_barriers(
     _leaves(
         items, by_lane, rename_groups, (), blocks, leaves, divergent=not allow_barriers
     )
-    if contains_compiler_marker([leaf.statement.node for leaf in leaves]):
-        return
+    # A later pass rewrites a body holding a placeholder (a reduction's
+    # ``_helion_lane_reduce``, a collective matmul's
+    # ``_helion_pending_collective_mma``), moving its statements between the
+    # passes it builds and refusing a barrier among the ones it stages: the
+    # accesses are checked as for any body, but a barrier they need rejects it.
+    placeholders = _compiler_markers([leaf.statement.node for leaf in leaves])
     statements = [leaf.statement for leaf in leaves]
     # The closures run over simple statements: a compound leaf (a device
     # loop) is represented by the statements of its body and takes their
@@ -2621,6 +3360,16 @@ def add_thread_barriers(
     _propagate_thread_axes(everything, masks)
     for statement, analyzed in parts:
         statement.thread_axes = set().union(*(piece.thread_axes for piece in analyzed))
+    # The split combines a reduction over its threads and gives every one of
+    # them the result (``_reduced_thread_axes``): two stores of one tensor
+    # whose addresses and values do not vary along the axes their threads
+    # differ on write the same sequence on each thread, ending with the
+    # program's value whatever the threads' order.
+    reduced_axes = (
+        _reduced_thread_axes(statements, parts, everything)
+        if _HELION_LANE_REDUCE_MARKER in placeholders
+        else None
+    )
     private = {
         rename_groups.get(name, name)
         for name in _register_arrays(statement.node for statement in everything)
@@ -2925,7 +3674,69 @@ def add_thread_barriers(
             # thread level orders.
             return False
         differing = {axis for axis in shared if thread_symbol(axis) not in equal}
+        if (
+            reduced_axes is not None
+            and tensor not in first.tensors_read | second.tensors_read
+            and not reduced_axes[id(second)] & differing
+            and (
+                not reduced_axes[id(first)] & differing
+                or leader_writes_after(first, second, tensor, differing, varying)
+            )
+        ):
+            return False
         return bool(differing) and _races(first, second, differing, [tensor])
+
+    def leader_writes_after(
+        first: _Statement,
+        second: _Statement,
+        tensor: str,
+        axes: set[int],
+        varying: Iterable[str],
+    ) -> bool:
+        """Whether ``first``'s write of each element ``second`` writes is the leader's, along ``axes``.
+
+        ``second`` stores one value along ``axes``; the reduction split either
+        has every thread store it, each thread's last write, or guards it to
+        the leader of the axes (coordinate 0), which then follows its own
+        write of the element in ``first``.
+        """
+        mine = address_maps.get(id(first), {}).get(tensor)
+        theirs = address_maps.get(id(second), {}).get(tensor)
+        if mine is None or theirs is None or tensor in first.opaque | second.opaque:
+            return False
+        leader = maps.bounds(
+            second.node,
+            [f"cute.arch.thread_idx()[{axis}] == 0" for axis in sorted(axes)],
+        )
+        second_bounds = dict(bounds[id(second)][tensor])
+        for symbol, bound in leader.items():
+            second_bounds[symbol] = _tighter(second_bounds.get(symbol, bound), bound)
+        # The leader's coordinates, zero by their bounds, join the address
+        # where ``first``'s does, so the proof relates them to its thread.
+        theirs = [list(access) for access in theirs]
+        for axis in axes:
+            symbol = thread_symbol(axis)
+            positions = {
+                index
+                for access in mine
+                for index, term in enumerate(access)
+                if term is not None and symbol in term.free_symbols
+            }
+            if len(positions) != 1:
+                return False
+            (position,) = positions
+            for access in theirs:
+                term = access[position] if position < len(access) else None
+                if term is None:
+                    return False
+                access[position] = sympy.Add(term, symbol)
+        equal = forced_equal(
+            mine,
+            theirs,
+            maps.pair_ranges(bounds[id(first)][tensor], second_bounds),
+            varying,
+        )
+        return all(thread_symbol(axis) in equal for axis in axes)
 
     def conflicting(
         first: _Statement, second: _Statement, tensor: str, shifts: _Shifts | None
@@ -2968,7 +3779,7 @@ def add_thread_barriers(
                 for tensor in shared_tensors
                 if racing(first.statement, second.statement, tensor, shifts={})
             }
-            if tensors:
+            if tensors and not _exclusive_sides(first, second):
                 block, after, before = _common_block(first, second)
                 if any(after < barrier <= before for barrier in block.existing):
                     # Ordered already, by a barrier the lowering emitted
@@ -3225,6 +4036,10 @@ def add_thread_barriers(
     # tile statement's.
     wraps: list[tuple[_Leaf, _Leaf, _Block, _Block, bool, set[str]]] = []
     for level, seeds, variables, tail, sequential in levels:
+        if not sequential and reduced_axes is not None:
+            # The reduction split rebuilds the lane loops into its passes and
+            # proves their order itself (``_lane_split_reorders_aliasing_memory``).
+            continue
         varying = set(seeds) | _dependent_names(
             everything,
             (bool(statement.reads & seeds) for statement in everything),
@@ -3343,10 +4158,81 @@ def add_thread_barriers(
             )
             position = index + 1
         placed[id(block)].append(position)
+    if placeholders:
+        if any(placed[id(block)] for block in blocks):
+            raise exc.BackendUnsupported(
+                "cute",
+                "threads sharing a tile axis race on a tensor in a body a later "
+                f"pass rewrites ({', '.join(sorted(placeholders))}), where the "
+                "barrier ordering them cannot be placed",
+            )
+        return
     for block in blocks:
         for position in sorted(placed[id(block)]):
             log.debug("thread barrier placed %s", _describe(block, position))
         block.insert(placed[id(block)])
+
+
+_THREAD_REDUCTION_HELPERS = ("_cute_grouped_reduce", "warp_reduction")
+
+
+def _combined_reduction(node: ast.AST) -> bool:
+    """Whether ``node`` assigns a reduction combined over its threads, and nothing else.
+
+    A ``_helion_lane_reduce`` marker, or a grouped or warp reduction helper,
+    either possibly under a cast: each gives every thread of its group the
+    group's result.
+    """
+    if _is_lane_reduce_marker_assign(node) is not None:
+        return True
+    if not isinstance(node, ast.Assign):
+        return False
+    value = node.value
+    if (
+        isinstance(value, ast.Call)
+        and ast.unparse(value.func).startswith("cutlass.")
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        value = value.args[0]
+    return isinstance(value, ast.Call) and (
+        ast.unparse(value.func).rsplit(".", 1)[-1].startswith(_THREAD_REDUCTION_HELPERS)
+    )
+
+
+def _reduced_thread_axes(
+    statements: Sequence[_Statement],
+    parts: Sequence[tuple[_Statement, list[_Statement]]],
+    everything: Sequence[_Statement],
+) -> dict[int, set[int]]:
+    """Per statement (by ``id``), the thread axes its values vary along once its reductions are combined.
+
+    For ``add_thread_barriers`` in a body the reduction split rewrites: the
+    result of a reduction combined over its threads (``_combined_reduction``)
+    is one value on every thread of the reduction's group, and a store's
+    index covers every axis its value still varies along, so the result is
+    taken to read no thread coordinate.  Unlike ``_propagate_thread_axes``
+    the masks count: a thread a mask skips writes nothing.  A compound
+    statement takes its simple statements' axes.
+    """
+    cut = [
+        dataclasses.replace(statement, reads=frozenset())
+        if _combined_reduction(statement.node)
+        else statement
+        for statement in everything
+    ]
+    seeds = [_thread_axis_reads(statement.node) for statement in everything]
+    axes = {
+        id(statement): dependence
+        for statement, dependence in zip(
+            everything, _propagate_dependence(cut, seeds, frozenset()), strict=True
+        )
+    }
+    for statement, analyzed in parts:
+        axes[id(statement)] = set().union(*(axes[id(piece)] for piece in analyzed))
+    for statement in statements:
+        axes.setdefault(id(statement), set())
+    return axes
 
 
 def _describe(block: _Block, position: int) -> str:

@@ -490,12 +490,13 @@ def test_masked_tile_uniform_store_after_per_lane_stores_matches_reference(
 def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
     x = _small_integers((8, 512))
     out = torch.full((8, 512), -7.0, device=CUDA_DEVICE)
-    with pytest.raises(
-        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
-    ):
-        _run(
-            _zero_first_column_then_copy_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
-        )
+    # The zeroing store leaves the lane loop the device loop built around
+    # the body (see the GPU-free companion); the copy then overwrites it.
+    result = _run(
+        _zero_first_column_then_copy_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
+    )
+    torch.testing.assert_close(result, x, rtol=0, atol=0)
+    out = torch.full((8, 512), -7.0, device=CUDA_DEVICE)
     result = _run(
         _copy_then_zero_first_column_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
     )

@@ -16,9 +16,15 @@ from ..generate_ast import GenerateAST
 from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
+from .matmul_utils import SHAPE_QUERY_TARGETS
 from .matmul_utils import CuteAtomicLaneRoute
 from .matmul_utils import cute_atomic_consumer_lane_route
 from .matmul_utils import cute_per_lane_atomic_consumer
+from .matmul_utils import cute_scalar_reduction_dtype
+from .matmul_utils import loop_carries
+from .matmul_utils import reads_loop_carry
+from .matmul_utils import reads_value_of
+from .matmul_utils import strip_new_vars
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -717,13 +723,7 @@ def _emit_cute_matmul_n_collapse(
     if hasattr(cg, "cute_uses_matmul"):
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
 
-    reduction_dtype: torch.dtype | None = acc_dtype
-    if (
-        lhs_dtype is not None
-        and rhs_dtype is not None
-        and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
-    ):
-        reduction_dtype = torch.float32
+    reduction_dtype = cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, acc_dtype)
     value_dtype = reduction_dtype or lhs_dtype or rhs_dtype or torch.float32
 
     loop_state = None
@@ -849,6 +849,138 @@ def _cute_k_lane_loop_is_innermost(cg: GenerateAST, loop_state: object) -> bool:
     return False
 
 
+def _loop_outputs_reading(node: torch.fx.Node) -> list[torch.fx.Node]:
+    """The outputs of ``node``'s graph whose values depend on ``node``."""
+    (output,) = node.graph.find_nodes(op="output")
+    results = output.args[0]
+    if not isinstance(results, (list, tuple)):
+        results = [results]
+    reached = {node}
+    for graph_node in node.graph.nodes:
+        if graph_node.op != "output" and any(
+            arg in reached for arg in graph_node.all_input_nodes
+        ):
+            reached.add(graph_node)
+    dependents: list[torch.fx.Node] = []
+    for value in results:
+        if isinstance(value, torch.fx.Node) and value in reached:
+            if value not in dependents:
+                dependents.append(value)
+    return dependents
+
+
+def _strip_passthroughs(node: torch.fx.Node) -> torch.fx.Node:
+    """``node`` without the pure dtype / layout changes applied to it."""
+    while (
+        node.op == "call_function"
+        and node.target in _ACC_PHI_PASSTHROUGH_TARGETS
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        node = node.args[0]
+    return node
+
+
+def _cute_running_sum_route(
+    cg: GenerateAST,
+    fx_node: object,
+    acc_node: object,
+    *,
+    has_acc: bool,
+    loop_state: object,
+    k_block_id: int,
+    lane_var: str,
+) -> str:
+    """How a matmul in a K-loop body may use the per-K-lane ``dot_acc`` running sum.
+
+    The running sum is zeroed before the K loop and adds the products of
+    every K lane of every K tile; ``dot_acc_base`` adds the accumulator from
+    before the loop.  That reduces the whole K extent, which is what a bare
+    matmul or one seeded by a loop-invariant accumulator lowers to when it
+    is stored or overwrites its carry, and the program for
+    ``carry = dot(..., acc=carry)`` when nothing else in the body reads the
+    carry or the result ("running").  ``hoist_lane_invariant_chunk_recurrence``
+    turns two more recurrences into once-per-tile updates ("recurrence"): an
+    accumulator rescaled by lane-invariant values (``acc=carry * decay``)
+    and ``carry = carry + dot(...)`` without one; it does not look inside a
+    vectorized lane loop.  Any other matmul (the carry changed after the
+    dot, another carry reading the result or the running carry, an
+    accumulator computed from another carry) takes the owned product-sum
+    route, which completes each tile's sum before its consumers ("owned").
+    A matmul outside the K loop's body graph keeps the running sum.
+    """
+    from ..device_ir import ForLoopGraphInfo
+
+    assert isinstance(cg, GenerateAST)
+    graphs = cg.codegen_graphs
+    if not isinstance(fx_node, torch.fx.Node) or (
+        has_acc and not isinstance(acc_node, torch.fx.Node)
+    ):
+        return "running"
+    carries = loop_carries(fx_node.graph, graphs)
+    if carries is None or not any(
+        isinstance(graph_info, ForLoopGraphInfo)
+        and graph_info.graph is fx_node.graph
+        and k_block_id in graph_info.block_ids
+        for graph_info in graphs
+    ):
+        return "running"
+    vectorized = lane_var in getattr(loop_state, "vec_lane_wrappers", {})
+    dependents = _loop_outputs_reading(fx_node)
+    if has_acc:
+        assert isinstance(acc_node, torch.fx.Node)
+        if not reads_loop_carry(acc_node, carries):
+            return "running" if dependents in ([], [fx_node]) else "owned"
+        carry = carries.get(fx_node)
+        if carry is None or dependents != [fx_node]:
+            return "owned"
+        if strip_new_vars(acc_node) is carry:
+            # Every lane rewrites the carry, so another read of it would see
+            # a partial sum instead of the tile's entry value.
+            copies = [acc_node]
+            while copies[-1] is not carry:
+                (source,) = copies[-1].all_input_nodes
+                copies.append(source)
+            if any(
+                user not in copies
+                and user is not fx_node
+                and user.target not in SHAPE_QUERY_TARGETS
+                for copy in copies
+                for user in copy.users
+            ):
+                return "owned"
+            return "running"
+        if (
+            not vectorized
+            and _cute_acc_is_rescaled_loop_carried(acc_node)
+            and reads_value_of(acc_node, {carry})
+        ):
+            return "recurrence"
+        return "owned"
+    if not dependents:
+        return "running"
+    if len(dependents) == 1:
+        (update,) = dependents
+        if _strip_passthroughs(update) is fx_node:
+            return "running"
+        carry = carries.get(update)
+        if (
+            not vectorized
+            and carry is not None
+            and update.target is torch.ops.aten.add.Tensor
+            and len(update.args) == 2
+            and not update.kwargs
+            and {
+                strip_new_vars(_strip_passthroughs(arg))
+                if isinstance(arg, torch.fx.Node)
+                else arg
+                for arg in update.args
+            }
+            == {fx_node, carry}
+        ):
+            return "recurrence"
+    return "owned"
+
+
 def _cute_product_uses_owned_lane_reduction(
     cg: CodegenInterface, product: ast.AST, owner_lane: str
 ) -> bool:
@@ -922,7 +1054,9 @@ def _emit_cute_matmul(
     """
     if hasattr(cg, "cute_uses_matmul"):
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
-    reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
+    reduction_dtype = cute_scalar_reduction_dtype(
+        lhs_dtype, rhs_dtype, acc_dtype or out_dtype
+    )
     lhs_terms: tuple[ast.AST, ...]
     if isinstance(lhs, (CutePackedAffineLoad, CutePackedTerms)):
         lhs_terms = tuple(lhs.terms)
@@ -938,7 +1072,6 @@ def _emit_cute_matmul(
         and rhs_dtype is not None
         and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     ):
-        reduction_dtype = torch.float32
         lhs_computed_fp8 = _cute_operand_is_computed_fp8(lhs_node)
         rhs_computed_fp8 = _cute_operand_is_computed_fp8(rhs_node)
         rhs_terms = tuple(
@@ -977,6 +1110,21 @@ def _emit_cute_matmul(
             loops = active_device_loops.get(k_block_id)
             if loops and isinstance(loops[-1], DeviceLoopOrGridState):
                 loop_state = loops[-1]
+    if loop_state is not None:
+        from ..tile_strategy import PerThreadFlattenedTileStrategy
+
+        if (
+            isinstance(loop_state.strategy, PerThreadFlattenedTileStrategy)
+            and loop_state.strategy._lane_var is not None
+        ):
+            # The fallback reduces K across the tile's threads only; the
+            # flattened tile's lane loop (fewer threads than rows) would keep
+            # one lane's products per thread: ``x[tile, :].T @ g[tile, :]``.
+            raise exc.BackendUnsupported(
+                "cute",
+                "matmul contraction over a flattened tile split across a lane "
+                "loop (fewer threads than tile elements)",
+            )
     reduction_base_acc = acc
     product_lane: str | None = None
     if loop_state is not None and k_block_id is not None:
@@ -1027,6 +1175,21 @@ def _emit_cute_matmul(
             # that sum in the once-per-tile carry update, with or without rescale.
             product_lane = lane_var
             lane_var = None
+        running_sum_route = "running"
+        if lane_var is not None:
+            assert k_block_id is not None
+            running_sum_route = _cute_running_sum_route(
+                cg,
+                fx_node,
+                acc_node,
+                has_acc=acc is not None,
+                loop_state=loop_state,
+                k_block_id=k_block_id,
+                lane_var=lane_var,
+            )
+            if running_sum_route == "owned":
+                product_lane = lane_var
+                lane_var = None
         if lane_var is not None:
             product_name = cg.lift(product, dce=True, prefix="dot_product").id
             dot_acc = cg.device_function.new_var("dot_acc")
@@ -1079,6 +1242,9 @@ def _emit_cute_matmul(
             running_sums = getattr(cg.device_function, "cute_matmul_running_sums", None)
             if isinstance(running_sums, set):
                 running_sums.add(dot_acc)
+            if running_sum_route == "recurrence":
+                # Exact only once restructured to update once per tile.
+                cg.device_function.cute_state.chunk_recurrence_running_sums.add(dot_acc)
         else:
             reduction_input = cg.lift(product, dce=True, prefix="dot_product").id
         reduction_value_dtype = (

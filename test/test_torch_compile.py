@@ -29,26 +29,72 @@ from helion._compat import requires_torch_version
 from helion._compat import supports_block_ptr
 from helion._compat import supports_tensor_descriptor
 from helion._compat import supports_torch_compile_fusion
+from helion._compat import supports_torch_compile_template_lowering
 from helion._compat import torch_uses_template_producer_fusion
+from helion._compiler._dynamo.variables import torch_compile_captures_kernel_hop
+from helion._compiler.backend_registry import get_backend_class
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
+from helion._testing import skipIfFn
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 import helion.language as hl
 
 
+def _captured_as_hop() -> bool:
+    """Whether torch.compile captures kernels on this backend as the Helion HOP."""
+    return torch_compile_captures_kernel_hop(_get_backend())
+
+
+def _inline_capture_loses_view_writes() -> bool:
+    backend = get_backend_class(_get_backend())()
+    return backend.dynamo_inline_capture_loses_view_writes
+
+
+def _view_writes_captured_as_hop() -> bool:
+    """Whether torch.compile captures a kernel call that writes an input
+    through a view as the Helion HOP: always on a HOP backend, and wherever
+    the template lowering exists on one whose inline capture loses them."""
+    return _captured_as_hop() or (
+        supports_torch_compile_template_lowering()
+        and _inline_capture_loses_view_writes()
+    )
+
+
+skipIfViewWritesLost = skipIfFn(
+    lambda: _inline_capture_loses_view_writes() and not _view_writes_captured_as_hop(),
+    "Dynamo's inline capture of a Triton launch loses its writes through a "
+    "view; this build lacks Helion's template lowering to capture them as the HOP",
+)
+
+
+def _backend_fuses() -> bool:
+    """Whether this backend splices Inductor prologues/epilogues into kernels."""
+    return get_backend_class(_get_backend())().supports_inductor_fusion
+
+
+_LOWERS_UNFUSED = (
+    "this backend lowers kernels unfused under torch.compile: Inductor's "
+    "prologue/epilogue fusion splices Triton code into the kernel"
+)
+skipUnlessBackendFuses = skipIfFn(lambda: not _backend_fuses(), _LOWERS_UNFUSED)
+
+
 def requires_fusion_support(test_fn):
-    """Decorator: when fusion is unsupported, assert the upgrade error instead of running."""
+    """Decorator: when this build cannot fuse a backend that would, assert the
+    upgrade error instead of running."""
 
     @functools.wraps(test_fn)
     def wrapper(self, *args, **kwargs):
         ctx = (
             contextlib.nullcontext()
-            if supports_torch_compile_fusion()
+            if supports_torch_compile_fusion() or not _backend_fuses()
             else self.assertRaisesRegex(
                 RuntimeError,
                 "torch_compile_fusion=True requires PyTorch nightly build",
@@ -390,6 +436,17 @@ def k_slice_mutate(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def k_mutate_slice_return_other(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Mutate a slice of x taken in host code, but return a new tensor."""
+    x_slice = x[:2, :4]
+    out = torch.empty_like(y)
+    for tile in hl.tile(x_slice.size()):
+        x_slice[tile] = x_slice[tile] + y[tile]
+        out[tile] = y[tile] * 3.0
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def k_slice_return_other(
     x_slice: torch.Tensor, y: torch.Tensor, x_full: torch.Tensor
 ) -> torch.Tensor:
@@ -478,12 +535,12 @@ def k_default_dtype_output(x: torch.Tensor) -> torch.Tensor:
 # =============================================================================
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
     def _compile_and_count_kernels(self, f, test_args, dynamic=False):
         """Compile f with torch.compile and return (result, source_codes, count)."""
         helion_kernel_side_table = None
-        if supports_torch_compile_fusion():
+        if supports_torch_compile_template_lowering():
             from helion._compiler._dynamo.higher_order_ops import (
                 helion_kernel_side_table,
             )
@@ -498,7 +555,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         FxGraphCache.clear()
         PyCodeCache.cache_clear()
         # Clear fusion config cache to prevent cross-test pollution.
-        if supports_torch_compile_fusion():
+        if supports_torch_compile_template_lowering():
             from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
 
             HelionTemplateBuffer._fusion_config_cache.clear()
@@ -521,8 +578,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             )
             actual, source_codes = run_and_get_code(compiled_f, *run_args)
 
-        # Count kernels
-        kernel_count = sum(code.count("@triton.jit") for code in source_codes)
+        # Count kernels (Inductor's are Triton; Helion's follow the backend)
+        kernel_count = sum(
+            code.count("@triton.jit") + code.count("@cute.kernel")
+            for code in source_codes
+        )
 
         # Verify no graph breaks
         graph_breaks = torch._dynamo.utils.counters["graph_break"]
@@ -550,8 +610,13 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         """Run torch.compile test comparing eager vs compiled execution."""
         # The upgrade-error path for fusion on unsupported builds is covered
         # once by test_fusion_unsupported_raises_upgrade_error; skip the many
-        # parametrized fusion legs that would otherwise all re-check it.
-        if allow_torch_compile_fusion and not supports_torch_compile_fusion():
+        # parametrized fusion legs that would otherwise all re-check it.  A
+        # backend that lowers unfused takes no upgrade error and runs them.
+        if (
+            allow_torch_compile_fusion
+            and not supports_torch_compile_fusion()
+            and _backend_fuses()
+        ):
             self.skipTest("torch.compile fusion not supported by this PyTorch build")
 
         # Reset specific kernels and configure fusion setting
@@ -568,7 +633,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         # Handle expected errors
         if expected_error is not None:
             helion_kernel_side_table = None
-            if supports_torch_compile_fusion():
+            if supports_torch_compile_template_lowering():
                 from helion._compiler._dynamo.higher_order_ops import (
                     helion_kernel_side_table,
                 )
@@ -613,8 +678,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         else:
             torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
-        # Assert helion kernel count
-        if expected_num_kernels is not None:
+        # Assert helion kernel count. A backend without Inductor fusion lowers
+        # its kernels unfused, so the fusion leg's expected count does not apply.
+        if expected_num_kernels is not None and (
+            not allow_torch_compile_fusion or _backend_fuses()
+        ):
             self.assertEqual(
                 kernel_count,
                 expected_num_kernels,
@@ -656,6 +724,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                     f"got {len(kernel._bound_kernels)}",
                 )
 
+    @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_fusion_unsupported_raises_upgrade_error(self):
         """Fusion requested on a build without fusion support: eager still
@@ -707,6 +776,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
+    @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_fusion_survives_a_codegen_retry(self):
         """The CuTe register-tile fallback throws a first codegen pass away
@@ -1109,7 +1179,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @unittest.skip("Correctness bug with indirect output aliasing")
+    @skipIfViewWritesLost
     def test_indirect_output_alias(self, allow_torch_compile_fusion):
         """Test: output is a slice/view of input (indirect alias with different shape)."""
 
@@ -1140,7 +1210,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y, scale),
             kernels=[k_slice_mutate],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else 5,
+            expected_num_kernels=3 if allow_torch_compile_fusion else 4,
             kernels_ref=[k_slice_mutate_ref],
             expected_num_kernels_ref=1,
         )
@@ -1207,6 +1277,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @skipIfCute("hl.inline_triton embeds Triton source; CuTe cannot lower it")
     def test_inline_triton_mutation(self, allow_torch_compile_fusion):
         """Test: kernel using inline_triton marks all inputs as potentially mutated."""
 
@@ -1288,7 +1359,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if supports_torch_compile_fusion()
+            if _view_writes_captured_as_hop()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
@@ -1608,7 +1679,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 RuntimeError,
                 r"Returning multiple outputs that share storage.*not yet supported",
             )
-            if supports_torch_compile_fusion()
+            if _captured_as_hop()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
@@ -1640,7 +1711,28 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @unittest.skip("Correctness bug with partial tensor mutation")
+    @skipIfViewWritesLost
+    def test_host_slice_mutation_not_returned(self, allow_torch_compile_fusion):
+        """Test: the kernel writes x through a slice its host code takes and
+        returns a new tensor; the write to x must still reach the caller."""
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            out = k_mutate_slice_return_other(x, y)
+            return x + 1.0, out
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 4, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_mutate_slice_return_other],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @skipIfViewWritesLost
     def test_partial_tensor_mutation(self, allow_torch_compile_fusion):
         """Test: mutate only a slice of tensor, rest remains unchanged."""
 
@@ -1661,7 +1753,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x, y),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else 6,
+            expected_num_kernels=4 if allow_torch_compile_fusion else 5,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -1749,7 +1841,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if supports_torch_compile_fusion()
+            if _captured_as_hop()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
@@ -2670,7 +2762,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if supports_torch_compile_fusion()
+            if _captured_as_hop()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
@@ -3002,7 +3094,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             dynamic=True,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             expected_error=(RuntimeError, "static_shapes=True.*dynamic=True")
-            if supports_torch_compile_fusion()
+            if _captured_as_hop()
             else None,
         )
 
@@ -3020,6 +3112,73 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         # dynamic=True requires static_shapes=False on the kernel
+        self.addCleanup(
+            setattr, k_add.settings, "static_shapes", k_add.settings.static_shapes
+        )
+        k_add.settings.static_shapes = False
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add],
+            dynamic=True,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            expected_num_kernels=2 if allow_torch_compile_fusion else None,
+            kernels_ref=[k_add_ref],
+            expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @skipIfFn(
+        lambda: not _captured_as_hop(),
+        "only the HOP capture checks the host trace between capture and lowering",
+    )
+    def test_dynamic_kernel_static_and_sliced_dims(self, allow_torch_compile_fusion):
+        """Test: a static_shapes=False kernel captured as the HOP binds the
+        same host trace at capture and lowering, with dims Dynamo keeps
+        static (dynamic=False at (4, 8)) and with a slice's compound size
+        (x[1:] under dynamic=True)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def k_row_scale(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * w[tile_n]
+            return out
+
+        def f(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            return k_row_scale(x * 2.0, w) + 1.0
+
+        def f_sliced(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            return k_row_scale(x[1:] * 2.0, w) + 1.0
+
+        w = torch.randn(8, device=DEVICE, dtype=torch.float32)
+        for fn, rows in ((f, 4), (f_sliced, 5)):
+            x = torch.randn(rows, 8, device=DEVICE, dtype=torch.float32)
+            for dynamic in (False, True):
+                with self.subTest(fn=fn.__name__, dynamic=dynamic):
+                    self._run_compile_test(
+                        fn,
+                        (x, w),
+                        kernels=[k_row_scale],
+                        dynamic=dynamic,
+                        allow_torch_compile_fusion=allow_torch_compile_fusion,
+                    )
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_dynamic_shapes_size_one_input(self, allow_torch_compile_fusion):
+        """Test: a dynamic kernel first compiled at a size-1 input carries a
+        guard fact in its dispatch key, which dynamo must be able to trace."""
+
+        def f(x: torch.Tensor, y: torch.Tensor, *, _kernels=(k_add,)) -> torch.Tensor:
+            x = x * 2.0
+            y = y * 2.0
+            result = _kernels[0](x, y)
+            return torch.relu(result) + 1.0
+
+        x = torch.randn(1, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1, 8, device=DEVICE, dtype=torch.float32)
         self.addCleanup(
             setattr, k_add.settings, "static_shapes", k_add.settings.static_shapes
         )
@@ -3263,7 +3422,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 )
 
             torch.testing.assert_close(actual, x + 1)
-            self.assertIn("tl.program_id(0).to(tl.int64)", code)
+            self.assertIn(
+                "cutlass.Int64(cute.arch.block_idx()[0])"
+                if _get_backend() == "cute"
+                else "tl.program_id(0).to(tl.int64)",
+                code,
+            )
             self.assertIs(next(iter(add_one._bound_kernels.values())), warm_bound)
         finally:
             add_one.settings.index_dtype = torch.int32
@@ -3524,7 +3688,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    @unittest.skip("Correctness bug with overlapping views mutation")
+    @skipIfViewWritesLost
     def test_overlapping_views_both_mutated(self, allow_torch_compile_fusion):
         """Test: two overlapping views of the same tensor, both mutated."""
 
@@ -3543,7 +3707,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             (x,),
             kernels=[k_add_inplace],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=5 if allow_torch_compile_fusion else 8,
+            expected_num_kernels=5 if allow_torch_compile_fusion else 6,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
@@ -3889,8 +4053,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     ):
         """Test: kernel returning (tensor, scalar) called twice with different scalar literals
         inside the compile region. Verifies no helion recompilation."""
-        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
-            self.skipTest("fullgraph capture requires Helion's fusion integration")
+        if not allow_torch_compile_fusion and not _captured_as_hop():
+            self.skipTest("fullgraph capture requires the Helion kernel HOP")
 
         def f(
             x: torch.Tensor, *, _kernels=(k_scale_with_scalar_output,)
@@ -4301,7 +4465,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 RuntimeError,
                 r"Return statements inside control flow.*not supported",
             )
-            if supports_torch_compile_fusion()
+            if _captured_as_hop()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
             kernels_ref=[k_multi_return_ref],
@@ -4434,7 +4598,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 torch._dynamo.exc.InternalTorchDynamoError,
                 "does not support multiple mutated arguments that share storage",
             )
-            if supports_torch_compile_fusion()
+            if _captured_as_hop()
             else None,
             allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
@@ -4536,8 +4700,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_tuple_input(self, allow_torch_compile_fusion):
         """Test: kernel with tuple of tensors as input."""
-        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
-            self.skipTest("fullgraph capture requires Helion's fusion integration")
+        if not allow_torch_compile_fusion and not _captured_as_hop():
+            self.skipTest("fullgraph capture requires the Helion kernel HOP")
 
         @helion.kernel(autotune_effort="none")
         def k_sum_tuple(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -4610,8 +4774,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_dict_input(self, allow_torch_compile_fusion):
         """Test: kernel with dict of tensors as input."""
-        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
-            self.skipTest("fullgraph capture requires Helion's fusion integration")
+        if not allow_torch_compile_fusion and not _captured_as_hop():
+            self.skipTest("fullgraph capture requires the Helion kernel HOP")
 
         @helion.kernel(autotune_effort="none")
         def k_sum_dict(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -4779,6 +4943,52 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 self._run_compile_test(**run_kwargs)
         else:
             self._run_compile_test(**run_kwargs)
+
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_lowering_examples_keep_input_alignment(self):
+        """Inductor lowers the kernel against example inputs, and the Triton
+        tensor-descriptor key reads their 16-byte base alignment.  A misaligned
+        graph input, an aligned-looking slice of one, and a misaligned slice of
+        an aligned input must not get a descriptor (a misaligned TMA base
+        faults)."""
+        if not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
+        if not _captured_as_hop():
+            self.skipTest("only the Helion kernel HOP lowers against examples")
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[16, 64], indexing="tensor_descriptor"),
+        )
+        def k_double(w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(w)
+            for tile in hl.tile(w.size()):
+                out[tile] = w[tile] * 2
+            return out
+
+        big = torch.randn(64, 264, device=DEVICE, dtype=torch.float32)
+        # (graph input, slice start inside the graph)
+        cases = {
+            "aligned_input": (big[:, 4:260], 0),
+            "misaligned_input": (big[:, 1:257], 0),
+            "aligned_slice_of_misaligned_input": (big[:, 1:], 4),
+            "misaligned_slice": (big, 1),
+        }
+        for name, (graph_input, start) in cases.items():
+            with self.subTest(case=name):
+
+                def f(x: torch.Tensor, start: int = start) -> torch.Tensor:
+                    return k_double(x[:, start : start + 256]) + 1
+
+                torch._dynamo.reset()
+                # Tensor descriptor lowering queries CUDA target info.
+                with fresh_cache(), inductor_config.patch({"compile_threads": 1}):
+                    out = torch.compile(f, fullgraph=True, backend="inductor")(
+                        graph_input
+                    )
+                torch.testing.assert_close(
+                    out, graph_input[:, start : start + 256] * 2 + 1
+                )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -5128,6 +5338,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     def test_autotune_fusion_aware_vs_default(self, autotune_with_fusion):
         """When fusion-aware autotuning is on, each config is benchmarked as fused code;
         when off, the pre-existing BoundKernel config is reused without recompilation."""
+        if autotune_with_fusion and not _backend_fuses():
+            self.skipTest(_LOWERS_UNFUSED)
 
         kernel = self._make_autotune_kernel(
             autotune_with_torch_compile_fusion=autotune_with_fusion
@@ -5183,6 +5395,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y)
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_fusion_recompile(self):
@@ -5224,6 +5437,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         self.assertIn(pp, code, "Must have prologue fusion")
         self.assertEqual(code.count("@triton.jit"), 1, "Single fused kernel")
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_different_epilogues(self):
@@ -5282,6 +5496,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(len(captured_codes), 0, "Re-run must reuse cached kernels")
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_different_shapes(self):
@@ -5334,6 +5549,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             second_fused_count, 0, "New shape must trigger new fused compilations"
         )
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_same_epilogue_cache(self):
@@ -5481,7 +5697,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         kernel.reset()
         torch._dynamo.reset()
 
-        if supports_torch_compile_fusion():
+        if supports_torch_compile_template_lowering():
             from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
 
             HelionTemplateBuffer._fusion_config_cache.clear()
@@ -5527,6 +5743,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 f"Fusion cache entry {fusion_key!r} must be a Config",
             )
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_epilogue_only_fusion(self):
@@ -5558,6 +5775,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         for code in fused:
             self.assertNotIn(pp, code, "Must NOT have prologue in epilogue-only test")
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_prologue_only_fusion(self):
@@ -5615,6 +5833,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y, rtol=1e-4, atol=1e-4)
 
+    @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_no_configs_uses_fusion_context(self):
         """Without explicit configs, fusion autotuning must benchmark the fused kernel.
@@ -5697,6 +5916,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "bench_compile_config, not reuse the cached unfused config",
         )
 
+    @skipUnlessBackendFuses
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @patch.object(k_rms_norm.settings, "torch_compile_fusion", True)
@@ -5743,7 +5963,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 instantiate_parametrized_tests(TestTorchCompile)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestMakeFxSymbolicTracing(RefEagerTestDisabled, TestCase):
     def test_hop_preserves_symbolic_shapes(self):
         """Verify _trace_hop_proxy preserves symbolic shapes as FX Node references.

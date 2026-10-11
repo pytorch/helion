@@ -47,7 +47,7 @@ def _split_dim(tensor: torch.Tensor, dim: int, op: str) -> tuple[int, int]:
 
 def _check_split_backend(op: str) -> None:
     env = CompileEnvironment.current()
-    if env.backend_name != "triton":
+    if env.backend_name not in ("triton", "cute"):
         raise exc.BackendUnsupported(
             env.backend_name,
             f"{op} device lowering. Use hl.split() for a trailing size-two axis",
@@ -220,9 +220,9 @@ def split(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     .. rubric:: PyTorch alternate forms
 
-    The Triton backend supports ``torch.chunk(x, 2, dim)`` for two equal
-    chunks and ``torch.unbind(x, dim)`` when the selected dimension has size
-    two. Tensor method forms (``x.chunk(...)`` and ``x.unbind(...)``),
+    The Triton and CuTe backends support ``torch.chunk(x, 2, dim)`` for two
+    equal chunks and ``torch.unbind(x, dim)`` when the selected dimension has
+    size two. Tensor method forms (``x.chunk(...)`` and ``x.unbind(...)``),
     including saved bound methods, are also supported. Both operations
     accept positive and negative axes and return a tuple of two tensors.
     ``chunk`` keeps the input rank; ``unbind`` removes the selected axis.
@@ -238,21 +238,33 @@ def split(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         left, right = hl.split(grouped)  # equivalent lowering
 
     Note:
-        These PyTorch alternate forms are currently Triton-only inside device
-        loops. The axis and split size must be known at compile time; use
-        :func:`~helion.language.specialize` before the loop when needed.
-        Other tile dimensions can remain symbolic. Because Triton pads tensor
-        dimensions to powers of two, ``chunk`` requires a power-of-two split
-        size of at least two. Other chunk counts, uneven chunks, and unbinding
-        dimensions of other sizes raise an unsupported-configuration error.
-        Host-side calls retain normal PyTorch behavior.
+        These PyTorch alternate forms are available inside device loops on
+        the Triton and CuTe backends. The axis and split size must be known
+        at compile time; use :func:`~helion.language.specialize` before the
+        loop when needed. Other tile dimensions can remain symbolic. Because
+        tile dimensions are padded to powers of two, ``chunk`` requires a
+        power-of-two split size of at least two. Other chunk counts, uneven
+        chunks, and unbinding dimensions of other sizes raise an
+        unsupported-configuration error. Host-side calls retain normal
+        PyTorch behavior.
 
-        Lowerings that permute rank-compacted tile tensors are unsupported.
-        This includes ``chunk`` even on the trailing axis. Unbinding an already
-        trailing size-two axis remains supported with flattened tiles. Direct
-        ``permute`` calls have the same restriction: the autotuner skips
-        configurations that compact the input rank. Disable ``flatten_loops``
-        for the affected tile axes to use these permutations.
+        On Triton, lowerings that permute rank-compacted tile tensors are
+        unsupported. This includes ``chunk`` even on the trailing axis.
+        Unbinding an already trailing size-two axis remains supported with
+        flattened tiles. Direct ``permute`` calls have the same restriction:
+        the autotuner skips configurations that compact the input rank.
+        Disable ``flatten_loops`` for the affected tile axes to use these
+        permutations.
+
+        On CuTe, each thread holds one element of a tile: a split of a loaded
+        tile re-reads each half from memory, while a split of a computed tile
+        exchanges the halves through shared memory, which is refused unless
+        both halves are proved to be staged in the same lane-loop iteration
+        (the halves of a computed row wider than a warp are not). The halves
+        can feed element-wise ops, ``hl.join``, stores of full slices and a
+        ``torch.unbind`` of their ``torch.stack``; other consumers, such as a
+        reduction over a half or an operand distributed by another block
+        (``bias[tile, :]``), are refused.
 
     See Also:
         - :func:`~helion.language.join`

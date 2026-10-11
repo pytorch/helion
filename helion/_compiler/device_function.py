@@ -680,6 +680,18 @@ class DeviceFunction:
             return None
         return bool(resolved)
 
+    def constexpr_taken_graph_id(self, if_node: torch.fx.Node) -> int | None:
+        """The graph id of the side an ``_if`` node takes when its test is a
+        constant for this config (``evaluate_constexpr_condition``), or
+        ``None`` when the test is decided at runtime."""
+        test, if_graph_id, else_graph_id, *_ = if_node.args
+        taken = self.evaluate_constexpr_condition(
+            test.meta["val"] if isinstance(test, torch.fx.Node) else test
+        )
+        if taken is None:
+            return None
+        return cast("int", if_graph_id if taken else else_graph_id)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 
@@ -1096,6 +1108,14 @@ class DeviceFunction:
         self.arguments.append(rv)
         return True
 
+    def resolved_int_constexpr(self, name: str) -> int | None:
+        """Return a registered constexpr's value as an int, if it is a static literal."""
+        arg = self._constexpr_args.get(name)
+        if arg is None:
+            return None
+        host_str = arg.host_str()
+        return int(host_str) if host_str.isdigit() else None
+
     def constexpr_arg_with_host_def(self, name: str, value: object) -> None:
         """Create a constexpr argument and add its host-side definition if needed."""
         created = self.constexpr_arg(name, value)
@@ -1501,6 +1521,7 @@ class DeviceFunction:
                 kernel_body,
                 running_sum_accumulators=self.cute_matmul_running_sums,
                 rename_groups=rename_groups,
+                unfoldable_vec_lanes=self.cute_state.unfoldable_vec_lanes,
             )
             if self.cute_state.simt_cluster_n > 1:
                 from .cute.duplicate_reduction_carries import (
@@ -1585,12 +1606,14 @@ class DeviceFunction:
             from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
 
             kernel_body = fuse_fp8_pair_decode(kernel_body)
-            # Hoist loop-invariant floating-point divisions out of inner
-            # tile loops, replacing each ``x / scalar`` with a hoisted
-            # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
-            # B200 div is ~22 cycles vs ~2 for multiply, so the softmax
-            # consume sweep (~12672 divides per row) sees a measured
-            # +20% bench gain on (4096, 12672) fp16.
+            # Under fast_math, hoist loop-invariant floating-point
+            # divisions out of inner tile loops, replacing each
+            # ``x / scalar`` with a hoisted ``inv = 1.0 / scalar`` +
+            # ``x * inv`` in the loop body.  B200 div is ~22 cycles vs ~2
+            # for multiply, so the softmax consume sweep (~12672 divides
+            # per row) sees a measured +20% bench gain on (4096, 12672)
+            # fp16.  The rewrite rounds differently and fires only in the
+            # loops a config creates, so it needs the setting.
             from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
 
             # Pass the post-renames map so the invariance analysis can
@@ -1601,7 +1624,9 @@ class DeviceFunction:
             # loop and capture its stale initial value.
             rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
             kernel_body = hoist_loop_invariant_recips(
-                kernel_body, rename_groups=rename_groups
+                kernel_body,
+                rename_groups=rename_groups,
+                fast_math=CompileEnvironment.current().settings.fast_math,
             )
             # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
             # ``cute.math.fma`` (the DSL's arith ops carry no contract
@@ -1888,11 +1913,12 @@ class DeviceFunction:
             )
             # Fuse an online-softmax (max, sum) pair of cluster reduces into
             # ONE packed DSM exchange: the max reduce relocalizes to a
-            # CTA-local block reduce, the sum site exchanges the
+            # CTA-local block reduce, and the sum site exchanges the
             # ``(local_max, local_sum)`` pair once and folds with the
-            # online-softmax rescale, and the write sweep reuses the sum
-            # sweep's cached exp values.  Saves a full cluster round-trip
-            # per row (+5..9% at cluster_n 2..16 on B200 softmax).
+            # online-softmax rescale.  Under fast_math the write sweep also
+            # reuses the sum sweep's cached exp values; otherwise it keeps
+            # computing them exactly.  Saves a full cluster round-trip per
+            # row (+5..9% at cluster_n 2..16 on B200 softmax).
             from .cute.cluster_online_pair import fuse_cluster_online_pair
 
             kernel_body = fuse_cluster_online_pair(
@@ -2036,15 +2062,19 @@ class DeviceFunction:
         inputs cannot overlap an external input or a separately allocated
         output.  Two external inputs are disjoint only when the current runtime
         storage spans do not overlap and that predicate is part of the bound
-        kernel cache key.  Origin type alone is insufficient: host-local
+        kernel cache key.  The predicate compares whole storages, so it also
+        covers host-side views (``x.view(...)``) through the input whose
+        storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
         from .cute.memory_ops import runtime_tensors_are_proven_disjoint
 
         env = CompileEnvironment.current()
         host_function = HostFunction.current()
-        input_storages = {id(tensor.untyped_storage()) for tensor in env.input_sources}
-        origins: dict[str, tuple[str, int, bool, torch.Tensor]] = {}
+        input_storages = {
+            id(tensor.untyped_storage()): tensor for tensor in env.input_sources
+        }
+        origins: dict[str, tuple[str, int, torch.Tensor | None]] = {}
         for arg in self.arguments:
             if not isinstance(arg, TensorArg):
                 continue
@@ -2055,33 +2085,24 @@ class DeviceFunction:
                 origins[arg.name] = (
                     root,
                     storage,
-                    storage not in input_storages,
-                    arg.fake_value,
+                    arg.fake_value
+                    if arg.fake_value in env.input_sources
+                    else input_storages.get(storage),
                 )
         return {
             frozenset((left_name, right_name))
-            for left_name, (
-                left_root,
-                left_storage,
-                left_is_fresh,
-                left_tensor,
-            ) in origins.items()
-            for right_name, (
-                right_root,
-                right_storage,
-                right_is_fresh,
-                right_tensor,
-            ) in origins.items()
+            for left_name, (left_root, left_storage, left_input) in origins.items()
+            for right_name, (right_root, right_storage, right_input) in origins.items()
             if left_name < right_name
             and left_root != right_root
             and left_storage != right_storage
             and (
-                left_is_fresh
-                or right_is_fresh
+                left_input is None
+                or right_input is None
                 or runtime_tensors_are_proven_disjoint(
                     env,
-                    left_tensor,
-                    right_tensor,
+                    left_input,
+                    right_input,
                 )
             )
         }

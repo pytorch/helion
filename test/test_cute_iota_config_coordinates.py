@@ -358,12 +358,14 @@ def test_derived_iota_cannot_borrow_unrelated_axis_with_equal_extent(
             active_device_loops=loops,
             current_grid_state=None,
             codegen_graphs=[],
+            cute_free_arange_lanes=None,
             device_function=SimpleNamespace(
                 config=config,
                 resolved_block_size=lambda block_id: config.block_sizes[block_id],
             ),
             index_var=lambda block_id: f"index_{block_id}",
             offset_var=lambda block_id: f"offset_{block_id}",
+            rolled_reduction_index_var=lambda size: None,
         )
         with (
             patch("helion._compiler.generate_ast.GenerateAST", SimpleNamespace),

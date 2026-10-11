@@ -754,8 +754,13 @@ def torch_uses_template_producer_fusion() -> bool:
 
 
 @functools.cache
-def supports_torch_compile_fusion() -> bool:
-    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+def supports_torch_compile_template_lowering() -> bool:
+    """Check whether Inductor can lower Helion's kernel HOP as a template.
+
+    This is the unfused subset of :func:`supports_torch_compile_fusion`: the
+    external template kernel and the template buffer fusion flags, without the
+    scheduler's prologue/producer fusion hook.
+    """
     if torch.xpu.is_available():
         return False
     if not requires_torch_version("2.11"):
@@ -769,15 +774,24 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
-        fusion_hook = (
-            "has_aliasing_or_mutation_for_producer_fusion"
-            if torch_uses_template_producer_fusion()
-            else "has_aliasing_or_mutation_for_prologue_fusion"
-        )
-        assert hasattr(TemplateBuffer, fusion_hook)
     except (ImportError, AttributeError, AssertionError):
         return False
     return True
+
+
+@functools.cache
+def supports_torch_compile_fusion() -> bool:
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+    if not supports_torch_compile_template_lowering():
+        return False
+    from torch._inductor.ir import TemplateBuffer
+
+    fusion_hook = (
+        "has_aliasing_or_mutation_for_producer_fusion"
+        if torch_uses_template_producer_fusion()
+        else "has_aliasing_or_mutation_for_prologue_fusion"
+    )
+    return hasattr(TemplateBuffer, fusion_hook)
 
 
 def extract_device(args: Sequence[object]) -> torch.device | None:

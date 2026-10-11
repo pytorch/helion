@@ -55,7 +55,8 @@ def reference_jagged_softmax_pytorch(
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp and division.
+@helion.kernel(fast_math=True)
 def jagged_softmax_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import typing
 import unittest
@@ -8,6 +9,8 @@ from unittest.mock import patch
 from packaging import version
 import pytest
 import torch
+from torch._decomp.decompositions import silu as core_silu
+import torch._inductor.decomposition as inductor_decomp
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -39,7 +42,6 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -48,6 +50,11 @@ from helion.runtime.ref_mode import is_ref_mode_enabled
 
 _orig_cudnn_fp32_precision: str = "none"
 _orig_float32_matmul_precision: str = "none"
+
+_CUTE_LINEAR_ATTN_SKIP = (
+    "[C, C] intra-chunk tiles (causal mask, q @ k^T, hl.zeros([t, C, C])) bind "
+    "one block id to two axes; cute's SIMT lowering has one lane per block id"
+)
 
 
 def _compile_only(
@@ -71,6 +78,31 @@ def _compile_only(
         bound._config = config
         return bound
     return bound.compile_config(config)
+
+
+@contextlib.contextmanager
+def _core_silu_decomposition() -> typing.Iterator[None]:
+    """Trace ``aten.silu`` with the core decomposition instead of Inductor's.
+
+    Inductor's custom silu decomposition (pytorch PR #171723) changes the
+    codegen between torch 2.9 and nightly.  ``fast_random_decomps()`` caches
+    a copy of the decomposition table, so the cache is cleared on entry, for
+    the patch to take effect, and again on exit: otherwise every later kernel
+    in the process traces silu with the core decomposition.
+    """
+
+    def clear_cache() -> None:
+        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
+            inductor_decomp.fast_random_decomps.cache_clear()
+
+    clear_cache()
+    try:
+        with patch.dict(
+            inductor_decomp.decompositions, {torch.ops.aten.silu.default: core_silu}
+        ):
+            yield
+    finally:
+        clear_cache()
 
 
 def setUpModule() -> None:
@@ -345,7 +377,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute", "triton"])
     def test_matmul_layernorm_half_dtype_multi_k_tile(self):
         """Guards K-loop accumulator precision when inputs are half-precision.
 
@@ -370,7 +402,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul_layernorm",
             args,
             expected,
-            block_sizes=[32, 256],
+            # [32, 256] keeps a whole [32, 1024] fp32 accumulator per program,
+            # which overflows Triton's shared memory and is refused by CuTe;
+            # [16, 16] still accumulates 64 K tiles.
+            block_sizes=[32, 256] if _get_backend() == "pallas" else [16, 16],
             static_shapes=True,
             atol=0.02,
             rtol=0.2,
@@ -389,11 +424,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         _compile_only(mod.matmul_layernorm, args, block_sizes=[16, 16])
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe lane reduction over a dynamic-shape full-slice N (400) is nested in "
-        "a different lane owner (BackendUnsupported); static shapes are covered",
-    )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -668,33 +698,41 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @parametrize("reduction_block_size", (32, 1024))
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("Test requires compiling a specific reduction config")
-    @skipUnlessTensorDescriptor("Test configs require tensor descriptor support")
+    @skipIfFn(
+        lambda: _get_backend() != "cute" and not _compat.supports_tensor_descriptor(),
+        "Test configs require tensor descriptor support",
+    )
     def test_welford_bfloat16_accuracy(self, reduction_block_size):
         from examples.welford import eager_layer_norm
         from examples.welford import welford
 
-        config = helion.Config(
-            atomic_indexing=[],
-            block_sizes=[16, reduction_block_size, 256],
-            indexing=[
-                "pointer",
-                "pointer",
-                "pointer",
-                "tensor_descriptor",
-                "pointer",
-            ],
-            load_eviction_policies=["last", "first", "", "last"],
-            num_stages=1,
-            num_warps=4,
-            pid_type="flat",
-            range_flattens=[None, None, None],
-            range_multi_buffers=[None, None, None],
-            range_num_stages=[0, 0, 0],
-            range_unroll_factors=[0, 0, 0],
-        )
+        if _get_backend() == "cute":
+            # The Triton config below pins Triton-only knobs (indexing,
+            # num_warps, range hints); cute checks the same reduction tiling.
+            config = helion.Config(block_sizes=[16, reduction_block_size, 256])
+        else:
+            config = helion.Config(
+                atomic_indexing=[],
+                block_sizes=[16, reduction_block_size, 256],
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                ],
+                load_eviction_policies=["last", "first", "", "last"],
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_flattens=[None, None, None],
+                range_multi_buffers=[None, None, None],
+                range_num_stages=[0, 0, 0],
+                range_unroll_factors=[0, 0, 0],
+            )
 
         torch.manual_seed(1337)
         rows, columns = 4096, 1024
@@ -1635,6 +1673,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
+    @skipIfRefEager("checks the decomposition cache; runs no kernel")
+    def test_core_silu_decomposition_does_not_outlive_its_patch(self):
+        # A patched decomposition table left in fast_random_decomps()'s cache
+        # changed the codegen of every later kernel in the process (the CuTe
+        # flash_gated tests failed after the HSTU examples).
+        silu = torch.ops.aten.silu.default
+        inductor_silu = inductor_decomp.select_decomp_table()[silu]
+        with _core_silu_decomposition():
+            self.assertIs(inductor_decomp.select_decomp_table()[silu], core_silu)
+        self.assertIs(inductor_decomp.select_decomp_table()[silu], inductor_silu)
+
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -1687,17 +1736,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             q, k, v, seq_offsets, None, max_seq_len
         )
 
-        # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-        # This ensures consistent codegen both torch 2.9 (stable) and nightly versions.
-        from torch._decomp.decompositions import silu
-        import torch._inductor.decomposition as inductor_decomp
-
-        # Clear cache since fast_random_decomps() caches a copy of decompositions
-        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-            inductor_decomp.fast_random_decomps.cache_clear()
-        with patch.dict(
-            inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-        ):
+        with _core_silu_decomposition():
             check_example(
                 "jagged_hstu_attn",
                 args,
@@ -1749,23 +1788,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
             expected = mod.reference_jagged_hstu_attention(*args)
 
-            # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-            # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
-            from torch._decomp.decompositions import silu
-            import torch._inductor.decomposition as inductor_decomp
-
-            if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-                inductor_decomp.fast_random_decomps.cache_clear()
-
             with (
                 patch.object(
                     mod.jagged_hstu_attention.settings,
                     "dot_precision",
                     helion_precision,
                 ),
-                patch.dict(
-                    inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-                ),
+                _core_silu_decomposition(),
             ):
                 # Clear the cache to ensure the modified settings are used.
                 mod.jagged_hstu_attention._bound_kernels.clear()
@@ -2864,6 +2893,87 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
+    def _flex_attention_block_mask_cases(self):
+        """Run the example with multi-block causal and 2D-neighborhood BlockMasks.
+
+        Yields ``(out, lse, expected, expected_lse)`` per mask, the references
+        computed from the dense mask.
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+        from torch.nn.attention.flex_attention import create_mask
+
+        z, h, n_ctx, head_dim = 2, 2, 512, 64
+        q, k, v = [
+            torch.randn((z, h, n_ctx, head_dim), dtype=HALF_DTYPE, device=DEVICE)
+            for _ in range(3)
+        ]
+
+        def causal(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        def neighborhood(b, h, q_idx, kv_idx):
+            # 2D 32x16 canvas, 5x5 window: leaves fully masked rows in partial blocks
+            q_x, q_y = q_idx // 16, q_idx % 16
+            kv_x, kv_y = kv_idx // 16, kv_idx % 16
+            return ((q_x - kv_x).abs() <= 2) & ((q_y - kv_y).abs() <= 2)
+
+        mod = import_path(EXAMPLES_DIR / "flex_attention.py")
+        config = helion.Config(block_sizes=[64, 64])
+        original_configs = mod.helion_flex_attention_kernel.configs
+        self.addCleanup(
+            setattr, mod.helion_flex_attention_kernel, "configs", original_configs
+        )
+        mod.helion_flex_attention_kernel.configs = [config]
+        for mask_mod in (causal, neighborhood):
+            block_mask = create_block_mask(mask_mod, z, h, n_ctx, n_ctx, device=DEVICE)
+            visited = block_mask.kv_num_blocks + block_mask.full_kv_num_blocks
+            self.assertGreater(visited.max().item(), 1)
+            out, lse = mod.helion_flex_attention(
+                q, k, v, block_mask=block_mask, return_lse=True
+            )
+            dense = create_mask(mask_mod, z, h, n_ctx, n_ctx, device=DEVICE)
+            expected = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=dense
+            )
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(
+                head_dim
+            )
+            expected_lse = torch.logsumexp(
+                scores.masked_fill(~dense, float("-inf")), dim=-1
+            )
+            yield out, lse, expected, expected_lse
+
+    @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    def test_flex_attention_block_mask(self):
+        """Multi-block BlockMasks: kv_indices are block ids, masks broadcast over kv,
+        and partially masked rows must not produce NaN."""
+        for (
+            out,
+            _lse,
+            expected,
+            _expected_lse,
+        ) in self._flex_attention_block_mask_cases():
+            self.assertFalse(torch.isnan(out).any().item())
+            torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @xfailIfPallas(
+        "the (B, H, M) lse is stored one head per grid step, but H is the sublane "
+        "dim of its TPU block and a block of 1 head is not expressible, so the "
+        "Pallas backend keeps the whole H extent in the block and each step "
+        "leaves the other heads' rows undefined"
+    )
+    def test_flex_attention_block_mask_lse(self):
+        """The LSE matches torch.logsumexp over the dense mask (natural log; -inf for
+        rows with no visible key)."""
+        for (
+            _out,
+            lse,
+            _expected,
+            expected_lse,
+        ) in self._flex_attention_block_mask_cases():
+            torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
@@ -3084,90 +3194,70 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(
-        "repeated full-slice block id / static-K register dot unsupported on cute"
-    )
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
 

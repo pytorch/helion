@@ -1391,8 +1391,8 @@ class TestTileDependency(TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
-    @skipIfTileIR("implicit tile-dependency scheduling is Triton-only")
-    @onlyBackends(["triton"])
+    @skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+    @onlyBackends(["triton", "cute"])
     def test_ssa_copies_keep_allocation_identity(self) -> None:
         x = torch.empty(64, 32, device=DEVICE)
         host = read_through_alias.bind((x,)).host_function

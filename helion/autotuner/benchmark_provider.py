@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import abc
+import contextlib
+import contextvars
 import copy
 import dataclasses
 import datetime
@@ -67,6 +69,7 @@ from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -77,6 +80,25 @@ if TYPE_CHECKING:
     from .base_search import _AutotunableKernel
     from .logger import AutotuningLogger
     from .metrics import AutotuneMetrics
+
+
+# True while the autotuner compiles configs to measure them (a search's
+# reference baseline and candidates, a best-of-K rebench, AOT measurement).  A
+# BoundKernel keys the specializations a compiled config's code needs (the
+# hint-sized CuTe reduction extents) only outside it, so configs that are
+# measured but not picked add no cache-key facts.
+_SEARCHING_CANDIDATES: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_SEARCHING_CANDIDATES", default=False
+)
+
+
+@contextlib.contextmanager
+def _searching_candidates() -> Iterator[None]:
+    token = _SEARCHING_CANDIDATES.set(True)
+    try:
+        yield
+    finally:
+        _SEARCHING_CANDIDATES.reset(token)
 
 
 MultiShapeAggregation = Literal["geomean", "max"]
@@ -890,9 +912,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         for attempt in range(_MAX_REFERENCE_BASELINE_ATTEMPTS):
             new_args = _clone_args(self.args, self.kernel.env.process_group_name)
             try:
-                baseline_output = self.kernel.compile_config(config, allow_print=False)(
-                    *new_args
-                )
+                with _searching_candidates():
+                    baseline_fn = self.kernel.compile_config(config, allow_print=False)
+                baseline_output = baseline_fn(*new_args)
                 synchronize_device()
             except Exception as e:
                 if not self._can_back_off_baseline(e):
@@ -1342,7 +1364,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # except handler below still needs `captured` bound.
             captured: list[str] = [""]
             try:
-                with capture_output() as captured:
+                with capture_output() as captured, _searching_candidates():
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception as e:
                 results[i] = results[i]._replace(completed_at=time.perf_counter())
@@ -1810,9 +1832,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 return inf
 
             with capture_output() as _captured_output:
-                benchmark_function = self.kernel.bench_compile_config(
-                    config, allow_print=False
-                )
+                with _searching_candidates():
+                    benchmark_function = self.kernel.bench_compile_config(
+                        config, allow_print=False
+                    )
                 benchmark_function(*working_args)  # warmup benchmark kernel
 
                 t1 = time.perf_counter()
