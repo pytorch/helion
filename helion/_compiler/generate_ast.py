@@ -1343,7 +1343,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if self.current_grid_state is None:
             return False
         # A mutually-exclusive branch reuse never grows the budget, so prefer it.
-        if self._mutually_exclusive_synthetic_axis() is not None:
+        if self._mutually_exclusive_synthetic_axis(size) is not None:
             return False
         used_axes = set(self._strategy_thread_axes())
         used_axes.update(self.cute_synthetic_arange_axes.values())
@@ -1443,7 +1443,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # at the same time, so they may share one thread axis (size = max). This
         # keeps the joint thread budget bounded for branch-by-grid kernels whose
         # branches each use a distinct free ``hl.arange``.
-        shared = self._mutually_exclusive_synthetic_axis()
+        shared = self._mutually_exclusive_synthetic_axis(size)
         if shared is not None:
             self.cute_synthetic_arange_axes[key] = shared
             self.cute_synthetic_arange_axis_sizes[shared] = max(
@@ -1499,7 +1499,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if current not in paths:
             paths.append(current)
 
-    def _mutually_exclusive_synthetic_axis(self) -> int | None:
+    def _mutually_exclusive_synthetic_axis(self, size: int) -> int | None:
         """Find a thread axis whose every recorded use is in a branch that can
         never co-execute with the current branch path, so it can be safely reused.
 
@@ -1507,6 +1507,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         a free arange in one grid branch may reuse the axis a reduction claimed in
         a sibling branch when the two can never run together. An axis recorded in
         BOTH maps must be mutually exclusive across all of its recorded paths.
+        A reduction's axis narrower than ``size`` is skipped: the reduction was
+        emitted for its own lanes, and widening the launch would run surplus
+        lanes through its cross-lane combine.
         """
         if not self._cute_branch_path:
             return None
@@ -1515,7 +1518,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self._cute_synthetic_arange_axis_branch_paths.keys()
             | self._cute_strategy_axis_branch_paths.keys()
         )
+        reserved = self._all_strategy_reserved_axes()
         for axis in sorted(candidate_axes):
+            if (
+                axis in self._cute_strategy_axis_branch_paths
+                and reserved.get(axis, 1) < size
+            ):
+                continue
             paths = [
                 *self._cute_synthetic_arange_axis_branch_paths.get(axis, []),
                 *self._cute_strategy_axis_branch_paths.get(axis, []),
@@ -2032,6 +2041,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         interchange_lane_outside_serial_reductions,
                     )
                     from .tile_strategy import restore_unprocessed_lane_reduce_markers
+                    from .tile_strategy import sink_lane_loops_into_uniform_branches
                     from .tile_strategy import split_lane_loop_reductions
                     from .tile_strategy import validate_lane_reduce_owners
 
@@ -2146,33 +2156,33 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     )
                     from .cute.nested_lane_reductions import resolve_pruned_lane_owners
 
+                    # The kernel arguments are uniform across the CTA; the
+                    # passes below copy the set before extending it.
+                    lane_uniform_names = {
+                        *(argument.name for argument in self.device_function.arguments),
+                        *self._extra_params,
+                    }
+                    lane_rename_groups = {
+                        name: aliases[0]
+                        for name, aliases in self.device_function._variable_renames.items()
+                    }
                     resolve_pruned_lane_owners(
                         list(self.device_function.body),
                         self.device_function.cute_state.reshape_lane_fallbacks,
                         physical_fallbacks=self.device_function.cute_state.reshape_physical_fallbacks,
-                        uniform_names={
-                            *(
-                                argument.name
-                                for argument in self.device_function.arguments
-                            ),
-                            *self._extra_params,
-                        },
+                        uniform_names=lane_uniform_names,
+                    )
+                    self.device_function.body = sink_lane_loops_into_uniform_branches(
+                        list(self.device_function.body),
+                        uniform_names=lane_uniform_names,
+                        rename_groups=lane_rename_groups,
                     )
                     self.device_function.body = normalize_nested_lane_reductions(
                         list(self.device_function.body),
-                        uniform_names={
-                            *(
-                                argument.name
-                                for argument in self.device_function.arguments
-                            ),
-                            *self._extra_params,
-                        },
+                        uniform_names=lane_uniform_names,
                         proven_disjoint_tensor_pairs=proven_disjoint_pairs,
                         proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
-                        rename_groups={
-                            name: aliases[0]
-                            for name, aliases in self.device_function._variable_renames.items()
-                        },
+                        rename_groups=lane_rename_groups,
                     )
                     validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = interchange_lane_outside_serial_reductions(
@@ -2188,13 +2198,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
-                        uniform_names={
-                            *(
-                                argument.name
-                                for argument in self.device_function.arguments
-                            ),
-                            *self._extra_params,
-                        },
+                        uniform_names=lane_uniform_names,
                         proven_disjoint_tensor_pairs=proven_disjoint_pairs,
                         proven_tensor_stride_values=(
                             self.device_function.proven_tensor_stride_values()

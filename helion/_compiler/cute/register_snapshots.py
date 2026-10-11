@@ -497,8 +497,9 @@ def snapshot_chains(
     by_id = {graph.graph_id: graph for graph in graphs}
     targets = atomic_target_origins(graphs)
 
-    def dimension(size: int | torch.SymInt) -> sympy.Basic:
-        expr = size._sympy_() if isinstance(size, torch.SymInt) else sympy.Integer(size)
+    def dimension(size: int | torch.SymInt | sympy.Expr) -> sympy.Basic:
+        # Reduction ranges are sympy expressions, tensor shapes ints/SymInts.
+        expr = size._sympy_() if isinstance(size, torch.SymInt) else sympy.sympify(size)
         return env.specialize_expr(
             cast("sympy.Expr", configured_fragment_expr(env, expr, lambda _bid: None))
         )
@@ -519,7 +520,7 @@ def snapshot_chains(
         logical = snapshot_logical_shape(load)
 
         def same(shape: object) -> bool:
-            sizes = cast("tuple[int | torch.SymInt, ...]", shape)
+            sizes = cast("tuple[int | torch.SymInt | sympy.Expr, ...]", shape)
             return len(sizes) == 1 and dimension(sizes[0]) == dimension(fake.shape[0])
 
         seen = {load}
