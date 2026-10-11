@@ -355,7 +355,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # the resolved per-thread coordinate expression so a load and store over
         # the same arange share one lane loop.
         self.cute_synthetic_arange_lane_exprs: dict[tuple[object, ...], str] = {}
-        self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
         # Per-pass state of ``load_transform``: the fused inputs whose prologue
@@ -1834,12 +1833,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         # pyrefly: ignore [missing-attribute]
                         self.device_function.pid.codegen_pid_init()
                     )
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
-                    body = []
-                else:
-                    # This is the last top level for, dont emit more if statements
-                    assert self.next_else_block is not None
-                    body = self.next_else_block
+                body = []
             with (
                 self.set_on_device(),
                 self.set_statements(body),
@@ -1975,30 +1969,26 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
                     self.device_function.flush_deferred_rdim_defs(self)
 
-                if isinstance(self.device_function.pid, ForEachProgramID):
-                    self.device_function.pid.case_phases.append(
+                pid = self.device_function.pid
+                if isinstance(pid, ForEachProgramID):
+                    pid.case_bodies.append(body)
+                    pid.case_phases.append(
                         self.host_function.device_ir.phase_for_root(node._root_id)
                     )
-
-                # If we are in a multi top level loop, for all loops except for the last one
-                # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
-                    block = (
-                        self.device_function.body
-                        if self.next_else_block is None
-                        else self.next_else_block
-                    )
-                    self.next_else_block = []
-                    block.append(
-                        create(
-                            ast.If,
-                            # pyrefly: ignore [missing-attribute]
-                            test=self.device_function.pid.codegen_test(state),
-                            body=body,
-                            orelse=self.next_else_block,
+                    if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                        pid.case_branches.append(
+                            create(
+                                ast.If,
+                                test=pid.codegen_test(state),
+                                body=body,
+                                orelse=[],
+                            )
                         )
-                    )
             if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                if isinstance(self.device_function.pid, ForEachProgramID):
+                    self.device_function.body.extend(
+                        self.device_function.pid.codegen_dispatch()
+                    )
                 if self.suppressed_lane_names:
                     _drop_dead_lane_derived_assignments(
                         self.device_function.body,
