@@ -5,6 +5,7 @@ from itertools import starmap
 import logging
 import operator
 from typing import TYPE_CHECKING
+from typing import NoReturn
 from typing import cast
 
 import sympy
@@ -29,6 +30,7 @@ from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import ReductionLowering
 from .inductor_lowering import install_inductor_kernel_handlers
+from .roll_reduction import FREE_IOTA_REDUCTION_META
 from .tile_strategy import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .tile_strategy import CompactedShape
 from .tile_strategy import CuteLaneAxis
@@ -2369,6 +2371,117 @@ class LoopedReductionStrategy(ReductionStrategy):
             axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         return axis_sizes
 
+    def _cute_lanes_below_reduce_axis(
+        self, state: CodegenState, device_loop: DeviceLoopState
+    ) -> tuple[int, dict[int, int]]:
+        """``(pre, axis_sizes)``: the live threads on the launch axes below this
+        rolled reduction's thread axis, which interleave with its lanes."""
+        axis_sizes = self._active_thread_axis_sizes(state, device_loop)
+        pre = 1
+        for axis in range(self._get_thread_axis()):
+            pre *= axis_sizes.get(axis, 1)
+        return pre, axis_sizes
+
+    def _cute_sibling_axis_reduction_expr(
+        self,
+        state: CodegenState,
+        device_loop: DeviceLoopState,
+        acc: str,
+        reduction_type: str,
+        default_value: float | bool,
+        dtype: torch.dtype,
+    ) -> str | None:
+        """Thread combine of a rolled reduction above live sibling thread axes.
+
+        A plain ``warp_reduction_*`` (and the ``pre=1`` cross-warp reduce of
+        ``_cute_cross_warp_reduction_expr``) folds consecutive linear lanes,
+        which here are the sibling lanes below the reduce axis:
+        ``out[tile] = buf[:, :].sum(-1)`` with the row dim on thread axis 0 and
+        a rolled column chunk on axis 1 summed rows instead of column lanes.
+        Use the grouped reductions that keep the ``pre`` interleaved sibling
+        lanes distinct, as ``PersistentReductionStrategy`` does.  Returns
+        ``None`` when the reduce axis is at the bottom of the lanes.
+        """
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if backend.name != "cute" or self._thread_count <= 1:
+            return None
+        pre, axis_sizes = self._cute_lanes_below_reduce_axis(state, device_loop)
+        if pre <= 1:
+            return None
+        reduce_axis = self._get_thread_axis()
+
+        def refuse(reason: str) -> NoReturn:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"rolled {reduction_type} over thread axis {reduce_axis} "
+                f"interleaved with {pre} sibling lanes below it: {reason}",
+            )
+
+        if self._cute_rolled_cluster_n > 1:
+            refuse("the cluster-split reduce combines whole CTAs")
+        if axis_sizes.get(reduce_axis, self._thread_count) != self._thread_count:
+            refuse("another block shares the reduce axis")
+        axis_sizes[reduce_axis] = self._thread_count
+        group_span = pre * self._thread_count
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        if (
+            group_span > _CUTE_WARP_REDUCTION_THREADS
+            and group_span % _CUTE_WARP_REDUCTION_THREADS != 0
+        ) or num_threads % group_span != 0:
+            refuse("the thread axes do not tile the reduce group")
+        # The warp combine needs the launch to match the axes up to this one
+        # (they order the warp lanes); the two-stage combine keys shared memory
+        # on the linear thread index, so it needs every launch axis.
+        planned_dims = tuple(
+            starmap(
+                max,
+                zip(
+                    self._planned_thread_dims(),
+                    state.codegen.max_thread_block_dims,
+                    strict=True,
+                ),
+            )
+        )
+        checked_axes = (
+            range(reduce_axis + 1)
+            if group_span <= _CUTE_WARP_REDUCTION_THREADS
+            else range(len(planned_dims))
+        )
+        if any(axis_sizes.get(axis, 1) != planned_dims[axis] for axis in checked_axes):
+            refuse(f"its thread group is not provable under the launch {planned_dims}")
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        if lane_expr is None:
+            refuse("no linear thread index for the block layout")
+        identity_expr = backend.cast_expr(
+            constant_repr(default_value), _dtype_str(dtype)
+        )
+        if group_span <= _CUTE_WARP_REDUCTION_THREADS:
+            return _grouped_warp_reduce_expr(
+                reduction_type,
+                acc,
+                identity_expr,
+                lane_expr,
+                pre=pre,
+                group_span=group_span,
+            )
+        result_var = self.fn.new_var("looped_reduce_result", dce=True)
+        device_loop.outer_suffix.extend(
+            _grouped_two_stage_reduce_stmts(
+                result_var,
+                reduction_type,
+                acc,
+                identity_expr,
+                lane_expr,
+                pre=pre,
+                group_span=group_span,
+                group_count=num_threads // group_span,
+            )
+        )
+        return result_var
+
     def _cute_cross_warp_reduction_expr(
         self,
         state: CodegenState,
@@ -2863,6 +2976,15 @@ class LoopedReductionStrategy(ReductionStrategy):
             and self._claims_thread_axis()
         ):
             state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
+        assert state.fx_node is not None
+        if state.fx_node.meta.get(FREE_IOTA_REDUCTION_META):
+            # Its input is computed outside the loop from a free hl.arange, so
+            # every chunk would fold the same full-extent value; only the
+            # computed-fragment lowering re-reads it per chunk.
+            raise exc.BackendUnsupported(
+                CompileEnvironment.current().backend.name,
+                "a rolled reduction of a value computed outside its loop",
+            )
         with install_inductor_kernel_handlers(state.codegen, {}):
             env = CompileEnvironment.current()
             backend = env.backend
@@ -2874,7 +2996,6 @@ class LoopedReductionStrategy(ReductionStrategy):
             )
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
-            assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
             acc_full = backend.reduction_acc_init_expr(
                 shape_dims, constant_repr(default), acc_dtype
@@ -2932,13 +3053,23 @@ class LoopedReductionStrategy(ReductionStrategy):
                     reduction_type, acc, vec_input, acc_dtype
                 )
                 state.add_statement(f"{acc} = {combine_expr}")
-                expr = self._cute_cross_warp_reduction_expr(
-                    state,
-                    device_loop,
-                    acc,
-                    reduction_type,
-                    default,
-                    acc_dtype,
+                expr = (
+                    self._cute_sibling_axis_reduction_expr(
+                        state,
+                        device_loop,
+                        acc,
+                        reduction_type,
+                        default,
+                        acc_dtype,
+                    )
+                    or self._cute_cross_warp_reduction_expr(
+                        state,
+                        device_loop,
+                        acc,
+                        reduction_type,
+                        default,
+                        acc_dtype,
+                    )
                 ) or self.call_reduction_function(
                     acc,
                     reduction_type,
@@ -2947,6 +3078,18 @@ class LoopedReductionStrategy(ReductionStrategy):
                     fake_output,
                 )
             else:
+                if (
+                    backend.name == "cute"
+                    and self._thread_count > 1
+                    and self._cute_lanes_below_reduce_axis(state, device_loop)[0] > 1
+                ):
+                    # The argreduce finalize folds consecutive lanes too.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"rolled {reduction_type} over thread axis "
+                        f"{self._get_thread_axis()} interleaved with sibling "
+                        "lanes below it",
+                    )
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
                 index_dtype = env.index_dtype
                 device_loop.outer_prefix.append(

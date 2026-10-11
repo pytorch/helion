@@ -266,6 +266,12 @@ def _(
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
+    # Allocate the reduction dims of full slices as ``tensor[index] = value``
+    # and ``hl.load`` do, so the slots of the store have blocks to address
+    # them by.
+    target = tensor if isinstance(tensor, torch.Tensor) else tensor[0]
+    assert isinstance(target, torch.Tensor)
+    SubscriptIndexing.compute_shape(target, index)
     return None
 
 

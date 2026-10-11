@@ -519,6 +519,27 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = x[1:-2] + x[3:]
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager("ref-mode hl.store with an extra_mask takes no slice entries")
+    def test_store_full_slice(self):
+        # ``hl.store`` with a ``:`` entry and no other slice of that width
+        # allocates its reduction dim as ``out[tile, :] = v`` does.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def store_rows(s: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([s.size(0), 8], device=s.device, dtype=s.dtype)
+            for tile in hl.tile(s.size(0)):
+                hl.store(
+                    out,
+                    [tile, slice(None)],
+                    (s[tile] * 2)[:, None].expand(-1, 8),
+                    extra_mask=(s[tile] > 0)[:, None],
+                )
+            return out
+
+        s = torch.randn([65], device=DEVICE)
+        _code, result = code_and_output(store_rows, (s,), block_size=32)
+        expected = torch.where((s > 0)[:, None], (s * 2)[:, None].expand(-1, 8), 0.0)
+        torch.testing.assert_close(result, expected)
+
     def test_mask_store(self):
         @helion.kernel
         def masked_store(x: torch.Tensor) -> torch.Tensor:

@@ -424,14 +424,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         _compile_only(mod.matmul_layernorm, args, block_sizes=[16, 16])
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "N=400 is not a power of two (static shapes fail too): the padded "
-        "full-slice N (512) and the row reduction over n get two reduction "
-        "dims, so the reduction's lane owner is not the loop producing its "
-        "input (BackendUnsupported: reduction marker is nested in a different "
-        "lane owner); test_matmul_layernorm_static_shapes covers N=512",
-    )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),

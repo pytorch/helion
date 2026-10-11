@@ -1260,7 +1260,10 @@ def _native_same_axis_statistic(
     return out
 
 
-def test_same_axis_statistic_broadcast_preserves_native_owner():
+def test_same_axis_statistic_broadcast_from_another_lane_owner_is_refused():
+    # The amax's lanes belong to the free hl.arange, not to the row tile's
+    # lane loop that consumes the broadcast statistic; lowering it there gave
+    # wrong values (17 and 1000 columns).
     with (
         _mock_cuda_unavailable(),
         _target(),
@@ -1276,9 +1279,10 @@ def test_same_axis_statistic_broadcast_preserves_native_owner():
         )
         config = bound.config_spec.default_config()
         config.config["reduction_loops"] = [None]
-        source = bound.to_code(config)
-    assert "fragment_smem" not in source
-    assert "warp_reduction_max" in source
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="nested in a different lane owner"
+        ):
+            bound.to_code(config)
 
 
 def test_independent_full_reduction_records_dynamic_metadata_before_projection():

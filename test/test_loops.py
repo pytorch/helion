@@ -30,6 +30,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -661,12 +662,42 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(result, args[0] + 1)
 
+    @skipIfRefEager("checks the CuTe lowering's refusal")
+    @skipUnlessBackends(["cute"])
+    def test_full_slice_of_block_sized_buffer_reduction(self):
+        """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
+        slice's reduction dim reuses the block's symbol after its loop ended.
+        CuTe must refuse it rather than reduce it with that dim's synthetic
+        lane loop, which would repeat the tile loop's atomics once per lane."""
+
+        @helion.kernel(static_shapes=True)
+        def row_sums(y: torch.Tensor) -> torch.Tensor:
+            bt, v = y.shape
+            block_size_n = hl.register_block_size(v)
+            loss_sum = torch.zeros(
+                [64, block_size_n], dtype=torch.float32, device=y.device
+            )
+            rows = torch.zeros([64], dtype=torch.float32, device=y.device)
+            for tile_bt in hl.tile(bt, block_size=64):
+                loss_sum[:, :] = hl.zeros([64, block_size_n], dtype=torch.float32)
+                for tile_v in hl.tile(v, block_size=block_size_n):
+                    hl.atomic_add(loss_sum, [tile_bt, tile_v], y[tile_bt, tile_v])
+                rows[:] = loss_sum[:, :].sum(dim=-1)
+            return rows
+
+        y = torch.randn(64, 128, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "reduction lane owner is not proven"
+        ):
+            code_and_output(row_sums, (y,), block_sizes=[128])
+
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
-        "CuTe cannot prove the full-slice loss_sum[:, :] rows (64) own the "
-        "lanes of the tile_bt store (BackendUnsupported: reduction lane owner "
-        "is not proven)",
+        "CuTe has no lowering for reducing the full slice loss_sum[:, :] of a "
+        "buffer sized by a block: its reduction dim reuses tile_v's block, "
+        "whose loop has ended (BackendUnsupported: reduction lane owner is "
+        "not proven)",
     )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
