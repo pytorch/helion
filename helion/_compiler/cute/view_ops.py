@@ -78,10 +78,14 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
     re-read whenever the tensor may be written at all.  Default-deny: a write
     counts unless its host tensor is provably distinct from the loaded one by
     ``collect_host_tensor_roots`` (every kernel argument shares one root, and
-    a host value of unknown provenance may alias anything).  A loaded value
-    that is not a host tensor is treated as written, and so is any tensor when
-    the kernel stores through a stack tensor's pointer table.
+    a host value of unknown provenance may alias anything), or both are kernel
+    arguments whose storage the bound kernel's cache key proves disjoint
+    (``runtime_tensors_are_proven_disjoint``: a preallocated ``out``).  A
+    loaded value that is not a host tensor is treated as written, and so is
+    any tensor when the kernel stores through a stack tensor's pointer table.
     """
+    from .memory_ops import runtime_tensors_are_proven_disjoint
+
     tensor = load_node.args[0]
     if not (isinstance(tensor, torch.fx.Node) and tensor.target is _host_tensor):
         return True
@@ -94,6 +98,17 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
     def tensor_roots(node: torch.fx.Node) -> frozenset[str]:
         name = _host_tensor_root_name(_host_tensor_name(node))
         return roots.get(name, unknown)
+
+    def _arguments_disjoint(left: torch.fx.Node, right: torch.fx.Node) -> bool:
+        left_val = left.meta.get("val")
+        right_val = right.meta.get("val")
+        return (
+            isinstance(left_val, torch.Tensor)
+            and isinstance(right_val, torch.Tensor)
+            and runtime_tensors_are_proven_disjoint(
+                CompileEnvironment.current(), left_val, right_val
+            )
+        )
 
     loaded = tensor_roots(tensor)
     for graph_info in cg.codegen_graphs:
@@ -108,7 +123,9 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
             ):
                 return True
             written = tensor_roots(target)
-            if HOST_UNKNOWN_ROOT in loaded | written or loaded & written:
+            if (
+                HOST_UNKNOWN_ROOT in loaded | written or loaded & written
+            ) and not _arguments_disjoint(tensor, target):
                 return True
     return False
 

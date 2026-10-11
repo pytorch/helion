@@ -259,6 +259,19 @@ def joined_pairs_transposed(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True)
+def joined_pairs_times(x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """The reshape undoing a pair split feeds a pointwise op with a loaded tile."""
+    n, d = x.size()
+    out = torch.empty_like(x)
+    for tile_n, tile_d in hl.tile([n, d]):
+        pair = x[tile_n, tile_d].reshape([tile_n, tile_d.block_size // 2, 2])
+        lo, hi = hl.split(pair)
+        joined = hl.join(hi, lo).reshape([tile_n, tile_d])
+        out[tile_n, tile_d] = joined * z[tile_n, tile_d]
+    return out
+
+
+@helion.kernel(static_shapes=True)
 def unit_permuted_pairs(x: torch.Tensor) -> torch.Tensor:
     """A permute that only moves a unit dim, over a non-load tile."""
     n, d = x.size()
@@ -465,6 +478,18 @@ class TestCuteSplitExchange(TestCase):
                     joined_pairs_transposed, (self.x,), block_sizes=block_sizes
                 )
                 self.assertNotIn("rebind_smem", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_joined_pairs_feed_pointwise(self) -> None:
+        # The join's coordinates recompose the tile's own, so the merging
+        # reshape keeps every element on its thread for any consumer.
+        z = torch.randn_like(self.x)
+        expected = _swapped_interleaved(self.x, 1.0) * z
+        for block_sizes in ([32, 32], [16, 64], [64, 16]):
+            with self.subTest(block_sizes=block_sizes):
+                _, result = code_and_output(
+                    joined_pairs_times, (self.x, z), block_sizes=block_sizes
+                )
                 torch.testing.assert_close(result, expected)
 
     def test_unit_permute_exchange(self) -> None:

@@ -64,6 +64,7 @@ from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     from torch.utils._ordered_set import OrderedSet
@@ -210,6 +211,7 @@ def prepare_node_lowering(
                 torch.SymFloat: torch.float32,
                 torch.SymBool: torch.bool,
             }[type(example)]
+            input_layouts[name] = ([], [])
             result = TensorBox.create(
                 InputBuffer(
                     name=name,
@@ -225,15 +227,13 @@ def prepare_node_lowering(
             assert isinstance(example, torch.Tensor), (
                 f"Expected Tensor, got {type(example)}: {node.target}"
             )
+            size = [*map(_unpack_symint, example.size())]
+            stride = [*map(_unpack_symint, example.stride())]
+            input_layouts[name] = (size, stride)
             result = TensorBox.create(
                 InputBuffer(
                     name=name,
-                    layout=FixedLayout(
-                        example.device,
-                        example.dtype,
-                        [*map(_unpack_symint, example.size())],
-                        [*map(_unpack_symint, example.stride())],
-                    ),
+                    layout=FixedLayout(example.device, example.dtype, size, stride),
                 )
             )
         assert isinstance(result, TensorBox)
@@ -241,6 +241,7 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
+    input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = {}
     with _patched_inductor_config():
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
@@ -322,6 +323,7 @@ def prepare_node_lowering(
             dict(zip(current_input_nodes, current_input_names, strict=True)),
         )
         new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
+        lowering.input_layouts = input_layouts
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
             lowering.add_input_mask(new_node)
@@ -431,6 +433,10 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
 class InductorLowering(Lowering):
     buffer: ComputedBuffer
     input_names: list[str]
+    # Size and stride of each node input the inner function loads, by name.
+    input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def input_asts(self, ctx: LoweringContext, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
@@ -507,17 +513,14 @@ class InductorLowering(Lowering):
 
 @contextlib.contextmanager
 def install_inductor_kernel_handlers(
-    cg: CodegenInterface, args: dict[str, ast.AST]
+    cg: CodegenInterface,
+    args: dict[str, ast.AST],
+    load_check: Callable[[str, sympy.Expr], None] | None = None,
 ) -> Iterator[None]:
     with (
         _patched_inductor_config(),
         V.set_graph_handler(FakeGraphLowering()),
-        V.set_ops_handler(
-            GenerateASTFromInductor(
-                cg,
-                args,
-            )
-        ),
+        V.set_ops_handler(GenerateASTFromInductor(cg, args, load_check)),
         V.set_kernel_handler(
             TritonKernel({}, features=SIMDKernelFeatures([], sympy.S.One))
         ),
@@ -560,16 +563,92 @@ class PointwiseLowering(InductorLowering):
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
         assert len(input_asts) == len(self.input_names)
+        indices = [sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))]
         with install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+            ctx.cg,
+            dict(zip(self.input_names, input_asts, strict=True)),
+            load_check=functools.partial(
+                self._check_position_preserving_load, node, indices
+            ),
         ):
-            indices = [
-                sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
-            ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
         return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
+
+    def _check_position_preserving_load(
+        self,
+        node: torch.fx.Node,
+        indices: list[sympy.Symbol],
+        name: str,
+        index: sympy.Expr,
+    ) -> None:
+        """Refuse a load of a node input at another position than the output's.
+
+        Every backend lowers an element-wise node from the values its inputs
+        hold at the output element's position (``GenerateASTFromInductor.load``
+        returns the input's value whatever the index).  That is right when the
+        index walks the input's own dims in order: ``sum(stride[d] * i[k])``
+        over its dims of extent > 1, each with its own output variable and in
+        the same order (broadcasting right-aligns them, a size-1 reduction
+        turned element-wise keeps the other dims), with no offset.  An
+        index-remapping decomposition (``torch.flip`` reads ``n - 1 - i``,
+        ``torch.rot90``, a padded or shifted read, a gather) would silently
+        compute the identity.  Loads of buffers produced inside the same
+        lowering are inductor's own and not checked.
+        """
+        if name not in self.input_layouts:
+            return
+        size, stride = self.input_layouts[name]
+        ranges = self.buffer.data.ranges
+        variables = set(indices)
+        unit = {
+            var: 0 for var, extent in zip(indices, ranges, strict=True) if extent == 1
+        }
+        constant: sympy.Expr = sympy.S.Zero
+        coefficients: dict[sympy.Symbol, sympy.Expr] = {}
+        linear = True
+        for term in sympy.Add.make_args(sympy.expand(index.xreplace(unit))):
+            # The terms of an index expression are expressions.
+            term = cast("sympy.Expr", term)
+            used = term.free_symbols & variables
+            if not used:
+                constant = sympy.Add(constant, term)
+                continue
+            if len(used) != 1:
+                linear = False
+                break
+            var = cast("sympy.Symbol", next(iter(used)))
+            coefficient = sympy.Mul(term, sympy.Pow(var, -1))
+            if coefficient.free_symbols & variables:
+                linear = False
+                break
+            coefficients[var] = sympy.Add(
+                coefficients.get(var, sympy.S.Zero), coefficient
+            )
+        walked = [
+            coefficient
+            for var in indices
+            if (coefficient := coefficients.get(var, sympy.S.Zero)) != 0
+        ]
+        dims = [
+            step
+            for extent, step in zip(size, stride, strict=True)
+            if extent != 1 and step != 0
+        ]
+        shape_env = CompileEnvironment.current().shape_env
+        if not (
+            linear
+            and len(walked) == len(dims)
+            and shape_env.simplify(constant) == 0
+            and all(
+                shape_env.simplify(sympy.Add(coefficient, sympy.Mul(-1, step))) == 0
+                for coefficient, step in zip(walked, dims, strict=True)
+            )
+        ):
+            raise exc.UnsupportedIndexRemapping(
+                op=node.meta.get("orig_node", node).target, index=index
+            )
 
     def _reshape_for_size1_reduction(
         self,
@@ -1185,7 +1264,10 @@ def _is_plain_true_division(node: torch.fx.Node) -> bool:
 
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
-        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
+        self,
+        cg: CodegenInterface,
+        input_name_lookup: dict[str, ast.AST],
+        load_check: Callable[[str, sympy.Expr], None] | None = None,
     ) -> None:
         super().__init__()
         self.parent_handler: InductorOpOverrides = (
@@ -1193,6 +1275,7 @@ class GenerateASTFromInductor(DefaultHandler):
         )
         self.cg = cg
         self.input_name_lookup = input_name_lookup
+        self.load_check = load_check
 
     def _cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         backend = CompileEnvironment.current().backend
@@ -1465,7 +1548,10 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._lift(result_expr)
 
     def load(self, name: str, index: sympy.Expr) -> str:
-        # TODO(jansel): assert the index is correct
+        # The input's value is the one at the output element's position;
+        # ``load_check`` refuses an index that names another.
+        if self.load_check is not None:
+            self.load_check(name, index)
         return self.cg.lift(self.input_name_lookup[name]).id
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:

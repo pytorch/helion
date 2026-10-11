@@ -337,6 +337,38 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 (torch.randn(2, 2, device=DEVICE), mask),
             )
 
+    def test_index_remapping_pointwise_refused(self):
+        # torch.flip / torch.rot90 decompose into an element-wise read at
+        # reversed positions; device loops lower element-wise ops position by
+        # position, which used to compute the identity silently.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def flip_fn(x: torch.Tensor, dims: hl.constexpr) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = torch.flip(x[tile, :], dims)
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def rot90_fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = torch.rot90(x[tile, :] + 1.0, 2, [0, 1])
+            return out
+
+        x = torch.randn([64, 32], device=DEVICE)
+        # A full-slice dim, a tile dim, both.
+        for dims in ((1,), (0,), (0, 1)):
+            with (
+                self.subTest(dims=dims),
+                self.assertRaisesRegex(
+                    helion.exc.UnsupportedIndexRemapping,
+                    r"reads its input at other positions than it writes",
+                ),
+            ):
+                code_and_output(flip_fn, (x, dims), block_size=32)
+        with self.assertRaises(helion.exc.UnsupportedIndexRemapping):
+            code_and_output(rot90_fn, (x,), block_size=32)
+
     def test_torch_nonzero_device_error(self):
         @helion.kernel()
         def torch_nonzero_in_device_code(x: torch.Tensor) -> torch.Tensor:

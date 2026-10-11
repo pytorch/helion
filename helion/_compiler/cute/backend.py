@@ -1558,6 +1558,7 @@ class CuteBackend(Backend):
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
+        from .literal_dims import annotate_literal_dims
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
             plan_split_single_token_rank1_recurrence,
@@ -1590,6 +1591,7 @@ class CuteBackend(Backend):
                     "direct affine scan requires one compatible single-root region",
                 )
             annotate_view_subtiles(graphs, config)
+            annotate_literal_dims(graphs, config)
             plan_layouts(graphs, config, tile_strategy)
             return
 
@@ -1620,6 +1622,7 @@ class CuteBackend(Backend):
         if device_function.cute_state.fixed_token_rank1_plan is not None:
             return
         annotate_view_subtiles(graphs, config)
+        annotate_literal_dims(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
     def reference_override(

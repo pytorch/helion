@@ -426,6 +426,15 @@ class InvalidConfig(BaseError):
     message = "{}"
 
 
+class UnsupportedIndexRemapping(BaseError):
+    message = (
+        "{op} reads its input at other positions than it writes (inductor "
+        "index {index}), which Helion device loops do not support: element-wise "
+        "ops are lowered position by position. Index the loaded tensor instead "
+        "(for example load at reversed indices in place of torch.flip)."
+    )
+
+
 class UnsupportedSplitConfiguration(BaseError):
     message = "{op} in Helion device loops requires {requirement}."
 
