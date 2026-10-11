@@ -1178,16 +1178,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self._statement_owner_fx_node = prior
 
     @contextlib.contextmanager
-    def cute_branch_scope(self, if_node_id: int, branch_side: int) -> Iterator[None]:
+    def cute_branch_scope(
+        self, if_node_id: int, branch_side: int, *, divergent: bool
+    ) -> Iterator[None]:
         """Mark codegen as inside one branch of a dynamic ``_if`` (CuTe only).
 
         ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body.
         Used so synthetic ``hl.arange`` axes allocated in mutually-exclusive
-        branches can share a single thread axis.
+        branches can share a single thread axis.  ``divergent`` is False for a
+        condition every thread of the CTA evaluates alike, where a block-wide
+        barrier stays placeable.
         """
         self._cute_branch_path.append((if_node_id, branch_side))
         try:
-            with self.divergent_control_flow():
+            with (
+                self.divergent_control_flow() if divergent else contextlib.nullcontext()
+            ):
                 yield
         finally:
             self._cute_branch_path.pop()

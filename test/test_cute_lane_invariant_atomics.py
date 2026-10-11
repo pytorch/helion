@@ -314,6 +314,64 @@ def _copy_then_release_count(x: torch.Tensor, counter: torch.Tensor) -> torch.Te
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _copy_then_release_rows(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0, tile1] = x[tile0, tile1]
+        hl.atomic_add(counts, [tile0], 1, sem="release")
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _acquire_rows_then_copy(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        hl.atomic_add(counts, [tile0], 1, sem="acquire")
+        out[tile0, tile1] = x[tile0, tile1]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _acquire_copy_release_rows(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        hl.atomic_add(counts, [tile0], 1, sem="acquire")
+        out[tile0, tile1] = x[tile0, tile1]
+        hl.atomic_add(counts, [tile0], 1, sem="release")
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _copy_then_release_elements(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0, tile1] = x[tile0, tile1]
+        hl.atomic_add(flags, [tile0, tile1], 1, sem="release")
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _acquire_elements_then_copy(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        hl.atomic_add(flags, [tile0, tile1], 1, sem="acquire")
+        out[tile0, tile1] = x[tile0, tile1]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _copy_then_flagged_release_elements(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0, tile1] = x[tile0, tile1]
+        if flags[0, 0] >= 0:
+            hl.atomic_add(flags, [tile0, tile1], 1, sem="release")
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _sum_into_scalar(x: torch.Tensor, total: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile0, tile1 in hl.tile(x.shape):
@@ -348,6 +406,18 @@ def _count_then_offset_the_copy(x: torch.Tensor, counter: torch.Tensor) -> torch
     for tile0, tile1 in hl.tile(x.shape):
         old = hl.atomic_add(counter, [0], 1)
         out[tile0, tile1] = x[tile0, tile1] + old
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flagged_count_then_offset_the_copy(
+    x: torch.Tensor, counter: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        if flag[0] > 0:
+            old = hl.atomic_add(counter, [0], 1)
+            out[tile0, tile1] = x[tile0, tile1] + old
     return out
 
 
@@ -444,6 +514,12 @@ def _convert_bytes_and_count(
 
 # One row per program, 32 threads x 8 lanes: a plain lane loop.
 _LANES = {"block_sizes": [1, 256], "num_threads": [0, 32], "cute_vector_widths": [1, 1]}
+# One thread per element of a 4 x 32 tile: no lane loops.
+_ONE_PER_THREAD = {
+    "block_sizes": [4, 32],
+    "num_threads": [4, 32],
+    "cute_vector_widths": [1, 1],
+}
 # 256 threads x one vector of four: the vectorized lane loop.
 _ROW = {"block_sizes": [1, 1024], "num_threads": [0, 256], "cute_vector_widths": [1, 4]}
 # Four rows per thread around the vectorized lane loop: two lane loops.
@@ -593,6 +669,103 @@ def test_release_atomic_follows_the_stores_it_orders() -> None:
     assert "sem='release'" in ast.unparse(atomic)
 
 
+@pytest.mark.parametrize(
+    ("kernel", "expected"),
+    [
+        pytest.param(
+            _copy_then_release_rows, ["lane_1", "barrier", "release"], id="release"
+        ),
+        pytest.param(
+            _acquire_rows_then_copy, ["acquire", "barrier", "lane_1"], id="acquire"
+        ),
+        pytest.param(
+            _acquire_copy_release_rows,
+            ["acquire", "barrier", "lane_1", "barrier", "release"],
+            id="acquire_release",
+        ),
+    ],
+)
+def test_row_fence_barrier_joins_its_atomic_in_the_row_loop(
+    kernel: object, expected: list[str]
+) -> None:
+    # A release / acquire count per row runs in the row loop, issued by the
+    # column axis's leader thread.  Its barrier runs there too, once per row,
+    # between the column loop and the atomic: after the row's per-lane stores
+    # for a release, before its per-lane loads for an acquire.
+    args = (torch.empty((8, 256)), torch.zeros((8,), dtype=torch.int32))
+    code = _generate(kernel, args, **_NESTED_SCALAR)
+    function = _kernel_function(code)
+    row_loop = next(node for node in function.body if isinstance(node, ast.For))
+    assert ast.unparse(row_loop.target) == "lane_0", code
+
+    def role(statement: ast.stmt) -> str | None:
+        if isinstance(statement, ast.For):
+            return ast.unparse(statement.target)
+        source = ast.unparse(statement)
+        if source == "cute.arch.sync_threads()":
+            return "barrier"
+        return next((sem for sem in ("acquire", "release") if sem in source), None)
+
+    roles = [role(statement) for statement in row_loop.body]
+    assert [r for r in roles if r is not None] == expected, code
+    barriers = ast.unparse(function).count("cute.arch.sync_threads()")
+    assert barriers == expected.count("barrier"), code
+
+
+@pytest.mark.parametrize(
+    ("kernel", "expected"),
+    [
+        pytest.param(
+            _copy_then_release_elements,
+            ["load", "store", "barrier", "release"],
+            id="release",
+        ),
+        pytest.param(
+            _acquire_elements_then_copy,
+            ["acquire", "barrier", "load", "store"],
+            id="acquire",
+        ),
+    ],
+)
+def test_per_element_fence_gets_the_block_barrier(
+    kernel: object, expected: list[str]
+) -> None:
+    # Each thread issues the release / acquire of its own elements, which
+    # orders only its own accesses, while Helion's memory orders act for the
+    # whole program (the Triton backend's bar.sync before every release and
+    # after every acquire).  A block barrier sits between the copy and the
+    # atomic in the column loop, every thread reaching it once per lane.
+    args = (torch.empty((8, 256)), torch.zeros((8, 256), dtype=torch.int32))
+    code = _generate(kernel, args, **_NESTED_SCALAR)
+    function = _kernel_function(code)
+    atomic = _the_atomic(function)
+    assert _lane_loops_around(function, atomic) == ["lane_1", "lane_0"], code
+    assert _guard(function, atomic) is None, code
+    column_loop = _enclosing(function, atomic, ast.For)[0]
+    assert isinstance(column_loop, ast.For)
+
+    def role(statement: ast.stmt) -> str | None:
+        source = ast.unparse(statement)
+        if source == "cute.arch.sync_threads()":
+            return "barrier"
+        for name in ("acquire", "release", ".load()", ".store("):
+            if name in source:
+                return name.strip(".()")
+        return None
+
+    roles = [role(statement) for statement in column_loop.body]
+    assert [r for r in roles if r is not None] == expected, code
+    assert ast.unparse(function).count("cute.arch.sync_threads()") == 1, code
+
+
+def test_per_element_fence_in_a_divergent_branch_rejects_the_config() -> None:
+    # The branch reads the tensor the atomic writes, so threads may disagree
+    # on it and some would skip the barrier its release needs.
+    args = (torch.empty((8, 256)), torch.zeros((8, 256), dtype=torch.int32))
+    with pytest.raises(exc.BackendUnsupported, match="inside a branch or while loop"):
+        _generate(_copy_then_flagged_release_elements, args, **_NESTED_SCALAR)
+
+
 def test_float_max_helper_is_a_tile_uniform_atomic() -> None:
     code = _generate(
         _max_then_copy, (torch.empty((8, 256)), torch.zeros((1,))), **_LANES
@@ -641,6 +814,27 @@ def test_atomic_result_needed_by_other_threads_rejects_the_config() -> None:
     # Only the leader thread performs the atomic and holds the previous value.
     with pytest.raises(exc.BackendUnsupported, match="leader thread"):
         _generate(_count_then_offset_the_copy, _counter_args(None, (8, 256)), **_LANES)
+
+
+def test_atomic_result_is_broadcast_from_the_leader_thread() -> None:
+    # Without lane loops the leader shares its old value through shared
+    # memory: write, barrier, every thread reads, barrier before a reuse.
+    code = _generate(
+        _count_then_offset_the_copy, _counter_args(None, (8, 64)), **_ONE_PER_THREAD
+    )
+    function = _kernel_function(code)
+    text = ast.unparse(function)
+    after = text[text.index("cute.arch.atomic_add(") :]
+    assert "_atomic_prev_smem" in after, code
+    assert after.count("cute.arch.sync_threads()") == 2, code
+    assert _leader_axes(_guard(function, _the_atomic(function))) == {0, 1}, code
+
+
+def test_atomic_result_in_a_branch_rejects_the_config() -> None:
+    # The broadcast's barriers cannot sit where a thread may skip them.
+    args = (torch.empty((8, 64)), torch.zeros(1, dtype=torch.int32), torch.ones(1))
+    with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
+        _generate(_flagged_count_then_offset_the_copy, args, **_ONE_PER_THREAD)
 
 
 # The lane loops around the atomic (innermost first) and the ones it varies

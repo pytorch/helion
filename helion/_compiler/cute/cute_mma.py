@@ -11153,6 +11153,17 @@ def _emit_mma_pipeline(
             and tcgen05_grouped_plan is None
             and not df.config.get(STARTUP_PREFILL_KEY, False)
         )
+        from .atomic_ops import reject_atomics_beside_warp_roles
+
+        reject_atomics_beside_warp_roles(
+            ctas_per_tile=(
+                "two-CTA pairs share each tile"
+                if tcgen05_is_two_cta
+                else "persistent CTAs own several tiles"
+                if tcgen05_pid_is_persistent and not tcgen05_one_shot_role_scheduler
+                else None
+            )
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=tcgen05_mma_bm,
             bn=tcgen05_mma_bn,

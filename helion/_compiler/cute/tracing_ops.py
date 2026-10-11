@@ -22,10 +22,12 @@ from ...language._tracing_ops import _mask_to
 from ...language._tracing_ops import _val_to_sympy
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..host_function import HostFunction
 from ..variable_origin import BlockSizeOrigin
+from .block_uniform import block_uniform
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -85,12 +87,16 @@ def _(state: CodegenState) -> list[object]:
     # Tag each branch with the dynamic ``_if`` node identity so synthetic
     # ``hl.arange`` axes allocated in mutually-exclusive branches can share a
     # single thread axis (only one branch runs per program instance).
+    assert state.fx_node is not None
     if_node_id = id(state.fx_node)
+    # A condition every thread of the CTA evaluates alike sends the whole
+    # block down one side, where a block-wide barrier is convergent.
+    uniform = block_uniform(state.fx_node.args[0])
 
     if_body_stmts: list[ast.AST] = []
     with (
         state.codegen.set_statements(if_body_stmts),
-        state.codegen.cute_branch_scope(if_node_id, 0),
+        state.codegen.cute_branch_scope(if_node_id, 0, divergent=not uniform),
     ):
         if_outputs = codegen_call_with_graph(
             state.codegen, graph_info.graph, [*if_args]
@@ -102,7 +108,7 @@ def _(state: CodegenState) -> list[object]:
     else_body_stmts: list[ast.AST] = []
     with (
         state.codegen.set_statements(else_body_stmts),
-        state.codegen.cute_branch_scope(if_node_id, 1),
+        state.codegen.cute_branch_scope(if_node_id, 1, divergent=not uniform),
     ):
         else_outputs = codegen_call_with_graph(
             state.codegen, else_graph.graph, [*else_args]
@@ -137,6 +143,8 @@ def _(state: CodegenState) -> list[object]:
     if not else_body_stmts:
         else_body_stmts.append(ast.Pass())
     if_ast_node = create(ast.If, test=test, body=if_body_stmts, orelse=else_body_stmts)
+    if uniform:
+        setattr(if_ast_node, HELION_BLOCK_UNIFORM_ATTR, True)
     state.add_statement(if_ast_node)
 
     if_return_names, else_return_names = graph_info.get_branches_return_names(

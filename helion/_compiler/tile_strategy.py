@@ -36,6 +36,7 @@ from .cute.scalar_recipe import PURE_DECODE_HELPERS
 from .cute.scalar_recipe import is_rounded_fp32_multiply
 from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
+from .device_function import TensorArg
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .program_id import FlatProgramIDs
@@ -6909,13 +6910,28 @@ def _lane_loop_is_live(
 
 
 def _current_rename_groups() -> dict[str, str]:
-    """Every alias the device function will rename, mapped to its canonical name."""
+    """Every alias the device function will rename, mapped to its canonical name.
+
+    A tensor argument viewing another's storage (``alias = x.view(...)`` on
+    the host) is mapped to the first such argument too: the lane-loop and
+    thread-barrier passes key memory dependences on these names, and a store
+    through one view must order a load through the other.
+    """
     try:
-        renames = DeviceFunction.current()._variable_renames
+        fn = DeviceFunction.current()
     except NoCurrentFunction:
         # Unit tests build the loop states outside a device function.
         return {}
-    return {name: aliases[0] for name, aliases in renames.items()}
+    groups = {name: aliases[0] for name, aliases in fn._variable_renames.items()}
+    storage_owners: dict[int, str] = {}
+    for arg in fn.arguments:
+        if isinstance(arg, TensorArg):
+            owner = storage_owners.setdefault(
+                id(arg.fake_value.untyped_storage()), arg.name
+            )
+            if owner != arg.name:
+                groups.setdefault(arg.name, owner)
+    return groups
 
 
 def _assign_lane_setup(

@@ -977,7 +977,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_cas", code)
 
-    @onlyBackends("triton")
+    @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
@@ -1033,14 +1033,25 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 hl.atomic_add(count, [0], 1, sem="relaxed")
             return out
 
+        cute = _get_backend() == "cute"
+        if cute:
+            ns, store, barrier_call = (
+                "cute.arch.",
+                ".store(",
+                "cute.arch.sync_threads()",
+            )
+        else:
+            ns, store, barrier_call = "tl.", "tl.store(", "tl.debug_barrier()"
         # kernel: (atomic call, barrier before it, barrier after it, final done)
         cases = {
-            release_unused: ("tl.atomic_add(", True, False, 0),
-            acq_rel_unused: ("tl.atomic_add(", True, True, 0),
-            # Triton itself broadcasts a used scalar result behind a bar.sync.
-            acq_rel_used: ("tl.atomic_add(", True, False, 1),
-            cas_acquire_unused: ("tl.atomic_cas(", False, True, 1),
-            relaxed: ("tl.atomic_add(", False, False, 0),
+            release_unused: (f"{ns}atomic_add(", True, False, 0),
+            acq_rel_unused: (f"{ns}atomic_add(", True, True, 0),
+            # A used scalar result is broadcast from the issuing thread: Triton
+            # does it behind a bar.sync of its own, CuTe's broadcast emits
+            # the barriers itself.
+            acq_rel_used: (f"{ns}atomic_add(", True, cute, 1),
+            cas_acquire_unused: (f"{ns}atomic_cas(", False, True, 1),
+            relaxed: (f"{ns}atomic_add(", False, False, 0),
         }
         x = torch.randn(512, device=DEVICE)
         for kernel, (call, before, after, final_done) in cases.items():
@@ -1052,12 +1063,183 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertEqual(int(count.item()), 4)
             self.assertEqual(int(done.item()), final_done)
             atomic = code.index(call)
-            barrier = code.rfind("tl.debug_barrier()", 0, atomic)
+            barrier = code.rfind(barrier_call, 0, atomic)
             if before:
-                self.assertGreater(barrier, code.rfind("tl.store(", 0, atomic))
+                self.assertGreater(barrier, code.rfind(store, 0, atomic))
             else:
                 self.assertEqual(barrier, -1)
-            self.assertEqual(code.find("tl.debug_barrier()", atomic) != -1, after)
+            self.assertEqual(code.find(barrier_call, atomic) != -1, after)
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_row_release_acquire_atomics_with_several_rows_per_thread(self):
+        """A per-row release / acquire atomic orders the accesses of its row."""
+
+        @helion.kernel(static_shapes=True)
+        def release_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                hl.atomic_add(flags, [tile_m], 1, sem="release")
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acquire_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_add(flags, [tile_m], 1, sem="acquire")
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acquire_release_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_add(flags, [tile_m], 1, sem="acquire")
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                hl.atomic_add(flags, [tile_m], 1, sem="release")
+            return out
+
+        cute = _get_backend() == "cute"
+        # On CuTe, 16 x 32 threads give every thread four rows and four
+        # columns of the 64 x 128 tile: a column lane loop in a row lane loop.
+        config = {
+            "block_sizes": [64, 128],
+            **({"num_threads": [16, 32]} if cute else {}),
+        }
+        x = torch.randn(128, 256, device=DEVICE)
+        # kernel: (atomics per row and column tile, semantics in program order)
+        cases = {
+            release_rows: (1, ["release"]),
+            acquire_rows: (1, ["acquire"]),
+            acquire_release_rows: (2, ["acquire", "release"]),
+        }
+        for kernel, (per_tile, semantics) in cases.items():
+            flags = torch.zeros(128, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(kernel, (x, flags), **config)
+            torch.testing.assert_close(result, x * 2.0, rtol=0, atol=0)
+            self.assertEqual(flags.tolist(), [2 * per_tile] * 128)
+            if not cute:
+                continue
+            # One barrier per atomic and row, on the atomic's side of the
+            # row's per-lane stores (release) or loads (acquire).
+            barrier = "cute.arch.sync_threads()"
+            self.assertEqual(code.count(barrier), len(semantics))
+            for sem in semantics:
+                atomic = code.index(f"sem='{sem}'")
+                if sem == "release":
+                    fence = code.rfind(barrier, 0, atomic)
+                    self.assertNotEqual(fence, -1)
+                    self.assertGreater(fence, code.rfind(".store(", 0, atomic))
+                else:
+                    fence = code.find(barrier, atomic)
+                    self.assertNotEqual(fence, -1)
+                    self.assertLess(fence, code.index(".load()", atomic))
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_per_element_release_acquire_atomics_sync_program(self):
+        """A per-element release / acquire orders every thread's accesses too."""
+
+        @helion.kernel(static_shapes=True)
+        def release_elements(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                hl.atomic_add(flags, [tile_m, tile_n], 1, sem="release")
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acquire_elements(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_add(flags, [tile_m, tile_n], 1, sem="acquire")
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acq_rel_elements_used(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                y = x[tile_m, tile_n] * 2.0
+                old = hl.atomic_xchg(flags, [tile_m, tile_n], 1, sem="acq_rel")
+                out[tile_m, tile_n] = y + old.to(torch.float32)
+            return out
+
+        cute = _get_backend() == "cute"
+        # On CuTe, 16 x 32 threads give every thread four rows and four
+        # columns of the 64 x 128 tile: the atomic in a column lane loop.
+        config = {
+            "block_sizes": [64, 128],
+            **({"num_threads": [16, 32]} if cute else {}),
+        }
+        if cute:
+            barrier, store, load = "cute.arch.sync_threads()", ".store(", ".load()"
+        else:
+            barrier, store, load = "tl.debug_barrier()", "tl.store(", "tl.load("
+        x = torch.randn(128, 256, device=DEVICE)
+        # kernel: (flag value before, flag value after, sem)
+        cases = {
+            release_elements: (0, 1, "release"),
+            acquire_elements: (0, 1, "acquire"),
+            acq_rel_elements_used: (3, 1, "acq_rel"),
+        }
+        for kernel, (before, after, sem) in cases.items():
+            flags = torch.full((128, 256), before, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(kernel, (x, flags), **config)
+            expected = x * 2.0 + (before if kernel is acq_rel_elements_used else 0)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+            self.assertTrue(bool((flags == after).all()))
+            atomic = code.index(f"sem='{sem}'")
+            if sem in ("release", "acq_rel"):
+                fence = code.rfind(barrier, 0, atomic)
+                self.assertNotEqual(fence, -1)
+                self.assertGreater(fence, code.rfind(store, 0, atomic))
+            if sem in ("acquire", "acq_rel"):
+                fence = code.find(barrier, atomic)
+                self.assertNotEqual(fence, -1)
+                later = [code.find(access, atomic) for access in (store, load)]
+                self.assertLess(fence, min(i for i in later if i != -1))
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_release_atomic_in_branch(self):
+        """A release atomic inside a branch needs a barrier there; CuTe refuses one."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[128]), static_shapes=True)
+        def release_in_branch(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, flag: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                if flag[0] > 0:
+                    hl.atomic_add(count, [0], 1, sem="release")
+            return out
+
+        x = torch.randn(512, device=DEVICE)
+        count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        flag = torch.ones(1, device=DEVICE, dtype=torch.int32)
+        args = (torch.empty_like(x), x, count, flag)
+        if _get_backend() == "cute":
+            # A CuTe branch condition may differ between threads, and a
+            # block-wide barrier some threads skip deadlocks.
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported, "inside a branch or while loop"
+            ):
+                code_and_output(release_in_branch, args)
+            return
+        code, result = code_and_output(release_in_branch, args)
+        torch.testing.assert_close(result, x * 2.0)
+        self.assertEqual(int(count.item()), 4)
+        self.assertGreater(
+            code.rfind("tl.debug_barrier()", 0, code.index("tl.atomic_add(")), -1
+        )
 
     @skipIfNotTriton("checks the drain of a Triton TMA store before a release")
     @skipIfRocm("Tensor descriptor not supported on ROCm")

@@ -1390,10 +1390,6 @@ class TestMisc(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
-    @skipIfCute(
-        "the threads of the first root race on out inside `if tile_m.begin < m`; "
-        "CuTe cannot place a CTA barrier inside a branch"
-    )
     @onlyBackends(["triton", "cute"])
     def test_device_symint_local_not_lifted_as_host_arg(self):
         """A SymInt local assigned in an earlier root's device code leaks into

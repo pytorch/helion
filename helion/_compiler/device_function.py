@@ -2045,15 +2045,19 @@ class DeviceFunction:
         inputs cannot overlap an external input or a separately allocated
         output.  Two external inputs are disjoint only when the current runtime
         storage spans do not overlap and that predicate is part of the bound
-        kernel cache key.  Origin type alone is insufficient: host-local
+        kernel cache key.  The predicate compares whole storages, so it also
+        covers host-side views (``x.view(...)``) through the input whose
+        storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
         from .cute.memory_ops import runtime_tensors_are_proven_disjoint
 
         env = CompileEnvironment.current()
         host_function = HostFunction.current()
-        input_storages = {id(tensor.untyped_storage()) for tensor in env.input_sources}
-        origins: dict[str, tuple[str, int, bool, torch.Tensor]] = {}
+        input_storages = {
+            id(tensor.untyped_storage()): tensor for tensor in env.input_sources
+        }
+        origins: dict[str, tuple[str, int, torch.Tensor | None]] = {}
         for arg in self.arguments:
             if not isinstance(arg, TensorArg):
                 continue
@@ -2064,33 +2068,24 @@ class DeviceFunction:
                 origins[arg.name] = (
                     root,
                     storage,
-                    storage not in input_storages,
-                    arg.fake_value,
+                    arg.fake_value
+                    if arg.fake_value in env.input_sources
+                    else input_storages.get(storage),
                 )
         return {
             frozenset((left_name, right_name))
-            for left_name, (
-                left_root,
-                left_storage,
-                left_is_fresh,
-                left_tensor,
-            ) in origins.items()
-            for right_name, (
-                right_root,
-                right_storage,
-                right_is_fresh,
-                right_tensor,
-            ) in origins.items()
+            for left_name, (left_root, left_storage, left_input) in origins.items()
+            for right_name, (right_root, right_storage, right_input) in origins.items()
             if left_name < right_name
             and left_root != right_root
             and left_storage != right_storage
             and (
-                left_is_fresh
-                or right_is_fresh
+                left_input is None
+                or right_input is None
                 or runtime_tensors_are_proven_disjoint(
                     env,
-                    left_tensor,
-                    right_tensor,
+                    left_input,
+                    right_input,
                 )
             )
         }
