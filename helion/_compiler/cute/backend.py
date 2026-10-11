@@ -1408,6 +1408,10 @@ class CuteBackend(Backend):
     def supports_eager_prepared_call(self) -> bool:
         return True
 
+    @property
+    def dynamo_captures_kernel_launch(self) -> bool:
+        return False
+
     def validate_environment(self) -> None:
         from .cutedsl_compat import check_cute_backend_requirements
 

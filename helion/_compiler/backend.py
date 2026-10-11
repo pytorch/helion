@@ -221,6 +221,42 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def supports_inductor_fusion(self) -> bool:
+        """Whether generated kernels apply Inductor's prologue/epilogue hooks.
+
+        ``torch.compile`` fusion splices Inductor-generated Triton code into the
+        kernel through ``load_transform``/``store_transform``.  A backend that
+        does not honor those hooks must lower its kernels unfused; otherwise
+        Inductor would drop the fused producers and consumers.
+        """
+        return False
+
+    @property
+    def dynamo_captures_kernel_launch(self) -> bool:
+        """Whether Dynamo may trace a kernel call inline down to its launch.
+
+        On PyTorch builds without Helion's fusion entrypoints, ``torch.compile``
+        traces ``Kernel.__call__`` and the generated host wrapper.  That is how
+        Dynamo captures Triton launches (as user-defined Triton kernels) and
+        where Pallas's compile capture hooks in, so it stays the default.
+        Backends whose launch Dynamo cannot trace return False and are captured
+        as the Helion kernel HOP instead.
+        """
+        return True
+
+    @property
+    def dynamo_inline_capture_loses_view_writes(self) -> bool:
+        """Whether Dynamo's inline capture drops a launch's write through a view.
+
+        A Triton launch is captured as a user-defined Triton kernel, whose
+        functionalization clones a mutated view's base-storage span from the
+        materialized view and so loses the write.  On builds with the template
+        lowering, a call that writes an input through a view is captured as
+        the Helion kernel HOP instead.
+        """
+        return False
+
+    @property
     def max_tensor_numel(self) -> int | None:
         """Per-tile maximum tensor element count enforced during config search.
 

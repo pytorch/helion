@@ -17,10 +17,15 @@ Covers both strategies (``PerThreadNDTileStrategy`` for N-D tiles,
 
 from __future__ import annotations
 
+import unittest
+
 import pytest
 import torch
+from torch._inductor.utils import fresh_cache
+from torch._inductor.utils import run_and_get_code
 
 import helion
+from helion._compat import supports_torch_compile_template_lowering
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -691,8 +696,56 @@ class TestCutePointwiseVec(TestCase):
                     )
                     self.assertTrue(torch.equal(out, reference))
 
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_misaligned_view_under_torch_compile_takes_scalar_loads(self) -> None:
+        """Inductor lowers the kernel against example inputs, which must have
+        the runtime address residue: a view four bf16 elements into an aligned
+        base, a misaligned graph input, and an aligned-looking slice of one are
+        all eight bytes off a packet boundary, and a packet emitted for any of
+        them faults with a misaligned address."""
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
+            ),
+        )
+        def double_bf16(w: torch.Tensor) -> torch.Tensor:
+            k, n = w.shape
+            out = torch.empty((k, n), dtype=torch.bfloat16, device=w.device)
+            for tk, tn in hl.tile((k, n)):
+                out[tk, tn] = w[tk, tn] * 2
+            return out
+
+        packet = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
+        big = torch.randn(64, 144, dtype=torch.bfloat16, device=DEVICE)
+        # (graph input, slice taken inside the graph, packet expected)
+        cases = {
+            "sliced_offset_4": (big, 4, False),
+            "sliced_offset_8": (big, 8, True),
+            "misaligned_input": (big[:, 4:132], 0, False),
+            "aligned_slice_of_misaligned_input": (big[:, 4:], 8, False),
+        }
+        for name, (graph_input, start, expect_packet) in cases.items():
+            with self.subTest(case=name):
+
+                def f(x: torch.Tensor, start: int = start) -> torch.Tensor:
+                    return double_bf16(x[:, start : start + 128]) + 1
+
+                torch._dynamo.reset()
+                with fresh_cache():
+                    out, (code,) = run_and_get_code(
+                        torch.compile(f, fullgraph=True, backend="inductor"),
+                        graph_input,
+                    )
+                self.assertEqual(packet in code, expect_packet)
+                expected = graph_input[:, start : start + 128] * 2 + 1
+                self.assertTrue(torch.equal(out, expected))
+
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
