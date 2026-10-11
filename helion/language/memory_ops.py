@@ -1703,6 +1703,41 @@ def _cute_tile_id_thread_extent_is_complete(
     return 0 <= axis < len(planned) and 0 < planned[axis] <= extent
 
 
+def _cute_arange_index_source(node: object) -> torch.fx.Node | None:
+    """The ``hl.arange`` iota that index ``node`` is computed lane-wise from.
+
+    Pointwise ops on a range (``cols * 2 + 1``) keep its lanes, as
+    ``_padded_iota_dims`` follows them for Triton.
+    """
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if node.target is torch.ops.prims.iota.default:
+        return node
+    value = node.meta.get("val")
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 1
+        or not isinstance(node.target, torch._ops.OpOverload)
+        or torch.Tag.pointwise not in node.target.tags
+    ):
+        return None
+    sources = {
+        _cute_arange_index_source(arg)
+        for arg in node.all_input_nodes
+        if isinstance(arg_value := arg.meta.get("val"), torch.Tensor) and arg_value.ndim
+    }
+    if len(sources) != 1 or (source := sources.pop()) is None:
+        return None
+    source_value = source.meta.get("val")
+    if not isinstance(
+        source_value, torch.Tensor
+    ) or not CompileEnvironment.current().known_equal(
+        source_value.size(0), value.size(0)
+    ):
+        return None
+    return source
+
+
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -1927,6 +1962,25 @@ def _cute_combined_mask(
                     break
         elif isinstance(idx, torch.Tensor):
             added_tensor_index_mask = False
+            # A range lowered onto the reduction axis allocated for its length
+            # (``_cute_iota_expr``) holds that axis' coordinate, and the axis
+            # may launch more lanes than the range has: its mask bounds the
+            # range's position (``hl.arange(1, 6)`` on 8 lanes), where the
+            # address bound below only checks the index value against the
+            # tensor (lanes 5..7 read columns 6..8 into a reduction).
+            fx_node = state.fx_node
+            fx_index = fx_node.args[1] if fx_node is not None else None
+            if (
+                isinstance(fx_index, (list, tuple))
+                and len(fx_index) == len(subscript)
+                and (iota := _cute_arange_index_source(fx_index[pos])) is not None
+                and (block_id := env.resolve_block_id(iota.meta["val"].size(0)))
+                is not None
+                and env.block_sizes[block_id].reduction
+                and (mask_var := mask_var_for_block_id(block_id)) is not None
+                and mask_var not in terms
+            ):
+                terms.append(mask_var)
             # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
             # block id, so the loops below add no bound for it. Emit its lane
             # bound explicitly to mask the out-of-bounds lanes a wider sibling
@@ -2068,16 +2122,25 @@ def _cute_synthetic_arange_lane_bound(
     if not isinstance(idx_node, torch.fx.Node):
         return None
     from .._compiler.cute.iota_utils import cute_free_arange_indexed_dim_key
+    from .._compiler.cute.iota_utils import cute_free_arange_lanes
 
-    dim_key = cute_free_arange_indexed_dim_key(idx_node, cg)
-    if dim_key is None:
-        return None
+    # ``key`` is ``(lane class, length)`` (``_cute_free_arange_axis_expr``) or,
+    # outside the modeled ops, ``(dim_key, length, start, step)``. The bound
+    # masks lanes beyond this arange's own extent, which is its ``length`` --
+    # independent of ``start``/``step`` -- so match on the class or ``dim_key``.
+    root = cute_free_arange_lanes(cg).root(idx_node)
+    if root is not None:
 
-    # ``key`` is ``(dim_key, length, start, step)``. The bound masks lanes beyond
-    # this arange's own extent, which is its ``length`` -- independent of
-    # ``start``/``step`` -- so match purely on ``dim_key``.
-    def _match(key: object) -> bool:
-        return isinstance(key, tuple) and len(key) == 4 and key[0] == dim_key
+        def _match(key: object) -> bool:
+            return isinstance(key, tuple) and len(key) == 2 and key[0] == root
+
+    else:
+        dim_key = cute_free_arange_indexed_dim_key(idx_node, cg)
+        if dim_key is None:
+            return None
+
+        def _match(key: object) -> bool:
+            return isinstance(key, tuple) and len(key) == 4 and key[0] == dim_key
 
     coord = None
     length: object = None

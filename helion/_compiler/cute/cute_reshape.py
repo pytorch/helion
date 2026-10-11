@@ -591,6 +591,13 @@ def _grid_local_coord_expr(
         # layout, vector inner lane, and any CTA slice. Reconstructing these
         # from thread_idx and an outer lane counter loses part of that mapping.
         return f"({strategy.index_var(block_id)}) - ({strategy.offset_var(block_id)})"
+    if (
+        isinstance(strategy, PerThreadFlattenedTileStrategy)
+        and (tile_base := strategy.cute_tile_base_expr(block_id)) is not None
+    ):
+        # A lane-looped single-block flattened tile: likewise, its index holds
+        # the thread, lane and vector-lane partition over the tile base.
+        return f"({strategy.index_var(block_id)}) - ({tile_base})"
 
     coord = f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
     if cg.current_grid_state is None:
@@ -2227,6 +2234,34 @@ def _fx_subscript_dims(
             block_ids.append(None)
         tensor_dim += 1
     return sizes, block_ids
+
+
+def block_size_arange_block_ids(graphs: Sequence[GraphInfo]) -> set[int]:
+    """Block ids whose block size sizes an ``hl.arange`` in ``graphs``.
+
+    Such a range counts positions in a rectangular tile of the block
+    (``hl.arange(tile.block_size)``), which a flattened tile is not, like the
+    other tile attributes that disable flattening (``_disable_flatten_get_tile``).
+    """
+    env = CompileEnvironment.current()
+    block_ids: set[int] = set()
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                torch.ops.prims.iota.default,
+                torch.ops.aten.arange.default,
+            ):
+                continue
+            value = node.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            for size in value.shape:
+                if not isinstance(size, torch.SymInt):
+                    continue
+                for symbol in size.node.expr.free_symbols:
+                    if (block_id := env.get_block_id(symbol)) is not None:
+                        block_ids.add(env.canonical_block_id(block_id))
+    return block_ids
 
 
 def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:

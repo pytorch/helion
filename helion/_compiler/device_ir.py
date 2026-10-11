@@ -4070,7 +4070,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # for multi-loop kernels.  Sorted by block id == declaration order.
         # Not for a kernel that may re-bind a tile dim to another block (a
         # blockwise transpose, a right-aligned lower-rank operand): its
-        # exchange pairs elements within the unflattened per-block tile.
+        # exchange pairs elements within the unflattened per-block tile.  Nor
+        # for a loop whose block size sizes an ``hl.arange``: it counts
+        # positions in a rectangular tile.
         env = CompileEnvironment.current()
         spec = env.config_spec
         if (
@@ -4079,13 +4081,19 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             and not len(spec.flatten_loops)
             and spec.cute_reflatten_candidates
         ):
+            from .cute.cute_reshape import block_size_arange_block_ids
             from .cute.cute_reshape import kernel_may_rebind_block_ids
 
             if not kernel_may_rebind_block_ids(device_ir.graphs):
+                arange_block_ids = block_size_arange_block_ids(device_ir.graphs)
                 for fspec in sorted(
                     spec.cute_reflatten_candidates, key=lambda f: f.block_ids[0]
                 ):
-                    spec.flatten_loops.append(fspec)
+                    if not any(
+                        env.canonical_block_id(block_id) in arange_block_ids
+                        for block_id in fspec.block_ids
+                    ):
+                        spec.flatten_loops.append(fspec)
 
         return device_ir
 

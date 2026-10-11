@@ -92,6 +92,7 @@ from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
 from .indexing import is_cute_unit_stride_iota_index
 from .indexing import match_cute_shifted_tile_index
+from .iota_utils import cute_free_arange_lanes
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -2617,6 +2618,7 @@ def _codegen_cute_store_expand_broadcast_tile(
     # ``out[..., c_store] = val[a, c_load]`` for ``c_load != c_store``).
     load_node = _cute_unsqueeze_expand_load_source(value_node, broadcast_dim)
     load_coords: list[str] | None = None
+    load_subscript_args: tuple[Any, ...] = ()
     load_subscript_proxy: tuple[object, ...] | None = None
     if load_node is not None:
         load_tensor_node = load_node.args[0]
@@ -2657,18 +2659,48 @@ def _codegen_cute_store_expand_broadcast_tile(
     # Re-align each non-broadcast free-``hl.arange`` store position onto the
     # load's matching coordinate. Value dim ``d`` maps to load dim ``d`` before
     # the unsqueezed broadcast dim and ``d - 1`` after it. Only positions where
-    # *both* the store and the matching load entry are free ``hl.arange`` index
-    # tensors are remapped — a tensor *indexer* (``idx[tile]``) keeps its own
-    # coordinate.
+    # *both* the store and the matching load entry are index tensors are
+    # considered.  Dims on one lane (``FreeArangeLanes``) already agree, as do
+    # two tensor indexers on tile axes (``idx[tile]``), and the load's
+    # coordinate addresses the store only when both entries are the same range:
+    # ``hl.arange(4) + 4`` loaded and stored at ``hl.arange(4)`` writes element
+    # ``j`` at ``j``, not at the load's ``j + 4``.
     if load_coords is not None and load_subscript_proxy is not None:
+        assert state.fx_node is not None
+        store_subscript = state.fx_node.args[1]
+        assert isinstance(store_subscript, (list, tuple))
+        lanes = cute_free_arange_lanes(state.codegen)
         for pos, idx in enumerate(subscript):
             if pos == broadcast_dim or not isinstance(idx, torch.Tensor):
                 continue
             load_dim = pos if pos < broadcast_dim else pos - 1
             if not (0 <= load_dim < len(load_coords)):
                 continue
-            if isinstance(load_subscript_proxy[load_dim], torch.Tensor):
-                index_exprs[pos] = load_coords[load_dim]
+            if not isinstance(load_subscript_proxy[load_dim], torch.Tensor):
+                continue
+            load_index = load_subscript_args[load_dim]
+            store_index = store_subscript[pos]
+            if load_index is store_index:
+                continue
+            if isinstance(load_index, torch.fx.Node) and isinstance(
+                store_index, torch.fx.Node
+            ):
+                # Both ``None`` in a modeled kernel: neither entry is an arange.
+                if lanes.complete and lanes.root(load_index) == lanes.root(store_index):
+                    continue
+                if (
+                    load_index.target is torch.ops.prims.iota.default
+                    and store_index.target is torch.ops.prims.iota.default
+                    and load_index.args == store_index.args
+                    and load_index.kwargs == store_index.kwargs
+                ):
+                    index_exprs[pos] = load_coords[load_dim]
+                    continue
+            raise exc.BackendUnsupported(
+                "cute",
+                "a store broadcast across a reused tile whose index tensor "
+                "differs from the loaded value's",
+            )
 
     # Replace the broadcast position's coordinate (currently the reused tile's
     # per-thread global index) with ``block_begin + lane`` so the lane loop sweeps

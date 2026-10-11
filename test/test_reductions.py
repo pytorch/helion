@@ -17,7 +17,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -675,7 +674,6 @@ class TestReductions(RefEagerTestBase, TestCase):
             _code, output = code_and_output(kernel, (x,), block_sizes=[1, 32])
             torch.testing.assert_close(output, tile_means, rtol=1e-4, atol=1e-4)
 
-    @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_sum_keepdims(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -737,7 +735,6 @@ class TestReductions(RefEagerTestBase, TestCase):
                 _, output = code_and_output(reduce_all_kernel, (x, fn), block_size=16)
                 torch.testing.assert_close(output, fn(x).reshape(1))
 
-    @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_reduction_functions(self):
         for reduction_loop in (None, 16):
@@ -1239,7 +1236,6 @@ class TestReductions(RefEagerTestBase, TestCase):
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
 
-    @skipIfNotTriton("tensor_descriptor indexing is Triton-specific")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_layer_norm_nonpow2_reduction(self):
         """Test layer norm with non-power-of-2 reduction dimension (1536)."""

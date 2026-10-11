@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from .cute.bounded_cache_codegen import BoundedCacheRequest
+    from .cute.iota_utils import FreeArangeLanes
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -318,6 +319,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # ``backend.py`` can grow the thread block to cover those lanes.
         self.cute_synthetic_arange_axes: dict[tuple[object, ...], int] = {}
         self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
+        # Positional lane classes of the free ``hl.arange`` dims, the synthetic
+        # axis keys when they cover the kernel (``cute/iota_utils.py``).
+        self.cute_free_arange_lanes: FreeArangeLanes | None = None
         # ``(load/store node, synthetic axis key) -> index position``: one
         # synthetic lane may address only one index dim of a given access.
         self.cute_synthetic_arange_access_positions: dict[
