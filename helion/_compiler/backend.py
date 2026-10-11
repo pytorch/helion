@@ -1157,14 +1157,15 @@ class Backend(abc.ABC):
         """Return the warp count the backend will actually launch."""
         return config.num_warps
 
-    def customize_ast(self, hf: HostFunction) -> None:
+    def customize_ast(self, hf: HostFunction) -> bool:
         """Run backend-specific AST customizations.
 
         Called after static loop unrolling but before type propagation
         and tracing.  Backends can override this to rewrite the user's
         AST for algorithmic transformations that change loop structure.
+        Returns whether the AST was rewritten.
         """
-        return None
+        return False
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Return a backend-owned lowering that must bypass Inductor IR.

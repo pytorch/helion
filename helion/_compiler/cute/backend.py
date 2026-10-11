@@ -1506,7 +1506,7 @@ class CuteBackend(Backend):
             return UniformComparisonLowering()
         return None
 
-    def customize_ast(self, hf: HostFunction) -> None:
+    def customize_ast(self, hf: HostFunction) -> bool:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
         equivalent forms that compile to materially faster code.
 
@@ -1519,7 +1519,7 @@ class CuteBackend(Backend):
         """
         from .online_to_3pass import rewrite_online_to_3pass
 
-        rewrite_online_to_3pass(hf)
+        rewritten = rewrite_online_to_3pass(hf)
         from ..compile_environment import CompileEnvironment
 
         plan = CompileEnvironment.current().cute_fission_plan
@@ -1527,18 +1527,20 @@ class CuteBackend(Backend):
             from .materialized_fission import apply_materialized_fission
 
             apply_materialized_fission(hf, plan)
+            rewritten = True
 
         from .full_slice_matmul import stripmine_full_slice_matmuls
 
-        stripmine_full_slice_matmuls(hf)
+        rewritten |= stripmine_full_slice_matmuls(hf) > 0
 
         from .segmented_matmul import normalize_segmented_matmuls
 
-        normalize_segmented_matmuls(hf)
+        rewritten |= normalize_segmented_matmuls(hf)
 
         from .flatten_nested_reductions import flatten_nested_reductions
 
-        flatten_nested_reductions(hf)
+        rewritten |= flatten_nested_reductions(hf) > 0
+        return rewritten
 
     def pre_codegen(
         self,
@@ -2286,6 +2288,20 @@ class CuteBackend(Backend):
                         a, b, "cute.math.div({a}, {b}, approx=True, ftz=True)"
                     )
                 return CuteDSLOpOverrides.truediv(a, b)
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def sign(x: CuteDSLArg) -> CuteDSLArg:
+                # ``(x > 0) - (x < 0)``: NaN and -0.0 map to +0 like torch.sign.
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                dtype = expected.dtype if expected is not None else torch.float32
+                if dtype == torch.bool:
+                    return x
+                positive = CuteDSLOpOverrides._cast_expr("(({x}) > 0)", dtype)
+                negative = CuteDSLOpOverrides._cast_expr("(({x}) < 0)", dtype)
+                return CuteDSLOpOverrides._apply_unary_op(
+                    x, f"({positive} - {negative})"
+                )
 
             @staticmethod
             def floordiv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:

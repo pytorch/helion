@@ -184,6 +184,14 @@ def cute_minimum_maximum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_sign(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sign(x[tile])
+    return out
+
+
 @helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
@@ -7542,6 +7550,22 @@ class TestCuteBackend(TestCase):
                     )
                 self.assertIn("cute.math.max", code)
                 self.assertIn("cute.math.min", code)
+
+    def test_pointwise_sign(self) -> None:
+        special = torch.tensor([float("nan"), -0.0, 0.0, float("inf"), -float("inf")])
+        cases = (
+            torch.cat([special, torch.randn(27)]).to(DEVICE).view(4, 8),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.bfloat16),
+            torch.randint(-3, 4, (4, 8), device=DEVICE, dtype=torch.int32),
+            torch.rand(4, 8, device=DEVICE) > 0.5,
+        )
+        for x in cases:
+            with self.subTest(dtype=str(x.dtype)):
+                code, out = code_and_output(cute_sign, (x,))
+                # NaN and -0.0 both map to +0, as in torch.sign.
+                torch.testing.assert_close(out, torch.sign(x), rtol=0, atol=0)
+                if x.is_floating_point():
+                    self.assertFalse(torch.signbit(out[out == 0]).any())
 
     def test_rms_norm_uses_native_rsqrt(self) -> None:
         x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)

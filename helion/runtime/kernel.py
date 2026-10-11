@@ -1561,8 +1561,14 @@ class Kernel(Generic[_R]):
             )
         return args
 
-    def _bind_isolated(self, args: tuple[object, ...]) -> BoundKernel[_R]:
-        """Construct a canonical bound without reading or publishing shared caches."""
+    def _bind_isolated(
+        self, args: tuple[object, ...], *, rewrite_ast: bool = True
+    ) -> BoundKernel[_R]:
+        """Construct a canonical bound without reading or publishing shared caches.
+
+        ``rewrite_ast=False`` traces the kernel as written, without the
+        backend's AST customizations.
+        """
         self._validate_structural_policy()
         args = self._validate_bind_args(args)
         args = self.normalize_args(*args)
@@ -1577,6 +1583,7 @@ class Kernel(Generic[_R]):
             base_spec_key=signature,
             is_distributed=is_distributed,
             cache_managed=False,
+            rewrite_ast=rewrite_ast,
         )
 
     def _bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
@@ -2287,6 +2294,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         base_spec_key: tuple[Hashable, ...] | None = None,
         is_distributed: bool | None = None,
         cache_managed: bool = True,
+        rewrite_ast: bool = True,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -2299,6 +2307,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             args: A tuple of arguments to bind to the kernel.
             cache_managed: Whether this bound participates in the kernel's shared
                 specialization and bound caches.
+            rewrite_ast: Whether to apply the backend's AST customizations.
         """
         super().__init__()
         kernel._validate_structural_policy()
@@ -2386,9 +2395,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         if (
-            self.settings.cute_region_fission
-            or self.settings.cute_materialize_transformed_operands
-        ) and self.settings.backend == "cute":
+            rewrite_ast
+            and (
+                self.settings.cute_region_fission
+                or self.settings.cute_materialize_transformed_operands
+            )
+            and self.settings.backend == "cute"
+        ):
             from .._compiler.cute.materialize_operand import (
                 plan_operand_materialization,
             )
@@ -2451,6 +2464,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,
+                        rewrite_ast=rewrite_ast,
                     )
                 except Exception:
                     config = self.env.config_spec.default_config()

@@ -6,15 +6,18 @@ import os
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
-from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRocm
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion.autotuner.effort_profile import _PROFILES
 from helion.autotuner.effort_profile import AutotuneEffortProfile
@@ -34,7 +37,8 @@ for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
 
 
 @skipIfMTIA("autodiff not tested on MTIA")
-@skipIfNotTriton("autodiff not tested on non Triton backends")
+@onlyBackends(["triton", "cute"])
+@skipIfTileIR("autodiff not tested on TileIR")
 @skipIfXPU("autodiff scan-path backward aborts in torch scan-HOP autograd on XPU")
 class TestAutodiff(RefEagerTestDisabled, TestCase):
     def _check_backward(
@@ -375,6 +379,37 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-2,
         )
 
+    def test_unchanged_scan_carry_is_not_written_back(self):
+        # The scan-hop backward of a multi-tile-loop matmul carries grad_out
+        # unchanged (the combine_fn returns a clone of it); the generated
+        # kernel loads the carry each step but must not store it back.
+        @helion.kernel(autotune_effort="none")
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.shape
+            _, n = b.shape
+            out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        helion_code, _ = self._check_backward(
+            kernel,
+            operator.matmul,
+            2,
+            shape=(32, 32),
+            inputs_fn=lambda: [
+                torch.randn(32, 64, device=DEVICE, dtype=torch.float32),
+                torch.randn(64, 32, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        self.assertRegex(helion_code, r"cur_carry_\d+ = carry_\d+\[:, :\]")
+        self.assertNotRegex(helion_code, r"\bcarry_\d+\[:, :\] = ")
+
     def test_single_loop_matmul(self):
         # A matmul fused into a *single* tile loop (the weight `w` is loaded
         # fully). Its backward must tile only `m`, keep `w` whole, and accumulate
@@ -582,6 +617,40 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             1,
             shape=(64, 32),
         )
+
+    def test_softmax_two_pass_backward_takes_forward_block_sizes(self):
+        # CuTe rewrites the online softmax into three passes, so the backward
+        # analyzes a separate bind of the kernel as written; its scan still
+        # takes the forward's 8-wide column chunks, not that bind's defaults.
+        @helion.kernel(config=helion.Config(block_sizes=[16, 8]))
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_size_m = hl.register_block_size(m)
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_size_m):
+                mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                di = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    local_amax = torch.amax(values, dim=1)
+                    mi_next = torch.maximum(mi, local_amax)
+                    di = di * torch.exp(mi - mi_next) + torch.exp(
+                        values - mi_next[:, None]
+                    ).sum(dim=1)
+                    mi = mi_next
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+            return out
+
+        helion_code, _ = self._check_backward(
+            kernel,
+            lambda x: torch.nn.functional.softmax(x, dim=1),
+            1,
+            shape=(64, 32),
+        )
+        self.assertIn("x.view([-1, 4, 8])", helion_code)
 
     def test_sum_reduction_square_shape(self):
         @helion.kernel(autotune_effort="none")
@@ -1176,6 +1245,8 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_shape=(64, 1),
         )
 
+    # A real autotune pass: CuTe compiles each candidate cold (~80s on B200).
+    @pytest.mark.timeout(300)
     @skipIfRocm("backward autotuning times out on ROCm")
     def test_backward_autotune(self):
         @helion.kernel(autotune_effort="none")
@@ -1213,6 +1284,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
                 autotune_effort="quick",
             )
 
+    @skipIfCute(
+        "the scan-hop backward reduces over four full-slice dims at once "
+        "(batch, M, N, K chunk), one more than CuTe's three thread axes"
+    )
     def test_example_bmm(self):
         from examples.bmm import bmm
 
@@ -1308,6 +1383,11 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-5,
         )
 
+    @skipIfCute(
+        "the scan-hop backward's [M, M] gradient product repeats a block id when "
+        "M equals the K chunk; at other M it contracts the computed gradient "
+        "carry, which the CuTe matmul fallbacks cannot re-read"
+    )
     def test_example_matmul_layernorm(self):
         from examples.matmul_layernorm import matmul_layernorm
 
@@ -1329,6 +1409,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-2,
         )
 
+    @skipIfCute(
+        "the scan-hop backward's bmms contract a scaled load (q * scale) and the "
+        "computed gradient carry, which the CuTe matmul fallbacks cannot re-read"
+    )
     def test_example_attention(self):
         from examples.attention import attention
 
@@ -1348,6 +1432,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-2,
         )
 
+    @skipIfCute(
+        "the scan-hop backward's Q K^T bmm reduces head_dim across threads with "
+        "batch, M and the key chunk already on CuTe's three thread axes"
+    )
     def test_example_attention_non_divisible_seqlen(self):
         # Non-block-divisible sequence length: the scan zero-pads the key dim
         # and must re-apply the forward's OOB mask, else the softmax is

@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
     from .._compiler.device_ir import GraphInfo
     from .._compiler.host_function import HostFunction
+    from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
 
 
@@ -2053,6 +2055,8 @@ def _convert_scan_op_bw_to_helion(
         return f"{safe}_{var_counter['v']}"
 
     node_to_var: dict[torch.fx.Node, str] = {}
+    # ys buffer of a single-step (inlined) scan -> the value written to it.
+    inline_ys_values: dict[str, str] = {}
 
     for ph in placeholders:
         if ph.name.startswith("primals_"):
@@ -2078,7 +2082,13 @@ def _convert_scan_op_bw_to_helion(
     # body: device-wrapper interior (one or more scan loops).
     # post_lines: kernel-host code emitted after the wrapper, operating
     # on filled buffers (post-scan reshape + grad_buf assignments).
-    host_lines: list[str] = []
+    # The kernel allocates (and returns) its gradient buffers: a fresh buffer
+    # provably shares no storage with the inputs, so the matmul lowerings may
+    # re-read an input after the kernel stored a gradient.
+    host_lines: list[str] = [
+        f"{indent}{buf} = torch.zeros_like({nm})"
+        for buf, nm in zip(grad_buffer_names, kernel_input_names, strict=True)
+    ]
     body: list[str] = []
     post_lines: list[str] = []
     post_lines_inside: list[str] = []  # must go inside wrapper
@@ -2125,6 +2135,24 @@ def _convert_scan_op_bw_to_helion(
         # so callers can detect and skip updating the corresponding carry or ys.
         out_vars = [sub_node_to_var[r] if r is not None else None for r in rets]
         return sub_lines, out_vars
+
+    def _unchanged_carries(combine_gm: torch.fx.GraphModule, n_carry: int) -> set[int]:
+        """Carry indices the combine_fn returns as themselves (or a copy)."""
+        sub_phs = list(combine_gm.graph.find_nodes(op="placeholder"))
+        sub_out_node = next(n for n in combine_gm.graph.nodes if n.op == "output")
+        rets = sub_out_node.args[0]
+        if not isinstance(rets, (list, tuple)):
+            rets = (rets,)
+        unchanged: set[int] = set()
+        for i, ret in enumerate(rets[:n_carry]):
+            if (
+                isinstance(ret, torch.fx.Node)
+                and ret.target is torch.ops.aten.clone.default
+            ):
+                ret = ret.args[0]
+            if ret is sub_phs[i]:
+                unchanged.add(i)
+        return unchanged
 
     out_args = out_node.args[0]
     if not isinstance(out_args, (list, tuple)):
@@ -2411,7 +2439,11 @@ def _convert_scan_op_bw_to_helion(
                 origin_var = node_to_var[x_node]
                 if scan_idx_expr is None:
                     full_slice_keep = ", ".join([":"] * (len(inner_shape) + 1))
-                    if x_node in device_nodes:
+                    if origin_var in inline_ys_values:
+                        # The single step's ys of an earlier inlined scan: use
+                        # the value instead of reloading the buffer just stored.
+                        v = inline_ys_values[origin_var]
+                    elif x_node in device_nodes:
                         loaded = fresh("xs_load")
                         body.append(
                             f"{inner}{loaded} = {origin_var}[{full_slice_keep}]"
@@ -2475,15 +2507,20 @@ def _convert_scan_op_bw_to_helion(
                     if gi is not None and nv is not None:
                         node_to_var[gi] = nv
             else:
-                for ci, nv, rank, init_node in zip(
-                    carry_vars,
-                    new_carry_vars,
-                    carry_ranks,
-                    init_tuple,
-                    strict=True,
+                unchanged = _unchanged_carries(combine_gm, n_carry)
+                for i, (ci, nv, rank, init_node) in enumerate(
+                    zip(
+                        carry_vars,
+                        new_carry_vars,
+                        carry_ranks,
+                        init_tuple,
+                        strict=True,
+                    )
                 ):
-                    if nv is None:
-                        # None means "no gradient for this carry" — leave ci unchanged.
+                    if nv is None or i in unchanged:
+                        # None means "no gradient for this carry"; an unchanged
+                        # carry would store back the values it loaded.  Either
+                        # way leave ci as is.
                         continue
                     if rank == 0:
                         # Rank-0 (scalar) carries must be updated via subscript
@@ -2518,6 +2555,7 @@ def _convert_scan_op_bw_to_helion(
                         body.append(
                             f"{inner}{buf}[{full_slice}] = {yi_var}.unsqueeze(0)"
                         )
+                        inline_ys_values[buf] = yi_var
                 else:
                     if rank == 0:
                         # Scalar ys buffer can't be indexed by tile.id; skip.
@@ -2670,7 +2708,6 @@ def _convert_scan_op_bw_to_helion(
     ]
     sig_params += list(kernel_input_names)
     sig_params += [f"_init_{i}" for i in range(n_inits)]
-    sig_params += grad_buffer_names
 
     src_lines = [
         '"""',
@@ -2712,7 +2749,9 @@ def _convert_scan_op_bw_to_helion(
         src_lines.extend(body)
         src_lines.extend(post_lines_inside)
         src_lines.extend(post_lines)
-    src_lines.append(f"{indent}return")
+    src_lines.append(
+        f"{indent}return ({''.join(f'{buf}, ' for buf in grad_buffer_names)})"
+    )
     return "\n".join(src_lines)
 
 
@@ -5295,6 +5334,30 @@ def _make_init_tensors(
     return tuple(out)
 
 
+def _analysis_config(bound: BoundKernel, analysis_bound: BoundKernel) -> Config:
+    """The config to trace ``analysis_bound``, ``bound`` without its AST rewrites.
+
+    The backward bakes the forward's block sizes in, and ``backward`` caches it
+    per forward block sizes, so reuse them while the rewrites left the
+    block-size structure alone; a default config would compile one identical
+    backward per forward config.  A changed structure takes the default.
+    """
+    from ..runtime.config import Config
+
+    def structure(kernel_bound: BoundKernel) -> list[tuple[object, ...]]:
+        return [
+            (tuple(spec.block_ids), spec.size_hint, spec.min_size, spec.max_size)
+            for spec in kernel_bound.env.config_spec.block_sizes
+        ]
+
+    default = analysis_bound.env.config_spec.default_config()
+    if bound._config is None or structure(bound) != structure(analysis_bound):
+        return default
+    return Config.from_dict(
+        {**default.config, "block_sizes": list(bound._config.block_sizes)}
+    )
+
+
 def backward(
     kernel: Kernel[object],
     grad_out: torch.Tensor | tuple[torch.Tensor, ...],
@@ -5489,7 +5552,15 @@ def backward(
     if not _cache_hit:
         from .._compiler.device_ir import RootGraphInfo
 
-        host_function = bound.host_function
+        # Differentiate the kernel as written.  Backend AST customizations
+        # (e.g. CuTe's three-pass rewrite of an online softmax) only speed up
+        # the forward, and can add constructs the analysis cannot follow.
+        analysis_bound = bound
+        assert bound.host_function is not None
+        if bound.host_function.backend_rewrote_ast:
+            analysis_bound = kernel._bind_isolated(inputs, rewrite_ast=False)
+            analysis_bound._config = _analysis_config(bound, analysis_bound)
+        host_function = analysis_bound.host_function
         assert host_function is not None
         graphs = host_function.device_ir.graphs
 
@@ -5532,15 +5603,17 @@ def backward(
         ]
         # Build config_block_sizes from both auto-tuned block_ids and
         # fixed/static block sizes (e.g. user-specified chunk_size).
+        analysis_config = analysis_bound._config
+        assert analysis_config is not None
         config_block_sizes: dict[int, int] = {
-            bid: bound._config.block_sizes[
-                bound.env.config_spec.block_sizes.block_id_to_index(bid)
+            bid: analysis_config.block_sizes[
+                analysis_bound.env.config_spec.block_sizes.block_id_to_index(bid)
             ]
-            for bid in bound.env.config_spec.block_sizes.valid_block_ids()
+            for bid in analysis_bound.env.config_spec.block_sizes.valid_block_ids()
         }
         from .._compiler.compile_environment import FixedBlockSizeSource
 
-        for bs_info in bound.env.block_sizes:
+        for bs_info in analysis_bound.env.block_sizes:
             if bs_info.block_id not in config_block_sizes and isinstance(
                 bs_info.block_size_source, FixedBlockSizeSource
             ):
@@ -5823,7 +5896,6 @@ def backward(
                 *grad_outs,
                 *converter_inputs,
                 *_make_init_tensors(cached_init_specs, tensor_inputs),
-                *(torch.zeros_like(t) for t in converter_inputs),
             )
         else:
             bwd_args = (*grad_outs, *converter_inputs)
@@ -5880,12 +5952,10 @@ def backward(
         hf,
     )
     if is_scan_hop:
-        grad_buffers = tuple(torch.zeros_like(t) for t in rt_inputs)
-        bwd_fn(  # pyrefly: ignore [not-callable]
+        grad_buffers = bwd_fn(  # pyrefly: ignore [not-callable]
             *grad_outs,
             *rt_inputs,
             *_make_init_tensors(cached_init_specs, tensor_inputs),
-            *grad_buffers,
         )
         derivation_map = _extract_derivation_map(hf)
         final_grads: list[torch.Tensor] = [torch.zeros_like(t) for t in tensor_inputs]
