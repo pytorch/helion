@@ -111,8 +111,6 @@ def cute_masked_block_end(codegen: GenerateAST, block_id: int, what: str) -> str
             "cute", f"{what} along a masked dim without a logical tile owner"
         )
     if isinstance(owner, DeviceGridState):
-        # A root grid's ``end_expr`` is its extent past ``begin``; the index
-        # runs up to the absolute end.
         if info.grid_end_expr is None:
             raise exc.BackendUnsupported(
                 "cute", f"{what} along a grid dim without a logical tile end"
