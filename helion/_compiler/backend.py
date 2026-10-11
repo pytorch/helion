@@ -1022,6 +1022,19 @@ class Backend(abc.ABC):
         """
         return None
 
+    def scalar_float_operand_ast(
+        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+    ) -> ast.AST:
+        """``x`` computes ``value``, a SymFloat operand (a Python-float host
+        scalar) of an Inductor op.
+
+        The op computes with it as a float32 scalar, as torch rounds such a
+        scalar to float32 (also the opmath of fp16/bf16 math, see
+        ``opmath_scalar_dtype``) unless the op's math is float64.  Backends
+        whose emitted scalar can carry another type cast it here.
+        """
+        return x
+
     def cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         """Cast a plain scalar (e.g. a bare number lifted from an index expr) to
         ``target_dtype``.

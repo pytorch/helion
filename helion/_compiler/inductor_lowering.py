@@ -152,6 +152,54 @@ def _functional_twins() -> dict[OpOverload, OpOverload]:
     return twins
 
 
+# Torch computes these with a Python scalar operand at the op's opmath dtype
+# (float32 for fp16/bf16 math) instead of rounding the scalar to the op's
+# dtype first, as it does for comparisons, ``where``, ``pow`` and friends.
+_OPMATH_SCALAR_TARGETS = {
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.div.Tensor,
+}
+
+
+def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
+    """The fp16/bf16 dtype of ``node`` when it combines a SymFloat or SymInt
+    (a Python host scalar) with 16-bit tensors and torch computes it at
+    float32 opmath, otherwise None.
+
+    Such a node keeps the scalar at float32 and rounds its result to this
+    dtype, as a static-shape literal scalar does.
+    """
+    if node.target not in _OPMATH_SCALAR_TARGETS or not any(
+        isinstance(arg, Node)
+        and isinstance(arg.meta["val"], (torch.SymFloat, torch.SymInt))
+        for arg in node.args
+    ):
+        return None
+    tensors = InductorLowering.input_fake_tensors(node)
+    if not tensors:
+        return None
+    dtype = functools.reduce(torch.promote_types, [t.dtype for t in tensors])
+    if dtype not in (torch.float16, torch.bfloat16):
+        return None
+    return dtype
+
+
+def _rounded_result_dtype(node: Node) -> torch.dtype | None:
+    """The 16-bit dtype ``node``'s float32 result is rounded to, as eager
+    rounds it before the next op, or None to leave it as computed."""
+    if (dtype := opmath_scalar_dtype(node)) is not None:
+        # The float32 scalar promoted the math to float32.
+        return dtype
+    if node.target is torch.ops.aten.reciprocal.default:
+        # Lowered as 1.0 / x with a float32 1.0.
+        dtype = node.meta["val"].dtype
+        if dtype in (torch.float16, torch.bfloat16):
+            return dtype
+    return None
+
+
 def prepare_node_lowering(
     graph_lowering: GraphLowering,
     node: Node,
@@ -193,6 +241,7 @@ def prepare_node_lowering(
 
     # Track arguments to reuse names for duplicates
     arg_to_name: dict[Node, str] = {}
+    opmath_dtype = opmath_scalar_dtype(node)
 
     def convert_arg(arg: Node) -> TensorBox:
         example = arg.meta["val"]
@@ -211,6 +260,13 @@ def prepare_node_lowering(
                 torch.SymFloat: torch.float32,
                 torch.SymBool: torch.bool,
             }[type(example)]
+            if (
+                isinstance(example, (torch.SymFloat, torch.SymInt))
+                and opmath_dtype is not None
+            ):
+                # Typed as the op's dtype, promotion leaves it unrounded; the
+                # kernel value is float32 (see opmath_scalar_dtype).
+                dtype = opmath_dtype
             input_layouts[name] = ([], [])
             result = TensorBox.create(
                 InputBuffer(
@@ -459,6 +515,13 @@ class InductorLowering(Lowering):
                             "{tensor}[" + ", ".join(expand) + "]",
                             tensor=ast_val,
                         )
+            elif isinstance(fake_val, torch.SymFloat):
+                ast_val = backend.scalar_float_operand_ast(
+                    ast_val, fake_val, computes_in_float64=computes_in_float64
+                )
+            elif isinstance(fake_val, torch.SymInt) and opmath_dtype is not None:
+                # An integer would take the 16-bit operand's type.
+                ast_val = backend.cast_ast(ast_val, torch.float32)
             if (
                 isinstance(ast_val, ast.Name)
                 and ast_val.id in device_function._constexpr_args
@@ -476,10 +539,18 @@ class InductorLowering(Lowering):
 
         device_function: DeviceFunction = ctx.cg.device_function
         tile_strategy = device_function.tile_strategy
+        backend = CompileEnvironment.current().backend
         output_shape: tuple[int | torch.SymInt, ...] = tuple(
             map(to_symint, self.buffer.get_size())
         )
         ndim: int = len(output_shape)
+        # A SymFloat input is a float32 0-d tensor (see ``convert_arg``),
+        # which promotes to float64 alongside a float64 tensor.
+        computes_in_float64 = any(
+            isinstance(val, torch.Tensor) and val.dtype == torch.float64
+            for val in (node.meta["val"], *self.input_fake_tensors(node))
+        )
+        opmath_dtype = opmath_scalar_dtype(node)
         input_asts: list[ast.AST] = []
         # _extra_deps should not be included in the inductor node inputs
         map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
@@ -573,6 +644,8 @@ class PointwiseLowering(InductorLowering):
         ):
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
+        if (dtype := _rounded_result_dtype(node)) is not None:
+            result = CompileEnvironment.current().backend.cast_ast(result, dtype)
 
         return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
 
@@ -1487,6 +1560,10 @@ class GenerateASTFromInductor(DefaultHandler):
     def abs(self, x: object) -> str:  # type: ignore[override]
         if CompileEnvironment.current().backend_name != "cute":
             return self._default("abs", (x,), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None and not dtype.is_signed:
+            # The DSL's abs reads an unsigned value as signed.
+            return _unpack_opsvalue(x)
         return self._lift(expr_from_string("abs({x})", x=self._to_ast(x)))
 
     def maximum(self, a: object, b: object) -> str:  # type: ignore[override]

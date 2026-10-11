@@ -44,6 +44,7 @@ from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
 from .licm_profitability import repeated_work_is_profitable
+from .scalar_recipe import PURE_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -137,6 +138,7 @@ _UNIFORM_GLOBAL_NAMES = {
     "min",
     "operator",
     "range",
+    *PURE_HELPERS,
 }
 
 
@@ -365,7 +367,7 @@ def _is_allowed_pure_call(call: ast.Call) -> bool:
             and not call.args
             and not call.keywords
         )
-    if path in {"abs", "max", "min", "range"}:
+    if path in {"abs", "max", "min", "range"} or path in PURE_HELPERS:
         return True
     if path in _PURE_OPERATOR_CALLS or path in _PURE_CUTLASS_CALLS:
         return True

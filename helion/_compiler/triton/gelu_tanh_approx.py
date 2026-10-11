@@ -15,8 +15,8 @@ from torch._inductor.utils import triton_type
 
 from ...language import _decorators
 from ...language._gelu_tanh_approx import GELU_ERF_INV_SQRT2
+from ...language._gelu_tanh_approx import GELU_TANH_APPROX_CUBIC
 from ...language._gelu_tanh_approx import GELU_TANH_APPROX_KAPPA
-from ...language._gelu_tanh_approx import GELU_TANH_APPROX_LAMBDA
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ..ast_extension import expr_from_string
@@ -37,8 +37,8 @@ if TYPE_CHECKING:
 # (``inductor_lowering_extra.FP32_FALLBACK_OPS_UNARY``). For fp32
 # inputs the codegen treats ``{x32}`` and ``{x}`` as the same local.
 _GELU_TANH_APPROX_EXPR_TRITON = (
-    f"(0.5 * ({{x}}) * (1.0 + libdevice.tanh(({{x32}}) * ({GELU_TANH_APPROX_KAPPA!r}"
-    f" + {GELU_TANH_APPROX_LAMBDA!r} * ({{x32}}) * ({{x32}})))))"
+    f"(0.5 * ({{x}}) * (1.0 + libdevice.tanh({GELU_TANH_APPROX_KAPPA!r} * (({{x32}})"
+    f" + {GELU_TANH_APPROX_CUBIC!r} * (({{x32}}) * ({{x32}}) * ({{x32}}))))))"
 )
 _GELU_ERF_EXPR_TRITON = (
     f"(0.5 * ({{x}}) * (1.0 + libdevice.erf(({{x32}}) * {GELU_ERF_INV_SQRT2!r})))"
@@ -47,10 +47,10 @@ _GELU_ERF_EXPR_TRITON = (
 
 @_decorators.codegen(_gelu_tanh_approx, "triton")
 def _(state: CodegenState) -> ast.AST:
-    # Lift the input to a local so the four ``{x}`` references all
-    # bind to the same Triton SSA name; without the lift, the
-    # rendered expression would textually duplicate the inbound
-    # expression four times (Triton compile-time CSE handles the
+    # Lift the input to a local so the five ``{x}`` / ``{x32}``
+    # references all bind to the same Triton SSA name; without the lift,
+    # the rendered expression would textually duplicate the inbound
+    # expression five times (Triton compile-time CSE handles the
     # values, but generated source size grows quadratically with
     # chain depth, which we explicitly avoid in cute_epilogue.py too).
     input_ast = state.codegen.lift(

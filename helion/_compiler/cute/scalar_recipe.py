@@ -47,9 +47,12 @@ _MATH_CALLS = frozenset(
     {
         "absf",
         "acos",
+        "acosh",
         "asin",
+        "asinh",
         "atan",
         "atan2",
+        "atanh",
         "ceil",
         "copysign",
         "cos",
@@ -75,6 +78,7 @@ _MATH_CALLS = frozenset(
         "min",
         "pow",
         "rcp",
+        "roundeven",
         "rsqrt",
         "sin",
         "sinh",
@@ -136,9 +140,14 @@ PURE_DECODE_HELPERS = frozenset(
     }
 )
 # Every pure helper generated code may call: the decode helpers, Python's
-# modulo and the trace-time numeric conversion at a dynamic if-join
-# (``join_cast.py``).  Shared with ``tile_strategy``'s relocation proofs.
-PURE_HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod", "_cute_join_cast"}
+# modulo, the trace-time numeric conversion at a dynamic if-join
+# (``join_cast.py``) and the bitwise copysign (``copysign.py``).  Shared with
+# ``tile_strategy``'s relocation proofs.
+PURE_HELPERS = PURE_DECODE_HELPERS | {
+    "_cute_copysign",
+    "_cute_join_cast",
+    "_cute_python_mod",
+}
 # ``_cute_inline_asm_elementwise`` enters a recipe only as the rounded FP32
 # product ``is_rounded_fp32_multiply`` recognizes (``_PureExpression.visit_Call``).
 _GLOBALS = (

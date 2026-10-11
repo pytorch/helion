@@ -18,6 +18,8 @@ from typing import Sequence
 
 import sympy
 import torch
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type
 
 from ... import exc
 from ..backend import Backend
@@ -64,6 +66,9 @@ if TYPE_CHECKING:
     from .attention_plan import AttentionScorePlan
 
     InductorOpOverrides = OpsHandler[Any]
+
+# Integer dtypes narrower than the Int32 the DSL gives a Python int.
+_NARROW_INTEGER_DTYPES = (torch.int8, torch.int16, torch.uint8)
 
 
 def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
@@ -2083,6 +2088,7 @@ class CuteBackend(Backend):
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_join_cast": "from helion._compiler.cute.join_cast import join_cast as _cute_join_cast",
+            "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
         }
@@ -2094,6 +2100,9 @@ class CuteBackend(Backend):
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLArg
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
             CuteDSLOpOverrides,
+        )
+        from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+            upcast_compute_type,
         )
 
         class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
@@ -2133,13 +2142,34 @@ class CuteBackend(Backend):
                     return CuteDSLOpOverrides._apply_unary_op(
                         x, "cute.math.exp2({x}, fastmath=True)"
                     )
-                return CuteDSLOpOverrides.exp2(x)
+                # Not Inductor's exp(x * ln2) decomposition: rounding x * ln2
+                # and then (x * ln2) * log2(e) in exp costs 2-3 ulp.
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.exp2({x})")
 
             @staticmethod
             def _fastmath_on() -> bool:
                 from ..compile_environment import CompileEnvironment
 
                 return CompileEnvironment.current().settings.fast_math
+
+            @staticmethod
+            def constant(value: bool | float, dtype: torch.dtype) -> str:
+                from ..inductor_lowering_extra import keeps_negative_nan_literal
+
+                # The DSL types a Python int as Int32, which widens 8- and
+                # 16-bit integer math so it never wraps, and takes a negative
+                # one as signed next to an unsigned value.  Eager converts the
+                # scalar to the tensor's dtype, wrapping it (x_uint8 % -7
+                # divides by 249).
+                if isinstance(value, int) and dtype in _NARROW_INTEGER_DTYPES:
+                    bits = torch.iinfo(dtype).bits
+                    value &= (1 << bits) - 1
+                    if dtype.is_signed and value >= 1 << (bits - 1):
+                        value -= 1 << bits
+                    return CuteDSLOpOverrides._cast_expr(repr(value), dtype)
+                if keeps_negative_nan_literal(value):
+                    return "-float('nan')"
+                return CuteDSLOpOverrides.constant(value, dtype)
 
             @staticmethod
             def mul(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
@@ -2220,6 +2250,31 @@ class CuteBackend(Backend):
                 return HelionCuteDSLOpOverrides._unary_math(x, "atan")
 
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def sinh(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "sinh")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def cosh(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "cosh")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def asinh(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "asinh")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def acosh(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "acosh")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def atanh(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "atanh")
+
+            @staticmethod
             def atan2(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
                 suffix = (
                     ", fastmath=True" if HelionCuteDSLOpOverrides._fastmath_on() else ""
@@ -2229,8 +2284,70 @@ class CuteBackend(Backend):
                 )
 
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def copysign(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                # Both operands take the compute type: a Python number
+                # operand is untyped.
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                result_dtype = expected.dtype if expected is not None else None
+                dtype = upcast_compute_type(result_dtype or torch.float32)
+                mag = CuteDSLOpOverrides._cast_expr("{a}", dtype)
+                sign = CuteDSLOpOverrides._cast_expr("{b}", dtype)
+                # cute.math.copysign gives a NaN magnitude the canonical
+                # positive NaN, which is what eager's rounding of a 16-bit
+                # result gives; at fp32/fp64 eager keeps the copied sign.
+                function = (
+                    "cute.math.copysign"
+                    if result_dtype in (torch.float16, torch.bfloat16)
+                    else "_cute_copysign"
+                )
+                return CuteDSLOpOverrides._apply_binary_op(
+                    a, b, f"{function}({mag}, {sign})"
+                )
+
+            @staticmethod
             def erf(x: CuteDSLArg) -> CuteDSLArg:
                 return HelionCuteDSLOpOverrides._unary_math(x, "erf")
+
+            # Inductor decomposes erfc, expm1 and log1p into 1 - erf(x),
+            # exp(x) - 1 and log(1 + x), which cancel catastrophically for
+            # large x (erfc) and for x near 0 (expm1, log1p).
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def erfc(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "erfc")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def expm1(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "expm1")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def log1p(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log1p")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def floor(x: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.floor({x})")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def ceil(x: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.ceil({x})")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def trunc(x: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.trunc({x})")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def round(x: CuteDSLArg) -> CuteDSLArg:
+                # torch.round rounds half to even (libdevice.nearbyint in triton).
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.roundeven({x})")
 
             @staticmethod
             def tanh(x0: CuteDSLArg) -> CuteDSLArg:
@@ -2308,12 +2425,62 @@ class CuteBackend(Backend):
                 )
 
             @staticmethod
+            def _nonzero_divisor(b: CuteDSLArg) -> CuteDSLArg:
+                # Integer division by zero is undefined behavior, and a
+                # masked-off lane's divisor is its load's zero fill: the
+                # compiler then drops the masks on that lane's loads and
+                # stores, which write out of bounds.  Divide such a lane by
+                # one (eager leaves a zero integer divisor undefined on CUDA).
+                from torch._inductor.virtualized import V
+
+                from ..compile_environment import CompileEnvironment
+
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if expected is None or expected.dtype.is_floating_point:
+                    return b
+                # A provably nonzero divisor (``x // 2``, ``tile.index %
+                # tile.block_size``) needs no guard.
+                args = V.current_node.args
+                divisor = args[1] if len(args) > 1 else None
+                if isinstance(divisor, torch.fx.Node):
+                    divisor = divisor.meta.get("val")
+                if type(divisor) is int and divisor != 0:
+                    return b
+                env = CompileEnvironment.current()
+                if isinstance(divisor, torch.SymInt) and env.known_nonnegative(
+                    sympy.Add(divisor._sympy_(), -1)
+                ):
+                    return b
+                # The divisor's DSL type can differ from the FX dtype (index
+                # math on Int64 shape arguments).
+                return CuteDSLOpOverrides._apply_unary_op(
+                    b, "(({x}) if ({x}) != 0 else _cute_join_cast(1, {x}))"
+                )
+
+            @staticmethod
             def floordiv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                b = HelionCuteDSLOpOverrides._nonzero_divisor(b)
                 return CuteDSLOpOverrides._apply_binary_op(a, b, "(({a}) // ({b}))")
 
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def truncdiv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                # The DSL's integer // floors; a minus its C remainder is an
+                # exact multiple of b, which floors and truncates alike.
+                from torch._inductor.virtualized import ops
+
+                return ops.floordiv(ops.sub(a, ops.mod(a, b)), b)
+
+            @staticmethod
             def mod(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                b = HelionCuteDSLOpOverrides._nonzero_divisor(b)
                 return CuteDSLOpOverrides._apply_binary_op(a, b, "(({a}) % ({b}))")
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def fmod(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                # CuTe DSL's % truncates like C: the result takes a's sign.
+                return HelionCuteDSLOpOverrides.mod(a, b)
 
             @staticmethod
             def remainder(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
@@ -2326,12 +2493,23 @@ class CuteBackend(Backend):
                     # TensorIterator first converts wrapped scalar operands to
                     # the logical promoted tensor dtype. Keep this distinct
                     # from scalar PythonMod's ordinary Python/SDK promotion.
+                    b = HelionCuteDSLOpOverrides._nonzero_divisor(b)
                     left = CuteDSLOpOverrides._cast_expr("{a}", expected.dtype)
                     right = CuteDSLOpOverrides._cast_expr("{b}", expected.dtype)
                     return CuteDSLOpOverrides._apply_binary_op(
                         a, b, f"_cute_python_mod({left}, {right})"
                     )
-                return HelionCuteDSLOpOverrides.mod(a, b)
+                # A float remainder is Python-style too: a nonzero C remainder
+                # whose sign differs from the divisor's moves by one divisor.
+                from torch._inductor.virtualized import ops
+
+                result = ops.mod(a, b)
+                zero = ops.constant(0, torch.int32)
+                wrong_sign = ops.logical_and(
+                    ops.ne(result, zero),
+                    ops.ne(ops.lt(result, zero), ops.lt(b, zero)),
+                )
+                return ops.where(wrong_sign, ops.add(result, b), result)
 
             @staticmethod
             def where(
@@ -2369,6 +2547,22 @@ class CuteBackend(Backend):
                 ):
                     return x
         return super().cast_ast(x, target_dtype)
+
+    def scalar_float_operand_ast(
+        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+    ) -> ast.AST:
+        # The DSL types a Python float combined with an Int as Float64
+        # (``n + 0.0`` for ``ToFloat(n)``), which would turn the op's float32
+        # math, and any loop carry it feeds, into Float64.  Float kernel
+        # arguments are Float32 (see the launcher), and so is an expression
+        # of only them and constants.
+        float_symbols = (SymT.FLOAT, SymT.UNBACKED_FLOAT)
+        if computes_in_float64 or all(
+            symbol_is_type(symbol, float_symbols)
+            for symbol in value._sympy_().free_symbols
+        ):
+            return x
+        return self.cast_ast(x, torch.float32)
 
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         # ``sem_arg`` is a TensorArg that arrives as a ``cute.Tensor``; its
