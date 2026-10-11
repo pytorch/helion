@@ -1182,6 +1182,17 @@ class PersistentReductionStrategy(ReductionStrategy):
                 "persistent reduction's thread layout is fixed at codegen from "
                 "the bound value and would not follow the argument",
             )
+        extent = numel._sympy_() if isinstance(numel, torch.SymInt) else numel
+        hint_bucket: int | None = None
+        if (
+            env.backend.name == "cute"
+            and isinstance(extent, sympy.Expr)
+            and extent.free_symbols
+        ):
+            # The same layout follows a dynamic tensor size only within the
+            # hint's power-of-2 bucket; the bound kernel keys that bucket.
+            env.cute_hint_sized_reduction_extents.add(extent)
+            hint_bucket = next_power_of_2(size_hint)
         # Skip the mask when RDIM_SIZE == numel (no padding needed).
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
@@ -1200,6 +1211,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             mask_var=mask_var,
             block_size_var=fn.new_var(f"_RDIM_SIZE_{block_index}"),
         )
+        self._cute_hint_bucket = hint_bucket
         self.offset_vars[block_index] = "0"
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
@@ -1522,6 +1534,26 @@ class PersistentReductionStrategy(ReductionStrategy):
                         f"{block_size_var} = {backend.dynamic_rdim_size_expr(expr_str)}"
                     )
                     state.codegen.host_statements.append(stmt)
+                    if (bucket := self._cute_hint_bucket) is not None:
+                        # The bound kernel keys this bucket, but a compiled
+                        # config called directly at another size bypasses
+                        # the key.  The layout spans the whole bucket and the
+                        # dynamic extent is always masked (needs_mask), so a
+                        # smaller extent runs exactly; a larger one would
+                        # leave the rest of the dim uncovered.
+                        message = (
+                            f"CuTe kernel compiled for {expr_str} in the "
+                            f"power-of-2 bucket {bucket}: a config compiled at "
+                            "one size cannot run a larger bucket; call the "
+                            "Kernel itself (not the compiled config) so it "
+                            "rebinds"
+                        )
+                        state.codegen.host_statements.append(
+                            statement_from_string(
+                                f"if {block_size_var} > {bucket}:\n"
+                                f"    raise RuntimeError({message!r})"
+                            )
+                        )
         current_grid = state.codegen.current_grid_state
         synthetic_lane_var = self._synthetic_cute_lane_var
         if synthetic_lane_var is not None and current_grid is not None:

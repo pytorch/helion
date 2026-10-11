@@ -459,6 +459,10 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        # Dynamic reduction extents whose CuTe persistent thread layout was
+        # sized from the size hint; the bound kernel keys their power-of-2
+        # bucket once code generation has used one.
+        self.cute_hint_sized_reduction_extents: set[sympy.Expr] = set()
         self.cute_fission_plan: MaterializedFissionPlan | None = None
         self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
         # Internal stage compilers may inherit a proved TensorMap-aligned view
@@ -1480,9 +1484,11 @@ class CompileEnvironment:
             # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
             # causes Inductor to see reduction_numel==1 and skip the reduction
             # instead of generating a masked reduction that yields the identity value.
-            # Use hint=2 in that case so the reduction is preserved.
+            # Use hint=2 in that case so the reduction is preserved (and a dynamic
+            # empty extent does not guard its block to 1).  Test the hint: a
+            # symbolic ``size == 0`` is statically False.
             hint=2
-            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
+            if self.size_hint(size) == 0
             else next_power_of_2(self.size_hint(size)),
             reuse_var=reuse_var,
         )
@@ -1907,6 +1913,40 @@ class CompileEnvironment:
                 return False
             return bool(res)
         return a == b
+
+    def resolve_broadcast_dim(
+        self,
+        size: int | torch.SymInt,
+        block_id: int,
+        offset: int | torch.SymInt = 0,
+    ) -> None:
+        """Settle whether a tensor dim indexed by block ``block_id`` is size 1.
+
+        Indexing a size-1 dim with a tile over a larger extent broadcasts.  A
+        dynamic size is compared with 1 under a guard unless it provably
+        covers the tile's extent plus ``offset``: at size 1 such a tile is at
+        most one wide there, where indexing equals broadcasting, so the
+        tile's own dim (``x[tile]`` over ``x.size()``) records no guard.  A
+        true comparison replaces the symbol by 1, which later
+        ``known_equal(size, 1)`` checks see, and either outcome's guard,
+        recorded during code generation, keys the bound kernel.
+        """
+        if not isinstance(size, torch.SymInt) or self.known_equal(size, 1):
+            return
+        if any(
+            self.get_block_id(symbol) is not None
+            for symbol in _to_sympy(size).free_symbols
+        ):
+            # A size computed from block sizes (``cdiv(n, block)`` partials)
+            # is fixed by the config, not by the inputs: a guard would settle
+            # it for whichever config compiled first.
+            return
+        extent = self.block_sizes[self.canonical_block_id(block_id)].size
+        if isinstance(extent, (int, torch.SymInt)) and self.known_nonnegative(
+            _to_sympy(size - extent - offset)
+        ):
+            return
+        bool(size == 1)
 
     def known_nonnegative(self, expression: sympy.Expr) -> bool:
         """Prove ``expression >= 0`` without adding a specialization guard."""

@@ -337,6 +337,11 @@ class TritonBackend(Backend):
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"triton.next_power_of_2({expr})"
 
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        # As in static_rdim_size: an empty axis still needs a length-1 block,
+        # and triton.next_power_of_2(0) is 0.
+        return f"max({self.next_power_of_2_host_expr(expr)}, 1)"
+
     @property
     def function_decorator(self) -> str:
         return "triton.jit"

@@ -46,6 +46,7 @@ from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import MultiShapeBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
+from .benchmark_provider import _searching_candidates
 from .benchmark_provider import _unset_fn
 from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import MirroredBenchmarkTrace
@@ -952,12 +953,15 @@ class BaseSearch(BaseAutotuner):
 
     def _autotune_with_logging(self, *, skip_cache: bool) -> Config:
         self._skip_cache = skip_cache
-        self._prepare()
+        # Constructing the benchmark provider compiles the reference baseline.
+        with _searching_candidates():
+            self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         best: Config | None = None
         try:
             with exit_stack:
+                exit_stack.enter_context(_searching_candidates())
                 if self.settings.autotune_log:
                     # .csv/.log follow the log path; the dataset (.meta.jsonl) also
                     # needs opt-in and a representative (non-restricted) search.

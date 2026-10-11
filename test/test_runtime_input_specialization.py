@@ -346,7 +346,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         bound._runtime_tensor_refs_by_name = {"value": weakref.ref(value)}
         bound._normalize_config = lambda config: config
         bound.format_kernel_decorator = lambda _config, _settings: "test"
-        bound.kernel = SimpleNamespace(settings=SimpleNamespace())
+        bound.kernel = SimpleNamespace(settings=SimpleNamespace(backend="triton"))
         observed: list[bool] = []
 
         def compile_config(_config: object) -> object:

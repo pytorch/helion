@@ -59,7 +59,9 @@ from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZ
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
+from .._compiler.compile_environment import _replay_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
+from .._compiler.compile_environment import shape_env_var_hints
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
@@ -74,13 +76,16 @@ from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
+from .._compiler.variable_origin import BlockSizeOrigin
 from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
 from .._dist_utils import kernel_declares_process_group
 from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
+from .._utils import next_power_of_2
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.benchmark_provider import _SEARCHING_CANDIDATES
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .cute_structural_config import DEFAULT_STRUCTURAL_POLICY
@@ -939,6 +944,7 @@ class Kernel(Generic[_R]):
         self._cute_grouped_static_tail_extra_descriptors: dict[
             Hashable, set[Hashable]
         ] = {}
+        self._cute_reduction_extent_descriptors: dict[Hashable, set[Hashable]] = {}
         if any(
             param.kind
             in (
@@ -1266,6 +1272,60 @@ class Kernel(Generic[_R]):
                 bound_kernel._cache_path_map.clear()
             return True
 
+    def _publish_guard_facts(
+        self,
+        bound_kernel: BoundKernel,
+        facts: Sequence[_PreparedMetadataSpecializationExtractor],
+    ) -> None:
+        """Append guard facts to a signature's dispatch schema.
+
+        A guard fact evaluates at any cached bound's bind-time hints, so every
+        bound of the signature (the publishing one included) is re-keyed in
+        place rather than evicted, and no runtime arguments are needed: code
+        generation can publish too.
+        """
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
+        signature = bound_kernel._base_spec_key
+        with self._bind_lock, self._specialize_extra_lock:
+            if bound_kernel._reset_generation != self._reset_generation:
+                return
+            published = self._specialize_extra.get(signature, [])
+            new_facts = [fact for fact in facts if fact not in published]
+            if not new_facts:
+                return
+            for key, bound in list(self._bound_kernels.items()):
+                if key.specialization_key not in (
+                    signature,
+                    *(
+                        alias_signature
+                        for alias_signature, alias in self._specialization_aliases.items()
+                        if alias.canonical_signature == signature
+                    ),
+                ):
+                    continue
+                del self._bound_kernels[key]
+                # Alias keys pack the canonical results; let them rebind.
+                if (
+                    key.specialization_key == signature
+                    and (results := _bound_guarded_input_facts(bound, new_facts))
+                    is not None
+                ):
+                    self._bound_kernels[
+                        BoundKernelInMemoryCacheKey(
+                            signature,
+                            (*key.extra_results, *results),
+                            compiler_seed_results=key.compiler_seed_results,
+                        )
+                    ] = bound
+            self._specialize_extra[signature] = [*published, *new_facts]
+            self._has_specialization_extras = True
+            self._specialization_generation += 1
+            for fast_key, cached_bound in list(self._dispatch_cache.items()):
+                if cached_bound._base_spec_key == signature:
+                    del self._dispatch_cache[fast_key]
+            self._prepared_call = None
+
     def _compute_is_distributed(
         self,
         args: Sequence[object],
@@ -1534,6 +1594,7 @@ class Kernel(Generic[_R]):
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
             )
+            created = False
             if bound_kernel is None:
                 normalized_args: tuple[object, ...] = self.normalize_args(*args)
                 extra_fns: list[Callable[[Sequence[object]], Hashable]] | None = None
@@ -1562,6 +1623,7 @@ class Kernel(Generic[_R]):
                         base_spec_key=signature,
                         is_distributed=is_distributed,
                     )
+                    created = True
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel,
@@ -1580,6 +1642,9 @@ class Kernel(Generic[_R]):
                             cache_key.extra_results,
                         )
                 self._bound_kernels[cache_key] = bound_kernel
+                if created:
+                    # Key the input-shape guards this compile recorded.
+                    bound_kernel._publish_guarded_input_facts()
             return bound_kernel
 
     def _base_specialization_key(
@@ -2185,6 +2250,7 @@ class Kernel(Generic[_R]):
                 self._compiler_seed_specialize_extra = {}
                 self._specialization_aliases = {}
                 self._cute_grouped_static_tail_extra_descriptors = {}
+                self._cute_reduction_extent_descriptors = {}
                 self._has_specialization_extras = False
                 self._specialization_generation += 1
                 self._reset_generation += 1
@@ -2282,6 +2348,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             tuple[Hashable | None, ...],
         ] = {}
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        # Shape guards recorded past this index come from code generation.
+        self._bind_guard_count = 0
+        # Hint-sized CuTe reduction extents, per generated config.
+        self._cute_reduction_extents: dict[
+            Config, tuple[_CuteReductionExtent, ...]
+        ] = {}
         self._cache_path_map: dict[Config, str | None] = {}
         self._host_semantic_fingerprints: dict[
             tuple[_HostSemanticInputNormalization, tuple[object, ...]], str
@@ -2386,6 +2458,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     raise
 
                 self.env.restrict_pid_types_for_persistent(args)
+                self._bind_guard_count = len(self.env.shape_env.guards)
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 runtime_args = dict(
@@ -2612,9 +2685,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._runtime_arg_values_for_codegen(),
                 measure("BoundKernel.generate_ast"),
             ):
+                self.env.cute_hint_sized_reduction_extents.clear()
                 # pyrefly: ignore [bad-argument-type]
                 root = generate_ast(self.host_function, config, emit_repro_caller)
+                # Code generation can guard on input sizes too.
+                self._publish_guarded_input_facts()
                 self._register_cute_grouped_static_tail_specializations()
+                self._cute_reduction_extents[config] = (
+                    _cute_reduction_extent_descriptors(self.env)
+                )
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             import_lines: list[str] = []
@@ -2691,6 +2770,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config, process_group_name=self._env.process_group_name
         )
         if (rv := self._compile_cache.get(config)) is not None:
+            self._register_cute_reduction_extent_specializations(config)
             return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
@@ -2751,6 +2831,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
+        self._register_cute_reduction_extent_specializations(config)
         return rv
 
     def bench_compile_config(
@@ -3305,6 +3386,116 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         return extractors
 
+    def _publish_guarded_input_facts(self) -> None:
+        """Extend the dispatch schema with guard facts it does not check yet."""
+        if self._cache_managed:
+            self.kernel._publish_guard_facts(self, self._guarded_input_facts())
+
+    def _guarded_input_facts(
+        self,
+    ) -> list[_PreparedMetadataSpecializationExtractor]:
+        """Input-shape guards this dynamic-shape compilation baked into its code.
+
+        ``static_shapes=False`` keeps 0/1 sizes symbolic so one bound kernel
+        can serve every size, but a compile-time comparison still guards on
+        them: ``size == 1`` at a size-1 dim replaces the symbol and drops that
+        dim's index, ``size != 1`` keeps a broadcast dim's index, and equal
+        sizes merge two reduction dims.  Each replacement of an input
+        size/stride (by a constant or other input sizes) and each ``!=``
+        against a constant that code generation recorded becomes a cache-key
+        fact, as do those on a reduction block symbol (an empty reduction
+        guarded 1-wide), keyed by the block its extent's input sizes give.
+        Nothing is added when no such guard fired, so the common case keeps
+        #2353's single bound kernel and its dispatch cost.
+        """
+        if self.settings.static_shapes:
+            return []
+        shape_env = self.env.shape_env
+        # Container elements share their container's source, so only direct
+        # tensor arguments replay; descriptor guards on elements are keyed by
+        # the descriptor layout extractor.
+        tensor_params = {
+            name
+            for name, fake in zip(
+                self.kernel.signature.parameters, self.fake_args, strict=False
+            )
+            if isinstance(fake, torch.Tensor)
+        }
+        sources: dict[sympy.Symbol, TensorPropertySource] = {}
+        for symbol, symbol_sources in shape_env.var_to_sources.items():
+            for source in symbol_sources:
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and isinstance(source.base, LocalSource)
+                    and source.base.local_name in tensor_params
+                ):
+                    sources[symbol] = source
+                    break
+
+        def guarded_quantity(symbol: sympy.Symbol) -> tuple[sympy.Expr, bool] | None:
+            """The input expression a guarded symbol stands for, and if a block."""
+            if (source := sources.get(symbol)) is not None:
+                # hl.specialize already keys the exact value.
+                if symbol in self.env.specialized_vars or (
+                    source in self.env.specialized_strides
+                ):
+                    return None
+                return symbol, False
+            assert self.host_function is not None
+            origin = self.host_function.expr_to_origin.get(symbol)
+            if (
+                origin is not None
+                and isinstance(origin.origin, BlockSizeOrigin)
+                and (info := self.env.block_sizes[origin.origin.block_id]).reduction
+                and isinstance(info.size, torch.SymInt)
+            ):
+                return cast("sympy.Expr", info.size._sympy_()), True
+            return None
+
+        relations: list[tuple[sympy.Symbol, sympy.Expr, bool]] = [
+            (symbol, expr, True)
+            for symbol, expr in shape_env.replacements.items()
+            if expr != symbol
+        ]
+        relations.extend(
+            (lhs, rhs, False)
+            # Binding records ``!= 1`` for any size it saw >= 2 without code
+            # depending on it; code generation's (block pointers keep a
+            # broadcast dim's index) does.
+            for guard in shape_env.guards[self._bind_guard_count :]
+            if isinstance(guard.expr, sympy.Ne)
+            and isinstance(lhs := guard.expr.lhs, sympy.Symbol)
+            and isinstance(rhs := guard.expr.rhs, sympy.Integer)
+        )
+        param_names = tuple(self.kernel.signature.parameters)
+        facts: dict[_GuardedInputFact, None] = {}
+        for symbol, expr, equal in relations:
+            if (quantity := guarded_quantity(symbol)) is None:
+                continue
+            lhs, block = quantity
+            free_symbols = sorted(
+                {
+                    cast("sympy.Symbol", free)
+                    for free in (*lhs.free_symbols, *expr.free_symbols)
+                },
+                key=str,
+            )
+            if lhs.free_symbols and all(free in sources for free in free_symbols):
+                facts.setdefault(
+                    _GuardedInputFact(
+                        lhs,
+                        expr,
+                        tuple((free, sources[free]) for free in free_symbols),
+                        block,
+                        equal,
+                        param_names,
+                    )
+                )
+        return [
+            _PreparedMetadataSpecializationExtractor(fact)
+            for fact in sorted(facts, key=repr)
+        ]
+
     def _record_runtime_input_specialization_results(
         self,
         extractors: Sequence[Callable[[Sequence[object]], Hashable]],
@@ -3344,44 +3535,76 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env.use_runtime_arg_values(values):
             yield
 
-    def _register_cute_grouped_static_tail_specializations(self) -> None:
-        if self.kernel.settings.backend != "cute" or not self._cache_managed:
-            return
-        signature = self._base_spec_key
-        descriptors = _cute_grouped_static_tail_extra_descriptors(
-            self.env.cute_resolved_wrapper_plans
-        )
+    def _extend_cute_descriptor_specializations(
+        self,
+        seen_by_signature: dict[Hashable, set[Hashable]],
+        descriptors: Sequence[Hashable],
+        make_extractor: Callable[[Any], Callable[[Sequence[object]], Hashable]],
+    ) -> None:
+        """Key every descriptor that this signature does not key yet."""
         if not descriptors:
             return
+        signature = self._base_spec_key
         # Serialize descriptor discovery with schema extension so concurrent
         # code generation cannot publish duplicate equivalent extractors.
         with self.kernel._bind_lock:
             if self._reset_generation != self.kernel._reset_generation:
                 return
-            seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
-                signature,
-                set(),
-            )
-            new_descriptors: list[Hashable] = []
-            new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
-            for descriptor in descriptors:
-                if descriptor in seen:
-                    continue
-                new_descriptors.append(descriptor)
-                new_extractors.append(
-                    _make_cute_grouped_static_tail_extractor(descriptor)
+            seen = seen_by_signature.setdefault(signature, set())
+            new_descriptors = [
+                descriptor for descriptor in descriptors if descriptor not in seen
+            ]
+            with self._runtime_arg_values_for_codegen():
+                runtime_args = tuple(
+                    self.env.runtime_arg_values_by_name.get(name)
+                    for name in self.kernel.signature.parameters
                 )
-            runtime_args = tuple(
-                self.env.runtime_arg_values_by_name.get(name)
-                for name in self.kernel.signature.parameters
-            )
             if self.kernel._extend_bound_kernel_specializations(
                 self,
                 signature,
-                new_extractors,
+                [make_extractor(descriptor) for descriptor in new_descriptors],
                 runtime_args,
             ):
                 seen.update(new_descriptors)
+
+    def _register_cute_grouped_static_tail_specializations(self) -> None:
+        if self.kernel.settings.backend != "cute" or not self._cache_managed:
+            return
+        self._extend_cute_descriptor_specializations(
+            self.kernel._cute_grouped_static_tail_extra_descriptors,
+            _cute_grouped_static_tail_extra_descriptors(
+                self.env.cute_resolved_wrapper_plans
+            ),
+            _make_cute_grouped_static_tail_extractor,
+        )
+
+    def _register_cute_reduction_extent_specializations(self, config: Config) -> None:
+        """Key the power-of-2 bucket of each hint-sized dynamic reduction extent.
+
+        A CuTe persistent reduction sizes its thread layout (and the CTA) from
+        the extent's size hint, while one dynamic-shape bound kernel serves
+        every size: a later call with a larger extent would launch too few
+        threads along that axis and skip the rest of each row.  Every config
+        compiled to run is keyed, whether by set_config or directly through
+        compile_config (whose callable a later bind() would otherwise hand
+        back for any size), but not the configs the autotuner only measures
+        (its reference baseline and candidates), so a looped winner keeps one
+        bound kernel across sizes.
+        """
+        if (
+            self.kernel.settings.backend != "cute"
+            or not self._cache_managed
+            or _SEARCHING_CANDIDATES.get()
+        ):
+            return
+        param_names = tuple(self.kernel.signature.parameters)
+        self._extend_cute_descriptor_specializations(
+            self.kernel._cute_reduction_extent_descriptors,
+            self._cute_reduction_extents.get(self._normalized_config_copy(config), ()),
+            lambda descriptor: _PreparedMetadataSpecializationExtractor(
+                _CuteReductionExtentExtractor(descriptor, param_names)
+            ),
+        )
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
@@ -3978,6 +4201,164 @@ def _cute_grouped_layout_has_m_tail(
     if cursor != len(layout_values):
         return None
     return has_m_tail
+
+
+def _tensor_property(
+    source: TensorPropertySource, root_values: dict[str, object]
+) -> int | None:
+    tensor = _replay_tensor_input_source(source.base, root_values)
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    if source.prop == TensorProperty.STORAGE_OFFSET:
+        return int(tensor.storage_offset())
+    assert source.idx is not None
+    if source.prop == TensorProperty.SIZE:
+        return int(tensor.size(source.idx))
+    return int(tensor.stride(source.idx))
+
+
+def _evaluate(expr: sympy.Expr, values: dict[sympy.Symbol, int]) -> int:
+    if isinstance(expr, sympy.Symbol):
+        return values[expr]
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    return int(expr.xreplace(values))
+
+
+@dataclasses.dataclass(frozen=True)
+class _GuardedInputFact:
+    """Whether a guard ``lhs == rhs`` (or ``!=`` without ``equal``) still holds.
+
+    Both sides are expressions of input sizes/strides; ``sources`` names the
+    input behind each symbol.  With ``block`` the guarded symbol was a
+    reduction block, whose value is ``next_power_of_2`` of the extent ``lhs``.
+    """
+
+    lhs: sympy.Expr
+    rhs: sympy.Expr
+    sources: tuple[tuple[sympy.Symbol, TensorPropertySource], ...]
+    block: bool
+    equal: bool
+    param_names: tuple[str, ...]
+
+    def _holds(self, values: dict[sympy.Symbol, int]) -> bool:
+        lhs = _evaluate(self.lhs, values)
+        same = (next_power_of_2(lhs) if self.block else lhs) == _evaluate(
+            self.rhs, values
+        )
+        # Branch rather than compare: traced by dynamo the sizes are SymInts,
+        # and their SymBool compared with a bool nests an Eq the shape env
+        # cannot evaluate, while a branch guards on it.
+        return self.equal if same else not self.equal
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        root_values = dict(zip(self.param_names, args, strict=False))
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in self.sources:
+            if (value := _tensor_property(source, root_values)) is None:
+                return None
+            values[symbol] = value
+        return self._holds(values)
+
+    def bound_value(self, env: CompileEnvironment) -> Hashable:
+        """This fact at ``env``'s bind-time hints (None when not recoverable)."""
+        symbols = {
+            source: symbol
+            for symbol, sources in env.shape_env.var_to_sources.items()
+            for source in sources
+        }
+        hints = shape_env_var_hints(env.shape_env)
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in self.sources:
+            if (
+                bound_symbol := symbols.get(source)
+            ) is None or bound_symbol not in hints:
+                return None
+            values[symbol] = int(hints[bound_symbol])
+        return self._holds(values)
+
+
+def _bound_guarded_input_facts(
+    bound: BoundKernel,
+    extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+) -> tuple[Hashable, ...] | None:
+    """Guard-fact results for a cached bound, or None if any is not a guard fact."""
+    results: list[Hashable] = []
+    for extractor in extractors:
+        if not (
+            isinstance(extractor, _PreparedMetadataSpecializationExtractor)
+            and isinstance(fact := extractor.extractor, _GuardedInputFact)
+        ):
+            return None
+        if (result := fact.bound_value(bound.env)) is None:
+            return None
+        results.append(result)
+    return tuple(results)
+
+
+class _CuteReductionExtent(NamedTuple):
+    """A dynamic reduction extent and the input size behind each of its symbols."""
+
+    extent: sympy.Expr
+    symbols: tuple[sympy.Symbol, ...]
+    sizes: tuple[TensorPropertySource, ...]
+
+
+def _input_size_of(
+    env: CompileEnvironment, symbol: sympy.Symbol
+) -> TensorPropertySource | None:
+    for source in env.shape_env.var_to_sources.get(symbol, ()):
+        if (
+            isinstance(source, TensorPropertySource)
+            and source.prop == TensorProperty.SIZE
+            and source.idx is not None
+        ):
+            return source
+    return None
+
+
+def _cute_reduction_extent_descriptors(
+    env: CompileEnvironment,
+) -> tuple[_CuteReductionExtent, ...]:
+    """Describe each recorded reduction extent by the input sizes it reads."""
+    descriptors: list[_CuteReductionExtent] = []
+    for extent in env.cute_hint_sized_reduction_extents:
+        symbols = tuple(
+            sorted(
+                (s for s in extent.free_symbols if isinstance(s, sympy.Symbol)),
+                key=str,
+            )
+        )
+        sizes = [_input_size_of(env, symbol) for symbol in symbols]
+        # A block-size symbol leaves no input size: the config fixes it.
+        if all(size is not None for size in sizes):
+            descriptors.append(
+                _CuteReductionExtent(
+                    extent,
+                    symbols,
+                    tuple(size for size in sizes if size is not None),
+                )
+            )
+    return tuple(sorted(descriptors, key=repr))
+
+
+@dataclasses.dataclass(frozen=True)
+class _CuteReductionExtentExtractor:
+    """Power-of-2 bucket of a dynamic reduction extent read from input sizes."""
+
+    descriptor: _CuteReductionExtent
+    param_names: tuple[str, ...]
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        root_values = dict(zip(self.param_names, args, strict=False))
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in zip(
+            self.descriptor.symbols, self.descriptor.sizes, strict=True
+        ):
+            if (value := _tensor_property(source, root_values)) is None:
+                return None
+            values[symbol] = value
+        return next_power_of_2(_evaluate(self.descriptor.extent, values))
 
 
 def _cute_grouped_static_tail_extra_descriptors(
