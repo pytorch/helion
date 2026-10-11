@@ -30,6 +30,7 @@ from ..language.view_ops import join as hl_join
 from ..language.view_ops import split as hl_split
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
+from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
 
@@ -66,10 +67,12 @@ class ReductionRoller:
         device_ir: DeviceIR,
         rdim: BlockSizeInfo,
         graph_id_to_info: dict[int, RolledReductionInfo],
+        enable_fusion: bool = False,
     ) -> None:
         self.device_ir = device_ir
         self.rdim = rdim
         self.graph_id_to_info = graph_id_to_info
+        self.enable_fusion = enable_fusion
         # inner graph contains ops on the reduction dimension
         self.inner_args: list[torch.fx.Node] = []
         self.inner_graph: torch.fx.Graph = torch.fx.Graph()
@@ -535,8 +538,73 @@ class ReductionRoller:
 
         return any(is_stack_with_rdim(node) for node in graph.nodes)
 
-    def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
+    def _reorder_for_fusion(self, graph: torch.fx.Graph) -> list[torch.fx.Node]:
+        """Defer each reduction's outer tail (its store plus the scalar ops
+        feeding it) past sibling reductions so the roller folds independent
+        reductions over ``self.rdim`` into one loop sharing a single load.
+        Nodes move only where data, memory, and side-effect ordering allow."""
+
+        def is_store(node: torch.fx.Node) -> bool:
+            return node.op == "call_function" and (
+                node.target is store or node.target in _ATOMIC_OPS
+            )
+
+        def is_load(node: torch.fx.Node) -> bool:
+            return node.op == "call_function" and node.target is load
+
+        def writes_local_allocation(node: torch.fx.Node) -> bool:
+            target = node.args[0]
+            if not isinstance(target, torch.fx.Node):
+                return False
+            val = target.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                return False
+            origin = HostFunction.current().tensor_to_origin.get(val)
+            return origin is not None and not origin.is_argument()
+
+        def is_deferrable(node: torch.fx.Node) -> bool:
+            if node.op != "call_function" or self.should_go_in_inner_graph(node):
+                return False
+            if is_store(node):
+                return writes_local_allocation(node)
+            return not (node.is_impure() or is_load(node))
+
+        order: list[torch.fx.Node] = []
+        deferred: list[torch.fx.Node] = []
+        deferred_set: set[torch.fx.Node] = set()
+
+        def flush_through(cutoff: int) -> None:
+            order.extend(deferred[: cutoff + 1])
+            del deferred[: cutoff + 1]
+            deferred_set.intersection_update(deferred)
+
         for node in graph.nodes:
+            if is_deferrable(node) and any(
+                inp in deferred_set or self.is_reduction(inp)
+                for inp in node.all_input_nodes
+            ):
+                deferred.append(node)
+                deferred_set.add(node)
+                continue
+            if deferred:
+                if node.op != "call_function" or node.is_impure():
+                    flush_through(len(deferred) - 1)
+                else:
+                    load_here = is_load(node)
+                    inputs = set(node.all_input_nodes)
+                    cutoff = -1
+                    for i, d in enumerate(deferred):
+                        if d in inputs or (load_here and is_store(d)):
+                            cutoff = i
+                    if cutoff >= 0:
+                        flush_through(cutoff)
+            order.append(node)
+        order.extend(deferred)
+        return order
+
+    def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
+        nodes = self._reorder_for_fusion(graph) if self.enable_fusion else graph.nodes
+        for node in nodes:
             if self.should_go_in_inner_graph(node):
                 if not all(
                     (n in self.available or n in self.inner_available)

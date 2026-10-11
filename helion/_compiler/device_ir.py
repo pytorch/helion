@@ -1074,6 +1074,8 @@ class DeviceIR:
                 register_cute_tensor_alias_specializations(env)
         if not rdims:
             return
+        from .inductor_lowering import ReductionLowering
+
         num_original_graphs = len(self.graphs)
 
         # First pass: run roller analysis for all reduction dims and
@@ -1122,6 +1124,17 @@ class DeviceIR:
                 allow_loop = allow_loop or reduction_info.used_rdim
                 if reduction_info.used_rdim:
                     used_graphs.add(graph_id)
+                    reduction_count = sum(
+                        1
+                        for n in graph_info.graph.nodes
+                        if n.op == "call_function"
+                        and isinstance(n.meta.get("lowering"), ReductionLowering)
+                        and n.meta["lowering"].block_index == rdim.block_id
+                    )
+                    if reduction_count >= 2 and env.config_spec.supports_config_key(
+                        "reduction_fusion"
+                    ):
+                        env.config_spec.reduction_fusion_available = True
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
             if not all_graphs_processed:
@@ -1683,7 +1696,12 @@ class DeviceIR:
                 if info is None or not info.used_rdim:
                     continue
                 graph_info = self.graphs[graph_id]
-                roller = ReductionRoller(self, rdim, graph_to_info)
+                enable_fusion = bool(
+                    config.reduction_fusion
+                ) and env.config_spec.supports_config_key("reduction_fusion")
+                roller = ReductionRoller(
+                    self, rdim, graph_to_info, enable_fusion=enable_fusion
+                )
                 new_graph = roller.process(graph_info.graph)
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
