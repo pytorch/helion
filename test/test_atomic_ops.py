@@ -1206,6 +1206,61 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 self.assertLess(fence, min(i for i in later if i != -1))
 
     @onlyBackends(["triton", "cute"])
+    def test_atomic_of_a_reduced_update_over_full_slices(self):
+        """An atomic covering only the full slices adds once per program."""
+
+        @helion.kernel(static_shapes=True)
+        def nested_aranges(
+            x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            b, m, n = x.shape
+            n = hl.specialize(n)
+            k = hl.specialize(w.size(0))
+            for tile_b in hl.tile(b):
+                for tile_m in hl.tile(m):
+                    update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+                    hl.atomic_add(out, [hl.arange(0, k), hl.arange(0, n)], update)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def nested_slices(
+            x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            b, m, n = x.shape
+            n = hl.specialize(n)
+            k = hl.specialize(w.size(0))
+            for tile_b in hl.tile(b):
+                for tile_m in hl.tile(m):
+                    update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+                    hl.atomic_add(out, [slice(0, k), slice(0, n)], update)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def grid_aranges(
+            x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            b, m, n = x.shape
+            n = hl.specialize(n)
+            k = hl.specialize(w.size(0))
+            for tile_b, tile_m in hl.tile([b, m]):
+                update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+                hl.atomic_add(out, [hl.arange(0, k), hl.arange(0, n)], update)
+            return out
+
+        x = torch.randn(4, 40, 6, device=DEVICE)
+        w = torch.randn(3, 6, device=DEVICE)
+        expected = w * x.sum((0, 1))[None, :]
+        # On CuTe the rows of m a tile holds are one thread's lane loop, which
+        # the reduction re-runs around the atomic.
+        for kernel in (nested_aranges, nested_slices, grid_aranges):
+            for block_sizes in ([2, 16], [4, 8], [1, 8]):
+                out = torch.zeros(3, 6, device=DEVICE)
+                _, result = code_and_output(
+                    kernel, (x, w, out), block_sizes=block_sizes
+                )
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")

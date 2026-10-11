@@ -229,11 +229,11 @@ def test_register_block_accumulator_slice_store(start: int) -> None:
 @skipIfRefEager("checks a compiled refusal")
 def test_register_block_accumulator_slice_store_lane_loop_refused() -> None:
     """With a lane loop over ``bn`` each thread keeps one accumulator for
-    its several columns, so the store after the loop is refused."""
+    its several columns, so the carry stored after the loop is refused."""
     x = torch.randint(-4, 5, (64, 512), device=DEVICE).float()
     config = helion.Config(block_sizes=[16, 1], num_threads=[4, 1])
     bound = _register_block_slice_store.bind((x, 0))
-    with pytest.raises(BackendUnsupported, match="outside its device loop"):
+    with pytest.raises(BackendUnsupported, match="own loop's block"):
         bound.compile_config(config)
 
 

@@ -16,7 +16,7 @@ it runs exactly once per tile.
 
 An atomic that has to stay inside the lane loop of a tile axis it is uniform
 along (the loop structure nests its own loop inside that one; the loop belongs
-to a device loop, whose nest is never redistributed) is pinned to the loop's
+to a device loop, whose nest is kept when it is exact) is pinned to the loop's
 first lane instead of repeating, inside a user branch when it sits in one,
 unless the pin would reorder it against other accesses of its tensor, skip
 other work in its statement or run under a condition that varies with the
@@ -368,6 +368,49 @@ def _copy_then_flagged_release_elements(
         out[tile0, tile1] = x[tile0, tile1]
         if flags[0, 0] >= 0:
             hl.atomic_add(flags, [tile0, tile1], 1, sem="release")
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _reduced_update_by_aranges(
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    b, m, n = x.shape
+    n = hl.specialize(n)
+    k = hl.specialize(w.size(0))
+    for tile_b in hl.tile(b):
+        for tile_m in hl.tile(m):
+            update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+            hl.atomic_add(out, [hl.arange(0, k), hl.arange(0, n)], update)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _reduced_update_by_slices(
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    b, m, n = x.shape
+    n = hl.specialize(n)
+    k = hl.specialize(w.size(0))
+    for tile_b in hl.tile(b):
+        for tile_m in hl.tile(m):
+            update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+            hl.atomic_add(out, [slice(0, k), slice(0, n)], update)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _reduced_update_rereading_its_target(
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    b, m, n = x.shape
+    n = hl.specialize(n)
+    k = hl.specialize(w.size(0))
+    for tile_b in hl.tile(b):
+        for tile_m in hl.tile(m):
+            total = x[tile_b, tile_m, :].sum(0).sum(0)
+            update = w[:, :] * total[None, :] + out[:, :] * 0
+            hl.atomic_add(out, [hl.arange(0, k), hl.arange(0, n)], update)
     return out
 
 
@@ -766,6 +809,52 @@ def test_per_element_fence_in_a_divergent_branch_rejects_the_config() -> None:
         _generate(_copy_then_flagged_release_elements, args, **_NESTED_SCALAR)
 
 
+def _reduced_update_args() -> tuple[torch.Tensor, ...]:
+    return (torch.empty((4, 40, 6)), torch.empty((3, 6)), torch.zeros((3, 6)))
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        pytest.param(_reduced_update_by_aranges, id="aranges"),
+        pytest.param(_reduced_update_by_slices, id="slices"),
+    ],
+)
+def test_atomic_after_a_lane_looped_reduction_runs_at_the_first_lane(
+    kernel: object,
+) -> None:
+    # Two rows per program on a thread axis and 16 rows of m per device-loop
+    # tile on one lane loop: the [k, n] update reads the sum that lane loop's
+    # reduction finalizes, and the reduction split re-runs the loop around
+    # the atomic.  The atomic covers neither axis, so it is pinned to the
+    # loop's first lane (once per lane would add the sum 16 times).
+    code = _generate(kernel, _reduced_update_args(), block_sizes=[2, 16])
+    function = _kernel_function(code)
+    atomic = _the_atomic(function)
+    assert _lane_loops_around(function, atomic)[0] == "lane_1", code
+    guard = _guard(function, atomic)
+    assert _first_lanes(guard) == {"lane_1"}, code
+    assert _leader_axes(guard) == {2}, code
+
+
+def test_atomic_after_a_lane_looped_reduction_beside_its_target_rejects_the_config() -> (
+    None
+):
+    # The update also reads ``out``: issued at the first lane only, the atomic
+    # would run before the other lanes' loads of it, and the other threads'
+    # loads race with it in a body the reduction split rewrites, where no
+    # barrier can order them.
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match="race on a tensor in a body a later pass rewrites",
+    ):
+        _generate(
+            _reduced_update_rereading_its_target,
+            _reduced_update_args(),
+            block_sizes=[2, 16],
+        )
+
+
 def test_float_max_helper_is_a_tile_uniform_atomic() -> None:
     code = _generate(
         _max_then_copy, (torch.empty((8, 256)), torch.zeros((1,))), **_LANES
@@ -1130,7 +1219,7 @@ def test_uniform_atomic_in_an_inner_loops_lane_nest_is_pinned(
     pinned: set[str],
 ) -> None:
     # A device loop's lane loops are built around its body before the body
-    # exists and are never redistributed; the full-nest check pins the row
+    # exists and are kept when exact; the full-nest check pins the row
     # count, uniform along the column lane, to that loop's first lane (and
     # first vector lane) instead of repeating it once per element.
     args = (torch.empty(shape), torch.zeros(shape[0]))

@@ -467,17 +467,15 @@ def test_store_after_the_per_lane_store_of_its_tensor_follows_the_consume_pass(
 @pytest.mark.parametrize(
     "kernel", [_zero_then_copy, _zero_then_softmax], ids=["one_pass", "dependent"]
 )
-def test_store_before_the_per_lane_store_of_its_tensor_precedes_the_consume_pass(
+def test_store_before_the_per_lane_store_of_its_tensor_rejects_the_config(
     kernel: object,
 ) -> None:
-    # The body's order is kept the other way round too: the zeroing store
-    # stays between the accumulate pass and the consume pass that overwrites
-    # its element.
-    code = _generate(kernel, _ARGS, **_CONFIG)
-    function = _kernel_function(code)
-    passes = _pass_indices(function)
-    assert _store_calls(function.body[passes[-1]], "out"), code
-    assert passes[0] < _tail_store_index(function, "out", _is_zero) < passes[-1], code
+    # Every thread of the row stores the zero, then thread 0 overwrites the
+    # element in the consume pass: another thread's zero may land after it,
+    # and the barrier between them cannot sit in the body the reduction split
+    # rewrites.
+    with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
+        _generate(kernel, _ARGS, **_CONFIG)
 
 
 def test_reduced_value_stored_into_the_copied_row_follows_the_consume_pass() -> None:
@@ -513,6 +511,8 @@ def test_store_between_two_per_lane_stores_of_its_tensor_rejects_the_config(
     kernel: object,
 ) -> None:
     # Two consume-pass stores of ``out`` surround the zeroing store: neither
-    # side of the pass keeps the body's order.
-    with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+    # side of the pass keeps the body's order.  The race check refuses it
+    # first: the other threads' zeros race with thread 0's stores of the
+    # element in the body the reduction split rewrites.
+    with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
         _generate(kernel, _ARGS, **_CONFIG)
