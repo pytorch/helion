@@ -54,6 +54,10 @@ class CodegenInterface(ABC):
         self.add_statement(statement_from_string(f"{varname} = {{expr}}", expr=expr))
         return create(ast.Name, id=varname, ctx=ast.Load())
 
+    def rolled_reduction_index_var(self, size: object) -> str | None:
+        """Index of the rolled reduction loop over the dim of extent ``size``."""
+        return None
+
 
 def extract_helper_function(helper_fn: object) -> types.FunctionType:
     """Extract the actual function from a Kernel object or return as-is.

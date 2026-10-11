@@ -906,6 +906,9 @@ class _FakeGenerateAST:
     def offset_var(self, block_idx: int) -> str:
         return f"offset_{block_idx}"
 
+    def rolled_reduction_index_var(self, size: object) -> str | None:
+        return None
+
 
 class _FakeLoopStrategy:
     def __init__(self, block_ids: list[int]) -> None:

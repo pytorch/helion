@@ -249,10 +249,16 @@ class TestBarrier(RefEagerTestBase, TestCase):
             def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
                 return False
 
+            def has_gather_along_rdim(self, graph: torch.fx.Graph) -> bool:
+                return False
+
             def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+                return False
+
+            def has_pinned_rdim(self) -> bool:
                 return False
 
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
@@ -597,12 +603,13 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
             )
 
     @skipIfRefEager("launch-layout checks only run in compiled mode")
-    def test_rejects_unprovable_persistent_reduction_group(self) -> None:
+    def test_persistent_reduction_group_spans_the_barrier_launch(self) -> None:
         """Two reductions in one tile loop put 2 lanes on axis 0 and a 64-lane
-        persistent reduction on axis 1.  The latter cannot prove its
-        shared-memory group under the launch (2, 64, 8), and the warp-shuffle
-        fallback combines at most 32 lanes, so a multi-phase kernel must be
-        rejected instead of returning wrong sums."""
+        persistent reduction on axis 1, and phase 2's tile takes 8 threads on
+        axis 2: the launch is (2, 64, 8).  Every strategy's axis counts toward
+        the reduction's thread group, so its shared-memory reduce keys on the
+        full linear thread id and gives each of phase 1's 8 replicas on axis 2
+        its own group, interleaving the 2 lanes below it."""
 
         @helion.kernel(
             config=helion.Config(block_sizes=[1, 8], pid_type="persistent_blocked")
@@ -618,14 +625,14 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
                 out[tile_m] = partial[tile_m] * 2.0
             return out
 
-        x = torch.randn([64, 2], device=DEVICE)
-        y = torch.randn([64, 64], device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported,
-            r"persistent reduction over 64 lanes cannot prove its thread group "
-            r"under the hl\.barrier\(\) launch \(2, 64, 8\)",
-        ):
-            code_and_output(two_reductions_then_wide, (x, y))
+        for seed in range(4):
+            torch.manual_seed(seed)
+            x = torch.randn([64, 2], device=DEVICE)
+            y = torch.randn([64, 64], device=DEVICE)
+            code, out = code_and_output(two_reductions_then_wide, (x, y))
+            self.assertIn("block=(2, 64, 8)", code)
+            self.assertIn("pre=2, group_span=128, group_count=8", code)
+            torch.testing.assert_close(out, (x.sum(-1) + y.sum(-1)) * 2.0)
 
 
 @onlyBackends(["cute"])
