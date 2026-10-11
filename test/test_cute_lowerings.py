@@ -15295,6 +15295,7 @@ class TestCuteLowerings(unittest.TestCase):
             _cute_resident_reduction=False,
             # ``__init__`` predicts the register tile; this lane stays rolled.
             _cute_register_tile_predicted=False,
+            _claims_thread_axis=lambda: True,
             block_size_var=lambda block_idx: "_RDIM_SIZE_0",
             index_var=lambda block_idx: "indices_0",
             _get_thread_axis=lambda: 0,
@@ -22147,7 +22148,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
                 return self.expr
 
         fake_pid = ForEachProgramID("pid_shared")
-        fake_pid.cases = [_Case("0"), _Case("1")]  # type: ignore[list-item]
+        fake_pid.cases = [_Case("2"), _Case("3")]  # type: ignore[list-item]
         self_stmt = self._stmt("shared_work = 1")
 
         class _DeviceFunction:
@@ -22201,7 +22202,7 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
         host_src = "\n".join(
             ast.unparse(stmt) for stmt in device_function.codegen.host_statements
         )
-        self.assertIn(f"{total_var} = 0 + 1", host_src)
+        self.assertIn(f"{total_var} = 5\n", host_src)
         self.assertIn(f"if {total_var} > 0", host_src)
         self.assertIn("supports runtime execution only", host_src)
 

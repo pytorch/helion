@@ -25,10 +25,12 @@ from torch._inductor.ir import Pointwise
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.lowering import to_dtype
 from torch._inductor.ops_handler import DefaultHandler
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
+from torch._ops import OpOverload
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
@@ -118,6 +120,36 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                             lowering._check_reduction_broadcast_keepdim(node)
 
 
+@functools.cache
+def _functional_twins() -> dict[OpOverload, OpOverload]:
+    """In-place aten overloads Inductor lowers, mapped to the functional
+    overloads they mutate with (``aten.mul_.Tensor`` -> ``aten.mul.Tensor``).
+
+    A tensor mutated inside the device loop is an SSA value: ``make_fx`` rebinds
+    it to the in-place node's output, so lowering that node as its functional
+    twin keeps every later read correct.  Inductor's own in-place lowerings
+    (``register_inplace`` -> ``mutate_to``) hand back the mutated *input*
+    buffer, which fails the ``ComputedBuffer`` check in
+    ``prepare_node_lowering`` since PyTorch nightly stopped swinging a realized
+    buffer's data pointer onto the new value.  Only pairs Inductor can lower on
+    both sides are mapped; anything else keeps its original lowering.
+    """
+    from torch._inductor.lowering import lowerings
+
+    by_name = {
+        (op._schema.name, op._overloadname): op
+        for op in lowerings
+        if isinstance(op, OpOverload)
+    }
+    twins: dict[OpOverload, OpOverload] = {}
+    for (name, overload), op in by_name.items():
+        if name.endswith("_") and not name.endswith("__"):
+            twin = by_name.get((name[:-1], overload))
+            if twin is not None:
+                twins[op] = twin
+    return twins
+
+
 def prepare_node_lowering(
     graph_lowering: GraphLowering,
     node: Node,
@@ -126,6 +158,13 @@ def prepare_node_lowering(
         APIFuncLowering.normalize_args_kwargs(api, node)
         node.meta["lowering"] = APIFuncLowering(api)
         return
+
+    inplace_dtype: torch.dtype | None = None
+    if (twin := _functional_twins().get(node.target)) is not None:  # pyrefly: ignore [bad-argument-type]
+        # ``x.mul_(y)`` lowers as ``aten.mul``; the in-place result keeps the
+        # dtype of ``x`` where the functional op would promote.
+        node.target = twin
+        inplace_dtype = node.meta["val"].dtype
 
     backend_lowering = CompileEnvironment.current().backend.pre_inductor_lowering(node)
     if backend_lowering is not None:
@@ -214,6 +253,8 @@ def prepare_node_lowering(
             except torch._inductor.exc.LoweringException as e:
                 # Wrap in Helion exception to get location automatically
                 raise InductorLoweringError(str(e)) from e
+            if inplace_dtype is not None and result.get_dtype() != inplace_dtype:
+                result = to_dtype(result, inplace_dtype)
         if not isinstance(result, tuple):
             result = (result,)
         buffer_name_to_output_index = {}

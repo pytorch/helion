@@ -135,6 +135,29 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
+    @skipIfRefEager(
+        "a ref-eager load is a view of the input, so in-place ops mutate it"
+    )
+    def test_inplace_ops_on_loop_values(self) -> None:
+        """In-place ops on device-loop values (``acc.mul_(y)``) mutate SSA values
+        and lower as their functional twins on every backend."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                acc = x[tile]
+                acc.mul_(y[tile])
+                acc.add_(1.0)
+                acc.sub_(x[tile])
+                out[tile] = acc
+            return out
+
+        x = torch.randn([1024], device=DEVICE)
+        y = torch.randn([1024], device=DEVICE)
+        code, result = code_and_output(fn, (x, y), block_size=128)
+        torch.testing.assert_close(result, x * y + 1.0 - x)
+
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
     def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
         node = ast.parse("while i < 4:\n    i += 1\n    i += 1\n").body[0]

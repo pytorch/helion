@@ -1,4 +1,5 @@
 ---
+name: cute-verify
 description: Verify changes to the Helion CuTe backend by running both test suites, lint, and a code review subagent — then fix any issues found.
 ---
 
@@ -7,13 +8,13 @@ Run all four checks, then fix any issues:
 1. **Lint** — `./lint.sh` (Ruff + Pyrefly).
 2. **Default test suite** — `pytest test/ -n4 -q --tb=line`.
 3. **CuTe test suite** — `HELION_BACKEND=cute pytest test/ -n4 -q --tb=line`.
-4. **Code review** — spawn an Opus-class `general-purpose` subagent with the diff (`git diff HEAD~` covers staged + uncommitted, or pick the right scope for the situation).
+4. **Code review** — spawn an Opus-class `general-purpose` subagent with the diff (`git diff HEAD~` covers the last commit plus staged and unstaged changes, but not untracked files; pick the right scope for the situation).
 
-**Parallelism:** Run lint and the code-review subagent in parallel with the test suites is fine, but **never run the two pytest suites simultaneously** — both use `-n4` and would put 8 workers on the GPU, causing OOMs and flaky failures. Run pytest suites sequentially.
+**Parallelism:** Running lint and the code-review subagent in parallel with the test suites is fine. Each pytest suite uses `-n4`, which saturates a GPU, so **never run the two suites on the same GPU** — 8 workers on one GPU causes OOMs and flaky failures. Run them in parallel on two different idle GPUs (`CUDA_VISIBLE_DEVICES=...`), or sequentially if only one GPU is free.
 
 **Review subagent prompt** (use `subagent_type: general-purpose`, `model: opus`):
 
-> Review `git diff HEAD~` in `/data/users/jansel/helion`. Focus on:
+> Review `git diff HEAD~` in `<repo root>`. Focus on:
 > - **Correctness:** wrong logic, missed edge cases, broken invariants.
 > - **Simplification:** redundant code, layers that could collapse, premature abstractions.
 > - **Hacky things:** ad-hoc workarounds, type-casts that hide bugs, magic constants without comments, stub APIs that aren't really plumbed.

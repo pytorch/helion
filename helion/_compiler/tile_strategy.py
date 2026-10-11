@@ -33,6 +33,7 @@ from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_DECODE_HELPERS
+from .cute.scalar_recipe import is_rounded_fp32_multiply
 from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
 from .host_function import HostFunction
@@ -5479,6 +5480,10 @@ def _is_proven_relocatable_call(
             return allow_load
         if call.func.attr == "bitcast":
             return True
+    if is_rounded_fp32_multiply(call):
+        # ``mul.rn.f32`` over two registers: a product kept separately rounded
+        # (``scalar_recipe_rounding``), as pure as the ``*`` it replaces.
+        return True
     name = _qualified_name(call.func)
     if name is None:
         return False

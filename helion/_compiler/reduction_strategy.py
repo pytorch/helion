@@ -328,15 +328,36 @@ class ReductionStrategy(TileStrategy):
         """Return threads used for this reduction on thread-aware backends."""
         return 0
 
-    def thread_axes_used(self) -> int:
+    def _claims_thread_axis(self) -> bool:
+        """Whether this reduction owns a launch thread axis.
+
+        A reduction spread across several live threads owns one axis.  On the
+        CuTe backend a reduction left with a single live thread (shrunk by
+        ``CuteBackend.adjust_reduction_thread_count`` once the tile axes fill
+        the CTA, or a dim whose padded extent is 1) walks its whole extent in
+        its synthetic lane loop and indexes with the constant 0
+        (``_index_init_expr``).  Its thread coordinate is never read, so it
+        claims no axis and records no ``block_thread_axes`` entry: the
+        dispatcher parks it on the lowest axis no threaded reduction holds
+        (``TileStrategyDispatch.thread_axis_for_strategy``), which a tile may
+        use.  Giving every such reduction a private axis ran past the three
+        hardware axes as soon as a kernel held four reduction dims (an
+        attention kernel whose value head dim differs from the q/k head dim,
+        plus the two tile-sized dims that ``tile.index[:, None]`` slices
+        allocate).
+        """
         count = self._reduction_thread_count()
-        if CompileEnvironment.current().backend_name == "cute" and count == 1:
-            return 0
-        return 1 if count > 0 else 0
+        if count <= 0:
+            return False
+        return count > 1 or CompileEnvironment.current().backend.name != "cute"
+
+    def thread_axes_used(self) -> int:
+        return 1 if self._claims_thread_axis() else 0
 
     def thread_block_sizes(self) -> list[int]:
-        count = self._reduction_thread_count()
-        return [count] if self.thread_axes_used() else []
+        if not self._claims_thread_axis():
+            return []
+        return [self._reduction_thread_count()]
 
     def _reduction_block_has_lane_loops(self) -> bool:
         """Return True when this reduction block is being traversed via a
@@ -979,8 +1000,9 @@ class ReductionStrategy(TileStrategy):
         env = CompileEnvironment.current()
         backend = env.backend
         if backend.name == "cute" and self._reduction_thread_count() == 1:
-            # A serial reduction has no thread axis of its own. Its fallback
-            # axis may belong to a sibling tile and must not shift this index.
+            # A single-thread reduction claims no thread axis of its own
+            # (``_claims_thread_axis``); the axis the dispatcher parks it on
+            # may belong to a sibling tile and must not shift this index.
             return backend.reduction_index_zero_expr(dtype)
         size = env.block_sizes[block_idx].size
         if isinstance(size, int) and size == 0:
@@ -988,11 +1010,12 @@ class ReductionStrategy(TileStrategy):
         if isinstance(size, torch.SymInt) and env.known_equal(size, 0):
             return backend.reduction_index_zero_expr(dtype)
         if self._reduction_thread_count() == 1:
-            # A reduction shrunk to one live thread (``adjust_reduction_thread_count``)
-            # still reserves a thread axis (``thread_axes_used() == 1``).  Alone,
-            # that axis is one thread wide and ``thread_idx()[axis]`` is always 0.
-            # Beside a sibling reduction with more threads the reductions share
-            # one reservation and ``TileStrategy._compute_thread_axis_offset``
+            # On the other thread-aware backends a reduction shrunk to one
+            # live thread (``adjust_reduction_thread_count``) still reserves a
+            # thread axis (``thread_axes_used() == 1``).  Alone, that axis is
+            # one thread wide and ``thread_idx()[axis]`` is always 0.  Beside
+            # a sibling reduction with more threads the reductions share one
+            # reservation and ``TileStrategy._compute_thread_axis_offset``
             # lets a tile strategy take this axis, so ``thread_idx()[axis]``
             # would alias the tile's thread id.  The constant 0 is the lane
             # index in both cases.
@@ -1548,11 +1571,12 @@ class PersistentReductionStrategy(ReductionStrategy):
                         ],
                         synthetic_lane_var,
                     )
-            current_grid.thread_axis_sizes[axis] = max(
-                current_grid.thread_axis_sizes.get(axis, 1),
-                self._thread_count,
-            )
-            current_grid.block_thread_axes[block_idx] = axis
+            if self._claims_thread_axis():
+                current_grid.thread_axis_sizes[axis] = max(
+                    current_grid.thread_axis_sizes.get(axis, 1),
+                    self._thread_count,
+                )
+                current_grid.block_thread_axes[block_idx] = axis
             if self._cute_resident_reduction:
                 # ``materialize_resident_reductions`` rewrites this loop and
                 # its prelude as a unit.
@@ -1582,7 +1606,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
         tracker = ThreadAxisTracker()
-        if self._thread_count > 0:
+        if self._claims_thread_axis():
             tracker.record(
                 self.block_index, self._get_thread_axis(), self._thread_count
             )
@@ -1806,7 +1830,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         # sibling grid branch reuses this axis instead of claiming a fresh one that
         # would widen the launch block and race this single-axis reduction. No-op
         # outside a dynamic ``_if`` branch.
-        if backend.name == "cute":
+        if backend.name == "cute" and self._claims_thread_axis():
             state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
         numel = env.block_sizes[self.block_index].numel
         if isinstance(numel, sympy.Integer) and numel == 0:
@@ -2632,7 +2656,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
         tracker = ThreadAxisTracker()
-        if self._thread_count > 0:
+        if self._claims_thread_axis():
             tracker.record(block_index, self._get_thread_axis(), self._thread_count)
         return DeviceLoopState(
             self,
@@ -2656,7 +2680,10 @@ class LoopedReductionStrategy(ReductionStrategy):
         # See ``PersistentReductionStrategy.codegen_reduction``: record the branch
         # path of this reduction's thread axis so a mutually-exclusive sibling
         # branch's free ``hl.arange`` can reuse the axis (CuTe backend only).
-        if CompileEnvironment.current().backend.name == "cute":
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and self._claims_thread_axis()
+        ):
             state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
         with install_inductor_kernel_handlers(state.codegen, {}):
             env = CompileEnvironment.current()
@@ -3309,9 +3336,13 @@ class BlockReductionStrategy(ReductionStrategy):
             # ``_thread_axis_map`` entry is the next block's axis), so a
             # reduction over it has nothing to combine across: taking the
             # axis would fold the sibling block's tile instead of passing
-            # the single element through.
+            # the single element through.  A single-thread reduction block
+            # reports an extent of 1 but claims no axis either
+            # (``_claims_thread_axis``): the axis the dispatcher parks it on
+            # may be a wider tile's, so it must not be reduced across.
             if (
                 strategy is not None
+                and strategy.thread_axes_used() > 0
                 and self.fn.tile_strategy.thread_extent_for_block_id(self.block_index)
                 is not None
             ):

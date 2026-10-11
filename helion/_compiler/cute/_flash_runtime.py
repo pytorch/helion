@@ -1350,17 +1350,94 @@ def _document_tile_bits_warp(
     return bits
 
 
+# ``2 * log2(e)``: ``tanh(y) = 1 - 2 / (exp2(2 * log2(e) * y) + 1)``.
+_SOFTCAP_TWO_LOG2E = 2.8853900817779268
+# Largest exp2 argument whose ``e + 1`` keeps the Newton reciprocal normal.
+_SOFTCAP_EXP2_CLAMP = 126.0
+
+
 def softcap_t2r(
     tLDrS: cute.Tensor,
     score_scale_log2: Float32,
     softcap_log2: Float32,
+    approx: bool = False,
 ) -> None:
-    """Apply ``softcap * tanh(score / softcap)`` in raw-QK score units."""
+    """Apply ``softcap * tanh(score / softcap)`` in raw-QK score units.
+
+    The fragment holds raw QK scores while ``softcap_log2`` is the cap in the
+    kernel's log2-softmax units, so every per-score constant is hoisted into one
+    multiplier (``x * scale / cap`` becomes ``x * (scale / cap)``: a one-ulp
+    rounding change that also removes a per-score IEEE divide whenever the cap
+    is not a power of two).
+
+    ``approx=False`` evaluates the identity
+    ``tanh(y) = 1 - 2 / (exp2(2 * log2(e) * y) + 1)`` with the ``ex2.approx.ftz``
+    the softmax already uses, an IEEE-exact reciprocal and the cap scale folded
+    into the final FMA (``cap - 2 * cap * r``). ``cute.math.tanh`` expands to
+    the libdevice form (abs, the same exp2 + reciprocal, two range selects, a
+    degree-9 odd polynomial and a copysign): about 17 ALU instructions per
+    score, which made the softmax warps 4-5x slower than the unmodified kernel.
+    Both forms carry the same ~2-ulp absolute error; only the relative accuracy
+    of tiny ``|y|`` differs, which ``exp2(score - row_max)`` downstream cannot
+    observe.
+
+    The reciprocal is ``rcp.rn``'s own fast path written out: ``MUFU.RCP`` plus
+    one Newton step (``v = fma(d, -r, 1); r' = fma(r, v, r)``), bit-identical to
+    IEEE ``rcp.rn`` for ``d = e + 1`` in ``[1, 2**125)``. ``cute.math.rcp``
+    itself is unusable here: ptxas wraps every ``rcp.rn.f32`` in an exponent
+    range check, a subroutine call for the slow path and BSSY/BSYNC
+    reconvergence, which serialises the per-score chains (measured 1.5x slower
+    than ``cute.math.tanh``). The reciprocal is carried negated (``rcp(-d)``)
+    so that every FMA uses positive operands and the hardware negate modifier
+    absorbs the one sign flip.
+
+    The exp2 argument is clamped to ``126`` (``|y| > 43.7``): past
+    ``2 * log2(e) * y >= 128`` the hardware exp2 returns ``inf`` and the Newton
+    step's ``fma(inf, -0, 1)`` would turn the whole row NaN. ``tanh`` is
+    already exactly ``1.0`` in fp32 from ``|y| > 9.01``, and with ``d = 2**126``
+    the reciprocal ``2**-126`` stays normal and ``cap + 2 cap * nr`` is exactly
+    ``cap``, so the clamp changes nothing for finite scores and maps ``+inf``
+    scores to ``+cap`` (``-inf`` already gives ``e = 0`` and ``-cap``). NaN
+    scores still propagate (``FMNMX.NaN``).
+
+    ``approx=True`` (the ``fast_math`` setting) uses the hardware
+    ``tanh.approx.f32`` instead: one MUFU op per score.
+    """
     score = cast("Any", tLDrS)
     raw_softcap = softcap_log2 / score_scale_log2
-    for i in range(cute.size(tLDrS)):
-        score[i] = raw_softcap * cute.math.tanh(
-            cutlass.Float32(score[i]) * score_scale_log2 / softcap_log2
+    inv_softcap = score_scale_log2 / softcap_log2
+    n = cute.size(tLDrS)
+    if approx:
+        # ``tanh.approx.f32`` is scalar-only; the scale multiplies stay packed.
+        for i in range(0, n, 2):
+            y0, y1 = cute.arch.mul_packed_f32x2(
+                (score[i], score[i + 1]), (inv_softcap, inv_softcap)
+            )
+            t0 = cute.math.tanh(y0, approx=True)
+            t1 = cute.math.tanh(y1, approx=True)
+            score[i], score[i + 1] = cute.arch.mul_packed_f32x2(
+                (t0, t1), (raw_softcap, raw_softcap)
+            )
+        return
+    exp_scale = inv_softcap * cutlass.Float32(_SOFTCAP_TWO_LOG2E)
+    two_cap = cutlass.Float32(2.0) * raw_softcap
+    one = cutlass.Float32(1.0)
+    for i in range(0, n, 2):
+        y0, y1 = cute.arch.mul_packed_f32x2(
+            (score[i], score[i + 1]), (exp_scale, exp_scale)
+        )
+        e0 = cute.arch.exp2(cute.arch.fmin(y0, _SOFTCAP_EXP2_CLAMP, nan=True))
+        e1 = cute.arch.exp2(cute.arch.fmin(y1, _SOFTCAP_EXP2_CLAMP, nan=True))
+        d0, d1 = cute.arch.add_packed_f32x2((e0, e1), (one, one))
+        # Negated seed: ``nr = -1 / d`` (approx), so ``v = 1 - d * r`` is one FMA
+        # with positive operands and ``nr' = nr + nr * v = -(r + r * v)``.
+        nr0 = cute.arch.rcp_approx(-d0)
+        nr1 = cute.arch.rcp_approx(-d1)
+        v0, v1 = cute.arch.fma_packed_f32x2((d0, d1), (nr0, nr1), (one, one))
+        nr0, nr1 = cute.arch.fma_packed_f32x2((nr0, nr1), (v0, v1), (nr0, nr1))
+        # ``cap * (1 - 2 r) = cap + 2 cap * nr'``
+        score[i], score[i + 1] = cute.arch.fma_packed_f32x2(
+            (two_cap, two_cap), (nr0, nr1), (raw_softcap, raw_softcap)
         )
 
 

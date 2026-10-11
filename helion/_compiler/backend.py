@@ -2557,11 +2557,48 @@ def _attention_score_modifiers(
         return score_node, tuple(modifiers)
 
 
+class _AttentionKVLoadIndices(NamedTuple):
+    """The ``(batch, kv_tile)`` indices of a canonical K/V load.
+
+    ``kv_group`` is the grouped-query divisor: the batch index is
+    ``batch_index // kv_group`` (``1`` for the plain ``tile_b`` form, where
+    ``batch_index`` is the index node itself).
+    """
+
+    batch_index: torch.fx.Node
+    kv_tile: torch.fx.Node
+    kv_group: int
+
+
+def _attention_kv_batch_index_group(
+    node: torch.fx.Node,
+) -> tuple[torch.fx.Node, int] | None:
+    """Return ``(dividend, divisor)`` of a K/V batch index, or None.
+
+    Accepts the inner batch tile index itself (divisor 1) or its floor
+    division by a positive constant (``tile_b.index // group``), the form a
+    grouped-query kernel uses to map query heads onto shared K/V heads.
+    """
+    index_mode = _attention_collapsed_batch_index_mode(
+        node,
+        allow_mod=False,
+        allow_floordiv=True,
+    )
+    if index_mode is None:
+        return None
+    if index_mode.mode == "identity":
+        return node, 1
+    assert index_mode.mode == "floordiv" and index_mode.divisor is not None
+    dividend = node.args[0]
+    assert isinstance(dividend, torch.fx.Node)
+    return dividend, index_mode.divisor
+
+
 def _attention_canonical_kv_load_indices(
     node: torch.fx.Node,
     *,
     kv_block_id: int | None,
-) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+) -> _AttentionKVLoadIndices | None:
     from ..language import memory_ops
 
     if node.op != "call_function" or node.target is not memory_ops.load:
@@ -2577,20 +2614,22 @@ def _attention_canonical_kv_load_indices(
         return None
     if not _attention_is_full_slice(indices[2]):
         return None
-    if not _attention_is_inner_batch_index(indices[0]):
+    batch_index = _attention_kv_batch_index_group(indices[0])
+    if batch_index is None:
         return None
     if kv_block_id is not None and not _attention_is_block_symnode(
         indices[1], int(kv_block_id)
     ):
         return None
-    return indices[0], indices[1]
+    dividend, kv_group = batch_index
+    return _AttentionKVLoadIndices(dividend, indices[1], kv_group)
 
 
 def _attention_k_load_indices(
     node: torch.fx.Node,
     *,
     kv_block_id: int | None,
-) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+) -> _AttentionKVLoadIndices | None:
     if node.op != "call_function":
         return None
     if node.target is torch.ops.aten.permute.default:
@@ -2612,7 +2651,7 @@ def _attention_v_load_indices(
     node: torch.fx.Node,
     *,
     kv_block_id: int | None,
-) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+) -> _AttentionKVLoadIndices | None:
     return _attention_canonical_kv_load_indices(node, kv_block_id=kv_block_id)
 
 
@@ -2993,7 +3032,13 @@ def _attention_softmax_pattern_head_dim(
     v_indices = _attention_v_load_indices(pv_node.args[2], kv_block_id=kv_block_id)
     if v_indices is None:
         return None
-    if k_indices[0] is not v_indices[0] or k_indices[1] is not v_indices[1]:
+    # K and V must read the same KV tile and the same (grouped) batch head:
+    # one ``kv_b = tile_b.index // group`` reused for both, or the plain index.
+    if (
+        k_indices.batch_index is not v_indices.batch_index
+        or k_indices.kv_tile is not v_indices.kv_tile
+        or k_indices.kv_group != v_indices.kv_group
+    ):
         return None
     q_placeholder = _attention_loop_carried_arg(graph, 0)
     if q_placeholder is None:
@@ -3033,6 +3078,9 @@ def _attention_softmax_pattern_head_dim(
         RELATIVE_BIAS_KIND,
         ALIBI_BIAS_KIND,
     }
+    from .compile_environment import CompileEnvironment
+
+    fast_math = CompileEnvironment.current().settings.fast_math
     scaled_modifiers = tuple(
         dataclasses.replace(
             modifier,
@@ -3046,6 +3094,7 @@ def _attention_softmax_pattern_head_dim(
                 if modifier.value_log2 is None
                 else modifier.value_log2 * bias_scale_log2
             ),
+            fast_math=fast_math,
         )
         if modifier.kind == SOFTCAP_KIND
         else modifier
@@ -3056,6 +3105,7 @@ def _attention_softmax_pattern_head_dim(
         qk_scale_log2=qk_scale_log2,
         lse_scale=lse_scale,
         modifiers=scaled_modifiers,
+        kv_group=k_indices.kv_group,
     )
     if not score_plan.has_lowering():
         return None

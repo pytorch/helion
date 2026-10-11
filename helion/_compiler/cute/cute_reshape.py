@@ -444,16 +444,14 @@ def _shape_op_needs_materialization(node: Node) -> bool:
     """Return True when non-store consumers need values, not just metadata."""
     from ...language import memory_ops
     from ...language._tracing_ops import _new_var
-    from ...language.matmul_ops import dot_scaled as hl_dot_scaled
+    from ..device_ir_analysis import matmul_operand_positions
 
-    matmul_targets = {
-        torch.ops.aten.mm.default,
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.bmm.default,
-        torch.ops.aten.baddbmm.default,
-        hl_dot,
-        hl_dot_scaled,
-    }
+    # Every matmul / dot overload, from the one registry: a hand-written copy
+    # here had drifted (``bmm.dtype``, ``torch.bmm(a, b, out_dtype)``, was
+    # missing, so the transposed key tile of an fp32-accumulating attention
+    # kernel went through a shared-memory shuffle that the lane-split
+    # scheduler then declined).
+    matmul_targets = frozenset(matmul_operand_positions())
     reduction_names = ("sum", "amax", "amin", "prod", "mean")
 
     def _feeds_only_matmuls(value: Node, visited: set[Node]) -> bool:

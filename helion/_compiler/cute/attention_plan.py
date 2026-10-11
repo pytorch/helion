@@ -53,6 +53,10 @@ class AttentionScoreModifier:
     prefix_length: int | None = None
     index_mode: str | None = None
     index_divisor: int | None = None
+    # The kernel's ``fast_math`` setting, recorded by the detector so the
+    # flash bodies can be rendered without a compile environment. Only the
+    # softcap transform reads it (``tanh.approx`` instead of the exact form).
+    fast_math: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,6 +67,10 @@ class AttentionScorePlan:
     qk_scale_log2: float
     lse_scale: float = 1.0
     modifiers: tuple[AttentionScoreModifier, ...] = ()
+    # Grouped-query attention: K/V are indexed by ``tile_b.index // kv_group``
+    # (``heads_q // heads_kv``), so they carry ``batch // kv_group`` leading
+    # entries. ``1`` is plain multi-head attention.
+    kv_group: int = 1
 
     @property
     def is_causal(self) -> bool:

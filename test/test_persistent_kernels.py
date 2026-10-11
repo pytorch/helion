@@ -337,6 +337,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("if pid_shared <", code_blocked)
         self.assertIn("pid_shared", code_interleaved)
         self.assertIn("if pid_shared <", code_interleaved)
+        self.assertIn("if pid_shared < 96:", code_flat)
 
     def test_persistent_shared_vs_flat_shared_equivalence(self):
         """Test that persistent+ForEachProgramID produces same results as flat+ForEachProgramID."""
@@ -707,8 +708,26 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             ","
         )
 
-        # Flat should use the full grid size calculation (ceiling division)
-        self.assertIn("//", flat_grid)
+        # Flat should use the full grid size: (64 / 32) * (96 / 16) tiles
+        self.assertEqual(flat_grid, "12")
+
+        # Dynamic shapes can't be folded, so the flat grid keeps the cdiv (//) form
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def test_kernel_dynamic(x: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.tile(x.size(), block_size=[32, 16]):
+                result[tile] = x[tile] + 1
+            return result
+
+        code_flat_dynamic, _ = code_and_output(
+            test_kernel_dynamic, args, pid_type="flat"
+        )
+        flat_grid_dynamic_match = re.search(grid_pattern, code_flat_dynamic)
+        self.assertIsNotNone(
+            flat_grid_dynamic_match, "Could not find grid size in dynamic flat code"
+        )
+        flat_grid_dynamic = flat_grid_dynamic_match.group(1).rstrip(",")
+        self.assertIn("//", flat_grid_dynamic)
 
         # Persistent kernels should use NUM_SMS
         self.assertEqual(

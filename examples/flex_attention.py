@@ -89,18 +89,18 @@ def helion_flex_attention_kernel(
             ]
 
             for block_idx in hl.tile(sparse_num_blocks, block_size=1):
-                start_n = block_mask_full_kv_indices[
-                    b_idx, h_idx, sparse_row, block_idx.id
-                ]
+                # kv_indices holds KV *block* indices; convert to a token offset.
+                start_n = (
+                    block_mask_full_kv_indices[b_idx, h_idx, sparse_row, block_idx.id]
+                    * block_mask_n
+                )
                 end_n = start_n + block_mask_n
                 end_N = end_n.new_full([], N)
                 end_n = torch.minimum(end_n, end_N)
 
                 for tile_n in hl.tile(start_n, end_n, block_size=block_n):
                     k = key[b_idx, h_kv_idx, tile_n, :]
-                    bcast_n = (tile_n.begin + hl.arange(tile_n.block_size))[
-                        None, None, None, :
-                    ]
+                    bcast_n = (tile_n.begin + hl.arange(tile_n.block_size))[None, :]
                     qk = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                     qk = hl.dot(q_i, k.T, acc=qk)
                     # Apply score_mod (score is in sm_scale space for API compat)
@@ -110,10 +110,14 @@ def helion_flex_attention_kernel(
                     qk = score
                     qk *= log_2_e
                     m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-                    qk = qk - m_ij[:, None]
+                    # A row with every score masked so far has m_ij == -inf;
+                    # rescale against 0 instead so -inf - -inf never produces
+                    # NaN, but keep the true running max in m_i.
+                    m_safe = torch.where(m_ij == float("-inf"), 0.0, m_ij)
+                    qk = qk - m_safe[:, None]
                     p = torch.exp2(qk)
                     l_ij = torch.sum(p, -1)
-                    alpha = torch.exp2(m_i - m_ij)
+                    alpha = torch.exp2(m_i - m_safe)
                     m_i = m_ij
                     l_i = l_i * alpha + l_ij
                     acc = acc * alpha[:, None]
@@ -125,16 +129,17 @@ def helion_flex_attention_kernel(
         sparse_num_blocks = block_mask_kv_num_blocks[b_idx, h_idx, sparse_row]
 
         for block_idx in hl.tile(sparse_num_blocks, block_size=1):
-            start_n = block_mask_kv_indices[b_idx, h_idx, sparse_row, block_idx.id]
+            start_n = (
+                block_mask_kv_indices[b_idx, h_idx, sparse_row, block_idx.id]
+                * block_mask_n
+            )
             end_n = start_n + block_mask_n
             end_N = end_n.new_full([], N)
             end_n = torch.minimum(end_n, end_N)
 
             for tile_n in hl.tile(start_n, end_n, block_size=block_n):
                 k = key[b_idx, h_kv_idx, tile_n, :]
-                bcast_n = (tile_n.begin + hl.arange(tile_n.block_size))[
-                    None, None, None, :
-                ]
+                bcast_n = (tile_n.begin + hl.arange(tile_n.block_size))[None, :]
                 qk = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 qk = hl.dot(q_i, k.T, acc=qk)
                 # Apply score_mod and mask
@@ -146,10 +151,11 @@ def helion_flex_attention_kernel(
                 qk = score
                 qk *= log_2_e
                 m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-                qk = qk - m_ij[:, None]
+                m_safe = torch.where(m_ij == float("-inf"), 0.0, m_ij)
+                qk = qk - m_safe[:, None]
                 p = torch.exp2(qk)
                 l_ij = torch.sum(p, -1)
-                alpha = torch.exp2(m_i - m_ij)
+                alpha = torch.exp2(m_i - m_safe)
                 m_i = m_ij
                 l_i = l_i * alpha + l_ij
                 acc = acc * alpha[:, None]
@@ -157,10 +163,12 @@ def helion_flex_attention_kernel(
                 p = p.to(v.dtype)
                 acc = hl.dot(p, v, acc=acc)
 
-        m_i += torch.log2(l_i) / log_2_e  # Convert back to natural log
+        # Rows with no visible key: output 0 and lse -inf, like FlexAttention.
+        l_i = torch.where(l_i == 0.0, 1.0, l_i)
+        lse_row = (m_i + torch.log2(l_i)) / log_2_e  # Convert back to natural log
         acc = acc / l_i[:, None]
         out[tile_b, tile_h, tile_m, :] = acc[None, None, :, :].to(out.dtype)
-        lse[tile_b, tile_h, tile_m] = m_i[None, None, :]
+        lse[tile_b, tile_h, tile_m] = lse_row[None, None, :]
     return out, lse
 
 

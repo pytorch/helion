@@ -8,7 +8,9 @@ on:
       - release/*
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  # Also applies to main: a new push cancels the previous main run so bursts of
+  # landed PRs don't queue a full run (including B200 jobs) per commit.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -349,6 +351,17 @@ jobs:
           # pushed the autotune and benchmark tests past their per-test timeout.
           if [[ -n "$PARALLEL" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
             PARALLEL="-n2"
+          fi
+          # B200 containers have 28 CPUs and most tests are CPU-bound compilation
+          # (the GPU sits mostly idle), so eight workers roughly halve the suite.
+          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == "b200" ]]; then
+            PARALLEL="-n8"
+          fi
+          # worksteal lets idle workers take tests queued behind a long-running
+          # one; the default "load" scheduler leaves them stuck on a single worker
+          # (e.g. the FLA-backed linear examples serialized into a ~16 min tail).
+          if [[ -n "$PARALLEL" ]]; then
+            PARALLEL="$PARALLEL --dist worksteal"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
