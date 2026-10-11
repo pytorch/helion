@@ -7292,6 +7292,9 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             default = max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
         elif reduction_numel <= 256:
             default = 16
+        elif total_ndim == 1 and reduction_numel > 1:
+            working_set_numel = 4096
+            default = max(1, working_set_numel // reduction_numel)
         else:
             default = 1
         low = min(max(self.min_size, self.autotuner_min), self.max_size)

@@ -5003,6 +5003,17 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             *coalescing_ids,
         )
 
+        min_programs = 8 * max(1, num_sm)
+        grid_row_floor: dict[int, int] = {}
+        for block_id in grid_ids:
+            bs_spec = cast("BlockSizeSpec", spec.block_sizes[slot_of[block_id]])
+            frag_default = bs_spec._fragment(spec).default()
+            program_cap = bs_spec.size_hint // min_programs
+            program_cap = 1 << (program_cap.bit_length() - 1) if program_cap >= 1 else 1
+            row_floor = min(frag_default, program_cap)
+            if row_floor > 1:
+                grid_row_floor[block_id] = row_floor
+
         def axis_value(current: _ReductionCandidate, block_id: int) -> int:
             if block_id in reduction_widths:
                 return current.reduction_width(block_id)
@@ -5015,6 +5026,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                     floor,
                     min(axis_maximums[block_id], cls.COALESCING_SENSITIVE_FLOOR),
                 )
+            if block_id in grid_row_floor:
+                floor = max(floor, grid_row_floor[block_id])
             return floor
 
         def resources_for(
