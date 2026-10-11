@@ -14091,6 +14091,84 @@ class TestCuteBackend(TestCase):
             "dim size (32)",
         )
 
+    def test_branch_reductions_of_different_widths_share_the_launch(self) -> None:
+        """Reductions in mutually exclusive pid branches share thread axis 0
+        and the launch takes the wider one, so the narrower reduction runs
+        surplus lanes.  They read past its row, reduced among themselves and
+        raced the row's result (a scalar store written by every lane), and a
+        row-wide store wrote past the row.  The narrower reduction now spans
+        the launch: its surplus lanes are masked to the identity and combined
+        with the rest.
+        """
+        for (da, db), block_sizes in [
+            ((32, 64), [1, 1]),
+            ((32, 64), [4, 4]),
+            ((64, 32), [1, 1]),
+            ((16, 128), [1, 1]),
+        ]:
+            a = torch.randn(16, da, device=DEVICE)
+            b = torch.randn(16, db, device=DEVICE)
+            code, (row_sums, row_maxes) = code_and_output(
+                cute_branch_row_sum_and_max, (a, b), block_sizes=block_sizes
+            )
+            msg = f"da={da} db={db} block_sizes={block_sizes}"
+            torch.testing.assert_close(
+                row_sums, a.sum(-1), rtol=1e-4, atol=1e-4, msg=msg
+            )
+            torch.testing.assert_close(row_maxes, b.amax(-1), rtol=0, atol=0, msg=msg)
+            width = max(da, db)
+            self.assertEqual(code.count(f"group_span={width},"), 2, msg)
+        a = torch.randn(16, 32, device=DEVICE)
+        b = torch.randn(16, 64, device=DEVICE) + 3.0
+        code, (normalized, centered) = code_and_output(
+            cute_branch_row_normalize_and_center, (a, b), block_sizes=[1, 1]
+        )
+        torch.testing.assert_close(
+            normalized, a / a.sum(-1, keepdim=True), rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            centered, b - b.amax(-1, keepdim=True), rtol=0, atol=0
+        )
+
+    def test_branch_reduction_beside_wider_free_arange(self) -> None:
+        """A sibling branch's free ``hl.arange`` claims its thread axis only
+        during codegen, after the reduction was emitted for its own lanes.
+        Reusing a narrower reduction's axis would run surplus reduction lanes,
+        so the arange takes its own axis, whichever branch comes first.
+        """
+        for kernel in (
+            cute_branch_row_sum_and_doubled,
+            cute_branch_doubled_and_row_sum,
+        ):
+            for da, db in [(32, 64), (64, 32)]:
+                a = torch.randn(16, da, device=DEVICE)
+                b = torch.randn(16, db, device=DEVICE)
+                _code, (row_sums, doubled) = code_and_output(
+                    kernel, (a, b), block_sizes=[1, 1]
+                )
+                msg = f"{kernel.name} da={da} db={db}"
+                torch.testing.assert_close(
+                    row_sums, a.sum(-1), rtol=1e-4, atol=1e-4, msg=msg
+                )
+                torch.testing.assert_close(doubled, b * 2.0, msg=msg)
+
+    def test_branch_argmax_is_not_widened_past_a_warp(self) -> None:
+        """argmax/argmin combine within one warp, so a narrower argmax beside
+        a sibling reduction wider than a warp is refused rather than widened.
+        """
+        a = torch.randn(16, 64, device=DEVICE)
+        b = torch.randn(16, 16, device=DEVICE)
+        with self.assertRaisesRegex(BackendUnsupported, "surplus lanes"):
+            code_and_output(cute_branch_row_sum_and_argmax, (a, b), block_sizes=[1, 1])
+        # Within a warp the narrower sum widens to the argmax's lanes.
+        a = torch.randn(16, 16, device=DEVICE)
+        b = torch.randn(16, 32, device=DEVICE)
+        _code, (row_sums, argmaxes) = code_and_output(
+            cute_branch_row_sum_and_argmax, (a, b), block_sizes=[1, 1]
+        )
+        torch.testing.assert_close(row_sums, a.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(argmaxes, b.argmax(-1))
+
 
 @helion.kernel(backend="cute", static_shapes=False)
 def cute_branch_free_arange_reduction(
@@ -14125,6 +14203,97 @@ def cute_branch_free_arange_reduction(
                 cv = c[tile_t, tile_h, co].to(torch.float32)
                 out_c[tile_t, tile_h, co] = cv + 1.0
     return out_a, out_b, out_c
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_row_sum_and_max(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = a.size(0)
+    out_a = torch.empty([m], device=a.device, dtype=a.dtype)
+    out_b = torch.empty([m], device=a.device, dtype=a.dtype)
+    for pid in hl.grid(2):
+        if pid == 0:
+            for tile_a in hl.tile(m):
+                out_a[tile_a] = a[tile_a, :].sum(-1)
+        else:
+            for tile_b in hl.tile(m):
+                out_b[tile_b] = b[tile_b, :].amax(-1)
+    return out_a, out_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_row_normalize_and_center(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = a.size(0)
+    out_a = torch.empty_like(a)
+    out_b = torch.empty_like(b)
+    for pid in hl.grid(2):
+        if pid == 0:
+            for tile_a in hl.tile(m):
+                a_rows = a[tile_a, :]
+                out_a[tile_a, :] = a_rows / a_rows.sum(-1, keepdim=True)
+        else:
+            for tile_b in hl.tile(m):
+                b_rows = b[tile_b, :]
+                out_b[tile_b, :] = b_rows - b_rows.amax(-1, keepdim=True)
+    return out_a, out_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_row_sum_and_doubled(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = a.size(0)
+    db = hl.specialize(b.size(1))
+    out_a = torch.empty([m], device=a.device, dtype=a.dtype)
+    out_b = torch.empty_like(b)
+    for pid in hl.grid(2):
+        if pid == 0:
+            for tile_a in hl.tile(m):
+                out_a[tile_a] = a[tile_a, :].sum(-1)
+        else:
+            for tile_b in hl.tile(m):
+                columns = hl.arange(0, db)
+                out_b[tile_b, columns] = b[tile_b, columns] * 2.0
+    return out_a, out_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_doubled_and_row_sum(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = a.size(0)
+    db = hl.specialize(b.size(1))
+    out_a = torch.empty([m], device=a.device, dtype=a.dtype)
+    out_b = torch.empty_like(b)
+    for pid in hl.grid(2):
+        if pid == 0:
+            for tile_b in hl.tile(m):
+                columns = hl.arange(0, db)
+                out_b[tile_b, columns] = b[tile_b, columns] * 2.0
+        else:
+            for tile_a in hl.tile(m):
+                out_a[tile_a] = a[tile_a, :].sum(-1)
+    return out_a, out_b
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_branch_row_sum_and_argmax(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = a.size(0)
+    out_a = torch.empty([m], device=a.device, dtype=a.dtype)
+    out_b = torch.empty([m], device=a.device, dtype=torch.int64)
+    for pid in hl.grid(2):
+        if pid == 0:
+            for tile_a in hl.tile(m):
+                out_a[tile_a] = a[tile_a, :].sum(-1)
+        else:
+            for tile_b in hl.tile(m):
+                out_b[tile_b] = b[tile_b, :].argmax(-1)
+    return out_a, out_b
 
 
 @helion.kernel(backend="cute", static_shapes=False)
