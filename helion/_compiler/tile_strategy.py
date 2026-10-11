@@ -6480,7 +6480,7 @@ class LoopDimInfo:
     begin_expr: sympy.Expr | None = None
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
-    # Absolute root-grid end; end_expr may instead describe its normalized extent.
+    # Absolute end of a root-grid dim; None for device loops.
     grid_end_expr: sympy.Expr | None = None
     # True when the generated extent mask checks both the logical begin and end.
     mask_has_lower_bound: bool = False
@@ -8121,7 +8121,8 @@ class TileStrategy:
         Args:
             state: The codegen state
             use_proxy_ends: If True, use proxy_ends from state.proxy_args (for device loops)
-            ends_override: If provided, use these ends instead of block_sizes.numel (for data-dependent bounds)
+            ends_override: The absolute ends of a root grid; like a device loop's
+                ends they bound ``tile.end``, ``tile.count`` and the tile extent
         """
         env = CompileEnvironment.current()
         block_id_to_info = {}
@@ -8199,8 +8200,8 @@ class TileStrategy:
                     end_var_name=None,
                     end_expr=end_expr,
                 )
-        elif ends_override is not None:
-            # Data-dependent bounds: use the provided ends
+        else:
+            assert ends_override is not None
             for idx, (block_id, end) in enumerate(
                 zip(self.block_ids, ends_override, strict=True)
             ):
@@ -8229,37 +8230,8 @@ class TileStrategy:
                     end_var_name=end_var_name,
                     end_expr=end_expr,
                 )
-        else:
-            for idx, block_id in enumerate(self.block_ids):
-                block_size_info = env.block_sizes[block_id]
-                begin_expr = None
-                begin_var_name = None
-                if proxy_begins is not None:
-                    begin = proxy_begins[idx]
-                    if isinstance(begin, (int, torch.SymInt)):
-                        begin_expr = _to_sympy(begin)
-                if begin_values is not None:
-                    begin_var_name = state.codegen.lift(
-                        begin_to_ast(begin_values[idx]),
-                        dce=True,
-                        prefix="begin",
-                    ).id
-                if block_size_info.size is None:
-                    # Data-dependent bound - skip numel, it will be handled elsewhere
-                    end_expr = None
-                    end_var_name = None
-                else:
-                    end_expr = block_size_info.numel
-                    end_var_name = state.sympy_expr(end_expr)
-                block_id_to_info[block_id] = LoopDimInfo(
-                    begin_var_name=begin_var_name,
-                    begin_expr=begin_expr,
-                    end_var_name=end_var_name,
-                    end_expr=end_expr,
-                )
 
-        # Root grid arguments still carry the absolute logical bounds here.
-        # Keep them separate from normalized extent metadata used by strategies.
+        # Root grid arguments carry the absolute logical bounds.
         if state.ast_args is None and len(state.proxy_args) == 3:
             begin_or_end, end, _ = state.proxy_args
             grid_ends = normalize_dim_values(begin_or_end if end is None else end)
@@ -9514,14 +9486,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        # Only use ends_override if there are data-dependent (tensor) bounds
-        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
-        if has_tensor_ends:
-            block_id_to_info = self._create_block_id_info_dict(
-                state, ends_override=ends
-            )
-        else:
-            block_id_to_info = self._create_block_id_info_dict(state)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
@@ -10553,13 +10518,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
-        if has_tensor_ends:
-            block_id_to_info = self._create_block_id_info_dict(
-                state, ends_override=ends
-            )
-        else:
-            block_id_to_info = self._create_block_id_info_dict(state)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         lane_loops = [
             (
                 self._lane_var_by_block[block_id],

@@ -479,6 +479,51 @@ def test_flattened_lane_loops_start_at_the_tile_begin(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _nd_begin_coordinates(x: torch.Tensor, begin: int, end: int) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile([begin, 0], [end, x.size(1)]):
+        v = x[tile_m, tile_n]
+        out[tile_m, tile_n] = (
+            v
+            - v.mean(0)[None, :]
+            + 100 * tile_m.begin
+            + 1000 * (tile_m.end - tile_m.begin)
+            + 10000 * tile_m.count
+        )
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("begin,end", [(3, 14), (9, 40)])
+@pytest.mark.parametrize("threads", [2, 8])
+def test_nd_root_tile_end_and_count_are_absolute(
+    begin: int, end: int, threads: int
+) -> None:
+    # The N-D root grid recorded the extent past ``begin`` as its end, so
+    # ``tile.end``, ``tile.count`` and the extent a mean divides by were off,
+    # with and without a lane loop.
+    block = 8
+    config = helion.Config(block_sizes=[block, 4], num_threads=[threads, 0])
+    x = torch.randn(40, 4, device=DEVICE)
+    out = _nd_begin_coordinates.bind((x, begin, end)).compile_config(config)(
+        x, begin, end
+    )
+    expected = torch.zeros_like(x)
+    starts = range(begin, end, block)
+    for start in starts:
+        stop = min(start + block, end)
+        rows = x[start:stop]
+        expected[start:stop] = (
+            rows
+            - rows.mean(0)
+            + 100 * start
+            + 1000 * (stop - start)
+            + 10000 * len(starts)
+        )
+    torch.testing.assert_close(out, expected)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _flat_begin_four(x: torch.Tensor) -> torch.Tensor:
     out = torch.zeros_like(x)
     for tile in hl.tile(4, x.size(0)):
