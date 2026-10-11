@@ -20,6 +20,87 @@ runs on the same machine can reuse prior configs.  For more on
 caching see {py:class}`~helion.autotuner.local_cache.LocalAutotuneCache`
 and {py:class}`~helion.autotuner.local_cache.StrictLocalAutotuneCache`.
 
+### Generated Triton source cache
+
+For Triton kernels, opt in to caching the selected configuration's
+generated source with `generated_code_cache=True` or
+`HELION_GENERATED_CODE_CACHE=1`.
+
+With the default `@helion.kernel` and no `config=`, the default adaptive
+autotuner selects the config, and the cache only skips source generation:
+every process still runs frontend compilation (`KernelCompiler.compile`) so
+that `LocalAutotuneCache` stays authoritative when a tuning result is deleted
+or replaced. Skipping the frontend as well requires an explicit config, a
+custom config selector or `autotune_effort="none"`:
+
+```python
+@helion.kernel(
+    config=helion.Config(block_sizes=[64]),
+    generated_code_cache=True,
+)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+Entries live under `HELION_CACHE_DIR/generated_code` (or the default Helion
+cache directory). A binding index records the selected config and its generated
+source. A later process with the same kernel, supported Python dependencies,
+input signature, hardware, compilation settings and library versions can load
+that source without running `KernelCompiler.compile` or source generation.
+Triton's binary cache remains independent; a source hit can still require
+Triton's first binary compilation.
+
+The disk lookup uses the in-memory specialization key, so it distinguishes
+inputs exactly as ordinary bindings do: `static_shapes=False` buckets shapes,
+while `static_shapes=True` keys exact sizes and strides. The binding also saves
+the guards its frontend compilation recorded, such as `hl.specialize()` values
+and tensor descriptor layout classes. A later process evaluates those guards
+before compiling, so a dynamic-shape binding serves shapes that the earlier
+process never saw, as one binding does with the cache disabled. A new guard
+value, such as another `hl.specialize()` value, compiles normally and saves a
+new binding. Kernels with runtime input specializations keep no binding entry.
+A source hit creates a lightweight runner that eager dispatch caches like an
+ordinary binding. When a call or request needs more than that runner provides,
+such as another config or frontend IR, Helion runs frontend compilation in that
+process and continues with an ordinary binding. Function dependencies are
+fingerprinted during disk lookup, not on each kernel launch.
+
+Custom config selectors still run.
+Native-source handoff (`autotune_handoff=True`) retains the ordinary frontend
+and backend tuning path so that cache hits cannot skip the requested handoff.
+PyTorch builds without Helion's `torch.compile` integration also retain frontend
+compilation, allowing legacy graph capture to reuse ordinary compiled launchers.
+Both paths can still reuse generated source after frontend compilation.
+
+The cache is disabled by default. Distributed kernels, tensor-descriptor configs
+and kernels with runtime input specializations retain normal compilation.
+Unsupported Python dependencies, forced autotuning and printing code or repro
+callers disable the pre-frontend lookup. Reference mode and TorchDynamo tracing
+retain normal compilation. Autotuning candidates are not written to this cache;
+`set_config` persists only the chosen config, including a winner already compiled
+during autotuning.
+
+`HELION_SKIP_CACHE=1` skips both reads and writes. Entries are checksummed and
+published with atomic renames. Missing, corrupt or unreadable entries are
+treated as misses: Helion compiles normally, as if the cache were disabled, and
+rewrites the entry. Failed writes log a warning and leave the compiled kernel
+usable. Remove the `generated_code` directory to clear it.
+
+Source, binding and guard schema entries share a 1 GiB disk budget by default.
+Set `HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES` to a nonnegative integer to
+change it; zero prevents new writes. Eviction is least recently used: each hit
+refreshes the entry's modification time, and a write that would exceed the
+budget removes the entries with the oldest modification times until the JSON
+files fit. Entries larger than the budget are not persisted. Evicting any
+part of a binding (its source, guard schema or binding entry) causes a later
+compilation miss, but does not affect already loaded kernels. Writers
+serialize eviction and atomic publication with a file lock and keep a running
+size total in a `.size` file, so a write only scans the directory when the
+budget may be exceeded, the total is missing or corrupt, or a periodic rescan
+is due. Lock timeouts and filesystem errors skip the write without interrupting
+execution. The budget excludes temporary files, the lock file and the size
+file, so a write can briefly use additional disk space.
+
 The rest of this document covers strategies for pre-tuning and deploying
 tuned configs, which is the recommended approach for production workloads.
 

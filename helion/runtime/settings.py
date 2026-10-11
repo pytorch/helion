@@ -410,6 +410,11 @@ class _Settings:
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
+    generated_code_cache: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_GENERATED_CODE_CACHE", False
+        )
+    )
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
@@ -709,6 +714,15 @@ class Settings(_Settings):
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
+        ),
+        "generated_code_cache": (
+            "Cache selected Triton configurations' generated source on disk. "
+            "Inputs that a saved binding accepts, including new shapes with "
+            "static_shapes=False, skip frontend compilation and codegen. "
+            "Tensor descriptors, distributed kernels and "
+            "unsupported Python dependencies retain normal compilation. Disabled by default. "
+            "Set HELION_GENERATED_CODE_CACHE=1 to enable and HELION_SKIP_CACHE=1 "
+            "to skip reads and writes."
         ),
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "

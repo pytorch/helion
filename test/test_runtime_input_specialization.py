@@ -226,6 +226,7 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
             bound = cast("BoundKernel[Any]", object.__new__(BoundKernel))
             bound._env = cast("CompileEnvironment", env)
             bound._config = None
+            bound._generated_code_artifact_key = None
             bound.kernel = cast(
                 "Any",
                 SimpleNamespace(
@@ -343,10 +344,13 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
 
         bound = cast("Any", object.__new__(BoundKernel))
         bound._env = env
+        bound._generated_code_artifact_key = None
         bound._runtime_tensor_refs_by_name = {"value": weakref.ref(value)}
         bound._normalize_config = lambda config: config
         bound.format_kernel_decorator = lambda _config, _settings: "test"
-        bound.kernel = SimpleNamespace(settings=SimpleNamespace())
+        bound.kernel = SimpleNamespace(
+            settings=SimpleNamespace(generated_code_cache=False)
+        )
         observed: list[bool] = []
 
         def compile_config(_config: object) -> object:
@@ -618,6 +622,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             _env=env,
             env=env,
             kernel=kernel,
+            _generated_code_artifact_key=None,
             _fixed_config_for_td_layout_guards=lambda: None,
         )
         extractor = BoundKernel._specialize_extra(cast("BoundKernel[object]", bound))[0]
@@ -853,6 +858,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 _env=env,
                 env=env,
                 kernel=kernel,
+                _generated_code_artifact_key=None,
                 _fixed_config_for_td_layout_guards=lambda: None,
             )
             extractors = BoundKernel._specialize_extra(

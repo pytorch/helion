@@ -10,6 +10,7 @@ import inspect
 import itertools
 import logging
 import os
+from pathlib import Path
 import re
 import sys
 import textwrap
@@ -88,6 +89,13 @@ from .cute_structural_config import CuteStructuralConfig
 from .cute_structural_config import StructuralPolicyError
 from .cute_structural_config import require_same_structural_policy
 from .cute_structural_config import select_structural_policy
+from .generated_code_cache import binding_input_key
+from .generated_code_cache import compiled_kernel_cache_key
+from .generated_code_cache import generated_code_cache_key
+from .generated_code_cache import load_generated_code
+from .generated_code_cache import save_binding
+from .generated_code_cache import save_generated_code
+from .generated_code_cache import source_guard
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -100,16 +108,33 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.backend import Backend
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
     from .cute_structural_config import CuteStructuralPolicyRequest
     from .cute_structural_policy import CuteStructuralPolicy
+    from .generated_code_cache import GeneratedCodeInputKey
 
     ConfigLike = Config | dict[str, object] | CuteStructuralConfig
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _load_code(
+    kernel: Kernel,
+    backend: Backend,
+    source: str,
+    device_index: int,
+    *,
+    extra: str = "",
+) -> types.ModuleType:
+    backend.setup_compile_cache_dir(device_index)
+    with measure("BoundKernel.PyCodeCache.load"):
+        module = PyCodeCache.load(source, extra=extra)
+    backend.annotate_compiled_module(module, source, kernel.name)
+    return module
 
 
 def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
@@ -698,7 +723,10 @@ class _PreparedCall:
         is_distributed: bool,
     ) -> _PreparedCall | None:
         if (
-            not bound.env.backend.supports_eager_prepared_call
+            # Disk runners always use Triton and never expose a frontend env.
+            not (
+                bound._is_disk_runner or bound.env.backend.supports_eager_prepared_call
+            )
             or kernel._key_fn is not None
         ):
             return None
@@ -1460,7 +1488,7 @@ class Kernel(Generic[_R]):
                 keyed_direct_dispatch = (
                     not self.settings.distributed
                     and not self._declares_process_group
-                    and not bound._env._is_distributed
+                    and (bound._is_disk_runner or not bound._env._is_distributed)
                 )
             # Process-group initialization is external to ``_bind_lock``. Do
             # not publish a key assembled across a state transition.
@@ -1556,12 +1584,30 @@ class Kernel(Generic[_R]):
                         else []
                     )
                 else:
-                    bound_kernel = BoundKernel(
-                        self,
-                        args,
-                        base_spec_key=signature,
-                        is_distributed=is_distributed,
+                    input_key = (
+                        None if is_distributed else binding_input_key(self, args)
                     )
+                    artifact_key = (
+                        None
+                        if input_key is None
+                        else compiled_kernel_cache_key(self, args, signature, input_key)
+                    )
+                    if artifact_key is not None:
+                        # cached_kernel builds ordinary bindings from this module.
+                        from .cached_kernel import load_cached_kernel
+
+                        bound_kernel = load_cached_kernel(
+                            self, args, signature, artifact_key, cache_key
+                        )
+                    if bound_kernel is None:
+                        bound_kernel = BoundKernel(
+                            self,
+                            args,
+                            base_spec_key=signature,
+                            is_distributed=is_distributed,
+                            artifact_key=artifact_key,
+                            input_key=input_key,
+                        )
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel,
@@ -2213,6 +2259,9 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
+    # True for cached_kernel's disk runners, which have no frontend env.
+    _is_disk_runner: bool = False
+
     def __init__(
         self,
         kernel: Kernel[_R],
@@ -2221,6 +2270,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         base_spec_key: tuple[Hashable, ...] | None = None,
         is_distributed: bool | None = None,
         cache_managed: bool = True,
+        artifact_key: str | None = None,
+        input_key: str | None = None,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -2268,6 +2319,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
+        self._generated_code_input_key: GeneratedCodeInputKey | None = None
+        self._generated_code_artifact_key = artifact_key
+        self._generated_source_cache_keys: dict[Config, str] = {}
+        # Disk entries this binding already wrote or loaded. Repeated set_config
+        # calls skip the writers' lock and eviction scan.
+        self._persisted_source_keys: set[str] = set()
+        self._persisted_binding: tuple[Config, str] | None = None
         self._compiler_seed_specialization_extractors: tuple[
             _CompilerSeedSpecializationExtractor, ...
         ] = ()
@@ -2486,6 +2544,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.env, self.host_function.device_ir
                     )
 
+        if self._cache_managed:
+            if input_key is None:
+                input_key = binding_input_key(kernel, args)
+            if input_key is not None:
+                guards: list[list[object] | None] = []
+                extractors = self._specialize_extra(guards)
+                self._generated_code_input_key = (
+                    self._base_spec_key,
+                    tuple(guards),
+                    tuple(extractor(args) for extractor in extractors),
+                    self._compiler_seed_specialization_results,
+                    input_key,
+                )
+
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
         Apply torch._dynamo.mark_static() markings from input tensors.
@@ -2683,6 +2755,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
         """
+        return self._compile_config(config, allow_print=allow_print)
+
+    def _compile_config(
+        self,
+        config: ConfigLike | None = None,
+        *,
+        allow_print: bool = True,
+        cache_generated_code: bool = False,
+    ) -> CompiledConfig:
         if config is None:
             config = self._require_implicit_config()
         requested_config = self._normalize_config(config)
@@ -2690,16 +2771,43 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         dist_check_config_consistancy(
             config, process_group_name=self._env.process_group_name
         )
+        source_key = None
+        if cache_generated_code and not self.settings.print_output_code:
+            source_key = self._generated_source_cache_keys.get(config)
+            if source_key is None:
+                source_key = generated_code_cache_key(self, config)
+            if source_key is not None:
+                self._generated_source_cache_keys[config] = source_key
         if (rv := self._compile_cache.get(config)) is not None:
+            # The autotuner already generated its winner. Persist that source
+            # without generating it again or retaining every candidate on disk.
+            if (
+                source_key is not None
+                and source_key not in self._persisted_source_keys
+                and (path := self._cache_path_map.get(config)) is not None
+            ):
+                # PyCodeCache writes the supplied source unchanged; its extra
+                # key changes the module identity, not the stored source text.
+                try:
+                    source = Path(path).read_text(encoding="utf-8")
+                except OSError as error:
+                    log.warning("Could not read generated code %s: %s", path, error)
+                else:
+                    save_generated_code(source_key, source)
+                    self._persisted_source_keys.add(source_key)
             return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
         )
-        self.env.backend.setup_compile_cache_dir(device_index)
         try:
-            triton_code = self.to_triton_code(
-                config, emit_repro_caller=self.settings.print_output_code
-            )
+            triton_code = None
+            if source_key is not None:
+                triton_code = load_generated_code(source_key)
+            source_miss = triton_code is None
+            if triton_code is None:
+                triton_code = self.to_triton_code(
+                    config, emit_repro_caller=self.settings.print_output_code
+                )
             # static_shapes=True keys a distinct BoundKernel per input shape (see
             # _tensor_key), but PyCodeCache keys compiled modules by SOURCE TEXT, so
             # two shapes that emit byte-identical source (e.g. compact_worklist, whose
@@ -2723,11 +2831,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 cache_extra = repr(self._base_spec_key)
             if self.kernel.cute_structural_policy is not None:
                 cache_extra += self.extra_cache_key()
-            with measure("BoundKernel.PyCodeCache.load"):
-                module = PyCodeCache.load(triton_code, extra=cache_extra)
-            self.env.backend.annotate_compiled_module(
-                module, triton_code, self.kernel.name
+            module = _load_code(
+                self.kernel,
+                self.env.backend,
+                triton_code,
+                device_index,
+                extra=cache_extra,
             )
+            if source_key is not None:
+                if source_miss:
+                    save_generated_code(source_key, triton_code)
+                self._persisted_source_keys.add(source_key)
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -3030,8 +3144,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         requested_config = config
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        if self.settings.generated_code_cache:
+            self._run = self._compile_config(config, cache_generated_code=True)
+        else:
+            self._run = self.compile_config(config)
         self._config = config
+        if self._generated_code_artifact_key is not None:
+            normalized = self._normalized_config_copy(config)
+            if (
+                source_key := self._generated_source_cache_keys.get(normalized)
+            ) is not None and self._persisted_binding != (config, source_key):
+                save_binding(self, config, normalized, source_key)
+                self._persisted_binding = (config, source_key)
         repro_config = (
             requested_config
             if isinstance(requested_config, CuteStructuralConfig)
@@ -3041,10 +3165,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.format_kernel_decorator(repro_config, self.settings)
         ] = 1
 
-    def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
+    def _specialize_extra(
+        self, guards: list[list[object] | None] | None = None
+    ) -> list[Callable[[Sequence[object]], Hashable]]:
         """
         Returns a list of functions that will be called to generate extra specialization keys.
         This is used to specialize on the values hl.specialize()'ed arguments.
+
+        Args:
+            guards: If given, receives a serializable description of each
+                extractor (``None`` if it has none) for the generated code cache.
 
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
@@ -3141,6 +3271,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if isinstance(source, TensorPropertySource):
                 extractor = _PreparedMetadataSpecializationExtractor(extractor)
             extractors.append(extractor)
+            if guards is not None:
+                guards.append(source_guard(source, arg_name_to_index))
             if (
                 isinstance(source, TensorPropertySource)
                 and source.prop == TensorProperty.STRIDE
@@ -3153,6 +3285,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
+            if guards is not None:
+                guards.append(source_guard(source, arg_name_to_index))
         candidate_configs: tuple[Config, ...] | None
         if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
             implicit_config = self._fixed_config_for_td_layout_guards()
@@ -3227,6 +3361,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not guard_is_active(guard):
                 continue
             extract_tensor = make_extractor(source)
+            extent_cap = descriptor_extent_cap(guard)
 
             def td_layout_extractor(
                 args: Sequence[object],
@@ -3235,7 +3370,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
-                _extent_cap: int | None = descriptor_extent_cap(guard),
+                _extent_cap: int | None = extent_cap,
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
@@ -3262,6 +3397,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
+            if guards is not None:
+                tensor_guard = source_guard(source, arg_name_to_index)
+                guards.append(
+                    None
+                    if tensor_guard is None or self.env.backend_name != "triton"
+                    else [
+                        "td_layout",
+                        tensor_guard,
+                        guard.ndim,
+                        guard.element_size,
+                        extent_cap,
+                    ]
+                )
 
         for source, guard in sorted(
             tensor_descriptor_alignment_guards.items(),
@@ -3287,6 +3435,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
             # Prepared metadata guards do not cover base pointers.
             extractors.append(td_alignment_extractor)
+            if guards is not None:
+                tensor_guard = source_guard(source, arg_name_to_index)
+                guards.append(
+                    None
+                    if tensor_guard is None
+                    else [
+                        "td_alignment",
+                        tensor_guard,
+                        guard.requires_zero_storage_offset,
+                    ]
+                )
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
@@ -3303,6 +3462,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     key,
                 )
             )
+            if guards is not None:
+                guards.append(None)
         return extractors
 
     def _record_runtime_input_specialization_results(
