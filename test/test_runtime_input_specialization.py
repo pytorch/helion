@@ -573,7 +573,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             replacement_calls += 1
             return "replacement-b"
 
-        kernel.bind = lambda _args: replacement
+        kernel._dispatch_bind = lambda _args: replacement
         value.data = unaligned.data
         self.assertEqual(bound(value), "replacement-b")
         self.assertEqual(replacement_calls, 1)
@@ -660,10 +660,11 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             _env=env,
             env=env,
             kernel=kernel,
-            _generated_code_artifact_key=None,
             _fixed_config_for_td_layout_guards=lambda: None,
         )
-        extractor = BoundKernel._specialize_extra(cast("BoundKernel[object]", bound))[0]
+        extractor = BoundKernel._specialization_guards(
+            cast("BoundKernel[object]", bound)
+        )[0][0]
 
         state = torch.empty((4, 8))
         other = torch.empty((4, 8))
@@ -686,7 +687,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
 
         kernel = SimpleNamespace(
             _reset_generation=2,
-            bind=lambda _args: replacement,
+            _dispatch_bind=lambda _args: replacement,
         )
         bound = cast("Any", object.__new__(BoundKernel))
         bound.kernel = kernel
@@ -896,13 +897,12 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 _env=env,
                 env=env,
                 kernel=kernel,
-                _generated_code_artifact_key=None,
                 _fixed_config_for_td_layout_guards=lambda: None,
             )
-            extractors = BoundKernel._specialize_extra(
+            extractors = BoundKernel._specialization_guards(
                 cast("BoundKernel[object]", bound)
             )
-            return tuple(extractor((11, 22)) for extractor in extractors)
+            return tuple(extractor((11, 22)) for extractor, _ in extractors)
 
         expected = (("a", (11,)), ("z", (22,)))
         self.assertEqual(results(entries), expected)

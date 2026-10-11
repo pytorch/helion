@@ -25,6 +25,7 @@ from helion.autotuner.base_search import BaseAutotuner
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
 from helion.runtime.kernel import BoundKernel
+from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
 from helion.runtime.ref_mode import is_ref_mode_enabled
@@ -64,12 +65,22 @@ def _cached_shift(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _runner(kernel: Kernel, args: tuple[object, ...]):
+    """The binding eager dispatch uses: on a warm cache a disk runner.
+
+    ``Kernel.bind`` returns an ordinary binding, compiling the frontend if the
+    process only has a runner; ``kernel(*args)`` keeps the runner.
+    """
+    with kernel._bind_lock:
+        return kernel._bind(args)
+
+
 def _bound(x: torch.Tensor, scale: int = 2, **settings: object):
     settings.setdefault("autotune_effort", "none")
     kernel = helion.kernel(backend="triton", generated_code_cache=True, **settings)(
         _cached_scale.fn
     )
-    return kernel.bind((x, scale))
+    return _runner(kernel, (x, scale))
 
 
 def _source_loader(root: Path, sources: list[str]):
@@ -523,6 +534,45 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
             second, second._normalized_config_copy(config)
         )
         self.assertTrue(key is not None and other is not None and (key != other))
+
+    def test_binding_key_identifies_cuda_capability_and_sm_count(self) -> None:
+        # Devices sharing a name can differ in compute capability and SM count
+        # (partitioned or cloud SKUs); the source key bakes both in, so the
+        # pre-frontend binding key must too. No frontend or CUDA is needed.
+        kernel = helion.kernel(
+            backend="triton", generated_code_cache=True, autotune_effort="none"
+        )(_cached_scale.fn)
+        x = torch.ones(16)
+        signature = kernel._base_specialization_key((x, 2))
+        hardware: dict[str, object] = {"capability": (9, 0), "sm": 132}
+        with (
+            patch.object(
+                cache, "_find_argument_device", return_value=torch.device("cuda", 0)
+            ),
+            patch.object(cache, "get_device_name", return_value="NVIDIA H100"),
+            patch.object(
+                cache, "target_device_capability", lambda device: hardware["capability"]
+            ),
+            patch.object(cache, "device_num_sm", lambda device: hardware["sm"]),
+        ):
+            key = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            self.assertIsNotNone(key)
+            self.assertEqual(
+                cache.compiled_kernel_cache_key(kernel, (x, 2), signature), key
+            )
+            hardware["sm"] = 114
+            fewer_sms = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            hardware["capability"] = (8, 0)
+            other_arch = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            self.assertEqual(len({key, fewer_sms, other_arch}), 3)
+            # An unresolvable CUDA capability is a miss, never an exception.
+            hardware["capability"] = None
+            self.assertIsNone(
+                cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            )
+        cpu_key = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+        self.assertIsNotNone(cpu_key)
+        self.assertNotEqual(cpu_key, key)
 
     @parametrize("skip", ["disabled", "descriptor", "skip_cache"])
     def test_ineligible_configs_use_codegen(self, skip: str) -> None:

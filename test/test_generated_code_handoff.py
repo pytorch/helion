@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import torch
 
+from test.test_generated_code_cache import _runner
+
 import helion
 from helion._compiler.backend import Backend
 from helion._testing import TestCase
@@ -102,7 +104,7 @@ class TestGeneratedCodeHandoff(TestCase):
         with patch.object(
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
-            bound = self._kernel().bind((x,))
+            bound = _runner(self._kernel(), (x,))
         self.assertNotIsInstance(bound, BoundKernel)
         return bound
 
@@ -113,7 +115,7 @@ class TestGeneratedCodeHandoff(TestCase):
         with patch.object(
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
-            warm = self._kernel().bind((x,))
+            warm = _runner(self._kernel(), (x,))
             self.assertEqual(warm.autotune((x,), force=False), self.config)
             torch.testing.assert_close(warm(x), x + 1)
         self.assertNotIsInstance(warm, BoundKernel)
@@ -164,7 +166,7 @@ class TestGeneratedCodeHandoff(TestCase):
         with patch.object(
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
-            cached = self._kernel().bind((x,))
+            cached = _runner(self._kernel(), (x,))
         self.assertNotIsInstance(cached, BoundKernel)
         search = self._select(cached, (x,))
         point = HandoffPoint(

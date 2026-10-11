@@ -203,6 +203,11 @@ def load_cached_kernel(
     if schema is None:
         return None
     guards = tuple(cast("list[list[object]]", schema["guards"]))
+    if cache_key is not None and kernel._published_guards.get(signature) != guards:
+        # Another binding already published this signature's schema with
+        # different guards (or ones the cache cannot serialize). The published
+        # schema is authoritative; equal results would not make it the same.
+        return None
     extractors = tuple(_guard_extractor(guard) for guard in guards)
     compiler_seed_extractors = tuple(
         _CompilerSeedSpecializationExtractor(
@@ -220,8 +225,6 @@ def load_cached_kernel(
         cache_key.extra_results != extra_results
         or cache_key.compiler_seed_results != compiler_seed_results
     ):
-        # Another binding already published this signature's schema, and the
-        # saved guards disagree with it. The published schema is authoritative.
         return None
     artifact = load_compiled_kernel(
         binding_variant_key(artifact_key, schema, extra_results, compiler_seed_results)
@@ -577,10 +580,10 @@ class _CachedBoundKernel(Generic[_R]):
         **kwargs: object,
     ) -> Config:
         normalized_args = self.kernel.normalize_args(*args)
-        if not self._is_current() or self.kernel.bind(normalized_args) is not self:
-            return self.kernel.bind(normalized_args).autotune(
-                normalized_args, force=force, **kwargs
-            )
+        # A delegate, a reset or capture rebinds to another binding.
+        bound = self.kernel._dispatch_bind(normalized_args)
+        if bound is not self:
+            return bound.autotune(normalized_args, force=force, **kwargs)
         if (
             force
             or self.settings.force_autotune
@@ -599,7 +602,7 @@ class _CachedBoundKernel(Generic[_R]):
             # access or a different winner naturally materializes the delegate.
             self.settings.check_autotuning_disabled()
             config = self.settings.autotuner_fn(
-                self.kernel.bind(normalized_args), normalized_args
+                cast("BoundKernel[_R]", self), normalized_args
             ).autotune(skip_cache=False)
         self.set_config(config)
         return config
@@ -644,7 +647,7 @@ class _CachedBoundKernel(Generic[_R]):
         if len(args) != self.kernel._num_params:
             args = self.kernel.normalize_args(*args)
         if not self._is_current():
-            return self.kernel.bind(args)(*args)
+            return self.kernel._dispatch_bind(args)(*args)
         if (
             (prepared := self._direct_prepared_call) is not None
             and prepared.matches(self.kernel, args)
@@ -656,7 +659,7 @@ class _CachedBoundKernel(Generic[_R]):
             or self._compiler_seed_specialization_extractors
         ):
             # As in BoundKernel.__call__, direct calls revalidate value guards.
-            rebound = self.kernel.bind(args)
+            rebound = self.kernel._dispatch_bind(args)
             if rebound is not self:
                 return rebound(*args)
         if self._run is None:
@@ -666,7 +669,7 @@ class _CachedBoundKernel(Generic[_R]):
                 # set_config() chose a config this runner did not save.
                 self._materialize(args).set_config(self._config)
         if not self._is_current() or (run := self._run) is None:
-            return self.kernel.bind(args)(*args)
+            return self.kernel._dispatch_bind(args)(*args)
         result = run(*args)
         self._prepare_direct_call(args)
         return result

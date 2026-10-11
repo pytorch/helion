@@ -20,15 +20,16 @@ class TestGeneratedCodeEviction(TestCase):
         root = self._test_stack.enter_context(tempfile.TemporaryDirectory())
         self._test_stack.enter_context(
             patch.dict(
-                "os.environ",
-                {
-                    "HELION_CACHE_DIR": root,
-                    "HELION_SKIP_CACHE": "0",
-                    "HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": "2048",
-                },
+                "os.environ", {"HELION_CACHE_DIR": root, "HELION_SKIP_CACHE": "0"}
             )
         )
+        # Tests pin the budget; the parsed one is restored for the next test.
+        self.parse_limit = cache._cache_limit
+        self._test_stack.enter_context(self._limit(2048))
         self.root = Path(root) / "generated_code"
+
+    def _limit(self, limit: int):
+        return patch.object(cache, "_cache_limit", lambda: limit)
 
     def test_sources_and_bindings_share_the_byte_budget(self) -> None:
         config = helion.Config(block_sizes=[32])
@@ -46,9 +47,7 @@ class TestGeneratedCodeEviction(TestCase):
         binding = self.root / "bindings" / "binding.json"
         os.utime(binding, ns=(1, 1))
         size = (self.root / f"{source_key}.json").stat().st_size
-        with patch.dict(
-            "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": str(2 * size)}
-        ):
+        with self._limit(2 * size):
             cache.save_generated_code("second", source)
         self.assertFalse(binding.exists())
         self.assertIsNone(cache.load_compiled_kernel("binding"))
@@ -63,9 +62,7 @@ class TestGeneratedCodeEviction(TestCase):
         old = self.root / "old.json"
         size = old.stat().st_size
         os.utime(old, ns=(1, 1))
-        with patch.dict(
-            "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": str(2 * size)}
-        ):
+        with self._limit(2 * size):
             cache.save_generated_code("second", source)
             cache.save_generated_code("third", source)
             self.assertIsNone(cache.load_generated_code("old"))
@@ -78,9 +75,7 @@ class TestGeneratedCodeEviction(TestCase):
                 sum(path.stat().st_size for path in self.root.rglob("*.json")),
                 2 * size,
             )
-        with patch.dict(
-            "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": "0"}
-        ):
+        with self._limit(0):
             cache.save_generated_code("disabled", source)
             self.assertIsNone(cache.load_generated_code("disabled"))
 
@@ -95,22 +90,53 @@ class TestGeneratedCodeEviction(TestCase):
         self.assertEqual(cache.load_generated_code("existing"), source)
         with (
             FileLock(self.root / ".lock"),
-            self.assertLogs(cache.log, level="WARNING"),
+            patch.object(
+                cache, "FileLock", lambda path, timeout: FileLock(path, timeout=0.1)
+            ),
+            self.assertLogs(cache.log, level="DEBUG") as logs,
         ):
             cache.save_generated_code("locked", source)
         self.assertIsNone(cache.load_generated_code("locked"))
-        with (
-            patch.dict(
-                "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": "-1"}
-            ),
-            self.assertLogs(cache.log, level="WARNING"),
-        ):
-            cache.save_generated_code("invalid", source)
-        self.assertIsNone(cache.load_generated_code("invalid"))
+        # A lock held by another writer is routine, not a warning.
+        self.assertEqual([record.levelname for record in logs.records], ["DEBUG"])
+        self.assertIn("lock timeout", logs.output[0])
         self.assertEqual(
             {path.name for path in self.root.iterdir()} - {".lock", ".size"},
             {"existing.json"},
         )
+
+    def test_identical_entry_is_not_rewritten(self) -> None:
+        source = "def cached():\n    return 1\n"
+        cache.save_generated_code("entry", source)
+        entry = self.root / "entry.json"
+        os.utime(entry, ns=(1, 1))
+        with (
+            patch.object(cache.os, "replace", side_effect=AssertionError("rewrite")),
+            patch.object(cache, "FileLock", side_effect=AssertionError("locked")),
+        ):
+            cache.save_generated_code("entry", source)
+        self.assertGreater(entry.stat().st_mtime_ns, 1)
+        self.assertEqual(cache.load_generated_code("entry"), source)
+
+    def test_budget_is_parsed_once_and_malformed_values_warn_once(self) -> None:
+        parse_limit = self.parse_limit
+        self.addCleanup(parse_limit.cache_clear)
+        parse_limit.cache_clear()
+        with patch.dict(
+            "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": "4096"}
+        ):
+            self.assertEqual(parse_limit(), 4096)
+        for value in ("-1", "many"):
+            parse_limit.cache_clear()
+            with (
+                patch.dict(
+                    "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": value}
+                ),
+                self.assertLogs(cache.log, level="WARNING") as logs,
+            ):
+                for _ in range(2):
+                    self.assertEqual(parse_limit(), cache._DEFAULT_CACHE_LIMIT)
+            self.assertEqual(len(logs.output), 1)
 
     def _json_bytes(self) -> int:
         return sum(path.stat().st_size for path in self.root.rglob("*.json"))
@@ -123,10 +149,7 @@ class TestGeneratedCodeEviction(TestCase):
         cache.save_generated_code("first", source)
         size = (self.root / "first.json").stat().st_size
         with (
-            patch.dict(
-                "os.environ",
-                {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": str(3 * size)},
-            ),
+            self._limit(3 * size),
             patch.object(
                 cache, "_evict_entries", side_effect=cache._evict_entries
             ) as evict,
@@ -147,22 +170,21 @@ class TestGeneratedCodeEviction(TestCase):
             cache.save_generated_code(name, source)
         size = (self.root / "first.json").stat().st_size
         index = self.root / ".size"
-        with patch.dict(
-            "os.environ", {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": str(3 * size)}
-        ):
+        with self._limit(3 * size):
             # A missing or corrupt index is rebuilt from the directory.
-            for contents in (None, "corrupt", "-5 0"):
+            for number, contents in enumerate((None, "corrupt", "-5 0")):
                 if contents is None:
                     index.unlink()
                 else:
                     index.write_text(contents)
-                cache.save_generated_code("third", source)
+                cache.save_generated_code(f"rebuilt{number}", source)
                 self.assertEqual(self._indexed_bytes(), 3 * size)
+                self.assertEqual(self._json_bytes(), 3 * size)
             # Manual removal leaves an overestimate, corrected by the next scan.
-            (self.root / "first.json").unlink()
+            next(self.root.glob("*.json")).unlink()
             cache.save_generated_code("fourth", source)
             self.assertEqual(self._indexed_bytes(), 3 * size)
-            self.assertEqual(cache.load_generated_code("second"), source)
+            self.assertEqual(cache.load_generated_code("fourth"), source)
             # A failed publication also leaves an overestimate.
             with (
                 self.assertLogs(cache.log, level="WARNING"),
@@ -187,10 +209,7 @@ class TestGeneratedCodeEviction(TestCase):
         cache.save_generated_code("probe", source)
         size = (self.root / "probe.json").stat().st_size
         with (
-            patch.dict(
-                "os.environ",
-                {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": str(5 * size)},
-            ),
+            self._limit(5 * size),
             patch.object(cache, "FileLock", lambda path, timeout: FileLock(path)),
             ThreadPoolExecutor(max_workers=4) as pool,
         ):
@@ -220,10 +239,7 @@ class TestGeneratedCodeEviction(TestCase):
         self.assertEqual(
             cache.load_compiled_kernel("binding"), (config, config, source)
         )
-        with patch.dict(
-            "os.environ",
-            {"HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES": str(self._json_bytes())},
-        ):
+        with self._limit(self._json_bytes()):
             cache.save_generated_code("new", source)
         self.assertIsNone(cache.load_generated_code("unused"))
         self.assertEqual(

@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import torch
 
+from test.test_generated_code_cache import _runner
+
 import helion
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -116,7 +118,7 @@ class TestGeneratedCodePolicy(RefEagerTestDisabled, TestCase):
         with patch.object(
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
-            fresh = self._kernel(config=self.config).bind((self.x,))
+            fresh = _runner(self._kernel(config=self.config), (self.x,))
             self.assertEqual(fresh.autotune((self.x,), force=False), self.config)
         self.assertEqual(self.sources[0], self.sources[1])
         torch.testing.assert_close(fresh(self.x), self.x + 1)

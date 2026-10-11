@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import dis
 import enum
+import functools
 import hashlib
 import inspect
 import json
@@ -26,8 +27,10 @@ from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 
 from .._argument_device import _find_argument_device
+from .._compat import device_num_sm
 from .._compat import get_device_name
 from .._compat import supports_torch_compile_fusion
+from .._compat import target_device_capability
 from .._utils import counters
 from .._utils import indexing_uses_tensor_descriptor
 from ..autotuner.base_cache import helion_key
@@ -65,6 +68,28 @@ _UNCACHEABLE = object()
 # Running byte total of the JSON entries, guarded by the writers' lock.
 _SIZE_INDEX = ".size"
 _SIZE_INDEX_RESCAN_WRITES = 1024
+_DEFAULT_CACHE_LIMIT = 1 << 30
+
+
+@functools.cache
+def _cache_limit() -> int:
+    """Byte budget shared by every entry, read once from the environment."""
+    value = os.environ.get("HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES")
+    if value is None or not value.strip():
+        return _DEFAULT_CACHE_LIMIT
+    try:
+        limit = int(value)
+    except ValueError:
+        limit = -1
+    if limit < 0:
+        log.warning(
+            "HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES must be a nonnegative "
+            "integer, got %r; using %d",
+            value,
+            _DEFAULT_CACHE_LIMIT,
+        )
+        return _DEFAULT_CACHE_LIMIT
+    return limit
 
 
 def _code_key(code: types.CodeType) -> tuple[object, ...]:
@@ -302,13 +327,20 @@ def compiled_kernel_cache_key(
     if settings is _UNCACHEABLE:
         return None
     device = _find_argument_device(args)
-    hardware = (
-        get_device_name(device)
-        if device is not None and device.type in {"cuda", "xpu"}
-        else str(device)
-    )
+    hardware: tuple[object, ...]
+    if device is not None and device.type == "cuda":
+        # The source key bakes in the compute capability and SM count; devices
+        # sharing a name can differ in both (partitioned or cloud SKUs).
+        capability = target_device_capability(device)
+        if capability is None:
+            return None
+        hardware = (get_device_name(device), capability, device_num_sm(device))
+    elif device is not None and device.type == "xpu":
+        hardware = (get_device_name(device),)
+    else:
+        hardware = (str(device),)
     payload = (
-        "helion-bound-source-v2",
+        "helion-bound-source-v3",
         sys.version_info[:3],
         helion_key(),
         torch_key_wrapper(),
@@ -489,6 +521,9 @@ def save_binding(
     # the generated code was not compiled for, so the binding is not saved.
     if None in guards or bound.kernel._published_guards.get(signature) != guards:
         return
+    # One schema per signature, and the last writer wins. Should bindings of
+    # one signature ever save different guard lists, the earlier variants
+    # (keyed by the schema JSON) become unreachable until eviction removes them.
     schema: dict[str, list[object]] = {
         "guards": list(guards),
         "compiler_seed_facts": [
@@ -618,19 +653,20 @@ def _save_entry(path: Path, entry: dict[str, object]) -> None:
         return
     temporary: Path | None = None
     try:
-        limit = int(
-            os.environ.get("HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES", str(1 << 30))
-        )
-        if limit < 0:
-            raise ValueError("HELION_GENERATED_CODE_CACHE_MAX_SIZE_BYTES must be >= 0")
+        limit = _cache_limit()
         data = json.dumps(entry).encode("utf-8")
         if len(data) > limit:
+            return
+        if _file_contents(path) == data:
+            # Workers starting together write the same entry; a hit's mtime
+            # refresh is all the existing entry needs.
+            _mark_used(path)
             return
         root = get_helion_cache_dir() / "generated_code"
         path.parent.mkdir(parents=True, exist_ok=True)
         # Serialize publication and eviction across threads/processes. Readers
         # need no lock: an evicted artifact is an ordinary cache miss.
-        with FileLock(root / ".lock", timeout=1):
+        with FileLock(root / ".lock", timeout=5):
             _reserve_space(root, path, len(data), limit)
             with tempfile.NamedTemporaryFile(
                 mode="wb", dir=path.parent, delete=False
@@ -638,7 +674,10 @@ def _save_entry(path: Path, entry: dict[str, object]) -> None:
                 temporary = Path(output.name)
                 output.write(data)
             os.replace(temporary, path)
-    except (OSError, Timeout, ValueError) as error:
+    except Timeout:
+        # Another writer holds the lock; the entry is usually already published.
+        log.debug("Skipped generated code cache entry %s: lock timeout", path)
+    except OSError as error:
         log.warning("Could not write generated code cache entry %s: %s", path, error)
     finally:
         if temporary is not None:
@@ -653,6 +692,13 @@ def _file_size(path: Path) -> int:
         return path.stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def _file_contents(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
 def _reserve_space(root: Path, target: Path, incoming: int, limit: int) -> None:

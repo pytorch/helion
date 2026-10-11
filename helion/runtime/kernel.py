@@ -1583,6 +1583,15 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
+        bound_kernel = self._dispatch_bind(args)
+        if bound_kernel._is_disk_runner:
+            # Calls keep the generated code cache's disk runner; the public
+            # binding is an ordinary one with a frontend.
+            bound_kernel = bound_kernel._materialize(self.normalize_args(*args))
+        return bound_kernel
+
+    def _dispatch_bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
+        """Bind for a call, where a disk runner serves in place of a binding."""
         # Dynamo executes bind while capturing the call but cannot trace an RLock.
         # Capture only needs an independent host function and compile environment.
         if torch.compiler.is_compiling():
@@ -2267,8 +2276,8 @@ class Kernel(Generic[_R]):
             result = auto_capture_call(self, args)
             if result is not RUN_NORMAL:
                 return cast("_R", result)
-            return self.bind(args)(*args)
-        bound = self.bind(args)
+            return self._dispatch_bind(args)(*args)
+        bound = self._dispatch_bind(args)
         result = bound(*args)
         if is_compiling:
             return result
@@ -2348,6 +2357,10 @@ class Kernel(Generic[_R]):
 class BoundKernel(_AutotunableKernel, Generic[_R]):
     # True for cached_kernel's disk runners, which have no frontend env.
     _is_disk_runner: bool = False
+
+    def _materialize(self, args: tuple[object, ...] | None = None) -> BoundKernel[_R]:
+        """The ordinary binding behind this one (disk runners compile one)."""
+        return self
 
     @property
     def _serialized_guards(self) -> tuple[list[object] | None, ...] | None:
@@ -2656,12 +2669,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if input_key is None:
                 input_key = binding_input_key(kernel, args)
             if input_key is not None:
-                guards: list[list[object] | None] = []
-                extractors = self._specialize_extra(guards)
+                specializations = self._specialization_guards()
                 self._generated_code_input_key = (
                     self._base_spec_key,
-                    tuple(guards),
-                    tuple(extractor(args) for extractor in extractors),
+                    tuple(guard for _, guard in specializations),
+                    tuple(extractor(args) for extractor, _ in specializations),
                     self._compiler_seed_specialization_results,
                     input_key,
                 )
@@ -3281,19 +3293,24 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.format_kernel_decorator(repro_config, self.settings)
         ] = 1
 
-    def _specialize_extra(
-        self, guards: list[list[object] | None] | None = None
-    ) -> list[Callable[[Sequence[object]], Hashable]]:
+    def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
         Returns a list of functions that will be called to generate extra specialization keys.
         This is used to specialize on the values hl.specialize()'ed arguments.
 
-        Args:
-            guards: If given, receives a serializable description of each
-                extractor (``None`` if it has none) for the generated code cache.
-
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
+        """
+        return [extractor for extractor, _ in self._specialization_guards()]
+
+    def _specialization_guards(
+        self,
+    ) -> list[tuple[Callable[[Sequence[object]], Hashable], list[object] | None]]:
+        """Each extra specialization extractor with its serialized guard.
+
+        The serialized guard lets the generated code cache rebuild the
+        extractor in a later process; it is ``None`` for extractors it cannot
+        serialize.
         """
         tensor_descriptor_layout_guards = self.env.tensor_descriptor_layout_guards
         tensor_descriptor_alignment_guards = getattr(
@@ -3379,16 +3396,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
-        extractors: list[Callable[[Sequence[object]], Hashable]] = []
+        extractors: list[
+            tuple[Callable[[Sequence[object]], Hashable], list[object] | None]
+        ] = []
         extracted_strides: set[TensorPropertySource] = set()
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
             extractor = make_extractor(source)
             if isinstance(source, TensorPropertySource):
                 extractor = _PreparedMetadataSpecializationExtractor(extractor)
-            extractors.append(extractor)
-            if guards is not None:
-                guards.append(source_guard(source, arg_name_to_index))
+            extractors.append((extractor, source_guard(source, arg_name_to_index)))
             if (
                 isinstance(source, TensorPropertySource)
                 and source.prop == TensorProperty.STRIDE
@@ -3399,10 +3416,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if source in extracted_strides:
                 continue
             extractors.append(
-                _PreparedMetadataSpecializationExtractor(make_extractor(source))
+                (
+                    _PreparedMetadataSpecializationExtractor(make_extractor(source)),
+                    source_guard(source, arg_name_to_index),
+                )
             )
-            if guards is not None:
-                guards.append(source_guard(source, arg_name_to_index))
         candidate_configs: tuple[Config, ...] | None
         if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
             implicit_config = self._fixed_config_for_td_layout_guards()
@@ -3510,12 +3528,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     all(int(size) < 2**31 for size in tensor.size()),
                 )
 
+            tensor_guard = source_guard(source, arg_name_to_index)
             extractors.append(
-                _PreparedMetadataSpecializationExtractor(td_layout_extractor)
-            )
-            if guards is not None:
-                tensor_guard = source_guard(source, arg_name_to_index)
-                guards.append(
+                (
+                    _PreparedMetadataSpecializationExtractor(td_layout_extractor),
                     None
                     if tensor_guard is None or self.env.backend_name != "triton"
                     else [
@@ -3524,8 +3540,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         guard.ndim,
                         guard.element_size,
                         extent_cap,
-                    ]
+                    ],
                 )
+            )
 
         for source, guard in sorted(
             tensor_descriptor_alignment_guards.items(),
@@ -3550,18 +3567,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
 
             # Prepared metadata guards do not cover base pointers.
-            extractors.append(td_alignment_extractor)
-            if guards is not None:
-                tensor_guard = source_guard(source, arg_name_to_index)
-                guards.append(
+            tensor_guard = source_guard(source, arg_name_to_index)
+            extractors.append(
+                (
+                    td_alignment_extractor,
                     None
                     if tensor_guard is None
                     else [
                         "td_alignment",
                         tensor_guard,
                         guard.requires_zero_storage_offset,
-                    ]
+                    ],
                 )
+            )
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
@@ -3570,16 +3588,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 make_extractor(source) for source in specialization.sources
             )
 
+            # Runtime classifiers inspect storage; no serialized guard rebuilds them.
             extractors.append(
-                _RuntimeInputSpecializationExtractor(
-                    source_extractors,
-                    specialization.classifier,
-                    frozenset(specialization.reusable_tensor_properties),
-                    key,
+                (
+                    _RuntimeInputSpecializationExtractor(
+                        source_extractors,
+                        specialization.classifier,
+                        frozenset(specialization.reusable_tensor_properties),
+                        key,
+                    ),
+                    None,
                 )
             )
-            if guards is not None:
-                guards.append(None)
         return extractors
 
     def _publish_guarded_input_facts(self) -> None:
@@ -3907,7 +3927,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self._cache_managed
             and self._reset_generation != self.kernel._reset_generation
         ):
-            return self.kernel.bind(args)(*args)
+            return self.kernel._dispatch_bind(args)(*args)
         is_compiling = torch.compiler.is_compiling()
         if (
             not is_compiling
@@ -3950,11 +3970,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 new_compiler_seed_device
                 or compiler_seed_results != self._compiler_seed_specialization_results
             ):
-                rebound = self.kernel.bind(args)
+                rebound = self.kernel._dispatch_bind(args)
                 if rebound is not self:
                     return rebound(*args)
         if self._cache_managed and self.kernel._has_specialization_extras:
-            rebound = self.kernel.bind(args)
+            rebound = self.kernel._dispatch_bind(args)
             if rebound is not self:
                 return rebound(*args)
 
@@ -3963,7 +3983,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # Another caller may have discovered a late specialization while
                 # this caller waited for the first compile.
                 if self._cache_managed and self.kernel._has_specialization_extras:
-                    rebound = self.kernel.bind(args)
+                    rebound = self.kernel._dispatch_bind(args)
                     if rebound is not self:
                         return rebound(*args)
                 if self._run is None:

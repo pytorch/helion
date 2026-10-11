@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import operator
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ from unittest.mock import patch
 import torch
 
 from test.test_generated_code_binding import _runtime_scale
+from test.test_generated_code_cache import _runner
 
 import helion
 from helion._testing import TestCase
@@ -21,6 +24,7 @@ from helion.autotuner.base_search import BaseAutotuner
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
 from helion.runtime.cached_kernel import _CachedBoundKernel
+from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
@@ -113,7 +117,7 @@ class TestGeneratedCodeDispatch(TestCase):
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
             torch.testing.assert_close(kernel(x, 2.0), x * 2)
-        runner = kernel.bind((x, 2.0))
+        runner = _runner(kernel, (x, 2.0))
         self.assertIsInstance(runner, _CachedBoundKernel)
         prepared = kernel._prepared_call
         self.assertIsNotNone(prepared)
@@ -149,7 +153,7 @@ class TestGeneratedCodeDispatch(TestCase):
         ):
             torch.testing.assert_close(kernel(x, 2), x * 2)
             torch.testing.assert_close(kernel(x, 2), x * 2)
-        runner = kernel.bind((x, 2))
+        runner = _runner(kernel, (x, 2))
         self.assertIsInstance(runner, _CachedBoundKernel)
         with (
             patch.object(Kernel, "_bind", side_effect=AssertionError("bind")),
@@ -205,7 +209,7 @@ class TestGeneratedCodeDispatch(TestCase):
     def test_runner_guards_match_frontend_extractors(self) -> None:
         x = torch.ones(8, 32)
         self._kernel(_specialized_rows)(x, 2)
-        runner = self._kernel(_specialized_rows).bind((x, 2))
+        runner = _runner(self._kernel(_specialized_rows), (x, 2))
         self.assertIsInstance(runner, _CachedBoundKernel)
         native = self._kernel(_specialized_rows, generated_code_cache=False).bind(
             (x, 2)
@@ -222,6 +226,85 @@ class TestGeneratedCodeDispatch(TestCase):
                 [extractor(args) for extractor in native_extractors],
             )
 
+    def test_public_bind_returns_binding_while_calls_skip_frontend(self) -> None:
+        x = torch.ones(16)
+        self._kernel()(x, 2.0)
+        kernel = self._kernel()
+        with patch.object(
+            KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+        ):
+            for scale in (2.0, 3.0):
+                torch.testing.assert_close(kernel(x, scale), x * scale)
+            self.assertIsInstance(_runner(kernel, (x, 2.0)), _CachedBoundKernel)
+        with self._frontend_count() as compile_fn:
+            bound = kernel.bind((x, 2.0))
+        # bind() hands out a binding with a frontend, compiled once.
+        self.assertIs(type(bound), BoundKernel)
+        self.assertEqual(compile_fn.call_count, 1)
+        self.assertIsNotNone(bound.host_function)
+        with self._frontend_count() as compile_fn:
+            self.assertIs(kernel.bind((x, 3.0)), bound)
+            self.assertIs(_runner(kernel, (x, 3.0)), bound)
+            torch.testing.assert_close(bound(x, 3.0), x * 3)
+            torch.testing.assert_close(kernel(x, 4.0), x * 4)
+        self.assertEqual(compile_fn.call_count, 0)
+
+    def test_published_schema_guards_must_match_saved_guards(self) -> None:
+        # A saved schema whose guards differ from the ones a native binding
+        # published for the signature is a miss even when both guard lists
+        # evaluate to the same results on the lookup inputs.
+        x = torch.ones(32, 32)
+        self._kernel(_specialized_rows)(x, 2)
+        kernel = self._kernel(_specialized_rows)
+        signature = kernel._base_specialization_key((x, 2))
+        with self._frontend_count() as compile_fn:
+            # A native binding publishes the frontend's guards first.
+            y = torch.ones(64, 64)
+            torch.testing.assert_close(kernel(y, 2), y * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+            self.assertEqual(
+                kernel._published_guards[signature],
+                (["size", ["arg", 0], 1], ["arg", 1]),
+            )
+            # Save x's binding again under guards on x.size(0) instead of
+            # x.size(1): the same results for x, a different schema.
+            key = cache.compiled_kernel_cache_key(kernel, (x, 2), signature)
+            assert key is not None
+            schema = cache.load_binding_schema(key)
+            assert schema is not None
+            schema["guards"] = [["size", ["arg", 0], 0], ["arg", 1]]
+            cache._save_entry(
+                cache._schema_path(key),
+                {
+                    "payload": schema,
+                    "sha256": hashlib.sha256(
+                        json.dumps(schema, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+            (native_key,) = kernel._bound_kernels
+            cache.save_compiled_kernel(
+                cache.binding_variant_key(
+                    key, schema, (32, 2), native_key.compiler_seed_results
+                ),
+                _CONFIG,
+                _CONFIG,
+                json.loads(
+                    next(
+                        (self.root / "generated_code" / "bindings").glob("*.json")
+                    ).read_text()
+                )["payload"]["source_key"],
+            )
+            # Equal results under different guards do not revive the runner.
+            torch.testing.assert_close(kernel(x, 2), x * 2)
+            self.assertEqual(compile_fn.call_count, 2)
+            self.assertFalse(
+                any(bound._is_disk_runner for bound in kernel._bound_kernels.values())
+            )
+            z = torch.ones(4, 32)
+            torch.testing.assert_close(kernel(z, 2), z * 2)
+            self.assertEqual(compile_fn.call_count, 2)
+
     def test_baked_shape_guards_are_not_saved_and_rebind_runners(self) -> None:
         # A static_shapes=False compile bound at a size-1 dim bakes ``size == 1``
         # into its code and keys it as a guard fact the saved guards cannot
@@ -236,7 +319,7 @@ class TestGeneratedCodeDispatch(TestCase):
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
             torch.testing.assert_close(kernel(x, 2), x * 2)
-        runner = kernel.bind((x, 2))
+        runner = _runner(kernel, (x, 2))
         self.assertIsInstance(runner, _CachedBoundKernel)
         self.assertEqual(kernel._published_guards[signature], runner._serialized_guards)
         with self._frontend_count() as compile_fn:
@@ -263,7 +346,7 @@ class TestGeneratedCodeDispatch(TestCase):
     def test_unknown_attributes_do_not_compile(self) -> None:
         x = torch.ones(16)
         self._kernel()(x, 2.0)
-        runner = self._kernel().bind((x, 2.0))
+        runner = _runner(self._kernel(), (x, 2.0))
         with self._frontend_count() as compile_fn:
             with self.assertRaises(AttributeError):
                 runner.not_a_binding_attribute  # noqa: B018
@@ -331,8 +414,11 @@ with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("
         assert isinstance(kernel._prepared_call.bound, module._CachedBoundKernel)
 # The saved bindings cover the same row classes as the cold process.
 assert len(kernel._bound_kernels) == int(sys.argv[3]), kernel._bound_kernels
+# The public binding is an ordinary one; it compiles the frontend once here.
 bound = kernel.bind((x,))
+assert type(bound) is module.BoundKernel, type(bound)
 torch.testing.assert_close(bound(x), x + 1)
+torch.testing.assert_close(kernel(x), x + 1)
 with patch.object(module.Kernel, "_bind", side_effect=AssertionError("bind")):
     torch.testing.assert_close(kernel(x), x + 1)
     torch.testing.assert_close(bound(x), x + 1)

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from test.test_generated_code_cache import _bound
+from test.test_generated_code_cache import _runner
 from test.test_generated_code_cache import _source_loader
 
 import helion
@@ -148,7 +149,7 @@ class TestGeneratedCodeLegacyCapture(_GeneratedCodeBindingTestCase):
         with patch.object(
             KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
         ):
-            warm = self._kernel().bind((x, 2.0))
+            warm = _runner(self._kernel(), (x, 2.0))
             self.assertNotIsInstance(warm, BoundKernel)
             torch.testing.assert_close(warm(x, 2.0), x * 2)
 
