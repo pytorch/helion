@@ -640,36 +640,26 @@ class ReductionRoller:
         reductions over ``self.rdim`` into one loop sharing a single load.
         Nodes move only where data, memory, and side-effect ordering allow."""
 
-        def is_store(node: torch.fx.Node) -> bool:
-            return node.op == "call_function" and (
-                node.target is store or node.target in _ATOMIC_OPS
-            )
-
-        def is_load(node: torch.fx.Node) -> bool:
-            return node.op == "call_function" and node.target is load
-
-        def writes_local_allocation(node: torch.fx.Node) -> bool:
-            target = node.args[0]
-            if not isinstance(target, torch.fx.Node):
-                return False
-            val = target.meta.get("val")
-            if not isinstance(val, torch.Tensor):
-                return False
-            origin = HostFunction.current().tensor_to_origin.get(val)
-            return origin is not None and not origin.is_argument()
-
         def is_deferrable(node: torch.fx.Node) -> bool:
             if node.op != "call_function" or self.should_go_in_inner_graph(node):
                 return False
-            if is_store(node):
-                return writes_local_allocation(node)
-            return not (node.is_impure() or is_load(node))
+            if node.target is store or node.target in _ATOMIC_OPS:
+                target = node.args[0]
+                if not isinstance(target, torch.fx.Node):
+                    return False
+                val = target.meta.get("val")
+                if not isinstance(val, torch.Tensor):
+                    return False
+                origin = HostFunction.current().tensor_to_origin.get(val)
+                return origin is not None and not origin.is_argument()
+            return not (node.is_impure() or node.target is load)
 
         order: list[torch.fx.Node] = []
         deferred: list[torch.fx.Node] = []
         deferred_set: set[torch.fx.Node] = set()
 
         def flush_through(cutoff: int) -> None:
+            # Preserve ordering among deferred nodes when releasing a dependency.
             order.extend(deferred[: cutoff + 1])
             del deferred[: cutoff + 1]
             deferred_set.intersection_update(deferred)
@@ -686,11 +676,17 @@ class ReductionRoller:
                 if node.op != "call_function" or node.is_impure():
                     flush_through(len(deferred) - 1)
                 else:
-                    load_here = is_load(node)
+                    is_load = node.target is load
                     inputs = set(node.all_input_nodes)
                     cutoff = -1
-                    for i, d in enumerate(deferred):
-                        if d in inputs or (load_here and is_store(d)):
+                    for i, deferred_node in enumerate(deferred):
+                        if deferred_node in inputs or (
+                            is_load
+                            and (
+                                deferred_node.target is store
+                                or deferred_node.target in _ATOMIC_OPS
+                            )
+                        ):
                             cutoff = i
                     if cutoff >= 0:
                         flush_through(cutoff)
