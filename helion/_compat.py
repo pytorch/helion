@@ -521,23 +521,30 @@ def num_compute_units() -> int:
     return 128
 
 
-@functools.cache
 def supports_amd_cdna_tunables() -> bool:
-    if not is_hip():
-        return False
+    # Keep is_hip() outside the cache: tests patch is_hip/_is_hip to model
+    # other targets, and a result cached under such a patch would leak into
+    # every later test in the process.
+    return is_hip() and _is_amd_cdna()
+
+
+@functools.cache
+def _is_amd_cdna() -> bool:
+    # CDNA architectures are gfx908 and above but less than gfx1000
+    # Reference: https://llvm.org/docs/AMDGPUUsage.html
+    match = re.match(r"gfx([0-9a-f]{3})", _amd_base_arch() or "")
+    return match is not None and int(match.group(1), 16) >= 0x908
+
+
+@functools.cache
+def _amd_base_arch() -> str | None:
+    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         arch = getattr(props, "gcnArchName", None)
-        if arch is None:
-            return False
-        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
-        # CDNA architectures are gfx908 and above but less than gfx1000
-        # Reference: https://llvm.org/docs/AMDGPUUsage.html
-        base_arch = arch.split(":")[0]
-        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
-        return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
-        return False
+        return None
+    return None if arch is None else arch.split(":")[0]
 
 
 def device_num_sm(device: torch.device | int | None = None) -> int:
@@ -599,7 +606,6 @@ def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
         return {}
 
 
-@functools.cache
 def supports_tf32_precision_on_amd() -> bool:
     """Check if the AMD GPU supports TF32 (XF32) precision.
 
@@ -608,19 +614,8 @@ def supports_tf32_precision_on_amd() -> bool:
     only support 'ieee' precision for dot operations.
     Reference: triton/backends/amd/compiler.py only enables tf32 for gfx942.
     """
-    if not is_hip():
-        return False
-    try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        arch = getattr(props, "gcnArchName", None)
-        if arch is None:
-            return False
-        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
-        base_arch = arch.split(":")[0]
-        # Only gfx942 (CDNA3 / MI300) supports TF32 in Triton's HIP backend
-        return base_arch == "gfx942"
-    except Exception:
-        return False
+    # is_hip() stays uncached for the same reason as in supports_amd_cdna_tunables.
+    return is_hip() and _amd_base_arch() == "gfx942"
 
 
 def shape_env_size_hint(
