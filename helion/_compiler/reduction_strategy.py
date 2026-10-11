@@ -1224,12 +1224,15 @@ class PersistentReductionStrategy(ReductionStrategy):
         # Skip the mask when RDIM_SIZE == numel (no padding needed).
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
+        mask_numel = numel
+        if env.backend.name != "cute" and isinstance(extent, sympy.Expr):
+            mask_numel = env.specialize_expr(extent)
         needs_mask = True
         # Guard numel > 0: on PyTorch 2.9, next_power_of_2(0) returns 0
         # (the n <= 0 guard was added later), so static_rdim_size(0) == 0
         # would incorrectly skip the mask for zero-size reductions.
-        if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
-            needs_mask = env.backend.static_rdim_size(int(numel)) != int(numel)
+        if isinstance(mask_numel, (int, sympy.Integer)) and (n := int(mask_numel)) > 0:
+            needs_mask = env.backend.static_rdim_size(n) != n
         mask_var: str | None = (
             fn.new_var(f"mask_{block_index}", dce=True) if needs_mask else None
         )
@@ -2335,9 +2338,10 @@ class LoopedReductionStrategy(ReductionStrategy):
                     self._cute_reduction_lane_extent = (
                         self._cute_reduction_lane_extent // vec_width
                     )
-        if env.known_multiple(
-            env.block_sizes[block_index].numel, self._loop_block_size
-        ):
+        looped_numel = env.block_sizes[block_index].numel
+        if env.backend.name != "cute" and isinstance(looped_numel, sympy.Expr):
+            looped_numel = env.specialize_expr(looped_numel)
+        if env.known_multiple(looped_numel, self._loop_block_size):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
