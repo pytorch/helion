@@ -133,6 +133,57 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_root_tile_end_count_and_extent_with_begin(self):
+        # A root tile's end is absolute: the last tile ends at ``end`` and the
+        # tiles are counted from ``begin``.  The mean divides by the tile's
+        # extent, ``tile.end - tile.begin``.
+        @helion.kernel(autotune_effort="none")
+        def tile_meta_1d(x: torch.Tensor, begin: int, end: int) -> torch.Tensor:
+            out = torch.zeros([x.size(0), 4], device=x.device, dtype=x.dtype)
+            for tile in hl.tile(begin, end):
+                v = x[tile]
+                out[tile, 0] = v * 0 + tile.end
+                out[tile, 1] = v * 0 + tile.count
+                out[tile, 2] = v * 0 + tile.begin
+                out[tile, 3] = v - v.mean()
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def tile_meta_2d(x: torch.Tensor, begin: int, end: int) -> torch.Tensor:
+            out = torch.zeros([x.size(0), x.size(1), 4], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([begin, 0], [end, x.size(1)]):
+                v = x[tile_m, tile_n]
+                out[tile_m, tile_n, 0] = v * 0 + tile_m.end
+                out[tile_m, tile_n, 1] = v * 0 + tile_m.count
+                out[tile_m, tile_n, 2] = v * 0 + tile_m.begin
+                out[tile_m, tile_n, 3] = v - v.mean(0)[None, :]
+            return out
+
+        x = torch.randn([40, 4], device=DEVICE)
+        for begin, end in [(3, 14), (9, 30)]:
+            expected = torch.zeros([40, 4, 4], device=DEVICE)
+            starts = range(begin, end, 8)
+            for start in starts:
+                stop = min(start + 8, end)
+                rows = x[start:stop]
+                expected[start:stop, :, 0] = stop
+                expected[start:stop, :, 1] = len(starts)
+                expected[start:stop, :, 2] = start
+                expected[start:stop, :, 3] = rows - rows.mean(0)
+            _, result = code_and_output(
+                tile_meta_2d, (x, begin, end), block_sizes=[8, 4]
+            )
+            torch.testing.assert_close(result, expected)
+            x1 = x[:, 0].contiguous()
+            for start in starts:
+                stop = min(start + 8, end)
+                expected[start:stop, 0, 3] = x1[start:stop] - x1[start:stop].mean()
+            _, result = code_and_output(tile_meta_1d, (x1, begin, end), block_sizes=[8])
+            torch.testing.assert_close(result, expected[:, 0])
+
     def test_arange(self):
         @helion.kernel
         def arange(length: int, device: torch.device) -> torch.Tensor:
