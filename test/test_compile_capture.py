@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -138,6 +139,73 @@ class TestArgs:
 
         x = torch.empty(4)
         assert k.normalize_args(x) == (x, 1e-5)
+
+    def test_normalize_args_replays_cached_plans_like_signature_bind(self) -> None:
+        @helion.kernel()
+        def k(
+            x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5, scale: float = 1.0
+        ) -> torch.Tensor:
+            return x + y
+
+        x, y = torch.empty(4), torch.empty(4)
+        # The second round replays the per-call-shape plans cached by the first.
+        for _ in range(2):
+            assert k.normalize_args(x, y) == (x, y, 1e-5, 1.0)
+            assert k.normalize_args(x, y=y) == (x, y, 1e-5, 1.0)
+            assert k.normalize_args(x, y, scale=2.0, eps=1e-3) == (x, y, 1e-3, 2.0)
+            assert k.normalize_args(y=y, x=x) == (x, y, 1e-5, 1.0)
+            with pytest.raises(TypeError, match="missing a required argument: 'y'"):
+                k.normalize_args(x)
+            with pytest.raises(TypeError, match="too many positional arguments"):
+                k.normalize_args(x, y, 1.0, 2.0, 3.0)
+            with pytest.raises(TypeError, match="multiple values for argument 'x'"):
+                k.normalize_args(x, y, x=x)
+            with pytest.raises(TypeError, match="unexpected keyword argument 'zzz'"):
+                k.normalize_args(x, y, zzz=1)
+        plans = k._normalize_args_plans
+        assert plans[(2, ())] is not None
+        defaults, positions = plans[(2, ("scale", "eps"))]
+        assert defaults[2:] == (1e-5, 1.0)
+        assert positions == (3, 2)
+        # Call shapes inspect rejects never get a plan.
+        assert plans[(1, ())] is None
+        assert plans[(5, ())] is None
+        assert plans[(2, ("x",))] is None
+        assert plans[(2, ("zzz",))] is None
+
+    def test_normalize_args_while_compiling_binds_through_inspect(self) -> None:
+        # Dynamo would guard on the plan cache's contents and replay the write,
+        # recompiling once per call shape, so a call made while compiling binds
+        # through inspect and leaves the cache untouched.
+        @helion.kernel()
+        def k(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+            return x
+
+        x, y = torch.empty(4), torch.empty(4)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            assert k.normalize_args(x, y=y) == (x, y, 1e-5)
+            with pytest.raises(TypeError, match="missing a required argument: 'y'"):
+                k.normalize_args(x)
+        assert k._normalize_args_plans == {}
+        # Outside of tracing the same call shape is planned and replayed.
+        assert k.normalize_args(x, y=y) == (x, y, 1e-5)
+        assert k._normalize_args_plans[(1, ("y",))] is not None
+
+    def test_normalize_args_positional_only_signature_uses_signature_bind(
+        self,
+    ) -> None:
+        @helion.kernel()
+        def k(x: torch.Tensor, /, y: torch.Tensor) -> torch.Tensor:
+            return x + y
+
+        x, y = torch.empty(4), torch.empty(4)
+        assert k.normalize_args(x, y) == (x, y)
+        assert k.normalize_args(x, y=y) == (x, y)
+        # CPython words this "missing a required positional-only argument" or
+        # "'x' parameter is positional only", depending on the version.
+        with pytest.raises(TypeError, match="positional.only"):
+            k.normalize_args(x=x, y=y)
+        assert k._normalize_args_plans[(2, ())] is None
 
     def test_tensors_extracts_in_order(self) -> None:
         a, b = torch.empty(2), torch.empty(3)

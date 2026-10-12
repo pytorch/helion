@@ -52,6 +52,14 @@ from .variable_origin import TensorSizeOrigin
 log = logging.getLogger(__name__)
 
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+# (source projections, expected classifier result) -> predicate over call args
+PreparedGuardFactory = typing.Callable[
+    [
+        typing.Sequence[typing.Callable[[typing.Sequence[object]], typing.Hashable]],
+        typing.Hashable,
+    ],
+    typing.Callable[[typing.Sequence[object]], bool],
+]
 # CUDA TMA limits each box dimension to 256 elements. Other descriptor
 # backends have their own legality checks and must not inherit this cap.
 CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
@@ -113,7 +121,13 @@ class RuntimeInputSpecialization:
     ``reusable_tensor_properties`` is an optional promise that the classifier's
     result depends only on the named storage properties (plus tensor metadata
     already covered by eager dispatch guards), never on tensor contents.  It
-    lets repeated calls with the exact same tensors reuse a prevalidated result.
+    lets code generation consume the result recorded in the bound kernel key.
+    ``prepared_guard_factory`` optionally builds, from the source projections
+    and an expected classifier result, a cheaper predicate over the raw call
+    arguments that holds exactly when the classifier would produce that result
+    again.  The prepared eager call evaluates it only after pinning every
+    argument's type, dtype, shape, stride and device, so the predicate needs to
+    read just the facts those pins leave open (pointers and storage spans).
     Runtime cache state is deliberately excluded from descriptor equality.
     """
 
@@ -125,6 +139,9 @@ class RuntimeInputSpecialization:
     reusable_tensor_properties: frozenset[
         typing.Literal["data_ptr", "storage_span"]
     ] = frozenset()
+    prepared_guard_factory: PreparedGuardFactory | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
