@@ -2013,7 +2013,10 @@ def emit_cross_loop_schedule(
         inner_counts = [axis_counts[block_id] for block_id in axis_order[:-1]]
         if (
             root in scheduled_task_roots
-            or root in root_counters_by_producer
+            or any(
+                plan.continuation_consumer is not None
+                for plan, _producer in root_counters_by_producer.get(root, ())
+            )
             or root in nested_producer_roots
             or root in nested_loop_counters_by_consumer
             or isinstance(owner.cases[root], L2GroupingProgramIDs)
@@ -2892,6 +2895,7 @@ def emit_cross_loop_schedule(
                 raise AssertionError("body PID ABI is not total")
             body.append(statement_from_string(f"{pid_task} = {pid_task_expression}"))
             scheduled_logical_pid = f"{case_offset_strings[root]} + {pid_task}"
+        readiness_tokens: list[str] = []
         for (
             incoming_readiness_counter,
             incoming_consumer,
@@ -2902,16 +2906,44 @@ def emit_cross_loop_schedule(
                 incoming_consumer.keys_by_consumer,
                 scheduled_coordinates,
             )
+            counter = readiness_counter(incoming_readiness_counter, readiness_key)
+            target = readiness_target(incoming_readiness_counter, readiness_key)
+            if any(device_function.config.range_warp_specializes):
+                # Triton's warp specialization rejects a while loop in the task
+                # loop: spin in one asm block and order the task on its token.
+                token = device_function.new_var(
+                    "tile_dependency_readiness_token", dce=False
+                )
+                spin = statement_from_string(
+                    f"{token} = tl.inline_asm_elementwise("
+                    "asm='{ .reg .pred p; .reg .b32 v; READY_WAIT: "
+                    "ld.acquire.gpu.global.u32 v, [$1]; setp.ne.u32 p, v, $2; "
+                    "@p bra READY_WAIT; bar.warp.sync 0xffffffff; "
+                    "fence.proxy.async.global; mov.u32 $0, 0; }', "
+                    f"constraints='=r,l,r', args=[{counter}, "
+                    f"tl.cast({target}, tl.uint32)], dtype=tl.int32, "
+                    "is_pure=False, pack=1)"
+                )
+                if incoming_consumer.keys_by_consumer.is_total_function():
+                    body.append(spin)
+                else:
+                    body.extend(
+                        [
+                            statement_from_string(f"{token} = 0"),
+                            create(
+                                ast.If,
+                                test=expr_from_string(membership),
+                                body=[spin],
+                                orelse=[],
+                            ),
+                        ]
+                    )
+                readiness_tokens.append(token)
+                continue
             wait = _wait_for_counter(
                 device_function=device_function,
-                counter=readiness_counter(
-                    incoming_readiness_counter,
-                    readiness_key,
-                ),
-                target=readiness_target(
-                    incoming_readiness_counter,
-                    readiness_key,
-                ),
+                counter=counter,
+                target=target,
                 prefix="tile_dependency_readiness_wait",
             )
             if not incoming_consumer.keys_by_consumer.is_total_function():
@@ -2928,6 +2960,10 @@ def emit_cross_loop_schedule(
         peer_counter_spins, peer_tokens = peer_counter_waits(
             root, scheduled_coordinates
         )
+        if readiness_tokens:
+            scheduled_logical_pid = " + ".join(
+                [scheduled_logical_pid, *readiness_tokens]
+            )
         if peer_tokens:
             # Zero tokens make every PID-derived address depend on the spins.
             has_task_scheduling = True
@@ -3093,12 +3129,17 @@ def emit_cross_loop_schedule(
 
     def skipped_task_dispatch(root: int, live: str) -> list[ast.stmt]:
         scatter_root = None if peer is None else peer.scatter_roots.get(root)
-        if scatter_root is None and not any(
-            plan.producers[0].producer_root == root for plan in peer_counter_plans
+        local_counters = root_counters_by_producer.get(root, ())
+        if (
+            scatter_root is None
+            and not local_counters
+            and not any(
+                plan.producers[0].producer_root == root for plan in peer_counter_plans
+            )
         ):
             return []
         # Guard-skipped tasks still count once per launch for keyed peers and
-        # mark their scatter done words.
+        # local readiness counters, and mark their scatter done words.
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = (
             segment_begin + static_pipeline_plan.execution_orders[root].task_count
@@ -3112,6 +3153,12 @@ def emit_cross_loop_schedule(
         )
         coordinates = execution_coordinates(root, f"({skipped}) - {segment_begin}")
         body = peer_counter_publications(root, coordinates, "relaxed")
+        for plan, readiness_producer in local_counters:
+            body.extend(
+                emit_readiness_arrivals_from_producer(
+                    plan, readiness_producer, coordinates
+                )
+            )
         if scatter_root is not None:
             assert peer is not None
             body.append(
