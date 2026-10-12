@@ -1342,12 +1342,12 @@ class Kernel(Generic[_R]):
                 ):
                     continue
                 del self._bound_kernels[key]
-                # Alias keys pack the canonical results; let them rebind.
-                # Disk runners have no bind-time hints and are keyed by guards
-                # the generated code cache can serialize; let them rebind too.
+                # Alias keys pack the canonical results; let them rebind. A
+                # disk runner evaluates the facts on the inputs it was bound
+                # to: its saved code fired none of them, like a native bound
+                # whose hints do not satisfy them.
                 if (
                     key.specialization_key == signature
-                    and not bound._is_disk_runner
                     and (results := _bound_guarded_input_facts(bound, new_facts))
                     is not None
                 ):
@@ -1359,7 +1359,9 @@ class Kernel(Generic[_R]):
                         )
                     ] = bound
             self._specialize_extra[signature] = [*published, *new_facts]
-            self._published_guards[signature] = None
+            # The serialized guards stay the schema's prefix. Bindings whose own
+            # code fired a fact are not saved (see save_binding).
+            self._published_guards.setdefault(signature, None)
             self._has_specialization_extras = True
             self._specialization_generation += 1
             for fast_key, cached_bound in list(self._dispatch_cache.items()):
@@ -1576,6 +1578,10 @@ class Kernel(Generic[_R]):
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
+
+        With ``generated_code_cache``, a warm cache hit runs frontend
+        compilation here to return an ordinary binding, while calling the
+        kernel directly (``kernel(*args)``) does not.
 
         Args:
             args: The arguments to bind to the Kernel.
@@ -2369,6 +2375,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return None
         return self._generated_code_input_key[1]
 
+    def _guard_fact_value(self, fact: _GuardedInputFact) -> Hashable:
+        """``fact`` at this binding's bind-time hints (None when not recoverable)."""
+        return fact.bound_value(self.env)
+
+    @property
+    def _codegen_fired_guard_facts(self) -> bool:
+        """Whether code generation guarded on inputs beyond what the frontend did.
+
+        The generated source key covers the frontend, so a guard that only code
+        generation recorded is not part of it.
+        """
+        return self._guard_facts != self._frontend_guard_facts
+
     def __init__(
         self,
         kernel: Kernel[_R],
@@ -2435,6 +2454,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         # calls skip the writers' lock and eviction scan.
         self._persisted_source_keys: set[str] = set()
         self._persisted_binding: tuple[Config, str] | None = None
+        # Guard facts (see _guarded_input_facts) this binding's frontend and
+        # its code generation so far fired; set when the binding publishes them.
+        self._frontend_guard_facts: int | None = None
+        self._guard_facts = 0
         self._compiler_seed_specialization_extractors: tuple[
             _CompilerSeedSpecializationExtractor, ...
         ] = ()
@@ -2911,6 +2934,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if (
                 source_key is not None
                 and source_key not in self._persisted_source_keys
+                and not self._codegen_fired_guard_facts
                 and (path := self._cache_path_map.get(config)) is not None
             ):
                 # PyCodeCache writes the supplied source unchanged; its extra
@@ -2965,7 +2989,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 device_index,
                 extra=cache_extra,
             )
-            if source_key is not None:
+            if source_key is not None and not self._codegen_fired_guard_facts:
                 if source_miss:
                     save_generated_code(source_key, triton_code)
                 self._persisted_source_keys.add(source_key)
@@ -3603,9 +3627,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         return extractors
 
     def _publish_guarded_input_facts(self) -> None:
-        """Extend the dispatch schema with guard facts it does not check yet."""
+        """Extend the dispatch schema with guard facts it does not check yet.
+
+        Binding calls this before any code generation, and code generation
+        after each config, so the first count is the frontend's.
+        """
         if self._cache_managed:
-            self.kernel._publish_guard_facts(self, self._guarded_input_facts())
+            facts = self._guarded_input_facts()
+            if self._frontend_guard_facts is None:
+                self._frontend_guard_facts = len(facts)
+            self._guard_facts = len(facts)
+            self.kernel._publish_guard_facts(self, facts)
 
     def _guarded_input_facts(
         self,
@@ -4476,6 +4508,17 @@ class _GuardedInputFact:
             values[symbol] = value
         return self._holds(values)
 
+    def value_at(
+        self, input_value: Callable[[TensorPropertySource], int | None]
+    ) -> Hashable:
+        """This fact where ``input_value`` gives each source (None if unknown)."""
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in self.sources:
+            if (value := input_value(source)) is None:
+                return None
+            values[symbol] = value
+        return self._holds(values)
+
     def bound_value(self, env: CompileEnvironment) -> Hashable:
         """This fact at ``env``'s bind-time hints (None when not recoverable)."""
         symbols = {
@@ -4484,14 +4527,15 @@ class _GuardedInputFact:
             for source in sources
         }
         hints = shape_env_var_hints(env.shape_env)
-        values: dict[sympy.Symbol, int] = {}
-        for symbol, source in self.sources:
-            if (
-                bound_symbol := symbols.get(source)
-            ) is None or bound_symbol not in hints:
+
+        def hint(source: TensorPropertySource) -> int | None:
+            if (bound_symbol := symbols.get(source)) is None or (
+                bound_symbol not in hints
+            ):
                 return None
-            values[symbol] = int(hints[bound_symbol])
-        return self._holds(values)
+            return int(hints[bound_symbol])
+
+        return self.value_at(hint)
 
 
 def _bound_guarded_input_facts(
@@ -4506,7 +4550,7 @@ def _bound_guarded_input_facts(
             and isinstance(fact := extractor.extractor, _GuardedInputFact)
         ):
             return None
-        if (result := fact.bound_value(bound.env)) is None:
+        if (result := bound._guard_fact_value(fact)) is None:
             return None
         results.append(result)
     return tuple(results)

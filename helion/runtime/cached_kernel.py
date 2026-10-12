@@ -12,6 +12,7 @@ from typing import cast
 import weakref
 
 import torch
+from torch._dynamo.source import TensorProperty
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
@@ -20,6 +21,7 @@ from .._argument_device import _canonicalize_argument_device
 from .._argument_device import _find_argument_device as _find_device
 from .._compiler.backend_registry import get_backend_class
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
+from .._compiler.compile_environment import _replay_tensor_input_source
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
@@ -41,6 +43,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import Hashable
 
+    from torch._dynamo.source import TensorPropertySource
+
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
@@ -48,6 +52,7 @@ if TYPE_CHECKING:
     from .kernel import CompiledConfig
     from .kernel import ConfigLike
     from .kernel import Kernel
+    from .kernel import _GuardedInputFact
     from .kernel import _PreparedCall
     from .settings import Settings
 
@@ -221,8 +226,17 @@ def load_cached_kernel(
     compiler_seed_results = tuple(
         extractor(args) for extractor in compiler_seed_extractors
     )
+    # Guard facts a native binding published follow the serialized guards.
+    # Saved code fired none of them, so it serves every value they take; the
+    # runner is keyed by their values on these inputs, as it would be re-keyed.
+    guard_facts = (
+        ()
+        if cache_key is None
+        else tuple(kernel._specialize_extra.get(signature, [])[len(guards) :])
+    )
     if cache_key is not None and (
-        cache_key.extra_results != extra_results
+        cache_key.extra_results
+        != (*extra_results, *(fact(args) for fact in guard_facts))
         or cache_key.compiler_seed_results != compiler_seed_results
     ):
         return None
@@ -352,6 +366,27 @@ class _CachedBoundKernel(Generic[_R]):
         # Saved schemas never contain runtime input specializations.
         return True
 
+    def _guard_fact_value(self, fact: _GuardedInputFact) -> Hashable:
+        """``fact`` on the input metadata this runner was bound to.
+
+        A native binding evaluates it at its bind-time hints, which are the
+        sizes and strides of the inputs it was bound to. This reads the same
+        values from the captured metadata, without the frontend or any lock.
+        """
+        arguments = dict(zip(fact.param_names, self._binding_args, strict=False))
+
+        def captured(source: TensorPropertySource) -> int | None:
+            value = _replay_tensor_input_source(source.base, arguments)
+            if not isinstance(value, _CachedTensorArgument) or source.idx is None:
+                return None
+            if source.prop == TensorProperty.SIZE:
+                return value.shape[source.idx]
+            if source.prop == TensorProperty.STRIDE:
+                return value.stride[source.idx]
+            return None
+
+        return fact.value_at(captured)
+
     def _restore_binding_args(self) -> tuple[tuple[object, ...], bool]:
         expired = False
         restored: dict[int, torch.Tensor] = {}
@@ -436,7 +471,16 @@ class _CachedBoundKernel(Generic[_R]):
                 not bound._is_disk_runner and bound._base_spec_key == signature
                 for bound in self.kernel._bound_kernels.values()
             )
-            if not has_native_schema:
+            # The frontend keys the same guards the runners published, so the
+            # published schema, its guard facts and the sibling runners stay.
+            same_schema = (
+                normal._serialized_guards == self._serialized_guards
+                and self.kernel._published_guards.get(signature)
+                == self._serialized_guards
+                and normal._compiler_seed_specialization_extractors
+                == self.kernel._compiler_seed_specialize_extra.get(signature)
+            )
+            if not (has_native_schema or same_schema):
                 extra_fns = normal._specialize_extra()
                 compiler_seed_fns = normal._compiler_seed_specialization_extractors
                 aliases = {
@@ -474,8 +518,9 @@ class _CachedBoundKernel(Generic[_R]):
                         self.kernel._dispatch_cache.pop(key)
                 self.kernel._prepared_call = None
             else:
-                # A different native specialization already established this
-                # schema. Preserve it and its bindings, as ordinary bind() does.
+                # A native specialization already established this schema, or
+                # the frontend matches it. Preserve it and its bindings, as
+                # ordinary bind() does.
                 self._evict()
             cache_key = self.kernel._create_bound_kernel_cache_key(
                 normal, args, signature, snapshot_runtime_results=True

@@ -719,8 +719,9 @@ class Settings(_Settings):
             "Cache selected Triton configurations' generated source on disk. "
             "Inputs that a saved binding accepts, including new shapes with "
             "static_shapes=False, skip frontend compilation and codegen. "
-            "Tensor descriptors, distributed kernels and "
-            "unsupported Python dependencies retain normal compilation. Disabled by default. "
+            "Tensor-descriptor configs, distributed kernels and unsupported Python "
+            "dependencies retain normal compilation; descriptor layout guards are "
+            "saved with the binding. Disabled by default. "
             "Set HELION_GENERATED_CODE_CACHE=1 to enable and HELION_SKIP_CACHE=1 "
             "to skip reads and writes."
         ),

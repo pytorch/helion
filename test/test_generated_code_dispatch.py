@@ -28,6 +28,7 @@ from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
+from helion.runtime.kernel import _GuardedInputFact
 
 _CONFIG = helion.Config(block_sizes=[32])
 
@@ -305,11 +306,19 @@ class TestGeneratedCodeDispatch(TestCase):
             torch.testing.assert_close(kernel(z, 2), z * 2)
             self.assertEqual(compile_fn.call_count, 2)
 
-    def test_baked_shape_guards_are_not_saved_and_rebind_runners(self) -> None:
+    def _guard_facts(self, kernel: Kernel, signature: object) -> list[object]:
+        return [
+            extractor.extractor
+            for extractor in kernel._specialize_extra[signature]
+            if isinstance(getattr(extractor, "extractor", None), _GuardedInputFact)
+        ]
+
+    def test_size_one_guard_facts_rekey_runners(self) -> None:
         # A static_shapes=False compile bound at a size-1 dim bakes ``size == 1``
-        # into its code and keys it as a guard fact the saved guards cannot
-        # express: the binding is not saved, and once the fact is published a
-        # disk runner of the signature rebinds instead of serving the key.
+        # into its code and publishes it as a guard fact the saved guards cannot
+        # express. That binding is not saved, but disk runners of the signature
+        # are re-keyed on their own inputs, as native bindings are on their
+        # hints, and keep serving without the frontend.
         x = torch.ones(8, 32)
         one = torch.ones(1, 64)
         self._kernel(_specialized_rows)(x, 2)
@@ -325,22 +334,141 @@ class TestGeneratedCodeDispatch(TestCase):
         with self._frontend_count() as compile_fn:
             torch.testing.assert_close(kernel(one, 2), one * 2)
             self.assertEqual(compile_fn.call_count, 1)
-            self.assertIsNone(kernel._published_guards[signature])
-            self.assertGreater(len(kernel._specialize_extra[signature]), 2)
-            self.assertNotIn(runner, kernel._bound_kernels.values())
-            self.assertIsNone(runner._delegate)
-            # The runner's key no longer covers the schema; its inputs rebind.
-            torch.testing.assert_close(kernel(x, 2), x * 2)
-            self.assertEqual(compile_fn.call_count, 2)
-            torch.testing.assert_close(
-                kernel(torch.ones(3, 32), 2), torch.ones(3, 32) * 2
+            self.assertTrue(self._guard_facts(kernel, signature))
+            # The serialized guards remain the schema's prefix.
+            self.assertEqual(
+                kernel._published_guards[signature], runner._serialized_guards
             )
-            self.assertEqual(compile_fn.call_count, 2)
-        # Neither binding of the fact-keyed signature was saved for later
-        # processes; the size-1 compile runs again.
+            self.assertIn(runner, kernel._bound_kernels.values())
+            self.assertIsNone(runner._delegate)
+            for y in (x, torch.ones(3, 32)):
+                torch.testing.assert_close(kernel(y, 2), y * 2)
+                self.assertIs(_runner(kernel, (y, 2)), runner)
+            self.assertEqual(compile_fn.call_count, 1)
+        self.assertIsNone(runner._delegate)
+        # The size-1 binding fired a fact and was not saved; x's binding was.
         with self._frontend_count() as compile_fn:
             fresh = self._kernel(_specialized_rows)
+            torch.testing.assert_close(fresh(x, 2), x * 2)
+            self.assertEqual(compile_fn.call_count, 0)
             torch.testing.assert_close(fresh(one, 2), one * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+
+    def test_runner_guard_facts_match_native_bindings(self) -> None:
+        # A runner evaluates guard facts on its captured input metadata; the
+        # values equal a native binding's at its bind-time hints for the same
+        # inputs, and the facts themselves on those inputs.
+        self._kernel(_specialized_rows)(torch.ones(8, 32), 2)
+        publisher = self._kernel(_specialized_rows)
+        one = torch.ones(1, 64)
+        publisher(one, 2)
+        facts = self._guard_facts(
+            publisher, publisher._base_specialization_key((one, 2))
+        )
+        self.assertTrue(facts)
+        for x in (
+            torch.ones(8, 32),
+            torch.ones(1, 32),
+            torch.ones(5, 64)[:, ::2],
+            torch.ones(32, 7).t(),
+        ):
+            runner = _runner(self._kernel(_specialized_rows), (x, 2))
+            self.assertIsInstance(runner, _CachedBoundKernel)
+            native = self._kernel(_specialized_rows, generated_code_cache=False).bind(
+                (x, 2)
+            )
+            runner_values = [runner._guard_fact_value(fact) for fact in facts]
+            self.assertNotIn(None, runner_values)
+            self.assertEqual(
+                runner_values, [fact.bound_value(native.env) for fact in facts]
+            )
+            self.assertEqual(runner_values, [fact((x, 2)) for fact in facts])
+
+    def test_bindings_without_guard_facts_are_saved(self) -> None:
+        # The size-1 binding publishes guard facts first; a later binding of
+        # the same signature whose own compile fired none is still saved.
+        one = torch.ones(1, 64)
+        y = torch.ones(8, 64)
+        kernel = self._kernel(_specialized_rows)
+        signature = kernel._base_specialization_key((one, 2))
+        with self._frontend_count() as compile_fn:
+            torch.testing.assert_close(kernel(one, 2), one * 2)
+            self.assertTrue(self._guard_facts(kernel, signature))
+            # y has the size-1 binding's saved guard values but not its fact.
+            torch.testing.assert_close(kernel(y, 2), y * 2)
+            self.assertEqual(compile_fn.call_count, 2)
+        self.assertEqual(
+            len(list((self.root / "generated_code" / "bindings").glob("*.json"))), 1
+        )
+        # A later process serves both from y's binding: its code fired no fact,
+        # so it serves size-1 inputs too, as a native binding does.
+        warm = self._kernel(_specialized_rows)
+        with patch.object(
+            KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+        ):
+            for z in (torch.ones(5, 64), one, y):
+                torch.testing.assert_close(warm(z, 2), z * 2)
+        # Once a size-1 compile publishes facts, a new runner loads keyed by
+        # the facts' values on its inputs.
+        warm = self._kernel(_specialized_rows)
+        with self._frontend_count() as compile_fn:
+            row = torch.ones(1, 32)
+            torch.testing.assert_close(warm(row, 2), row * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+            torch.testing.assert_close(warm(y, 2), y * 2)
+            self.assertEqual(compile_fn.call_count, 1)
+            self.assertIsInstance(_runner(warm, (y, 2)), _CachedBoundKernel)
+            torch.testing.assert_close(warm(one, 2), one * 2)
+            self.assertIsInstance(_runner(warm, (one, 2)), _CachedBoundKernel)
+            self.assertEqual(compile_fn.call_count, 1)
+
+    def test_codegen_guard_facts_do_not_save_source(self) -> None:
+        # The source key covers the frontend, not guards that only code
+        # generation recorded; such source is neither saved nor bound.
+        x = torch.ones(8, 32)
+        kernel = self._kernel(_specialized_rows)
+        original = BoundKernel._guarded_input_facts
+        calls = 0
+
+        def codegen_fact(bound: BoundKernel) -> list[object]:
+            nonlocal calls
+            calls += 1
+            facts = original(bound)
+            # Binding publishes first; every later call is code generation.
+            return facts if calls == 1 else [*facts, object()]
+
+        with (
+            patch.object(BoundKernel, "_guarded_input_facts", codegen_fact),
+            patch.object(Kernel, "_publish_guard_facts"),
+        ):
+            torch.testing.assert_close(kernel(x, 2), x * 2)
+        self.assertGreater(calls, 1)
+        self.assertFalse(list((self.root / "generated_code").rglob("*.json")))
+
+    def test_public_bind_keeps_sibling_runners(self) -> None:
+        x = torch.ones(8, 32)
+        y = torch.ones(8, 64)
+        self._kernel(_specialized_rows)(x, 2)
+        self._kernel(_specialized_rows)(y, 2)
+        kernel = self._kernel(_specialized_rows)
+        with patch.object(
+            KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
+        ):
+            for z in (x, y):
+                torch.testing.assert_close(kernel(z, 2), z * 2)
+        sibling = _runner(kernel, (y, 2))
+        self.assertIsInstance(sibling, _CachedBoundKernel)
+        with self._frontend_count() as compile_fn:
+            bound = kernel.bind((x, 2))
+            self.assertIs(type(bound), BoundKernel)
+            self.assertEqual(compile_fn.call_count, 1)
+            # The frontend keyed the guards the runners published, so the
+            # sibling runner keeps serving its inputs.
+            self.assertIn(sibling, kernel._bound_kernels.values())
+            self.assertIs(_runner(kernel, (y, 2)), sibling)
+            torch.testing.assert_close(kernel(y, 2), y * 2)
+            torch.testing.assert_close(kernel(x, 2), x * 2)
+            self.assertIs(_runner(kernel, (x, 2)), bound)
             self.assertEqual(compile_fn.call_count, 1)
 
     def test_unknown_attributes_do_not_compile(self) -> None:
@@ -435,6 +563,48 @@ with patch.object(module.Kernel, "_bind", side_effect=AssertionError("bind")):
             check=True,
             timeout=60,
         )
+
+    @unittest.skipIf(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+    def test_size_one_compile_keeps_warm_runners(self) -> None:
+        # vLLM decode and CUDA graph capture call with M == 1 in a process
+        # whose other row counts load from disk. Where descriptor guards give
+        # M == 1 its own key, it compiles once and publishes a size-1 guard
+        # fact; the loaded runners are re-keyed and keep serving.
+        root = self._test_stack.enter_context(tempfile.TemporaryDirectory())
+        self._test_stack.enter_context(
+            patch.dict(os.environ, {"HELION_CACHE_DIR": root, "HELION_SKIP_CACHE": "0"})
+        )
+        device = torch.device("cuda")
+        cold = _dynamic_2d_kernel()
+        for m in (4, 16):
+            x = torch.randn(m, 64, device=device)
+            torch.testing.assert_close(cold(x), x + 1)
+        kernel = _dynamic_2d_kernel()
+        with patch.object(
+            KernelCompiler, "compile", autospec=True, side_effect=KernelCompiler.compile
+        ) as compile_fn:
+            for m in (4, 16):
+                x = torch.randn(m, 64, device=device)
+                torch.testing.assert_close(kernel(x), x + 1)
+            self.assertEqual(compile_fn.call_count, 0)
+            runners = [
+                bound
+                for bound in kernel._bound_kernels.values()
+                if bound._is_disk_runner
+            ]
+            self.assertTrue(runners)
+            for _ in range(2):
+                one = torch.randn(1, 64, device=device)
+                torch.testing.assert_close(kernel(one), one + 1)
+            self.assertLessEqual(compile_fn.call_count, 1)
+            compiled = compile_fn.call_count
+            for runner in runners:
+                self.assertIn(runner, kernel._bound_kernels.values())
+            for m in (4, 16, 5, 17, 1):
+                for _ in range(2):
+                    x = torch.randn(m, 64, device=device)
+                    torch.testing.assert_close(kernel(x), x + 1)
+            self.assertEqual(compile_fn.call_count, compiled)
 
 
 if __name__ == "__main__":

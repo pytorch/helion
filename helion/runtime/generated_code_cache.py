@@ -515,11 +515,17 @@ def save_binding(
         return
     signature, guards, extra_results, compiler_seed_results, _ = input_key
     # The binding is only valid under the schema its signature published in
-    # this process: the frontend may have keyed guards this binding cannot
-    # serialize (``None``), or a dynamic-shape compile may have added guard
-    # facts after binding. Either way the saved guards would accept inputs
-    # the generated code was not compiled for, so the binding is not saved.
-    if None in guards or bound.kernel._published_guards.get(signature) != guards:
+    # this process, and only if its guards are all serializable (no ``None``).
+    # A dynamic-shape binding whose own compile guarded on an input size (a
+    # guard fact, such as ``size == 1``) is not saved either: the saved guards
+    # would accept inputs its code was not compiled for. Bindings of the same
+    # signature that fired no fact serve every input their guards accept, so
+    # they are saved even after another binding published facts.
+    if (
+        None in guards
+        or bound._guard_facts
+        or bound.kernel._published_guards.get(signature) != guards
+    ):
         return
     # One schema per signature, and the last writer wins. Should bindings of
     # one signature ever save different guard lists, the earlier variants
