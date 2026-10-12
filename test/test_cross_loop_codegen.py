@@ -774,9 +774,7 @@ def guarded_readiness_fanout(
         if tile_r.begin < live:
             tmp[tile_r, tile_c] = x[tile_r, tile_c] + 1
     for tile_s, tile_r in hl.tile([splits, rows], block_size=[1, 1]):
-        out[tile_s, tile_r, :] = (
-            tmp[tile_r, :][None, :, :] * 2 + tile_s.index[:, None, None]
-        )
+        out[tile_s.begin, tile_r, :] = tmp[tile_r, :] * 2 + tile_s.begin
     return tmp, out
 
 
