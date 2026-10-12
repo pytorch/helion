@@ -809,22 +809,24 @@ def inband_store_codegen(
         peer = peer_state(device_function)
         assert peer is not None
         backend = CompileEnvironment.current().backend
-        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+        indexing = SubscriptIndexing.create(
+            state, fake_tensor, subscript, extra_mask, for_store=True
+        )
         output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
         word_value = value
-        if not indexing.block_shaped_offset and output_size:
+        if (
+            not indexing.block_shaped_offset
+            and not indexing.needs_broadcast()
+            and output_size
+        ):
             word_value = expr_from_string(
                 backend.reshape_expr("{value}", "[]"), value=value
             )
-        offset = indexing.index_expr
-        if indexing.needs_broadcast():
-            offset = expr_from_string(
-                backend.broadcast_to_expr(
-                    "{offset}", state.tile_strategy.shape_str(output_size)
-                ),
-                offset=offset,
-            )
-        offset = state.codegen.lift(offset, dce=True, prefix="inband_offset")
+        offset = state.codegen.lift(
+            indexing.broadcast_offset(state, output_size),
+            dce=True,
+            prefix="inband_offset",
+        )
         dtype = fake_tensor.dtype
         _, _, lanes, pair = peer.mailboxes[access.allocation_id]
         bits = (
