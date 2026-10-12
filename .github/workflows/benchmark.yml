@@ -88,7 +88,6 @@ jobs:
         if: inputs.runtime-version == 'xpu'
         run: |
           echo "Detected Intel XPU image"
-          echo "ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-<unset>}"
           xpu-smi discovery || echo "xpu-smi not found"
 
       - name: Setup toolchain
