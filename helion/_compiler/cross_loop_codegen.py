@@ -2617,6 +2617,7 @@ def emit_cross_loop_schedule(
     def emit_readiness_arrival_for_key(
         plan: ReadinessCounterPlan,
         readiness_key: str,
+        sem: str = "release",
     ) -> list[ast.stmt]:
         continuation_consumer = plan.continuation_consumer
         if continuation_consumer is None:
@@ -2625,12 +2626,12 @@ def emit_cross_loop_schedule(
                 return [
                     statement_from_string(
                         f"tl.atomic_xchg({counter}, {epoch_var}, "
-                        "sem='release', scope='gpu')"
+                        f"sem='{sem}', scope='gpu')"
                     )
                 ]
             return [
                 statement_from_string(
-                    f"tl.atomic_add({counter}, 1, sem='release', scope='gpu')"
+                    f"tl.atomic_add({counter}, 1, sem='{sem}', scope='gpu')"
                 ),
             ]
 
@@ -2736,6 +2737,7 @@ def emit_cross_loop_schedule(
         plan: ReadinessCounterPlan,
         readiness_producer: ReadinessProducer,
         producer_coordinates: dict[int, str],
+        sem: str = "release",
     ) -> list[ast.stmt]:
         publication = readiness_producer.incidence.keys_by_item
         if publication is None:
@@ -2745,7 +2747,7 @@ def emit_cross_loop_schedule(
             producer_coordinates,
             trusted_single_valued=True,
         )
-        publications = emit_readiness_arrival_for_key(plan, readiness_key)
+        publications = emit_readiness_arrival_for_key(plan, readiness_key, sem)
         if membership == "True":
             return publications
         return [
@@ -2908,45 +2910,40 @@ def emit_cross_loop_schedule(
             )
             counter = readiness_counter(incoming_readiness_counter, readiness_key)
             target = readiness_target(incoming_readiness_counter, readiness_key)
+            total = incoming_consumer.keys_by_consumer.is_total_function()
             if any(device_function.config.range_warp_specializes):
-                # Triton's warp specialization rejects a while loop in the task
-                # loop: spin in one asm block and order the task on its token.
+                # Triton's warp specialization rejects a while loop in a task
+                # loop: spin in one asm block and gate the task PID on its token.
                 token = device_function.new_var(
                     "tile_dependency_readiness_token", dce=False
                 )
-                spin = statement_from_string(
-                    f"{token} = tl.inline_asm_elementwise("
-                    "asm='{ .reg .pred p; .reg .b32 v; READY_WAIT: "
-                    "ld.acquire.gpu.global.u32 v, [$1]; setp.ne.u32 p, v, $2; "
-                    "@p bra READY_WAIT; bar.warp.sync 0xffffffff; "
-                    "fence.proxy.async.global; mov.u32 $0, 0; }', "
-                    f"constraints='=r,l,r', args=[{counter}, "
-                    f"tl.cast({target}, tl.uint32)], dtype=tl.int32, "
-                    "is_pure=False, pack=1)"
+                fence = (
+                    "fence.proxy.async.global; "
+                    if device_function.uses_async_proxy_global
+                    else ""
                 )
-                if incoming_consumer.keys_by_consumer.is_total_function():
-                    body.append(spin)
-                else:
-                    body.extend(
-                        [
-                            statement_from_string(f"{token} = 0"),
-                            create(
-                                ast.If,
-                                test=expr_from_string(membership),
-                                body=[spin],
-                                orelse=[],
-                            ),
-                        ]
+                wait = [
+                    statement_from_string(
+                        f"{token} = tl.inline_asm_elementwise("
+                        "asm='{ .reg .pred p; .reg .b32 v; READY_WAIT: "
+                        "ld.acquire.gpu.global.u32 v, [$1]; setp.ne.u32 p, v, $2; "
+                        "@p bra READY_WAIT; bar.warp.sync 0xffffffff; "
+                        f"{fence}mov.u32 $0, 0; }}', constraints='=r,l,r', "
+                        f"args=[{counter}, tl.cast({target}, tl.uint32)], "
+                        "dtype=tl.int32, is_pure=False, pack=1)"
                     )
+                ]
                 readiness_tokens.append(token)
-                continue
-            wait = _wait_for_counter(
-                device_function=device_function,
-                counter=counter,
-                target=target,
-                prefix="tile_dependency_readiness_wait",
-            )
-            if not incoming_consumer.keys_by_consumer.is_total_function():
+                if not total:
+                    body.append(statement_from_string(f"{token} = 0"))
+            else:
+                wait = _wait_for_counter(
+                    device_function=device_function,
+                    counter=counter,
+                    target=target,
+                    prefix="tile_dependency_readiness_wait",
+                )
+            if not total:
                 body.append(
                     create(
                         ast.If,
@@ -3153,10 +3150,11 @@ def emit_cross_loop_schedule(
         )
         coordinates = execution_coordinates(root, f"({skipped}) - {segment_begin}")
         body = peer_counter_publications(root, coordinates, "relaxed")
+        # A skipped task writes nothing, so its arrivals need no release.
         for plan, readiness_producer in local_counters:
             body.extend(
                 emit_readiness_arrivals_from_producer(
-                    plan, readiness_producer, coordinates
+                    plan, readiness_producer, coordinates, "relaxed"
                 )
             )
         if scatter_root is not None:

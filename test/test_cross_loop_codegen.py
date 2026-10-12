@@ -762,6 +762,28 @@ def guarded_prefix_chain(
     static_shapes=True,
     autotune_effort="none",
 )
+def guarded_readiness_fanout(
+    x: torch.Tensor, flags: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, columns = x.size()
+    splits = 4
+    tmp = torch.zeros_like(x)
+    out = torch.empty((splits, rows, columns), dtype=x.dtype, device=x.device)
+    for tile_c, tile_r in hl.tile([columns, rows], block_size=[64, 1]):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile_r.begin < live:
+            tmp[tile_r, tile_c] = x[tile_r, tile_c] + 1
+    for tile_s, tile_r in hl.tile([splits, rows], block_size=[1, 1]):
+        out[tile_s, tile_r, :] = (
+            tmp[tile_r, :][None, :, :] * 2 + tile_s.index[:, None, None]
+        )
+    return tmp, out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def guarded_scan_gather(
     x: torch.Tensor, flags: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2197,6 +2219,60 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         root = _generated_function(code, "tile_dependency_root_0")
         self.assertFalse(any(isinstance(node, ast.If) for node in ast.walk(root)))
         self.assertNotIn("flags", ast.unparse(root))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_guard_skipped_tasks_publish_local_readiness(self) -> None:
+        x = torch.randn((16, 256), device=DEVICE, dtype=torch.float32)
+        for live in (0, 1, 5, 16):
+            flags = (torch.arange(16, device=DEVICE) < live).to(torch.int32)
+            code, (tmp, out) = code_and_output(
+                guarded_readiness_fanout,
+                (x, flags),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=4,
+            )
+            expected = torch.zeros_like(x)
+            expected[:live] = x[:live] + 1
+            splits = torch.arange(4, device=DEVICE, dtype=x.dtype)[:, None, None]
+            torch.testing.assert_close(tmp, expected)
+            torch.testing.assert_close(out, expected[None] * 2 + splits)
+        # Each row's four split tasks wait on its four column tiles, live or not.
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertIn("sem='relaxed'", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    @skipIfCudaCapabilityLessThan((10, 0), reason="warp specialization needs sm100")
+    def test_warp_specialized_consumer_waits_on_a_readiness_token(self) -> None:
+        x = torch.randn((16, 256), device=DEVICE, dtype=torch.float32)
+        for live in (0, 5, 16):
+            flags = (torch.arange(16, device=DEVICE) < live).to(torch.int32)
+            code, (tmp, out) = code_and_output(
+                guarded_readiness_fanout,
+                (x, flags),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=4,
+                range_warp_specializes=[None, True],
+            )
+            expected = torch.zeros_like(x)
+            expected[:live] = x[:live] + 1
+            splits = torch.arange(4, device=DEVICE, dtype=x.dtype)[:, None, None]
+            torch.testing.assert_close(out, expected[None] * 2 + splits)
+        # The wait is one asm spin, not a while loop, and its zero token feeds
+        # the task PID so the producer partition's loads wait too.
+        task = ast.unparse(
+            _generated_function(code, "tile_dependency_root_1_scheduled_task")
+        )
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+        self.assertIn("READY_WAIT", task)
+        self.assertNotIn("while ", task)
+        self.assertIn("+ tile_dependency_readiness_token", root)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
