@@ -12,7 +12,9 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
+from helion._testing import skipUnlessChunkLowering
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
@@ -335,6 +337,38 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 (torch.randn(2, 2, device=DEVICE), mask),
             )
 
+    def test_index_remapping_pointwise_refused(self):
+        # torch.flip / torch.rot90 decompose into an element-wise read at
+        # reversed positions; device loops lower element-wise ops position by
+        # position, which used to compute the identity silently.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def flip_fn(x: torch.Tensor, dims: hl.constexpr) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = torch.flip(x[tile, :], dims)
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def rot90_fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile, :] = torch.rot90(x[tile, :] + 1.0, 2, [0, 1])
+            return out
+
+        x = torch.randn([64, 32], device=DEVICE)
+        # A full-slice dim, a tile dim, both.
+        for dims in ((1,), (0,), (0, 1)):
+            with (
+                self.subTest(dims=dims),
+                self.assertRaisesRegex(
+                    helion.exc.UnsupportedIndexRemapping,
+                    r"reads its input at other positions than it writes",
+                ),
+            ):
+                code_and_output(flip_fn, (x, dims), block_size=32)
+        with self.assertRaises(helion.exc.UnsupportedIndexRemapping):
+            code_and_output(rot90_fn, (x,), block_size=32)
+
     def test_torch_nonzero_device_error(self):
         @helion.kernel()
         def torch_nonzero_in_device_code(x: torch.Tensor) -> torch.Tensor:
@@ -349,7 +383,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 torch_nonzero_in_device_code, (torch.randn(2, 2, device=DEVICE),)
             )
 
-    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    @skipUnlessChunkLowering
     def test_torch_chunk_unsupported_configuration(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def fn(
@@ -393,7 +427,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 ):
                     fn.bind((x, chunks, dim, use_method))
 
-    @skipIfNotTriton("torch.unbind lowering is Triton-only")
+    @skipUnlessChunkLowering
     def test_torch_unbind_unsupported_configuration(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def fn(
@@ -429,7 +463,11 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 ):
                     fn.bind((x, dim, use_method))
 
-    @onlyBackends(["cute"])
+    @skipIfFn(
+        lambda: _get_backend() != "tileir",
+        "of this class's backends only TileIR lacks the torch.chunk/torch.unbind "
+        "device lowering",
+    )
     def test_torch_chunk_unbind_unsupported_backend(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def fn(
@@ -465,7 +503,10 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                     ):
                         fn.bind((x, use_chunk, use_method))
 
-    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    @skipIfNotTriton(
+        "pins Triton's refusal to permute rank-compacted (flattened) tiles; CuTe "
+        "lowers the flattened chunk (test_cute_chunk_unbind)"
+    )
     def test_torch_chunk_unbind_reject_flattened_multi_axis_tiles(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def chunk_fn(x: torch.Tensor) -> torch.Tensor:
@@ -483,7 +524,10 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(chunk_fn, (x,), block_sizes=[2, 8], flatten_loops=[True])
 
-    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    @skipIfNotTriton(
+        "pins the autotuner skipping the flattened candidate Triton rejects; on "
+        "CuTe both candidates compile (test_cute_chunk_unbind)"
+    )
     def test_torch_chunk_autotune_skips_flattened_candidate(self):
         @helion.kernel(
             static_shapes=True,

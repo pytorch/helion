@@ -173,10 +173,10 @@ class Config(Mapping[str, object]):
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             cross_loop_pipeline: Execution strategy for kernels with
                 compiler-inferred cross-loop dependencies. ``"barrier"`` uses
-                grid synchronization. ``"static"`` and ``"dynamic"`` execute
-                the same compiler-derived dependency schedule with fixed worker
-                ownership or one-shot packet dispatch, respectively.
-                Unsupported kernels reject this field.
+                grid synchronization. ``"static"`` and ``"dynamic"`` (Triton
+                only) execute the same compiler-derived dependency schedule
+                with fixed worker ownership or one-shot packet dispatch,
+                respectively. Unsupported kernels reject this field.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configurations may use intermediate values.

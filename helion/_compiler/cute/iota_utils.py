@@ -2,12 +2,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sympy
+import torch
+from torch.fx.node import Node
+
+from ... import exc
 from ...language import _tracing_ops
+from ...language import memory_ops
+from ...language import view_ops
+from ..compile_environment import CompileEnvironment
+from ..compile_environment import _symint_expr
+from ..host_function import HostFunction
+from ..variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
-    from torch.fx.node import Node
+    from collections.abc import Iterable
+    from collections.abc import Iterator
 
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+
+    _Slot = tuple[Node, int]
 
 
 def _is_atomic_tensor_index_iota_user(source_node: Node, user: Node) -> bool:
@@ -480,3 +495,303 @@ def _add_feeds_memory_index(add_node: Node) -> bool:
         ):
             return True
     return False
+
+
+# Index-shape dims that are not an arange lane: a size-one dim, or any other
+# axis (a tile, a slice, a gather).
+_ONE = "one"
+_AXIS = "axis"
+
+_LANE_PASSTHROUGH_TARGETS = frozenset(
+    {
+        _tracing_ops._new_var,
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+    }
+)
+
+
+class FreeArangeLanes:
+    """Positional lane classes of the ``hl.arange`` dims of a kernel's values.
+
+    Helion values are positional: a store writes element ``j`` of its value at
+    the ``j``-th coordinate of its index, a load's value dims follow its index
+    dims, and pointwise operands meet at equal positions counted from the
+    right.  A free arange (bound to no tile axis) gets a synthetic thread
+    axis, so every arange dim that meets another (a load's index dim carried
+    to a store's index, two loaded values added, a permute in between) must
+    take the same axis whatever its start and step, and two dims of one value
+    distinct axes.  This unions the dims that meet through the ops it models
+    (pointwise ops, ``[:, None]``-style subscripts, permute, unsqueeze, expand,
+    loads and stores with one-dimensional arange indexes).  An arange-derived
+    value reaching any other op leaves the kernel unmodeled: ``root`` is then
+    ``None`` and callers keep their size-based keys.
+    """
+
+    def __init__(self, graphs: Iterable[GraphInfo]) -> None:
+        self._parent: dict[_Slot, _Slot] = {}
+        self._derived: set[Node] = set()
+        self._store_lanes: list[list[_Slot]] = []
+        self.complete = all(self._visit_graph(info.graph) for info in graphs)
+        # Two dims of one value or one access in a single class need two lane
+        # coordinates of one axis: ``r1``/``r2`` merged by ``a[r1] + a[r2]``
+        # and then indexing as a cartesian pair (``x[p[r1], q[r2]]``), or one
+        # arange gathering two dims (``x[p[r], q[r]]``).  The classes cannot
+        # lower it, and the size-based keys get the merged statement wrong.
+        self.shares_lane = self.complete and any(
+            len({self._find(slot) for slot in slots}) != len(slots)
+            for slots in self._lane_groups()
+        )
+
+    def root(self, node: Node) -> _Slot | None:
+        """The class of the last dim of ``node`` (an iota or a value of one)."""
+        slot = (node, -1)
+        if not self.complete or slot not in self._parent:
+            return None
+        if self.shares_lane:
+            raise exc.BackendUnsupported(
+                "cute",
+                "two dims of one value or load/store share a free hl.arange "
+                "lane; the SIMT lowering addresses one lane coordinate per "
+                "thread axis",
+            )
+        return self._find(slot)
+
+    def _lane_groups(self) -> Iterator[list[_Slot]]:
+        """The arange lanes of each derived value and of each store's index."""
+        for node in self._derived:
+            value = node.meta.get("val")
+            if isinstance(value, torch.Tensor):
+                yield [
+                    (node, -i)
+                    for i in range(1, value.ndim + 1)
+                    if self._is_lane((node, -i))
+                ]
+        yield from self._store_lanes
+
+    def _find(self, slot: _Slot) -> _Slot:
+        parent = self._parent.setdefault(slot, slot)
+        while parent != slot:
+            grandparent = self._parent[parent]
+            self._parent[slot] = grandparent
+            slot, parent = parent, grandparent
+        return slot
+
+    def _union(self, a: _Slot, b: _Slot) -> None:
+        self._parent[self._find(a)] = self._find(b)
+
+    def _is_lane(self, slot: _Slot) -> bool:
+        return slot in self._parent
+
+    def _visit_graph(self, graph: torch.fx.Graph) -> bool:
+        for node in graph.nodes:
+            if node.op == "output":
+                if any(arg in self._derived for arg in node.all_input_nodes):
+                    return False
+                continue
+            if node.op != "call_function":
+                continue
+            if node.target is torch.ops.prims.iota.default:
+                self._find((node, -1))
+                self._derived.add(node)
+                continue
+            if not any(arg in self._derived for arg in node.all_input_nodes):
+                continue
+            if not self._visit(node):
+                return False
+        return True
+
+    def _visit(self, node: Node) -> bool:
+        target = node.target
+        if target is memory_ops.load:
+            return self._visit_load(node)
+        if target is memory_ops.store:
+            return self._visit_store(node)
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            return False
+        self._derived.add(node)
+        if target in _LANE_PASSTHROUGH_TARGETS or (
+            isinstance(target, torch._ops.OpOverload)
+            and torch.Tag.pointwise in target.tags
+        ):
+            return self._visit_pointwise(node, value)
+        source = node.args[0]
+        if not isinstance(source, Node):
+            return False
+        source_value = source.meta.get("val")
+        if not isinstance(source_value, torch.Tensor):
+            return False
+        pairs: list[tuple[int, int]] = []
+        if target is view_ops.subscript:
+            entries = node.args[1]
+            if not isinstance(entries, (list, tuple)):
+                return False
+            source_dim = output_dim = 0
+            for entry in entries:
+                if entry is None:
+                    output_dim += 1
+                elif isinstance(entry, slice) and entry == slice(None):
+                    pairs.append((source_dim, output_dim))
+                    source_dim += 1
+                    output_dim += 1
+                else:
+                    return False
+            pairs.extend(
+                (source_dim + i, output_dim + i)
+                for i in range(source_value.ndim - source_dim)
+            )
+        elif target is torch.ops.aten.permute.default:
+            dims = node.args[1]
+            assert isinstance(dims, (list, tuple))
+            pairs = []
+            for output_dim, dim in enumerate(dims):
+                assert isinstance(dim, int)
+                pairs.append((dim % source_value.ndim, output_dim))
+        elif target is torch.ops.aten.unsqueeze.default:
+            new_dim = node.args[1]
+            assert isinstance(new_dim, int)
+            new_dim %= value.ndim
+            pairs = [
+                (source_dim, source_dim + (source_dim >= new_dim))
+                for source_dim in range(source_value.ndim)
+            ]
+        elif target is torch.ops.aten.expand.default:
+            offset = value.ndim - source_value.ndim
+            pairs = [
+                (source_dim, source_dim + offset)
+                for source_dim in range(source_value.ndim)
+            ]
+        else:
+            return False
+        for source_dim, output_dim in pairs:
+            source_slot = (source, source_dim - source_value.ndim)
+            if self._is_lane(source_slot):
+                self._union((node, output_dim - value.ndim), source_slot)
+        return True
+
+    def _visit_pointwise(self, node: Node, value: torch.Tensor) -> bool:
+        env = CompileEnvironment.current()
+        operands = [
+            arg
+            for arg in node.all_input_nodes
+            if isinstance(arg.meta.get("val"), torch.Tensor)
+        ]
+        for i in range(1, value.ndim + 1):
+            slots = [
+                (operand, -i)
+                for operand in operands
+                if operand.meta["val"].ndim >= i
+                and not env.known_equal(operand.meta["val"].shape[-i], 1)
+            ]
+            lanes = [slot for slot in slots if self._is_lane(slot)]
+            if not lanes:
+                continue
+            if len(lanes) != len(slots):
+                # An arange dim meeting a tile axis: not a synthetic lane.
+                return False
+            for slot in lanes:
+                self._union((node, -i), slot)
+        return True
+
+    def _index_dims(self, index: object) -> list[_Slot | str] | None:
+        """The dims of the shape a load at ``index`` produces, as ``compute_shape``.
+
+        An arange-derived index entry contributes its lane; ``None`` when an
+        arange-derived entry is not one-dimensional, or when tensor indexers of
+        more dims broadcast together (one-dimensional ones form a cartesian
+        product, one dim each in order, as without broadcasting).
+        """
+        if not isinstance(index, (list, tuple)):
+            return None
+        env = CompileEnvironment.current()
+        values = [
+            entry.meta.get("val") if isinstance(entry, Node) else entry
+            for entry in index
+        ]
+        if (
+            any(isinstance(entry, Node) and entry in self._derived for entry in index)
+            and env.should_broadcast_tensor_indexers(values)
+            and any(
+                isinstance(value, torch.Tensor) and value.ndim != 1 for value in values
+            )
+        ):
+            return None
+        dims: list[_Slot | str] = []
+        for entry, value in zip(index, values, strict=True):
+            if value is None:
+                dims.append(_ONE)
+            elif isinstance(value, torch.SymInt):
+                symbol = _symint_expr(value)
+                origin = (
+                    HostFunction.current().expr_to_origin.get(symbol)
+                    if isinstance(symbol, sympy.Symbol)
+                    else None
+                )
+                if origin is not None and isinstance(origin.origin, BlockSizeOrigin):
+                    dims.append(_AXIS)
+            elif isinstance(value, slice):
+                dims.append(_AXIS)
+            elif isinstance(value, torch.Tensor):
+                if not (isinstance(entry, Node) and entry in self._derived):
+                    dims.extend([_AXIS] * len(env.tensor_indexer_dims(value)))
+                elif value.ndim == 1 and self._is_lane((entry, -1)):
+                    dims.append((entry, -1))
+                else:
+                    return None
+            elif not isinstance(value, int):
+                return None
+        return dims
+
+    def _align(self, operand: object, dims: list[_Slot | str]) -> bool:
+        """Union the dims of ``operand`` with ``dims``, aligned from the right."""
+        if not isinstance(operand, Node):
+            return True
+        value = operand.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            return True
+        if value.ndim > len(dims):
+            return False
+        env = CompileEnvironment.current()
+        for i in range(1, value.ndim + 1):
+            if env.known_equal(value.shape[-i], 1):
+                continue
+            slot = (operand, -i)
+            dim = dims[-i]
+            if isinstance(dim, tuple) and self._is_lane(slot):
+                self._union(slot, dim)
+            elif isinstance(dim, tuple) or self._is_lane(slot):
+                return False
+        return True
+
+    def _visit_load(self, node: Node) -> bool:
+        if not isinstance(node.args[0], Node):
+            return False
+        dims = self._index_dims(node.args[1])
+        value = node.meta.get("val")
+        if dims is None or not isinstance(value, torch.Tensor):
+            return False
+        if len(dims) != value.ndim:
+            return False
+        for output_dim, dim in enumerate(dims):
+            if isinstance(dim, tuple):
+                self._union((node, output_dim - value.ndim), dim)
+        self._derived.add(node)
+        return len(node.args) < 3 or self._align(node.args[2], dims)
+
+    def _visit_store(self, node: Node) -> bool:
+        if not isinstance(node.args[0], Node):
+            return False
+        dims = self._index_dims(node.args[1])
+        if dims is None:
+            return False
+        self._store_lanes.append([dim for dim in dims if isinstance(dim, tuple)])
+        return all(self._align(operand, dims) for operand in node.args[2:4])
+
+
+def cute_free_arange_lanes(cg: GenerateAST) -> FreeArangeLanes:
+    """The kernel's :class:`FreeArangeLanes`, built on first use."""
+    if cg.cute_free_arange_lanes is None:
+        cg.cute_free_arange_lanes = FreeArangeLanes(cg.codegen_graphs)
+    return cg.cute_free_arange_lanes

@@ -13,7 +13,9 @@ import torch
 from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import ExactWeakKeyDictionary
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import Buffer
+from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import FinalizeCodegenResult
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
@@ -22,6 +24,7 @@ from torch._inductor.ir import MutationOutput
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import TemplateBuffer
 from torch._inductor.ir import TensorBox
+from torch._inductor.ir import is_unaligned
 from torch._inductor.lowering import clone
 from torch._inductor.lowering import register_lowering
 from torch._inductor.select_algorithm import AlgorithmSelectorCache
@@ -29,11 +32,14 @@ from torch._inductor.select_algorithm import (
     ExternalTritonTemplateKernel,  # pyrefly: ignore[missing-module-attribute]
 )
 from torch._inductor.select_algorithm import PartialRender
+from torch._inductor.utils import GPU_ALIGN_BYTES
 from torch._inductor.utils import Placeholder
 from torch._inductor.utils import convert_shape_to_symint
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 import torch.utils._pytree as pytree
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import free_symbol_is_type
 
 from .._dynamo.higher_order_ops import _rebuild_container_args
 from .._dynamo.higher_order_ops import get_helion_kernel
@@ -44,6 +50,7 @@ from .._dynamo.variables import _HOST_SEMANTIC_INPUT_NORMALIZATION
 from .._dynamo.variables import _REQUIRES_ISOLATED_LOWERING
 from .._dynamo.variables import _get_flat_output
 from ..ast_extension import unparse
+from ..compile_environment import HELION_STATIC_DIMS_ATTR
 from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
 from ..output_header import _active_library_imports
@@ -559,6 +566,15 @@ class HelionTemplateBuffer(TemplateBuffer):
             for inp in inputs  # type: ignore[union-attr]
             if inp.get_read_names() & mutated_inp_names
         }
+        size_indexed_inp_names = {
+            inp.get_name()
+            for inp in inputs
+            if isinstance(inp, ComputedBuffer)
+            and any(
+                isinstance(dep, MemoryDep) and _read_offset_uses_size_vars(dep)
+                for dep in inp.get_read_writes().reads
+            )
+        }
         buf = cls(
             layout=MultiOutputLayout(device=dev),  # pyrefly: ignore[bad-argument-type]
             inputs=inputs,
@@ -569,6 +585,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 if inp.get_name() not in mutated_inp_names
                 and inp.get_name() not in container_inp_names
                 and inp.get_name() not in mutation_dependent_inp_names
+                and inp.get_name() not in size_indexed_inp_names
             ),
             named_inputs=realized_inputs,
             **buffer_kwargs,
@@ -980,6 +997,47 @@ def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> Bound
         kernel._bind_lock.release()
 
 
+def _read_offset_uses_size_vars(dep: MemoryDep) -> bool:
+    """Whether a producer's read differs from its own contiguous iteration by
+    a size-variable term (a dynamic slice's offset, or a symbolic stride).
+
+    A fused prologue renders that term as a size variable (``ks0``) which the
+    Helion kernel does not define, so such a producer stays unfused.
+    """
+    flat = sympy.Add(
+        *(sympy.Mul(var, *dep.size[i + 1 :]) for i, var in enumerate(dep.var_names))
+    )
+    return free_symbol_is_type(
+        sympy.expand(sympy.Add(dep.index, sympy.Mul(-1, flat))),
+        (SymT.SIZE, SymT.PRECOMPUTED_SIZE, SymT.UNBACKED_INT),
+    )
+
+
+def _example_storage_offset(node: IRNode) -> int:
+    """Storage offset that gives ``node``'s example input its runtime alignment.
+
+    Backends specialize on address residues (CuTe vector packets, Triton's
+    16-byte TMA base), and Inductor promises 16-byte alignment only for inputs
+    it has not recorded as unaligned.  Example storage comes from the caching
+    allocator, so an offset within one 16-byte window reproduces a known
+    residue, and a nonzero offset stays nonzero for zero-offset checks.  An
+    unknown residue (unaligned base or symbolic offset) becomes a one-element
+    shift, the weakest alignment an element offset can express; 16-byte
+    elements cannot be misaligned by element offsets in the first place.
+    """
+    offset = node.get_layout().offset
+    window = max(GPU_ALIGN_BYTES // node.get_dtype().itemsize, 1)
+    if not is_unaligned(node):
+        return 0 if V.graph.sizevars.statically_known_equals(offset, 0) else window
+    if (
+        isinstance(node, ReinterpretView)
+        and not is_unaligned(node.data)
+        and isinstance(offset, (int, sympy.Integer))
+    ):
+        return int(offset) % window
+    return 1
+
+
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -1022,18 +1080,37 @@ def lower_helion_kernel(
         )
 
     all_args: dict[str, object] = {**constant_args}
+    has_static_dims = False
     for n, r in realized.items():
         # Reused as autotune_args; uninitialized memory may contain NaN
         # bytes that spuriously fail accuracy checks. rand_strided
         # matches inductor's benchmark_example_value.
         device = r.get_device()
         assert device is not None
-        all_args[n] = rand_strided(
-            [as_int(s, 64) for s in r.get_size()],
-            [as_int(s, 1) for s in r.get_stride()],
+        size = [as_int(s, 64) for s in r.get_size()]
+        stride = [as_int(s, 1) for s in r.get_stride()]
+        offset = _example_storage_offset(r)
+        example = rand_strided(
+            size,
+            stride,
             dtype=r.get_dtype(),
             device=device,
-        )
+            extra_size=offset,
+        ).as_strided(size, stride, offset)
+        if not kernel.settings.static_shapes:
+            # Capture bound Dynamo's FakeTensors, whose static dims are
+            # literal ints; keep them literal here too, or this bind traces
+            # them as symbols (a size-1 one guarded to 1) and its host trace
+            # no longer matches the captured one.
+            static_dims = frozenset(
+                i
+                for i, s in enumerate(r.get_size())
+                if isinstance(s, (int, sympy.Integer))
+            )
+            if static_dims:
+                setattr(example, HELION_STATIC_DIMS_ATTR, static_dims)
+                has_static_dims = True
+        all_args[n] = example
     _rebuild_container_args(all_args)
 
     fake_tensors: list[object] = [
@@ -1042,7 +1119,9 @@ def lower_helion_kernel(
         if n in all_args or p.default is not p.empty
     ]
     bind_args = tuple(fake_tensors)
-    if output_spec.get(_REQUIRES_ISOLATED_LOWERING):
+    # Static dims are not part of a dynamic-shape kernel's cache key, so a
+    # bound that keeps them literal must not be shared through the cache.
+    if output_spec.get(_REQUIRES_ISOLATED_LOWERING) or has_static_dims:
         bound = kernel._bind_isolated(bind_args)
     else:
         bound = _bind_kernel_for_lowering(kernel, bind_args)
@@ -1182,7 +1261,8 @@ def lower_helion_kernel(
             if name in realized
         },
         on_tensor_leaf=on_tensor_leaf,
-        fusion_enabled=kernel.settings.torch_compile_fusion,
+        fusion_enabled=kernel.settings.torch_compile_fusion
+        and bound.env.backend.supports_inductor_fusion,
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,

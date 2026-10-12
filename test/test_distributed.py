@@ -38,6 +38,7 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -1344,7 +1345,10 @@ class TestDistributedGating(CommonTestCase):
             pass
 
 
-@onlyBackends(["triton"])
+@skipIfNotTriton(
+    "cross-rank tile dependencies need the static/dynamic cross_loop_pipelines' "
+    "peer transports, which are Triton-only codegen"
+)
 @skipIfNotCUDA()
 @instantiate_parametrized_tests
 class TestDistributedTileDependencies(TestCase):

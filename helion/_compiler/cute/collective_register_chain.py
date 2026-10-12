@@ -28,8 +28,8 @@ from .scalar_recipe import ScalarRecipe
 from .scalar_recipe import _clone
 from .scalar_recipe import _read_names
 from .scalar_recipe import build_recipe
+from .scalar_recipe import is_rounded_fp32_multiply as _rounded_multiply
 from .scalar_recipe_cache import _Dependencies
-from .scalar_recipe_rounding import is_rounded_fp32_multiply as _rounded_multiply
 from .scalar_recipe_rounding import preserve_fp32_multiply_rounding
 
 if TYPE_CHECKING:

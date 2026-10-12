@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import torch
 from torch._inductor.codegen.triton import TritonOverrides
+from torch._inductor.codegen.triton import triton_compute_type
 from torch._inductor.virtualized import V
 
 from ...language._decorators import is_api_func
+from ..inductor_lowering_extra import keeps_negative_nan_literal
 
 # Tile API functions that always produce non-negative integer values.
 _NON_NEGATIVE_TILE_FUNCS = frozenset(
@@ -85,11 +87,33 @@ def _is_provably_positive_divisor(node: object) -> bool:
     return False
 
 
+# The bit pattern of -nan in each float compute type.
+_NEGATIVE_NAN_BITS = {
+    "tl.float32": ("tl.uint32", 0xFFC00000),
+    "tl.float64": ("tl.uint64", 0xFFF8000000000000),
+}
+
+
 class HelionTritonOverrides(TritonOverrides):
     """Helion Triton op overrides.
 
     Inherits all expression generation from Inductor's TritonOverrides.
     """
+
+    @staticmethod
+    def _shaped_constant(
+        value: bool | float, dtype: torch.dtype, shape: list[int]
+    ) -> str:
+        # Like -0.0 (handled by Inductor), a negative NaN reaches Triton
+        # unsigned, and copysign(x, -nan) reads the sign.
+        triton_type = triton_compute_type(dtype)
+        if keeps_negative_nan_literal(value) and triton_type in _NEGATIVE_NAN_BITS:
+            bits_type, bits = _NEGATIVE_NAN_BITS[triton_type]
+            return (
+                f"tl.full({shape}, {bits:#x}, {bits_type})"
+                f".to({triton_type}, bitcast=True)"
+            )
+        return TritonOverrides._shaped_constant(value, dtype, shape)
 
     @staticmethod
     def _can_simplify_div() -> bool:
@@ -127,6 +151,19 @@ class HelionTritonOverrides(TritonOverrides):
         if HelionTritonOverrides._can_simplify_div():
             return f"{a} // {b}"
         return TritonOverrides.floordiv(a, b)
+
+    @staticmethod
+    def mod(x: str, y: str) -> str:
+        """C remainder; IEEE ``fmod`` for floats.
+
+        Triton's float ``%`` rounds an exact multiple to +0 where ``fmod``
+        (and eager) keep the dividend's sign, e.g. ``-1.5 % 0.5``.
+        """
+        node = V.current_node
+        val = node.meta.get("val") if node is not None else None
+        if isinstance(val, torch.Tensor) and val.dtype.is_floating_point:
+            return f"libdevice.fmod({x}, {y})"
+        return TritonOverrides.mod(x, y)
 
     @staticmethod
     def remainder(a: str, b: str) -> str:

@@ -8,6 +8,10 @@ source multiplies were separately rounded.
 
 The caller uses this only without fast math. Explicit FMA calls remain fused;
 integer, low-precision, FP64, and unproven arithmetic remain unchanged.
+
+``mark_narrowed_fp32_multiplies`` applies the same contract to the FP32
+products an explicit cast rounds to a lower-precision float before more
+arithmetic, independently of where the product is emitted.
 """
 
 from __future__ import annotations
@@ -16,14 +20,21 @@ import ast
 from typing import TYPE_CHECKING
 from typing import Literal
 
+import torch
+
 from ..ast_extension import expr_from_string
+from .indexing import is_cute_shape_chain_target
 from .scalar_recipe import _MATH_CALLS
+from .scalar_recipe import ROUNDED_FP32_MULTIPLY_ASM
+from .scalar_recipe import ROUNDED_FP32_MULTIPLY_CONSTRAINTS
 from .scalar_recipe import _clone
 from .scalar_recipe import _path
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from torch.fx import Node
 
 _Kind = Literal["fp32", "literal"] | None
 _FLOAT_MATH_CALLS = _MATH_CALLS - {"isfinite", "isinf", "isnan"}
@@ -35,29 +46,230 @@ FP32_MULTIPLY_ROUNDING_META_KEY = "cute_preserve_fp32_multiply_rounding"
 FP32_MULTIPLY_ROUNDING_EXPR = (
     "_cute_inline_asm_elementwise("
     "(cutlass.Float32({a}), cutlass.Float32({b})), "
-    "asm='mul.rn.f32 $0, $1, $2;', constraints='=f,f,f', "
+    f"asm={ROUNDED_FP32_MULTIPLY_ASM!r}, "
+    f"constraints={ROUNDED_FP32_MULTIPLY_CONSTRAINTS!r}, "
     "dtype=cutlass.Float32, is_pure=True)"
 )
 
 
-def is_rounded_fp32_multiply(value: ast.expr) -> bool:
-    """Recognize only the existing, explicitly rounded scalar operation."""
-    if not (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id == "_cute_inline_asm_elementwise"
-        and len(value.args) == 1
-        and isinstance(value.args[0], ast.Tuple)
-        and len(value.args[0].elts) == 2
-        and len(value.keywords) == 4
-    ):
-        return False
-    return {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords} == {
-        "asm": repr("mul.rn.f32 $0, $1, $2;"),
-        "constraints": repr("=f,f,f"),
-        "dtype": "cutlass.Float32",
-        "is_pure": "True",
+_PRODUCTS = frozenset({torch.ops.aten.mul.Tensor, torch.ops.aten.mul_.Tensor})
+_SQUARE = torch.ops.aten.pow.Tensor_Scalar
+_CONVERT = torch.ops.prims.convert_element_type.default
+_WHERE = torch.ops.aten.where.self
+# Shape and sign changes LLVM sees through; ``hl.subscript`` (``x[:, None]``)
+# joins them in ``_forwarded``.
+_VALUE_VIEWS = frozenset(
+    {
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.t.default,
+        torch.ops.aten.neg.default,
     }
+)
+
+
+def mark_narrowed_fp32_multiplies(graph: torch.fx.Graph) -> None:
+    """Flag FP32 products that an explicit cast rounds before more arithmetic.
+
+    ``(a.float() * b.float()).to(half) - (c.float() * d.float()).to(half)``
+    asks for each product rounded to the half type before the subtraction.
+    LLVM narrows ``fptrunc(fmul(fpext a, fpext b))`` to an exact half multiply
+    and emits it without a rounding modifier, so ptxas may contract that
+    ``mul.f16`` with the following ``sub.f16`` into one half FMA, dropping the
+    product's rounding.  Whether it does depends on unrelated codegen details
+    (a predicated load feeding the multiply blocks the narrowing).  A
+    ``mul.rn.f32`` can be neither narrowed nor contracted, so the cast rounds
+    the product exactly as written.
+
+    The hazard needs three things, and only a product with all three is
+    flagged:
+
+    * a product LLVM can narrow: ``aten.mul.Tensor``, its in-place form or
+      ``x ** 2`` (rendered ``x * x``) whose operands are all lower-precision
+      floats, upcasts of them or Python scalars.  A product with a genuinely
+      FP32 operand (a load, an earlier FP32 result, an accumulator) is never
+      narrowed, so it keeps its plain multiply;
+    * a cast of the product, directly or through views, ``where`` or a
+      negation, to a float narrower than FP32;
+    * a consumer of the cast value, again through views, ``where``,
+      negations, multiplies by ``1.0``/``-1.0`` (LLVM folds those away) or
+      an upcast, that can take the product into an FMA.  A store, a matmul
+      lhs/rhs operand and another multiply consume the rounded value as is
+      and keep the plain multiply (and its packed half lowering); every
+      other consumer counts.
+
+    A tensor filled with one Python scalar (``hl.full``, ``torch.full_like``)
+    is a splat constant LLVM narrows like the scalar itself.  Known gap: a
+    scalar operand counts as narrow even when the half type cannot represent
+    it (LLVM would not narrow; the only cost is a ``mul.rn.f32``).
+    """
+    from ...language import memory_ops
+    from ..device_ir_analysis import matmul_operand_positions
+
+    operand_positions = matmul_operand_positions()
+    for node in graph.nodes:
+        if not _is_product(node):
+            continue
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor) or value.dtype is not torch.float32:
+            continue
+        if not all(_is_narrow(operand) for operand in _product_operands(node)):
+            continue
+        if any(
+            _can_fuse(cast, operand_positions, memory_ops.store)
+            for cast in _narrowing_casts(node)
+        ):
+            node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
+
+
+def _is_product(node: Node) -> bool:
+    if node.op != "call_function":
+        return False
+    if node.target in _PRODUCTS:
+        return True
+    if node.target is not _SQUARE or len(node.args) != 2:
+        return False
+    exponent = node.args[1]
+    if isinstance(exponent, bool) or not isinstance(exponent, (int, float)):
+        return False
+    return exponent == 2
+
+
+def _product_operands(node: Node) -> tuple[object, ...]:
+    return node.args[:1] if node.target is _SQUARE else node.args[:2]
+
+
+def _below_fp32(dtype: object) -> bool:
+    return (
+        isinstance(dtype, torch.dtype)
+        and dtype.is_floating_point
+        and dtype.itemsize < 4
+    )
+
+
+def _is_unit_scalar(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and abs(value) == 1
+    )
+
+
+def _is_scalar_fill(node: Node) -> bool:
+    """Whether ``node`` is a tensor filled with one Python scalar."""
+    from ...language import creation_ops
+
+    if node.op != "call_function":
+        return False
+    if node.target is torch.ops.aten.scalar_tensor.default:
+        fill = node.args[0] if node.args else None
+    elif node.target in (
+        creation_ops.full,
+        torch.ops.aten.full.default,
+        torch.ops.aten.full_like.default,
+    ):
+        fill = node.args[1] if len(node.args) > 1 else None
+    else:
+        return False
+    return isinstance(fill, (int, float)) and not isinstance(fill, bool)
+
+
+def _forwarded(node: Node) -> tuple[object, ...] | None:
+    """The operands ``node`` passes on unchanged but for shape or sign."""
+    from ...language import view_ops
+
+    if node.op != "call_function":
+        return None
+    if node.target is _WHERE:
+        return node.args[1:3]
+    if node.target is torch.ops.aten.mul.Tensor and len(node.args) == 2:
+        # ``x * 1.0`` and ``x * -1.0`` fold to ``x`` and ``-x``.
+        left, right = node.args
+        if _is_unit_scalar(right):
+            return (left,)
+        if _is_unit_scalar(left):
+            return (right,)
+    if (
+        node.target is view_ops.subscript
+        or node.target in _VALUE_VIEWS
+        or is_cute_shape_chain_target(node.target)
+    ):
+        return node.args[:1]
+    return None
+
+
+def _passes(node: Node, value: Node) -> bool:
+    forwarded = _forwarded(node)
+    return forwarded is not None and any(source is value for source in forwarded)
+
+
+def _is_narrow(value: object) -> bool:
+    """Whether LLVM sees ``value`` as a float narrower than FP32 or a scalar."""
+    if not isinstance(value, torch.fx.Node):
+        return True
+    tensor = value.meta.get("val")
+    if not isinstance(tensor, torch.Tensor):
+        return True
+    if _below_fp32(tensor.dtype):
+        return True
+    if tensor.dtype is not torch.float32:
+        return False
+    if _is_scalar_fill(value):
+        return True
+    if value.op == "call_function" and value.target is _CONVERT:
+        return _is_narrow(value.args[0])
+    forwarded = _forwarded(value)
+    return forwarded is not None and all(_is_narrow(source) for source in forwarded)
+
+
+def _narrowing_casts(product: Node) -> list[Node]:
+    """Casts of ``product`` below FP32, reached through pass-through nodes."""
+    casts: list[Node] = []
+    seen: set[Node] = set()
+    stack = [product]
+    while stack:
+        value = stack.pop()
+        for user in value.users:
+            if user.op != "call_function":
+                continue
+            if user.target is _CONVERT:
+                if user.args[0] is value and _below_fp32(user.args[1]):
+                    casts.append(user)
+            elif _passes(user, value) and user not in seen:
+                seen.add(user)
+                stack.append(user)
+    return casts
+
+
+def _can_fuse(
+    cast: Node, operand_positions: Mapping[object, tuple[int, int]], store: object
+) -> bool:
+    """Whether the rounded value reaches a consumer able to fuse the product."""
+    seen: set[Node] = set()
+    stack = [cast]
+    while stack:
+        value = stack.pop()
+        for user in value.users:
+            if user.target is store:
+                continue
+            positions = operand_positions.get(user.target)
+            if positions is not None and any(
+                len(user.args) > position and user.args[position] is value
+                for position in positions
+            ):
+                continue
+            upcast = (
+                user.op == "call_function"
+                and user.target is _CONVERT
+                and user.args[0] is value
+                and user.args[1] is torch.float32
+            )
+            if upcast or _passes(user, value):
+                if user not in seen:
+                    seen.add(user)
+                    stack.append(user)
+            elif not _is_product(user):
+                return True
+    return False
 
 
 def _combined_kind(kinds: Sequence[_Kind]) -> _Kind:

@@ -8,9 +8,9 @@ a decomposition (see ``install_gelu_decomp`` below) that maps the
 to ``_gelu_erf`` for the same reason: the default erf formula also references
 the input multiple times.
 
-The polynomial form ``0.5 * x * (1 + tanh(x * (sqrt(2/pi) +
-sqrt(2/pi) * 0.044715 * x * x)))`` references ``x`` four times. Spelled
-out as four primitive ops, this breaks the linear-chain assumption of
+The polynomial form ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 *
+(x * x * x))))`` references ``x`` five times. Spelled
+out as primitive ops, this breaks the linear-chain assumption of
 Helion's tcgen05 epilogue chain analyzer
 (``helion/_compiler/cute/cute_epilogue.py``) and falls back to the
 loud-failure backstop. Folding the whole expression behind a single
@@ -21,7 +21,7 @@ already-bound carrier local.
 Inside the tcgen05 chain analyzer, ``_gelu_tanh_approx`` is registered
 as a ``_UnaryOp`` row in ``_ZERO_ARG_TARGETS`` keyed on the api
 wrapper itself (the FX target). The template references the carrier
-local four times in the standard polynomial; the renderer keeps that
+local five times in the standard polynomial; the renderer keeps that
 carrier bound before formatting the template.
 
 Backend support: ``cute`` and ``triton`` only. The ``pallas`` backend
@@ -46,14 +46,12 @@ from . import _decorators
 # rendered Python literals are byte-identical across machines and
 # pinned by the codegen-marker tests in ``test_cute_lowerings.py``.
 #
-# ``kappa = sqrt(2/pi)``, ``lambda = sqrt(2/pi) * 0.044715``. Both are
-# the same constants Quack uses in ``quack.activation.gelu_tanh_approx``
-# (``quack/quack/activation.py``); pinned here so the rendered
-# expression matches PyTorch's
-# ``torch.nn.functional.gelu(x, approximate="tanh")`` to bf16
-# precision.
+# ``kappa = sqrt(2/pi)`` and the cubic coefficient 0.044715, associated
+# as in PyTorch's CUDA kernel (``kappa * (x + 0.044715 * x_cube)``): with
+# a tanh that matches eager's, the fp32 result is then bit-exact against
+# ``torch.nn.functional.gelu(x, approximate="tanh")``.
 GELU_TANH_APPROX_KAPPA: float = 0.7978845608028654
-GELU_TANH_APPROX_LAMBDA: float = 0.035677408136300125
+GELU_TANH_APPROX_CUBIC: float = 0.044715
 GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 
 
@@ -80,14 +78,13 @@ GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 # this template at a per-thread T2R register where the accumulator is
 # always fp32 (the carrier is the matmul accumulator), so no cast is
 # needed. The standalone cute pointwise codegen path also calls this
-# template; that path runs through cute_dsl which broadens bf16/fp16
-# inputs to fp32 around ``cute.math.tanh`` automatically, so the
-# absence of an explicit cast is intentional and safe for both call
-# sites.
+# template; it casts a bf16/fp16 input to fp32 first (``x * x * x``
+# would otherwise round at 16 bits) and rounds the result back to the
+# input dtype once, as eager does.
 _GELU_TANH_APPROX_EXPR_CUTE = (
-    f"(0.5 * ({{inner}}) * (1.0 + cute.math.tanh(({{inner}}) *"
-    f" ({GELU_TANH_APPROX_KAPPA!r} + {GELU_TANH_APPROX_LAMBDA!r}"
-    f" * ({{inner}}) * ({{inner}})))))"
+    f"(0.5 * ({{inner}}) * (1.0 + cute.math.tanh({GELU_TANH_APPROX_KAPPA!r} *"
+    f" (({{inner}}) + {GELU_TANH_APPROX_CUBIC!r}"
+    f" * (({{inner}}) * ({{inner}}) * ({{inner}}))))))"
 )
 # Exact erf GELU uses a helper so fp32 TensorSSA carriers, including
 # tcgen05 epilogue fragments, can use packed f32x2 mul/fma around the
@@ -100,8 +97,8 @@ _GELU_ERF_EXPR_CUTE = "_cute_gelu_erf_exact_f32x2({inner})"
 def _gelu_tanh_approx(x: torch.Tensor) -> torch.Tensor:
     """Internal tanh-approximation GELU op (see module docstring).
 
-    Computes ``0.5 * x * (1 + tanh(x * (sqrt(2/pi) + sqrt(2/pi) *
-    0.044715 * x * x)))``. Not user-facing — invoked via the
+    Computes ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 *
+    (x * x * x))))``. Not user-facing — invoked via the
     ``aten.gelu.default`` decomposition installed by
     :func:`install_gelu_decomp`. For fp16 / bf16 inputs the polynomial
     runs in fp32 (Triton's ``libdevice.tanh`` is fp32-only) and the

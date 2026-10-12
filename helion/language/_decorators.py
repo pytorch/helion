@@ -176,6 +176,9 @@ def args_to_proxies(
             return x.proxy
         if isinstance(x, Thunk):
             return x.force()
+        if isinstance(x, slice):
+            # pytree treats a slice as a leaf; its symbolic bounds need proxies.
+            return slice(unpack(x.start), unpack(x.stop), unpack(x.step))
         return x
 
     return tree_map(

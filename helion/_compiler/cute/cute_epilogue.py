@@ -474,10 +474,10 @@ def _scalar_binary_template(
 # is the same object every FX traced kernel sees, so identity-keying
 # off it is stable across kernels. The template renders the standard
 # tanh-approximation GELU polynomial inline (``0.5 * x * (1 +
-# cute.math.tanh(x * (kappa + lambda * x * x)))``); see
+# cute.math.tanh(kappa * (x + 0.044715 * (x * x * x))))``); see
 # ``helion/language/_gelu_tanh_approx.py`` for constants and
 # motivation. The renderer always passes a bound local for ``{inner}``,
-# so the four occurrences of ``x`` do not duplicate a complex expression.
+# so the five occurrences of ``x`` do not duplicate a complex expression.
 _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     torch.ops.aten.relu.default: _UnaryOp(
         op_name="relu",

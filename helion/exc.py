@@ -175,6 +175,18 @@ class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
+class InvalidSliceStep(BaseError):
+    message = "Slice step must be greater than zero, as in PyTorch indexing; got {0!s}."
+
+
+class TensorSliceBound(BaseError):
+    message = (
+        "A slice bound inside a device loop must be an int (a literal, size, int "
+        "argument or tile attribute), not the tensor value {0!s}; index with a "
+        "tensor instead, e.g. ``x[tile, start + hl.arange(n)]``."
+    )
+
+
 class DotBatchDimensionMismatch(BaseError):
     message = (
         "hl.dot requires matching batch dimensions (or broadcasting with 1s), "
@@ -428,6 +440,15 @@ class _WrapException(BaseError):
 
 class InvalidConfig(BaseError):
     message = "{}"
+
+
+class UnsupportedIndexRemapping(BaseError):
+    message = (
+        "{op} reads its input at other positions than it writes (inductor "
+        "index {index}), which Helion device loops do not support: element-wise "
+        "ops are lowered position by position. Index the loaded tensor instead "
+        "(for example load at reversed indices in place of torch.flip)."
+    )
 
 
 class UnsupportedSplitConfiguration(BaseError):

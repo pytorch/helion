@@ -170,31 +170,94 @@ def exact_tile_block_ids(
     return tuple(block_ids)
 
 
-def _get_padded_iota_original_length(
-    state: CodegenState, index_position: int
-) -> int | None:
-    """Get the original length of a padded iota node at the given index position.
+def _padded_iota_dims(node: object) -> tuple[int | None, ...] | None:
+    """Per-dim lengths of the padded iotas ``node`` is computed lane-wise from.
+
+    A static non-power-of-2 ``hl.arange`` is emitted as a power-of-2 range, and
+    ``[:, None]`` subscripts and pointwise ops (``rows[:, None] * 9 + cols``)
+    keep its padding lanes in place.  Entry ``d`` is the iota length behind
+    dim ``d``, or None where no padded iota feeds that dim.
+    """
+    from ..language import view_ops
+
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if node.target == torch.ops.prims.iota.default:
+        length = node.args[0]
+        padded = isinstance(length, int) and length != next_power_of_2(length)
+        return (length if padded else None,)
+    if node.target is view_ops.subscript:
+        base = _padded_iota_dims(node.args[0])
+        index = node.args[1]
+        if base is None or not isinstance(index, (list, tuple)):
+            return None
+        consumed = 0
+        dims: list[int | None] = []
+        for item in index:
+            if item is None:
+                dims.append(None)
+            elif item == slice(None) and consumed < len(base):
+                dims.append(base[consumed])
+                consumed += 1
+            else:
+                return None
+        return (*dims, *base[consumed:])
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or torch.Tag.pointwise not in getattr(
+        node.target, "tags", ()
+    ):
+        return None
+    dims = [None] * val.ndim
+    for arg in node.all_input_nodes:
+        # Inputs that no iota feeds carry no padding lanes of their own here.
+        if (arg_dims := _padded_iota_dims(arg)) is None:
+            continue
+        offset = val.ndim - len(arg_dims)
+        if offset < 0:
+            return None
+        for dim, length in enumerate(arg_dims):
+            if length is None:
+                continue
+            if dims[offset + dim] not in (None, length):
+                return None
+            dims[offset + dim] = length
+    return tuple(dims)
+
+
+def _padded_iota_mask(state: CodegenState, index_position: int) -> str | None:
+    """Mask the padding lanes of a padded-iota index at the given position.
+
+    ``hl.arange(start, end, step)`` with a static non-power-of-2 length is
+    emitted as ``start + step * tl.arange(0, next_power_of_2(length))``, so the
+    valid lanes of the index (and of anything computed lane-wise from it) are
+    the first ``length`` arange positions whatever ``start`` and ``step`` are.
+    The mask compares those positions, not the index values, and has the
+    index's own rank.
 
     Args:
         state: The codegen state containing fx_node information
         index_position: The position in the index list to check
 
     Returns:
-        The original (unpadded) length if the index is a padded iota, None otherwise
+        The mask expression if the index is a padded iota, None otherwise
     """
     try:
         index_node = state.fx_node.args[1][index_position]  # type: ignore[union-attr, index]
-        if (
-            isinstance(index_node, torch.fx.Node)
-            and index_node.target == torch.ops.prims.iota.default
-            and isinstance(length_arg := index_node.args[0], int)
-            and length_arg != next_power_of_2(length_arg)
-        ):
-            return length_arg
     except (AttributeError, IndexError, TypeError):
-        pass
-
-    return None
+        return None
+    if (dims := _padded_iota_dims(index_node)) is None:
+        return None
+    terms = []
+    for dim, length in enumerate(dims):
+        if length is None:
+            continue
+        expand = (
+            "[" + ", ".join(":" if d == dim else "None" for d in range(len(dims))) + "]"
+            if len(dims) > 1
+            else ""
+        )
+        terms.append(f"(tl.arange(0, {next_power_of_2(length)}) < {length}){expand}")
+    return f"({' & '.join(terms)})" if terms else None
 
 
 def _get_tile_with_offset_info(
@@ -516,6 +579,16 @@ def _inactive_slice_index_expr(
     index_expr = env.backend.arange_index_expr(block_size_expr, dtype)
     size_expr = state.device_function.literal_expr(size)
     return index_expr, f"({index_expr} < {size_expr})"
+
+
+def _size_one_slice_index(start_expr: str, expand: str, dtype: str) -> str:
+    """The index of a one-element slice: its start, as a one-element index
+    vector when ``expand`` places it among the other output dims (a literal
+    start cannot be subscripted)."""
+    if not expand:
+        return start_expr
+    env = CompileEnvironment.current()
+    return f"({start_expr} + {env.backend.arange_index_expr('1', dtype)}){expand}"
 
 
 class IndexingStrategy:
@@ -1949,13 +2022,9 @@ class SubscriptIndexing(NamedTuple):
                                 new_masks.setdefault(
                                     f"({mv}){tile_strategy.expand_str(output_size, p)}"
                                 )
-            # Padded iota mask
-            if (
-                orig_len := _get_padded_iota_original_length(state, position)
-            ) is not None:
-                new_masks.setdefault(
-                    f"(({index_var} < {orig_len}){tile_strategy.expand_str(output_size, first_tensor_out_idx + tensor_idx)})"
-                )
+            # The padding mask has the index's rank: expand it like the index.
+            if (iota_mask := _padded_iota_mask(state, position)) is not None:
+                new_masks.setdefault(f"({iota_mask}{expand})")
             return idx_val, new_masks
 
         for n, k in enumerate(index):
@@ -1974,6 +2043,9 @@ class SubscriptIndexing(NamedTuple):
                 full_block_size = env.block_sizes[env.canonical_block_id(block_id)].var
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 i = len(index_values)
+                env.resolve_broadcast_dim(
+                    fake_value.size(i), block_id, tile_info.offset
+                )
                 block_dims.append(True)
                 if tile_info.block_size is not None and not env.known_equal(
                     tile_info.block_size, full_block_size
@@ -2016,6 +2088,7 @@ class SubscriptIndexing(NamedTuple):
                     index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
+                    env.resolve_broadcast_dim(fake_value.size(i), block_id)
                     block_dims.append(True)
                     index_values.append(f"({index_var}){expand}")
                     if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
@@ -2068,15 +2141,19 @@ class SubscriptIndexing(NamedTuple):
                                 state, block_idx, slice_size, dtype
                             )
                         # Generate strided index: start + index * step
+                        start_expr = state.device_function.literal_expr(start)
                         block_dims.append(True)
                         index_values.append(
-                            f"({start} + ({base_index_expr}) * {step}){expand}"
+                            f"({start_expr} + ({base_index_expr}) * {step}){expand}"
                         )
                         if mask_expr is not None:
                             mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
+                        start_expr = state.device_function.literal_expr(start)
                         block_dims.append(False)
-                        index_values.append(f"{start}{expand}")
+                        index_values.append(
+                            _size_one_slice_index(start_expr, expand, dtype)
+                        )
                 else:
                     slice_size = compute_slice_size(k, size)
                     if not _is_size_one(slice_size):
@@ -2097,7 +2174,9 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         start_expr = state.device_function.literal_expr(start)
                         block_dims.append(False)
-                        index_values.append(f"{start_expr}{expand}")
+                        index_values.append(
+                            _size_one_slice_index(start_expr, expand, dtype)
+                        )
                 output_idx += 1
             elif isinstance(k, torch.Tensor):
                 ast_index = state.ast_args[1]
@@ -2134,6 +2213,8 @@ class SubscriptIndexing(NamedTuple):
                         fake_value.size(len(index_values) - 1)
                     ):
                         mask_values.setdefault(f"({mask_var}){expand}")
+                if (iota_mask := _padded_iota_mask(state, n)) is not None:
+                    mask_values.setdefault(f"({iota_mask}{expand})")
 
                 output_idx += k.ndim
             else:

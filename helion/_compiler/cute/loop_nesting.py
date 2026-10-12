@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     import sympy
 
     from ..compile_environment import CompileEnvironment
+    from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
 
@@ -110,6 +111,46 @@ def _child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
             result = (*result, node.args[3])
         return result
     return ()
+
+
+def constexpr_live_graph_ids(
+    device_ir: DeviceIR,
+    graphs: Sequence[GraphInfo],
+    fn: DeviceFunction,
+) -> frozenset[int] | None:
+    """The graphs reachable from the roots without entering the untaken side
+    of a branch whose test is a constant for this config
+    (``DeviceFunction.evaluate_constexpr_condition``), or ``None`` when no
+    branch test is such a constant.
+
+    CuTe emits only the taken side of such a branch, so the graphs left out
+    need no tile strategies and must not claim thread axes.  That includes
+    the rolled copies of a dead graph, which nothing references until rolling
+    is applied.
+    """
+    from ...language import _tracing_ops
+
+    taken_sides: dict[torch.fx.Node, int] = {}
+    for info in graphs:
+        for node in info.graph.find_nodes(op="call_function", target=_tracing_ops._if):
+            taken = fn.constexpr_taken_graph_id(node)
+            if taken is not None:
+                taken_sides[node] = taken
+    if not taken_sides:
+        return None
+    pending = list(device_ir.root_ids)
+    live: set[int] = set()
+    while pending:
+        graph_id = pending.pop()
+        if graph_id in live:
+            continue
+        live.add(graph_id)
+        for node in graphs[graph_id].graph.nodes:
+            if node in taken_sides:
+                pending.append(taken_sides[node])
+            else:
+                pending.extend(_child_graph_ids(node))
+    return frozenset(live)
 
 
 def tile_loop_paths(

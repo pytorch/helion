@@ -103,6 +103,10 @@ def _execute(body: list[ast.AST], **values: object) -> tuple[dict[str, Any], int
                 exp2=lambda value: np.float32(np.exp2(value)),
                 max=lambda left, right, **kwargs: np.maximum(left, right),
             ),
+            # The NaN-propagating fp32 max of the lane-reduction combine.
+            arch=SimpleNamespace(
+                fmax=lambda left, right, **kwargs: np.maximum(left, right),
+            ),
         ),
         "_cute_grouped_reduce_shared_two_stage": collective,
         **values,
