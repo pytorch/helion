@@ -17,6 +17,7 @@ from .backend import PallasBackend
 from .backend import TileIRBackend
 from .backend import TritonBackend
 from .flydsl.backend import FlyDSLBackend
+from .spyre.backend import SpyreBackend
 
 if TYPE_CHECKING:
     from .backend import Backend
@@ -28,6 +29,7 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
     TileIRBackend,
     MetalBackend,
     FlyDSLBackend,
+    SpyreBackend,
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}

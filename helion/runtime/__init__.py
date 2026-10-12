@@ -265,3 +265,59 @@ def _make(kernel):
         compiled = _flyc.compile(_flydsl_jit_cache[cache_key], *args, _flydsl_stream)
         _flydsl_compiled_cache[cache_key] = compiled
     compiled(*args, _flydsl_stream)
+
+
+#: One compiled Spyre kernel per spec-hash, keyed by the generated module's
+#: kernel object. ``SpyreAsyncCompile`` already caches on disk by spec hash;
+#: this only avoids re-entering it per launch.
+_spyre_runner_cache: dict = {}
+
+
+def default_spyre_launcher(
+    spyre_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Default launcher for Spyre kernels.
+
+    There is no device Python on this backend: the payload is the OpSpec/LoopSpec
+    tree, attached to the kernel object by the generated module. Mirrors
+    ``run_op_specs`` in torch-spyre/tests/op_specs/runner.py; caching, the spec
+    hash and the ``dbo-opt`` subprocess all live inside ``SpyreAsyncCompile``.
+    """
+    if kwargs:
+        raise exc.BackendUnsupported(
+            "spyre", f"unexpected launcher kwargs: {sorted(kwargs)}"
+        )
+    # The grid is a fact of OpSpec.iteration_space, so a non-trivial grid here
+    # would mean the emitter and the launcher disagree about work division.
+    if tuple(grid) not in ((), (1,), (1, 1), (1, 1, 1)):
+        raise exc.BackendUnsupported(
+            "spyre", f"grid {grid!r}: the grid is OpSpec.iteration_space, not a launch arg"
+        )
+
+    # The spec tree is a module-level literal in the generated module, and a
+    # function's __globals__ *is* its defining module's namespace -- so the
+    # payload travels with the kernel object without needing an attribute
+    # assignment emitted after the kernel def.
+    namespace = getattr(spyre_kernel, "__globals__", None)
+    if namespace is None or "_SPYRE_SPECS" not in namespace:
+        raise exc.BackendUnsupported(
+            "spyre", "kernel carries no _SPYRE_SPECS; emitter did not run"
+        )
+    specs = namespace["_SPYRE_SPECS"]
+    pool_size = namespace.get("_SPYRE_POOL_SIZE", 0)
+    name = getattr(spyre_kernel, "__name__", "helion_spyre_kernel")
+
+    runner = _spyre_runner_cache.get(id(spyre_kernel))
+    if runner is None:
+        from torch_spyre.execution.async_compile import SpyreAsyncCompile
+
+        async_compile = SpyreAsyncCompile()
+        scope = {"runner": async_compile.sdsc(name, list(specs), pool_size=pool_size)}
+        async_compile.wait(scope)
+        runner = scope["runner"]
+        _spyre_runner_cache[id(spyre_kernel)] = runner
+
+    return runner.run(*args)
