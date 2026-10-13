@@ -1032,7 +1032,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                     hl.atomic_add(out, [tile_m, tile_n], a[tile_m, tile_n] + 1.0)
                 return out
 
-            for m in (1, 4):
+            for m in (1, 4, 5):
                 with self.subTest(config=config, m=m):
                     a = torch.randn(m, 64, device=DEVICE)
                     out = torch.randn(m, 64, device=DEVICE)
@@ -1040,7 +1040,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(
                         atomic_add_one(a, out.clone()), out + a + 1.0
                     )
-                    if _get_backend() == "triton" and not self._in_ref_eager_mode:
+                    if not self._in_ref_eager_mode:
                         for kernel in (store_add_one, atomic_add_one):
                             bound = kernel.bind((a, out))
                             self.assertEqual(bound._guarded_input_facts(), [])
@@ -1166,6 +1166,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 stack_store(x, ptrs, targets[0])
                 for target in targets:
                     torch.testing.assert_close(target, x + 1.0)
+                self.assertEqual(
+                    stack_store.bind((x, ptrs, targets[0]))._guarded_input_facts(), []
+                )
 
     @skipIfNotTriton("block_ptr indexing is Triton-only")
     @skipUnlessBlockPtr("block_ptr indexing is required")

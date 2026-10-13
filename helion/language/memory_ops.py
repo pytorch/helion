@@ -549,6 +549,7 @@ def _cute_index_exprs(
     *,
     inactive_slice_expr: str | None = None,
     inactive_singleton_slice_expr: str | None = None,
+    for_store: bool = False,
 ) -> list[str]:
     env = CompileEnvironment.current()
 
@@ -717,7 +718,9 @@ def _cute_index_exprs(
         tile_info = _get_tile_with_offset_info(
             idx, getattr(state, "fx_node", None), pos
         )
-        if tensor is not None and tensor_dim < tensor.ndim:
+        # A store target never needs to broadcast (a valid store's dim covers
+        # the tile's extent), so its dynamic sizes are not compared with 1.
+        if tensor is not None and tensor_dim < tensor.ndim and not for_store:
             if tile_info is not None:
                 env.resolve_broadcast_dim(
                     tensor.shape[tensor_dim], tile_info.block_id, tile_info.offset
