@@ -478,6 +478,88 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, y)
         torch.testing.assert_close(prev, torch.zeros_like(x))
 
+    def test_atomic_add_returns_prev_with_tensor_index_beside_tile(self):
+        """A tensor index after a tile returns each lane's previous value in
+        the ``[tile_m, tile_n]`` layout, and lanes adding into one element
+        each see a distinct previous value."""
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8]))
+        def scatter_columns(
+            x: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            prev = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_n] = hl.atomic_add(
+                    out, [tile_m, cols[tile_n]], x[tile_m, tile_n]
+                )
+            return out, prev
+
+        x = torch.ones(4, 8, device=DEVICE)
+        out = torch.zeros(4, 2, device=DEVICE)
+        cols = torch.tensor([0, 1, 1, 1, 1, 1, 1, 1], device=DEVICE)
+        out, prev = scatter_columns(x, cols, out)
+        torch.testing.assert_close(out, torch.tensor([[1.0, 7.0]] * 4, device=DEVICE))
+        torch.testing.assert_close(prev[:, 0], torch.zeros(4, device=DEVICE))
+        torch.testing.assert_close(
+            prev[:, 1:].sort(dim=1).values,
+            torch.arange(7, device=DEVICE, dtype=torch.float32).expand(4, 7),
+        )
+
+    def test_atomic_add_tensor_index_layouts(self):
+        """Tensor indices separated by a tile return each lane's previous
+        value in the compiled ``[m, k, n]`` layout (eager indexing would put
+        the indexed dims first), and a one-element index keeps its dim."""
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8, 4]))
+        def scatter_around_tile(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_m, tile_k, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_k, tile_n] = hl.atomic_add(
+                    out, [rows[tile_m], tile_k, cols[tile_n]], x[tile_m, tile_k, tile_n]
+                )
+            return prev
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8]))
+        def scatter_pairs(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_n] = hl.atomic_add(
+                    out, [rows[tile_m], cols[tile_n]], x[tile_m, tile_n]
+                )
+            return prev
+
+        out = torch.arange(3 * 8 * 5, device=DEVICE, dtype=torch.float32).view(3, 8, 5)
+        rows = torch.tensor([2, 0], device=DEVICE)
+        cols = torch.tensor([4, 1, 3, 0], device=DEVICE)
+        x = torch.ones(2, 8, 4, device=DEVICE)
+        expected_prev = out[rows][:, :, cols]
+        prev = scatter_around_tile(x, rows, cols, out.clone())
+        torch.testing.assert_close(prev, expected_prev)
+
+        out = torch.arange(3 * 5, device=DEVICE, dtype=torch.float32).view(3, 5)
+        rows = torch.tensor([1], device=DEVICE)
+        cols = torch.tensor([4, 0, 2, 3, 1, 2, 0, 4], device=DEVICE)
+        x = torch.ones(1, 8, device=DEVICE)
+        prev = scatter_pairs(x, rows, cols, out.clone())
+        self.assertEqual(prev.shape, (1, 8))
+        # A column added to k times returns its value plus 0..k-1.
+        expected = [
+            out[1, c].item() + j
+            for c in cols.unique().tolist()
+            for j in range(int((cols == c).sum()))
+        ]
+        torch.testing.assert_close(
+            prev[0].sort().values, torch.tensor(sorted(expected), device=DEVICE)
+        )
+
     @xfailIfPallas("gather indexing with different-sized tensors unsupported on Pallas")
     def test_overlapping_atomic_add(self):
         # Test with overlapping indices
