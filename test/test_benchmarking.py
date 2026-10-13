@@ -3751,7 +3751,7 @@ def _full_autotune_config_spec():
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
-    spec = ConfigSpec(backend=CuteBackend())
+    spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
     spec.enable_cute_flash_search(
