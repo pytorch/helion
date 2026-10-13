@@ -177,7 +177,7 @@ make html
 
 ### CuTe Backend (CUDA 13+)
 
-To use the experimental [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass)
+To use the beta [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass)
 backend (`HELION_BACKEND=cute`), PyTorch must be built against **CUDA 13 or
 later** (`torch.version.cuda >= "13"`). The backend refuses to launch on older
 CUDA builds.
