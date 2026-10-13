@@ -20,6 +20,7 @@ from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .node_masking import apply_masking
+from .node_masking import broadcasts_onto_masked_lanes
 from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 
@@ -467,15 +468,32 @@ permute_lowering = register_lowering(
 )
 
 
+def stack_masked_value(node: Node) -> float | bool | None:
+    # Every input lands in the result, so they must share their masked value
+    values = {
+        cached_masked_value(input_node)
+        for input_node in node.all_input_nodes
+        if isinstance(input_node.meta["val"], torch.Tensor)
+    }
+    return values.pop() if len(values) == 1 else None
+
+
 stack_lowering = register_lowering(
     torch.ops.aten.stack.default,
-    masked_value_fn=passthrough_masked_value,
+    masked_value_fn=stack_masked_value,
 )
+
+
+def expand_masked_value(node: Node) -> float | bool | None:
+    (input_node, *_) = node.all_input_nodes
+    if broadcasts_onto_masked_lanes(input_node, node):
+        return None
+    return cached_masked_value(input_node)
 
 
 expand_lowering = register_lowering(
     torch.ops.aten.expand.default,
-    masked_value_fn=passthrough_masked_value,
+    masked_value_fn=expand_masked_value,
 )
 
 
@@ -582,10 +600,9 @@ def _node_dtype_kwarg(node: Node) -> torch.dtype | None:
 sort_lowering = register_lowering(torch.ops.aten.sort.default)
 
 
-gather_lowering = register_lowering(
-    torch.ops.aten.gather.default,
-    masked_value_fn=passthrough_masked_value,
-)
+# A gather's masked-off lanes read the source at (masked) index 0, which is
+# real data, so its masked value is unknown.
+gather_lowering = register_lowering(torch.ops.aten.gather.default)
 
 
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
