@@ -86,6 +86,13 @@ def stickify(
         *(symbols[i] for i in others),
         sympy.Mod(stick_sym, eps),
     ]
+    if len(device_size) < 3:
+        # A device layout is at least rank 3 (outer sticks, middle dims, within
+        # stick), so a 1-D operand gets a leading unit axis at a constant
+        # coordinate -- the shape the captured gather reference uses for its
+        # 1-D index tensor: device_size [1, 2, 32], coords ['0', ...].
+        device_size = [1, *device_size]
+        device_coordinates = [sympy.Integer(0), *device_coordinates]
     return device_size, device_coordinates
 
 
@@ -97,6 +104,14 @@ def stick_dim_of(tensor: torch.Tensor) -> int:
     ``SpyreTensorLayout | None``. ``None`` means the tensor carries no device
     layout (a fake tensor at trace time, or a host tensor), where the trailing
     dim is the only defensible choice -- torch-spyre's own default tiled layout.
+
+    The stick dim is recovered from ``device_size``, not ``stride_map``: both
+    are **device**-dim indexed (length = host rank + 1), so indexing them by a
+    host dim is a category error. ``stickify`` lays an operand out as
+    ``[ceil(stick_extent / eps), *other_extents, eps]``, so the stick dim is
+    the host dim whose extent is ``device_size[0] * device_size[-1]`` rounded
+    to a stick, with the remaining host extents appearing in the middle in
+    order.
     """
     getter = getattr(tensor, "device_tensor_layout", None)
     if getter is None:
@@ -107,10 +122,26 @@ def stick_dim_of(tensor: torch.Tensor) -> int:
         return tensor.dim() - 1
     if stl is None:
         return tensor.dim() - 1
-    strides = list(stl.stride_map)
-    ones = [i for i, s in enumerate(strides) if s == 1]
-    if len(ones) != 1:
+
+    device_size = [int(d) for d in stl.device_size]
+    host_size = [int(d) for d in tensor.size()]
+    if len(device_size) != len(host_size) + 1:
         raise exc.BackendUnsupported(
-            "spyre", f"cannot identify stick axis from stride_map {strides}"
+            "spyre",
+            f"device_size {device_size} does not match host shape {host_size}",
         )
-    return ones[0]
+
+    eps = device_size[-1]
+    middle = device_size[1:-1]
+    for candidate in range(len(host_size)):
+        others = [host_size[i] for i in range(len(host_size)) if i != candidate]
+        if others != middle:
+            continue
+        if -(-host_size[candidate] // eps) == device_size[0]:
+            return candidate
+
+    raise exc.BackendUnsupported(
+        "spyre",
+        f"cannot identify stick axis: device_size {device_size}"
+        f" for host shape {host_size}",
+    )

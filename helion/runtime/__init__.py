@@ -290,12 +290,13 @@ def default_spyre_launcher(
         raise exc.BackendUnsupported(
             "spyre", f"unexpected launcher kwargs: {sorted(kwargs)}"
         )
-    # The grid is a fact of OpSpec.iteration_space, so a non-trivial grid here
-    # would mean the emitter and the launcher disagree about work division.
-    if tuple(grid) not in ((), (1,), (1, 1), (1, 1, 1)):
-        raise exc.BackendUnsupported(
-            "spyre", f"grid {grid!r}: the grid is OpSpec.iteration_space, not a launch arg"
-        )
+    # The grid is genuinely vestigial on this backend: work division is
+    # OpSpec.iteration_space[sym][1], which the emitter fills and SDSC reads
+    # ("the grid is a fact of the contract" -- codegen/ktir.py:1268-1280).
+    # Helion still computes a Triton-style grid from the block sizes, so it is
+    # ignored rather than rejected -- rejecting it broke autotuning, which
+    # launches through the ordinary host wrapper.
+    del grid
 
     # The spec tree is a module-level literal in the generated module, and a
     # function's __globals__ *is* its defining module's namespace -- so the

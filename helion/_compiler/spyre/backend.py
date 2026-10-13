@@ -30,6 +30,28 @@ if TYPE_CHECKING:
     from ..tile_dispatch import TileStrategyDispatch
 
 
+#: Widest stick any supported dtype uses: 64 elements at fp16/bf16
+#: (torch_spyre._C.get_elem_in_stick), 32 at fp32. Used as the floor for a
+#: trailing block size so no config can split a stick.
+_MAX_ELEMS_PER_STICK = 64
+
+#: A Spyre launch costs milliseconds and the device is a shared, serialized
+#: resource, so keep the sample count low: autotuning sweeps dozens of configs.
+_BENCH_WARMUP = 1
+_BENCH_REPS = 3
+
+
+def _sencores() -> int:
+    """Cores available to one kernel (``SENCORES``, default 32)."""
+    from torch_spyre._inductor import config as spyre_config
+
+    return int(spyre_config.sencores)
+
+
+#: Device for a synthesized scalar constant in the generated host wrapper.
+_DEVICE_EXPR = '"spyre"' 
+
+
 class SpyreBackend(Backend):
     """Emits torch-spyre ``OpSpec``/``LoopSpec`` objects per Device IR node."""
 
@@ -43,6 +65,8 @@ class SpyreBackend(Backend):
     def __init__(self) -> None:
         super().__init__()
         self.emitter = SpyreEmitter()
+        #: id(fake tensor) -> stick axis of the real input it stands for.
+        self._input_stick_dims: dict[int, int] = {}
 
     @property
     def name(self) -> str:
@@ -82,10 +106,154 @@ class SpyreBackend(Backend):
     def supports_precompile(self) -> bool:
         return False
 
-    def autotune_config_is_viable(self, config: Config) -> tuple[bool, str | None]:
-        # Plan 4.1: at most one reduction dim may be split across cores
-        # (work_division.py:317-322), since a K-split builds a PSUM chain.
-        return True, None
+    def get_do_bench(self) -> object:
+        """Wall-clock timing: the default ``do_bench`` is CUDA-shaped.
+
+        ``autotuner/benchmarking.py`` times with CUDA events and streams
+        (`:105-114`), which do not exist for the ``spyre`` device. Spyre
+        launches are synchronous from the host's point of view -- ``runner.run``
+        returns once the jobplan completes -- so a monotonic clock around the
+        call is the honest measurement here, with no device-side timer to read.
+        """
+
+        def spyre_do_bench(
+            fn: object,
+            warmup: int = 25,
+            rep: int = 100,
+            grad_to_none: object = None,
+            quantiles: object = None,
+            return_mode: str = "mean",
+            process_group_name: object = None,
+            **kwargs: object,
+        ) -> float | tuple[float, ...]:
+            import statistics
+            import time
+
+            for _ in range(_BENCH_WARMUP):
+                fn()
+
+            samples: list[float] = []
+            for _ in range(_BENCH_REPS):
+                start = time.perf_counter()
+                fn()
+                samples.append((time.perf_counter() - start) * 1e3)
+
+            if return_mode == "all":
+                return tuple(samples)
+            if quantiles:
+                ordered = sorted(samples)
+                return tuple(
+                    ordered[min(int(q * (len(ordered) - 1)), len(ordered) - 1)]
+                    for q in quantiles
+                )
+            reducer = {
+                "min": min,
+                "max": max,
+                "median": statistics.median,
+                "mean": statistics.fmean,
+            }.get(return_mode, statistics.fmean)
+            return float(reducer(samples))
+
+        return spyre_do_bench
+
+    def adjust_block_size_constraints(
+        self,
+        block_specs: list[object],
+        ndim: int,
+        block_sizes: list[object] | None = None,
+        kernel_tensor_sizes: dict[tuple[object, ...], int] | None = None,
+        min_element_bits: int = 32,
+    ) -> None:
+        """Keep the autotuner off block sizes that split a stick.
+
+        Plan 4.3: the trailing axis is the within-stick axis and is never
+        divided -- "a stick is the unit of transfer, so splitting it across
+        cores would split a stick" (opspec_utils.py:515-516). A sub-stick
+        trailing block is not caught by ``validate_op_specs``; it surfaces as an
+        opaque ``SubprocException`` from the backend compiler, so bound the
+        search instead of discovering it late.
+
+        The floor is the widest stick any supported dtype uses (64 elements at
+        fp16/bf16; fp32 uses 32 and is therefore also satisfied).
+        """
+        from ...autotuner.config_spec import BlockSizeSpec
+
+        specs = [s for s in block_specs if isinstance(s, BlockSizeSpec)]
+        if len(specs) < 2:
+            return
+        for trailing in specs[1:]:
+            # Never raise the floor above the dim itself: a dim narrower than
+            # one stick (e.g. N=32 fp16) occupies a single partial stick, which
+            # is not a split and is therefore legal. Forcing 64 there makes the
+            # block indivisible by the extent and nothing can satisfy it.
+            extent = getattr(trailing, "size_hint", None)
+            if isinstance(extent, int) and extent < _MAX_ELEMS_PER_STICK:
+                continue
+            trailing.update_min(_MAX_ELEMS_PER_STICK)
+
+    def autotune_config_is_viable(
+        self, config_spec: object, config: Config
+    ) -> bool:
+        """Reject configs Spyre cannot express, before anything is emitted.
+
+        Three rules, each one a hard constraint rather than a preference:
+
+        * **Exact division.** Spyre work division and coarse-tile counts are
+          integers; a block size that does not divide its extent has no valid
+          ``iteration_space`` split (`wsr/coarse_tile.py:1384-1395` raises on
+          this for coarse tiles). The emitter already fails loudly, but a
+          rejected *config* must never reach codegen.
+        * **Stick alignment.** As in ``adjust_block_size_constraints``: a
+          trailing block below one stick splits a stick.
+        * **One reduction split.** Plan 4.1: at most one reduction dim may be
+          split across cores (`work_division.py:317-322`), since a K-split
+          builds a PSUM chain the emitter does not model.
+        * **Core budget.** The product of the per-dim splits is the number of
+          cores the kernel asks for, bounded by ``config.sencores``
+          (`_inductor/config.py:143`, default 32; also the ``max_cores`` the
+          work divider itself uses at `work_division.py:1990`). Overshooting is
+          not caught by ``validate_op_specs`` -- it surfaces as an opaque
+          ``SubprocException`` from the backend compiler, which an autotune
+          sweep hits constantly as it shrinks block sizes.
+        """
+        block_sizes = config.block_sizes
+        if not block_sizes:
+            return True
+
+        # config_spec is the authority here, not CompileEnvironment.current():
+        # this hook is called from the autotuner's search loop, where there is
+        # no active compile environment, so reading the ambient one silently
+        # accepted every candidate.
+        spec = getattr(config_spec, "block_sizes", None)
+        if spec is None:
+            return True
+        infos = [spec.block_id_lookup(bid) for bid in spec.valid_block_ids()]
+        reduction_splits = 0
+        cores = 1
+        for position, (info, block) in enumerate(zip(infos, block_sizes)):
+            extent = int(getattr(info, "size_hint", 0) or 0)
+            value = int(block)
+            if extent <= 0:
+                continue
+            if value <= 0 or extent % value != 0:
+                # Work division must be exact.
+                return False
+            if (
+                position > 0
+                and value < _MAX_ELEMS_PER_STICK
+                and extent > _MAX_ELEMS_PER_STICK
+            ):
+                # A trailing block below one stick splits a stick -- unless the
+                # whole dim is narrower than a stick, where it cannot.
+                return False
+            if getattr(info, "reduction", False) and extent // value > 1:
+                reduction_splits += 1
+            cores *= extent // value
+
+        # At most one reduction dim may be split across cores.
+        if reduction_splits > 1:
+            return False
+        return cores <= _sencores()
 
     # -- the emission seam ------------------------------------------------
 
@@ -96,6 +264,30 @@ class SpyreBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         self.emitter.reset()
+
+    def record_input_layout(
+        self, real: torch.Tensor, fake: torch.Tensor
+    ) -> None:
+        """Remember each real input's stick axis before it is fakified.
+
+        Plan 5.3 says input layouts are *read*, not chosen -- but by codegen
+        time every tensor is a ``FakeTensor`` whose ``device_tensor_layout()``
+        returns ``None``, so the real layout is unrecoverable there. Without
+        this the backend silently assumed the default trailing-dim stick axis
+        for every input, which is wrong numerics (not a crash) for a
+        transposed operand and means no ReStickifyOpHBM is ever emitted.
+        """
+        from .layout import stick_dim_of
+
+        try:
+            self._input_stick_dims[id(fake)] = stick_dim_of(real)
+        except Exception:
+            # A dtype or layout the backend cannot describe fails later, at the
+            # point where it is actually used and can be named.
+            pass
+
+    def input_stick_dim(self, fake: torch.Tensor) -> int | None:
+        return self._input_stick_dims.get(id(fake))
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Install a Spyre lowering for every compute node.
@@ -215,6 +407,9 @@ class SpyreBackend(Backend):
             "OpSpec": "from torch_spyre._inductor.op_spec import OpSpec",
             "LoopSpec": "from torch_spyre._inductor.op_spec import LoopSpec",
             "TensorArg": "from torch_spyre._inductor.op_spec import TensorArg",
+            "IndirectAccess": (
+                "from torch_spyre._inductor.op_spec import IndirectAccess"
+            ),
             "_default_spyre_launcher": (
                 "from helion.runtime import default_spyre_launcher"
                 " as _default_spyre_launcher"
@@ -271,9 +466,43 @@ class SpyreBackend(Backend):
         has_barrier: bool,
         sorted_args: Sequence[object] | None = None,
     ) -> list[str]:
+        """Pass the host tensors positionally, in OpSpec ``arg_index`` order.
+
+        The device body is vestigial here, so it references none of the kernel
+        tensors and Helion registers no device args for them: ``args``,
+        ``tensor_host_args`` and ``sorted_args`` all arrive empty, and the
+        emitted call would be ``_launcher(kernel, grid)`` with no tensors --
+        which fails at runtime with "symbolic_args tensor_id out of range".
+
+        The emitter's own buffer table is the source of truth instead. Each
+        graph input/output was registered from Helion's ``tensor_arg`` table, so
+        its ``name`` *is* the host wrapper's variable name and its ``arg_index``
+        is the position SDSC expects. A scalar constant the emitter synthesized
+        (an accumulator zero-fill has no host tensor) is materialized here.
+        """
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
-        return list(args)
+
+        consts = {index for index, _, _ in self.emitter.const_args}
+        launch: list[tuple[int, str]] = []
+        for operand in self.emitter.args:
+            if operand.arg_index < 0:
+                continue
+            if operand.arg_index in consts:
+                launch.append(
+                    (
+                        operand.arg_index,
+                        f"torch.zeros((), dtype={operand.dtype!r},"
+                        f" device={_DEVICE_EXPR})",
+                    )
+                )
+            elif operand.name:
+                launch.append((operand.arg_index, operand.name))
+            else:
+                raise exc.BackendUnsupported(
+                    self.name, f"kernel arg {operand.arg_index} has no host name"
+                )
+        return [name for _, name in sorted(launch)]
 
     def scalar_arg_preamble(self, arg: object) -> list[ast.AST]:
         return []

@@ -25,6 +25,12 @@ if TYPE_CHECKING:
     import torch
 
 
+#: Concurrent LX intermediates to request before spilling to the HBM pool.
+#: Empirical, not nominal: 3 concurrent 128x256 fp16 LX buffers fail at launch
+#: with a Compute CB hardware error, 2 work.
+_MAX_LX_BUFFERS = 2
+
+
 @dataclasses.dataclass
 class Operand:
     """One Spyre buffer, as Helion knows it before an OpSpec needs it.
@@ -52,6 +58,9 @@ class Operand:
         *,
         is_input: bool,
         tile_advance: sympy.Expr | None = None,
+        spec_name: str | None = None,
+        indirect_dim: int | None = None,
+        indirect_from: str | None = None,
     ) -> object:
         """Realize this buffer as a ``TensorArg`` under a given indexing.
 
@@ -72,6 +81,17 @@ class Operand:
         device_size, device_coordinates = layout.stickify(
             self.sizes, symbols, self.stick_dim, self.dtype
         )
+        if indirect_dim is not None:
+            # Replace the coordinate for one host dim with a runtime index read
+            # from another TensorArg: IndirectAccess(name) resolves by the
+            # *spec_name* of the index arg (op_spec.py's IndirectAccess
+            # docstring; the pairing is done in codegen/superdsc.py:1216-1217).
+            from torch_spyre._inductor.op_spec import IndirectAccess
+
+            assert indirect_from is not None
+            position = self._device_axis_of(indirect_dim)
+            device_coordinates = list(device_coordinates)
+            device_coordinates[position] = IndirectAccess(indirect_from)
         return TensorArg(
             is_input=is_input,
             arg_index=self.arg_index,
@@ -80,7 +100,75 @@ class Operand:
             device_coordinates=device_coordinates,
             allocation=dict(self.allocation),
             device_tile_advance_expr=tile_advance,
+            name=spec_name,
         )
+
+    def _device_axis_of(self, host_dim: int) -> int:
+        """Device-coordinate position carrying a host dim's whole index.
+
+        ``stickify`` emits ``[floor(stick/eps), *others, Mod(stick, eps)]``, so
+        a non-stick host dim appears once in the middle and the stick dim is
+        split across the first and last positions. Only a non-stick dim can
+        carry an indirect index, since an indirect read is not stick-divisible.
+        """
+        if host_dim == self.stick_dim:
+            raise exc.BackendUnsupported(
+                "spyre",
+                f"indirect access on the stick axis (host dim {host_dim})",
+            )
+        others = [i for i in range(len(self.sizes)) if i != self.stick_dim]
+        return 1 + others.index(host_dim)
+
+
+@dataclasses.dataclass
+class IndirectOperand:
+    """A gathered operand: a value buffer plus the index buffer addressing it.
+
+    Spyre pairs the two by name, so they cannot be separated: the value arg's
+    coordinate is ``IndirectAccess(<index arg name>)`` and the index arg carries
+    that ``name``. Both must appear in the same OpSpec.
+    """
+
+    value: Operand
+    index: Operand
+    indirect_dim: int
+
+    #: Name the index arg is published under, referenced by IndirectAccess.
+    spec_name: str = "_spyre_idx"
+
+    @property
+    def sizes(self) -> list[int]:
+        """Logical shape of the gathered result."""
+        return [
+            self.index.sizes[0] if d == self.indirect_dim else extent
+            for d, extent in enumerate(self.value.sizes)
+        ]
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.value.dtype
+
+    @property
+    def stick_dim(self) -> int:
+        return self.value.stick_dim
+
+    def args(self, symbols: list[sympy.Expr]) -> list[object]:
+        """``[index arg, value arg]`` for the consuming OpSpec.
+
+        Mirrors the captured reference's gather, whose op reads the index tensor
+        first and then the value tensor whose coordinate is
+        ``IndirectAccess('buf1')`` (golden/ref_gather.py).
+        """
+        index_symbols = [symbols[self.indirect_dim]]
+        return [
+            self.index.tensor_arg(index_symbols, is_input=True, spec_name=self.spec_name),
+            self.value.tensor_arg(
+                symbols,
+                is_input=True,
+                indirect_dim=self.indirect_dim,
+                indirect_from=self.spec_name,
+            ),
+        ]
 
 
 class SpyreEmitter:
@@ -121,6 +209,8 @@ class SpyreEmitter:
         self._carries: dict[str, Operand] = {}
         #: Per open level: {block_id: per-iteration tile extent}.
         self._tiled_blocks: list[dict[int, int]] = []
+        #: (op_key, level) -> that op's minted tile-advance symbol.
+        self._op_level_symbols: dict[tuple[str, int], Any] = {}
 
     def mark_accumulator(self, operand: Operand, value: float) -> None:
         self.pending_fills[id(operand)] = (operand, value)
@@ -143,12 +233,20 @@ class SpyreEmitter:
         if name in self.operands:
             return self.operands[name]
         index = len(self.args)
+        if stick_dim is None:
+            # Prefer the axis recorded from the *real* tensor before
+            # fakification; a fake tensor carries no device layout.
+            from ..compile_environment import CompileEnvironment
+
+            backend = CompileEnvironment.current().backend
+            recorded = backend.input_stick_dim(tensor)
+            stick_dim = (
+                recorded if recorded is not None else layout.stick_dim_of(tensor)
+            )
         operand = Operand(
             sizes=list(tensor.size()),
             dtype=tensor.dtype,
-            stick_dim=(
-                layout.stick_dim_of(tensor) if stick_dim is None else stick_dim
-            ),
+            stick_dim=stick_dim,
             allocation={"hbm": index},
             arg_index=index,
             name=name,
@@ -172,7 +270,20 @@ class SpyreEmitter:
         fused pointwise chain (golden/ref_fused_add_mul.py: the ``(x+y)``
         intermediate is ``allocation={'lx': 0}``, ``arg_index=-1``, pool_size 0).
         ``hbm_pool`` is plan 4.4's alternative and needs ``pool_size`` set.
+
+        LX is a hard-capped resource and asking for too much of it is not
+        diagnosed anywhere in the stack: a chain needing 3 concurrent LX
+        buffers compiles and validates, then fails at launch with
+        ``RAS::RUNTIMESCHEDULER::ComputeHardwareError`` ("Compute CB hardware
+        error detected"). Measured on this device, 2 LX intermediates of
+        128x256 fp16 work and 3 do not, well under the nominal budget of
+        ``_LX_TRACKER_CAPACITY_BYTES * dxp_lx_frac_avail`` (~406 KB, ~6 such
+        buffers; scratchpad/allocator.py:169, :1524). So the request is capped
+        here and anything beyond it spills to ``hbm_pool``, which is the
+        residency plan 4.4 proposed in the first place.
         """
+        if residency == "lx" and self._n_lx >= _MAX_LX_BUFFERS:
+            residency = "hbm_pool"
         if residency == "lx":
             allocation: dict[str, Any] = {"lx": self._n_lx}
             self._n_lx += 1
@@ -234,6 +345,168 @@ class SpyreEmitter:
         self.args.append(operand)
         self.const_args.append((index, value, dtype))
         return operand
+
+    def emit_restickify(
+        self, source: Operand, stick_dim: int, symbols: list[sympy.Expr]
+    ) -> Operand:
+        """Relayout ``source`` onto a new stick axis, as a visible node.
+
+        Plan 4.2/M3: where an operand's given layout conflicts with what an op
+        needs, the backend must emit an explicit ``ReStickifyOpHBM`` rather than
+        reinterpret the buffer -- silently reinterpreting is wrong numerics, not
+        a crash. ``RESTICKIFY_OP`` is ``constants.py:21``.
+
+        ``op_spec_validation._check_stick_restickify`` (`:687`) requires the
+        input and output to have *different* stick symbols, which is exactly the
+        condition the caller detected, so a no-op relayout is rejected here
+        instead of producing a spec the validator will refuse.
+        """
+        from torch_spyre._inductor.constants import RESTICKIFY_OP
+
+        if source.stick_dim == stick_dim:
+            raise exc.BackendUnsupported(
+                "spyre",
+                f"restickify from stick axis {stick_dim} to itself is a no-op",
+            )
+
+        # The destination must live in HBM, as the op name says: an identical
+        # spec writing an ``lx`` destination silently produces wrong data
+        # (measured max|d| ~1.0 on a [0,1) input, versus fp16 rounding error
+        # when the destination is HBM). Nothing validates this -- G1 and the
+        # backend compiler both accept the lx form.
+        relaid = self.add_intermediate(
+            f"{source.name or 'buf'}_restick",
+            list(source.sizes),
+            source.dtype,
+            stick_dim,
+            residency="hbm_pool",
+        )
+        self.emit(
+            self.op_spec(
+                RESTICKIFY_OP,
+                is_reduction=False,
+                iteration_space=self._full_space(source.sizes, symbols),
+                args=[
+                    source.tensor_arg(symbols, is_input=True),
+                    relaid.tensor_arg(symbols, is_input=False),
+                ],
+            )
+        )
+        return relaid
+
+    def _full_space(
+        self, sizes: list[int], symbols: list[sympy.Expr]
+    ) -> dict[Any, tuple[Any, int]]:
+        import sympy
+
+        return {
+            sym: (sympy.Integer(size), 1)
+            for sym, size in zip(symbols, sizes, strict=True)
+        }
+
+    def emit_gather(self, gathered: IndirectOperand, dest: Operand) -> None:
+        """Stage the gathered table, then copy through the runtime index.
+
+        Two ops, as the reference does (golden/ref_gather.py):
+
+        1. an ``identity`` relayouting the table so the **gathered dim is the
+           outermost device axis** -- ``device_size=[256, 2, 64]`` rather than
+           the default ``[2, 256, 64]``. ``IndirectAccess`` occupies device
+           position 0, so a table whose gathered dim sits on a middle axis
+           reads the wrong rows (measured: 98.8% error, a plausible-looking but
+           wrong result).
+        2. an ``identity`` reading the index arg and the
+           IndirectAccess-coordinated staged table, writing ``dest``.
+        """
+        import sympy
+
+        from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
+
+        from . import layout
+
+        value = gathered.value
+        gdim = gathered.indirect_dim
+        dtype = value.dtype
+        eps = layout.elems_per_stick(dtype)
+        device_dtype = layout.device_dtype(dtype)
+
+        # Staged layout: [gathered extent, sticks of the rest..., eps].
+        others = [i for i in range(len(value.sizes)) if i != gdim]
+        if len(others) != 1:
+            raise exc.BackendUnsupported(
+                "spyre", "indirect access is modelled for 2-D operands only"
+            )
+        rest = value.sizes[others[0]]
+        staged_size = [value.sizes[gdim], -(-rest // eps), eps]
+
+        c_g, c_r = sympy.Symbol("c0"), sympy.Symbol("c1")
+        source_size, source_coords = layout.stickify(
+            value.sizes, [c_g, c_r], value.stick_dim, dtype
+        )
+        staged_coords = [c_g, sympy.floor(c_r / eps), sympy.Mod(c_r, eps)]
+
+        staged = self.add_intermediate(
+            f"{value.name or 'buf'}_gather_src",
+            list(value.sizes),
+            dtype,
+            value.stick_dim,
+            residency="hbm_pool",
+        )
+        self.emit(
+            self.op_spec(
+                "identity",
+                is_reduction=False,
+                iteration_space=self._full_space(value.sizes, [c_g, c_r]),
+                args=[
+                    TensorArg(
+                        is_input=True,
+                        arg_index=value.arg_index,
+                        device_dtype=device_dtype,
+                        device_size=source_size,
+                        device_coordinates=source_coords,
+                        allocation=dict(value.allocation),
+                    ),
+                    TensorArg(
+                        is_input=False,
+                        arg_index=-1,
+                        device_dtype=device_dtype,
+                        device_size=staged_size,
+                        device_coordinates=staged_coords,
+                        allocation=dict(staged.allocation),
+                    ),
+                ],
+            )
+        )
+
+        out_sizes = gathered.sizes
+        o_g, o_r = sympy.Symbol("c0"), sympy.Symbol("c1")
+        index_arg = gathered.index.tensor_arg(
+            [o_g], is_input=True, spec_name=gathered.spec_name
+        )
+        value_arg = TensorArg(
+            is_input=True,
+            arg_index=-1,
+            device_dtype=device_dtype,
+            device_size=staged_size,
+            device_coordinates=[
+                IndirectAccess(gathered.spec_name),
+                sympy.floor(o_r / eps),
+                sympy.Mod(o_r, eps),
+            ],
+            allocation=dict(staged.allocation),
+        )
+        self.emit(
+            self.op_spec(
+                "identity",
+                is_reduction=False,
+                iteration_space=self._full_space(out_sizes, [o_g, o_r]),
+                args=[
+                    index_arg,
+                    value_arg,
+                    dest.tensor_arg([o_g, o_r], is_input=False),
+                ],
+            )
+        )
 
     def emit_zero_fill(self, operand: Operand) -> None:
         """Zero an accumulator with an ``identity`` from a scalar constant.
@@ -371,52 +644,158 @@ class SpyreEmitter:
             trips[symbol] = trip
         return symbols, trips
 
-    def current_k_advance(
-        self, k_tile: int, dtype: torch.dtype
-    ) -> sympy.Expr | None:
-        """Per-iteration device-element advance of a K-tiled operand.
+    @staticmethod
+    def device_element_offset(
+        device_size: list[int], coords: list[sympy.Expr]
+    ) -> sympy.Expr:
+        """Linear device-element offset of a coordinate tuple.
 
-        One coarse step moves the read window by a whole K-tile, which in
-        device elements is ``k_tile * elems_per_stick``: the reference's
-        ``floor(8192*_tile_adv_op0_lvl0)`` is 128 * 64 for a 128-element K-tile
-        at fp16. ``spyre_kernel.py:732-768`` does the same reprojection from
-        the tiling expression into device-element space.
+        ``device_size`` is row-major, so dim ``i``'s stride is the product of
+        the dims inside it -- the same projection SDSC codegen uses to turn
+        coordinates into addresses.
+        """
+        strides: list[int] = []
+        acc = 1
+        for dim in reversed(device_size):
+            strides.insert(0, acc)
+            acc *= dim
+        total = 0
+        for coord, stride in zip(coords, strides, strict=True):
+            total = total + coord * stride
+        return total
+
+    def level_symbol_for(self, op_key: str) -> sympy.Symbol | None:
+        """The innermost level's tile-advance symbol for one op.
+
+        Minted per (op, level), never shared between ops: spyre_kernel.py:552-569
+        mints it that way specifically to fix a "same-real-symbol-tiled-at-2+-
+        levels collapse bug", and sharing one symbol across the read-copy,
+        matmul and combine ops makes their advances collapse so every iteration
+        reads the same tile. ``integer=True`` so Mod()/floor() of a shifted
+        coordinate resolve in tile_advance_for.
         """
         import sympy
 
-        from . import layout
+        if not self._levels:
+            return None
+        key = (op_key, len(self._levels) - 1)
+        symbol = self._op_level_symbols.get(key)
+        if symbol is None:
+            symbol = sympy.Symbol(
+                f"_tile_adv_{op_key}_lvl{len(self._levels) - 1}", integer=True
+            )
+            self._op_level_symbols[key] = symbol
+        return symbol
+
+    def tiling_for(
+        self, op_key: str
+    ) -> tuple[list[list[Any]], dict[Any, int]] | None:
+        """``(tiled_symbols, trip_counts)`` for one op, with its own symbols."""
+        if not self._levels:
+            return None
+        symbols: list[list[Any]] = []
+        trips: dict[Any, int] = {}
+        for depth in range(len(self._levels) - 1, -1, -1):
+            _, trip = self._levels[depth]
+            key = (op_key, depth)
+            symbol = self._op_level_symbols.get(key)
+            if symbol is None:
+                import sympy
+
+                symbol = sympy.Symbol(f"_tile_adv_{op_key}_lvl{depth}", integer=True)
+                self._op_level_symbols[key] = symbol
+            symbols.append([symbol])
+            trips[symbol] = trip
+        return symbols, trips
+
+    def tile_advance_for(
+        self,
+        device_size: list[int],
+        coords: list[sympy.Expr],
+        tiled_symbol: sympy.Symbol,
+        tile_extent: int,
+        *,
+        level_symbol: sympy.Symbol | None = None,
+    ) -> sympy.Expr | None:
+        """Per-step device-element advance of one operand along a tiled dim.
+
+        Derived from the operand's *own* coordinates rather than a per-op
+        formula: shift the tiled iteration symbol by one coarse tile, subtract,
+        and evaluate at the window origin. That is the same reprojection
+        ``spyre_kernel._general_tile_advance`` performs
+        (spyre_kernel.py:732-768), and it is why a matmul's two inputs get
+        different advances when they stick on different axes.
+
+        Returns ``None`` when the operand does not move, which is correct for a
+        loop-invariant buffer such as an accumulator.
+        """
+        import sympy
 
         if not self._levels:
             return None
-        symbol, _ = self._levels[-1]
-        if symbol is None:
+        if level_symbol is None:
+            level_symbol = self._levels[-1][0]
+        if level_symbol is None:
             return None
-        return sympy.floor(k_tile * layout.elems_per_stick(dtype) * symbol)
+
+        offset = self.device_element_offset(device_size, coords)
+        shifted = offset.subs(tiled_symbol, tiled_symbol + tile_extent * level_symbol)
+        delta = sympy.simplify(shifted - offset)
+        # The advance is a per-step constant, so evaluate it at the window
+        # origin; every other free coordinate cancels or is in-tile.
+        origin = {s: 0 for s in delta.free_symbols if s is not level_symbol}
+        delta = sympy.simplify(delta.subs(origin))
+        if delta == 0:
+            return None
+        return delta
+
+    @property
+    def level_symbol(self) -> sympy.Symbol | None:
+        """The innermost open level's tile-advance symbol."""
+        if not self._levels:
+            return None
+        return self._levels[-1][0]
 
     @property
     def loop_depth(self) -> int:
         return len(self._stack) - 1
 
     def redirect_output(self, value: Operand, dest: Operand) -> None:
-        """Make the OpSpec that produced ``value`` write ``dest`` instead.
+        """Rebind every reference to ``value`` onto ``dest``.
 
-        Plan 2's store rule. ``value`` is an intermediate buffer whose producing
-        OpSpec is the most recent one writing it; rewriting that OpSpec's output
-        arg avoids emitting a copy. The intermediate then has no users, so its
-        ``lx``/``hbm_pool`` slot is released by not having been needed.
+        Plan 2's store rule. Rewriting only the producing OpSpec's *output* arg
+        is not enough for a loop carry: the combine op reads the accumulator as
+        an input too, so leaving those reads on the old ``lx`` buffer makes each
+        iteration overwrite instead of accumulate. A per-stick probe caught
+        exactly that -- only the last K-tile survived in the output.
+
+        The reference accumulates in place in HBM (golden/ref_matmul_ktiled.py's
+        combine ``add`` has arg0 and arg2 both ``hbm: 3``), so the accumulator
+        must *be* the store destination rather than a buffer copied out at the
+        end.
         """
         producer = self._producers.get(id(value))
         if producer is None:
             raise exc.BackendUnsupported(
                 "spyre", f"store of a value with no producing OpSpec: {value.name}"
             )
-        op_spec, arg_pos = producer
-        old = op_spec.args[arg_pos]
-        op_spec.args[arg_pos] = dest.tensor_arg(
-            self._output_symbols[id(value)],
-            is_input=False,
-            tile_advance=old.device_tile_advance_expr,
-        )
+
+        symbols = self._output_symbols[id(value)]
+        old_alloc = dict(value.allocation)
+        old_index = value.arg_index
+
+        def rebind(arg: object) -> object:
+            if arg.allocation != old_alloc or arg.arg_index != old_index:
+                return arg
+            return dest.tensor_arg(
+                symbols,
+                is_input=arg.is_input,
+                tile_advance=arg.device_tile_advance_expr,
+            )
+
+        for spec in self._iter_op_specs(self._specs):
+            spec.args = [rebind(a) for a in spec.args]
+
         if "lx" in value.allocation:
             self._n_lx -= 1
         elif "hbm_pool" in value.allocation:
@@ -425,7 +804,20 @@ class SpyreEmitter:
             for s in value.sizes:
                 n *= s
             self.pool_size -= n * value.dtype.itemsize
-        self.operands.pop(value.name, None) if value.name else None
+        if value.name:
+            self.operands.pop(value.name, None)
+
+    @staticmethod
+    def _iter_op_specs(specs: list[object]) -> list[object]:
+        """Every OpSpec in a spec tree, descending into LoopSpec bodies."""
+        out: list[object] = []
+        for spec in specs:
+            body = getattr(spec, "body", None)
+            if body is not None:
+                out.extend(SpyreEmitter._iter_op_specs(body))
+            elif hasattr(spec, "args"):
+                out.append(spec)
+        return out
 
     def specs(self) -> list[object]:
         if self.loop_depth != 0:

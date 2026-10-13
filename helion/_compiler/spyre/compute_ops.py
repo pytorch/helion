@@ -146,16 +146,25 @@ def _emit_pointwise(
     sizes, splits = tile_space(val)
     symbols = _iteration_symbols(len(sizes))
 
-    # The output sticks where its inputs do; a mismatch is a relayout (M3), not
-    # something to paper over.
-    stick_dims = {o.stick_dim for o in inputs}
-    if len(stick_dims) != 1:
-        raise exc.BackendUnsupported(
-            "spyre",
-            f"operands disagree on stick axis {sorted(stick_dims)};"
-            " needs a ReStickifyOpHBM (plan M3)",
-        )
-    stick_dim = stick_dims.pop()
+    # Every operand of a pointwise op must stick on the same axis, and the
+    # *consumer's* axis is the one that wins: the output is written in the
+    # layout its own users expect, so a disagreeing input is relaid onto that
+    # axis by an explicit ReStickifyOpHBM (plan 4.2/M3), never by
+    # reinterpreting the buffer. Picking a majority axis instead would relayout
+    # the correct operands and leave the output inconsistent -- which
+    # validates, then fails in the backend scheduler with
+    # "There must be at least one valid candidate".
+    #
+    # The output's axis is the trailing dim, torch-spyre's default tiled layout
+    # and what every graph input carries unless its real layout says otherwise.
+    stick_dim = len(sizes) - 1
+    if any(o.stick_dim != stick_dim for o in inputs):
+        inputs = [
+            o
+            if o.stick_dim == stick_dim
+            else emitter.emit_restickify(o, stick_dim, symbols)
+            for o in inputs
+        ]
 
     out = emitter.add_intermediate(
         node.name, sizes, val.dtype, stick_dim, residency="lx"
@@ -213,8 +222,14 @@ def _matmul_shape(node: Node, x_node: Node, y_node: Node) -> MatmulShape:
             "spyre", f"matmul shape mismatch: {x_iter} @ {y_iter}"
         )
 
-    # Layout extents come from the operands' own buffers, which hold the full
-    # tensor shape regardless of how the iteration space is tiled.
+    # device_size stays FULL for an operand that advances. The reference is
+    # explicit about the two roles: its y reads full K
+    # (device_size=[1,512,64]) *with* floor(8192*L), and 8192 = k_tile *
+    # elems_per_stick is a stride within that full buffer -- so the advance and
+    # the full extent belong together. Only a one-tile window read from a pool
+    # shrinks device_size, and that window carries no advance at all
+    # (golden/ref_matmul_ktiled.py: the bmm's x arg is [2,64,64], hbm_pool, no
+    # advance). Helion reads straight from HBM, so it takes the advancing role.
     x_full = _full_sizes(x_node)
     y_full = _full_sizes(y_node)
 
@@ -253,8 +268,8 @@ def _matmul_op_spec(
     y: Operand,
     out: Operand,
     shape: MatmulShape,
-    tiled: tuple[list[list[sympy.Symbol]], dict[sympy.Symbol, int]] | None = None,
-    k_advance: sympy.Expr | None = None,
+    op_key: str = "op",
+    x_advances: bool = True,
 ) -> object:
     """Build the ``batchmatmul`` OpSpec under the DF16 stick rule.
 
@@ -278,8 +293,28 @@ def _matmul_op_spec(
         c2: (_int(shape.k), 1),
     }
 
+    # Both inputs are indexed by the reduction symbol c2, so inside a K-tiled
+    # loop BOTH must advance -- each by its own amount, since they stick on
+    # different axes. Omitting x's advance makes it re-read K-tile 0 forever,
+    # which a loose numeric tolerance will not catch.
+    # This op's own level symbol: sharing one symbol across the read-copy,
+    # matmul and combine ops collapses their advances (spyre_kernel.py:552-569).
+    level = emitter.level_symbol_for(op_key)
+
+    # A staged x is already one K-tile wide and does not advance; an unstaged
+    # x spans full K and must advance with the loop.
+    x_sizes = shape.x_sizes if x_advances else [shape.x_sizes[0], shape.k]
     x_arg = _matmul_arg(
-        x, [c0, c2], sizes=shape.x_sizes, stick_dim=1, is_input=True
+        x,
+        [c0, c2],
+        sizes=x_sizes,
+        stick_dim=1,
+        is_input=True,
+        tile_advance=(
+            _k_advance(emitter, x, shape.x_sizes, [c0, c2], 1, shape.k, level)
+            if x_advances
+            else None
+        ),
     )
     y_arg = _matmul_arg(
         y,
@@ -287,13 +322,16 @@ def _matmul_op_spec(
         sizes=shape.y_sizes,
         stick_dim=1,
         is_input=True,
-        tile_advance=k_advance,
+        tile_advance=_k_advance(
+            emitter, y, shape.y_sizes, [c2, c1], 1, shape.k, level
+        ),
     )
     out_arg = _matmul_arg(
         out, [c0, c1], sizes=[shape.m, shape.n], stick_dim=1, is_input=False
     )
 
-    tiled_symbols, trip_counts = tiled if tiled is not None else ([], {})
+    tiling = emitter.tiling_for(op_key)
+    tiled_symbols, trip_counts = tiling if tiling is not None else ([], {})
     return emitter.op_spec(
         op,
         is_reduction=True,
@@ -304,6 +342,47 @@ def _matmul_op_spec(
         output=out,
         output_symbols=[c0, c1],
     )
+
+
+def _k_advance(
+    emitter: object,
+    operand: Operand,
+    sizes: list[int],
+    symbols: list[sympy.Expr],
+    stick_dim: int,
+    k_tile: int,
+    level_symbol: sympy.Expr | None = None,
+) -> sympy.Expr | None:
+    """This operand's per-step advance along the tiled reduction dim.
+
+    Built from the operand's realized layout, so it cannot disagree with the
+    ``device_coordinates`` the same operand is emitted with.
+    """
+    import dataclasses as _dc
+
+    from . import layout
+    from .emitter import Operand as _Operand
+
+    assert isinstance(operand, _Operand)
+    reshaped = _dc.replace(operand, sizes=list(sizes), stick_dim=stick_dim)
+    device_size, coords = layout.stickify(
+        reshaped.sizes, symbols, reshaped.stick_dim, reshaped.dtype
+    )
+    return emitter.tile_advance_for(
+        device_size,
+        coords,
+        _reduction_symbol(symbols),
+        k_tile,
+        level_symbol=level_symbol,
+    )
+
+
+def _reduction_symbol(symbols: list[sympy.Expr]) -> sympy.Expr:
+    """``c2``, the matmul reduction symbol, in an operand's symbol list."""
+    for sym in symbols:
+        if getattr(sym, "name", "") == "c2":
+            return sym
+    raise exc.BackendUnsupported("spyre", "matmul operand has no reduction symbol")
 
 
 def _emit_matmul(
@@ -328,6 +407,87 @@ def _emit_matmul(
 
     emitter.emit(_matmul_op_spec(emitter, op, x=x, y=y, out=out, shape=shape))
     return out
+
+
+def _stage_advancing_operand(
+    emitter: object,
+    operand: Operand,
+    shape: MatmulShape,
+    node: Node,
+    tiled: object,
+    *,
+    dtype: torch.dtype,
+) -> Operand:
+    """Copy one K-tile of ``operand`` into a pool buffer, advancing per step.
+
+    The staging op is an ``identity`` whose source keeps the operand's full
+    device_size and carries the tile advance, and whose destination is a
+    one-tile ``hbm_pool`` window with no advance -- the shape
+    golden/ref_matmul_ktiled.py emits as ``coarse_tile_read_copy_0_arg0_1_0``.
+    """
+    import dataclasses as _dc
+
+    c0, _, c2 = _iteration_symbols(3)
+    k_tile = shape.k
+
+    op_key = f"read_copy_{node.name}"
+    level = emitter.level_symbol_for(op_key)
+    source = _dc.replace(operand, sizes=list(shape.x_sizes), stick_dim=1)
+    device_size, coords = layout_stickify(source, [c0, c2])
+    advance = emitter.tile_advance_for(
+        device_size, coords, c2, k_tile, level_symbol=level
+    )
+    if advance is None:
+        # No open coarse-tile level: the operand does not move, so the matmul
+        # can read it directly and staging would be pure overhead.
+        return operand
+
+    staged = emitter.add_intermediate(
+        f"{node.name}_ktile",
+        [shape.x_sizes[0], k_tile],
+        dtype,
+        1,
+        residency="hbm_pool",
+    )
+
+    from torch_spyre._inductor.op_spec import TensorArg
+
+    from . import layout as _layout
+
+    src_arg = TensorArg(
+        is_input=True,
+        arg_index=operand.arg_index,
+        device_dtype=_layout.device_dtype(dtype),
+        device_size=device_size,
+        device_coordinates=coords,
+        allocation=dict(operand.allocation),
+        device_tile_advance_expr=advance,
+    )
+    staging_tiling = emitter.tiling_for(op_key)
+    tiled_symbols, trip_counts = (
+        staging_tiling if staging_tiling is not None else ([], {})
+    )
+    emitter.emit(
+        emitter.op_spec(
+            "identity",
+            is_reduction=False,
+            iteration_space=_iteration_space(
+                [c0, c2], [shape.x_sizes[0], k_tile], [1, 1]
+            ),
+            args=[src_arg, staged.tensor_arg([c0, c2], is_input=False)],
+            tiled_symbols=tiled_symbols,
+            tiled_symbol_trip_counts=trip_counts,
+        )
+    )
+    return staged
+
+
+def layout_stickify(operand: Operand, symbols: list[sympy.Expr]):
+    from . import layout as _layout
+
+    return _layout.stickify(
+        operand.sizes, symbols, operand.stick_dim, operand.dtype
+    )
 
 
 def _emit_addmm(
@@ -355,6 +515,22 @@ def _emit_addmm(
     assert isinstance(val, torch.Tensor)
 
     tiled = emitter.current_tiling()
+
+    # Stage the K-advancing operand into a one-tile pool buffer first.
+    # golden/ref_matmul_ktiled.py shows the two roles cannot be combined on one
+    # TensorArg: the advancing read keeps its FULL device_size and carries
+    # floor(8192*L) (the read-copy identity, arg0 [8,64,64] hbm + advance ->
+    # arg1 [2,64,64] hbm_pool, no advance), and the matmul then reads that
+    # one-tile pool window with no advance of its own. Emitting the matmul
+    # directly against advancing full-K HBM instead makes every iteration read
+    # the same final tile -- a per-stick probe showed only K[384:512] read, and
+    # twice over.
+    x_staged = _stage_advancing_operand(
+        emitter, x, shape, node, tiled, dtype=val.dtype
+    )
+    mm_key = f"mm_{node.name}"
+    combine_key = f"combine_{node.name}"
+
     partial = emitter.add_intermediate(
         f"{node.name}_partial", [shape.m, shape.n], val.dtype, 1, residency="lx"
     )
@@ -362,19 +538,22 @@ def _emit_addmm(
         _matmul_op_spec(
             emitter,
             "batchmatmul",
-            x=x,
+            x=x_staged,
             y=y,
             out=partial,
             shape=shape,
-            tiled=tiled,
-            k_advance=emitter.current_k_advance(shape.k, val.dtype),
+            op_key=mm_key,
+            x_advances=False,
         )
     )
 
     # Combine into the accumulator: acc = acc + partial, in place.
     c0, c1 = _iteration_symbols(2)
     combine_space = _iteration_space([c0, c1], [shape.m, shape.n], [1, 1])
-    tiled_symbols, trip_counts = tiled if tiled is not None else ([], {})
+    combine_tiling = emitter.tiling_for(combine_key)
+    tiled_symbols, trip_counts = (
+        combine_tiling if combine_tiling is not None else ([], {})
+    )
     emitter.emit(
         emitter.op_spec(
             "add",

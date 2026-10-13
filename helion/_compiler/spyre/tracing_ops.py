@@ -81,7 +81,11 @@ def _(state: CodegenState) -> object:
     # One minted symbol per level, shared by tiled_symbols and every
     # device_tile_advance_expr at that level (spyre_kernel.py:552-568, :743):
     # the shared identity is what lets SDSC recover each level's stride.
-    level_symbol = sympy.Symbol(f"_tile_adv_helion_lvl{emitter.loop_depth}")
+    # integer=True so Mod()/floor() of a shifted coordinate resolve when
+    # tile_advance_for derives each operand's own advance.
+    level_symbol = sympy.Symbol(
+        f"_tile_adv_helion_lvl{emitter.loop_depth}", integer=True
+    )
 
     emitter.open_loop(level_symbol, count, block_ids, block_size)
     ok = False

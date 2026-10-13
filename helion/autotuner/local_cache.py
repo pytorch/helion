@@ -311,6 +311,15 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = str(torch.mtia.get_device_properties(dev))
             except Exception:
                 runtime_name = "unknown"
+        elif dev.type == "spyre":
+            hardware = "spyre"
+            try:
+                import torch_spyre  # type: ignore[import-not-found]
+                from importlib.metadata import version
+
+                runtime_name = version("torch_spyre")
+            except Exception:
+                runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(

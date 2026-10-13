@@ -47,8 +47,56 @@ def _(state: CodegenState) -> object:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+
+    indirect = _indirect_dim(subscript)
+    if indirect is not None:
+        return _indirect_operand(state, tensor, subscript, indirect)
+
     _reject_narrowing(subscript)
     return host_operand(state, tensor)
+
+
+def _indirect_dim(subscript: object) -> int | None:
+    """Host dim indexed by a *tensor*, i.e. a gather."""
+    assert isinstance(subscript, (list, tuple))
+    for dim, index in enumerate(subscript):
+        if isinstance(index, torch.Tensor):
+            return dim
+    return None
+
+
+def _indirect_operand(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: object,
+    indirect_dim: int,
+) -> Operand:
+    """A gathered view of ``tensor``, indexed at runtime by another buffer.
+
+    Spyre expresses this as ``IndirectAccess(name)`` in the value tensor's
+    ``device_coordinates``, paired by name with an index ``TensorArg`` carrying
+    that ``name`` (op_spec.py's ``IndirectAccess`` docstring;
+    codegen/superdsc.py:1216-1217 does the pairing). The index operand must
+    therefore travel with the value operand, which is what ``IndirectOperand``
+    records for the consuming OpSpec to emit.
+    """
+    from .emitter import IndirectOperand
+    from .emitter import Operand as _Operand
+
+    # The index is a *loaded value*, not a kernel argument: Device IR shows
+    # load(table, [load(idx, ...), slice]) -- so its buffer comes from the
+    # already-codegen'd subscript argument, which the "spyre" load handler
+    # returned as an Operand.
+    index_value = state.ast_args[1][indirect_dim]
+    if not isinstance(index_value, _Operand):
+        raise exc.BackendUnsupported(
+            "spyre",
+            f"indirect index is {type(index_value).__name__}, not a buffer",
+        )
+    value = host_operand(state, tensor)
+    return IndirectOperand(
+        value=value, index=index_value, indirect_dim=indirect_dim
+    )
 
 
 @_decorators.codegen(store, "spyre")
@@ -72,8 +120,16 @@ def _(state: CodegenState) -> None:
     dest = host_operand(state, tensor)
 
     value = state.ast_args[2] if len(state.ast_args) > 2 else None
+    from .emitter import IndirectOperand
     from .emitter import Operand as _Operand
 
+    if isinstance(value, IndirectOperand):
+        # A gather feeding a store is a copy through the indirect index: the
+        # reference emits exactly this as an `identity` whose value arg carries
+        # IndirectAccess (golden/ref_gather.py, op 2).
+        emitter.emit_gather(value, dest)
+        _mark_device_body(state)
+        return
     if not isinstance(value, _Operand):
         raise exc.BackendUnsupported(
             "spyre", f"store of a non-buffer value: {type(value).__name__}"
@@ -97,3 +153,20 @@ def _reject_narrowing(subscript: object) -> None:
             raise exc.BackendUnsupported(
                 "spyre", f"subscript of type {type(index).__name__}"
             )
+
+
+def _mark_device_body(state: CodegenState) -> None:
+    """Keep a vestigial device body non-empty so DCE does not reject the loop.
+
+    ``generate_ast.py:1936-1937`` raises ``EmptyDeviceLoopAfterDCE`` when both
+    the preamble and body are empty after elimination. On this backend the body
+    is never executed -- the OpSpec tree is the kernel -- but a store whose
+    subscript needs no index arithmetic (a gather, where the index is a buffer)
+    leaves nothing behind, so the loop looks dead. The statement documents
+    itself in the generated source.
+    """
+    from ..ast_extension import statement_from_string
+
+    state.add_statement(
+        statement_from_string("pass  # Spyre: the OpSpec tree is the kernel")
+    )

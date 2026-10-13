@@ -512,6 +512,17 @@ class Backend(abc.ABC):
         """Return the tensor metadata used while tracing a kernel input."""
         return tensor
 
+    def record_input_layout(
+        self, real: torch.Tensor, fake: torch.Tensor
+    ) -> None:
+        """Note any backend layout metadata of a real input before fakification.
+
+        Called from ``CompileEnvironment.to_fake`` with both the real tensor and
+        the fake tensor that will stand in for it. Backends whose codegen needs
+        a property the fake tensor does not carry record it here.
+        """
+        return
+
     def fake_subscript_shape(
         self,
         tensor: torch.Tensor,

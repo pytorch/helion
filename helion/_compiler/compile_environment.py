@@ -1754,6 +1754,10 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
+        # Carry backend-specific layout metadata across fakification: a fake
+        # tensor has no device layout, so a backend whose codegen depends on
+        # one (Spyre reads the stick axis off it) cannot recover it later.
+        self.backend.record_input_layout(tensor, result)
         result = self.backend.normalize_input_fake_tensor(result)
         previous_source = self.input_sources.get(result)
         if previous_source is not None and previous_source != source:
