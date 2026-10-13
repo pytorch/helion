@@ -249,11 +249,12 @@ def test_symmetric_resolution_is_unchanged() -> None:
 def test_surface_searches_only_the_fa4_family() -> None:
     fragments = _fragments()
     assert _active(fragments[FAMILY_KEY]) == ("fa4",)
-    # The causal resident packet is keyed on the 128-wide value tiles (its
-    # body never touches the Q/K width); the plain cadence packets stay off.
+    # The causal resident packets (every cadence sibling) are keyed on the
+    # 128-wide value tiles (their body never touches the Q/K width); the
+    # plain cadence packets stay off.
     assert _active(fragments[cute_flash.FLASH_EXP2_PACKET_KEY]) == (
         "1x1",
-        "causal_hd128_resident3_013_prefetch2_deg2_early_acquire",
+        *cute_flash._FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKET_CHOICES,
     )
     assert _active(fragments[cute_flash.FLASH_Q_TILE_M_KEY]) == (128,)
     assert fragments[FAMILY_KEY].default() == "fa4"
@@ -285,25 +286,60 @@ def test_seeds_resolve_to_the_fa4_family() -> None:
             assert resolved.kv_stage == 2
             assert not resolved.epi_tma and not resolved.epi_stg
     staged = [resolved for resolved in resolved_seeds if resolved.uneven_kv_ring]
-    assert len(staged) == 3
+    assert len(staged) == 7
     resident = "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+    sparse = "causal_hd128_resident3_013_prefetch2_deg2_16x2_early_acquire"
+    hardware = "causal_hd128_resident3_013_prefetch2_xu_early_acquire"
     staged_packets = sorted(
-        (resolved.exp2_packet, resolved.e2e_schedule, resolved.softmax_regs)
+        (
+            resolved.exp2_packet,
+            resolved.e2e_schedule,
+            resolved.softmax_regs,
+            resolved.wait_hint,
+        )
         for resolved in staged
     )
-    # The measured best (hd128 winner registers), the packet on the defaults,
-    # and the XU cadence without the packet.
-    assert staged_packets == [
-        ("1x1", "xu", 200),
-        (resident, "16/6", 160),
-        (resident, "16/6", 200),
-    ]
+    # The 16/6 packet on the hd128 winner registers and on the defaults, the
+    # sparse (16/2) resident cadence on the three measured register splits
+    # (hd128 winners, defaults, FA4's 192/72), the hardware-only resident
+    # cadence, and the XU cadence without the packet.
+    assert staged_packets == sorted(
+        [
+            ("1x1", "xu", 200, 10_000_000),
+            (resident, "16/6", 160, 0),
+            (resident, "16/6", 200, 10_000_000),
+            (sparse, "16/2", 160, 0),
+            (sparse, "16/2", 200, 10_000_000),
+            (sparse, "16/2", 192, 0),
+            (hardware, "xu", 160, 0),
+        ]
+    )
+    assert {
+        (resolved.softmax_regs, resolved.corr_regs, resolved.other_regs)
+        for resolved in staged
+        if resolved.exp2_packet == sparse
+    } == {(160, 112, 48), (200, 64, 48), (192, 72, 56)}
+    for resolved in staged:
+        if resolved.exp2_packet in (sparse, hardware):
+            assert resolved.rescale_threshold == 8.0
+        if resolved.exp2_packet == hardware:
+            # No residue pairs: the phase offsets are dead and normalize away.
+            assert (resolved.e2e_freq, resolved.e2e_res) == (16, 0)
+            assert (resolved.e2e_offset, resolved.e2e_offset0) == (0, 0)
     for resolved in staged:
         assert resolved.causal_kv_order == "descending"
+    # FA4's register row carries the halved L2-sized launch group (16 batch-heads
+    # at s2048, the measured s2048 winner); the other seeds keep FA4's group.
+    assert {
+        (resolved.softmax_regs, resolved.causal_lpt_l2_shift) for resolved in staged
+    } == {(160, 0), (200, 0), (192, 1)}
+    for resolved in staged:
+        assert resolved.causal_lpt_swizzle == 0
         assert resolved.causal_loop_split
         assert resolved.corr_tile_size == 16
     # The direct-store fallbacks: the descending loop-split schedule with the
-    # default and the XU cadence (plus the packet's generic seed).
+    # default and the XU cadence (plus the generic seed of each resident
+    # cadence packet).
     direct_schedules = sorted(
         resolved.e2e_schedule
         for resolved in resolved_seeds
@@ -311,7 +347,7 @@ def test_seeds_resolve_to_the_fa4_family() -> None:
         and resolved.causal_kv_order == "descending"
         and resolved.causal_loop_split
     )
-    assert direct_schedules == ["16/6", "8/2", "xu"]
+    assert direct_schedules == ["16/2", "16/4", "16/6", "8/2", "xu", "xu"]
 
 
 # --------------------------------------------------------------------------

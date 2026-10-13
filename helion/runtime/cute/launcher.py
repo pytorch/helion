@@ -758,6 +758,7 @@ def _append_cute_wrapper_plan(
         alibi_idx = plan_optional_int("alibi_idx")
         document_idx = plan_optional_int("document_idx")
         row_kv_begin_idx = plan_optional_int("row_kv_begin_idx")
+        row_kv_begin_work_idx = plan_optional_int("row_kv_begin_work_idx")
         seq = plan_int("seq")
         head_dim = plan_int("head_dim")
         # V/O head dim: equals ``head_dim`` except for the asymmetric MLA pair
@@ -981,6 +982,16 @@ def _append_cute_wrapper_plan(
                     ),
                 ]
             )
+            if row_kv_begin_work_idx is not None:
+                # Host-built ``(rows, 4)`` int32 work table of the segment
+                # tiling: row 0 holds the item count, the rest the
+                # (batch row, segment start, segment length, pair code) items.
+                work_rows = plan_int("row_kv_begin_work_rows")
+                flash_lines.append(
+                    "_flash_mRkbWork = cute.make_tensor("
+                    f"arg{row_kv_begin_work_idx}.iterator, "
+                    f"cute.make_layout(({work_rows}, 4), stride=(4, 1)))"
+                )
         # Fused row-epilogue inputs share O's (S, D, B) view so the device body
         # can partition them exactly like the O store.
         epi_aux_count = plan_int("epi_aux_count", default=0)
@@ -1125,6 +1136,11 @@ def _append_cute_wrapper_plan(
             )
         if row_kv_begin_idx is not None:
             call_args.extend(["_flash_mRowKvBegin", "_flash_rkb_heads_per_batch"])
+            if row_kv_begin_work_idx is not None:
+                call_args.append("_flash_mRkbWork")
+                if epi_tma:
+                    # The ragged tiles' vector store needs the plain O view.
+                    call_args.append("_flash_mO")
         if epi_tma:
             call_args.extend(["_flash_tma_o", "_flash_osl"])
         elif epi_stg:

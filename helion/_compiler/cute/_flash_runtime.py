@@ -1483,6 +1483,50 @@ def row_kv_begin_mask_t2r_chunk(
     mask_r2p_sm100_range(tLDrS, row_lb - block_start, row_idx + 1 - block_start)
 
 
+def fa4_disc_rowmax_live_rows(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_max: Float32,
+    ld_chunks: int,
+    row_live: cutlass.Boolean,
+) -> Float32:
+    """``fa4_disc_rowmax_balanced`` for a KV tile that is either fully visible
+    to a row or fully hidden from it (``row_live`` per thread): the dense
+    fold is kept for the visible rows and discarded for the hidden ones --
+    exactly the fold the per-element mask would produce, since a hidden
+    row's masked scores are all ``-inf`` and leave its row max unchanged.
+
+    The hidden rows' raw scores are read unmasked here and in the matching
+    PASS2 (``row_minus_max_scale``).  This fold discards them whole, so the
+    row max is the masked path's for any score value; the PASS2 identity
+    needs them finite -- see ``row_minus_max_scale`` for the contract."""
+    folded = fa4_disc_rowmax_balanced(tiled_ld, tLDtS, tLDcS, row_max, ld_chunks)
+    return Float32(cutlass.select_(row_live, folded, row_max))
+
+
+def row_minus_max_scale(minus_max_scale: Float32, row_live: cutlass.Boolean) -> Float32:
+    """The scaled negative row max PASS2 adds to each score, or ``-inf`` for
+    a row the KV tile hides entirely.
+
+    PASS2 computes ``exp2(score * scale + minus_max_scale)``; with ``-inf``
+    in place of ``minus_max_scale`` every finite score of the row maps to
+    the same ``-inf`` argument a masked (``-inf``) score produces, so the
+    probabilities, the row sum and the stored P are bitwise those of the
+    masked tile without masking or storing the scores back.
+
+    That identity assumes the hidden rows' raw scores are finite:
+    ``fma(score, scale, -inf)`` is ``-inf`` only then, whereas the
+    per-element mask replaces the score unconditionally.  A ``NaN`` or
+    ``inf`` raw score at a position the query never attends -- uninitialised
+    padding between packed documents, a Q.K product overflowing fp32 --
+    makes P and the row's output NaN here where the masked tile hid it.
+    Such inputs are outside the row-bound kind's contract: the attended
+    positions of every flash body already assume finite scores, and this
+    path extends that assumption to the rows a KV tile hides whole."""
+    return Float32(cutlass.select_(row_live, minus_max_scale, -cutlass.Float32.inf))
+
+
 def _row_kv_begin_clamped(value: object, limit: cutlass.Int32) -> cutlass.Int32:
     """A lower-bound table entry clamped to ``[0, limit]`` as an exact Int32.
 
@@ -2014,6 +2058,45 @@ def fa4_disc_rowmax_causal_balanced(
         )
         row_max = _fmax_reduce_chunk_balanced(frg, row_max)
     cute.arch.fence_view_async_tmem_load()
+    return row_max
+
+
+def fa4_disc_rowmax_causal_store_balanced(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_max: Float32,
+    ld_chunks: int,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    tiled_score_st: object,
+    tScoreSTtS: cute.Tensor,
+) -> Float32:
+    """``fa4_disc_rowmax_causal_balanced`` that writes the masked chunks back.
+
+    The causal mask is applied once: PASS1 stores each masked fp32 score chunk
+    back over its own TMEM columns (the store atom repeats the load atom's
+    column count, so chunk ``ci`` of the store aliases chunk ``ci`` of the
+    load), and PASS2 runs the plain exp pass on the stored scores. On the
+    latency-bound diagonal tile this removes the per-chunk R2P/select chain
+    from PASS2's load -> exp -> store dependency chain. The trailing
+    ``tcgen05.wait::st`` orders the stores before PASS2's loads.
+    """
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(ld_chunks):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ci, None, None]),
+            m_block,
+            n_block,
+            ci,
+        )
+        row_max = _fmax_reduce_chunk_balanced(frg, row_max)
+        cute.copy(tiled_score_st, frg, tScoreSTtS[None, ci, None, None])
+    cute.arch.fence_view_async_tmem_load()
+    cute.arch.fence_view_async_tmem_store()
     return row_max
 
 
@@ -3328,6 +3411,60 @@ def fa4_store_o_smem_to_gmem_whole(
             out[None, rest_m, None],
             tOgO_epi[None, rest_m, None],
         )
+
+
+@cute.jit
+def fa4_store_o_smem_to_gmem_rows(
+    gmem_tiled_copy: object,
+    gmem_thr_copy: object,
+    tOsO: cute.Tensor,
+    tOgO: cute.Tensor,
+    tOcO: cute.Tensor,
+    live_rows: cutlass.Int32,
+    io_dtype: type[Numeric] = cutlass.Float16,
+) -> None:
+    """``fa4_store_o_smem_to_gmem`` for a ragged output tile: only the rows
+    before ``live_rows`` are stored.
+
+    ``tOcO`` is this thread's partition of the tile's identity tensor, so
+    ``tOcO[0, rest_m, 0][0]`` is the tile row of row slice ``rest_m``.  The
+    segment-aligned per-row-KV-lower-bound tiling computes the rows of a
+    segment's last pair past the segment end with whatever keys follow them;
+    those rows belong to the next segment's pair and must not be written (a
+    full-tile store would race with that pair's store).  FA4's varlen
+    epilogue (``_store_O_to_gmem``) guards its rows the same way.
+    """
+    tOgO_epi = cast("Any", gmem_thr_copy).partition_D(tOgO)
+    coord = cast("Any", tOcO)
+    for rest_m in cutlass.range_constexpr(cute.size(tOsO, mode=[1])):
+        if coord[0, rest_m, 0][0] < live_rows:
+            src = cast("cute.Tensor", tOsO[None, rest_m, None])
+            out = cute.make_fragment_like(src, io_dtype)
+            cute.autovec_copy(src, out)
+            cute.copy(gmem_tiled_copy, out, tOgO_epi[None, rest_m, None])
+
+
+@cute.jit
+def fa4_store_o_smem_to_gmem_whole_rows(
+    gmem_tiled_copy: object,
+    gmem_thr_copy: object,
+    tOsO: cute.Tensor,
+    tOgO: cute.Tensor,
+    tOcO: cute.Tensor,
+    live_rows: cutlass.Int32,
+    io_dtype: type[Numeric] = cutlass.Float16,
+) -> None:
+    """``fa4_store_o_smem_to_gmem_whole`` with the row guard of
+    ``fa4_store_o_smem_to_gmem_rows``."""
+    tOgO_epi = cast("Any", gmem_thr_copy).partition_D(tOgO)
+    coord = cast("Any", tOcO)
+    out = cute.make_fragment_like(tOsO, io_dtype)
+    cute.autovec_copy(tOsO, out)
+    for rest_m in cutlass.range_constexpr(cute.size(out, mode=[1])):
+        if coord[0, rest_m, 0][0] < live_rows:
+            cute.copy(
+                gmem_tiled_copy, out[None, rest_m, None], tOgO_epi[None, rest_m, None]
+            )
 
 
 @dsl_user_op

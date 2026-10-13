@@ -442,6 +442,14 @@ def test_normal100_retains_all_seeds_and_both_schedules() -> None:
         "post_acquire",
         "pre_acquire",
     }
-    assert {c.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] for c in stateful} == set(
+    # The launch group is a free coordinate of every lowering: the coverage
+    # design reaches every stateful width on some lowering, and the stateful
+    # rows carry at least the stateful seed widths.
+    assert {c.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] for c in configs} >= set(
         flash._flash_stateful_lpt_candidates(64)
+    )
+    assert {c.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] for c in stateful} >= set(
+        flash._flash_stateful_lpt_seed_widths(
+            64, 32, num_bh=64, num_sm=152, dtype=torch.float16
+        )
     )

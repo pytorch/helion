@@ -1990,19 +1990,26 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     for key, value in resident_defaults.items():
         assert _active_choices(enum_fragments[key]) == frozenset((value,))
     assert set(resident_defaults.items()) <= set(active_values)
-    # 63: the ws surface pins every dimension it cannot vary to one value,
+    # 67: the ws surface pins every dimension it cannot vary to one value,
     # including the KV tile width, the query-tile height, the one-pass
     # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
     # the (fa4-only) per-chunk P release, the affine bias lowering
     # (``cute_flash_bias_form``, live only with an ALiBi/relative bias), the
     # two row-program knobs (``cute_flash_row_warps``,
-    # ``cute_flash_row_tile_m`` of the ``row_mma`` family) and the asymmetric
-    # pair's fa4 knobs (``cute_flash_uneven_kv_ring``, ``cute_flash_o_over_q``);
-    # the two-warpgroup body measures both of its O epilogues
+    # ``cute_flash_row_tile_m`` of the ``row_mma`` family), the asymmetric
+    # pair's fa4 knobs (``cute_flash_uneven_kv_ring``, ``cute_flash_o_over_q``),
+    # the L2-budget halving of the causal launch group
+    # (``cute_flash_causal_lpt_l2_shift``), the single-application causal
+    # mask (``cute_flash_causal_mask_storeback``, live only on plain causal
+    # fa4 disc bodies), the per-row KV lower bound's fa4 tiling
+    # (``cute_flash_row_bound_tiling``, live only on fa4 ROW_KV_BEGIN plans)
+    # and the dead stage-0 tile skip (``cute_flash_causal_skip_dead_tile``,
+    # live only on the descending plain causal fa4 PTX body); the
+    # two-warpgroup body measures both of its O epilogues
     # (``cute_flash_epi_stg``).
     # Resident-only coordinates add exactly three inactive singletons; keep
     # the upstream bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 63
+    assert len(active_values) - len(resident_defaults) <= 67
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
