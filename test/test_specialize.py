@@ -1210,6 +1210,84 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(store_column(x, out), expected)
                 torch.testing.assert_close(add_one(x, torch.empty_like(x)), x + 1.0)
 
+    def test_size_one_broadcast_load_feeds_reduction(self):
+        """``bias[tile_m, tile_n]`` with ``bias.size(0) == 1`` broadcasts row
+        0 over the tile.  A load is masked to 0 past the tile's extent, which
+        lets the column sum skip its own mask, so the broadcast rows past
+        ``M`` must be zeroed too (they counted ``bias`` once per row of the
+        block)."""
+        configs = [helion.Config(block_sizes=[32, 16])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[32, 16], indexing=indexing)
+                for indexing in indexings
+            ]
+        for static_shapes in (True, False):
+            for config in configs:
+
+                @helion.kernel(static_shapes=static_shapes, config=config)
+                def column_sums(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+                    m, n = x.size()
+                    out = torch.empty([n], dtype=torch.float32, device=x.device)
+                    for tile_n in hl.tile(n):
+                        acc = hl.zeros([tile_n], dtype=torch.float32)
+                        for tile_m in hl.tile(m):
+                            acc += (x[tile_m, tile_n] + bias[tile_m, tile_n]).sum(0)
+                        out[tile_n] = acc
+                    return out
+
+                for m in (1, 4, 20):
+                    with self.subTest(static_shapes=static_shapes, config=config, m=m):
+                        x = torch.randn(m, 64, device=DEVICE)
+                        bias = torch.randn(1, 64, device=DEVICE)
+                        torch.testing.assert_close(
+                            column_sums(x, bias),
+                            (x + bias).sum(0),
+                            rtol=1e-4,
+                            atol=1e-4,
+                        )
+
+    @skipIfRefEager("stack tensors are not supported in ref eager mode")
+    @skipIfNotTriton("CuTe stack tensors do not support dynamic shapes")
+    def test_size_one_broadcast_stack_load_feeds_reduction(self):
+        """A stack tensor load that broadcasts a size-1 dim onto a wider tile
+        must also be 0 past the tile's extent before a reduction over it."""
+        for static_shapes in (True, False):
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 32]),
+            )
+            def stack_column_sums(
+                x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+            ) -> torch.Tensor:
+                m, n = x.size()
+                s = hl.specialize(dev_ptrs.size(0))
+                out = torch.empty([s, n], dtype=torch.float32, device=x.device)
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([s, tile_n], dtype=torch.float32)
+                    for tile_m in hl.tile(m):
+                        tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                        acc += tensors[tile_m, tile_n].sum(1)
+                    out[:, tile_n] = acc
+                return out
+
+            with self.subTest(static_shapes=static_shapes):
+                x = torch.randn(20, 64, device=DEVICE)
+                rows = [torch.randn(1, 64, device=DEVICE) for _ in range(4)]
+                ptrs = torch.as_tensor(
+                    [r.data_ptr() for r in rows], device=DEVICE, dtype=torch.uint64
+                )
+                torch.testing.assert_close(
+                    stack_column_sums(x, ptrs, rows[0]),
+                    torch.stack([r[0] * 20 for r in rows]),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+
     def test_own_extent_dims_record_no_broadcast_guard(self):
         """A dim indexed by a tile over its own size cannot broadcast, so code
         generation does not compare it with 1 and the kernel keeps a
