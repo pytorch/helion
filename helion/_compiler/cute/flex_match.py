@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 # Flipped by the emitter workstream once the fa4 list-walk body exists. The
 # integration points (surface detector, codegen hook) consult it; tests patch
 # it to exercise the plumbing before the emitter lands.
-FLEX_PLAN_ENABLED = False
+FLEX_PLAN_ENABLED = True
 # v1 restrictions of the walk: 128-wide KV tiles (one BlockMask KV block per
 # kernel tile) and Q blocks of one or two 128-row tiles.
 FLEX_KV_BLOCK = 128
@@ -504,6 +504,11 @@ def flex_host_scalar_device_name(
     closure int); registers the argument on ``df`` like any scalar read."""
     symbol = flex_host_scalar_symbol(host_function, name)
     return None if symbol is None else df.sympy_expr(symbol)
+
+
+class _UnmappedRegionValue(Exception):
+    """A region node that is neither an admitted op nor a leaf (score,
+    coordinate, host scalar) was used as a value while building a region."""
 
 
 class _Ctx:
@@ -1765,7 +1770,10 @@ class _RegionBuilder:
             if node in mapping:
                 return mapping[node]
             leaf = self.leaf_of(node)
-            assert leaf is not None, node
+            if leaf is None:
+                # Not a region value (a shape query the admission let through
+                # as metadata, say) used as one: decline, never render it.
+                raise _UnmappedRegionValue(node.name)
             if leaf.kind == "score":
                 result = placeholders["score"]
             elif leaf.kind == "coord":
@@ -1781,9 +1789,20 @@ class _RegionBuilder:
                 assert isinstance(source, torch.fx.Node)
                 mapping[node] = transform(source)
                 continue
+            if node.target is _aten.sym_size.int:
+                # Shape metadata (``zeros_like(score)`` sizes its ``full`` by
+                # ``sym_size_int(score, d)``): never a region value.
+                continue
             if node.target in _FULL_TARGETS or node.target is creation_ops.full:
-                copied = graph.node_copy(node, transform)
-                copied.args = ([], *copied.args[1:])
+                # The shape argument is metadata (``zeros_like(score)`` traces
+                # to ``full([sym_size(q, 0), block_size_kv], 0.0)``): drop it
+                # instead of mapping its symbolic size nodes into the region.
+                target = node.target
+                assert callable(target)
+                rest = torch.fx.node.map_arg(tuple(node.args[1:]), transform)
+                kwargs = torch.fx.node.map_arg(dict(node.kwargs), transform)
+                copied = graph.call_function(target, ([], *rest), kwargs)
+                copied.meta = dict(node.meta)
                 mapping[node] = copied
                 continue
             if node.target is memory_ops.load:
@@ -1890,16 +1909,20 @@ def _capture_regions(
     aux_order = list(builder.aux_order)
     host_scalars = list(builder.host_scalars)
     score_graph = score_output = mask_graph = mask_output = None
-    if score_nodes is not None:
-        assert isinstance(score_src, torch.fx.Node)
-        score_graph, score_output = builder.build(
-            score_nodes, score_src, aux_order, host_scalars, coord_meta
-        )
-    if mask_nodes is not None:
-        assert isinstance(mask_pred, torch.fx.Node)
-        mask_graph, mask_output = builder.build(
-            mask_nodes, mask_pred, aux_order, host_scalars, coord_meta
-        )
+    try:
+        if score_nodes is not None:
+            assert isinstance(score_src, torch.fx.Node)
+            score_graph, score_output = builder.build(
+                score_nodes, score_src, aux_order, host_scalars, coord_meta
+            )
+        if mask_nodes is not None:
+            assert isinstance(mask_pred, torch.fx.Node)
+            mask_graph, mask_output = builder.build(
+                mask_nodes, mask_pred, aux_order, host_scalars, coord_meta
+            )
+    except _UnmappedRegionValue as error:
+        ctx.decline(f"flex: region value {error} is not a score, coordinate or scalar")
+        return None
     aux_buffers: list[FlexAuxBuffer] = []
     for name in aux_order:
         value = _host_tensor_value(builder.aux_nodes[name])

@@ -24,6 +24,7 @@ import inspect
 import json
 import linecache
 import logging
+import math
 import os
 import sys
 import threading
@@ -760,6 +761,11 @@ def _append_cute_wrapper_plan(
         row_kv_begin_idx = plan_optional_int("row_kv_begin_idx")
         row_kv_begin_work_idx = plan_optional_int("row_kv_begin_work_idx")
         seq = plan_int("seq")
+        # The flex envelope's K/V length (the Q/O/LSE length is ``seq``).
+        kv_seq = plan_int("kv_seq", default=seq)
+        # The flex envelope's runtime softmax scale.
+        scale_idx = plan_optional_int("scale_idx")
+        scale_peeled = bool(plan.get("scale_peeled", True))
         head_dim = plan_int("head_dim")
         # V/O head dim: equals ``head_dim`` except for the asymmetric MLA pair
         # (192-wide Q/K against 128-wide V/O).
@@ -791,7 +797,7 @@ def _append_cute_wrapper_plan(
         # amortizes the per-tile softmax correction over more columns, which is
         # where FA4's tuned plans get their edge on sm_103.
         kv_n = plan_int("kv_tile_n", default=128)
-        num_kv = (seq + kv_n - 1) // kv_n
+        num_kv = (kv_seq + kv_n - 1) // kv_n
         # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
         # flat tile-id space the device-body strided while loop walks). When
         # persistent, the host clamps grid_x down to min(total_tiles, num_SMs)
@@ -821,8 +827,10 @@ def _append_cute_wrapper_plan(
         qkd = f"({mma_m}, {kv_n}, {hd})"
         pvd = f"({mma_m}, {hd_v}, {kv_n})"
         if use_tensor_4d_tma:
-            # The 4D descriptors describe Q/K/V/O with one head dim.
+            # The 4D descriptors describe Q/K/V/O with one head dim and one
+            # sequence length.
             assert hd_v == hd
+            assert kv_seq == seq
             bh_stride = seq * hd
             batch_stride = tensor_4d_heads * bh_stride
             sdb = (
@@ -851,18 +859,18 @@ def _append_cute_wrapper_plan(
                 f"cute.make_layout(({hd_v}, {seq}, {batch}), "
                 f"stride=(1, {hd_v}, {seq * hd_v}))"
             )
-        # K/V layouts span their own (grouped) batch-head count.
-        if kv_group == 1:
+        # K/V layouts span their own (grouped) batch-head count and length.
+        if kv_group == 1 and kv_seq == seq:
             sdb_kv = sdb
             dsb_kv = dsb
         else:
             sdb_kv = (
-                f"cute.make_layout(({seq}, {hd}, {kv_batch}), "
-                f"stride=({hd}, 1, {seq * hd}))"
+                f"cute.make_layout(({kv_seq}, {hd}, {kv_batch}), "
+                f"stride=({hd}, 1, {kv_seq * hd}))"
             )
             dsb_kv = (
-                f"cute.make_layout(({hd_v}, {seq}, {kv_batch}), "
-                f"stride=(1, {hd_v}, {seq * hd_v}))"
+                f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
+                f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
             )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
@@ -926,6 +934,20 @@ def _append_cute_wrapper_plan(
             f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
             f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
         ]
+        if scale_idx is not None:
+            # The flex envelope's runtime scale: the hooks read it as
+            # ``_flash_scale``; a mask-only plan (raw QK units, the scale
+            # peeled into the PASS2 multiplier) derives the log2 scale from
+            # it and needs it positive (a non-positive scale would flip the
+            # row max), while a score region owns the multiply itself.
+            flash_lines.append(f"_flash_scale = cutlass.Float32(arg{scale_idx})")
+            if scale_peeled:
+                # A non-positive scale would flip the row max; the example's
+                # host wrapper asserts ``scale > 0`` (a staged value cannot be
+                # asserted inside the DSL wrapper).
+                flash_lines.append(
+                    f"_flash_scale_log2 = _flash_scale * cutlass.Float32({math.log2(math.e)!r})"
+                )
         if bias_idx is not None:
             flash_lines.extend(
                 [
@@ -1141,6 +1163,8 @@ def _append_cute_wrapper_plan(
                 if epi_tma:
                     # The ragged tiles' vector store needs the plain O view.
                     call_args.append("_flash_mO")
+        if scale_idx is not None:
+            call_args.append("_flash_scale")
         if epi_tma:
             call_args.extend(["_flash_tma_o", "_flash_osl"])
         elif epi_stg:

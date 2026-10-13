@@ -28,12 +28,20 @@ chunked body (the autotune candidate whose benchmark hung, which the fix
 covers as well but which hung far more rarely before it), and
 ``HELION_CUTE_FLASH_STRESS_PROCESSES`` repeats each case in that many fresh
 subprocesses.
+
+The flex case runs the FlexAttention envelope's BlockMask list walk
+(``examples/flex_attention.py`` on the fa4 pair body) over random partial /
+full lists: counts from zero to every tile, rows without keys, an empty pair
+and an asymmetric pair, so every role's per-item trip count comes from the
+tables and the zero-P path is exercised; its reference is block-level
+visibility (the noop mask_mod keeps every key of a listed block).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -53,6 +61,8 @@ from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 
 _SHAPE = (2, 16, 2048, 128)
+# The flex list walk: 16 query rows x 16 KV tiles per (batch, head).
+_FLEX_SHAPE = (2, 16, 2048, 64)
 _LAUNCHES_ENV = "HELION_CUTE_FLASH_STRESS_LAUNCHES"
 _PROCESSES_ENV = "HELION_CUTE_FLASH_STRESS_PROCESSES"
 _DEFAULT_LAUNCHES = 3_000
@@ -94,12 +104,94 @@ _XSA_CHUNKED_SOFTMAX_ROUTE: dict[str, object] = {
 }
 
 
+# The flex list walk on the chunked fa4 body with the two-slot ring (the
+# pruned-fa4 campaign structure the flex GPU suite pins as well).
+_FLEX_LIST_WALK: dict[str, object] = {
+    "block_sizes": [128, 128],
+    "cute_flash_pipeline_family": "fa4",
+    "cute_flash_exp2_packet": "8x2",
+    "cute_flash_e2e_schedule": "16/8",
+    "cute_flash_s_load_rep": 16,
+    "cute_flash_p_store_rep": 16,
+    "cute_flash_disc_pipe": 2,
+    "cute_flash_split_p_arrive": True,
+    "cute_flash_causal_kv_order": "descending",
+    "cute_flash_epi_tma": True,
+}
+
+
+def _random_block_mask(batch: int, heads: int, rows: int, tiles: int) -> object:
+    """Random partial / full lists per (batch, head, row): a total from zero
+    to every tile, a random partial / full split, plus an empty pair (rows
+    0 and 1 of head 0) and an asymmetric pair (row 2 empty, row 3 full)."""
+    from torch.nn.attention.flex_attention import BlockMask
+    from torch.nn.attention.flex_attention import noop_mask
+
+    generator = torch.Generator().manual_seed(1)
+    part_cnt = torch.zeros(batch, heads, rows, dtype=torch.int32)
+    full_cnt = torch.zeros(batch, heads, rows, dtype=torch.int32)
+    part_idx = torch.zeros(batch, heads, rows, tiles, dtype=torch.int32)
+    full_idx = torch.zeros(batch, heads, rows, tiles, dtype=torch.int32)
+    for b in range(batch):
+        for h in range(heads):
+            for r in range(rows):
+                total = int(torch.randint(0, tiles + 1, (1,), generator=generator))
+                n_part = int(torch.randint(0, total + 1, (1,), generator=generator))
+                perm = torch.randperm(tiles, generator=generator)
+                part = perm[:n_part].sort().values
+                full = perm[n_part:total].sort().values
+                part_cnt[b, h, r] = n_part
+                part_idx[b, h, r, :n_part] = part.to(torch.int32)
+                full_cnt[b, h, r] = total - n_part
+                full_idx[b, h, r, : total - n_part] = full.to(torch.int32)
+    for r in (0, 1, 2):
+        part_cnt[0, 0, r] = 0
+        full_cnt[0, 0, r] = 0
+    part_cnt[0, 0, 3] = 0
+    full_cnt[0, 0, 3] = tiles
+    full_idx[0, 0, 3] = torch.arange(tiles, dtype=torch.int32)
+    return BlockMask.from_kv_blocks(
+        part_cnt.to(DEVICE),
+        part_idx.to(DEVICE),
+        full_cnt.to(DEVICE),
+        full_idx.to(DEVICE),
+        BLOCK_SIZE=128,
+        mask_mod=noop_mask,
+    )
+
+
+def _block_visibility_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask: object,
+    scale: float,
+) -> torch.Tensor:
+    """Softmax over the keys of the listed (partial | full) blocks of each
+    query row's block; a row without a listed block gives 0."""
+    visible = block_mask.to_dense().bool()  # pyrefly: ignore [missing-attribute]
+    rows, tiles = visible.shape[-2:]
+    mask = visible.repeat_interleave(q.size(2) // rows, dim=2)
+    mask = mask.repeat_interleave(k.size(2) // tiles, dim=3)
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
+    scores = scores.masked_fill(~mask, float("-inf"))
+    p = torch.softmax(scores, dim=-1)
+    p = torch.where(mask.any(dim=-1, keepdim=True), p, torch.zeros_like(p))
+    return torch.matmul(p, v.float()).to(q.dtype)
+
+
 def _stress(
     module: str, config: dict[str, object], launches: int, watchdog: float
 ) -> None:
     """Compile ``config`` and launch it ``launches`` times with an L2 flush in between."""
     import helion
 
+    torch.manual_seed(0)
+    shape = _FLEX_SHAPE if module == "flex" else _SHAPE
+    q, k, v = (
+        torch.randn(*shape, dtype=torch.bfloat16, device=DEVICE) for _ in range(3)
+    )
+    bind_args: tuple[object, ...] = (q, k, v)
     if module == "attention":
         from examples.attention import attention as example
 
@@ -108,6 +200,34 @@ def _stress(
 
         def reference() -> torch.Tensor:
             return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    elif module == "flex":
+        from examples.flex_attention import _identity
+        from examples.flex_attention import helion_flex_attention_kernel as example
+
+        batch, heads, seq, head_dim = shape
+        block_mask = _random_block_mask(batch, heads, seq // 128, seq // 128)
+        scale = 1.0 / math.sqrt(head_dim)
+        bind_args = (
+            q,
+            k,
+            v,
+            _identity,
+            block_mask.kv_num_blocks,  # pyrefly: ignore [missing-attribute]
+            block_mask.kv_indices,  # pyrefly: ignore [missing-attribute]
+            block_mask.full_kv_num_blocks,  # pyrefly: ignore [missing-attribute]
+            block_mask.full_kv_indices,  # pyrefly: ignore [missing-attribute]
+            block_mask.mask_mod,  # pyrefly: ignore [missing-attribute]
+            128,
+            128,
+            scale,
+            False,
+        )
+
+        def call(fn: object) -> torch.Tensor:
+            return fn(*bind_args)[0]  # pyrefly: ignore [not-callable]
+
+        def reference() -> torch.Tensor:
+            return _block_visibility_reference(q, k, v, block_mask, scale)
     else:
         from examples.xsa import ref_xsa
         from examples.xsa import xsa_kernel as example
@@ -118,10 +238,6 @@ def _stress(
         def reference() -> torch.Tensor:
             return ref_xsa(q, k, v)
 
-    torch.manual_seed(0)
-    q, k, v = (
-        torch.randn(*_SHAPE, dtype=torch.bfloat16, device=DEVICE) for _ in range(3)
-    )
     # The polynomial exp2 packets (the XSA route's ``deg2_16x6``) are
     # approximations and reach the surface only under the fast_math setting.
     kernel = helion.kernel(
@@ -132,12 +248,13 @@ def _stress(
         fast_math=config.get("cute_flash_exp2_packet")
         in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS,
     )
-    bound = kernel.bind((q, k, v))
+    bound = kernel.bind(bind_args)
     normalized = bound._normalized_config_copy(helion.Config(**config))
-    assert (
-        normalized.config["cute_flash_softmax_disc"]
-        is config["cute_flash_softmax_disc"]
-    )
+    if "cute_flash_softmax_disc" in config:
+        assert (
+            normalized.config["cute_flash_softmax_disc"]
+            is config["cute_flash_softmax_disc"]
+        )
     fn = bound.compile_config(normalized)
     out = call(fn)
     torch.cuda.synchronize()
@@ -260,6 +377,16 @@ def test_whole_row_ring2_attention_survives_flushed_launches() -> None:
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+def test_flex_list_walk_survives_flushed_launches() -> None:
+    """The BlockMask list walk over random tables (zero counts, an empty
+    pair, an asymmetric pair) on the chunked fa4 body with the two-slot
+    ring: the per-item trip count and the zero-P path under flushed launches
+    next to a busy neighbour."""
+    _run_in_subprocesses("flex", _FLEX_LIST_WALK)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
 @skipIfFn(
     lambda: not _soak_requested(),
     reason=f"soak run only: set {_LAUNCHES_ENV} (the chunked-body hang was rare)",
@@ -270,7 +397,7 @@ def test_chunked_softmax_route_xsa_survives_flushed_launches() -> None:
 
 def _main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--module", choices=("attention", "xsa"), required=True)
+    parser.add_argument("--module", choices=("attention", "flex", "xsa"), required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--launches", type=int, default=_DEFAULT_LAUNCHES)
     parser.add_argument("--watchdog", type=float, default=_WATCHDOG_SECONDS)

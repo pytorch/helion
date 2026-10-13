@@ -34,6 +34,7 @@ import os
 import textwrap
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import TypedDict
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -50,6 +51,7 @@ from .attention_plan import ALIBI_BIAS_KIND
 from .attention_plan import CAUSAL_MASK_KIND
 from .attention_plan import DENSE_SCORE_KIND
 from .attention_plan import DOCUMENT_MASK_KIND
+from .attention_plan import FLEX_SCORE_KIND
 from .attention_plan import MASK_SCORE_KINDS
 from .attention_plan import PREFIX_LM_MASK_KIND
 from .attention_plan import RELATIVE_BIAS_KIND
@@ -58,6 +60,7 @@ from .attention_plan import SLIDING_WINDOW_MASK_KIND
 from .attention_plan import SOFTCAP_KIND
 from .attention_plan import TENSOR_BIAS_KIND
 from .attention_plan import AttentionScorePlan
+from .attention_plan import FlexKvWalk
 from .attention_plan import flash_head_dims_supported
 from .causal_range import CausalRangeProof
 from .causal_range import IntegerInterval
@@ -92,6 +95,8 @@ from .flash_schedule import build_fa4_schedule
 from .flash_schedule import fa4_schedule_fits
 from .flash_schedule import max_fa4_kv_depth
 from .flash_schedule import verify_flash_schedule
+from .flash_score_mod import FlexHookCode
+from .flash_score_mod import render_flex_hook
 from .flash_tuning import FLASH_FLOAT16_MAX_LOG2
 from .flash_tuning import FlashCausalSeedTemplate
 from .flash_tuning import FlashPackedExp2Mode
@@ -2557,6 +2562,16 @@ class FlashAttentionConfig:
     # every call (~25 small torch kernels), a cost the autotuner's timing of
     # the cached path does not see.
     row_bound_tiling: str = "global"
+    # FlexAttention list walk: the MMA warp skips the QK and PV of a query
+    # stage on the steps where the stage's BlockMask row has no block for the
+    # tile (its softmax takes the zero-P path there). Numerically a no-op (a
+    # zero P adds nothing) and not a search axis. Opt-in
+    # (``HELION_CUTE_FLASH_FLEX_SKIP_ABSENT=1``): measured on B200 at s4096 it
+    # gains 1.6% (hd64) / 6.8% (hd128) on asymmetric pairs (odd rows seeing a
+    # third of the even rows' tiles) and loses ~6% on symmetric pairs, where
+    # it never fires: the issue predicate on the in-order MMA warp's streams
+    # is on the softmax's critical chain even when always true.
+    flex_skip_absent: bool = False
 
 
 # TMEM is 512 columns. The FA4 score pipeline holds ``s_stage`` score buffers of
@@ -3322,17 +3337,20 @@ def _flash_early_prologue_loads_legal(
     row_bound_tiling: str,
     alternating_warpgroups: bool,
     first_load_order: int,
+    has_list_walk: bool = False,
 ) -> bool:
     """Whether the pre-sync prologue loads apply: the plain one-CTA fa4 pair
     body with one aliased K/V ring, whose two Q tiles and first K/V tile are
     the only loads before the CTA-wide prologue sync. A pruned KV interval
     (sliding-window, prefix-LM, document masks) starts the load warp at the
     work item's own first/last active tile, which the pre-sync copies (issued
-    from the ring's fixed first index) do not follow."""
+    from the ring's fixed first index) do not follow; a BlockMask list walk's
+    first tile is data dependent."""
     return (
         topology == "fa4"
         and not persistent
         and not has_kv_tile_pruning
+        and not has_list_walk
         and q_tile_count == 2
         and not use_2cta_instrs
         and not use_cga2_local_cta
@@ -3587,6 +3605,7 @@ def resolve_flash_config(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
 
@@ -3621,6 +3640,14 @@ def resolve_flash_config(
     packets (``_FLASH_FAST_MATH_EXP2_PACKETS``), approximations; without it a
     request for one of them, from the config or from
     ``HELION_CUTE_FLASH_EXP2_PACKET``, resolves to the exact default packet.
+    *has_list_walk* is the FlexAttention envelope's BlockMask-driven KV list
+    (``AttentionScorePlan.has_list_walk``): a data-dependent per-work-item
+    trip count like the causal and pruned-interval plans', hosted in v1 by the
+    plain fa4 pair body alone (keyed on the query geometry, never on the KV
+    tile count), non-persistent, one CTA, chunked softmax with the ring
+    statistics handoff, 128-wide KV tiles, a staged output epilogue (the
+    row-guarded stores of a ragged query length), no pre-sync prologue loads
+    and no loop split (one loop with a per-step tile status).
     """
 
     # *head_dim_v* is the V/O head dim when it differs from the Q/K
@@ -3629,6 +3656,17 @@ def resolve_flash_config(
     # follow ``head_dim_v``. Only the plain FA4 body carries the pair.
     if head_dim_v is None:
         head_dim_v = head_dim
+    # The plan category covers every flex plan: a trivial walk (one KV block
+    # covering the whole sequence, tables never read) renders through the
+    # same fa4 body with every tile present, so it takes the same pins.
+    has_list_walk = has_list_walk or FLEX_SCORE_KIND in score_modifier_kinds
+    if has_list_walk:
+        # A BlockMask walk has no standard dense / causal output: its
+        # visibility is data dependent, so the dense and causal-only
+        # lowerings (tuning tables, resident packets, hybrid cadences) that
+        # key on these never apply.
+        standard_dense_output = False
+        standard_causal_output = False
     asymmetric_head_dims = head_dim_v != head_dim
 
     if tmem_rowmax_compatible is None:
@@ -3695,15 +3733,18 @@ def resolve_flash_config(
 
     s_stage = _flash_s_stage()
     kv_stage = _flash_kv_stage(head_dim)
-    if num_kv < 2:
+    # One KV tile: the single-warpgroup ws body (the flex pair body keeps
+    # its two-slot ring and its searched depths at any tile count).
+    single_tile = num_kv < 2 and not has_list_walk
+    if single_tile:
         s_stage = 1
         kv_stage = 1
     # Config overrides for the warp-spec / KV-ring depths (autotune knobs).
     s_stage_cfg = _cfg(FLASH_S_STAGE_KEY)
-    if s_stage_cfg is not None and num_kv >= 2:
+    if s_stage_cfg is not None and not single_tile:
         s_stage = int(s_stage_cfg)  # type: ignore[arg-type]
     kv_stage_cfg = _cfg(FLASH_KV_STAGE_KEY)
-    if kv_stage_cfg is not None and num_kv >= 2:
+    if kv_stage_cfg is not None and not single_tile:
         kv_stage = int(kv_stage_cfg)  # type: ignore[arg-type]
     persistent = _flash_persistent() and s_stage == 2
     persistent_cfg = _cfg(FLASH_PERSISTENT_KEY)
@@ -3732,6 +3773,11 @@ def resolve_flash_config(
         # the deep/2-CTA FA4 variants, gated) keeps one head dim for all four
         # operands; pin the pair to the plain FA4 family regardless of the
         # requested family, env override or legacy topology key.
+        requested_family_flags = _flash_pipeline_family_flags("fa4")
+    if has_list_walk:
+        # The BlockMask list walk is written for the plain fa4 pair body
+        # (per-stage tile status over the union of two 128-row lists); the
+        # other families are pinned away regardless of the request.
         requested_family_flags = _flash_pipeline_family_flags("fa4")
     alt_requested = bool(
         requested_family_flags is not None
@@ -3792,13 +3838,19 @@ def resolve_flash_config(
             if row_mma_config is not None:
                 return row_mma_config
         topology = topology_default
-    if topology == "fa4" and num_kv % 2 != 0:
+    if topology == "fa4" and num_kv % 2 != 0 and not has_list_walk:
+        # The dense/causal fa4 pair needs an even 128-row tile count of the
+        # (square) sequence; the list walk's pair count follows the query
+        # length alone (a ragged last pair runs a dead or half-live second
+        # stage), so the KV tile count never flips its family.
         topology = "ws_overlap"
     # Causal and KV-tile-pruned masks (sliding window, prefix-LM, document)
     # share the fa4 work-item structure: a contiguous per-pair KV interval and
     # a per-work-item trip count. The pruned kinds stay non-persistent, 1-CTA,
-    # on the chunked softmax body with the ring statistics handoff.
-    variable_trip_count = is_causal or has_kv_tile_pruning
+    # on the chunked softmax body with the ring statistics handoff. The
+    # BlockMask list walk (``has_list_walk``) is the third member: its count
+    # comes from the mask tables.
+    variable_trip_count = is_causal or has_kv_tile_pruning or has_list_walk
     # The dense value graph is a whole-row dense lowering: no per-work-item
     # KV interval (the emitter asserts the plain dense plan).
     if softmax_lowering == "resident_value_graph" and not (
@@ -3834,11 +3886,18 @@ def resolve_flash_config(
     # env knob (default ON) WITHOUT the ws-only s_stage==2 gate: the fa4 device body
     # carries the raw-mbarrier phases (s_full/pfor/pfor2/o_full) across work-items in
     # its own strided loop, so it does not depend on the cutlass-pipeline s_stage path.
+    # The causal and pruned-interval plans decode their KV interval in the
+    # CTA-wide setup (one work item per CTA); the list walk re-reads its
+    # tables per work item in each role, so it may also run the static
+    # strided persistent loop (off by default: searched).
+    interval_setup = is_causal or has_kv_tile_pruning
     if topology == "fa4":
         if persistent_cfg is not None:
-            persistent = bool(persistent_cfg) and not variable_trip_count
+            persistent = bool(persistent_cfg) and not interval_setup
         else:
-            persistent = _flash_persistent() and not variable_trip_count
+            persistent = (
+                _flash_persistent() and not interval_setup and not has_list_walk
+            )
         if (
             (is_causal or dense_hd64_fa4)
             and kv_stage_cfg is None
@@ -4178,12 +4237,15 @@ def resolve_flash_config(
         head_dim_v=head_dim_v,
     ):
         row_bound_tiling = "global"
-    if row_bound_tiling == "segment" and not (epi_tma or epi_stg):
+    if (row_bound_tiling == "segment" or has_list_walk) and not (epi_tma or epi_stg):
         # The segment tiling stores through the staged epilogue: the TMA
         # store for whole tiles plus the row-guarded vector store for the
         # ragged last pair of a segment (``epi_tma``), or the row-guarded
         # vector store alone (``epi_stg``); the direct correction-warp store
-        # has no row guard.
+        # has no row guard. The list walk's query length need not be a
+        # multiple of 256 (the config cannot depend on it), so it pins the
+        # same: the TMA store clips to the true extent and the staged vector
+        # store is row-guarded.
         epi_stg = True
     # ws_overlap drains sO with the 128-thread consumer warpgroup; loading the
     # whole per-thread slice before storing hides the smem load latency that
@@ -4399,7 +4461,8 @@ def resolve_flash_config(
         causal_lpt_l2_shift = min(
             max(causal_lpt_l2_shift, 0), max(_FLASH_CAUSAL_LPT_L2_SHIFTS)
         )
-    causal_kv_order_default = "ascending"
+    # The list walk follows FA4's block-sparse order (descending) by default.
+    causal_kv_order_default = "descending" if has_list_walk else "ascending"
     causal_kv_order = _flash_env_get(
         "HELION_CUTE_FLASH_CAUSAL_KV_ORDER", causal_kv_order_default
     )
@@ -4420,10 +4483,13 @@ def resolve_flash_config(
     if causal_loop_split_cfg is not None:
         causal_loop_split = bool(causal_loop_split_cfg)
     # The causal split is the descending masked-prefix / unmasked-suffix pair;
-    # the pruned masks' three-segment split is proven in either order.
+    # the pruned masks' three-segment split is proven in either order. The
+    # list walk is one loop with a per-step tile status (the table says
+    # which tiles are masked), so the knob is an owned no-op there.
     if (
         not variable_trip_count
         or topology != "fa4"
+        or has_list_walk
         or (is_causal and causal_kv_order != "descending")
     ):
         causal_loop_split = False
@@ -4470,6 +4536,7 @@ def resolve_flash_config(
         topology != "fa4"
         or (is_causal and not causal_two_cta)
         or has_kv_tile_pruning
+        or has_list_walk
         or (requested_causal_two_cta and not causal_two_cta)
         or num_kv % 4 != 0
         or (head_dim != 128 and not dense_hd64_2cta and not causal_two_cta)
@@ -4626,6 +4693,9 @@ def resolve_flash_config(
         and supports_tensor_4d_tma
         and topology == "fa4"
         and not is_causal
+        # The list walk's Q and K/V lengths may differ (one (S, D, B) view
+        # each); the BHSD descriptors describe one sequence length.
+        and not has_list_walk
         # The segment tiling re-slices the (S, D, B) views per work item.
         and row_bound_tiling != "segment"
         and head_dim == 64
@@ -5387,6 +5457,7 @@ def resolve_flash_config(
         row_bound_tiling=row_bound_tiling,
         alternating_warpgroups=alternating_warpgroups,
         first_load_order=first_load_order,
+        has_list_walk=has_list_walk,
     ):
         early_prologue_loads = False
     resolved = FlashAttentionConfig(
@@ -5482,6 +5553,13 @@ def resolve_flash_config(
         uneven_kv_ring=uneven_kv_ring,
         o_over_q=o_over_q,
         row_bound_tiling=row_bound_tiling,
+        # The per-step skip is written for the PTX MMA warp (opt-in, see the
+        # field).
+        flex_skip_absent=(
+            has_list_walk
+            and mma_ptx
+            and _flash_bool_env("HELION_CUTE_FLASH_FLEX_SKIP_ABSENT", False)
+        ),
     )
     if (
         resolved.causal_skip_dead_tile
@@ -6396,6 +6474,7 @@ def _flash_seed_values(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> dict[str, object]:
     fragments = flash_autotune_fragments(
         head_dim,
@@ -6421,6 +6500,7 @@ def _flash_seed_values(
         head_dim_v=head_dim_v,
         kv_group=kv_group,
         fast_math=fast_math,
+        has_list_walk=has_list_walk,
     )
     return {key: fragment.default() for key, fragment in fragments.items()}
 
@@ -6668,6 +6748,7 @@ def _flash_target_seed_templates(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Project every target template onto the current implementation's legality.
 
@@ -6683,6 +6764,9 @@ def _flash_target_seed_templates(
     if (
         tuning is None
         or has_kv_tile_pruning
+        # The tables are measured on the dense / causal bodies; the BlockMask
+        # list walk seeds its own structure (``flash_attention_seed_configs``).
+        or has_list_walk
         or requires_ws_overlap
         or small_biased_candidate
     ):
@@ -6735,6 +6819,7 @@ def _flash_target_seed_templates(
                 head_dim_v=head_dim_v,
                 kv_group=kv_group,
                 fast_math=fast_math,
+                has_list_walk=has_list_walk,
             ).exp2_packet
             legality, _ = _flash_target_policy_values(
                 expected, default_packet=default_packet, fast_math=fast_math
@@ -6759,6 +6844,7 @@ def _flash_target_seed_templates(
             head_dim_v=head_dim_v,
             kv_group=kv_group,
             fast_math=fast_math,
+            has_list_walk=has_list_walk,
         )
         if not _flash_config_matches_tuning_values(
             resolved,
@@ -7026,6 +7112,7 @@ def _flash_validated_target_seed(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
     exact_table: bool = True,
 ) -> Config:
     """Build a target seed and reject policies normalized by config resolution.
@@ -7070,6 +7157,7 @@ def _flash_validated_target_seed(
         score_modifier_kinds=score_modifier_kinds,
         kv_group=kv_group,
         fast_math=fast_math,
+        has_list_walk=has_list_walk,
     )
     actual = flash_effective_config_values(resolved)
     # The dead-tile skip, the staggered walk and the head pair default on
@@ -7129,6 +7217,7 @@ def _flash_target_seed_configs(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> tuple[Config, ...]:
     if tmem_rowmax_compatible is None:
         tmem_rowmax_compatible = standard_dense_output or standard_causal_output
@@ -7152,6 +7241,7 @@ def _flash_target_seed_configs(
         "head_dim_v": head_dim_v,
         "kv_group": kv_group,
         "fast_math": fast_math,
+        "has_list_walk": has_list_walk,
     }
     families = _flash_legal_autotune_pipeline_families(
         head_dim, num_kv, output_requires_tma=False, requested_family=None, **common
@@ -7221,6 +7311,7 @@ def _flash_target_seed_configs(
                 head_dim_v=head_dim_v,
                 kv_group=kv_group,
                 fast_math=fast_math,
+                has_list_walk=has_list_walk,
                 exact_table=exact_table,
                 values={
                     "block_sizes": block_sizes,
@@ -7263,6 +7354,7 @@ def flash_attention_seed_config(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> Config | None:
     """Return the first legal template in deterministic order, or a generic seed.
 
@@ -7297,6 +7389,7 @@ def flash_attention_seed_config(
             score_modifier_kinds=score_modifier_kinds,
             kv_group=kv_group,
             fast_math=fast_math,
+            has_list_walk=has_list_walk,
         )
         if target_seeds:
             return target_seeds[0]
@@ -7326,6 +7419,7 @@ def flash_attention_seed_config(
         score_modifier_kinds=score_modifier_kinds,
         kv_group=kv_group,
         fast_math=fast_math,
+        has_list_walk=has_list_walk,
     )
     if seed_kind == "default":
         return _flash_config_with_values(block_sizes, values)
@@ -7420,6 +7514,38 @@ def _flash_stateful_joint_seed_configs(
     return tuple(result)
 
 
+class _FlashSeedFacts(TypedDict):
+    """The workload facts ``flash_attention_seed_configs`` shares with the
+    surface, the resolver and the seed helpers (``**common``).
+
+    Declared so the type checker matches every fact to its parameter by name;
+    an inferred dict literal of this size is checked against the join of its
+    values instead.
+    """
+
+    num_bh: int | None
+    tensor_4d_heads: int | None
+    dtype: torch.dtype
+    is_causal: bool
+    has_kv_tile_pruning: bool
+    requires_ws_overlap: bool
+    small_biased_candidate: bool
+    standard_dense_output: bool
+    standard_causal_output: bool
+    tmem_rowmax_compatible: bool | None
+    causal_resident_compatible: bool
+    supports_tensor_4d_tma: bool
+    has_row_epilogue: bool
+    plain_row_body: bool
+    has_score_modifiers: bool
+    target_device_capability: tuple[int, int] | None
+    score_modifier_kinds: Sequence[str]
+    head_dim_v: int | None
+    kv_group: int
+    fast_math: bool
+    has_list_walk: bool
+
+
 def flash_attention_seed_configs(
     head_dim: int,
     num_kv: int | None,
@@ -7447,6 +7573,7 @@ def flash_attention_seed_configs(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> tuple[Config, ...]:
     """Return measured starting points plus generic structural coverage.
 
@@ -7470,8 +7597,9 @@ def flash_attention_seed_configs(
     block_sizes = _flash_seed_block_sizes(block_size_targets)
     if block_sizes is None:
         return ()
+    has_list_walk = has_list_walk or FLEX_SCORE_KIND in score_modifier_kinds
 
-    common = {
+    common: _FlashSeedFacts = {
         "num_bh": num_bh,
         "tensor_4d_heads": tensor_4d_heads,
         "dtype": dtype,
@@ -7492,6 +7620,7 @@ def flash_attention_seed_configs(
         "head_dim_v": head_dim_v,
         "kv_group": kv_group,
         "fast_math": fast_math,
+        "has_list_walk": has_list_walk,
     }
     fragments = flash_autotune_fragments(head_dim, num_kv, **common)
     base_values = {key: fragment.default() for key, fragment in fragments.items()}
@@ -7803,8 +7932,9 @@ def flash_attention_seed_configs(
     # folded below.
     withheld_packets: tuple[object, ...] = ()
     if not fast_math:
+        fast_math_common: _FlashSeedFacts = {**common, "fast_math": True}
         fast_math_fragment = flash_autotune_fragments(
-            head_dim, num_kv, **{**common, "fast_math": True}
+            head_dim, num_kv, **fast_math_common
         )[FLASH_EXP2_PACKET_KEY]
         assert isinstance(fast_math_fragment, EnumFragment)
         withheld_packets = tuple(
@@ -8288,6 +8418,39 @@ def flash_attention_seed_configs(
                 (FLASH_ROW_BOUND_TILING_KEY, tiling, row_bound_long),
                 (FLASH_ROW_BOUND_TILING_KEY, tiling, row_bound_short),
             )
+    if has_list_walk:
+        # The FlexAttention list walk: the fa4 pair body's defaults come from
+        # the family seed; seed the pruned-interval campaign structure on it
+        # too (8x2 packets, chunked body with the two-deep PASS2 pipe, split P
+        # arrival, descending walk, TMA epilogue, K-first loads, interleaved
+        # MMA) at both measured cadences: the causal winners' 16/8 and the
+        # 8/2 the pinned pruned sweep preferred on short work items. No loop
+        # split (an owned no-op here) and the inherited masked cadence.
+        flex_fa4_structure = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_EXP2_PACKET_KEY: "8x2",
+            FLASH_SOFTMAX_DISC_KEY: True,
+            FLASH_DISC_PIPE_KEY: 2,
+            FLASH_SPLIT_P_ARRIVE_KEY: True,
+            FLASH_P_STORE_REP_KEY: 16,
+            FLASH_S_LOAD_REP_KEY: 32,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_FIRST_LOAD_ORDER_KEY: 3,
+            FLASH_MMA_INTERLEAVE_KEY: True,
+        }
+        source_variants += (
+            (
+                FLASH_E2E_SCHEDULE_KEY,
+                "16/8",
+                {
+                    **flex_fa4_structure,
+                    FLASH_E2E_OFFSET_KEY: 12,
+                    FLASH_E2E_OFFSET0_KEY: 7,
+                },
+            ),
+            (FLASH_E2E_SCHEDULE_KEY, "8/2", flex_fa4_structure),
+        )
     if has_row_epilogue:
         # The fa4 family seeds carry the softmax-warpgroup row epilogue (the
         # fa4 default); seed the correction-warp evaluation once as well.
@@ -8493,11 +8656,15 @@ def _flash_legal_autotune_pipeline_families(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> tuple[str, ...]:
     """Enumerate families whose requested structure survives normalization."""
     candidates = (
         ("ws_overlap",)
         if requires_ws_overlap
+        # The BlockMask list walk lives on the plain fa4 pair body alone.
+        else ("fa4",)
+        if has_list_walk
         else (requested_family,)
         if requested_family is not None
         else FLASH_AUTOTUNE_PIPELINE_FAMILIES
@@ -8547,6 +8714,7 @@ def _flash_legal_autotune_pipeline_families(
             has_score_modifiers=has_score_modifiers,
             score_modifier_kinds=score_modifier_kinds,
             fast_math=fast_math,
+            has_list_walk=has_list_walk,
         )
         if effective.pipeline_family != family:
             continue
@@ -8583,6 +8751,7 @@ def flash_autotune_fragments(
     head_dim_v: int | None = None,
     kv_group: int = 1,
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> dict[str, ConfigSpecFragment]:
     """Build a legality-driven, length-invariant flash search surface.
 
@@ -8594,10 +8763,23 @@ def flash_autotune_fragments(
     (``_FLASH_FAST_MATH_EXP2_PACKETS``) to the packet choices, the search
     choices and the target-policy value widening; without it the surface
     offers the exact packets only.
+
+    ``has_list_walk`` is the FlexAttention envelope's BlockMask-driven KV
+    list: a per-work-item trip count like the causal and pruned-interval
+    plans' (their structural pins apply), pinned to the plain fa4 family.
     """
 
     if tmem_rowmax_compatible is None:
         tmem_rowmax_compatible = standard_dense_output or standard_causal_output
+    has_list_walk = has_list_walk or FLEX_SCORE_KIND in score_modifier_kinds
+    if has_list_walk:
+        # The list walk is pinned to the plain fa4 pair body (the resolver
+        # does the same); its surface is the pinned-fa4 surface.
+        pipeline_family_override = "fa4"
+        topology_override = None
+    # Every plan with a per-work-item trip count (causal, the pruned masks,
+    # the list walk) shares the structural pins below.
+    variable_trip_count = is_causal or has_kv_tile_pruning or has_list_walk
     if head_dim_v is not None and head_dim_v != head_dim:
         # The asymmetric pair is hosted by the plain fa4 family alone, so its
         # surface is the pinned-fa4 surface: values only another body realizes
@@ -8650,12 +8832,16 @@ def flash_autotune_fragments(
         score_modifier_kinds=score_modifier_kinds,
         kv_group=kv_group,
         fast_math=fast_math,
+        has_list_walk=has_list_walk,
     )
     # The asymmetric (192, 128) pair: only the plain fa4 family hosts it, its
     # aliased ring slots are the wider K tile, and staged O fits only when the
     # schedule's byte model says so (it does not at 192/128).
     asymmetric_head_dims = head_dim_v is not None and head_dim_v != head_dim
-    paired = num_kv >= 2 and num_kv % 2 == 0
+    # The list walk's pair body is keyed on the query geometry (a ragged
+    # last pair runs a dead or half-live second stage), never on the KV tile
+    # count: its fa4 surface is the same at every length.
+    paired = has_list_walk or (num_kv >= 2 and num_kv % 2 == 0)
     cluster_aligned = num_kv >= 4 and num_kv % 4 == 0
     fa4_eligible = paired and not requires_ws_overlap
     # Output tiles staged in the dead Q stages: searched where it unlocks
@@ -8752,7 +8938,7 @@ def flash_autotune_fragments(
     # The dense hd64 fa4 body's own knobs (whole-row softmax, statistics
     # transport, persistent loop): interval plans (causal and the pruned
     # masks) pin them, so their values would not survive normalization.
-    dense_d64_fa4 = d64_fa4 and not is_causal and not has_kv_tile_pruning
+    dense_d64_fa4 = d64_fa4 and not variable_trip_count
     causal_d64_fa4 = d64_fa4 and is_causal
     standard_dense_d64 = (
         dense_d64_fa4
@@ -8811,6 +8997,7 @@ def flash_autotune_fragments(
         score_modifier_kinds=score_modifier_kinds,
         head_dim_v=head_dim_v,
         fast_math=fast_math,
+        has_list_walk=has_list_walk,
     )
     if valid_family is None and valid_topology is not None:
         active_families = tuple(
@@ -8846,7 +9033,7 @@ def flash_autotune_fragments(
         )
         return EnumFragment(all_choices, active, coverage)
 
-    if num_kv < 2:
+    if num_kv < 2 and not has_list_walk:
         s_stage = enum(1, (1,), (1,))
     elif (
         fa4_search_eligible
@@ -8858,7 +9045,8 @@ def flash_autotune_fragments(
         s_stage = enum(defaults.s_stage, (1, 2))
 
     ws_only_kv_pipeline = not fa4_search_eligible
-    if num_kv < 2:
+    if num_kv < 2 and not has_list_walk:
+        # (The flex pair body keeps its two-slot ring at one KV tile.)
         kv_stage = enum(1, (1,), (1,))
     elif ws_only_kv_pipeline:
         cap = _flash_deep_1cta_kv_stage_cap(head_dim)
@@ -8890,7 +9078,9 @@ def flash_autotune_fragments(
         search_cap = _flash_aliased_kv_stage_cap(
             head_dim,
             head_dim_v=head_dim_v,
-            stage_output=output_requires_tma,
+            # The list walk pins the staged output epilogue (its row-guarded
+            # stores), so its searched depths are the staged ring's.
+            stage_output=output_requires_tma or has_list_walk,
             use_2cta_instrs=use_2cta_kv_layout,
         )
         kv_stage_values = tuple(range(2, value_cap + 1))
@@ -8948,13 +9138,20 @@ def flash_autotune_fragments(
         persistent = enum(True, (True, False), (True,))
         persistent_ctas = enum(1, (1,), (1,))
         recompute = enum(False, (False, True), (False,))
-    elif fa4_search_eligible and not (is_causal or has_kv_tile_pruning):
+    elif fa4_search_eligible and not variable_trip_count:
         persistent = enum(defaults.persistent, (True, False), (True, False))
         persistent_ctas = enum(
             defaults.persistent_ctas_per_sm, (1, 2, 3, 4), (1, 2, 3, 4)
         )
         recompute = enum(defaults.recompute_tile_coords, (False, True), (False, True))
-    elif is_causal or has_kv_tile_pruning or num_kv < 2:
+    elif has_list_walk:
+        # The list walk searches the persistent loop (its per-item count
+        # prelude re-reads the tables); one CTA per SM, no coordinate
+        # recompute.
+        persistent = enum(defaults.persistent, (False, True), (False, True))
+        persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
+        recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
+    elif variable_trip_count or num_kv < 2:
         persistent = enum(defaults.persistent, (False, True), (False,))
         persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
         recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
@@ -8991,7 +9188,7 @@ def flash_autotune_fragments(
     else:
         e2e_schedule = enum(defaults.e2e_schedule, schedule_values, schedule_search)
 
-    if is_causal or has_kv_tile_pruning:
+    if variable_trip_count:
         masked_values = (
             tuple(
                 dict.fromkeys(("inherit", "xu", "16/4", "8/2", *manual_schedule_names))
@@ -9009,9 +9206,11 @@ def flash_autotune_fragments(
         else:
             # Legacy fixed configs may name a distinct cadence even when the
             # resolver canonicalizes it away; keep it valid but out of search.
+            # The list walk is one loop with a per-step tile status (no
+            # proven separate loop regions), so its masked cadence inherits.
             masked_search = (
                 ("inherit", "xu", "16/4", "8/2")
-                if fa4_search_eligible
+                if fa4_search_eligible and not has_list_walk
                 else ("inherit",)
             )
             masked_schedule = enum(
@@ -9035,9 +9234,7 @@ def flash_autotune_fragments(
         softmax_disc = enum(
             defaults.softmax_disc,
             (True, False),
-            (True,)
-            if is_causal or has_kv_tile_pruning or has_row_epilogue
-            else (True, False),
+            (True,) if variable_trip_count or has_row_epilogue else (True, False),
         )
     else:
         softmax_disc = enum(
@@ -9050,7 +9247,7 @@ def flash_autotune_fragments(
         p_chunk = enum(
             defaults.p_chunk_arrive,
             (False, True),
-            (False,) if is_causal or has_kv_tile_pruning else (False, True),
+            (False,) if variable_trip_count else (False, True),
         )
         p_store = enum(defaults.p_store_repetition, (16, 32), (16, 32))
         s_load = enum(defaults.s_load_repetition, (16, 32), (16, 32))
@@ -9063,9 +9260,7 @@ def flash_autotune_fragments(
         kv_order = enum(
             defaults.kv_order,
             ("ascending", "descending"),
-            ("ascending",)
-            if is_causal or has_kv_tile_pruning
-            else ("ascending", "descending"),
+            ("ascending",) if variable_trip_count else ("ascending", "descending"),
         )
     else:
         disc_pipe = enum(
@@ -9169,10 +9364,11 @@ def flash_autotune_fragments(
 
     causal_lpt_choices: tuple[int, ...] = (0,)
     causal_lpt_search: tuple[int, ...] = (0,)
-    if is_causal or has_kv_tile_pruning:
+    if variable_trip_count:
         # The launch group, KV order and loop split of every plan with a
         # per-work-item KV interval (causal, and the pruned masks' reversed
-        # pair order and three-segment split).
+        # pair order and three-segment split) and of the list walk (its walk
+        # order; the split is an owned no-op there).
         causal_lpt_choices, causal_lpt_search = _flash_causal_lpt_candidates(num_bh)
         causal_lpt = enum(
             0,
@@ -9198,7 +9394,9 @@ def flash_autotune_fragments(
         causal_split = enum(
             defaults.causal_loop_split,
             (False, True),
-            (False, True) if fa4_search_eligible else (defaults.causal_loop_split,),
+            (False, True)
+            if fa4_search_eligible and not has_list_walk
+            else (defaults.causal_loop_split,),
         )
     else:
         causal_lpt = enum(0, (0,), (0,))
@@ -9312,6 +9510,7 @@ def flash_autotune_fragments(
         fa4_search_eligible
         and "fa4" in active_families
         and not has_kv_tile_pruning
+        and not has_list_walk
         and not asymmetric_head_dims
     )
     early_prologue_loads = enum(
@@ -9561,6 +9760,7 @@ def flash_autotune_fragments(
                 has_score_modifiers=has_score_modifiers,
                 score_modifier_kinds=score_modifier_kinds,
                 fast_math=fast_math,
+                has_list_walk=has_list_walk,
             ).exp2_packet
             == packet
         ]
@@ -9592,9 +9792,10 @@ def flash_autotune_fragments(
             (*causal_lpt_choices, *range(65)),
             (*causal_lpt_search, *_flash_stateful_lpt_candidates(num_bh)),
         )
-    # Plans with a per-work-item KV interval (causal and the KV-tile-pruned
-    # masks) keep the ring statistics handoff; the resolver pins it.
-    if fa4_search_eligible and not is_causal and not has_kv_tile_pruning:
+    # Plans with a per-work-item trip count (causal, the KV-tile-pruned
+    # masks and the list walk) keep the ring statistics handoff; the
+    # resolver pins it.
+    if fa4_search_eligible and not variable_trip_count:
         transports = (
             ("ring2", "single", "single_final")
             if dense_d64_fa4 and standard_dense_output
@@ -9626,8 +9827,7 @@ def flash_autotune_fragments(
 
     persistent_loop_eligible = (
         fa4_search_eligible
-        and not is_causal
-        and not has_kv_tile_pruning
+        and not variable_trip_count
         and not defaults.use_clc_scheduler
     )
     persistent_loop = enum(
@@ -9643,8 +9843,7 @@ def flash_autotune_fragments(
         ("fragment", "whole"),
         ("fragment", "whole")
         if fa4_search_eligible
-        and not is_causal
-        and not has_kv_tile_pruning
+        and not variable_trip_count
         and _flash_supported_io_dtype(dtype)
         and not has_row_epilogue
         else ("fragment",),
@@ -9681,8 +9880,9 @@ def flash_autotune_fragments(
             num_kv=num_kv,
             topology=defaults.topology,
             # Variable per-work-item trip counts (causal and KV-tile-pruned
-            # masks) keep the 128-wide tile the interval arithmetic assumes.
-            is_causal=is_causal or has_kv_tile_pruning,
+            # masks, the list walk) keep the 128-wide tile the interval
+            # arithmetic and the mask tables assume.
+            is_causal=variable_trip_count,
             s_stage=defaults.s_stage,
         )
     )
@@ -9935,6 +10135,7 @@ def flash_config_from_config(
     target_device_capability: tuple[int, int] | None = None,
     score_modifier_kinds: Sequence[str] = (),
     fast_math: bool = False,
+    has_list_walk: bool = False,
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -9963,6 +10164,7 @@ def flash_config_from_config(
         target_device_capability=target_device_capability,
         score_modifier_kinds=score_modifier_kinds,
         fast_math=fast_math,
+        has_list_walk=has_list_walk,
     )
 
 
@@ -10087,6 +10289,59 @@ def _flash_row_bound_work_arg(
         df.new_var("flash_rkb_work"),
         fake,
         f"_helion_flash_row_bound_work_table({lower_bound_arg.host_str()}, {seq})",
+    )
+    df.arguments.append(arg)
+    df._tensor_args[fake] = arg
+    return arg
+
+
+# Only persistent flex list walks import the item-table builder, so every
+# other flash render (and its disk-cache key) is unchanged.
+_FLASH_FLEX_ITEM_PREAMBLE_IMPORTS = """\
+from helion.runtime.cute.flash_flex import flex_item_table as _helion_flash_flex_item_table
+"""
+
+
+def emit_flash_flex_item_module_statements(cg: GenerateAST) -> None:
+    """Emit the once-per-module import of the flex item-table builder."""
+    if getattr(cg, "_helion_flash_flex_item_module_emitted", False):
+        return
+    cg._helion_flash_flex_item_module_emitted = True  # type: ignore[attr-defined]
+    for line_stmt in ast.parse(_FLASH_FLEX_ITEM_PREAMBLE_IMPORTS).body:
+        cg.module_statements.append(line_stmt)
+
+
+def _flash_flex_item_arg(
+    df: DeviceFunction,
+    walk_args: Sequence[TensorArg],
+    *,
+    q_block: int,
+    batch: int,
+    heads: int,
+    num_pairs: int,
+    num_kv: int,
+) -> TensorArg:
+    """Bind the host-built item order of the persistent flex list walk: the
+    ``(batch * heads * num_pairs,)`` int32 table of pair items sorted by
+    their KV tile union, longest first (``flex_item_table``).
+
+    The host expression runs inside the generated launch on every call and
+    is cached per BlockMask behind the tables' version counters (rebuilt
+    unconditionally under CUDA-graph capture), like the document id-bounds
+    and row-bound work tables.
+    """
+    assert len(walk_args) == 4
+    env = CompileEnvironment.current()
+    with env.fake_mode:
+        fake = torch.empty(
+            (batch * heads * num_pairs,), dtype=torch.int32, device=env.device
+        )
+    tables = ", ".join(arg.host_str() for arg in walk_args)
+    arg = TensorArg(
+        df.new_var("flash_flex_items"),
+        fake,
+        f"_helion_flash_flex_item_table({tables}, q_block={q_block}, "
+        f"batch={batch}, heads={heads}, num_pairs={num_pairs}, num_kv={num_kv})",
     )
     df.arguments.append(arg)
     df._tensor_args[fake] = arg
@@ -10767,8 +11022,13 @@ def _flash_ws_inv_sum_source(score_plan: AttentionScorePlan) -> str:
 def _flash_fa4_runtime_disc_score_plan_supported(
     score_plan: AttentionScorePlan,
 ) -> bool:
-    """Whether the hand-written FA4 disc runtime helpers cover this transform."""
-    return all(modifier.kind == CAUSAL_MASK_KIND for modifier in score_plan.modifiers)
+    """Whether the hand-written FA4 disc runtime helpers cover this transform.
+
+    The flex envelope's regions render through the hook slot of the generic
+    modifier body, never through the hand-written helpers."""
+    return not score_plan.is_flex and all(
+        modifier.kind == CAUSAL_MASK_KIND for modifier in score_plan.modifiers
+    )
 
 
 def _flash_plan_has_additional_mask_modifiers(score_plan: AttentionScorePlan) -> bool:
@@ -13094,6 +13354,7 @@ def _flash_fa4_wrap(
     tensor_4d_heads: int = 0,
     recompute_tile_coords: bool = False,
     kv_group: int = 1,
+    item_table: str | None = None,
 ) -> str:
     """Wrap an fa4 role body for the (non-)persistent scheduler.
 
@@ -13113,7 +13374,12 @@ def _flash_fa4_wrap(
     ``(m_pair, bh)`` state and advance it by ``grid_dim`` each iteration, avoiding
     repeated per-work-item div/mod decode. The raw-mbarrier phases in ``head``
     carry across iterations (every per-tile acquire/arrive count is a
-    compile-time constant, so the phases advance deterministically)."""
+    compile-time constant, so the phases advance deterministically).
+
+    ``item_table`` (persistent flex list walks): the kernel-visible name of
+    the host-sorted item order; work item ``flash_tile_id`` is the pair item
+    ``item_table[flash_tile_id]`` (longest KV union first, report 02 §6.9),
+    decoded per item instead of carried."""
     if not persistent:
         # Flat: head + inner sit directly under the guard at 4-space. ``inner`` is
         # written at 8-space (the persistent while-loop body level), so dedent it 4.
@@ -13237,6 +13503,31 @@ def _flash_fa4_wrap(
     while flash_tile_id < {total_tiles_expr}:
 {inner}
         flash_tile_id = flash_tile_id + {grid_dim_expr}
+{tail}"""
+    if item_table is not None:
+        assert not use_cluster_scheduler
+        item_decode = (
+            _flash_power2_decode_exprs("flash_item", num_m_pairs)
+            if num_m_pairs is not None
+            else None
+        )
+        if item_decode is None:
+            item_decode = (
+                f"flash_item % {num_m_pairs_expr}",
+                f"flash_item // {num_m_pairs_expr}",
+            )
+        m_pair_expr, bh_expr = item_decode
+        return f"""
+{role_guard}
+{head}
+    flash_tile_id = {tile_id_expr}
+{num_m_pairs_setup}    flash_grid_dim = {grid_dim_expr}
+    while flash_tile_id < {total_tiles_expr}:
+        flash_item = cutlass.Int32({item_table}[flash_tile_id])
+        flash_m_pair = {m_pair_expr}
+        flash_bh = {bh_expr}
+{prelude_block}{inner}
+        flash_tile_id = flash_tile_id + flash_grid_dim
 {tail}"""
     if recompute_tile_coords:
         if power2_decode is not None:
@@ -13468,6 +13759,299 @@ def _flash_fa4_segment_wrap(
 {tail}"""
 
 
+def _flash_flex_mask_words(num_kv: int) -> int:
+    """32-bit words of a per-row KV tile bitmask over ``num_kv`` tiles."""
+    return -(-num_kv // 32)
+
+
+def _flash_flex_word_select(prefix: str, words: int, word_expr: str) -> str:
+    """Expression selecting the bitmask word ``{prefix}{word_expr}``.
+
+    The word index is a runtime value and register arrays take static
+    indices only, so the words are separate scalars picked by a select
+    chain (``words`` is 1 to a handful: the KV tile count over 32).
+    """
+    expr = f"{prefix}0"
+    for word in range(1, words):
+        expr = (
+            f"cutlass.Int32(cutlass.select_({word_expr} == {word}, "
+            f"{prefix}{word}, {expr}))"
+        )
+    return expr
+
+
+def _flash_flex_mask_build(
+    prefix: str,
+    words: int,
+    *,
+    count_expr: str,
+    index_expr: str,
+    indent: str,
+) -> list[str]:
+    """Lines building the tile bitmask ``{prefix}{w}`` of one BlockMask list:
+    ``count_expr`` entries, entry ``flash_flex_i`` read by ``index_expr``.
+
+    The loads of the entries are independent (one per entry, no chain), so
+    the loop pipelines them; the shift amount is masked to the word so a
+    stray entry can never poison the shift.
+    """
+    lines = [f"{indent}{prefix}{word} = cutlass.Int32(0)" for word in range(words)]
+    lines += [
+        f"{indent}for flash_flex_i in cutlass.range({count_expr}, unroll=1):",
+        f"{indent}    flash_flex_t = cutlass.Int32({index_expr})",
+        (
+            f"{indent}    flash_flex_bit = cutlass.Int32(1) << "
+            "(flash_flex_t & cutlass.Int32(31))"
+        ),
+    ]
+    if words == 1:
+        lines.append(f"{indent}    {prefix}0 = {prefix}0 | flash_flex_bit")
+        return lines
+    lines.append(f"{indent}    flash_flex_word = flash_flex_t >> cutlass.Int32(5)")
+    for word in range(words):
+        lines.append(
+            f"{indent}    {prefix}{word} = {prefix}{word} | cutlass.Int32("
+            f"cutlass.select_(flash_flex_word == {word}, flash_flex_bit, "
+            "cutlass.Int32(0)))"
+        )
+    return lines
+
+
+def _flash_flex_walk_step(
+    rem_prefix: str,
+    words: int,
+    *,
+    target: str,
+    descending: bool,
+    indent: str,
+) -> list[str]:
+    """Lines taking the next tile of the merged walk out of the remaining
+    union bitmask ``{rem_prefix}{w}``: ``target`` is the tile (0 when the
+    mask is empty: the one fake step of an empty pair), ``flash_flex_kvbit``
+    / ``flash_flex_kvword`` its bit and word, and the bit is cleared.
+
+    Descending takes the highest set bit (``clz``), ascending the lowest
+    (``clz`` of the isolated low bit); both are branch-free select chains
+    over the words.
+    """
+    lines = [f"{indent}{target} = cutlass.Int32(0)"]
+    order = range(words) if descending else reversed(range(words))
+    for word in order:
+        value = f"{rem_prefix}{word}"
+        if not descending:
+            value = f"({value} & (cutlass.Int32(0) - {value}))"
+        lines.append(
+            f"{indent}{target} = cutlass.Int32(cutlass.select_({rem_prefix}{word} != 0, "
+            f"cutlass.Int32({word * 32 + 31}) - cutlass.Int32(cute.arch.clz({value})), "
+            f"{target}))"
+        )
+    lines.append(
+        f"{indent}flash_flex_kvbit = cutlass.Int32(1) << ({target} & cutlass.Int32(31))"
+    )
+    if words == 1:
+        lines.append(f"{indent}{rem_prefix}0 = {rem_prefix}0 & ~flash_flex_kvbit")
+        return lines
+    lines.append(f"{indent}flash_flex_kvword = {target} >> cutlass.Int32(5)")
+    for word in range(words):
+        lines.append(
+            f"{indent}{rem_prefix}{word} = {rem_prefix}{word} & ~cutlass.Int32("
+            f"cutlass.select_(flash_flex_kvword == {word}, flash_flex_kvbit, "
+            "cutlass.Int32(0)))"
+        )
+    return lines
+
+
+def _flash_flex_status_line(
+    part_prefix: str, full_prefix: str, words: int, *, indent: str
+) -> str:
+    """``flash_flex_status`` of the current tile for one query stage: 2 when
+    the tile is in the stage's partial list, 1 in its full list, else 0
+    (absent: the stage sees no key of this tile)."""
+    part_word = _flash_flex_word_select(part_prefix, words, "flash_flex_kvword")
+    full_word = _flash_flex_word_select(full_prefix, words, "flash_flex_kvword")
+    return (
+        f"{indent}flash_flex_status = cutlass.Int32(cutlass.select_("
+        f"({part_word} & flash_flex_kvbit) != 0, cutlass.Int32(2), "
+        f"cutlass.Int32(cutlass.select_(({full_word} & flash_flex_kvbit) != 0, "
+        "cutlass.Int32(1), cutlass.Int32(0)))))"
+    )
+
+
+def _flash_flex_setup(
+    score_plan: AttentionScorePlan,
+    *,
+    num_kv: int,
+    num_bh: int,
+    num_heads: int,
+    ragged_m: bool,
+    present_masks: bool = False,
+    scalar_exprs: Sequence[str] = (),
+    bindings: bool = True,
+) -> str:
+    """CTA-wide per-item setup of the BlockMask list walk (unindented lines).
+
+    Reads the four tables' rows of the pair (rows ``2p`` / ``2p + 1`` of a
+    128-row BlockMask, row ``p`` of a 256-row one), builds one tile bitmask
+    per (stage, list), their union and its population: the per-item trip
+    count every role shares (at least 1: an empty pair walks one fake step
+    over tile 0 with both stages absent). The counts and entries are
+    warp-uniform scalar loads (no smem staging, no barrier); the per-step
+    tile and status are then pure register arithmetic in every walking role.
+    """
+    walk = score_plan.kv_walk
+    assert walk is not None
+    assert walk.kv_block == 128
+    assert walk.q_block in (128, 256)
+    assert score_plan.q_seq is not None
+    assert num_bh % num_heads == 0
+    words = _flash_flex_mask_words(num_kv)
+    lines = [
+        *(
+            _flash_flex_bindings(
+                score_plan, num_heads=num_heads, scalar_exprs=scalar_exprs
+            )
+            if bindings
+            else []
+        ),
+        f"_flash_mFlexPartCnt = {walk.part_cnt_name}",
+        f"_flash_mFlexPartIdx = {walk.part_idx_name}",
+        f"_flash_mFlexFullCnt = {walk.full_cnt_name}",
+        f"_flash_mFlexFullIdx = {walk.full_idx_name}",
+    ]
+    batch = num_bh // num_heads
+    if walk.table_batch == 1:
+        lines.append("flash_flex_b = cutlass.Int32(0)")
+    elif walk.table_batch == batch:
+        lines.append("flash_flex_b = flash_bh // _flash_heads")
+    else:
+        lines.append(f"flash_flex_b = (flash_bh // _flash_heads) % {walk.table_batch}")
+    if walk.table_heads == 1:
+        lines.append("flash_flex_h = cutlass.Int32(0)")
+    elif walk.table_heads == num_heads:
+        lines.append("flash_flex_h = flash_bh % _flash_heads")
+    else:
+        lines.append(f"flash_flex_h = (flash_bh % _flash_heads) % {walk.table_heads}")
+    table_rows = -(-score_plan.q_seq // walk.q_block)
+
+    def _count(table: str, row: str) -> str:
+        return f"cutlass.Int32({table}[flash_flex_b, flash_flex_h, {row}])"
+
+    def _entry(table: str, row: str) -> str:
+        return f"{table}[flash_flex_b, flash_flex_h, {row}, flash_flex_i]"
+
+    if walk.q_block == 256:
+        rows = [("0", "flash_m_pair", True)]
+    else:
+        # Row 2p + 1 exists unless the pair is the ragged last one of an odd
+        # row count (its second stage has no live row: counts 0).
+        rows = [
+            ("0", "flash_m_tile0", True),
+            ("1", "flash_m_tile1", table_rows % 2 == 0),
+        ]
+    for stage, row_expr, always in rows:
+        lines.append(f"flash_flex_row{stage} = {row_expr}")
+        if always:
+            lines += [
+                f"flash_flex_cp{stage} = {_count('_flash_mFlexPartCnt', f'flash_flex_row{stage}')}",
+                f"flash_flex_cf{stage} = {_count('_flash_mFlexFullCnt', f'flash_flex_row{stage}')}",
+            ]
+        else:
+            lines += [
+                f"flash_flex_cp{stage} = cutlass.Int32(0)",
+                f"flash_flex_cf{stage} = cutlass.Int32(0)",
+                f"if flash_flex_row{stage} < {table_rows}:",
+                f"    flash_flex_cp{stage} = {_count('_flash_mFlexPartCnt', f'flash_flex_row{stage}')}",
+                f"    flash_flex_cf{stage} = {_count('_flash_mFlexFullCnt', f'flash_flex_row{stage}')}",
+            ]
+        lines += _flash_flex_mask_build(
+            f"flash_flex_p{stage}_",
+            words,
+            count_expr=f"flash_flex_cp{stage}",
+            index_expr=_entry("_flash_mFlexPartIdx", f"flash_flex_row{stage}"),
+            indent="",
+        )
+        lines += _flash_flex_mask_build(
+            f"flash_flex_f{stage}_",
+            words,
+            count_expr=f"flash_flex_cf{stage}",
+            index_expr=_entry("_flash_mFlexFullIdx", f"flash_flex_row{stage}"),
+            indent="",
+        )
+    stages = [stage for stage, _, _ in rows]
+    for word in range(words):
+        union = " | ".join(
+            f"flash_flex_{kind}{stage}_{word}"
+            for stage in stages
+            for kind in ("p", "f")
+        )
+        lines.append(f"flash_flex_u{word} = {union}")
+    if present_masks:
+        # Per stage, the tiles it sees at all (the MMA warp's skip test).
+        for stage in stages:
+            for word in range(words):
+                lines.append(
+                    f"flash_flex_n{stage}_{word} = "
+                    f"flash_flex_p{stage}_{word} | flash_flex_f{stage}_{word}"
+                )
+    population = " + ".join(
+        f"cutlass.Int32(cute.arch.popc(flash_flex_u{word}))" for word in range(words)
+    )
+    lines.append(f"flash_num_active_kv = cutlass.max(cutlass.Int32(1), {population})")
+    lines += _flash_flex_live_rows(score_plan, ragged_m)
+    return "\n" + "\n".join(lines)
+
+
+def _flash_flex_bindings(
+    score_plan: AttentionScorePlan,
+    *,
+    num_heads: int,
+    scalar_exprs: Sequence[str] = (),
+) -> list[str]:
+    """The names the hooks read, bound at the CTA-wide setup (unindented
+    lines): the head count, the regions' aux tensors (``_flash_aux{i}``, plan
+    order) and host scalars (``_flash_hs{i}``, plan order; ``scalar_exprs``
+    are their kernel-argument expressions, the names themselves when empty)."""
+    lines = [f"_flash_heads = {num_heads}"]
+    for index, aux in enumerate(score_plan.aux_buffers):
+        lines.append(f"_flash_aux{index} = {aux.name}")
+    scalars = scalar_exprs or score_plan.host_scalars
+    assert len(scalars) == len(score_plan.host_scalars)
+    for index, expr in enumerate(scalars):
+        lines.append(f"_flash_hs{index} = {expr}")
+    return lines
+
+
+def _flash_flex_live_rows(score_plan: AttentionScorePlan, ragged_m: bool) -> list[str]:
+    """Live rows of each 128-row stage when the query length is ragged
+    (unindented lines): a ragged query length leaves the last pair's second
+    stage dead or half live. Q TMA zero-fills the rows past the sequence;
+    the O/LSE stores are guarded by these."""
+    if not ragged_m:
+        return []
+    assert score_plan.q_seq is not None
+    return [
+        f"flash_live_rows{stage} = cutlass.min(cutlass.Int32(128), cutlass.max("
+        f"cutlass.Int32(0), cutlass.Int32({score_plan.q_seq}) - "
+        f"flash_m_tile{stage} * cutlass.Int32(128)))"
+        for stage in ("0", "1")
+    ]
+
+
+def _flash_flex_hook_lines(text: str, indent: str) -> str:
+    """Re-indent one rendered hook field to ``indent`` (newline-terminated
+    complete lines; empty stays empty)."""
+    if not text.strip():
+        return ""
+    body = textwrap.indent(textwrap.dedent(text).strip("\n"), indent)
+    return body + "\n"
+
+
+def _flash_flex_unique_blocks(blocks: Sequence[str]) -> str:
+    """Concatenate distinct non-empty blocks in order (the masked and the
+    unmasked hook of one plan render the same item-/tile-invariant values)."""
+    return "".join(dict.fromkeys(block for block in blocks if block))
+
+
 def emit_flash_fa4_device_body(
     df: DeviceFunction,
     *,
@@ -13487,6 +14071,9 @@ def emit_flash_fa4_device_body(
     row_epilogue: FlashRowEpilogueEmit | None = None,
     head_dim_v: int | None = None,
     row_kv_begin_heads_per_batch: int = 1,
+    num_heads: int | None = None,
+    flex_scalar_exprs: Sequence[str] = (),
+    flex_item_table: str | None = None,
 ) -> list[ast.stmt]:
     """FA4-topology device body: faithful transcription of the validated 16-warp /
     512-thread spike kernel (sp single-pass softmax body), adapted for Helion's
@@ -13515,6 +14102,19 @@ def emit_flash_fa4_device_body(
     each S buffer (staged-P r2t split 3/4 + 1/4 on pfor / pfor2). Raw mbarriers
     (s_full / pfor / pfor2 / o_full) carry the MMA<->softmax<->correction
     handshakes; s0_corr / s1_corr are raw full/empty two-stage mbarriers.
+
+    The FlexAttention envelope (``score_plan.has_list_walk``) walks the
+    BlockMask tables instead of a KV interval: ``sequence_extent`` is then the
+    KV length, ``score_plan.q_seq`` the query length (``total_tiles`` is
+    ``num_bh`` times its 256-row pair count) and ``num_heads`` the head count
+    the collapsed batch-head index splits into (the tables and the hooks
+    index ``b`` / ``h``). Per item the setup merges the pair's two 128-row
+    lists into one union walk (``_flash_flex_setup``); per step every stage
+    takes its own status (absent / full / partial) and the softmax body
+    branches on it: the zero-P path, the dense passes or the hook.
+    ``flex_scalar_exprs`` are the kernel-argument expressions of the regions'
+    host scalars (``plan.host_scalars`` order; the names themselves when
+    empty), bound as ``_flash_hs{i}`` for the hooks.
     """
     hd = head_dim
     hd_v = head_dim if head_dim_v is None else head_dim_v
@@ -13581,9 +14181,63 @@ def emit_flash_fa4_device_body(
     # split (every tile of the union evaluates the element mask unless the
     # per-tile predicate proves it fully visible); the resolver pins those.
     pruned_interval = score_plan.has_kv_tile_pruning
-    interval_kv = is_causal or pruned_interval
-    if interval_kv:
+    # The FlexAttention envelope shares the interval plans' work-item
+    # structure (one per-item trip count, the LPT-style grid decode); a list
+    # walk reads the count and the tiles from the BlockMask tables, a trivial
+    # walk (one KV block covering the sequence) visits every tile with the
+    # same softmax body.
+    flex_body = score_plan.is_flex
+    list_walk = score_plan.has_list_walk
+    interval_kv = is_causal or pruned_interval or flex_body
+    if interval_kv and not flex_body:
         assert not cfg.persistent
+    # The persistent list walk re-reads its tables per work item in every
+    # role (a per-role count prelude); the CTA-wide setup keeps only the
+    # item-independent bindings.
+    flex_persistent = flex_body and cfg.persistent
+    # Its work items run in the host-sorted longest-first order
+    # (``flex_item_table``), read through ``_flash_mFlexItems``.
+    fa4_item_table = "_flash_mFlexItems" if flex_persistent else None
+    # The per-item table reads, count and live rows (the CTA-wide setup of
+    # the one-item grid, the per-role prelude of the persistent walk).
+    flex_item_setup = ""
+    flex_walk: FlexKvWalk | None = None
+    flex_q_seq = 0
+    if flex_body:
+        flex_walk = score_plan.kv_walk
+        assert flex_walk is not None
+        assert flex_walk.kv_block == 128 or not list_walk
+        assert flex_walk.q_block in (128, 256) or not list_walk
+        assert score_plan.q_seq is not None
+        assert num_heads is not None and num_bh % num_heads == 0
+        flex_q_seq = score_plan.q_seq
+        assert not is_causal and not pruned_interval
+        assert not cfg.use_2cta_instrs
+        assert not cfg.use_cga2_local_cta
+        assert not cfg.use_clc_scheduler
+        assert cfg.softmax_disc
+        assert cfg.kv_tile_n == 128
+        assert not cfg.causal_loop_split
+        assert not cfg.early_prologue_loads
+        assert not cfg.causal_stagger
+        assert not cfg.causal_skip_dead_tile
+        assert not cfg.causal_head_pair
+        assert not cfg.alternating_warpgroups
+        assert cfg.epi_tma or cfg.epi_stg
+        assert cfg.row_bound_tiling != "segment"
+        assert row_epilogue is None
+        assert num_kv == -(-sequence_extent // 128)
+        assert total_tiles == num_bh * (-(-flex_q_seq // 256))
+    # A query length that is not a multiple of 256 (flex only): the last
+    # pair's second stage is dead or half live; its O/LSE stores are row
+    # guarded by ``flash_live_rows{stage}`` like the segment tiling's.
+    ragged_m = flex_body and flex_q_seq % 256 != 0
+    # The MMA warp skips a stage's QK / PV on the steps where the stage is
+    # absent (its softmax zero-stores P there); its first PV is always issued
+    # so the output accumulator is zero-initialized even for a dead stage.
+    flex_skip_absent = list_walk and cfg.flex_skip_absent
+    if flex_skip_absent:
+        assert cfg.mma_ptx
     if pruned_interval:
         assert score_plan.has_contiguous_kv_interval
         assert not cfg.use_2cta_instrs
@@ -13965,6 +14619,7 @@ def emit_flash_fa4_device_body(
         assert not (
             persistent
             or pruned_interval
+            or list_walk
             or use_2cta_instrs
             or use_cga2_local_cta
             or use_clc_scheduler
@@ -14442,11 +15097,64 @@ flash_num_active_kv = flash_m_tile1 + cutlass.Int32(1)"""
 {range0[0]}{range1[0]}flash_kv_first = cutlass.min({range0[1]}, {range1[1]})
 flash_kv_last = cutlass.max({range0[2]}, {range1[2]})
 flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
+    elif flex_body:
+        assert num_heads is not None
+        flex_bindings = "\n" + "\n".join(
+            _flash_flex_bindings(
+                score_plan, num_heads=num_heads, scalar_exprs=flex_scalar_exprs
+            )
+        )
+        if flex_persistent:
+            assert flex_item_table is not None
+            flex_bindings += f"\n_flash_mFlexItems = {flex_item_table}"
+        if list_walk:
+            flex_item_setup = _flash_flex_setup(
+                score_plan,
+                num_kv=num_kv,
+                num_bh=num_bh,
+                num_heads=num_heads,
+                ragged_m=ragged_m,
+                present_masks=flex_skip_absent,
+                scalar_exprs=flex_scalar_exprs,
+                bindings=False,
+            )
+        else:
+            # The trivial walk: every tile, no tables.
+            flex_item_setup = "\n" + "\n".join(
+                [
+                    "flash_num_active_kv = _flash_num_kv_tiles",
+                    *_flash_flex_live_rows(score_plan, ragged_m),
+                ]
+            )
+        if flex_persistent:
+            active_kv_setup = flex_bindings
+        else:
+            active_kv_setup = flex_bindings + flex_item_setup
+        # Constants the hooks read: the last tile, and the column limit of
+        # the current tile (every column except on the last tile of a ragged
+        # KV length, where the softmax step re-binds it to the tail width:
+        # the masked body also runs on the other partial tiles).
+        active_kv_setup += f"\n_flash_kv_tail_cols = cutlass.Int32({kv_n})\n_flash_last_tile = {num_kv - 1}"
     else:
         active_kv_setup = ""
     if segment_tiling:
         # The item loop decodes the range per work item (``_flash_fa4_segment_kv_range``).
         active_kv_setup = ""
+    # The persistent list walk's per-role count prelude: every walking role
+    # re-reads the pair's table rows and rebuilds the masks and the count at
+    # the top of each work item (the pipeline phases carry across items as
+    # on the dense persistent pair; every role takes the same count). The
+    # epilogue warp needs only the live rows of a ragged query length.
+    flex_item_prelude = ""
+    flex_item_rows = ""
+    if flex_persistent:
+        assert flex_body
+        flex_item_prelude = (
+            textwrap.indent(flex_item_setup.strip("\n"), "        ") + "\n"
+        )
+        rows = _flash_flex_live_rows(score_plan, ragged_m)
+        if rows:
+            flex_item_rows = textwrap.indent("\n".join(rows), "        ") + "\n"
     if persistent:
         setup_gmem_slice = ""
     elif use_tensor_4d_tma:
@@ -15080,7 +15788,7 @@ tOsO_epi1 = flash_o_gmem_thr.partition_S(sO[None, None, 1])
         if cfg.epi_stg or segment_tiling
         else ""
     )
-    if segment_tiling:
+    if segment_tiling or (ragged_m and cfg.epi_stg):
         # The row coordinate of each store slice, for the ragged-tail guard.
         epi_stg_setup += f"""flash_o_cO_epi = cute.make_identity_tensor((128, {hd_v}))
 tOcO_epi = flash_o_gmem_thr.partition_S(flash_o_cO_epi)
@@ -15138,6 +15846,7 @@ if warp_idx == 15:
             "",
             persistent,
             persistent_loop=cfg.persistent_loop,
+            item_table=fa4_item_table,
             prelude="none",
             total_tiles=total_tiles,
             num_m_pairs=num_m_pairs,
@@ -15309,9 +16018,10 @@ if warp_idx == 15:
             )
 
         def _epi_stg_inner(stage: str) -> str:
-            if segment_tiling:
-                # Only the rows inside the segment are stored: the ragged
-                # last pair's remaining rows belong to the next segment.
+            if segment_tiling or ragged_m:
+                # Only the rows inside the segment (or the sequence) are
+                # stored: the ragged last pair's remaining rows belong to the
+                # next segment / lie past the query length.
                 store_call = f"""        _helion_flash_rt.{epi_stg_store_fn}_rows(
             flash_o_gmem_tiled_copy, flash_o_gmem_thr,
             tOsO_epi{stage}, tOgO_stg{stage}, tOcO_epi, flash_live_rows{stage}, {io_dtype})"""
@@ -15338,6 +16048,7 @@ if warp_idx == 15:
         epi_head = f"    cute.arch.setmaxregister_decrease({cfg.other_regs})"
         epi_inner = ""
         epi_prelude = "none"
+    epi_inner = flex_item_rows + epi_inner
     epi_block = (
         segment_wrap(
             f"{role_next} warp_idx == {epi_warp}:",
@@ -15352,6 +16063,7 @@ if warp_idx == 15:
             epi_inner,
             persistent,
             persistent_loop=cfg.persistent_loop,
+            item_table=fa4_item_table,
             prelude=epi_prelude,
             total_tiles=total_tiles,
             num_m_pairs=num_m_pairs,
@@ -15366,7 +16078,41 @@ if warp_idx == 15:
 
     load_head = f"    cute.arch.setmaxregister_decrease({cfg.other_regs})"
     load_loop_var = "flash_kv_load_iter"
-    if pruned_interval and desc_kv:
+    flex_load_prelude = ""
+    load_next_stmt: str | None = None
+    if list_walk:
+        # The load warp walks the same merged union as the softmax
+        # warpgroups: its own copy of the remaining bitmask, the first tile
+        # before the prologue and the next tile at the top of each step.
+        flex_words = _flash_flex_mask_words(num_kv)
+        flex_load_prelude = "\n".join(
+            [
+                *(
+                    f"        flash_flex_rem{word} = flash_flex_u{word}"
+                    for word in range(flex_words)
+                ),
+                *_flash_flex_walk_step(
+                    "flash_flex_rem",
+                    flex_words,
+                    target="flash_kv_first",
+                    descending=desc_kv,
+                    indent="        ",
+                ),
+            ]
+        )
+        flex_load_prelude += "\n"
+        load_first_kv = "flash_kv_first"
+        load_next_kv = "flash_kv_next"
+        load_next_stmt = "\n".join(
+            _flash_flex_walk_step(
+                "flash_flex_rem",
+                flex_words,
+                target="flash_kv_next",
+                descending=desc_kv,
+                indent="            ",
+            )
+        )
+    elif pruned_interval and desc_kv:
         load_first_kv = "flash_kv_last"
         load_next_kv = "flash_kv_last - cutlass.Int32(1) - flash_kv_load_iter"
     elif pruned_interval:
@@ -15429,6 +16175,9 @@ if warp_idx == 15:
     else:
         local_load_tma_block = ""
         load_prelude_mode = "full"
+    local_load_tma_block = flex_load_prelude + local_load_tma_block
+    if load_next_stmt is None:
+        load_next_stmt = f"            flash_kv_next = {load_next_kv}"
     local_load_views = use_local_tma_partition or segment_tiling
     load_q0_src = "0" if local_load_views else "flash_q_mma_tile0"
     load_q1_src = "1" if local_load_views else "flash_q_mma_tile1"
@@ -15504,7 +16253,7 @@ if warp_idx == 15:
     )
     load_inner = f"""{local_load_tma_block}{load_prologue}
         for {load_loop_var} in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
-            flash_kv_next = {load_next_kv}
+{load_next_stmt}
             flash_kve = {load_k_prod}.acquire_and_advance(){load_k_extra_tx_loop}{load_k_extra_wait_loop}
             cute.copy(_flash_tma_k, tKgK[None, flash_kv_next], {k_load_slot},
                       tma_bar_ptr=flash_kve.barrier)
@@ -15516,6 +16265,7 @@ if warp_idx == 15:
         if separate_kv_rings
         else "    flash_kv_prod.tail()\n    flash_q_prod.tail()"
     )
+    load_inner = flex_item_prelude + load_inner
     load_block = (
         segment_wrap(
             f"{role_next} warp_idx == {load_warp}:",
@@ -15531,6 +16281,7 @@ if warp_idx == 15:
             load_inner,
             persistent,
             persistent_loop=cfg.persistent_loop,
+            item_table=fa4_item_table,
             prelude=load_prelude_mode,
             tail=load_tail,
             total_tiles=total_tiles,
@@ -15680,17 +16431,18 @@ if warp_idx == 15:
     _helion_flash_ptx.declare_ptx_idesc(
         _flash_qk_mma.op, "helion_flash_qk_mma_idesc")"""
 
-            def _qk_gemm(stage: str, k_state: str) -> str:
+            def _qk_gemm(stage: str, k_state: str, issue: str | None = None) -> str:
                 k_slot = _k_ring_slot(
                     f"sK[None, None, None, {k_state}.index]", f"{k_state}.index"
                 )
+                issue_arg = f", issue={issue}" if issue else ""
                 return f"""            _helion_flash_ptx.gemm_ptx_precomputed_qk_static(
                 _flash_qk_mma.op, flash_s{stage}_addr,
                 tSrK[None, None, None, {k_state}.index],
                 {k_slot},
                 "helion_flash_q{stage}_smem_desc",
                 "helion_flash_qk_mma_idesc",
-                zero_init=True{gemm_cta_group_arg})"""
+                zero_init=True{gemm_cta_group_arg}{issue_arg})"""
 
         else:
             # The shared descriptors start one stage stride before the first
@@ -15710,11 +16462,12 @@ if warp_idx == 15:
     _helion_flash_ptx.declare_ptx_idesc(
         _flash_qk_mma.op, "helion_flash_qk_mma_idesc")"""
 
-            def _qk_gemm(stage: str, k_state: str) -> str:
+            def _qk_gemm(stage: str, k_state: str, issue: str | None = None) -> str:
                 smem_offset = -q_stage_stride if stage == "0" else q_stage_stride
                 k_slot = _k_ring_slot(
                     f"sK[None, None, None, {k_state}.index]", f"{k_state}.index"
                 )
+                issue_arg = f", issue={issue}" if issue else ""
                 return f"""            _helion_flash_ptx.gemm_ptx_precomputed_qk(
                 flash_s{stage}_addr,
                 _helion_flash_ptx.make_smem_desc_start_addr(
@@ -15724,7 +16477,7 @@ if warp_idx == 15:
                 "helion_flash_q_smem_desc",
                 "helion_flash_qk_mma_idesc",
                 smem_offset={smem_offset},
-                zero_init=True{gemm_cta_group_arg})"""
+                zero_init=True{gemm_cta_group_arg}{issue_arg})"""
 
         pv_desc_head = """
     flash_v_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(
@@ -15851,13 +16604,14 @@ if warp_idx == 15:
 {textwrap.indent(_mma_commit_s_ready("1"), "            ")}
             flash_k_full.release()"""
 
-        def _pv_gemm(stage: str, v_state: str) -> str:
+        def _pv_gemm(stage: str, v_state: str, issue: str | None = None) -> str:
             # One PV issue of ``stage`` reading the V tile of ``v_state`` (the
             # staggered walk's stage 1 reads the slot stage 0 read last step).
             v_slot = _v_ring_slot(
                 f"sV[None, None, None, {v_state}.index]", f"{v_state}.index"
             )
             split_wait_arg = pv0_split_wait_arg if stage == "0" else pv1_split_wait_arg
+            issue_arg = f", issue={issue}" if issue else ""
             return f"""_helion_flash_ptx.gemm_ptx_precomputed_pv_ts(
                 flash_o{stage}_addr, {pv_p0 if stage == "0" else pv_p1},
                 _helion_flash_ptx.make_smem_desc_start_addr(
@@ -15866,7 +16620,7 @@ if warp_idx == 15:
                 tOrP{stage}[None, None, None, 0].layout,
                 tOrV[None, None, None, 0].layout,
                 "helion_flash_pv_mma_idesc",{split_wait_arg}
-                zero_init=flash_o_zero{stage}{gemm_cta_group_arg}{pv_wait_hint_arg})"""
+                zero_init=flash_o_zero{stage}{gemm_cta_group_arg}{pv_wait_hint_arg}{issue_arg})"""
 
         def _mma_stagger_steady_body() -> str:
             # Step i of the staggered walk, stage 1 first: it is the leading
@@ -15964,6 +16718,160 @@ if warp_idx == 15:
         flash_v_full.release()
         flash_pfor_phase ^= 1"""
 
+        def _flex_live_lines(prefix: str, indent: str) -> list[str]:
+            # ``{prefix}{s}``: whether stage ``s`` sees the tile just taken
+            # (``flash_flex_kvbit`` / ``flash_flex_kvword`` of the MMA's walk).
+            assert flex_walk is not None
+            words = _flash_flex_mask_words(num_kv)
+            lines = []
+            for stage in ("0", "1"):
+                list_stage = "0" if flex_walk.q_block == 256 else stage
+                word = _flash_flex_word_select(
+                    f"flash_flex_n{list_stage}_", words, "flash_flex_kvword"
+                )
+                # A warp-uniform 0/1 Int32: the issue flag the PTX streams
+                # test with one ``setp`` + uniform branch (the uniformity
+                # shuffle is paid here, off the MMA issue chain).
+                lines.append(
+                    f"{indent}{prefix}{stage} = cute.arch.make_warp_uniform("
+                    f"cutlass.Int32(({word} & flash_flex_kvbit) != 0))"
+                )
+            return lines
+
+        def _flex_walk_lines(prefix: str, indent: str) -> str:
+            return "\n".join(
+                [
+                    *_flash_flex_walk_step(
+                        "flash_flex_rem",
+                        _flash_flex_mask_words(num_kv),
+                        target="flash_kv_mma",
+                        descending=desc_kv,
+                        indent=indent,
+                    ),
+                    *_flex_live_lines(prefix, indent),
+                ]
+            )
+
+        def _flex_qk_issue(stage: str, k_state: str, indent: str) -> str:
+            # A skipped QK leaves S stale (the stage's softmax takes the
+            # zero-P path and never reads it). The skip is an issue predicate
+            # inside the PTX stream, not a branch: the in-order MMA warp's
+            # issue latency is on the softmax's critical chain and a region
+            # per issue measured 4-6% on symmetric masks; the shared Q
+            # descriptor still walks its stride.
+            return textwrap.indent(
+                textwrap.dedent(
+                    _qk_gemm(stage, k_state, issue=f"flash_flex_qk_live{stage}")
+                ),
+                indent,
+            )
+
+        def _flex_pv_issue(stage: str, indent: str) -> str:
+            # The PV of an absent stage is dead work (P = 0) once the output
+            # accumulator was zero-initialized by a first PV (a dead stage
+            # still gets that one, so the epilogue never reads uninitialized
+            # TMEM); the predicated stream still runs its folded P-last wait.
+            issue = textwrap.indent(
+                textwrap.dedent(
+                    _pv_gemm(stage, "flash_v_full", issue=f"flash_flex_pv_issue{stage}")
+                ),
+                indent,
+            )
+            return f"""{indent}flash_flex_pv_issue{stage} = flash_flex_pv_live{stage} | cutlass.Int32(flash_o_zero{stage})
+{issue}
+{indent}flash_o_zero{stage} = flash_o_zero{stage} & (flash_flex_pv_issue{stage} == 0)"""
+
+        def _mma_flex_steady_body() -> str:
+            # Step i: the walk takes tile i + 1 (its QKs), the PVs are tile
+            # i's (``flash_flex_pv_live``), then the liveness advances.
+            derive = _flex_walk_lines("flash_flex_qk_live", "            ")
+            carry = (
+                "            flash_flex_pv_live0 = flash_flex_qk_live0\n"
+                "            flash_flex_pv_live1 = flash_flex_qk_live1"
+            )
+            pv0 = _flex_pv_issue("0", "            ")
+            pv1 = _flex_pv_issue("1", "            ")
+            qk0 = _flex_qk_issue("0", "flash_k_full", "            ")
+            qk1 = _flex_qk_issue("1", "flash_k_full", "            ")
+            if cfg.mma_interleave:
+                return f"""
+{derive}
+            {_mma_wait_p_ready("0")}
+{pv0}
+            flash_k_full = {mma_k_cons}.wait_and_advance()
+{qk0}
+{textwrap.indent(_mma_commit_s_ready("0"), "            ")}
+            {_mma_wait_p_ready("1")}
+{pv1}
+            flash_v_full.release()
+{qk1}
+{textwrap.indent(_mma_commit_s_ready("1"), "            ")}
+            flash_k_full.release()
+{carry}"""
+            return f"""
+{derive}
+            {_mma_wait_p_ready("0")}
+{pv0}
+            {_mma_wait_p_ready("1")}
+{pv1}
+            flash_v_full.release()
+            flash_k_full = {mma_k_cons}.wait_and_advance()
+{qk0}
+{textwrap.indent(_mma_commit_s_ready("0"), "            ")}
+{qk1}
+{textwrap.indent(_mma_commit_s_ready("1"), "            ")}
+            flash_k_full.release()
+{carry}"""
+
+        def _mma_flex_inner() -> str:
+            """The MMA warp of the list walk: the dense protocol (one K/V
+            step, two QKs and two PVs per tile, every barrier arrival kept)
+            with each stage's QK / PV issued only on its live steps."""
+            words = _flash_flex_mask_words(num_kv)
+            rem_init = "\n".join(
+                f"        flash_flex_rem{word} = flash_flex_u{word}"
+                for word in range(words)
+            )
+            first = _flex_walk_lines("flash_flex_pv_live", "        ")
+            return f"""        flash_q0_full = flash_q_cons.wait_and_advance()
+{rem_init}
+{first}
+        flash_flex_qk_live0 = flash_flex_pv_live0
+        flash_flex_qk_live1 = flash_flex_pv_live1
+
+        # PROLOGUE: QK0(0)->S0 as soon as Q0 and K0 landed, then QK1(0)->S1 once
+        # Q1 landed too; then release K0 (each only where its stage is live).
+        flash_k0_full = {mma_k_cons}.wait_and_advance(){mma_prologue_signal}
+{_flex_qk_issue("0", "flash_k0_full", "        ")}
+{textwrap.indent(_mma_commit_s_ready("0"), "        ")}
+        flash_q1_full = flash_q_cons.wait_and_advance()
+{_flex_qk_issue("1", "flash_k0_full", "        ")}
+{textwrap.indent(_mma_commit_s_ready("1"), "        ")}
+        flash_k0_full.release()
+
+        # STEADY: i = 0..N-2. PV(i) for both stages interleaved with QK(i+1).
+        flash_o_zero0 = cutlass.Boolean(True)
+        flash_o_zero1 = cutlass.Boolean(True)
+        for flash_i in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
+            flash_v_full = {mma_v_cons}.wait_and_advance(){_mma_flex_steady_body()}
+            flash_pfor_phase ^= 1
+
+        flash_q0_full.release()
+        flash_q1_full.release()
+
+        # EPILOGUE: PV(N-1) for both stages; commit O_full.
+        flash_v_full = {mma_v_cons}.wait_and_advance()
+        {_mma_wait_p_ready("0")}
+{_flex_pv_issue("0", "        ")}
+{textwrap.indent(_mma_commit_o_ready("0"), "        ")}
+        {_mma_wait_p_ready("1")}
+{_flex_pv_issue("1", "        ")}
+{textwrap.indent(_mma_commit_o_ready("1"), "        ")}
+        flash_v_full.release()
+        # The 2 epilogue PV waits did NOT flip pfor_phase; flip once so the carried
+        # parity matches the next work-item's correction pre-arrive.
+        flash_pfor_phase ^= 1"""
+
         mma_steady_body = _mma_steady_body(pv0_live_issue)
         steady_loop_bound = kv_loop_bound_minus_1
         dead_tile_step = ""
@@ -16036,6 +16944,8 @@ if warp_idx == 15:
         flash_pfor_phase ^= 1"""
         if causal_stagger:
             mma_inner = _mma_stagger_inner()
+        if flex_skip_absent:
+            mma_inner = _mma_flex_inner()
     else:
         mma_head = f"""    cute.arch.setmaxregister_decrease({cfg.other_regs})
     flash_tmem.allocate(512)
@@ -16152,6 +17062,7 @@ if warp_idx == 15:
         # the leader CTA issues the CtaGroup.TWO MMA instructions.
         mma_role_inner = f"""        if flash_is_leader_cta:
 {textwrap.indent(mma_inner, "    ")}"""
+    mma_role_inner = flex_item_prelude + mma_role_inner
     mma_block = (
         segment_wrap(
             f"{role_next} warp_idx == 12:",
@@ -16167,7 +17078,8 @@ if warp_idx == 15:
             mma_role_inner,
             persistent,
             persistent_loop=cfg.persistent_loop,
-            prelude="none",
+            item_table=fa4_item_table,
+            prelude="decode" if flex_persistent else "none",
             tail=mma_tmem_teardown,
             total_tiles=total_tiles,
             num_m_pairs=num_m_pairs,
@@ -16424,9 +17336,12 @@ if warp_idx == 15:
     # that row's sum (its max is still -inf; under the polynomial exp2 packets
     # the masked lanes' probabilities are subnormals, not 0, so the sum alone
     # could not be tested against 0) and the normalizer maps 0 to 0.
+    # A FlexAttention mask can hide a row on every tile (and an empty pair
+    # walks one zero-P step), so the flex plan takes the same pair.
+    empty_row_normalizer = bool(score_plan.row_kv_begin_masks) or score_plan.is_flex
     inv_sum_fn = (
         "_helion_flash_rt.rcp_approx_ftz_or_zero"
-        if score_plan.row_kv_begin_masks
+        if empty_row_normalizer
         else "_helion_flash_rt.rcp_approx_ftz"
     )
 
@@ -16434,9 +17349,9 @@ if warp_idx == 15:
         """The softmax warpgroup's final row sum, as published to the
         correction warps' stat slot and to the softmax row epilogue."""
         if use_causal_stateful_softmax:
-            assert not score_plan.row_kv_begin_masks
+            assert not empty_row_normalizer
             return "flash_softmax.row_sum[0]"
-        if score_plan.row_kv_begin_masks:
+        if empty_row_normalizer:
             return "_helion_flash_rt.row_kv_begin_row_sum(flash_row_sum, flash_row_max)"
         return "flash_row_sum"
 
@@ -16518,6 +17433,165 @@ if warp_idx == 15:
             "_helion_flash_rt.mbar_spin_wait("
             f"flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})"
         )
+
+    def _flex_softmax_body(
+        stage: str,
+        ld: str,
+        ldt: str,
+        score_m_tile_expr: str,
+        modifier_rowmax_block: Callable[[str], str],
+        *,
+        pass2_block: str,
+        pass2_masked_block: str,
+        format_disc_loop: Callable[..., str],
+        corr_publish_rowsum: str,
+    ) -> str:
+        """The softmax warpgroup's loop of the BlockMask list walk.
+
+        One loop over the pair's merged union (``flash_num_active_kv``
+        steps); the per-step prologue re-derives the tile from the stage's
+        copy of the union bitmask (the same walk the load warp runs) and the
+        stage's status for it. Absent: the zero-P path (no passes, the P
+        handshake kept). Partial (or the last tile of a ragged KV length):
+        the hook with the mask (and the score region when there is one),
+        the store-back and PASS2 at the masked cadence. Full: the dense
+        passes, or the score hook without the mask plus the dense PASS2.
+        The alpha publish guard is the loop counter: one loop, no segments.
+        """
+        assert flex_walk is not None
+        words = _flash_flex_mask_words(num_kv)
+        shared_row = flex_walk.q_block == 256
+        list_stage = "0" if shared_row else stage
+        with_score = score_plan.flex_has_score_region
+        with_mask = score_plan.flex_has_mask_region
+        hook_kwargs: dict[str, object] = {
+            "stage": int(stage),
+            "score_tensor": "flash_disc_frg",
+            "coord_tensor": "tLDcS[None, flash_ci, None, None]",
+            "m_tile_expr": score_m_tile_expr,
+            "kv_tile_expr": "flash_kv",
+            "chunk_expr": "flash_ci",
+            "chunk_cols": cfg.s_load_repetition,
+            "indent": 16,
+        }
+        hooks: list[FlexHookCode] = []
+        dense_rowmax_block = (
+            "            flash_row_max = _helion_flash_rt.fa4_disc_rowmax_balanced(\n"
+            f"                {ld}, {ldt}, tLDcS, flash_row_max, flash_LD_CHUNKS)"
+        )
+        if with_score:
+            full_hook = render_flex_hook(
+                score_plan,
+                with_score=True,
+                with_mask=False,
+                tail_mask=False,
+                **hook_kwargs,  # pyrefly: ignore[bad-argument-type]
+            )
+            hooks.append(full_hook)
+            full_rowmax_block = modifier_rowmax_block(
+                "\n" + _flash_flex_hook_lines(full_hook.chunk_body, " " * 16).rstrip()
+            )
+        else:
+            full_rowmax_block = dense_rowmax_block
+        # The masked body serves the stage's partial tiles (the mask region)
+        # and, on a ragged KV length, the last tile in whichever list it
+        # appears (the tail mask runs ahead of the mask hook).
+        mask_terms: list[str] = []
+        if with_mask:
+            mask_terms.append("flash_flex_status == 2")
+        if has_kv_tail:
+            mask_terms.append("flash_kv == _flash_last_tile")
+        if mask_terms:
+            masked_hook = render_flex_hook(
+                score_plan,
+                with_score=with_score,
+                with_mask=with_mask,
+                tail_mask=has_kv_tail,
+                **hook_kwargs,  # pyrefly: ignore[bad-argument-type]
+            )
+            hooks.append(masked_hook)
+            masked_rowmax_block = modifier_rowmax_block(
+                "\n" + _flash_flex_hook_lines(masked_hook.chunk_body, " " * 16).rstrip()
+            )
+            rowmax_block = f"""            if flash_flex_needs_mask:
+{textwrap.indent(masked_rowmax_block, "    ")}
+            else:
+{textwrap.indent(full_rowmax_block, "    ")}"""
+            loop_pass2_block = f"""            if flash_flex_needs_mask:
+{textwrap.indent(pass2_masked_block, "    ")}
+            else:
+{textwrap.indent(pass2_block, "    ")}"""
+            needs_mask_line = "            flash_flex_needs_mask = " + " | ".join(
+                f"({term})" for term in mask_terms
+            )
+        else:
+            rowmax_block = full_rowmax_block
+            loop_pass2_block = pass2_block
+            needs_mask_line = ""
+        item_prelude = "".join(
+            f"        flash_flex_rem{word} = flash_flex_u{word}\n"
+            for word in range(words if list_walk else 0)
+        ) + _flash_flex_unique_blocks(
+            [_flash_flex_hook_lines(hook.item_prelude, " " * 8) for hook in hooks]
+        )
+        if list_walk:
+            tile_prologue_lines = [
+                *_flash_flex_walk_step(
+                    "flash_flex_rem",
+                    words,
+                    target="flash_kv",
+                    descending=desc_kv,
+                    indent="            ",
+                ),
+                _flash_flex_status_line(
+                    f"flash_flex_p{list_stage}_",
+                    f"flash_flex_f{list_stage}_",
+                    words,
+                    indent="            ",
+                ),
+            ]
+        else:
+            # The trivial walk: every tile present, partial when the plan
+            # has a mask region (the one block is masked element-wise).
+            tile_prologue_lines = [
+                (
+                    f"            flash_kv = {kv_loop_bound} - cutlass.Int32(1) - flash_kv_iter"
+                    if desc_kv
+                    else "            flash_kv = flash_kv_iter"
+                ),
+                f"            flash_flex_status = cutlass.Int32({2 if with_mask else 1})",
+            ]
+        if needs_mask_line:
+            tile_prologue_lines.append(needs_mask_line)
+        if has_kv_tail:
+            # The tail mask (ahead of the mask hook) runs on every masked
+            # step; only the last tile has columns past the KV length.
+            tile_prologue_lines.append(
+                "            _flash_kv_tail_cols = cutlass.Int32(cutlass.select_("
+                f"flash_kv == _flash_last_tile, cutlass.Int32({kv_tail_cols}), "
+                f"cutlass.Int32({kv_n})))"
+            )
+        tile_prologue = "\n".join(tile_prologue_lines)
+        hook_prologue = _flash_flex_unique_blocks(
+            [_flash_flex_hook_lines(hook.tile_prologue, " " * 12) for hook in hooks]
+        )
+        if hook_prologue:
+            tile_prologue += "\n" + hook_prologue.rstrip("\n")
+        segment = _FlashSoftmaxLoopSegment(
+            loop_var="flash_kv_iter", loop_bound=kv_loop_bound
+        )
+        loop = format_disc_loop(
+            segment,
+            rowmax_block,
+            loop_pass2_block,
+            zero_first_tile=True,
+            zero_tile_condition="flash_flex_status != 0",
+            tile_prologue=tile_prologue,
+        )
+        return f"""{item_prelude}        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
+        flash_row_sum = cutlass.Float32(0.0)
+{loop}
+{corr_publish_rowsum}"""
 
     def _softmax_inner(
         stage: str,
@@ -16711,12 +17785,16 @@ if warp_idx == 15:
             )
             + ")"
         )
-        if has_lse and segment_tiling:
+        if has_lse and (segment_tiling or ragged_m):
             # Global row of this thread's segment-relative row; the rows past
-            # the segment end are not this item's.
+            # the segment end (or the query length) are not this item's.
             lse_store = f"\n        if flash_local_tidx < flash_live_rows{stage}:" + (
                 _flash_lse_store(
-                    f"flash_seg_start + flash_m_tile{stage} * 128 + flash_local_tidx",
+                    (
+                        f"flash_seg_start + flash_m_tile{stage} * 128 + flash_local_tidx"
+                        if segment_tiling
+                        else f"flash_m_tile{stage} * 128 + flash_local_tidx"
+                    ),
                     "flash_bh",
                     "            ",
                     lse_scale=score_plan.lse_scale,
@@ -16912,6 +17990,21 @@ if warp_idx == 15:
             cute.arch.fence_view_async_tmem_load()
             cute.arch.fence_view_async_tmem_store()"""
 
+                if flex_body:
+                    assert flex_walk is not None
+                    return _flex_softmax_body(
+                        stage,
+                        ld,
+                        ldt,
+                        score_m_tile_expr,
+                        _modifier_rowmax_block,
+                        pass2_block=f"            flash_p_sum = {pass2_call}",
+                        pass2_masked_block=(
+                            f"            flash_p_sum = {pass2_masked_call}"
+                        ),
+                        format_disc_loop=_format_disc_loop,
+                        corr_publish_rowsum=corr_publish_rowsum,
+                    )
                 masked_rowmax_block = _modifier_rowmax_block(
                     _modifier_transform(score_plan)
                 )
@@ -17763,6 +18856,7 @@ if warp_idx == 15:
     softmax_needs_tile_decode = (
         has_lse
         or is_causal
+        or flex_body
         or any(
             modifier.kind
             in {
@@ -17828,6 +18922,8 @@ if warp_idx == 15:
             + softmax1_inner
             + _softmax_row_epilogue("1", softmax_row_sum_expr)
         )
+    softmax0_inner = flex_item_prelude + softmax0_inner
+    softmax1_inner = flex_item_prelude + softmax1_inner
     softmax0_block = (
         segment_wrap(
             f"{role_next} warp_idx < 4:",
@@ -17843,6 +18939,7 @@ if warp_idx == 15:
             softmax0_inner,
             persistent,
             persistent_loop=cfg.persistent_loop,
+            item_table=fa4_item_table,
             prelude=softmax_prelude,
             tail=_softmax_tail("0"),
             total_tiles=total_tiles,
@@ -17870,6 +18967,7 @@ if warp_idx == 15:
             softmax1_inner,
             persistent,
             persistent_loop=cfg.persistent_loop,
+            item_table=fa4_item_table,
             prelude=softmax_prelude,
             tail=_softmax_tail("1"),
             total_tiles=total_tiles,
@@ -18257,12 +19355,14 @@ if warp_idx == 15:
         flash_o_full_phase ^= 1"""
     # A fused row epilogue addresses aux rows from the correction warps, so they
     # need the per-work-item tile decode even on the staged-smem store routes.
+    corr_inner = flex_item_prelude + corr_inner
     corr_prelude = (
         "none"
         if epi_smem
         and not is_causal
         and not has_lse
         and not score_plan.modifiers
+        and not flex_persistent
         and (row_epilogue is None or softmax_row_epilogue)
         else "decode"
     )
@@ -18281,6 +19381,7 @@ if warp_idx == 15:
             corr_inner,
             persistent,
             persistent_loop=cfg.persistent_loop,
+            item_table=fa4_item_table,
             prelude=corr_prelude,
             tail=tmem_dealloc_arrive,
             total_tiles=total_tiles,
@@ -18672,6 +19773,11 @@ _FLASH_ROW_KV_BEGIN_SEGMENT_KERNEL_PARAMS = [
 _FLASH_ROW_KV_BEGIN_SEGMENT_TMA_KERNEL_PARAMS = [
     "_flash_mO",
 ]
+
+
+# The flex envelope's runtime softmax scale (``AttentionScorePlan.scale_arg``),
+# as the hooks read it; ``_flash_scale_log2`` is derived from it host-side.
+_FLASH_FLEX_SCALE_KERNEL_PARAMS: tuple[str, ...] = ("_flash_scale",)
 
 
 class FlashTensorPlan(NamedTuple):
@@ -19106,13 +20212,6 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     plan = flash_attention_tensor_plan(df)
     if plan is None:
         return False
-    if df.cute_state.attention_flex_match is not None:
-        # The matcher admitted the FlexAttention envelope (BlockMask list
-        # walk + captured score / mask regions), but the fa4 list-walk body
-        # that renders it is not in the tree yet.
-        raise NotImplementedError(
-            "flex-envelope flash attention: the list-walk emitter has not landed"
-        )
     q_arg, k_arg, v_arg, o_arg = plan.q_arg, plan.k_arg, plan.v_arg, plan.o_arg
     output_epilogue = plan.output_epilogue
     lse_arg = plan.lse_arg
@@ -19159,7 +20258,43 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         return False
 
     scale_log2 = score_plan.qk_scale_log2
-    num_kv = (seq + 127) // 128
+    # The flex envelope's query and K/V lengths may differ and need not be
+    # multiples of 128: ``seq`` (Q/O/LSE) and ``kv_seq`` (K/V, the KV tile
+    # count) come from the score plan; every other plan has one length.
+    kv_seq = seq
+    if score_plan.is_flex:
+        if plan.q_seq is not None:
+            seq = plan.q_seq
+        elif score_plan.q_seq is not None:
+            seq = score_plan.q_seq
+        if plan.kv_seq is not None:
+            kv_seq = plan.kv_seq
+        elif score_plan.kv_seq is not None:
+            kv_seq = score_plan.kv_seq
+        walk = score_plan.kv_walk
+        if walk is not None and len(plan.kv_walk_args) == 4:
+            # The device body reads the tables and aux tensors through their
+            # kernel parameter names.
+            names = tuple(arg.name for arg in plan.kv_walk_args)
+            walk = dataclasses.replace(
+                walk,
+                part_cnt_name=names[0],
+                part_idx_name=names[1],
+                full_cnt_name=names[2],
+                full_idx_name=names[3],
+            )
+            score_plan = dataclasses.replace(score_plan, kv_walk=walk)
+        if plan.aux_args and len(plan.aux_args) == len(score_plan.aux_buffers):
+            score_plan = dataclasses.replace(
+                score_plan,
+                aux_buffers=tuple(
+                    dataclasses.replace(aux, name=arg.name)
+                    for aux, arg in zip(
+                        score_plan.aux_buffers, plan.aux_args, strict=True
+                    )
+                ),
+            )
+    num_kv = (kv_seq + 127) // 128
     row_emit: FlashRowEpilogueEmit | None = None
     if plan.row_epilogue is not None:
         row_emit = FlashRowEpilogueEmit(
@@ -19241,10 +20376,14 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         supports_tensor_4d_tma=supports_tensor_4d_tma,
         tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(score_plan),
         causal_resident_compatible=seq % 256 == 0,
-        prefer_packed_reduce=bool(score_plan.modifiers),
-        plain_row_body=row_emit is None and not score_plan.modifiers,
+        prefer_packed_reduce=bool(score_plan.modifiers) or score_plan.is_flex,
+        plain_row_body=(
+            row_emit is None and not score_plan.modifiers and not score_plan.is_flex
+        ),
         has_row_epilogue=row_emit is not None,
-        has_score_modifiers=bool(score_plan.modifiers),
+        has_score_modifiers=(
+            bool(score_plan.modifiers) or score_plan.flex_has_score_region
+        ),
         score_modifier_kinds=score_plan.modifier_kinds,
         row_mma_aligned=row_mma_aligned,
         row_mma_aux_dtypes=row_mma_aux_dtypes,
@@ -19253,7 +20392,18 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         ),
         kv_group=kv_group,
         fast_math=env.settings.fast_math,
+        # The flex envelope (the plan category the resolver pins to the fa4
+        # pair body at every KV tile count; a trivial walk included).
+        has_list_walk=score_plan.is_flex,
     )
+    if score_plan.is_flex and seq < 128 and cfg.epi_tma:
+        # A query length shorter than one 128-row tile: the TMA store's
+        # tiled view over the output has no whole tile and the box lands
+        # nowhere (M=64 left the output unwritten), while the staged vector
+        # store takes the row-guarded ``_rows`` variant. Longer ragged
+        # lengths (M=192, 320, 1088) clip correctly under TMA. The strategy
+        # stays in the config; this size-dependent choice is the emitter's.
+        cfg = dataclasses.replace(cfg, epi_tma=False, epi_stg=True)
     if _flash_output_requires_tma(batch, seq, head_dim_v) and not cfg.epi_tma:
         return False
     if head_dim_v != head_dim and (
@@ -19421,9 +20571,13 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         fa4_tile_rows = 128 * cfg.q_tile_count
         if cfg.use_2cta_instrs or cfg.use_cga2_local_cta:
             fa4_tile_rows *= 2
-        if seq % fa4_tile_rows != 0:
+        if score_plan.is_flex:
+            # A ragged last pair runs a dead or half-live second stage.
+            total_tiles = batch * (-(-seq // fa4_tile_rows))
+        elif seq % fa4_tile_rows != 0:
             return False
-        total_tiles = batch * (seq // fa4_tile_rows)
+        else:
+            total_tiles = batch * (seq // fa4_tile_rows)
     else:
         total_tiles = batch * (seq // cfg.q_tile_m)
 
@@ -19471,6 +20625,20 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         # The launcher builds the K/V (S, D, B) views over ``batch // kv_group``
         # batch heads; Q/O/LSE/bias keep the full ``batch``.
         wrapper_plan["kv_group"] = kv_group
+    if kv_seq != seq:
+        # The launcher builds the K/V views and the KV tile count over the
+        # K/V length; Q/O/LSE keep ``seq``.
+        wrapper_plan["kv_seq"] = kv_seq
+    flex_scale_arg = (
+        plan.flex_scale_arg_name
+        if plan.flex_scale_arg_name is not None
+        else score_plan.scale_arg
+    )
+    if score_plan.is_flex and flex_scale_arg is not None:
+        # A runtime softmax scale: the launcher derives ``_flash_scale_log2``
+        # from it (mask-only plans, raw QK units) and passes it to the hooks.
+        wrapper_plan["scale_name"] = flex_scale_arg
+        wrapper_plan["scale_peeled"] = score_plan.scale_peeled
     if cfg.uneven_kv_ring:
         # The launcher composes both K/V smem layouts over the uneven ring's
         # stage stride (half a K plus half a V tile).
@@ -19513,6 +20681,25 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             wrapper_plan["row_kv_begin_work_name"] = work_arg.name
             wrapper_plan["row_kv_begin_work_rows"] = int(work_arg.fake_value.shape[0])
             df.placeholder_args.add(work_arg.name)
+    flex_item_table: str | None = None
+    if score_plan.is_flex and cfg.persistent:
+        # The persistent list walk's host-sorted item order (a plain kernel
+        # param like the tables; the launcher passes it positionally).
+        flex_walk = score_plan.kv_walk
+        assert flex_walk is not None
+        flex_heads = plan.tensor_4d_heads or batch
+        emit_flash_flex_item_module_statements(cg)
+        item_arg = _flash_flex_item_arg(
+            df,
+            plan.kv_walk_args,
+            q_block=flex_walk.q_block,
+            batch=batch // flex_heads,
+            heads=flex_heads,
+            num_pairs=total_tiles // batch,
+            num_kv=num_kv,
+        )
+        df.placeholder_args.add(item_arg.name)
+        flex_item_table = item_arg.name
     aux_smem_staging = _flash_aux_smem_staging(
         cfg,
         row_emit,
@@ -19551,6 +20738,12 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 df.wrapper_only_params.extend(
                     _FLASH_ROW_KV_BEGIN_SEGMENT_TMA_KERNEL_PARAMS
                 )
+    if score_plan.is_flex and flex_scale_arg is not None:
+        df.wrapper_only_params.extend(_FLASH_FLEX_SCALE_KERNEL_PARAMS)
+        # The wrapper reads the scale argument (the device body only sees the
+        # derived ``_flash_scale`` params): keep it in the signature.
+        df.placeholder_args.add(flex_scale_arg)
+    df.placeholder_args.update(plan.flex_scalar_arg_names)
     if cfg.epi_tma:
         df.wrapper_only_params.extend(_FLASH_EPI_TMA_KERNEL_PARAMS)
     elif cfg.epi_stg:
@@ -19573,6 +20766,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.placeholder_args.add(document_arg.name)
     for row_kv_begin_arg in row_kv_begin_args:
         df.placeholder_args.add(row_kv_begin_arg.name)
+    # The flex tables and the regions' tensors are plain kernel params the
+    # device body reads by name (no wrapper-built views).
+    df.placeholder_args.update(arg.name for arg in plan.kv_walk_args)
+    df.placeholder_args.update(arg.name for arg in plan.aux_args)
     cg.cute_uses_matmul = True
 
     if cfg.topology == "ws_overlap":
@@ -19638,7 +20835,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 head_dim=head_dim,
                 head_dim_v=None if head_dim_v == head_dim else head_dim_v,
                 num_kv=num_kv,
-                sequence_extent=seq,
+                sequence_extent=kv_seq,
                 num_bh=batch,
                 total_tiles=total_tiles,
                 cfg=cfg,
@@ -19653,6 +20850,14 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 output_epilogue=output_epilogue,
                 row_epilogue=row_emit,
                 row_kv_begin_heads_per_batch=row_kv_begin_heads_per_batch,
+                # The head count the collapsed batch-head index splits into
+                # (the flex tables and hooks index ``b`` / ``h``): the 4D
+                # geometry when the tensor plan proved it, else one batch.
+                num_heads=(
+                    (plan.tensor_4d_heads or batch) if score_plan.is_flex else None
+                ),
+                flex_scalar_exprs=plan.flex_scalar_exprs,
+                flex_item_table=flex_item_table,
             )
         )
     else:

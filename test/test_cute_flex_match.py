@@ -26,7 +26,6 @@ pytest.importorskip("cutlass.cute")
 
 from test._cute_aux import _cpu_codegen
 
-import helion
 from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flex_match
@@ -470,6 +469,67 @@ def test_mask_tables_and_head_slopes() -> None:
     assert plan.aux_buffers[0] is slope_aux
 
 
+def test_zeros_like_accumulation_with_dependent_gathers() -> None:
+    """The graphormer-edge form: ``torch.zeros_like(score)`` (an ``aten.full``
+    whose shape arguments are symbolic size nodes) accumulating
+    ``where(length > n, c_n, 0.0)`` terms through two-level gathers."""
+    batch, heads, seq, path_len, edge_types = 2, 4, 256, 3, 8
+    q, k, v = _qkv(batch, heads, seq, seq)
+    path_lengths = torch.randint(0, path_len + 1, (batch, seq, seq), dtype=torch.int32)
+    path_types = torch.randint(
+        0, edge_types, (batch, seq, seq, path_len), dtype=torch.int32
+    )
+    edge_bias_flat = torch.randn(heads, path_len * edge_types)
+
+    # Literal path positions and offsets, as the harness-generated source has
+    # them (a closure int would trace as a symbolic host scalar).
+    def edge_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        length = hl.load(path_lengths, [b, q_idx, kv_idx])
+        total = torch.zeros_like(score)
+        et0 = hl.load(path_types, [b, q_idx, kv_idx, 0])
+        c0 = hl.load(edge_bias_flat, [h, et0 + 0])
+        total = total + torch.where(length > 0, c0, 0.0)
+        et1 = hl.load(path_types, [b, q_idx, kv_idx, 1])
+        c1 = hl.load(edge_bias_flat, [h, et1 + 8])
+        total = total + torch.where(length > 1, c1, 0.0)
+        et2 = hl.load(path_types, [b, q_idx, kv_idx, 2])
+        c2 = hl.load(edge_bias_flat, [h, et2 + 16])
+        total = total + torch.where(length > 2, c2, 0.0)
+        return score + total / torch.clamp(length, min=1).to(torch.float32)
+
+    block_mask = create_block_mask(
+        noop_mask, batch, heads, seq, seq, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, edge_mod, block_mask))
+    plan = _match_or_fail(bound).plan
+    assert plan.score_region is not None and plan.mask_region is None
+    assert not plan.scale_peeled
+    classes = {aux.shape: aux.index_class for aux in plan.aux_buffers}
+    # path_lengths[b, q, kv]: lane-contiguous per row; path_types[b, q, kv, n]:
+    # a constant last index with the lane in a leading dim (strided gather);
+    # edge_bias_flat[h, et + c]: indexed by a loaded value.
+    assert classes == {
+        (batch, seq, seq): "row_col",
+        (batch, seq, seq, path_len): "general",
+        (heads, path_len * edge_types): "value",
+    }
+    graph = plan.score_region.graph
+    fulls = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target is _aten.full.default
+    ]
+    # One typed literal zero with its shape argument dropped; no size node.
+    assert len(fulls) == 1
+    assert fulls[0].args[0] == [] and fulls[0].args[1] == 0.0
+    assert fulls[0].meta["val"].dtype == torch.float32
+    assert _aten.sym_size.int not in _targets(graph)
+    assert {_aten.where.self, _aten.clamp_min.default, _aten.gt.Scalar} <= _targets(
+        graph
+    )
+    assert len([n for n in graph.nodes if n.target is hl.load]) == 1 + 2 * path_len
+
+
 # -- declines ------------------------------------------------------------------
 
 
@@ -549,25 +609,50 @@ def test_declines_non_unit_batch_tile(tmp_path: pathlib.Path) -> None:
     assert reasons == ["flex: root axis 2 is not pinned to block size 1"]
 
 
+def test_zeros_like_score_in_a_score_mod_is_admitted() -> None:
+    """``torch.zeros_like(score)`` (attention-gym graphormer-edge) lowers to
+    ``aten.full`` sized by ``sym_size_int(score, d)``: shape metadata, not
+    region values. The region keeps a shapeless literal and no size query
+    (the builder used to assert on the size node)."""
+    q, k, v = _qkv()
+    table = torch.randn(1024, dtype=torch.float32)
+
+    def score_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        total = torch.zeros_like(score)
+        total = total + hl.load(table, [kv_idx])
+        return score + total
+
+    block_mask = create_block_mask(
+        _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, score_mod, block_mask))
+    plan = _match_or_fail(bound).plan
+    assert plan.score_region is not None
+    nodes = list(plan.score_region.graph.nodes)
+    fulls = [node for node in nodes if node.target is _aten.full.default]
+    assert fulls and all(node.args[0] == [] for node in fulls)
+    assert not any(node.target is _aten.sym_size.int for node in nodes)
+
+
 # -- integration -----------------------------------------------------------------
 
 
 def test_flag_off_keeps_the_generic_path() -> None:
-    """With ``FLEX_PLAN_ENABLED`` False (the default until the emitter lands)
-    the flex kernel keeps today's generic surface."""
+    """With ``FLEX_PLAN_ENABLED`` patched off the flex kernel keeps the generic
+    surface (the flag is on by default now that the list-walk emitter is in)."""
     q, k, v = _qkv()
     block_mask = create_block_mask(
         _causal, None, None, 1024, 1024, BLOCK_SIZE=128, device=_CPU
     )
     bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask))
-    assert not flex_match.FLEX_PLAN_ENABLED
+    assert flex_match.FLEX_PLAN_ENABLED
     assert not bound.config_spec.cute_flash_search_enabled
 
 
 def test_surface_and_codegen_claim_every_walk_loop() -> None:
     """With the flag on: the surface records the flex facts and pins only the
     tunable (tile_m, tile_n) ids; codegen matches once, records all loop
-    ids of both walks and stops at the documented NotImplementedError."""
+    ids of both walks and renders the fa4 list-walk body."""
     q, k, v = _qkv()
     block_mask = create_block_mask(
         _causal, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU
@@ -608,9 +693,11 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
         _cpu_codegen(),
         patch.object(flex_match, "FLEX_PLAN_ENABLED", True),
         patch.object(cute_flash, "codegen_attention_flash", spy),
-        pytest.raises(helion.exc.InternalError, match="list-walk emitter"),
     ):
-        bound.to_code(config)
+        code = bound.to_code(config)
+    # The list-walk emitter rendered the fa4 pair body over the tables.
+    assert "flash_flex_status" in code
+    assert "'topology': 'fa4'" in code
     match = captured["match"]
     assert isinstance(match, FlexMatch)
     assert sorted(captured["block_ids"]) == sorted(match.loop_block_ids) == [1, 5, 6]
@@ -696,9 +783,9 @@ def test_collapsed_envelope_surface_unchanged(name: str) -> None:
 def test_short_query_lengths_enable_the_search(q_seq: int) -> None:
     """A query length below (or just past) one 128-row tile caps the generic
     block range at its extent; the flex surface still pins the 128x128
-    tiles (the emitter row-guards the ragged tile). Mirrors attention-gym's
-    jetspec-tree (M=64 query rows over N=2112 keys, a bool table read per
-    score)."""
+    tiles (the emitter row-guards the ragged tile) and the default config
+    renders the fa4 list-walk body. Mirrors attention-gym's jetspec-tree
+    (M=64 query rows over N=2112 keys, a bool table read per score)."""
     q, k, v = _qkv(q_seq=q_seq, kv_seq=2112)
     ancestor = torch.rand(256, 64) < 0.5
 
@@ -740,6 +827,26 @@ def test_short_query_lengths_enable_the_search(q_seq: int) -> None:
 
     config = spec.default_config()
     assert config.block_sizes == [128, 128]
+    captured: dict[str, Any] = {}
+    real_codegen = cute_flash.codegen_attention_flash
+
+    def spy(cg: Any) -> bool:
+        state = cg.device_function.cute_state
+        captured["block_ids"] = list(state.attention_flash_block_ids or [])
+        captured["match"] = state.attention_flex_match
+        return real_codegen(cg)
+
+    with (
+        _as_sm100(flex=True),
+        patch.object(cute_flash, "codegen_attention_flash", spy),
+    ):
+        code = bound.to_code(config)
+    assert "flash_flex_status" in code
+    assert "'topology': 'fa4'" in code
+    match = captured["match"]
+    assert isinstance(match, FlexMatch)
+    assert match.q_seq == q_seq
+    assert sorted(captured["block_ids"]) == sorted(match.loop_block_ids)
 
 
 def test_declared_ceiling_below_128_keeps_the_generic_path(

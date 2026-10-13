@@ -3561,6 +3561,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 score_modifier_kinds=pattern.score_plan.modifier_kinds,
                 head_dim_v=pattern.score_plan.head_dim_v,
                 kv_group=pattern.score_plan.kv_group,
+                has_list_walk=pattern.score_plan.has_list_walk,
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(

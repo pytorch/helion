@@ -996,11 +996,19 @@ class _HookEmitter:
             f"{tensor}.iterator" + "".join(f" + {o}" for o in offsets) + f" + {clamped}"
         )
         self.emit(_GROUP, f"{name}_ok = {' & '.join(guards)}")
-        self.emit(_GROUP, f"{name}_vec = _cute_flex_load_vec({pointer}, {width}, {t})")
+        if buffer.dtype is torch.bool:
+            # A bool table is loaded as bytes: ``cutlass.Boolean``'s MLIR type
+            # is ``i1`` and a ``vector<16xi1>`` load traps the DSL's lowering
+            # (the host process dies with SIGILL); each lane is ``!= 0``.
+            vec_t = "cutlass.Int8"
+            lane = f"{vec_t}({name}_vec[{_LANE_VAR}]) != {vec_t}(0)"
+        else:
+            vec_t = t
+            lane = f"{t}({name}_vec[{_LANE_VAR}])"
         self.emit(
-            _ELEMENT,
-            f"{name} = {t}(cutlass.select_({name}_ok, {t}({name}_vec[{_LANE_VAR}]), {zero}))",
+            _GROUP, f"{name}_vec = _cute_flex_load_vec({pointer}, {width}, {vec_t})"
         )
+        self.emit(_ELEMENT, f"{name} = {t}(cutlass.select_({name}_ok, {lane}, {zero}))")
 
     # -- assembly -----------------------------------------------------------
 
