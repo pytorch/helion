@@ -2039,12 +2039,6 @@ class SubscriptIndexing(NamedTuple):
                 single_output_dim = len(non_trivial_output_positions) <= 1
 
             new_masks: dict[str, None] = {}
-            # A size-1 target dim drops this index from the offset, which then
-            # broadcasts over the output positions the index covers.  The tile
-            # masks the first index attaches also guard the other indices'
-            # offsets, so they stay in the access's own mask, to whose shape a
-            # load broadcasts its pointer.
-            size_one = _is_size_one(fake_value.size(len(index_values)))
             if not non_trivial_output_positions and not is_cartesian:
                 # An all-singleton tensor contributes a scalar index to the
                 # shared advanced-index broadcast shape. Expand it across that
@@ -2052,7 +2046,7 @@ class SubscriptIndexing(NamedTuple):
                 expand = tile_strategy.expand_dims_str(
                     output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
                 )
-                idx_val = f"({index_var}){expand}"
+                positions: list[int] = []
             elif single_output_dim:
                 assert pos is not None
                 if index_elem.ndim == 1:
@@ -2063,11 +2057,25 @@ class SubscriptIndexing(NamedTuple):
                     expand = tile_strategy.expand_dims_str(
                         output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
                     )
-                idx_val = f"({index_var}){expand}"
-                # Add mask for the single non-trivial output position
+                positions = [pos]
+            else:
+                # Multi-dim tensor with multiple non-trivial dims
+                # Still need expansion for trailing/leading slice dimensions
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                positions = non_trivial_output_positions
+            idx_val = f"({index_var}){expand}"
+            # Every index masks the tile positions it covers (a later index may
+            # cover positions an earlier one does not).  The masks also guard
+            # the other indices' offsets, so even over a size-1 target dim,
+            # which drops this index from the offset and broadcasts it over
+            # these positions, they stay in the access's own mask, to whose
+            # shape a load broadcasts its pointer.
+            for p in positions:
                 if (
-                    pos < len(output_size)
-                    and (bid := env.get_block_id(output_size[pos])) is not None
+                    p < len(output_size)
+                    and (bid := env.get_block_id(output_size[p])) is not None
                     and (mv := state.codegen.mask_var(bid))
                 ):
                     if env.is_jagged_tile(bid):
@@ -2077,38 +2085,9 @@ class SubscriptIndexing(NamedTuple):
                         )
                     else:
                         new_masks.setdefault(
-                            f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                            f"({mv}){tile_strategy.expand_str(output_size, p)}"
                         )
-            else:
-                # Multi-dim tensor with multiple non-trivial dims
-                # Still need expansion for trailing/leading slice dimensions
-                expand = tile_strategy.expand_dims_str(
-                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
-                )
-                idx_val = f"({index_var}){expand}"
-                if tensor_idx == 0:
-                    for p in non_trivial_output_positions:
-                        if (
-                            p < len(output_size)
-                            and (bid := env.get_block_id(output_size[p])) is not None
-                            and (mv := state.codegen.mask_var(bid))
-                        ):
-                            if env.is_jagged_tile(bid):
-                                mask_shape = env.jagged_tile_mask_shapes[bid]
-                                new_masks.setdefault(
-                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
-                                )
-
-                            else:
-                                new_masks.setdefault(
-                                    f"({mv}){tile_strategy.expand_str(output_size, p)}"
-                                )
-            if size_one:
-                if is_cartesian:
-                    assert pos is not None
-                    positions = [pos]
-                else:
-                    positions = non_trivial_output_positions
+            if _is_size_one(fake_value.size(len(index_values))):
                 size1_broadcast_dims.extend(
                     (p, output_size[p])
                     for p in positions

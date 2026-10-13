@@ -4175,6 +4175,57 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     atol=1e-4,
                 )
 
+    def test_every_index_tensor_masks_its_positions(self):
+        """Each of several index tensors masks the tile positions it covers:
+        only the first used to, so a later multi-dim index covering more
+        positions, or an all-singleton first index, left them unmasked and
+        stores and atomics wrote past the valid columns."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
+        def transpose_rows(
+            rows: torch.Tensor, v: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(v.size()):
+                cols = tile_m.index[:, None] + tile_n.index[None, :] * 0
+                out[rows[tile_n], cols] = v[tile_m, tile_n]
+            return out
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
+        def transpose_add_rows(
+            rows: torch.Tensor, v: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(v.size()):
+                cols = tile_m.index[:, None] + tile_n.index[None, :] * 0
+                hl.atomic_add(out, [rows[tile_n], cols], v[tile_m, tile_n])
+            return out
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
+        def store_row(v: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(v.size()):
+                row = hl.zeros([1, 1], dtype=torch.int64)
+                cols = tile_m.index[:, None] * 0 + tile_n.index[None, :]
+                out[row, cols] = v[tile_m, tile_n]
+            return out
+
+        v = torch.randn(5, 8, device=DEVICE)
+        out = torch.full((8, 16), -1.0, device=DEVICE)
+        expected = out.clone()
+        expected[:, :5] = v.T
+        rows = torch.arange(8, device=DEVICE)
+        torch.testing.assert_close(transpose_rows(rows, v, out), expected)
+
+        v = torch.randn(1, 40, device=DEVICE)
+        out = torch.full((2, 48), -1.0, device=DEVICE)
+        expected = out.clone()
+        expected[0, :40] = v[0]
+        torch.testing.assert_close(store_row(v, out), expected)
+
+        v = torch.ones(5, 8, device=DEVICE)
+        out = torch.zeros(8, 16, device=DEVICE)
+        expected = out.clone()
+        expected[:, :5] = 1.0
+        torch.testing.assert_close(transpose_add_rows(rows, v, out), expected)
+
     def test_broadcast_tile_store_of_a_shifted_or_gathered_load(self):
         """The broadcast store writes element ``j`` at its own index tensor's
         ``j``-th entry, not at the coordinate the value was loaded from."""
