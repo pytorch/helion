@@ -40,6 +40,7 @@ from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
+from .backend import BackendState
 from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -450,7 +451,7 @@ class CompileEnvironment:
                 "debug_dtype_asserts=True (it emits Triton tl.cast / "
                 "tl.static_assert checks)",
             )
-        if self._backend.experimental:
+        if self._backend.state is BackendState.EXPERIMENTAL:
             from torch._dynamo.utils import warn_once
 
             warn_once(
