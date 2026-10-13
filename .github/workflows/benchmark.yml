@@ -152,6 +152,17 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
+      - name: Uninstall pyzes (XPU workaround)
+        if: inputs.runtime-version == 'xpu'
+        run: |
+          set -x
+          source .venv/bin/activate
+          # The intel/omix image ships the `pyzes` PyPI package, which shadows
+          # the Level Zero bindings torch.xpu expects and breaks device
+          # discovery. Remove it from both the venv and the system interpreter.
+          uv pip uninstall pyzes || true
+          /usr/bin/python3 -m pip uninstall -y --break-system-packages pyzes || true
+
       - name: XPU Compute Check
         if: inputs.runtime-version == 'xpu'
         run: |
