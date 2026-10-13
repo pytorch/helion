@@ -103,7 +103,9 @@ def test_fixed_stateful_width_survives_canonical_round_trip(heads: int) -> None:
 
 
 @pytest.mark.parametrize("lowering", ("auto", "standard"))
-def test_historical_routes_keep_serial_mapping(lowering: str) -> None:
+def test_other_lowerings_honour_the_explicit_group(lowering: str) -> None:
+    # The launch group is a free coordinate of every fa4 lowering: an explicit
+    # group keeps its name (clamped to the grid), 0 names the L2-sized group.
     spec = _spec(64)
     config = helion.Config(
         block_sizes=[1, 128, 128],
@@ -112,8 +114,10 @@ def test_historical_routes_keep_serial_mapping(lowering: str) -> None:
         cute_flash_causal_lpt_swizzle=64,
     )
     spec.normalize(config)
-    assert config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 1
-    assert _resolve(64, 64, lowering=lowering).causal_lpt_swizzle == 1
+    assert config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 64
+    assert _resolve(64, 64, lowering=lowering).causal_lpt_swizzle == 64
+    assert _resolve(64, 0, lowering=lowering).causal_lpt_swizzle == 0
+    assert _resolve(16, 64, lowering=lowering).causal_lpt_swizzle == 16
 
 
 def test_unqualified_stateful_does_not_gain_a_mapping() -> None:
@@ -132,7 +136,11 @@ def test_active_widths_are_effective_and_compiler_seeded(heads: int) -> None:
     spec = _spec(heads)
     fragment = spec._cute_flash_autotune_fragments()[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert 64 in fragment.choices
-    assert fragment._active_choices() == flash._flash_stateful_lpt_candidates(heads)
+    # The stateful widths are searched next to the strategy values of the
+    # other lowerings (0 the L2-sized group, 1 serial, the whole grid).
+    assert set(fragment._active_choices()) == {0, 1, heads} | set(
+        flash._flash_stateful_lpt_candidates(heads)
+    )
     seeds = spec.autotune_seed_configs()
     assert seeds
     assert all(
@@ -246,11 +254,14 @@ def test_both_schedules_reach_every_active_width(schedule: str) -> None:
         neighbors = generation.coordinate_neighbor_projections(
             base, radius=64, frozen_indices=owned
         )
+        # 0 folds to the serial order on this lowering, so the strategy value
+        # proposes an alias of width 1 (and of the incumbent at width 1).
         assert {
             item.config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
             for item in neighbors
             if item.key == flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
             and item.config is not None
+            and item.outcome == "candidate"
         } == set(widths) - {width}
         switches = [
             item.config
@@ -261,26 +272,20 @@ def test_both_schedules_reach_every_active_width(schedule: str) -> None:
             "auto",
             "standard",
         }
-        assert all(c.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 1 for c in switches)
+        # The launch group is not owned: a lowering switch keeps the group.
+        assert all(
+            c.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == width for c in switches
+        )
         assert all(
             c.config[flash.FLASH_ROW_SUM_SCHEDULE_KEY] == "post_acquire"
             for c in switches
         )
 
 
-@pytest.mark.parametrize("causal", (False, True))
-def test_inactive_owned_mapping_uses_workload_context(causal: bool) -> None:
-    for lowering in ("auto", "standard", "resident_value_graph"):
-        owned = flash._flash_resident_softmax_overrides(
-            lowering, is_causal=causal, topology="fa4"
-        )
-        assert owned[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == int(causal)
-    assert (
-        flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
-        not in flash._flash_resident_softmax_overrides(
-            "resident_stateful", is_causal=causal, topology="fa4"
-        )
-    )
+def test_no_lowering_owns_the_launch_group() -> None:
+    for lowering in ("auto", "standard", "resident_value_graph", "resident_stateful"):
+        owned = flash._flash_resident_softmax_overrides(lowering)
+        assert flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY not in owned
 
 
 @pytest.mark.parametrize(
@@ -291,27 +296,38 @@ def test_inactive_owned_mapping_uses_workload_context(causal: bool) -> None:
         {flash.FLASH_SOFTMAX_LOWERING_KEY: "standard"},
     ),
 )
-def test_fixed_parent_excludes_unreachable_wide_mapping(
+def test_fixed_parent_keeps_the_launch_group_searchable(
     overrides: dict[str, object],
 ) -> None:
-    generation = _spec(64).create_config_generation(overrides=overrides)
+    # Parents that exclude the stateful lowering keep the launch group's full
+    # domain: every fa4 lowering decodes the grid inside the group.
+    spec = _spec(64)
+    generation = spec.create_config_generation(overrides=overrides)
     fragment = generation._flat_fields()[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert isinstance(fragment, EnumFragment)
-    assert fragment._active_choices() == (1,)
-    assert all(
-        key != flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY or value == 1
+    full = spec._cute_flash_autotune_fragments()[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
+    assert isinstance(full, EnumFragment)
+    assert fragment._active_choices() == full._active_choices()
+    assert {
+        value
         for key, value in generation.flash_structural_coverage_active_values()
-    )
+        if key == flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
+    } >= {0, 1, 64}
 
 
-def test_fixed_wide_mapping_limits_lowering_without_widening_user_domain() -> None:
+def test_fixed_wide_mapping_keeps_every_lowering() -> None:
+    # A wide explicit group is legal on every fa4 lowering, so it neither
+    # narrows the lowering choices nor empties a narrowed width domain.
     spec = _spec(64)
     generation = spec.create_config_generation(
         overrides={flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: 32}
     )
     mode = generation._flat_fields()[flash.FLASH_SOFTMAX_LOWERING_KEY]
     assert isinstance(mode, EnumFragment)
-    assert mode._active_choices() == ("resident_stateful",)
+    full_mode = spec._cute_flash_autotune_fragments()[flash.FLASH_SOFTMAX_LOWERING_KEY]
+    assert isinstance(full_mode, EnumFragment)
+    assert mode._active_choices() == full_mode._active_choices()
+    assert {"auto", "standard", "resident_stateful"} <= set(mode._active_choices())
     fields = dict(spec._flat_fields())
     width = fields[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert isinstance(width, EnumFragment)
@@ -322,12 +338,14 @@ def test_fixed_wide_mapping_limits_lowering_without_widening_user_domain() -> No
     assert narrowed._flat_fields()[
         flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
     ]._active_choices() == (8, 32)
-    with pytest.raises(ValueError, match="search_choices must not be empty"):
-        ConfigGeneration(
-            spec,
-            overrides={flash.FLASH_SOFTMAX_LOWERING_KEY: "standard"},
-            _field_view=fields,
-        )
+    standard = ConfigGeneration(
+        spec,
+        overrides={flash.FLASH_SOFTMAX_LOWERING_KEY: "standard"},
+        _field_view=fields,
+    )
+    assert standard._flat_fields()[
+        flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
+    ]._active_choices() == (8, 32)
     assert fields[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]._active_choices() == (8, 32)
 
 

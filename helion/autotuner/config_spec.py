@@ -66,7 +66,6 @@ from .._compiler.cute.cute_flash import _flash_compound_exp2_packet_overrides
 from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
 from .._compiler.cute.cute_flash import _flash_env_get
-from .._compiler.cute.cute_flash import _flash_inactive_lpt_domain
 from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
@@ -1690,6 +1689,7 @@ class ConfigSpec:
         self._cute_flash_has_row_epilogue: bool = False
         self._cute_flash_plain_row_body: bool = True
         self._cute_flash_has_score_modifiers: bool = False
+        self._cute_flash_score_modifier_kinds: tuple[str, ...] = ()
         self._cute_flash_block_size_targets: dict[int, int] = {}
         # Memo for ``flash_autotune_fragments``: every other input is fixed
         # ConfigSpec state, so (topology_override, pipeline_family_override) is
@@ -2008,6 +2008,7 @@ class ConfigSpec:
                 has_row_epilogue=self._cute_flash_has_row_epilogue,
                 plain_row_body=self._cute_flash_plain_row_body,
                 has_score_modifiers=self._cute_flash_has_score_modifiers,
+                score_modifier_kinds=self._cute_flash_score_modifier_kinds,
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
             )
@@ -2045,6 +2046,7 @@ class ConfigSpec:
             plain_row_body=self._cute_flash_plain_row_body,
             has_row_epilogue=self._cute_flash_has_row_epilogue,
             has_score_modifiers=self._cute_flash_has_score_modifiers,
+            score_modifier_kinds=self._cute_flash_score_modifier_kinds,
         )
 
     def _cute_flash_config_topology(self, config: Mapping[str, object]) -> str:
@@ -2126,22 +2128,20 @@ class ConfigSpec:
         # active Boolean fragment validates it.
         if FLASH_MMA_INTERLEAVE_KEY in config:
             config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
-        topology = self._cute_flash_config_topology(config)
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
         if (
             self._cute_flash_is_causal
             and type(causal_lpt) is int
-            and config.get(FLASH_SOFTMAX_LOWERING_KEY) != "resident_stateful"
+            and self._cute_flash_num_bh is not None
         ):
-            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = _flash_inactive_lpt_domain(
-                is_causal=self._cute_flash_is_causal, topology=topology
-            )[0]
-        config.update(
-            _flash_resident_softmax_overrides(
-                config.get(FLASH_SOFTMAX_LOWERING_KEY),
-                is_causal=self._cute_flash_is_causal,
-                topology=topology,
+            # A causal launch group wider than the grid (a config carried over
+            # from a larger grid) names the whole-grid order; the resolver
+            # projects the explicit stateful lowering's width below.
+            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = min(
+                causal_lpt, max(self._cute_flash_num_bh, 1)
             )
+        config.update(
+            _flash_resident_softmax_overrides(config.get(FLASH_SOFTMAX_LOWERING_KEY))
         )
         block_size_targets = self._cute_flash_block_size_target_list()
         if fix_invalid:
@@ -2551,6 +2551,7 @@ class ConfigSpec:
         has_row_epilogue: bool = False,
         plain_row_body: bool = True,
         has_score_modifiers: bool = False,
+        score_modifier_kinds: Sequence[str] = (),
         device_sm_count: int = 0,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
@@ -2581,6 +2582,7 @@ class ConfigSpec:
         self._cute_flash_has_row_epilogue = has_row_epilogue
         self._cute_flash_plain_row_body = plain_row_body
         self._cute_flash_has_score_modifiers = has_score_modifiers
+        self._cute_flash_score_modifier_kinds = tuple(score_modifier_kinds)
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -3272,6 +3274,7 @@ class ConfigSpec:
                     has_row_epilogue=self._cute_flash_has_row_epilogue,
                     plain_row_body=self._cute_flash_plain_row_body,
                     has_score_modifiers=self._cute_flash_has_score_modifiers,
+                    score_modifier_kinds=self._cute_flash_score_modifier_kinds,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                     device_sm_count=self._cute_flash_device_sm_count,
                 )
@@ -6226,25 +6229,9 @@ class ConfigSpec:
                 requested_lowering = overrides.get(
                     FLASH_SOFTMAX_LOWERING_KEY, config.get(FLASH_SOFTMAX_LOWERING_KEY)
                 )
-                topology = self._cute_flash_config_topology({**config, **overrides})
-                inactive_lpt = _flash_inactive_lpt_domain(
-                    is_causal=self._cute_flash_is_causal, topology=topology
-                )
-                requirements = _flash_resident_softmax_overrides(
-                    requested_lowering,
-                    is_causal=self._cute_flash_is_causal,
-                    topology=topology,
-                )
+                requirements = _flash_resident_softmax_overrides(requested_lowering)
                 for key, required_value in requirements.items():
-                    if (
-                        key in overrides
-                        and overrides[key] != required_value
-                        and not (
-                            key == FLASH_CAUSAL_LPT_SWIZZLE_KEY
-                            and type(overrides[key]) is int
-                            and overrides[key] in inactive_lpt
-                        )
-                    ):
+                    if key in overrides and overrides[key] != required_value:
                         raise InvalidConfig(
                             f"{FLASH_SOFTMAX_LOWERING_KEY}={requested_lowering!r} "
                             f"requires {key}={required_value!r}, got {overrides[key]!r}"
