@@ -1683,6 +1683,7 @@ class ConfigSpec:
         self._cute_flash_is_causal: bool = False
         self._cute_flash_has_kv_tile_pruning: bool = False
         self._cute_flash_requires_ws_overlap: bool = False
+        self._cute_flash_has_list_walk: bool = False
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
         self._cute_flash_standard_causal_output: bool = False
@@ -2016,6 +2017,7 @@ class ConfigSpec:
                 is_causal=self._cute_flash_is_causal,
                 has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                has_list_walk=self._cute_flash_has_list_walk,
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
@@ -2055,6 +2057,7 @@ class ConfigSpec:
             is_causal=self._cute_flash_is_causal,
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+            has_list_walk=self._cute_flash_has_list_walk,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
@@ -2155,7 +2158,11 @@ class ConfigSpec:
             config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
         if (
-            (self._cute_flash_is_causal or self._cute_flash_has_kv_tile_pruning)
+            (
+                self._cute_flash_is_causal
+                or self._cute_flash_has_kv_tile_pruning
+                or self._cute_flash_has_list_walk
+            )
             and type(causal_lpt) is int
             and self._cute_flash_num_bh is not None
         ):
@@ -2411,7 +2418,11 @@ class ConfigSpec:
                 e2e_res,
             )
         )
-        if not (self._cute_flash_is_causal or self._cute_flash_has_kv_tile_pruning):
+        if not (
+            self._cute_flash_is_causal
+            or self._cute_flash_has_kv_tile_pruning
+            or self._cute_flash_has_list_walk
+        ):
             masked_e2e_freq = e2e_freq
             masked_e2e_res = e2e_res
         e2e_offset_period = _flash_e2e_offset_period(
@@ -2607,6 +2618,7 @@ class ConfigSpec:
         self._cute_flash_is_causal = is_causal
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
+        self._cute_flash_has_list_walk = has_list_walk
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
         self._cute_flash_standard_causal_output = standard_causal_output
@@ -3310,6 +3322,7 @@ class ConfigSpec:
                     is_causal=self._cute_flash_is_causal,
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                    has_list_walk=self._cute_flash_has_list_walk,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,

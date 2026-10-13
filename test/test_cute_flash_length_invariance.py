@@ -3580,6 +3580,41 @@ def test_persistent_loop_canonicalizes_for_clc() -> None:
     assert resolved.persistent_loop == "while"
 
 
+@pytest.mark.parametrize("num_kv", (16, 17, 64))
+def test_flex_list_walk_surface_has_a_complete_coverage_design(num_kv: int) -> None:
+    # The FlexAttention envelope's BlockMask list walk is pinned to the fa4
+    # pair body at every KV tile count (its pair count follows the query
+    # length); every value its fragments offer must survive normalization.
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=num_kv,
+        num_bh=64,
+        dtype=torch.bfloat16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        has_list_walk=True,
+        has_score_modifiers=False,
+        plain_row_body=False,
+        score_modifier_kinds=("flex",),
+    )
+    generation = ConfigGeneration(spec)
+    with _memoized_flash_fragments():
+        configs = generation.flash_deterministic_population_configs()
+    assert configs
+    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    generation.validate_flash_structural_coverage()
+    for config in configs:
+        resolved = spec._resolve_cute_flash_config(config.config)
+        assert resolved.pipeline_family == "fa4"
+        # v1.5: static persistence (host-sorted item order) is searched.
+        assert resolved.persistent_loop == "while" or not resolved.persistent
+        assert resolved.stat_transport == "ring2"
+        assert resolved.kv_tile_n == 128
+
+
 @pytest.mark.parametrize(
     ("mask_kind", "standard_causal_output"),
     (

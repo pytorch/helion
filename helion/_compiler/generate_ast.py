@@ -3030,6 +3030,7 @@ def _generate_ast(
                         "document_range_name",
                         "row_kv_begin_name",
                         "row_kv_begin_work_name",
+                        "scale_name",
                         "layout_name",
                         "n_sizes_name",
                         "k_sizes_name",
