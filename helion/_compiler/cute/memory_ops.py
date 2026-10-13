@@ -1432,10 +1432,7 @@ def _cute_stack_tensor_offset_expr(
     index_dtype = env.index_type()
     terms = []
     for dim, index in enumerate(index_exprs):
-        stride = tensor_like.stride(dim)
-        stride_expr = (
-            str(stride) if isinstance(stride, int) else state.sympy_expr(stride)
-        )
+        stride_expr = state.device_function.tensor_stride(tensor_like, dim).name
         terms.append(f"({index_dtype}({index}) * {index_dtype}({stride_expr}))")
     return " + ".join(terms) if terms else "0"
 
@@ -1568,10 +1565,12 @@ def _codegen_cute_store_stack_load(
         dev_ptrs_name = state.device_function.tensor_arg(dev_ptrs).name
         tensor_name = state.device_function.tensor_arg(tensor).name
         target_dtype = env.backend.dtype_str(tensor.dtype)
+        fn = state.device_function
         dev_ptr_offset = (
             f"{index_dtype}({first_stack_index}) * "
-            f"{index_dtype}({dev_ptrs.stride(0)}) + "
-            f"{index_dtype}({loop_var}) * {index_dtype}({dev_ptrs.stride(1)})"
+            f"{index_dtype}({fn.tensor_stride(dev_ptrs, 0).name}) + "
+            f"{index_dtype}({loop_var}) * "
+            f"{index_dtype}({fn.tensor_stride(dev_ptrs, 1).name})"
         )
         stack_ptr_expr = (
             f"(cute.make_ptr({target_dtype}, "
@@ -1593,7 +1592,7 @@ def _codegen_cute_store_stack_load(
             body = f"    if {mask_expr}:\n        {store_expr}"
         state.add_statement(
             statement_from_string(
-                f"for {loop_var} in range({dev_ptrs.size(1)}):\n{body}"
+                f"for {loop_var} in range({fn.tensor_size(dev_ptrs, 1).name}):\n{body}"
             )
         )
         return ast.Constant(value=None)
