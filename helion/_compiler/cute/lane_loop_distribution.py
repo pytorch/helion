@@ -293,6 +293,7 @@ from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ..ast_read_writes import ReadWrites
 from ..tile_strategy import _HELION_LANE_REDUCE_MARKER
+from ..tile_strategy import _find_lane_reduce_call
 from ..tile_strategy import _is_lane_reduce_marker_assign
 from ..tile_strategy import _is_proven_relocatable_call
 from ..tile_strategy import _memory_write_calls
@@ -500,12 +501,14 @@ def _atomic_addresses_a_tensor(call: ast.Call) -> bool:
     return bool(call.args) and bool(_addressed_tensors(call.args[0]))
 
 
-def _calls_are_movable(node: ast.AST, *, atomics: bool = False) -> bool:
+def _calls_are_movable(
+    node: ast.AST, *, also: Callable[[ast.Call], bool] | None = None
+) -> bool:
     return all(
         _is_plain_store(call)
         or _is_plain_load(call)
         or _is_list_append(call)
-        or (atomics and _is_atomic_call(call))
+        or (also is not None and also(call))
         or ast.unparse(call.func) in _PURE_CALLS
         or _is_proven_relocatable_call(call, allow_load=True)
         for call in ast.walk(node)
@@ -521,30 +524,61 @@ def _is_movable_iterator(node: ast.expr) -> bool:
     )
 
 
-def _is_movable(node: ast.AST, *, atomics: bool = False) -> bool:
+def _is_movable(
+    node: ast.AST, *, also: Callable[[ast.Call], bool] | None = None
+) -> bool:
     """Whether running ``node`` once instead of once per lane preserves it.
 
     Assignments and expression statements made of proven pure calls (loads
     included), ordinary stores and store buffer appends qualify, as do
     ``range`` loops and branches built only from them.  Anything else pins
-    the statement.  With ``atomics`` the atomic calls qualify too: such a
-    statement is placed by its reads and its tensor and never repeated.
+    the statement.  The calls ``also`` accepts qualify too: with
+    ``_is_atomic_call`` such a statement is placed by its reads and its
+    tensor and never repeated.
     """
     if isinstance(node, ast.For):
         return (
             not node.orelse
             and _is_movable_iterator(node.iter)
-            and all(_is_movable(child, atomics=atomics) for child in node.body)
+            and all(_is_movable(child, also=also) for child in node.body)
         )
     if isinstance(node, ast.If):
         return _calls_are_movable(node.test) and all(
-            _is_movable(child, atomics=atomics) for child in [*node.body, *node.orelse]
+            _is_movable(child, also=also) for child in [*node.body, *node.orelse]
         )
     if isinstance(node, ast.Pass):
         return True
     if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr)):
-        return _calls_are_movable(node, atomics=atomics)
+        return _calls_are_movable(node, also=also)
     return False
+
+
+def runs_once_outside_lane(node: ast.AST, lane_var: str) -> bool:
+    """Whether ``node`` keeps its effect run once instead of once per lane of ``lane_var``.
+
+    For a statement that reads none of the loop's coordinates
+    (``_sink_lane_loop_into_branches``): the statements ``_is_movable``
+    accepts, where an atomic recorded uniform along the loop and the
+    reduction marker of another lane loop qualify too.  An atomic that is
+    not uniform along it adds once per lane, and the loop's own marker
+    reduces over its lanes.
+    """
+    foreign_markers: set[int] = set()
+    for child in ast.walk(node):
+        marker = _is_lane_reduce_marker_assign(child)
+        if marker is None:
+            continue
+        if marker.owner_lane in (None, lane_var):
+            return False
+        assert isinstance(child, ast.Assign)
+        foreign_markers.add(id(_find_lane_reduce_call(child.value)))
+
+    def also(call: ast.Call) -> bool:
+        if _is_atomic_call(call):
+            return lane_var in _uniform_lanes_of(call)
+        return id(call) in foreign_markers
+
+    return _is_movable(node, also=also)
 
 
 def _mentions(
@@ -1351,7 +1385,7 @@ def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statemen
     ]
     atomic = (
         bool(atomics)
-        and _is_movable(node, atomics=True)
+        and _is_movable(node, also=_is_atomic_call)
         and all(_atomic_addresses_a_tensor(call) for call in atomics)
     )
     uniform_lanes: frozenset[str] = frozenset()

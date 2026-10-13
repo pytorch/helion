@@ -4471,6 +4471,32 @@ def test_snapshot_native_typed_loads(dtype):
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_sliced_integer_extrema(x):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        values = x[row, :]
+        out[row, :] = values + 2 * torch.amax(-values) + 3 * torch.amin(values)
+    return out
+
+
+def test_snapshot_sliced_row_reduction_binds():
+    # A sliced row reduces over a symbolic rdim extent, not an int.
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(
+            _fragment_sliced_integer_extrema, (torch.ones(2, 65, dtype=torch.int32),)
+        )
+        assert "@cute.kernel" in bound.to_code(bound.config_spec.default_config())
+
+
+@skipUnlessBackends(["cute"])
+def test_snapshot_sliced_row_reduction_native():
+    x = torch.randint(-1000, 1000, (8, 65), device=DEVICE, dtype=torch.int32)
+    _, out = code_and_output(_fragment_sliced_integer_extrema, (x,))
+    expected = x + 2 * (-x).amax(-1, keepdim=True) + 3 * x.amin(-1, keepdim=True)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _fragment_packet_masked_scan(x: torch.Tensor, modulus: hl.constexpr):
     raw = torch.empty_like(x)
     out = torch.empty_like(x)

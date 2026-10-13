@@ -23,6 +23,7 @@ from torch.utils._sympy.symbol import symbol_is_type
 
 from ... import exc
 from ..backend import Backend
+from ..backend import BackendState
 from ..backend import _active_loop_block_ids
 from ..backend import _attention_flash_gate_enabled
 from ..backend import _attention_flash_supported
@@ -1408,6 +1409,10 @@ class CuteBackend(Backend):
     @property
     def name(self) -> str:
         return "cute"
+
+    @property
+    def state(self) -> BackendState:
+        return BackendState.BETA
 
     @property
     def supports_eager_prepared_call(self) -> bool:
