@@ -344,6 +344,8 @@ def default_pallas_jax_launcher(
             a = args[arg_idx]
             if isinstance(a, _JaxExportTensor):
                 orig_shapes[arg_idx] = tuple(int(s) for s in a._jax_arr.shape)  # type: ignore[union-attr]
+            elif isinstance(a, torch.Tensor):  # output-only: a plain meta tensor
+                orig_shapes[arg_idx] = tuple(int(s) for s in a.shape)
 
         args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
 
