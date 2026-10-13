@@ -1161,6 +1161,15 @@ def _cute_iota_expr(
         return _wrap_iota_coord_expr(ctx, rolled, start, step, dtype)
 
     env = CompileEnvironment.current()
+    if isinstance(length_arg, int) and length_arg == 1:
+        # A one-element range (``hl.arange(1)``, the literal broadcast
+        # coordinate of a unit tile such as the flex example's batch / head
+        # vectors) has no element coordinate in the SIMT lowering: a size-1
+        # dim is a scalar, so the range is its ``start``.
+        expr = "{start}"
+        if dtype != torch.int32:
+            expr = f"{env.backend.dtype_str(dtype)}({expr})"
+        return expr_from_string(expr, start=ctx.to_ast(start))
     length_hint: int | None = None
     if isinstance(length_arg, (int, torch.SymInt)):
         length_hint = _resolve_tile_extent(length_arg, env, cg.device_function.config)

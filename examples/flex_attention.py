@@ -11,6 +11,7 @@ with support for both static and dynamic input shapes.
 # -------
 from __future__ import annotations
 
+import functools
 import math
 from typing import Any
 from typing import Callable
@@ -32,7 +33,17 @@ import helion.language as hl
 # %%
 # Flex Attention Kernel Implementation
 # ----------------------------
-@helion.kernel(autotune_accuracy_check=False, static_shapes=True)
+@helion.kernel(
+    autotune_accuracy_check=False,
+    static_shapes=True,
+    # fast_math: the CuTe flash backend offers its polynomial (degree-2) exp2
+    # packets, an approximation of ex2.approx, only under this setting; the
+    # Triton backend takes the approximate divide (fast_dividef,
+    # div.approx.ftz.f32) for the output normalization (the LSE rescale
+    # divides by a constant, which Inductor folds into a multiply) and
+    # Inductor's use_fast_math (flush-to-zero exp; exp2 keeps libdevice).
+    fast_math=True,
+)
 def helion_flex_attention_kernel(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -56,10 +67,20 @@ def helion_flex_attention_kernel(
     assert Dk == D
     if enable_gqa:
         assert H % Hk == 0
-        num_groups = H // Hk
     else:
         assert Hk == H
-        num_groups = 1
+    # Computed outside the branch so it stays a static int (a branch on the
+    # runtime ``enable_gqa`` flag would merge it into a symbolic value).
+    num_groups = H // Hk
+    # The BlockMask block sizes are compile-time constants of the walk (the
+    # fused CuTe plan reads them off the IR); a mask with other block sizes
+    # binds a different specialization.
+    block_mask_m = hl.specialize(block_mask_m)
+    block_mask_n = hl.specialize(block_mask_n)
+    # BlockMask tables may broadcast over batch and/or heads (size-1 leading
+    # dims): index them modulo their own sizes, like FlexAttention's
+    # ``sparse_idx_z = off_z % SPARSE_Z``.
+    table_batch, table_heads, _ = block_mask_kv_num_blocks.size()
     out = torch.empty_like(query)
     lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)
     log_2_e = 1.44269504
@@ -78,20 +99,27 @@ def helion_flex_attention_kernel(
         b_idx = tile_b.begin
         h_idx = tile_h.begin
         h_kv_idx = h_idx // num_groups
-        bcast_b = (tile_b.begin + hl.arange(tile_b.block_size))[:, None]
-        bcast_h = (tile_h.begin + hl.arange(tile_h.block_size))[:, None]
+        tb_idx = b_idx % table_batch
+        th_idx = h_idx % table_heads
+        # The batch and head tiles are one element wide (``block_size=[1, 1,
+        # block_m]``), so ``b`` / ``h`` are ``[1, 1]`` vectors that broadcast
+        # against every ``[tile_m, tile_n]`` score; built from a literal
+        # one-element range rather than the tiles' own (symbolic) extent so
+        # that the shape is a concrete 1 for the broadcast.
+        bcast_b = (tile_b.begin + hl.arange(1))[:, None]
+        bcast_h = (tile_h.begin + hl.arange(1))[:, None]
         bcast_m = (tile_m.begin + hl.arange(tile_m.block_size))[:, None]
 
         # iterate through full tiles (no mask needed)
         if block_mask_full_kv_indices is not None:
             sparse_num_blocks = block_mask_full_kv_num_blocks[  # pyrefly: ignore[unsupported-operation]
-                b_idx, h_idx, sparse_row
+                tb_idx, th_idx, sparse_row
             ]
 
             for block_idx in hl.tile(sparse_num_blocks, block_size=1):
                 # kv_indices holds KV *block* indices; convert to a token offset.
                 start_n = (
-                    block_mask_full_kv_indices[b_idx, h_idx, sparse_row, block_idx.id]
+                    block_mask_full_kv_indices[tb_idx, th_idx, sparse_row, block_idx.id]
                     * block_mask_n
                 )
                 end_n = start_n + block_mask_n
@@ -126,11 +154,11 @@ def helion_flex_attention_kernel(
                     acc = hl.dot(p, v, acc=acc)
 
         # iterate through partial tiles (mask needed)
-        sparse_num_blocks = block_mask_kv_num_blocks[b_idx, h_idx, sparse_row]
+        sparse_num_blocks = block_mask_kv_num_blocks[tb_idx, th_idx, sparse_row]
 
         for block_idx in hl.tile(sparse_num_blocks, block_size=1):
             start_n = (
-                block_mask_kv_indices[b_idx, h_idx, sparse_row, block_idx.id]
+                block_mask_kv_indices[tb_idx, th_idx, sparse_row, block_idx.id]
                 * block_mask_n
             )
             end_n = start_n + block_mask_n
@@ -172,6 +200,26 @@ def helion_flex_attention_kernel(
     return out, lse
 
 
+@functools.cache
+def _zero_block_table(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """An all-zero BlockMask table (block counts or indices) for a mask that
+    has no full blocks.
+
+    The kernel only reads it, so one tensor per shape, dtype and device serves
+    every call: allocating and zero-filling fresh tables per call would put
+    that work on the launch path (and into CUDA-graph replays) and hand the
+    fused CuTe plan a new table identity on every call.  The cache holds the
+    tables for the life of the process.
+    """
+    return torch.zeros(shape, dtype=dtype, device=device)
+
+
+def _zero_block_table_like(table: torch.Tensor) -> torch.Tensor:
+    return _zero_block_table(tuple(table.shape), table.dtype, table.device)
+
+
 def helion_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -188,6 +236,18 @@ def helion_flex_attention(
     if block_mask is None:
         block_mask = _create_empty_block_mask(query, key)
     scale = 1.0 / math.sqrt(D) if scale is None else scale
+    # The fused CuTe plan folds ``scale`` into the softmax multiplier of a
+    # mask-only kernel, which is only an identity for a positive scale
+    # (``-inf * 0`` and ``-inf * negative`` differ from the source).
+    assert scale > 0, "flex attention requires a positive scale"
+    # Always pass both block lists so one kernel specialization serves every
+    # mask: a BlockMask without full blocks gets cached zero-count full tables
+    # (``_zero_block_table``), so the launch path allocates nothing.
+    full_kv_num_blocks = block_mask.full_kv_num_blocks
+    full_kv_indices = block_mask.full_kv_indices
+    if full_kv_num_blocks is None or full_kv_indices is None:
+        full_kv_num_blocks = _zero_block_table_like(block_mask.kv_num_blocks)
+        full_kv_indices = _zero_block_table_like(block_mask.kv_indices)
     out, lse = helion_flex_attention_kernel(
         query,
         key,
@@ -195,8 +255,8 @@ def helion_flex_attention(
         score_mod,
         block_mask.kv_num_blocks,
         block_mask.kv_indices,
-        block_mask.full_kv_num_blocks,
-        block_mask.full_kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
         block_mask.mask_mod,
         block_mask.BLOCK_SIZE[0],
         block_mask.BLOCK_SIZE[1],
