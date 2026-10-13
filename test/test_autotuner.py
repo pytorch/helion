@@ -12548,9 +12548,9 @@ class TestCuteAutotuner(TestCase):
         # tiles but runs on both families: the fa4 pair body takes the union
         # of its two query tiles' intervals, so the surface searches fa4 next
         # to ws_overlap and defaults to fa4 at an even tile count. Only plans
-        # whose active tiles are not one interval (two composed masks) and
-        # the per-row KV lower bound (its range prelude describes the
-        # ws_overlap body's single query tile) keep the ws_overlap lock.
+        # whose active tiles are not one interval (two composed masks) keep
+        # the ws_overlap lock; the per-row KV lower bound evaluates its range
+        # prelude per resident query tile, so it runs on the pair body too.
         sparse_bound = sparse_flash_attention.bind((q, k, v))
         sparse_spec = sparse_bound.config_spec
         self.assertTrue(sparse_spec._cute_flash_has_kv_tile_pruning)
@@ -12585,13 +12585,82 @@ class TestCuteAutotuner(TestCase):
         for modifiers, locked in (
             ((window,), False),
             ((causal, window), True),
-            ((row_kv_begin,), True),
+            ((row_kv_begin,), False),
         ):
             plan = AttentionScorePlan(
                 head_dim=64, qk_scale_log2=1.0, modifiers=modifiers
             )
             self.assertTrue(plan.has_kv_tile_pruning)
             self.assertIs(plan.requires_ws_overlap, locked, modifiers)
+
+        # A ws_overlap-locked plan (two composed masks here: the causal mask
+        # applied by its own ``torch.where`` ahead of the window, which detects
+        # as two mask modifiers whose active tiles are not one interval)
+        # carries a single-family surface: a config that asks for the fa4
+        # family (a cached winner of another plan, say) normalizes back to
+        # ws_overlap.
+        @helion.kernel(backend="cute", static_shapes=True)
+        def chained_sparse_flash_attention(q_in, k_in, v_in):
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    causal = tile_m.index[None, :, None] >= tile_n.index[None, None, :]
+                    qk = torch.where(causal, qk, float("-inf"))
+                    delta = tile_m.index[None, :, None] - tile_n.index[None, None, :]
+                    qk = torch.where((delta >= 0) & (delta <= 64), qk, float("-inf"))
+                    m_ij_keepdim = torch.maximum(
+                        m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+                    )
+                    qk = qk - m_ij_keepdim
+                    m_ij = m_ij_keepdim.squeeze(-1)
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        locked_spec = chained_sparse_flash_attention.bind((q, k, v)).config_spec
+        self.assertTrue(locked_spec.cute_flash_search_enabled)
+        self.assertTrue(locked_spec._cute_flash_requires_ws_overlap)
+        self.assertEqual(
+            set(
+                active_choices(
+                    locked_spec._flat_fields()[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+                )
+            ),
+            {"ws_overlap"},
+        )
+        wants_fa4 = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+        )
+        locked_spec.normalize(wants_fa4)
+        self.assertEqual(
+            wants_fa4.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY], "ws_overlap"
+        )
+        self.assertEqual(
+            locked_spec.default_config().config[cute_flash.FLASH_PIPELINE_FAMILY_KEY],
+            "ws_overlap",
+        )
 
         # Aligned lengths share the same general search space. Only structural
         # legality, such as the parity needed by two-CTA families, may narrow it.

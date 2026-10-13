@@ -1669,6 +1669,8 @@ class ConfigSpec:
             tuple[int, int], tuple[int, ...]
         ] = {}
         self._cute_flash_head_dim: int | None = None
+        # V/O head dim when it differs from the Q/K head dim (MLA prefill).
+        self._cute_flash_head_dim_v: int | None = None
         self._cute_flash_num_kv: int | None = None
         self._cute_flash_num_bh: int | None = None
         # SM count of the bound device (0 when unknown); small grids seed the
@@ -2011,6 +2013,7 @@ class ConfigSpec:
                 score_modifier_kinds=self._cute_flash_score_modifier_kinds,
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
+                head_dim_v=self._cute_flash_head_dim_v,
             )
             self._cute_flash_fragments_cache[key] = cached
         return dict(cached)
@@ -2027,6 +2030,7 @@ class ConfigSpec:
             self._cute_flash_head_dim,
             self._cute_flash_num_kv,
             flash_config,
+            head_dim_v=self._cute_flash_head_dim_v,
             dtype=self._cute_flash_dtype,
             num_bh=self._cute_flash_num_bh,
             is_causal=self._cute_flash_is_causal,
@@ -2130,7 +2134,7 @@ class ConfigSpec:
             config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
         if (
-            self._cute_flash_is_causal
+            (self._cute_flash_is_causal or self._cute_flash_has_kv_tile_pruning)
             and type(causal_lpt) is int
             and self._cute_flash_num_bh is not None
         ):
@@ -2202,6 +2206,7 @@ class ConfigSpec:
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
+                head_dim_v=self._cute_flash_head_dim_v,
             )
         )
         if self._cute_flash_requires_ws_overlap:
@@ -2384,7 +2389,7 @@ class ConfigSpec:
                 e2e_res,
             )
         )
-        if not self._cute_flash_is_causal:
+        if not (self._cute_flash_is_causal or self._cute_flash_has_kv_tile_pruning):
             masked_e2e_freq = e2e_freq
             masked_e2e_res = e2e_res
         e2e_offset_period = _flash_e2e_offset_period(
@@ -2553,6 +2558,7 @@ class ConfigSpec:
         has_score_modifiers: bool = False,
         score_modifier_kinds: Sequence[str] = (),
         device_sm_count: int = 0,
+        head_dim_v: int | None = None,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
@@ -2561,6 +2567,9 @@ class ConfigSpec:
         self._cute_flash_fragments_cache.clear()
         self._cute_flash_fragments_env_fingerprint = None
         self._cute_flash_head_dim = head_dim
+        self._cute_flash_head_dim_v = (
+            None if head_dim_v is None or head_dim_v == head_dim else head_dim_v
+        )
         self._cute_flash_num_kv = num_kv
         self._cute_flash_num_bh = num_bh
         self._cute_flash_tensor_4d_heads = tensor_4d_heads
@@ -3257,6 +3266,7 @@ class ConfigSpec:
                 flash_attention_seed_configs(
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
+                    head_dim_v=self._cute_flash_head_dim_v,
                     num_bh=self._cute_flash_num_bh,
                     num_sm=self.num_sm,
                     tensor_4d_heads=self._cute_flash_tensor_4d_heads,
@@ -6121,6 +6131,7 @@ class ConfigSpec:
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
+                    head_dim_v=self._cute_flash_head_dim_v,
                 )
                 if not packet_requirements:
                     raise InvalidConfig(
@@ -6277,6 +6288,7 @@ class ConfigSpec:
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
+                    head_dim_v=self._cute_flash_head_dim_v,
                 )
                 requested_packet = overrides[FLASH_EXP2_PACKET_KEY]
                 for key, required_value in packet_requirements.items():

@@ -35,6 +35,7 @@ from ..backend import _largest_divisor_at_most
 from ..backend import _loop_contains_matmul
 from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
+from .attention_plan import flash_head_dims_supported
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
@@ -1048,11 +1049,23 @@ def _detect_attention_mma_loop(
     ):
         return False
     bk = score_plan.head_dim
-    # Validated envelope mirrors the spike: 128x128 mma_tiler, head_dim 64/128.
-    if bm == 128 and bn == 128 and bk in (64, 128):
-        fn.cute_state.attention_flash_score_plan = score_plan
-        return True
-    return False
+    # Validated envelope mirrors the spike: 128x128 mma_tiler and one of the
+    # fused head-dim pairs (64/64, 128/128, 192/128).
+    if bm != 128 or bn != 128:
+        return False
+    if not flash_head_dims_supported(bk, score_plan.value_head_dim):
+        return False
+    if score_plan.asymmetric_head_dims:
+        # Only the FA4 topology carries the pair: two 128-row query tiles per
+        # CTA, so the sequence has to be a multiple of 256.
+        env = CompileEnvironment.current()
+        kv_seq = env.block_sizes[block_ids[0]].size
+        if not isinstance(kv_seq, int) or kv_seq % 256 != 0:
+            return False
+        if score_plan.requires_ws_overlap:
+            return False
+    fn.cute_state.attention_flash_score_plan = score_plan
+    return True
 
 
 def _is_mma_candidate_loop(

@@ -7634,6 +7634,72 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
         )
 
+    def test_cute_flash_causal_hd64_seeds_carry_measured_bodies(self) -> None:
+        """The causal hd64 shapes are won by the paired 16-column score-load
+        body (s2048) and the hybrid degree-1 body with 80 correction registers
+        (s4096/s8192); both are seeded so a cold search starts next to them."""
+        pair_body = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_EXP2_PACKET_KEY: "8x1",
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+            FLASH_MASKED_E2E_SCHEDULE_KEY: "xu",
+            FLASH_S_LOAD_REP_KEY: 16,
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_SOFTMAX_REGS_KEY: 168,
+            FLASH_CORR_REGS_KEY: 104,
+            FLASH_OTHER_REGS_KEY: 56,
+            FLASH_RESCALE_THRESHOLD_KEY: 16.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 64,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+        }
+        hybrid_body = {
+            FLASH_EXP2_PACKET_KEY: "hybrid_deg1_16x8",
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_SOFTMAX_REGS_KEY: 192,
+            FLASH_CORR_REGS_KEY: 80,
+            FLASH_RESCALE_THRESHOLD_KEY: 32.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+        }
+        for num_kv in (16, 32, 64):
+            with self.subTest(num_kv=num_kv):
+                seeds = flash_attention_seed_configs(
+                    64,
+                    num_kv,
+                    num_bh=64,
+                    dtype=torch.bfloat16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                )
+                for body in (pair_body, hybrid_body):
+                    matches = [
+                        seed.config
+                        for seed in seeds
+                        if all(seed.config.get(k) == v for k, v in body.items())
+                    ]
+                    self.assertEqual(len(matches), 1, body)
+                    resolved = resolve_flash_config(
+                        64,
+                        num_kv,
+                        matches[0],
+                        dtype=torch.bfloat16,
+                        num_bh=64,
+                        is_causal=True,
+                        standard_causal_output=True,
+                    )
+                    self.assertEqual(resolved.pipeline_family, "fa4")
+                    self.assertEqual(resolved.exp2_packet, body[FLASH_EXP2_PACKET_KEY])
+                    self.assertEqual(
+                        resolved.s_load_repetition,
+                        body.get(FLASH_S_LOAD_REP_KEY, 32),
+                    )
+                    self.assertEqual(resolved.corr_regs, body[FLASH_CORR_REGS_KEY])
+                    self.assertTrue(resolved.causal_loop_split)
+
     def test_cute_flash_dense_hd64_seeds_carry_local_tma_packets(self) -> None:
         """The fa4_local_tma family wins the dense hd64 shapes with a wide exp2
         packet and the measured 16/4 / six-stage / direct-epilogue / FA4-role
@@ -7858,21 +7924,27 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 for seed in seeds
                 if seed.config[FLASH_EXP2_PACKET_KEY] == "hybrid_deg1_16x8"
             ]
-            self.assertEqual(len(hybrid), 1)
-            resolved = resolve_flash_config(
-                64,
-                num_kv,
-                hybrid[0].config,
-                dtype=torch.bfloat16,
-                is_causal=True,
-                standard_causal_output=True,
+            # The packet-loop seed and the measured long-sequence body (80
+            # correction registers, 16-column rescale chunks).
+            self.assertEqual(len(hybrid), 2)
+            self.assertEqual(
+                sorted(seed.config[FLASH_CORR_REGS_KEY] for seed in hybrid), [64, 80]
             )
-            self.assertEqual(resolved.pipeline_family, "fa4")
-            self.assertEqual(resolved.exp2_packet, "hybrid_deg1_16x8")
-            self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 8))
-            self.assertTrue(resolved.causal_loop_split)
-            self.assertEqual(resolved.causal_kv_order, "descending")
-            configs.append(hybrid[0].config)
+            for seed in hybrid:
+                resolved = resolve_flash_config(
+                    64,
+                    num_kv,
+                    seed.config,
+                    dtype=torch.bfloat16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                )
+                self.assertEqual(resolved.pipeline_family, "fa4")
+                self.assertEqual(resolved.exp2_packet, "hybrid_deg1_16x8")
+                self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 8))
+                self.assertTrue(resolved.causal_loop_split)
+                self.assertEqual(resolved.causal_kv_order, "descending")
+            configs.append(tuple(seed.config for seed in hybrid))
         self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
     def test_cute_flash_dense_degree2_seed_gates(self) -> None:

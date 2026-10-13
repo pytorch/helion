@@ -759,6 +759,10 @@ def _append_cute_wrapper_plan(
         row_kv_begin_idx = plan_optional_int("row_kv_begin_idx")
         seq = plan_int("seq")
         head_dim = plan_int("head_dim")
+        # V/O head dim: equals ``head_dim`` except for the asymmetric MLA pair
+        # (192-wide Q/K against 128-wide V/O).
+        head_dim_v = plan_int("head_dim_v", default=head_dim)
+        uneven_kv_ring = bool(plan.get("uneven_kv_ring"))
         batch = plan_int("batch")
         # Grouped-query attention: K/V hold ``batch // kv_group`` batch heads
         # (the device body reads them at ``bh // kv_group``); Q/O keep ``batch``.
@@ -794,6 +798,7 @@ def _append_cute_wrapper_plan(
         total_tiles = plan_int("total_tiles", default=batch * (seq // 128))
         pass_dynamic_tile_counts = plan.get("topology") != "fa4"
         hd = head_dim
+        hd_v = head_dim_v
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
         tensor_4d_batch = plan_int("tensor_4d_batch", default=0)
@@ -812,8 +817,10 @@ def _append_cute_wrapper_plan(
         q_tile_m = plan_int("q_tile_m", default=128)
         mma_m = 256 if use_2cta_instrs else q_tile_m
         qkd = f"({mma_m}, {kv_n}, {hd})"
-        pvd = f"({mma_m}, {hd}, {kv_n})"
+        pvd = f"({mma_m}, {hd_v}, {kv_n})"
         if use_tensor_4d_tma:
+            # The 4D descriptors describe Q/K/V/O with one head dim.
+            assert hd_v == hd
             bh_stride = seq * hd
             batch_stride = tensor_4d_heads * bh_stride
             sdb = (
@@ -826,14 +833,21 @@ def _append_cute_wrapper_plan(
                 f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
                 f"{batch_stride}))"
             )
+            sdb_o = sdb
         else:
+            # Q (and K) are ``hd`` wide; O (and the row-epilogue aux rows that
+            # share its view) and the MN-major V are ``hd_v`` wide.
             sdb = (
                 f"cute.make_layout(({seq}, {hd}, {batch}), "
                 f"stride=({hd}, 1, {seq * hd}))"
             )
+            sdb_o = (
+                f"cute.make_layout(({seq}, {hd_v}, {batch}), "
+                f"stride=({hd_v}, 1, {seq * hd_v}))"
+            )
             dsb = (
-                f"cute.make_layout(({hd}, {seq}, {batch}), "
-                f"stride=(1, {hd}, {seq * hd}))"
+                f"cute.make_layout(({hd_v}, {seq}, {batch}), "
+                f"stride=(1, {hd_v}, {seq * hd_v}))"
             )
         # K/V layouts span their own (grouped) batch-head count.
         if kv_group == 1:
@@ -845,8 +859,8 @@ def _append_cute_wrapper_plan(
                 f"stride=({hd}, 1, {seq * hd}))"
             )
             dsb_kv = (
-                f"cute.make_layout(({hd}, {seq}, {kv_batch}), "
-                f"stride=(1, {hd}, {seq * hd}))"
+                f"cute.make_layout(({hd_v}, {seq}, {kv_batch}), "
+                f"stride=(1, {hd_v}, {seq * hd_v}))"
             )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
@@ -861,15 +875,47 @@ def _append_cute_wrapper_plan(
             f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb_kv})",
             # V is MN-major: (D, S, B).
             f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb_kv})",
-            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
+            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb_o})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
-            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
             # the device-body kv_stage + the SharedStorage MemRange depths.
             f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
             f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
+        ]
+        if hd_v != hd:
+            # The aliased K/V ring alternates K and V through one physical
+            # ring whose slots are K's (wider) tile, so V's stage stride has
+            # to be K's: recompose V's swizzled layout over the shared stage
+            # stride (FA4's ``same_hdim_kv_padded`` layout fix-up). One V stage
+            # still covers only its own ``kv_n x hd_v`` box. FA4's uneven
+            # [wide, narrow, wide] ring strides both operands by half a K
+            # plus half a V tile instead (the device body shifts the odd slot).
+            if uneven_kv_ring:
+                stage_stride = (
+                    "(max(_flash_ksl.outer.stride[-1], 0) "
+                    "+ max(_flash_vsl.outer.stride[-1], 0)) // 2"
+                )
+            else:
+                stage_stride = (
+                    "max(max(_flash_ksl.outer.stride[-1], 0), "
+                    "max(_flash_vsl.outer.stride[-1], 0))"
+                )
+            flash_lines.append(f"_flash_kv_stage_stride = {stage_stride}")
+            if uneven_kv_ring:
+                flash_lines.append(
+                    "_flash_ksl = cute.make_composed_layout(_flash_ksl.inner, 0, "
+                    f"cute.make_layout((*_flash_ksl.outer.shape[:-1], {kv_stage}), "
+                    "stride=(*_flash_ksl.outer.stride[:-1], _flash_kv_stage_stride)))"
+                )
+            flash_lines.append(
+                "_flash_vsl = cute.make_composed_layout(_flash_vsl.inner, 0, "
+                f"cute.make_layout((*_flash_vsl.outer.shape[:-1], {kv_stage}), "
+                "stride=(*_flash_vsl.outer.stride[:-1], _flash_kv_stage_stride)))"
+            )
+        flash_lines += [
             f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
             f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg})",
             f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
@@ -940,7 +986,7 @@ def _append_cute_wrapper_plan(
         for index in range(epi_aux_count):
             aux_idx = plan_int(f"epi_aux{index}_idx")
             flash_lines.append(
-                f"_flash_mEpiAux{index} = cute.make_tensor(arg{aux_idx}.iterator, {sdb})"
+                f"_flash_mEpiAux{index} = cute.make_tensor(arg{aux_idx}.iterator, {sdb_o})"
             )
         if pass_dynamic_tile_counts:
             flash_lines.extend(
@@ -963,7 +1009,7 @@ def _append_cute_wrapper_plan(
             # Q tiles of a work item, ws_overlap stages its single tile.
             # Per-CTA output tile: 128 rows for fa4 (also under CtaGroup.TWO,
             # where each CTA stores its own half) or the ws_overlap tile height.
-            otile = f"({q_tile_m}, {hd})"
+            otile = f"({q_tile_m}, {hd_v})"
             flash_lines.extend(
                 [
                     (

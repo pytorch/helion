@@ -1902,6 +1902,39 @@ def test_causal_resident_native_gate_preserves_fallbacks() -> None:
         assert "resident_softmax_value_graph" in neighbour_source, neighbour
 
 
+def test_causal_resident_native_renders_with_the_q_staged_output() -> None:
+    # The GB300 causal resident body verifies its schedule (single-slot stat
+    # pipeline, release mapping, equal-iteration proof) before the generic
+    # one-CTA branch, so FA4's Q-staged output composes with it instead of
+    # failing the verifier ("causal cross-slot stat releases require proof of
+    # equal query-slot K/V iteration counts" from the proof-less generic spec).
+    staged = {
+        cute_flash.FLASH_EPI_TMA_KEY: True,
+        cute_flash.FLASH_O_OVER_Q_KEY: True,
+    }
+    q_alias = (
+        "sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, _flash_osl.inner), "
+        "_flash_osl.outer)"
+    )
+    # num_kv 512 seeds the stateful lowering, 1024 the resident value graph.
+    for num_kv, marker in (
+        (512, "ResidentSoftmaxState.create"),
+        (1024, "resident_softmax_value_graph"),
+    ):
+        source = _emit_causal_resident_native_source(
+            num_kv=num_kv, config_overrides=staged
+        )
+        assert marker in source
+        assert q_alias in source
+        assert "storage.sO" not in source
+        separate = _emit_causal_resident_native_source(
+            num_kv=num_kv, config_overrides={cute_flash.FLASH_EPI_TMA_KEY: True}
+        )
+        assert marker in separate
+        assert q_alias not in separate
+        assert "storage.sO" in separate
+
+
 @onlyBackends(["cute"])
 def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     capability = torch.cuda.get_device_capability()
@@ -3615,7 +3648,7 @@ def test_degree2_packet_canonicalizes_cadence_but_preserves_phase_offsets() -> N
 
 @pytest.mark.parametrize(
     "eligibility_fact",
-    ("has_kv_tile_pruning", "requires_ws_overlap", "small_biased_candidate"),
+    ("requires_ws_overlap", "small_biased_candidate"),
 )
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_hybrid_packet_does_not_survive_ineligible_attention_fact(
@@ -3632,6 +3665,36 @@ def test_hybrid_packet_does_not_survive_ineligible_attention_fact(
             **{eligibility_fact: True},
         )
     assert resolved.exp2_packet == "1x1"
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_hybrid_packet_survives_kv_tile_pruning_with_standard_output(
+    dtype: torch.dtype,
+) -> None:
+    # The KV-tile-pruned masks with a proven three-segment loop run the
+    # packet on their unmasked interior (``standard_causal_output`` names
+    # them); without that output fact (the document-id mask, an LSE store)
+    # the packet canonicalizes away.
+    with patch.dict(os.environ, {}, clear=True):
+        pruned = cute_flash.resolve_flash_config(
+            64,
+            512,
+            _manual_config(_HYBRID_PACKET),
+            dtype=dtype,
+            has_kv_tile_pruning=True,
+            standard_causal_output=True,
+        )
+        plain = cute_flash.resolve_flash_config(
+            64,
+            512,
+            _manual_config(_HYBRID_PACKET),
+            dtype=dtype,
+            has_kv_tile_pruning=True,
+        )
+    assert pruned.exp2_packet == _HYBRID_PACKET
+    assert pruned.causal_loop_split
+    assert pruned.causal_kv_order == "descending"
+    assert plain.exp2_packet == "1x1"
 
 
 @pytest.mark.parametrize(

@@ -208,6 +208,36 @@ def prefix_unmasked_kv_tiles(
     return IntegerInterval(0, stop)
 
 
+def prove_row_bound_interior_layout(
+    *,
+    query_layout: TileLayout,
+    kv_layout: TileLayout,
+) -> CausalRangeProof:
+    """Prove the runtime interior formula of the per-row KV lower bound is
+    exact for these tile layouts: with equal, gap-free (``stride == width``),
+    zero-origin geometries the first key of KV tile ``k`` is ``k * stride``
+    and every key of the tile is at or past it, so ``k * stride >= max_bound``
+    (``k >= ceil(max_bound / stride)``) means no row's bound cuts the tile,
+    while ``k < query_tile`` keeps it below the diagonal.  The kernel
+    evaluates ``(max_bound + 127) // 128`` per query tile;
+    ``test_cute_causal_range`` checks that formula against the per-tile mask
+    by brute force.
+    """
+    if (
+        query_layout.stride != kv_layout.stride
+        or query_layout.width != kv_layout.width
+        or query_layout.origin != kv_layout.origin
+    ):
+        return CausalRangeProof(False, "query/KV tile geometry mismatch")
+    if kv_layout.stride <= 0 or kv_layout.width <= 0:
+        return CausalRangeProof(False, "empty or invalid range")
+    if kv_layout.stride != kv_layout.width:
+        return CausalRangeProof(False, "tiles overlap or leave gaps")
+    if kv_layout.origin != 0:
+        return CausalRangeProof(False, "tile origin is not the first key")
+    return CausalRangeProof(True, "tile k starts at key k * stride")
+
+
 def prove_descending_causal_prefix_unmasked(
     *,
     query_tiles: IntegerInterval | None,

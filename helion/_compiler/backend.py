@@ -31,6 +31,7 @@ from .cute.attention_plan import SOFTCAP_KIND
 from .cute.attention_plan import TENSOR_BIAS_KIND
 from .cute.attention_plan import AttentionScoreModifier
 from .cute.attention_plan import AttentionScorePlan
+from .cute.attention_plan import flash_head_dims_supported
 from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
@@ -85,6 +86,8 @@ class FlashSearchSurface(NamedTuple):
     score_modifier_kinds: tuple[str, ...]
     tmem_rowmax_compatible: bool = False
     causal_resident_compatible: bool = False
+    # V/O head dim when it differs from the Q/K ``head_dim`` (MLA prefill).
+    head_dim_v: int | None = None
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -94,6 +97,10 @@ class AttentionSoftmaxPattern(NamedTuple):
     @property
     def head_dim(self) -> int:
         return self.score_plan.head_dim
+
+    @property
+    def head_dim_v(self) -> int:
+        return self.score_plan.value_head_dim
 
     @property
     def is_causal(self) -> bool:
@@ -2807,6 +2814,37 @@ def _attention_k_load_indices(
     return _attention_canonical_kv_load_indices(source, kv_block_id=kv_block_id)
 
 
+def _attention_k_load_head_dim(node: torch.fx.Node) -> int | None:
+    """Return K's static head dim from the host tensor behind ``K^T``.
+
+    ``node`` is the transposed K operand of the score matmul; its source is the
+    canonical ``k_view[b, tile_n, :]`` load whose host tensor keeps the
+    specialized head dim (the loop graph's operand metadata does not).
+    """
+    from ..language import memory_ops
+    from ..language._tracing_ops import _host_tensor
+
+    if node.op != "call_function" or not node.args:
+        return None
+    source = node.args[0]
+    if not isinstance(source, torch.fx.Node):
+        return None
+    if source.op != "call_function" or source.target is not memory_ops.load:
+        return None
+    tensor = source.args[0] if source.args else None
+    if (
+        not isinstance(tensor, torch.fx.Node)
+        or tensor.op != "call_function"
+        or tensor.target is not _host_tensor
+    ):
+        return None
+    value = tensor.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.ndim != 3:
+        return None
+    head_dim = value.shape[2]
+    return head_dim if isinstance(head_dim, int) else None
+
+
 def _attention_v_load_indices(
     node: torch.fx.Node,
     *,
@@ -3179,13 +3217,22 @@ def _attention_softmax_pattern_head_dim(
             operand_dtype = operand_val.dtype
         elif operand_val.dtype != operand_dtype:
             return None
-    head_dim = pv_val.shape[2]
-    if not isinstance(head_dim, int) or head_dim not in (64, 128):
+    head_dim_v = pv_val.shape[2]
+    if not isinstance(head_dim_v, int):
         return None
     if not isinstance(qk_node.args[1], torch.fx.Node):
         return None
     k_indices = _attention_k_load_indices(qk_node.args[1], kv_block_id=kv_block_id)
     if k_indices is None:
+        return None
+    # The Q/K head dim comes from K's host tensor: the loop graph's operand
+    # metadata carries the contraction as an unbacked symbol, while the host
+    # tensor keeps the specialized width. A K load without a host tensor keeps
+    # the historical symmetric reading (the scale check below still pins it).
+    head_dim = _attention_k_load_head_dim(qk_node.args[1])
+    if head_dim is None:
+        head_dim = head_dim_v
+    if not flash_head_dims_supported(head_dim, head_dim_v):
         return None
     if len(pv_node.args) < 3 or not isinstance(pv_node.args[2], torch.fx.Node):
         return None
@@ -3266,6 +3313,7 @@ def _attention_softmax_pattern_head_dim(
         lse_scale=lse_scale,
         modifiers=scaled_modifiers,
         kv_group=k_indices.kv_group,
+        head_dim_v=None if head_dim_v == head_dim else head_dim_v,
     )
     if not score_plan.has_lowering():
         return None
@@ -3415,8 +3463,17 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             continue
         num_kv = (kv_seq + 127) // 128
         output_requires_tma = _flash_output_requires_tma(
-            num_bh, q_seq, pattern.head_dim
+            num_bh, q_seq, pattern.head_dim_v
         )
+        # Only the plain FA4 topology (two 128-row query tiles per CTA, direct
+        # output store: staged O does not fit next to 2 x 192-wide Q tiles)
+        # hosts the asymmetric head-dim pair.
+        if pattern.score_plan.asymmetric_head_dims and (
+            num_kv % 2 != 0
+            or pattern.score_plan.requires_ws_overlap
+            or output_requires_tma
+        ):
+            continue
         # TMA output is currently FA4-only. Do not expose a flash search whose
         # only legal output path is unavailable; the generic CuTe search can
         # still handle these uncommon large-output shapes.
@@ -3474,6 +3531,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                     pattern.score_plan
                 ),
                 score_modifier_kinds=pattern.score_plan.modifier_kinds,
+                head_dim_v=pattern.score_plan.head_dim_v,
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(
