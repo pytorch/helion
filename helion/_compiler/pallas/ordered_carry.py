@@ -360,7 +360,7 @@ def emit_carry_store(
     state: CodegenState,
     tensor: torch.Tensor,
     name: str,
-    idx_str: str,
+    parts: list[str],
     value: object,
 ) -> bool:
     """Store a jagged row tile, stitching the boundary two groups share.
@@ -371,9 +371,12 @@ def emit_carry_store(
     back; save (group's last tile, ``end`` unaligned) hands this group's forward.
     Saving the folded value keeps it cumulative, so several tiny groups in one
     boundary still work.
+
+    ``parts`` are the store's per-dim index strings (row, column).
     """
     from helion._compiler.ast_extension import statement_from_string
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.codegen import _is_compact_aligned_load
 
     fn = state.device_function
     assert state.fx_node is not None
@@ -404,6 +407,9 @@ def emit_carry_store(
     rec = fn.carry_tiles[row_block_id]
     S = rec.sublane
     n_cols = tensor.size(1)
+    assert len(parts) == 2, parts
+    idx_str = ", ".join(parts)
+    col_part = parts[1]
 
     # One boundary per column tile, stacked on dim 0: only the sublane (first)
     # dim of a VMEM ref is runtime-sliceable on TPU, not the column.
@@ -429,7 +435,9 @@ def emit_carry_store(
 
     row_off = state.codegen.offset_var(row_block_id)
     col_off = state.codegen.offset_var(col_block_id)
-    begin, end = rec.begin_var, rec.end_var
+    # Parenthesized: under compact_worklist the bounds are metadata expressions
+    # (``begin_ref[_wid] + extent_ref[_wid]``), not names.
+    begin, end = f"({rec.begin_var})", f"({rec.end_var})"
     a_start = f"({begin} - {begin} % {S})"
     a_end = f"(({end} + {S} - 1) // {S} * {S})"
     # TODO(tcombes): assumes contiguous group offsets; a gap folds a stale carry.
@@ -437,26 +445,44 @@ def emit_carry_store(
     save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
     col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
-    # Group's last row block: S-aligned, within [0, block_row - S].
+    # Group's last row block: S-aligned, within [0, block_row - S].  Read through
+    # the store's column index: the ref may hold more columns than one tile.
     last_off = f"pl.multiple_of({a_end} - {S} - ({row_off}), {S})"
-    out_last = f"{name}[pl.ds({last_off}, {S}), :]"
+    out_last = f"{name}[pl.ds({last_off}, {S}), {col_part}]"
 
-    # Pad the [S, block_col] carry to a full [block_row, block_col] tile (carry on
-    # top, zeros below): Pallas rejects a partial write to the double-buffered out.
-    promoted = f"jnp.pad({carry_slice}, ((0, {block_row - S}), (0, 0)))"
     # Zero the over-read rows so an f(0) != 0 op (e.g. bias add) can't corrupt the
     # carried boundary; astype before reshape (Mosaic won't reshape a bool vector).
     dtype_str = env.backend.dtype_str(tensor.dtype)
     row_mask = state.codegen.mask_var(row_block_id)
     assert row_mask is not None, "carry tile must be a masked jagged tile"
     owned = f"{row_mask}.astype({dtype_str})[:, None]"
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{idx_str}] = (({{value}}) * {owned}) "
-            f"+ jnp.where({fold_guard}, {promoted}, 0)",
-            value=value,  # pyrefly: ignore[bad-argument-type]
+    if _is_compact_aligned_load(state, row_block_id, tensor):
+        # Compact-worklist window: one tile per work item, written whole into
+        # the pipelined output block, with the carry folded into the S head rows.
+        head = f"{name}[pl.ds(0, {S}), {col_part}]"
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{name}[{idx_str}] = jnp.where({owned}, {{value}}, 0)",
+                value=value,  # pyrefly: ignore[bad-argument-type]
+            )
         )
-    )
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{head} = {head} + jnp.where({fold_guard}, {carry_slice}, 0)"
+            )
+        )
+    else:
+        # Pad the [S, block_col] carry to a full [block_row, block_col] tile
+        # (carry on top, zeros below): Pallas rejects a partial write to the
+        # double-buffered out.
+        promoted = f"jnp.pad({carry_slice}, ((0, {block_row - S}), (0, 0)))"
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{name}[{idx_str}] = (({{value}}) * {owned}) "
+                f"+ jnp.where({fold_guard}, {promoted}, 0)",
+                value=value,  # pyrefly: ignore[bad-argument-type]
+            )
+        )
     state.codegen.add_statement(
         statement_from_string(
             f"{carry_slice} = jnp.where({save_guard}, {out_last}, {carry_slice})"

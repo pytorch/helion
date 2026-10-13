@@ -1402,18 +1402,31 @@ if __name__ == "__main__":
 
 
 def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
-    """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
+    """Emit the module-level worklist builder for a compact-worklist kernel.
+
+    The jnp ``_build_worklist`` runs as XLA ops before the launch; a plan with
+    static inner loops instead gets ``_fill_worklist``, which the launcher runs
+    inside the kernel on SMEM refs.
+    """
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None:
         return
     from .pallas.compact_worklist import render_build_worklist
+    from .pallas.compact_worklist import render_fill_worklist
 
-    source, offset_params = render_build_worklist(
-        plan,
-        block_expr=str(env.compact_worklist_block),
-        upper_expr=str(env.compact_worklist_upper),
-    )
+    if plan.static_inner_loops:
+        source, offset_params = render_fill_worklist(
+            plan,
+            block=env.compact_worklist_block,
+            sublane=env.compact_worklist_sublane,
+        )
+    else:
+        source, offset_params = render_build_worklist(
+            plan,
+            block_expr=str(env.compact_worklist_block),
+            upper_expr=str(env.compact_worklist_upper),
+        )
     env.compact_worklist_offset_params = offset_params
     codegen.module_statements.append(statement_from_string(source))
 
