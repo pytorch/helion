@@ -72,6 +72,8 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",
         "_compiler/cute/block_scaled_runtime.py",
+        "_compiler/cute/mxfp8_mma.py",
+        "_compiler/cute/mxfp8_prepare.py",
     ),
     "gathered_mma_tma": (
         "_compiler/cute/_mlir_compat.py",

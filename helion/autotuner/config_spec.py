@@ -28,8 +28,8 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
-from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
+from .._compiler.cute.block_scaled_config import block_scaled_choices
 from .._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from .._compiler.cute.cute_flash import _FLASH_EXP2_PACKET_PARAMS
 from .._compiler.cute.cute_flash import _FLASH_MANUAL_EXP2_PACKET_PARAMS
@@ -1457,6 +1457,7 @@ class ConfigSpec:
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
         self.cute_scaled_mma_available = False
+        self.cute_mxfp8_mma_available = False
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_packet_prefetch_enabled = False
@@ -5474,6 +5475,7 @@ class ConfigSpec:
                 available=self.cute_scaled_mma_available,
                 capability=self.target_device_capability,
                 fix_invalid=_fix_invalid,
+                mxfp8=self.cute_mxfp8_mma_available,
             )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
@@ -6957,8 +6959,18 @@ class ConfigSpec:
                 and self.target_device_capability[0] == 10
             ):
                 fields.update(
-                    (key, EnumFragment(choices=choices))
-                    for key, choices in BLOCK_SCALED_CHOICES.items()
+                    (
+                        key,
+                        EnumFragment(
+                            choices=tuple(value for value in choices if value != 64)
+                            if self.cute_mxfp8_mma_available
+                            and key == "cute_scaled_tile_k"
+                            else choices
+                        ),
+                    )
+                    for key, choices in block_scaled_choices(
+                        mxfp8=self.cute_mxfp8_mma_available
+                    ).items()
                 )
             if self.cute_matmul_min_blocks_search_enabled:
                 fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))

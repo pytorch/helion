@@ -149,6 +149,7 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
             torch.bfloat16: cutlass.BFloat16,
             torch.float8_e4m3fn: cutlass.Float8E4M3FN,
             torch.float8_e5m2: cutlass.Float8E5M2,
+            torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
             torch.float4_e2m1fn_x2: cutlass.Uint8,
             # CuTe does not support i1 global-memory tensors; torch.bool is
             # stored as one byte, so pass bool tensor pointers as uint8 and
@@ -524,7 +525,8 @@ def _append_cute_wrapper_plan(
     kind = plan["kind"]
     if kind == "block_scaled_mma":
         if (
-            plan_int("bn") not in (128, 256)
+            plan_int("bn")
+            not in ((64, 128, 256) if plan.get("format") == "mxfp8" else (128, 256))
             or plan_int("bk") not in (64, 128, 256)
             or plan_int("stages") not in (2, 3, 4, 5)
             or plan_int("cluster_m") not in (1, 2)
@@ -3422,6 +3424,10 @@ def _cute_staged_plan_operands(
     for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
         kind = str(plan.get("kind"))
         roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
+        if kind == "block_scaled_mma" and plan.get("format") == "mxfp8":
+            # Unlike packed NVFP4, MXFP8 TMA reads the original FP8 allocations.
+            # Preserve their values when a replacement binding is under-aligned.
+            roles = (("lhs_idx", "rhs_idx"), ())
         if roles is None:
             continue
         input_keys, output_keys = roles

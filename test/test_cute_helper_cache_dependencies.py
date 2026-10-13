@@ -310,6 +310,8 @@ def test_missing_single_helper_source_disables_only_single_disk_reuse(
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",
         "_compiler/cute/block_scaled_runtime.py",
+        "_compiler/cute/mxfp8_mma.py",
+        "_compiler/cute/mxfp8_prepare.py",
     ],
 )
 def test_helper_only_edit_changes_key_without_wrapper_or_plan_change(
