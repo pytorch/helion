@@ -977,6 +977,29 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_cas", code)
 
+    def test_atomic_cas_masks_tile_lanes(self):
+        """Triton's CAS takes no mask, so the lanes of a tile past the
+        tensor's extent wrote past its end (768 elements of the buffer here)."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def cas(x: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+            old = torch.empty_like(expected)
+            for tile_m, tile_n in hl.tile(expected.size()):
+                old[tile_m, tile_n] = hl.atomic_cas(
+                    x,
+                    [tile_m, tile_n],
+                    expected[tile_m, tile_n],
+                    expected[tile_m, tile_n] + 1.0,
+                )
+            return old
+
+        buffer = torch.zeros(64, 64, device=DEVICE)
+        x = buffer[:4]
+        expected = torch.zeros(4, 64, device=DEVICE)
+        torch.testing.assert_close(cas(x, expected), torch.zeros_like(expected))
+        torch.testing.assert_close(x, expected + 1.0)
+        torch.testing.assert_close(buffer[4:], torch.zeros_like(buffer[4:]))
+
     @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")

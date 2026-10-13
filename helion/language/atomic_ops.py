@@ -663,8 +663,10 @@ def atomic_cas(
         torch.Tensor: The previous value(s) stored at ``target[index]`` before the compare-and-swap.
 
     Note:
-        Triton CAS doesn’t support a masked form; our generated code uses
-        an unmasked CAS and relies on index masking to avoid OOB.
+        Triton CAS has no masked form.  A lane of a tile past the target's
+        extent instead swaps an in-bounds element (its indices clamped to
+        each dim's last element) for that lane's expected value, which
+        leaves memory unchanged; its returned value is meaningless.
     """
     raise exc.NotInsideKernel
 
