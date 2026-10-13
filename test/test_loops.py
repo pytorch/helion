@@ -2219,6 +2219,88 @@ class TestLoops(RefEagerTestBase, TestCase):
         lambda: _get_backend() not in ("triton", "cute"),
         "Pallas/JAX emits no thread barrier",
     )
+    def test_sequential_loops_device_local_carry_has_no_barrier(self):
+        @helion.kernel(autotune_effort="none")
+        def two_pass_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                total = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n):
+                    total += x[tile_m, tile_n].sum(dim=1)
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + total[:, None]
+            return out
+
+        x = torch.randn(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            two_pass_sum,
+            (x,),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(result, x + x.sum(dim=1, keepdim=True))
+        self.assertNotIn("tl.debug_barrier()", code)
+
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
+    )
+    def test_sequential_loops_atomic_add_requires_barrier(self):
+        @helion.kernel(autotune_effort="none")
+        def write_then_atomic_add(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    x[tile_m, tile_n] = 0.0
+                for tile_n in hl.tile(n):
+                    hl.atomic_add(x, [tile_m, tile_n], 1.0)
+            return x
+
+        x = torch.zeros(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            write_then_atomic_add,
+            (x,),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        self.assertIn(_thread_barrier(), code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
+    )
+    def test_sequential_loops_barrier_tracks_storage_aliases(self):
+        @helion.kernel(autotune_effort="none")
+        def write_then_read_view(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            alias = x.view(m, n)
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    x[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = alias[tile_m, tile_n] + 1.0
+            return out
+
+        x = torch.randn(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            write_then_read_view,
+            (x.clone(),),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        self.assertIn(_thread_barrier(), code)
+        torch.testing.assert_close(result, x * 2.0 + 1.0)
+
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
+    )
     def test_intra_loop_store_then_load_barrier(self):
         """A store to a tensor followed by a load of the same tensor *within one
         loop body* (using a different-shaped index) is a cross-thread
