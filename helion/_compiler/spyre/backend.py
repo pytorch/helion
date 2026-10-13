@@ -106,6 +106,44 @@ class SpyreBackend(Backend):
     def supports_precompile(self) -> bool:
         return False
 
+    def get_interleaved_bench(self) -> object:
+        """Wall-clock interleaved timing; the default needs Triton.
+
+        ``autotuner/benchmarking.py:383`` imports ``triton.runtime`` for its
+        cache-clearing and device-interface handles, which do not exist here.
+        The hook's own docstring (`_compiler/backend.py:603-604`) says backends
+        without Triton event timing should override.
+
+        Interleaving exists to cancel slow drift between candidates, so the
+        sweeps are round-robin over the candidate functions rather than
+        candidate-at-a-time.
+        """
+
+        def spyre_interleaved_bench(
+            fns: object,
+            *,
+            repeat: int = 3,
+            desc: object = None,
+            max_total_ms: object = None,
+            **kwargs: object,
+        ) -> list[float]:
+            import time
+
+            fns = list(fns)
+            for fn in fns:
+                fn()
+
+            totals = [0.0] * len(fns)
+            sweeps = max(1, min(int(repeat), _BENCH_REPS))
+            for _ in range(sweeps):
+                for i, fn in enumerate(fns):
+                    start = time.perf_counter()
+                    fn()
+                    totals[i] += (time.perf_counter() - start) * 1e3
+            return [t / sweeps for t in totals]
+
+        return spyre_interleaved_bench
+
     def get_do_bench(self) -> object:
         """Wall-clock timing: the default ``do_bench`` is CUDA-shaped.
 

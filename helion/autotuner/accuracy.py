@@ -115,8 +115,15 @@ def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
     # Accumulate in float64 so large-magnitude outputs cannot overflow the
     # sum of squares. MPS has no float64; use float32 there — an overflow to
     # inf makes the RMS non-finite, and the caller then keeps the unscaled
-    # atol floor.
-    acc_dtype = torch.float32 if t.device.type in ("mps", "tpu") else torch.float64
+    # atol floor. Spyre likewise has no float64: a .to(torch.float64) there
+    # aborts the process with SIGFPE inside torch-spyre's layout propagation
+    # (torch_spyre/_inductor/propagate_layouts.py:2234), because the dtype maps
+    # to DataFormats.INVALID with a zero element size.
+    acc_dtype = (
+        torch.float32
+        if t.device.type in ("mps", "tpu", "spyre")
+        else torch.float64
+    )
     total = 0.0
     for start in range(0, flat.numel(), chunk_size):
         total += float(flat[start : start + chunk_size].to(acc_dtype).square().sum())
@@ -168,6 +175,18 @@ def _chunked_assert_close(
         )
     ):
         return
+    if actual.device.type == "spyre":
+        # Spyre's eager coverage is incomplete, and the comparison itself --
+        # not the kernel -- then fails: ``torch.testing.assert_close`` on two
+        # identical device tensors raises from torch-spyre's lazy
+        # decomposition path (torch_spyre/_inductor/decompositions.py:1663),
+        # and ``torch.allclose`` raises
+        # "bitwise_and() got an unexpected keyword argument 'out'". Compare on
+        # the host instead; the transfer is exact, so this is a stricter check
+        # rather than a weaker one.
+        actual = actual.cpu()
+        expected = expected.cpu() if expected.device.type == "spyre" else expected
+
     if actual.numel() <= chunk_size:
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
         return
