@@ -135,10 +135,66 @@ class FlashGraphOutputPlan(NamedTuple):
     # V/O head dim when it differs from ``head_dim`` (the asymmetric (192, 128)
     # pair); ``None`` is the symmetric case, as on ``AttentionScorePlan``.
     head_dim_v: int | None = None
+    # Flex envelope (``AttentionScorePlan.is_flex``): the Q and K/V lengths
+    # (``seq`` keeps the Q length), the BHSD geometry of the 4-D operands
+    # (``batch`` is ``B * H``), the four BlockMask tables in
+    # ``FlexKvWalk`` order (partial count, partial index, full count, full
+    # index) and the tensors the captured regions read (plan order).
+    q_seq: int | None = None
+    kv_seq: int | None = None
+    tensor_4d_batch: int | None = None
+    tensor_4d_heads: int | None = None
+    kv_walk_names: tuple[str, ...] = ()
+    aux_names: tuple[str, ...] = ()
 
     @property
     def value_head_dim(self) -> int:
         return self.head_dim if self.head_dim_v is None else self.head_dim_v
+
+
+def _flash_flex_graph_output_plan(match: FlexMatch) -> FlashGraphOutputPlan:
+    """The output plan of a matched flex kernel: 4-D operands, the
+    ``(B, H, M)`` LSE, the table and aux names in the closed world."""
+    return FlashGraphOutputPlan(
+        match.q_name,
+        match.k_name,
+        match.v_name,
+        match.o_name,
+        _FLASH_OUTPUT_EPILOGUE_IDENTITY,
+        match.lse_name,
+        match.lse_log_base,
+        (),
+        (),
+        (),
+        match.num_bh,
+        match.q_seq,
+        match.head_dim,
+        match.io_dtype,
+        None,
+        match.plan.kv_group,
+        head_dim_v=match.plan.head_dim_v,
+        q_seq=match.q_seq,
+        kv_seq=match.kv_seq,
+        tensor_4d_batch=match.batch,
+        tensor_4d_heads=match.heads,
+        kv_walk_names=match.table_names,
+        aux_names=match.aux_names,
+    )
+
+
+def _flash_flex_graph_output_plan_from_graphs(
+    graphs: Sequence[GraphInfo],
+    root_block_ids: Sequence[int] | None,
+) -> FlashGraphOutputPlan | None:
+    from ..compile_environment import CompileEnvironment
+    from .flex_match import match_flex_envelope
+
+    if root_block_ids is None:
+        return None
+    match = match_flex_envelope(
+        graphs, root_block_ids, env=CompileEnvironment.current()
+    )
+    return None if match is None else _flash_flex_graph_output_plan(match)
 
 
 def _flash_supported_io_dtype(dtype: torch.dtype) -> bool:
@@ -996,6 +1052,10 @@ def _flash_graph_output_plan_from_graphs(
     score_plan: AttentionScorePlan | None = None,
 ) -> FlashGraphOutputPlan | None:
     graphs = tuple(graphs)
+    if score_plan is not None and score_plan.is_flex:
+        # The flex envelope is matched over the whole graph set (3-axis grid,
+        # two list walks); its output plan comes from that match.
+        return _flash_flex_graph_output_plan_from_graphs(graphs, root_block_ids)
     host_tensors = _flash_graph_host_tensors(graphs)
     flash_3d_tensors = {
         name: value
@@ -9910,6 +9970,7 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .flex_match import FlexMatch
 
 
 # The SharedStorage struct (Gotcha G: stringified annotations break
@@ -18640,10 +18701,161 @@ class FlashTensorPlan(NamedTuple):
     # V/O head dim when it differs from ``head_dim`` (the asymmetric (192, 128)
     # pair); ``None`` is the symmetric case, as on ``AttentionScorePlan``.
     head_dim_v: int | None = None
+    # Flex envelope: the four BlockMask tables (partial count, partial index,
+    # full count, full index) and the captured aux tensors as plain kernel
+    # params (``df.placeholder_args`` keeps them in the signature), the Q and
+    # K/V lengths, and the host expressions of the regions' scalars
+    # (``plan.host_scalars`` order, ``cutlass.Int32(...)`` /
+    # ``cutlass.Float32(...)``) and of the runtime scale (``plan.scale_arg``).
+    kv_walk_args: tuple[TensorArg, ...] = ()
+    aux_args: tuple[TensorArg, ...] = ()
+    q_seq: int | None = None
+    kv_seq: int | None = None
+    flex_scalar_exprs: tuple[str, ...] = ()
+    flex_scale_expr: str | None = None
+    # The bare kernel-argument names behind the two expressions above (the
+    # launcher indexes ``_flash_scale`` by argument position).
+    flex_scalar_arg_names: tuple[str, ...] = ()
+    flex_scale_arg_name: str | None = None
 
     @property
     def value_head_dim(self) -> int:
         return self.head_dim if self.head_dim_v is None else self.head_dim_v
+
+
+def _flash_flex_tensor_plan(
+    df: DeviceFunction, match: FlexMatch
+) -> FlashTensorPlan | None:
+    """Bind the operands of a matched flex kernel to ``TensorArg``s.
+
+    Q/O are ``[B, H, M, D]`` / ``[B, H, M, Dv]``, K/V ``[B, H // g, N, D]`` /
+    ``[B, H // g, N, Dv]`` (contiguous), the LSE ``[B, H, M]`` fp32, the
+    tables int32 with the matched ``(Bm, Hm, R)`` geometry (any strides) and
+    the aux tensors exactly as the plan captured them.
+    """
+    from ..host_function import HostFunction
+    from .flex_match import flex_host_scalar_device_name
+    from .flex_match import flex_host_scalar_symbol
+
+    plan = match.plan
+    walk = plan.kv_walk
+    assert walk is not None
+    graph_plan = _flash_flex_graph_output_plan(match)
+    required = [
+        match.q_name,
+        match.k_name,
+        match.v_name,
+        match.o_name,
+        *graph_plan.kv_walk_names,
+        *graph_plan.aux_names,
+    ]
+    if match.lse_name is not None:
+        required.append(match.lse_name)
+    host_tensors = _flash_graph_host_tensors(df.codegen.codegen_graphs)
+    if any(name not in host_tensors for name in required):
+        return None
+    args: dict[str, TensorArg] = {}
+    for name in dict.fromkeys(required):
+        # Closure / global tensors carry their host path as the IR name;
+        # those take the origin's suggested identifier.
+        prefer_name = name if name.isidentifier() else None
+        args[name] = df.tensor_arg(host_tensors[name], prefer_name=prefer_name)
+    batch, heads, kv_heads = match.batch, match.heads, match.kv_heads
+    for name, expected_shape, expected_dtype in (
+        (match.q_name, (batch, heads, match.q_seq, match.head_dim), match.io_dtype),
+        (match.k_name, (batch, kv_heads, match.kv_seq, match.head_dim), match.io_dtype),
+        (
+            match.v_name,
+            (batch, kv_heads, match.kv_seq, match.head_dim_v),
+            match.io_dtype,
+        ),
+        (match.o_name, (batch, heads, match.q_seq, match.head_dim_v), match.io_dtype),
+    ):
+        value = args[name].fake_value
+        if (
+            tuple(int(size) for size in value.shape) != expected_shape
+            or value.dtype != expected_dtype
+            or not value.is_contiguous()
+        ):
+            return None
+    lse_arg = None
+    if match.lse_name is not None:
+        lse_arg = args[match.lse_name]
+        value = lse_arg.fake_value
+        if (
+            tuple(int(size) for size in value.shape) != (batch, heads, match.q_seq)
+            or value.dtype != torch.float32
+            or not value.is_contiguous()
+        ):
+            return None
+    rows = int(args[walk.part_cnt_name].fake_value.shape[2])
+    for index, name in enumerate(graph_plan.kv_walk_names):
+        value = args[name].fake_value
+        expected_ndim = 3 if index % 2 == 0 else 4
+        if (
+            value.ndim != expected_ndim
+            or value.dtype != torch.int32
+            or tuple(int(size) for size in value.shape[:3])
+            != (walk.table_batch, walk.table_heads, rows)
+        ):
+            return None
+    for buffer in plan.aux_buffers:
+        value = args[buffer.name].fake_value
+        if (
+            value.dtype != buffer.dtype
+            or tuple(int(size) for size in value.shape) != buffer.shape
+            or tuple(int(stride) for stride in value.stride()) != buffer.strides
+        ):
+            return None
+    host_function = HostFunction.current()
+    scalar_exprs: list[str] = []
+    scalar_arg_names: list[str] = []
+    for name in plan.host_scalars:
+        symbol = flex_host_scalar_symbol(host_function, name)
+        arg_name = flex_host_scalar_device_name(df, host_function, name)
+        if symbol is None or arg_name is None:
+            return None
+        kind = "Int32" if symbol.is_integer else "Float32"  # pyrefly: ignore[missing-attribute]
+        scalar_exprs.append(f"cutlass.{kind}({arg_name})")
+        scalar_arg_names.append(arg_name)
+    scale_expr = scale_arg_name = None
+    if plan.scale_arg is not None:
+        scale_arg_name = flex_host_scalar_device_name(df, host_function, plan.scale_arg)
+        if scale_arg_name is None:
+            return None
+        scale_expr = f"cutlass.Float32({scale_arg_name})"
+    return FlashTensorPlan(
+        args[match.q_name],
+        args[match.k_name],
+        args[match.v_name],
+        args[match.o_name],
+        graph_plan.output_epilogue,
+        lse_arg,
+        graph_plan.lse_log_base,
+        (),
+        (),
+        (),
+        graph_plan.batch,
+        graph_plan.seq,
+        graph_plan.head_dim,
+        graph_plan.dtype,
+        batch,
+        heads,
+        None,
+        (),
+        (),
+        graph_plan.kv_group,
+        row_kv_begin_args=(),
+        head_dim_v=graph_plan.head_dim_v,
+        kv_walk_args=tuple(args[name] for name in graph_plan.kv_walk_names),
+        aux_args=tuple(args[name] for name in graph_plan.aux_names),
+        q_seq=match.q_seq,
+        kv_seq=match.kv_seq,
+        flex_scalar_exprs=tuple(scalar_exprs),
+        flex_scale_expr=scale_expr,
+        flex_scalar_arg_names=tuple(scalar_arg_names),
+        flex_scale_arg_name=scale_arg_name,
+    )
 
 
 def _flash_current_block_ids(
@@ -18674,6 +18886,9 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
     """
     from ..host_function import HostFunction
 
+    flex_match = df.cute_state.attention_flex_match
+    if flex_match is not None:
+        return _flash_flex_tensor_plan(df, flex_match)
     block_ids = _flash_current_block_ids(df)
     if block_ids is None:
         return None
@@ -18891,6 +19106,13 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     plan = flash_attention_tensor_plan(df)
     if plan is None:
         return False
+    if df.cute_state.attention_flex_match is not None:
+        # The matcher admitted the FlexAttention envelope (BlockMask list
+        # walk + captured score / mask regions), but the fa4 list-walk body
+        # that renders it is not in the tree yet.
+        raise NotImplementedError(
+            "flex-envelope flash attention: the list-walk emitter has not landed"
+        )
     q_arg, k_arg, v_arg, o_arg = plan.q_arg, plan.k_arg, plan.v_arg, plan.o_arg
     output_epilogue = plan.output_epilogue
     lse_arg = plan.lse_arg

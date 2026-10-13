@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    import torch.fx
 
 DENSE_SCORE_KIND = "dense"
 CAUSAL_MASK_KIND = "causal_mask"
@@ -27,6 +33,11 @@ DOCUMENT_MASK_KIND = "document_mask"
 # (``row_kv_begin_row_sum``) and maps to a 0 output row.
 ROW_KV_BEGIN_MASK_KIND = "row_kv_begin_mask"
 SOFTCAP_KIND = "softcap"
+# The FlexAttention envelope: a BlockMask-driven KV walk plus the user's
+# score_mod / mask_mod captured as pointwise FX regions (``FlexRegion``). A
+# flex plan reports this single kind; its structure lives in ``kv_walk``,
+# ``score_region`` and ``mask_region`` rather than in modifiers.
+FLEX_SCORE_KIND = "flex"
 LOWERED_SCORE_KINDS = frozenset(
     {
         CAUSAL_MASK_KIND,
@@ -38,6 +49,7 @@ LOWERED_SCORE_KINDS = frozenset(
         DOCUMENT_MASK_KIND,
         ROW_KV_BEGIN_MASK_KIND,
         SOFTCAP_KIND,
+        FLEX_SCORE_KIND,
     }
 )
 MASK_SCORE_KINDS = frozenset(
@@ -88,6 +100,62 @@ class AttentionScoreModifier:
 
 
 @dataclasses.dataclass(frozen=True)
+class FlexKvWalk:
+    """BlockMask-driven KV walk of the FlexAttention envelope.
+
+    The four tables are the BlockMask tensors as the kernel receives them:
+    counts ``[Bm, Hm, R]`` and 128-wide KV tile ids ``[Bm, Hm, R, L]`` (int32)
+    for the partial (masked) and full lists, one row per ``q_block`` query
+    rows. ``Bm`` / ``Hm`` may be 1 (broadcast over batch / heads). With
+    ``q_block == 128`` the fa4 pair body walks the union of two rows per
+    256-row pair, with a per-stage membership status per step; with
+    ``q_block == 256`` both stages share one row.
+    """
+
+    part_cnt_name: str
+    part_idx_name: str
+    full_cnt_name: str
+    full_idx_name: str
+    q_block: int
+    kv_block: int
+    table_batch: int
+    table_heads: int
+    # ``kv_block >= kv_seq``: every KV tile is in one block, the walk is dense
+    # and the tables are never read (torch's trivial-mask case).
+    trivial: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexAuxBuffer:
+    """A tensor captured by a flex region (FlexAttention's ``other_buffers``)."""
+
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    # How the load's kv-dependent index relates to the KV lane; drives the
+    # renderer's load form (uniform broadcast / 16-byte vector / gather):
+    # "row_uniform" | "column_affine" | "head" | "diagonal" | "row_col" |
+    # "value" | "general".
+    index_class: str = "general"
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexRegion:
+    """A captured pointwise FX region of the flex envelope.
+
+    ``graph`` placeholders, in order: ``score`` (fp32), ``b``, ``h``, ``q_idx``,
+    ``kv_idx`` (int32), then one per ``AttentionScorePlan.aux_buffers`` entry,
+    then one per ``host_scalars`` entry. ``output`` is the region's value: the
+    transformed score (fp32) for a score region, the keep predicate (bool) for
+    a mask region.
+    """
+
+    graph: torch.fx.Graph
+    output: torch.fx.Node
+
+
+@dataclasses.dataclass(frozen=True)
 class AttentionScorePlan:
     """Composable score-transform plan for the CuTe flash attention path."""
 
@@ -103,6 +171,41 @@ class AttentionScorePlan:
     # the Q/K width the softmax scale is derived from); ``None`` is the
     # symmetric case.
     head_dim_v: int | None = None
+    # Flex envelope (``FLEX_SCORE_KIND``): Q and K/V lengths (they may differ
+    # and need not be multiples of 128), the BlockMask walk and the captured
+    # score_mod / mask_mod regions. ``scale_peeled`` records whether the
+    # matcher folded the ``qk * scale`` multiply into the PASS2 multiplier
+    # (mask-only regions, raw QK units on every tile) or left it in the score
+    # region (natural units; the hook runs on every tile and PASS2 applies
+    # ``log2(e)``). ``scale_arg`` names the runtime scale symbol when the scale
+    # is not a literal.
+    q_seq: int | None = None
+    kv_seq: int | None = None
+    kv_walk: FlexKvWalk | None = None
+    score_region: FlexRegion | None = None
+    mask_region: FlexRegion | None = None
+    aux_buffers: tuple[FlexAuxBuffer, ...] = ()
+    host_scalars: tuple[str, ...] = ()
+    scale_arg: str | None = None
+    scale_peeled: bool = True
+
+    @property
+    def is_flex(self) -> bool:
+        return self.kv_walk is not None
+
+    @property
+    def has_list_walk(self) -> bool:
+        """A data-dependent per-item KV list (variable trip count, like the
+        causal / pruned-interval plans, but driven by tables)."""
+        return self.kv_walk is not None and not self.kv_walk.trivial
+
+    @property
+    def flex_has_score_region(self) -> bool:
+        return self.is_flex and (self.score_region is not None or not self.scale_peeled)
+
+    @property
+    def flex_has_mask_region(self) -> bool:
+        return self.is_flex and self.mask_region is not None
 
     @property
     def value_head_dim(self) -> int:
@@ -118,6 +221,8 @@ class AttentionScorePlan:
 
     @property
     def modifier_kinds(self) -> tuple[str, ...]:
+        if self.is_flex:
+            return (FLEX_SCORE_KIND,)
         if not self.modifiers:
             return (DENSE_SCORE_KIND,)
         return tuple(modifier.kind for modifier in self.modifiers)
@@ -205,6 +310,10 @@ class AttentionScorePlan:
         return self.has_kv_tile_pruning and not self.has_contiguous_kv_interval
 
     def has_lowering(self) -> bool:
+        if self.is_flex:
+            # The matcher admits the regions (pure pointwise over the canonical
+            # coordinates); a flex plan carries no kind modifiers.
+            return not self.modifiers
         seen_mask = False
         for modifier in self.modifiers:
             if modifier.kind in MASK_SCORE_KINDS:

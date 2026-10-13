@@ -655,6 +655,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         cute_state.attention_flash_block_ids = None
         cute_state.attention_flash_score_plan = None
         cute_state.attention_flash_gated_match = None
+        cute_state.attention_flex_match = None
         cute_state.attention_flash_threads = 128
 
     def _try_codegen_attention_flash_root(self) -> bool:

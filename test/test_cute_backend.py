@@ -4855,6 +4855,8 @@ class TestCuteBackend(TestCase):
                         requires_ws_overlap=requires_ws,
                         modifiers=(),
                         modifier_kinds=(DENSE_SCORE_KIND,),
+                        is_flex=False,
+                        has_list_walk=False,
                         head_dim_v=None,
                         asymmetric_head_dims=False,
                         kv_group=1,
