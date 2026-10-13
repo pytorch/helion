@@ -1990,16 +1990,17 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     for key, value in resident_defaults.items():
         assert _active_choices(enum_fragments[key]) == frozenset((value,))
     assert set(resident_defaults.items()) <= set(active_values)
-    # 60: the ws surface pins every dimension it cannot vary to one value,
+    # 61: the ws surface pins every dimension it cannot vary to one value,
     # including the KV tile width, the query-tile height, the one-pass
     # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
-    # the (fa4-only) per-chunk P release and the two row-program knobs
-    # (``cute_flash_row_warps``, ``cute_flash_row_tile_m`` of the ``row_mma``
-    # family); the two-warpgroup body measures both of its O epilogues
-    # (``cute_flash_epi_stg``).
+    # the (fa4-only) per-chunk P release, the affine bias lowering
+    # (``cute_flash_bias_form``, live only with an ALiBi/relative bias) and
+    # the two row-program knobs (``cute_flash_row_warps``,
+    # ``cute_flash_row_tile_m`` of the ``row_mma`` family); the two-warpgroup
+    # body measures both of its O epilogues (``cute_flash_epi_stg``).
     # Resident-only coordinates add exactly three inactive singletons; keep
     # the upstream bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 60
+    assert len(active_values) - len(resident_defaults) <= 61
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -2585,14 +2586,10 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
         "EnumFragment",
         spec._flat_fields()[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY],
     )
-    expected_masked_schedules = (
-        frozenset(("inherit", "xu", "16/4", "8/2"))
-        if standard_causal_output
-        else frozenset(("inherit",))
-    )
-    assert frozenset(masked_schedule_fragment.choices) >= frozenset(
-        ("inherit", "xu", "16/4", "8/2")
-    )
+    # The descending loop split (and with it a distinct masked cadence) is
+    # proven for the standard causal body and for the modifier body alike.
+    expected_masked_schedules = frozenset(("inherit", "xu", "16/4", "8/2"))
+    assert frozenset(masked_schedule_fragment.choices) >= expected_masked_schedules
     assert _active_choices(masked_schedule_fragment) == expected_masked_schedules
     with _memoized_flash_fragments():
         coverage = spec.create_config_generation(
@@ -2614,9 +2611,7 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
     )
     spec.normalize(fixed)
     assert fixed.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] is True
-    assert fixed.config[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY] == (
-        "16/4" if standard_causal_output else "inherit"
-    )
+    assert fixed.config[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY] == "16/4"
 
 
 def test_fa4_ineligible_causal_config_accepts_legacy_masked_cadence() -> None:
@@ -3141,7 +3136,9 @@ def test_legacy_exp2_schedule_normalization_preserves_valid_cadence() -> None:
     assert masked_cadence.config[cute_flash.FLASH_E2E_OFFSET0_KEY] == 14
 
 
-def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
+def test_causal_lpt_swizzle_defaults_to_the_l2_sized_group() -> None:
+    # 0 names FA4's L2-sized launch group at every length (the emitter sizes
+    # it: 1.5 MB per K/V head at fp16 s6144, 32 heads fit 50 MB, or the grid).
     resolved = cute_flash.resolve_flash_config(
         64,
         48,
@@ -3150,7 +3147,9 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
         is_causal=True,
         standard_causal_output=True,
     )
-    assert resolved.causal_lpt_swizzle == 1
+    assert resolved.causal_lpt_swizzle == 0
+    assert cute_flash.flash_causal_lpt_l2_swizzle(64, 48) == 32
+    assert cute_flash.flash_causal_lpt_l2_swizzle(64, 48, num_bh=3) == 3
 
     fragments = cute_flash.flash_autotune_fragments(
         64,
@@ -3161,8 +3160,9 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
     )
     swizzle = fragments[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY]
     assert isinstance(swizzle, EnumFragment)
-    assert 0 in swizzle.choices
-    assert swizzle.search_choices == (1,)
+    assert swizzle.default() == 0
+    assert set(swizzle.search_choices or ()) == {0, 1, 3}
+    assert set(swizzle.choices) == {0, 1, 2, 3}
 
     wide = cute_flash.resolve_flash_config(
         64,
@@ -3172,7 +3172,17 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
         is_causal=True,
         standard_causal_output=True,
     )
-    assert wide.causal_lpt_swizzle == 1
+    assert wide.causal_lpt_swizzle == 64
+    # Above the grid the group is the grid.
+    over = cute_flash.resolve_flash_config(
+        64,
+        48,
+        {cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: 64},
+        num_bh=48,
+        is_causal=True,
+        standard_causal_output=True,
+    )
+    assert over.causal_lpt_swizzle == 48
 
     spec = _flash_config_spec(
         head_dim=64,
@@ -3185,7 +3195,25 @@ def test_causal_lpt_swizzle_is_bounded_to_the_stress_tested_envelope() -> None:
         cute_flash_causal_lpt_swizzle=64,
     )
     spec.normalize(legacy_wide)
-    assert legacy_wide.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 1
+    assert legacy_wide.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 64
+    # The L2-sized group keeps its name whether requested or left unset;
+    # wider requests clamp to the grid.
+    zero = helion.Config(block_sizes=[1, 128, 128], cute_flash_causal_lpt_swizzle=0)
+    spec.normalize(zero)
+    assert zero.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 0
+    unset = helion.Config(block_sizes=[1, 128, 128])
+    spec.normalize(unset)
+    assert unset == zero
+    # An explicit group keeps its name (the coverage design reaches every
+    # searched value) even where it equals the L2-sized one.
+    spelled = helion.Config(block_sizes=[1, 128, 128], cute_flash_causal_lpt_swizzle=32)
+    spec.normalize(spelled)
+    assert spelled.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 32
+    over_wide = helion.Config(
+        block_sizes=[1, 128, 128], cute_flash_causal_lpt_swizzle=128
+    )
+    spec.normalize(over_wide)
+    assert over_wide.config[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 64
 
 
 @pytest.mark.parametrize("num_kv", _ALIGNED_LENGTHS)

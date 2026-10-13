@@ -3026,6 +3026,8 @@ def _generate_ast(
                         "bias_name",
                         "alibi_name",
                         "document_name",
+                        "document_range_name",
+                        "row_kv_begin_name",
                         "layout_name",
                         "n_sizes_name",
                         "k_sizes_name",

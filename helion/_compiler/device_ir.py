@@ -3730,6 +3730,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_row_epilogue=flash_shape.has_row_epilogue,
                     plain_row_body=flash_shape.plain_row_body,
                     has_score_modifiers=flash_shape.has_score_modifiers,
+                    score_modifier_kinds=flash_shape.score_modifier_kinds,
                     device_sm_count=_cuda_num_sms_or_zero(
                         CompileEnvironment.current().device
                     ),

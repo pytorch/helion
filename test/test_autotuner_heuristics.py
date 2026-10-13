@@ -104,6 +104,7 @@ from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
 from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_LOOP_KEY
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILIES
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
@@ -128,6 +129,7 @@ from helion._compiler.cute.cute_flash import _flash_values_tensor_4d_batch_heads
 from helion._compiler.cute.cute_flash import flash_attention_seed_config
 from helion._compiler.cute.cute_flash import flash_attention_seed_configs
 from helion._compiler.cute.cute_flash import flash_autotune_fragments
+from helion._compiler.cute.cute_flash import flash_effective_config_values
 from helion._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from helion._compiler.cute.cute_flash import resolve_flash_config
 from helion._compiler.cute.flash_policy import get_flash_target_policy
@@ -6481,7 +6483,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         try:
             random.seed(3)
             while len(cached_configs) < 30:
-                cached_configs.add(config_gen.unflatten(config_gen.random_flat()))
+                # A random draw may combine a resident lowering with a family
+                # the resolver rejects (about 2.5% of the draws on this
+                # surface, on main as well); the population generators skip
+                # such draws, so skip them here too.
+                try:
+                    cached_configs.add(config_gen.unflatten(config_gen.random_flat()))
+                except helion.exc.InvalidConfig:
+                    continue
         finally:
             random.setstate(random_state)
         search._generate_best_available_population_flat = lambda: [
@@ -7624,6 +7633,82 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dtype=torch.bfloat16,
             )
         )
+
+    def test_cute_flash_dense_hd64_seeds_carry_local_tma_packets(self) -> None:
+        """The fa4_local_tma family wins the dense hd64 shapes with a wide exp2
+        packet and the measured 16/4 / six-stage / direct-epilogue / FA4-role
+        structure, which the family and packet loops alone never seed."""
+        measured = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4_local_tma",
+            FLASH_E2E_SCHEDULE_KEY: "16/4",
+            FLASH_KV_STAGE_KEY: 6,
+            FLASH_EPI_TMA_KEY: False,
+            FLASH_PERSISTENT_CTAS_PER_SM_KEY: 1,
+            FLASH_PERSISTENT_LOOP_KEY: "counted",
+            FLASH_ROLE_MAP_KEY: "fa4",
+            FLASH_SOFTMAX_DISC_KEY: False,
+            FLASH_SPLIT_P_ARRIVE_KEY: True,
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_WAIT_HINT_KEY: 0,
+        }
+        # Threshold 16 where the dtype's largest pinned probability allows it.
+        thresholds = {torch.bfloat16: 16.0, torch.float16: 12.0}
+        for dtype in (torch.bfloat16, torch.float16):
+            measured[FLASH_RESCALE_THRESHOLD_KEY] = thresholds[dtype]
+            for num_kv in (16, 32, 64):
+                with self.subTest(dtype=dtype, num_kv=num_kv):
+                    seeds = flash_attention_seed_configs(
+                        64,
+                        num_kv,
+                        num_bh=64,
+                        dtype=dtype,
+                        standard_dense_output=True,
+                    )
+                    local_tma = {
+                        seed.config[FLASH_EXP2_PACKET_KEY]: seed.config
+                        for seed in seeds
+                        if seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4_local_tma"
+                    }
+                    self.assertEqual(set(local_tma), {"1x1", "4x2", "8x2"})
+                    for packet in ("4x2", "8x2"):
+                        config = local_tma[packet]
+                        for key, value in measured.items():
+                            self.assertEqual(config[key], value, key)
+                        resolved = resolve_flash_config(
+                            64,
+                            num_kv,
+                            config,
+                            dtype=dtype,
+                            num_bh=64,
+                            standard_dense_output=True,
+                        )
+                        self.assertEqual(resolved.pipeline_family, "fa4_local_tma")
+                        self.assertEqual(resolved.exp2_packet, packet)
+                        self.assertTrue(resolved.persistent)
+                        # The seed resolves as written (no knob is coerced).
+                        effective = flash_effective_config_values(resolved)
+                        for key, value in measured.items():
+                            self.assertEqual(effective[key], value, key)
+        # The structure is measured on dense hd64 only: causal and hd128
+        # lists keep their family seed alone.
+        for head_dim, is_causal in ((64, True), (128, False)):
+            with self.subTest(head_dim=head_dim, is_causal=is_causal):
+                seeds = flash_attention_seed_configs(
+                    head_dim,
+                    16,
+                    num_bh=64,
+                    dtype=torch.bfloat16,
+                    is_causal=is_causal,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                )
+                packets = {
+                    seed.config[FLASH_EXP2_PACKET_KEY]
+                    for seed in seeds
+                    if seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4_local_tma"
+                }
+                self.assertLessEqual(packets, {"1x1"})
 
     def test_cute_flash_bf16_hd64_2cta_seed_uses_validated_schedule(
         self,

@@ -756,6 +756,7 @@ def _append_cute_wrapper_plan(
         bias_idx = plan_optional_int("bias_idx")
         alibi_idx = plan_optional_int("alibi_idx")
         document_idx = plan_optional_int("document_idx")
+        row_kv_begin_idx = plan_optional_int("row_kv_begin_idx")
         seq = plan_int("seq")
         head_dim = plan_int("head_dim")
         batch = plan_int("batch")
@@ -770,6 +771,10 @@ def _append_cute_wrapper_plan(
         alibi_count = plan_int("alibi_count", default=batch)
         document_batch = plan_int("document_batch", default=batch)
         document_heads_per_batch = plan_int("document_heads_per_batch", default=1)
+        row_kv_begin_batch = plan_int("row_kv_begin_batch", default=batch)
+        row_kv_begin_heads_per_batch = plan_int(
+            "row_kv_begin_heads_per_batch", default=1
+        )
         kv_stage = plan_int("kv_stage")
         q_stage = plan_int("q_stage", default=1)
         use_2cta_instrs = bool(plan.get("use_2cta_instrs"))
@@ -892,12 +897,40 @@ def _append_cute_wrapper_plan(
             )
         if document_idx is not None:
             sdoc = f"cute.make_layout(({seq}, {document_batch}), stride=(1, {seq}))"
+            # Host-built ``(2, doc_batch, num_tiles)`` int32 [min, max] id table,
+            # viewed as ``(num_tiles, doc_batch, 2)`` so the device indexes it
+            # ``[tile, doc_bh, 0 | 1]``.
+            document_range_idx = plan_int("document_range_idx")
+            document_tiles = plan_int("document_tiles")
+            srange = (
+                f"cute.make_layout(({document_tiles}, {document_batch}, 2), "
+                f"stride=(1, {document_tiles}, {document_tiles * document_batch}))"
+            )
             flash_lines.extend(
                 [
                     f"_flash_mDoc = cute.make_tensor(arg{document_idx}.iterator, {sdoc})",
                     (
                         "_flash_doc_heads_per_batch = "
                         f"cutlass.Int32({document_heads_per_batch})"
+                    ),
+                    (
+                        "_flash_mDocRange = cute.make_tensor("
+                        f"arg{document_range_idx}.iterator, {srange})"
+                    ),
+                ]
+            )
+        if row_kv_begin_idx is not None:
+            # Per-row KV lower-bound table, viewed like the document table.
+            srkb = f"cute.make_layout(({seq}, {row_kv_begin_batch}), stride=(1, {seq}))"
+            flash_lines.extend(
+                [
+                    (
+                        "_flash_mRowKvBegin = cute.make_tensor("
+                        f"arg{row_kv_begin_idx}.iterator, {srkb})"
+                    ),
+                    (
+                        "_flash_rkb_heads_per_batch = "
+                        f"cutlass.Int32({row_kv_begin_heads_per_batch})"
                     ),
                 ]
             )
@@ -1040,7 +1073,11 @@ def _append_cute_wrapper_plan(
         if alibi_idx is not None:
             call_args.extend(["_flash_mAlibi", "_flash_num_alibi"])
         if document_idx is not None:
-            call_args.extend(["_flash_mDoc", "_flash_doc_heads_per_batch"])
+            call_args.extend(
+                ["_flash_mDoc", "_flash_doc_heads_per_batch", "_flash_mDocRange"]
+            )
+        if row_kv_begin_idx is not None:
+            call_args.extend(["_flash_mRowKvBegin", "_flash_rkb_heads_per_batch"])
         if epi_tma:
             call_args.extend(["_flash_tma_o", "_flash_osl"])
         elif epi_stg:

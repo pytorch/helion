@@ -11,6 +11,15 @@ ALIBI_BIAS_KIND = "alibi_bias"
 SLIDING_WINDOW_MASK_KIND = "sliding_window_mask"
 PREFIX_LM_MASK_KIND = "prefix_lm_mask"
 DOCUMENT_MASK_KIND = "document_mask"
+# ``kv_idx >= lb[b, q_idx]`` with the causal conjunct: a per-row KV lower bound
+# (FA4 varlen's ``cu_seqlens`` data as a ``[B, S]`` table) lowered as a
+# contiguous KV tile range plus a boundary-only per-row range mask. The kind
+# folds the causal conjunct, so it is the plan's only mask modifier (a second
+# one, including a separately applied causal mask, declines the lowering). A
+# row whose bound lies past the row sees no key: the lowering returns 0 for it
+# (the FlexAttention / FA4 convention) where the kernel source and the Triton
+# lowering produce NaN from ``0 * inf``.
+ROW_KV_BEGIN_MASK_KIND = "row_kv_begin_mask"
 SOFTCAP_KIND = "softcap"
 LOWERED_SCORE_KINDS = frozenset(
     {
@@ -21,6 +30,7 @@ LOWERED_SCORE_KINDS = frozenset(
         SLIDING_WINDOW_MASK_KIND,
         PREFIX_LM_MASK_KIND,
         DOCUMENT_MASK_KIND,
+        ROW_KV_BEGIN_MASK_KIND,
         SOFTCAP_KIND,
     }
 )
@@ -30,6 +40,7 @@ MASK_SCORE_KINDS = frozenset(
         SLIDING_WINDOW_MASK_KIND,
         PREFIX_LM_MASK_KIND,
         DOCUMENT_MASK_KIND,
+        ROW_KV_BEGIN_MASK_KIND,
     }
 )
 SPARSE_TILE_MASK_KINDS = frozenset(
@@ -37,6 +48,7 @@ SPARSE_TILE_MASK_KINDS = frozenset(
         SLIDING_WINDOW_MASK_KIND,
         PREFIX_LM_MASK_KIND,
         DOCUMENT_MASK_KIND,
+        ROW_KV_BEGIN_MASK_KIND,
     }
 )
 
@@ -107,6 +119,14 @@ class AttentionScorePlan:
         )
 
     @property
+    def row_kv_begin_masks(self) -> tuple[AttentionScoreModifier, ...]:
+        return tuple(
+            modifier
+            for modifier in self.modifiers
+            if modifier.kind == ROW_KV_BEGIN_MASK_KIND
+        )
+
+    @property
     def sliding_window_masks(self) -> tuple[AttentionScoreModifier, ...]:
         return tuple(
             modifier
@@ -129,8 +149,34 @@ class AttentionScorePlan:
         )
 
     @property
+    def has_causal_structure(self) -> bool:
+        """Whether every mask kind here only ever keeps keys at or below the
+        diagonal (causal, sliding-window, prefix-LM and document masks all do),
+        so a work item's KV range is a contiguous interval ending at its own
+        tile and the trip count varies per work item."""
+        return self.is_causal or self.has_kv_tile_pruning
+
+    @property
+    def has_contiguous_kv_interval(self) -> bool:
+        """Whether the plan's KV tile pruning is one contiguous ``[first, last]``
+        interval per query tile: exactly one mask modifier, so the range
+        helpers in ``cute_flash`` can express it (two masks compose into a
+        per-tile predicate that is not an interval)."""
+        return (
+            sum(modifier.kind in MASK_SCORE_KINDS for modifier in self.modifiers) == 1
+        )
+
+    @property
     def requires_ws_overlap(self) -> bool:
-        return self.has_kv_tile_pruning
+        """Pruned plans whose active tiles are not one contiguous interval per
+        query tile keep the ws_overlap body (its per-tile activity predicate);
+        interval plans run on every family. The per-row KV lower bound is an
+        interval kind whose range prelude and boundary mask are emitted for
+        the ws_overlap body's single resident query tile only, so it keeps
+        that body too."""
+        return self.has_kv_tile_pruning and (
+            not self.has_contiguous_kv_interval or bool(self.row_kv_begin_masks)
+        )
 
     def has_lowering(self) -> bool:
         seen_mask = False
@@ -146,6 +192,19 @@ class AttentionScorePlan:
             and len(self.sliding_window_masks) <= 1
             and len(self.prefix_lm_masks) <= 1
             and len(self.document_masks) <= 1
+            and len(self.row_kv_begin_masks) <= 1
+            # The per-row lower bound owns the KV tile range outright and
+            # already carries the causal conjunct: it must be the plan's only
+            # mask modifier. Its range prelude is emitted only for the
+            # single-interval form, so a second mask (another range-pruned
+            # kind or a separately applied causal mask, as chained
+            # ``torch.where`` calls produce) would leave the boundary mask and
+            # the tile predicate referencing an undefined range.
+            and (
+                not self.row_kv_begin_masks
+                or sum(modifier.kind in MASK_SCORE_KINDS for modifier in self.modifiers)
+                == 1
+            )
         )
 
 

@@ -40,6 +40,11 @@ from helion import _hardware
 from helion import exc
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
+from helion._compiler.cute.attention_plan import ROW_KV_BEGIN_MASK_KIND
+from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
+from helion._compiler.cute.attention_plan import AttentionScoreModifier
+from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.cute_flash import _flash_clc_heads_per_batch_candidates
 from helion._compiler.cute.cute_flash import (
     _flash_clc_heads_per_batch_coverage_candidates,
@@ -12539,10 +12544,17 @@ class TestCuteAutotuner(TestCase):
                 key,
             )
 
+        # A single contiguous-interval mask (sliding window here) prunes KV
+        # tiles but runs on both families: the fa4 pair body takes the union
+        # of its two query tiles' intervals, so the surface searches fa4 next
+        # to ws_overlap and defaults to fa4 at an even tile count. Only plans
+        # whose active tiles are not one interval (two composed masks) and
+        # the per-row KV lower bound (its range prelude describes the
+        # ws_overlap body's single query tile) keep the ws_overlap lock.
         sparse_bound = sparse_flash_attention.bind((q, k, v))
         sparse_spec = sparse_bound.config_spec
         self.assertTrue(sparse_spec._cute_flash_has_kv_tile_pruning)
-        self.assertTrue(sparse_spec._cute_flash_requires_ws_overlap)
+        self.assertFalse(sparse_spec._cute_flash_requires_ws_overlap)
         sparse_bound_fragments = sparse_spec._flat_fields()
         self.assertEqual(
             set(
@@ -12550,16 +12562,14 @@ class TestCuteAutotuner(TestCase):
                     sparse_bound_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
                 )
             ),
-            {"ws_overlap"},
+            {"fa4", "ws_overlap"},
         )
         sparse_default = sparse_spec.default_config().config
-        self.assertEqual(
-            sparse_default[cute_flash.FLASH_PIPELINE_FAMILY_KEY], "ws_overlap"
-        )
+        self.assertEqual(sparse_default[cute_flash.FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertTrue(sparse_default[cute_flash.FLASH_PACKED_REDUCE_KEY])
         stale_sparse = helion.Config(
             block_sizes=[1, 128, 128],
-            cute_flash_topology="fa4",
+            cute_flash_topology="ws_overlap",
         )
         sparse_spec.normalize(stale_sparse)
         self.assertEqual(
@@ -12567,6 +12577,21 @@ class TestCuteAutotuner(TestCase):
             "ws_overlap",
         )
         self.assertNotIn(cute_flash.FLASH_TOPOLOGY_KEY, stale_sparse.config)
+        window = AttentionScoreModifier(SLIDING_WINDOW_MASK_KIND, window_size=64)
+        causal = AttentionScoreModifier(CAUSAL_MASK_KIND)
+        row_kv_begin = AttentionScoreModifier(
+            ROW_KV_BEGIN_MASK_KIND, tensor_name="lb", index_mode="identity"
+        )
+        for modifiers, locked in (
+            ((window,), False),
+            ((causal, window), True),
+            ((row_kv_begin,), True),
+        ):
+            plan = AttentionScorePlan(
+                head_dim=64, qk_scale_log2=1.0, modifiers=modifiers
+            )
+            self.assertTrue(plan.has_kv_tile_pruning)
+            self.assertIs(plan.requires_ws_overlap, locked, modifiers)
 
         # Aligned lengths share the same general search space. Only structural
         # legality, such as the parity needed by two-CTA families, may narrow it.
@@ -12634,9 +12659,11 @@ class TestCuteAutotuner(TestCase):
             cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY,
         ):
             self.assertGreater(len(active_choices(causal_short[key])), 1, key)
+        # FA4's L2-sized group (0, resolved per length), the serial head order
+        # and the whole 16-head grid.
         self.assertEqual(
             set(active_choices(causal_short[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY])),
-            {1},
+            {0, 1, 16},
         )
 
         sparse = cute_flash.flash_autotune_fragments(

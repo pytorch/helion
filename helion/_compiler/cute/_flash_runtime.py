@@ -1205,6 +1205,58 @@ def add_score_bias_t2r_contiguous(
             )
 
 
+def _add_affine_bias_t2r_hoisted(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    slope_scaled: Float32,
+    *,
+    packed: bool,
+) -> None:
+    """Add ``(key - query) * slope_scaled`` to a one-row score fragment.
+
+    The per-fragment base ``(col0 - row) * slope_scaled`` is computed once;
+    element ``i`` then adds ``fma(offset_i, slope_scaled, base)`` where
+    ``offset_i = coord[i][1] - coord[0][1]`` is the fragment's own column
+    offset. The t2r coordinates are a per-thread dynamic base plus a static
+    per-element offset, so the difference folds to a constant and the
+    per-element work is pure FP32: one FFMA with an immediate plus one FADD
+    (``packed=False``) or, per column pair, one packed FFMA over a constant
+    register pair plus one packed FADD (``packed=True``). Both forms evaluate
+    the same two IEEE operations in the same order per element (the packed
+    f32x2 ops round each lane like their scalar twins), so their outputs are
+    bitwise identical and the autotuner may choose between them freely; the
+    scalar form wins on the 128-column whole-row bodies (no constant register
+    pairs), the packed form on the 32-column chunked fa4 disc body.
+    """
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    score = cast("Any", tLDrS)
+    coord = cast("Any", tLDcS)
+    col0 = coord[0][1] + n_block * 128
+    base = cutlass.Float32(col0 - row_idx) * slope_scaled
+    n = cute.size(tLDrS)
+    offsets = [cutlass.Float32(coord[i][1] - coord[0][1]) for i in range(n)]
+    if not packed:
+        for i in range(n):
+            score[i] = cutlass.Float32(score[i]) + cute.math.fma(
+                offsets[i], slope_scaled, base
+            )
+        return
+    assert n % 2 == 0, "packed affine bias needs an even fragment"
+    for i in range(0, n, 2):
+        b0, b1 = cute.arch.fma_packed_f32x2(
+            (offsets[i], offsets[i + 1]),
+            (slope_scaled, slope_scaled),
+            (base, base),
+        )
+        s0, s1 = cute.arch.add_packed_f32x2(
+            (cutlass.Float32(score[i]), cutlass.Float32(score[i + 1])), (b0, b1)
+        )
+        score[i] = s0
+        score[i + 1] = s1
+
+
 def add_relative_bias_t2r(
     tLDrS: cute.Tensor,
     tLDcS: cute.Tensor,
@@ -1212,7 +1264,15 @@ def add_relative_bias_t2r(
     n_block: cutlass.Int32,
     bias_scale: Float32,
 ) -> None:
-    """Add a relative-position linear bias to a loaded score row."""
+    """Add a relative-position linear bias to a loaded score row.
+
+    Always the per-element integer difference (int sub, I2F, FMUL, FADD):
+    ``cute_flash_bias_form`` does not reach this bias. Its hoisted affine
+    forms (``_add_affine_bias_t2r_hoisted``) round differently and both
+    regressed the relative bias's fa4 whole-row winner by 8-12% at s8192, so
+    the emitter renders this form even next to an ALiBi bias that takes a
+    hoisted one.
+    """
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     score = cast("Any", tLDrS)
     coord = cast("Any", tLDcS)
@@ -1232,13 +1292,32 @@ def add_alibi_bias_t2r(
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
     bias_scale: Float32,
+    form: str = "scalar",
 ) -> None:
-    """Add ALiBi-style ``(key - query) * slope`` to a loaded score row."""
+    """Add ALiBi-style ``(key - query) * slope`` to a loaded score row.
+
+    ``form`` selects the ``cute_flash_bias_form`` lowering: ``scalar`` and
+    ``packed`` hoist the slope and the per-fragment base so each element is
+    one FFMA and one FADD (``_add_affine_bias_t2r_hoisted``; the two are
+    bitwise identical and are the searched values); ``direct`` is the
+    per-element integer form (int add/sub, I2F, two FMUL, FADD per element),
+    a different rounding that only an explicit pin reaches.
+    """
+    alibi = cast("Any", mAlibi)
+    slope = cutlass.Float32(alibi[bh % alibi_count])
+    if form != "direct":
+        _add_affine_bias_t2r_hoisted(
+            tLDrS,
+            tLDcS,
+            m_block,
+            n_block,
+            slope * bias_scale,
+            packed=form == "packed",
+        )
+        return
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     score = cast("Any", tLDrS)
     coord = cast("Any", tLDcS)
-    alibi = cast("Any", mAlibi)
-    slope = cutlass.Float32(alibi[bh % alibi_count])
     for i in range(cute.size(tLDrS)):
         col_idx = coord[i][1] + n_block * 128
         score[i] = (
@@ -1262,6 +1341,28 @@ def sliding_window_mask_t2r(
     mask_r2p_sm100_range(tLDrS, col_start, col_limit)
 
 
+def sliding_window_mask_t2r_chunk(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    window_size: cutlass.Int32,
+    chunk_idx: int,
+) -> None:
+    """Window-mask one FA4 32-column score chunk after a T2R load.
+
+    The chunk holds columns ``[chunk_idx * chunk_cols, +chunk_cols)`` of the
+    KV tile, so the tile-relative window bounds shift by the chunk origin
+    (the same offset ``causal_mask_t2r_chunk`` applies).
+    """
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    chunk_cols = cute.size(tLDrS.shape)
+    block_start = n_block * 128 + cutlass.Int32(chunk_idx * chunk_cols)
+    col_start = row_idx - window_size - block_start
+    col_limit = row_idx + 1 - block_start
+    mask_r2p_sm100_range(tLDrS, col_start, col_limit)
+
+
 def prefix_lm_mask_t2r(
     tLDrS: cute.Tensor,
     tLDcS: cute.Tensor,
@@ -1273,6 +1374,111 @@ def prefix_lm_mask_t2r(
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     col_limit = cutlass.max(row_idx + 1, prefix_length) - n_block * 128
     mask_r2p_sm100_rank1(tLDrS, col_limit)
+
+
+def prefix_lm_mask_t2r_chunk(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    prefix_length: cutlass.Int32,
+    chunk_idx: int,
+) -> None:
+    """Prefix-LM-mask one FA4 32-column score chunk after a T2R load."""
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    chunk_cols = cute.size(tLDrS.shape)
+    col_limit = (
+        cutlass.max(row_idx + 1, prefix_length)
+        - n_block * 128
+        - cutlass.Int32(chunk_idx * chunk_cols)
+    )
+    mask_r2p_sm100_rank1(tLDrS, col_limit)
+
+
+def row_kv_begin_mask_t2r(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_lb: cutlass.Int32,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+) -> None:
+    """Apply a per-row KV lower bound with the causal bound: ``lb <= key <= query``.
+
+    ``row_lb`` is this thread's row entry of the ``[batch, seq]`` lower-bound
+    table, loaded once per query tile (``row_kv_begin_row_bound``); the mask is
+    the same column range form as ``sliding_window_mask_t2r``. A row whose
+    bound lies past the row keeps no key at all; the consumer turns its zero
+    row sum into a 0 output (the FlexAttention / FA4 convention) where the
+    kernel source and the Triton lowering produce NaN.
+    """
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    block_start = n_block * 128
+    mask_r2p_sm100_range(tLDrS, row_lb - block_start, row_idx + 1 - block_start)
+
+
+def _row_kv_begin_clamped(value: object, limit: cutlass.Int32) -> cutlass.Int32:
+    """A lower-bound table entry clamped to ``[0, limit]`` as an exact Int32.
+
+    The clamp runs in Int64 so int64 tables are read exactly and an int32
+    sentinel (``INT32_MAX`` for "no key") cannot overflow the tile arithmetic
+    of the range prelude (``(max + 127) // 128``). Clamping is exact for the
+    mask: a bound below 0 admits every key a bound of 0 admits, and a bound at
+    or past ``limit`` (the end of the query tile, or the row itself plus one)
+    masks every key the unclamped bound masks within that limit.
+    """
+    bounded = cutlass.max(cutlass.Int64(value), cutlass.Int64(0))
+    bounded = cutlass.min(bounded, cutlass.Int64(limit))
+    return cutlass.Int32(bounded)
+
+
+def row_kv_begin_row_bound(
+    lb_tensor: object,
+    lb_bh: cutlass.Int32,
+    row_idx: cutlass.Int32,
+) -> cutlass.Int32:
+    """This row's KV lower bound from the ``[batch, seq]`` table, clamped to
+    ``[0, row_idx + 1]`` (``row_idx + 1`` leaves the row without a key)."""
+    lb = cast("Any", lb_tensor)
+    return _row_kv_begin_clamped(lb[row_idx, lb_bh], row_idx + cutlass.Int32(1))
+
+
+def row_kv_begin_bounds_warp(
+    lb_tensor: object,
+    lb_bh: cutlass.Int32,
+    row_start: cutlass.Int32,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """Warp-cooperative ``(min, max)`` of the KV lower bound over 128 query rows.
+
+    Four table loads per lane plus two five-step butterfly reductions; every
+    lane returns the same pair.  ``min // 128`` is the first KV tile any row
+    of the query tile can see and ``ceil(max / 128)`` the first tile no row
+    masks (tiles before it need the per-row mask).  Every entry is clamped to
+    ``[0, row_start + 128]`` (``_row_kv_begin_clamped``) so the pair is a
+    plain Int32 range inside the query tile for any int32 or int64 table.
+    The result is exact for any lower-bound table: it only bounds the tile
+    range, the per-row mask stays exact.
+    """
+    lb = cast("Any", lb_tensor)
+    lane = cute.arch.lane_idx()
+    row_limit = row_start + cutlass.Int32(128)
+    lo = cutlass.Int32(2147483647)
+    hi = cutlass.Int32(-2147483648)
+    for i in range(4):
+        value = _row_kv_begin_clamped(
+            lb[row_start + lane + cutlass.Int32(i * 32), lb_bh], row_limit
+        )
+        lo = cutlass.min(lo, value)
+        hi = cutlass.max(hi, value)
+    for offset in (16, 8, 4, 2, 1):
+        lo = cutlass.min(
+            lo,
+            cute.arch.shuffle_sync_bfly(lo, offset=offset, mask=-1, mask_and_clamp=31),
+        )
+        hi = cutlass.max(
+            hi,
+            cute.arch.shuffle_sync_bfly(hi, offset=offset, mask=-1, mask_and_clamp=31),
+        )
+    return lo, hi
 
 
 def document_mask_t2r(
@@ -1300,54 +1506,106 @@ def document_mask_t2r(
 
 
 def document_tile_maybe_active(
-    mDoc: cute.Tensor,
+    bounds_tensor: object,
     bh: cutlass.Int32,
     doc_heads_per_batch: cutlass.Int32,
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
 ) -> cutlass.Boolean:
-    """Conservative whole-tile predicate for causal same-document masking."""
-    doc = cast("Any", mDoc)
-    doc_bh = bh // doc_heads_per_batch
-    q_start = m_block * 128
-    k_start = n_block * 128
-    q_bits = cutlass.Int32(0)
-    k_bits = cutlass.Int32(0)
-    for i in range(128):
-        q_doc = cast("Any", cutlass.Int32(doc[q_start + i, doc_bh]))
-        k_doc = cast("Any", cutlass.Int32(doc[k_start + i, doc_bh]))
-        q_bits = q_bits | (cutlass.Int32(1) << (q_doc & cutlass.Int32(31)))
-        k_bits = k_bits | (cutlass.Int32(1) << (k_doc & cutlass.Int32(31)))
-    return (n_block <= m_block) & ((q_bits & k_bits) != 0)
+    """Conservative whole-tile predicate for causal same-document masking.
 
-
-def _document_tile_bits_warp(
-    doc_tensor: object,
-    doc_bh: cutlass.Int32,
-    start: cutlass.Int32,
-) -> cutlass.Int32:
-    """Modulo-32 doc-id fingerprint used only for conservative tile pruning.
-
-    Collisions are allowed: the exact per-score document mask still runs for every
-    retained tile, so false positives only cost extra work and never affect output.
+    ``bounds_tensor`` is the wrapper-built ``(num_tiles, batch, 2)`` table of
+    the smallest / largest document id in each 128-token tile (see
+    ``helion.runtime.cute.flash_document.document_tile_bounds``). Interval
+    overlap is a superset of "the tiles share an id" for arbitrary ids; the
+    exact per-score mask still runs on every retained tile.
     """
-    doc = cast("Any", doc_tensor)
-    lane = cute.arch.lane_idx()
-    bits = cutlass.Int32(0)
-    for i in range(4):
-        doc_id = cast(
-            "Any",
-            cutlass.Int32(doc[start + lane + cutlass.Int32(i * 32), doc_bh]),
+    bounds = cast("Any", bounds_tensor)
+    doc_bh = bh // doc_heads_per_batch
+    q_lo = cutlass.Int32(bounds[m_block, doc_bh, 0])
+    q_hi = cutlass.Int32(bounds[m_block, doc_bh, 1])
+    k_lo = cutlass.Int32(bounds[n_block, doc_bh, 0])
+    k_hi = cutlass.Int32(bounds[n_block, doc_bh, 1])
+    return (n_block <= m_block) & (k_hi >= q_lo) & (k_lo <= q_hi)
+
+
+def document_tile_needs_mask(
+    bounds_tensor: object,
+    bh: cutlass.Int32,
+    doc_heads_per_batch: cutlass.Int32,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+) -> cutlass.Boolean:
+    """Whether the causal same-document mask may hide a score of this tile.
+
+    False only when the KV tile is strictly below the diagonal and both tiles
+    hold a single, identical document id (the id-bounds table's min and max
+    agree), which makes every (row, key) pair visible.
+    """
+    bounds = cast("Any", bounds_tensor)
+    doc_bh = bh // doc_heads_per_batch
+    q_lo = cutlass.Int32(bounds[m_block, doc_bh, 0])
+    q_hi = cutlass.Int32(bounds[m_block, doc_bh, 1])
+    k_lo = cutlass.Int32(bounds[n_block, doc_bh, 0])
+    k_hi = cutlass.Int32(bounds[n_block, doc_bh, 1])
+    return (n_block >= m_block) | (q_lo != q_hi) | (k_lo != k_hi) | (q_lo != k_lo)
+
+
+def document_tile_range_warp(
+    bounds_tensor: object,
+    doc_bh: cutlass.Int32,
+    m_block: cutlass.Int32,
+    num_kv: int,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """Warp-parallel inclusive ``[first, last]`` KV tile range of a query tile.
+
+    ``bounds_tensor`` is the wrapper-built ``(num_kv, batch, 2)`` table of the
+    smallest / largest document id in each 128-token tile. A KV tile is kept
+    when it is on or below the diagonal and its id interval overlaps the query
+    tile's. For ARBITRARY id assignments that is a superset of "the two tiles
+    share an id" (a shared id lies inside both intervals), so no monotone or
+    packed layout is assumed: ``[first, last]`` is a contiguous superset of the
+    active tiles and the exact per-score document mask still runs on every
+    retained tile. Lane ``l`` owns tiles ``l, l + 32, ...`` (two loads each)
+    and one butterfly min/max pair merges the lanes, so the prelude costs
+    ``2 * ceil(num_kv / 32)`` loads and 10 shuffles per lane. Falls back to
+    the diagonal tile when nothing is active (it always is under
+    ``doc_q == doc_k`` & causal). Must be called by a full, converged warp.
+    """
+    bounds = cast("Any", bounds_tensor)
+    lane = cutlass.Int32(cute.arch.lane_idx())
+    q_lo = cutlass.Int32(bounds[m_block, doc_bh, 0])
+    q_hi = cutlass.Int32(bounds[m_block, doc_bh, 1])
+    first = cutlass.Int32(num_kv)
+    last = cutlass.Int32(-1)
+    for i in range((num_kv + 31) // 32):
+        t = lane + cutlass.Int32(i * 32)
+        t_c = cutlass.min(t, cutlass.Int32(num_kv - 1))
+        k_lo = cutlass.Int32(bounds[t_c, doc_bh, 0])
+        k_hi = cutlass.Int32(bounds[t_c, doc_bh, 1])
+        active = (t <= m_block) & (k_hi >= q_lo) & (k_lo <= q_hi)
+        first = cutlass.Int32(
+            cutlass.select_(active & (first == cutlass.Int32(num_kv)), t, first)
         )
-        bits = bits | (cutlass.Int32(1) << (doc_id & cutlass.Int32(31)))
+        last = cutlass.Int32(cutlass.select_(active, t, last))
     for offset in (16, 8, 4, 2, 1):
-        bits = bits | cute.arch.shuffle_sync_bfly(
-            bits,
-            offset=offset,
-            mask=-1,
-            mask_and_clamp=31,
+        first = cutlass.min(
+            first,
+            cute.arch.shuffle_sync_bfly(
+                first, offset=offset, mask=-1, mask_and_clamp=31
+            ),
         )
-    return bits
+        last = cutlass.max(
+            last,
+            cute.arch.shuffle_sync_bfly(
+                last, offset=offset, mask=-1, mask_and_clamp=31
+            ),
+        )
+    first = cutlass.Int32(
+        cutlass.select_(first == cutlass.Int32(num_kv), m_block, first)
+    )
+    last = cutlass.Int32(cutlass.select_(last < cutlass.Int32(0), m_block, last))
+    return first, last
 
 
 # ``2 * log2(e)``: ``tanh(y) = 1 - 2 / (exp2(2 * log2(e) * y) + 1)``.

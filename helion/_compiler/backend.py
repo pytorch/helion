@@ -25,6 +25,7 @@ from .cute.attention_plan import CAUSAL_MASK_KIND
 from .cute.attention_plan import DOCUMENT_MASK_KIND
 from .cute.attention_plan import PREFIX_LM_MASK_KIND
 from .cute.attention_plan import RELATIVE_BIAS_KIND
+from .cute.attention_plan import ROW_KV_BEGIN_MASK_KIND
 from .cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from .cute.attention_plan import SOFTCAP_KIND
 from .cute.attention_plan import TENSOR_BIAS_KIND
@@ -81,6 +82,7 @@ class FlashSearchSurface(NamedTuple):
     has_row_epilogue: bool
     plain_row_body: bool
     has_score_modifiers: bool
+    score_modifier_kinds: tuple[str, ...]
     tmem_rowmax_compatible: bool = False
     causal_resident_compatible: bool = False
 
@@ -2443,6 +2445,41 @@ def _attention_document_mask_name(
     return (lhs[0], lhs[2]) if {lhs[1], rhs[1]} == {"q", "kv"} else None
 
 
+def _attention_row_kv_begin_mask_name(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[str, _AttentionBatchIndex] | None:
+    """Match ``kv_idx >= lb[batch, q_tile]`` (or ``lb[...] <= kv_idx``).
+
+    ``lb`` is a ``[B, S]`` per-row KV lower bound loaded at the Q tile, the
+    document-table index form of ``_attention_doc_id_load``.
+    """
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or len(node.args) < 2
+    ):
+        return None
+    if node.target is torch.ops.aten.ge.Tensor:
+        kv_node, bound_node = node.args[:2]
+    elif node.target is torch.ops.aten.le.Tensor:
+        bound_node, kv_node = node.args[:2]
+    else:
+        return None
+    if not _attention_is_kv_tile_index(kv_node, kv_block_id):
+        return None
+    bound = _attention_doc_id_load(
+        bound_node,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if bound is None or bound[1] != "q":
+        return None
+    return bound[0], bound[2]
+
+
 def _attention_mask_modifier_from_predicate(
     pred: torch.fx.Node,
     q_placeholder: torch.fx.Node,
@@ -2484,6 +2521,8 @@ def _attention_mask_modifier_from_predicate(
         window = None
         document_name = None
         document_index: _AttentionBatchIndex | None = None
+        row_kv_begin_name = None
+        row_kv_begin_index: _AttentionBatchIndex | None = None
         for term in and_terms:
             if _attention_is_causal_predicate(
                 term,
@@ -2512,7 +2551,30 @@ def _attention_mask_modifier_from_predicate(
                     return None
                 document_name, document_index = term_document
                 continue
+            term_row_kv_begin = _attention_row_kv_begin_mask_name(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            if term_row_kv_begin is not None:
+                if row_kv_begin_name is not None:
+                    return None
+                row_kv_begin_name, row_kv_begin_index = term_row_kv_begin
+                continue
             return None
+        if row_kv_begin_name is not None:
+            if not has_causal or window is not None or document_name is not None:
+                return None
+            return AttentionScoreModifier(
+                ROW_KV_BEGIN_MASK_KIND,
+                tensor_name=row_kv_begin_name,
+                index_mode=row_kv_begin_index.mode
+                if row_kv_begin_index is not None
+                else None,
+                index_divisor=row_kv_begin_index.divisor
+                if row_kv_begin_index is not None
+                else None,
+            )
         if has_causal and window is not None and document_name is None:
             return AttentionScoreModifier(
                 SLIDING_WINDOW_MASK_KIND,
@@ -3411,6 +3473,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(
                     pattern.score_plan
                 ),
+                score_modifier_kinds=pattern.score_plan.modifier_kinds,
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(
