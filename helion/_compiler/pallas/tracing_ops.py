@@ -2007,12 +2007,12 @@ def _compute_grid_and_block_sizes(
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
         if block_id in aligned_tiles:
-            # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S.
+            # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S (0 when empty).
             begin, end = _get_loop_begin_and_end(state, i)
             sublane = aligned_tiles[block_id]
             a_start = f"(({begin}) - ({begin}) % {sublane})"
             a_end = f"((({end}) + {sublane} - 1) // {sublane} * {sublane})"
-            numel_expr = f"({a_end} - {a_start})"
+            numel_expr = f"jnp.where(({end}) > ({begin}), {a_end} - {a_start}, 0)"
         else:
             numel_expr = _get_loop_numel(state, i)
         grid_parts.append(

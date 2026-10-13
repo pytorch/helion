@@ -167,7 +167,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         code, out = _run(
             seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
         )
-        self.assertIn("pl.program_id(0) != 0", code)
+        self.assertIn("pl.program_id(0) == 0", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @parametrize("kernel", _BMM_KERNELS)
@@ -425,7 +425,8 @@ class TestPallasJaggedCarryBmm(TestCase):
         "offsets",
         [
             [0, 0, 16],  # leading empty
-            [0, 5, 5, 16],  # interior empty
+            [5, 5, 13, 16],  # leading empty at unaligned non-zero offset
+            [0, 5, 5, 5, 20],  # interior and repeated empties at an unaligned row
             [0, 16, 16],  # trailing empty
         ],
     )
@@ -436,10 +437,62 @@ class TestPallasJaggedCarryBmm(TestCase):
     ) -> None:
         # Zero-length groups (s == e) iterate no tiles; carry threads the neighbours.
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        _code, out = _run(
+        code, out = _run(
             seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
         )
-        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
+        self.assertIn("jnp.where(e > s, ", code)
+        ref = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        torch.testing.assert_close(out[offsets[0] :], ref[offsets[0] :])
+
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_pad_rows_zeroed(self, loop_type: str) -> None:
+        # Unowned rows in a non-empty group's S-aligned window ([offs[0] - offs[0] % S,
+        # offs[0])) are zeroed, while an empty group ([5, 5]) writes nothing.
+        @helion.kernel(backend="pallas")
+        def jagged_bmm_into(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            dense: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            B, D, K = dense.shape
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st, kt in hl.tile((s, 0), (e, K)):
+                    acc = hl.zeros([st, kt], dtype=torch.float32)
+                    for dt in hl.tile(0, D):
+                        acc = acc + torch.matmul(jagged[st, dt], dense[g, dt, kt])
+                    out[st, kt] = acc.to(out.dtype)
+            return out
+
+        seq_offsets, jagged, dense = _inputs(
+            [5, 5, 13, 61, 192], 128, 128, torch.bfloat16
+        )
+        out = torch.full(
+            (jagged.shape[0], dense.shape[2]),
+            7,
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        _code, res = code_and_output(
+            jagged_bmm_into,
+            (seq_offsets, jagged, dense, out),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        ref = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        torch.testing.assert_close(res[:5], torch.zeros_like(res[:5]))
+        empty_offsets = torch.tensor([5, 5], dtype=torch.int32, device=DEVICE)
+        empty_out = torch.full_like(out[:32], 7)
+        _code, empty_res = code_and_output(
+            jagged_bmm_into,
+            (empty_offsets, jagged[:32], dense[:1], empty_out),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(empty_res, torch.full_like(empty_res, 7))
+        torch.testing.assert_close(res[5:], ref[5:])
 
     @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
     def test_elementwise_map_axis(self, loop_type: str) -> None:
