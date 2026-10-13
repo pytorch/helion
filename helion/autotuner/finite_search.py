@@ -14,8 +14,10 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .base_search import _AutotunableKernel
+    from .benchmark_objective import BenchmarkObjective
     from .benchmark_provider import BenchmarkProvider
     from .config_generation import ConfigGeneration
+    from .objective_timing import ObjectiveTiming
 
 
 class FiniteSearch(BaseSearch):
@@ -31,14 +33,23 @@ class FiniteSearch(BaseSearch):
         configs: Sequence[Config] | None = None,
         *,
         benchmark_provider_cls: Callable[..., BenchmarkProvider] | None = None,
+        benchmark_objective: BenchmarkObjective | None = None,
+        objective_timing: ObjectiveTiming | None = None,
     ) -> None:
         if benchmark_provider_cls is None:
-            super().__init__(kernel, args)
+            super().__init__(
+                kernel,
+                args,
+                benchmark_objective=benchmark_objective,
+                objective_timing=objective_timing,
+            )
         else:
             super().__init__(
                 kernel,
                 args,
                 benchmark_provider_cls=benchmark_provider_cls,
+                benchmark_objective=benchmark_objective,
+                objective_timing=objective_timing,
             )
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,

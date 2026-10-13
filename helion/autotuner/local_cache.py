@@ -28,6 +28,8 @@ from ..runtime.cute_structural_config import require_same_structural_policy
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
+from .benchmark_objective import BenchmarkObjectiveError
+from .objective_timing import ObjectiveBenchmark
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -254,6 +256,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
     def _generate_key(self) -> LooseAutotuneCacheKey:
         from .benchmark_provider import _MultiShapeAutotuneArgs
 
+        self.autotuner._validate_timing_policy()
         multi_args = (
             self.args if isinstance(self.args, _MultiShapeAutotuneArgs) else None
         )
@@ -322,6 +325,49 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
             ),
         )
+        if self.autotuner.timing_policy is not None:
+            from .search_timing import timing_error
+
+            timing_policy = self.autotuner.timing_policy
+            timing_policy.validate_settings(self.autotuner.settings)
+            policy = self.autotuner.cache_policy()
+            if policy is None:
+                timing_error(
+                    "Profiler search requires a cacheable built-in search policy"
+                )
+            encoded = json.dumps(
+                _search_policy_json_value(
+                    {
+                        "search": policy,
+                        "timing": timing_policy.cache_record(),
+                    }
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+            search_policy_hash = hashlib.sha256(encoded).hexdigest()
+        extra_cache_key = self.kernel.extra_cache_key()
+        if isinstance(self.autotuner.objective_benchmark, ObjectiveBenchmark):
+            extra_cache_key = self.autotuner._objective_cache_key(extra_cache_key)
+            policy = self.autotuner.cache_policy()
+            if policy is None:
+                raise BenchmarkObjectiveError(
+                    "Pipeline objectives require a cacheable built-in search policy"
+                )
+            search_policy_hash = hashlib.sha256(
+                json.dumps(
+                    _search_policy_json_value(
+                        {
+                            "search": policy,
+                            "objective": self.autotuner.objective_benchmark.epoch,
+                        }
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest()
         return LooseAutotuneCacheKey(
             specialization_key=specialization_key,
             extra_results=extra_results,
@@ -331,7 +377,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             runtime_name=runtime_name,
             backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
-            extra_cache_key=self.kernel.extra_cache_key(),
+            extra_cache_key=extra_cache_key,
             best_of_k=self.autotuner.settings.autotune_best_of_k,
             search_policy_hash=search_policy_hash,
         )
@@ -340,6 +386,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         return get_helion_cache_dir() / f"{self.key.stable_hash()}.best_config"
 
     def get(self) -> Config | None:
+        self.autotuner._validate_timing_policy()
         path = self._get_local_cache_path()
         try:
             data = json.loads(path.read_text())
@@ -364,6 +411,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         )
 
     def put(self, config: Config) -> None:
+        self.autotuner._validate_timing_policy()
         path = self._get_local_cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -470,6 +518,10 @@ def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
         if not autotuner.kernel.is_cacheable():
             return None
         return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
-    except Exception:
+    except Exception as error:
+        if autotuner.timing_policy is not None:
+            from .search_timing import raise_timing_error
+
+            raise_timing_error(error)
         log.debug("Could not compute autotune cache hash", exc_info=True)
         return None

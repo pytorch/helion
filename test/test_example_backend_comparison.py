@@ -30,8 +30,30 @@ def test_catalog_covers_example_kernel_modules():
             for node in ast.walk(tree)
         ):
             kernel_modules.add(".".join(path.relative_to(root).with_suffix("").parts))
-    # This shared engine is exercised by its eight public linear examples.
-    assert kernel_modules - set(cases.MODULES) == {"linear.linear_attention_engine"}
+    # Shared helpers use the public linear cases. Serving programs have their
+    # own catalogues because their contracts differ from those example cases.
+    shared_helpers = {
+        "linear.linear_attention_engine",
+        "linear.linear_attention_preprocessing",
+    }
+    dedicated_catalogs = {
+        "linear.mamba2_ssd": "mamba2_ssd_inputs",
+        "linear.recurrent_decode": "recurrent_decode_inputs",
+        "linear.retention_prefill": "retention_prefill_inputs",
+    }
+    assert kernel_modules - set(cases.MODULES) == (
+        shared_helpers | dedicated_catalogs.keys()
+    )
+    for module, catalog in dedicated_catalogs.items():
+        path = root.parent / "benchmarks" / "cute" / f"{catalog}.py"
+        imports = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                imports.add(node.module)
+                imports.update(f"{node.module}.{alias.name}" for alias in node.names)
+            elif isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+        assert f"examples.{module}" in imports
     assert len(cases.MODULES) == len(set(cases.MODULES))
     assert all(len(shapes) == 3 for _, shapes in cases.CHECKS.values())
 

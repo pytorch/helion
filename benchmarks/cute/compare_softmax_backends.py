@@ -209,12 +209,11 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
         from quack.cute_dsl_utils import (  # pyrefly: ignore [missing-import]
             torch2cute_dtype_map,
         )
-        from quack.softmax import (  # pyrefly: ignore [missing-import]
-            _compile_softmax_fwd,
-        )
+        from quack.softmax import Softmax  # pyrefly: ignore [missing-import]
 
         cute_dtype = torch2cute_dtype_map[x.dtype]
-        compiled_kernel = _compile_softmax_fwd(cute_dtype, cute_dtype, args.n)
+        compiled_kernel = Softmax.compile(cute_dtype, cute_dtype, args.n)
+        assert callable(compiled_kernel)
         out = torch.empty_like(x)
         fn = lambda: compiled_kernel(x, out)  # noqa: E731
         fn()

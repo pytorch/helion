@@ -706,6 +706,7 @@ def chunk_fwd_h_delta_helion(
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     k_pre_scaled: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    final_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Serial state pass for the delta rule. Walk i = 0 -> N-1 carrying the state
     S; h_all[i] is the state entering chunk i. The chunk walk is serial; DV is
@@ -726,6 +727,9 @@ def chunk_fwd_h_delta_helion(
                 + (k[i] * exp(gc_last[None, :] - gc[i])).T @ v_new[i]
         With k_pre_scaled=True the key arrives with exp(gc_last - gc) already
         applied, so this serial walk only decays the carry.
+
+    When supplied, final_state receives the final FP32 carry directly. This
+    avoids reconstructing it from the rounded state entering the last chunk.
     """
     BH = k.size(0)
     N = k.size(1)
@@ -771,6 +775,9 @@ def chunk_fwd_h_delta_helion(
                     )
                 h_orig = h_orig * torch.exp2(gl * RCP_LN2)[:, None]
             h_acc = hl.dot(k_i.transpose(-2, -1), vnew_i.to(k_i.dtype), acc=h_orig)
+
+        if final_state is not None:
+            final_state[idx, :, tile_dv] = h_acc
 
     return h_all, v_new
 
@@ -852,10 +859,13 @@ def chunk_fwd_o_helion(
     h: torch.Tensor,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Output computation for all chunks in parallel (no correction). With
     use_g=False the decay is compiled out for variants with no decay. The output
     is linear in q, so scale is applied to it and q can be passed unscaled.
+    An optional [B, H, N, C, DV] output view writes directly to the caller's
+    layout, including a token-major allocation with head-major view strides.
     """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
@@ -863,7 +873,10 @@ def chunk_fwd_o_helion(
     DV = v.size(2)
     hl.specialize(D)
 
-    out = torch.empty([BHN, C, DV], dtype=q.dtype, device=q.device)
+    if output is None:
+        out = torch.empty([BHN, C, DV], dtype=q.dtype, device=q.device)
+    else:
+        out = output
 
     for tile_bhn, tile_dv in hl.tile([BHN, DV]):
         o_cross = hl.zeros([tile_bhn, C, tile_dv], dtype=torch.float32)
@@ -889,7 +902,23 @@ def chunk_fwd_o_helion(
         vt = v[tile_bhn, :, tile_dv]
         # o_intra = attn @ v accumulated onto o_cross
         o = hl.dot(attn.to(vt.dtype), vt, acc=o_cross)
-        out[tile_bhn, :, tile_dv] = (o * scale).to(out.dtype)
+        if output is None:
+            out[tile_bhn, :, tile_dv] = (o * scale).to(out.dtype)
+        else:
+            heads = output.size(1)
+            chunks = output.size(2)
+            row = tile_bhn.index[:, None, None]
+            hl.store(
+                output,
+                [
+                    row // (heads * chunks),
+                    row // chunks % heads,
+                    row % chunks,
+                    idx[None, :, None],
+                    tile_dv.index[None, None, :],
+                ],
+                (o * scale).to(output.dtype),
+            )
 
     return out
 

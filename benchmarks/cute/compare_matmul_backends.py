@@ -1124,7 +1124,9 @@ def _benchmark_quack(args: argparse.Namespace) -> dict[str, Any]:
     dtype, a, b, bias, residual = _make_matmul_problem(args)
     expected = _matmul_expected(args, a, b, bias, residual, dtype)
     if not args.skip_correctness:
-        _check_close(gemm(a, b, bias=bias, out_dtype=dtype), expected, dtype)
+        actual = gemm(a, b, bias=bias, out_dtype=dtype)
+        assert isinstance(actual, torch.Tensor)
+        _check_close(actual, expected, dtype)
     fn = lambda: gemm(a, b, bias=bias, out_dtype=dtype)  # noqa: E731
     stats = _bench_steady(
         fn,

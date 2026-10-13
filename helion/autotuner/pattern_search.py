@@ -20,8 +20,10 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from . import ConfigSpec
     from .base_search import _AutotunableKernel
+    from .benchmark_objective import BenchmarkObjective
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+    from .objective_timing import ObjectiveTiming
 
 
 class InitialPopulationStrategy(enum.Enum):
@@ -76,6 +78,8 @@ class PatternSearch(PopulationBasedSearch):
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
+        benchmark_objective: BenchmarkObjective | None = None,
+        objective_timing: ObjectiveTiming | None = None,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -104,7 +108,13 @@ class PatternSearch(PopulationBasedSearch):
             compile_timeout_lower_bound: Lower bound for adaptive compile timeout in seconds.
             compile_timeout_quantile: Quantile of compile times to use for adaptive timeout.
         """
-        super().__init__(kernel, args, finishing_rounds=finishing_rounds)
+        super().__init__(
+            kernel,
+            args,
+            finishing_rounds=finishing_rounds,
+            benchmark_objective=benchmark_objective,
+            objective_timing=objective_timing,
+        )
         if initial_population_strategy is None:
             initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         self.initial_population_strategy = initial_population_strategy

@@ -7,6 +7,7 @@ import math
 import operator
 import random
 from typing import TYPE_CHECKING
+from typing import cast
 
 from .. import exc
 from .base_search import BenchmarkResult
@@ -23,6 +24,7 @@ from .effort_profile import FlashStructuralSearchConfig
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
 from .search_space_logger import canonical_config_id
+from .search_timing import ProfilerSweepTrace
 from helion._dist_utils import sync_seed
 
 _CUTE_FLASH_LANE_POLICY_VERSION = 16
@@ -44,10 +46,13 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .benchmark_objective import BenchmarkObjective
+    from .benchmark_objective import WorkloadMeasurement
     from .benchmarking import MirroredBenchmarkTrace
     from .config_generation import ConfigGeneration
     from .config_generation import CoordinateNeighborProjection
     from .config_generation import FlatConfig
+    from .objective_timing import ObjectiveTiming
 
 try:
     import numpy as np
@@ -198,6 +203,8 @@ class LFBOPatternSearch(PatternSearch):
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
         flash_structural_search: FlashStructuralSearchConfig | None = None,
+        benchmark_objective: BenchmarkObjective | None = None,
+        objective_timing: ObjectiveTiming | None = None,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -218,11 +225,16 @@ class LFBOPatternSearch(PatternSearch):
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
+            benchmark_objective=benchmark_objective,
+            objective_timing=objective_timing,
         )
         # Parallel to train_x/train_y: the live member behind each training
         # row (None for externally seeded rows). Used to sync labels with
         # rebenchmarked timings before each surrogate fit.
         self._train_members: list[PopulationMember | None] = []
+        self._objective_training_configs: list[Config] | None = (
+            [] if self.objective_benchmark is not None else None
+        )
 
         # Number of neighbors and how many to evalaute
         self.num_neighbors = num_neighbors
@@ -362,7 +374,30 @@ class LFBOPatternSearch(PatternSearch):
         rather than starting from scratch. Failed configs (perf=inf) are
         kept since the surrogate's binary classifier learns from negatives too.
         """
+        self._validate_timing_policy()
+        if self.objective_benchmark is not None:
+            for result in results:
+                if math.isfinite(result.perf):
+                    request = self.objective_benchmark.request(
+                        self.kernel, result.config, result.fn
+                    )
+                    self.objective_benchmark.check(
+                        request, result.objective_measurement, result.perf
+                    )
         for result in results:
+            if self.timing_policy is not None:
+                if result.timing_policy != self.timing_policy:
+                    from .search_timing import timing_error
+
+                    timing_error("Foreign external training timing domain")
+                if math.isfinite(result.perf):
+                    self._check_timing_measurement(result.measurement)
+                    assert result.measurement is not None
+                    result.measurement.validate_callable(self.timing_policy, result.fn)
+                    if result.perf != result.measurement.perf:
+                        from .search_timing import timing_error
+
+                        timing_error("External score differs from measurement")
             try:
                 flat_values = self.config_gen.flatten(result.config)
                 encoded = self.config_gen.encode_config(flat_values)
@@ -374,6 +409,7 @@ class LFBOPatternSearch(PatternSearch):
                 result.perf,
                 result.config,
                 result.fn,
+                objective_measurement=result.objective_measurement,
             )
 
     def _append_training_sample(
@@ -383,7 +419,20 @@ class LFBOPatternSearch(PatternSearch):
         config: Config,
         fn: object,
         member: PopulationMember | None = None,
+        objective_measurement: WorkloadMeasurement | None = None,
     ) -> None:
+        if self.objective_benchmark is not None:
+            self._validate_objective()
+            if math.isfinite(perf):
+                if member is not None:
+                    self._check_objective_member(member)
+                    objective_measurement = member.objective_measurement
+                request = self.objective_benchmark.request(
+                    self.kernel, config, cast("Callable[..., object]", fn)
+                )
+                self.objective_benchmark.check(request, objective_measurement, perf)
+        if self._objective_training_configs is not None:
+            self._objective_training_configs.append(copy.deepcopy(config))
         self.train_x.append(encoded)
         self.train_y.append(perf)
         self._train_members.append(member)
@@ -423,6 +472,14 @@ class LFBOPatternSearch(PatternSearch):
         failed_configs: set[Config],
         failed_source_hashes: set[str],
     ) -> None:
+        if self.objective_benchmark is not None:
+            self._validate_objective()
+            assert self._objective_training_configs is not None
+            assert not failed_source_hashes
+            for index, config in enumerate(self._objective_training_configs):
+                if config in failed_configs:
+                    self.train_y[index] = math.inf
+            return
         if self.train_configs is None:
             return
         if self.train_source_hashes is None:
@@ -439,7 +496,10 @@ class LFBOPatternSearch(PatternSearch):
         """Refresh train_y from live members so rebenchmarked timings (which
         replace noisy one-shot measurements) are what the surrogate learns
         from. Rows without a live member keep their recorded label."""
+        self._validate_objective()
         for index, member in enumerate(self._train_members):
+            if member is not None:
+                self._check_objective_member(member)
             if member is None or index >= len(self.train_y):
                 continue
             if member.perfs and math.isfinite(self.train_y[index]):
@@ -4340,8 +4400,26 @@ class LFBOPatternSearch(PatternSearch):
 
     @staticmethod
     def _flash_terminal_trace_metric(
-        member_ids: Sequence[str], trace: MirroredBenchmarkTrace
+        member_ids: Sequence[str], trace: MirroredBenchmarkTrace | ProfilerSweepTrace
     ) -> dict[str, object]:
+        if isinstance(trace, ProfilerSweepTrace):
+            return {
+                "base_order": list(member_ids),
+                "orders": trace.orders,
+                "target_ms": trace.target_ms,
+                "repeat_reference_perf_ms": trace.repeat_reference_perf_ms,
+                "sweep_count": trace.sweep_count,
+                "calls_per_sample": trace.calls_per_sample,
+                "total_calls": trace.total_calls,
+                "mean_kernel_work_ms": [
+                    {"config_id": name, "value": value}
+                    for name, value in zip(member_ids, trace.means_ms, strict=True)
+                ],
+                "observations": [
+                    [block.record() for block in blocks]
+                    for blocks in trace.observations
+                ],
+            }
         return {
             "base_order": list(member_ids),
             "target_ms": trace.target_ms,
@@ -4399,7 +4477,11 @@ class LFBOPatternSearch(PatternSearch):
             "policy_version": _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION,
             "lane_policy_version": _CUTE_FLASH_LANE_POLICY_VERSION,
             "coordinate_policy": _FLASH_TERMINAL_COORDINATE_POLICY,
-            "measurement_policy": _FLASH_TERMINAL_MEASUREMENT_POLICY,
+            "measurement_policy": (
+                "mirrored_profiler_kernel_work_mean_v1"
+                if self.timing_policy is not None
+                else _FLASH_TERMINAL_MEASUREMENT_POLICY
+            ),
             "rounds_planned": policy.terminal_coordinate_rounds,
             "beam_width": policy.terminal_coordinate_beam_width,
             "maximum_projection_parent_count": 1
@@ -5198,6 +5280,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
         flash_structural_search: FlashStructuralSearchConfig | None = None,
+        benchmark_objective: BenchmarkObjective | None = None,
+        objective_timing: ObjectiveTiming | None = None,
     ) -> None:
         super().__init__(
             kernel=kernel,
@@ -5219,6 +5303,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
             polish_rounds=polish_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
+            benchmark_objective=benchmark_objective,
+            objective_timing=objective_timing,
             flash_structural_search=flash_structural_search,
         )
         self._encoded_to_flat_mapping: list[tuple[int, int, int]] | None = None
