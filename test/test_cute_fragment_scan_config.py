@@ -1039,11 +1039,18 @@ def test_fragment_threads_scan_loop_and_launch_ownership(count, mode):
 
 
 def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
+    from helion._compiler.generate_ast import GenerateAST
+
     bound = _bind()
     assert bound.to_code(_thread_config(bound, 128)) == bound.to_code(
         bound.config_spec.default_config()
     )
-    assert "block=(512, 1, 1)" in bound.to_code(_thread_config(bound, 512))
+    with patch.object(
+        GenerateAST,
+        "_try_codegen_topk_root",
+        side_effect=AssertionError("explicit fragment owns root"),
+    ):
+        assert "block=(512, 1, 1)" in bound.to_code(_thread_config(bound, 512))
     with (
         patch(
             "helion._compiler.cute.computed_fragment.computed_fragment_supported",

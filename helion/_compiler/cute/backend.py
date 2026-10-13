@@ -1504,6 +1504,7 @@ class CuteBackend(Backend):
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import squeeze_lowering
+        from .aten_lowering import NumericExtremumLowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
@@ -1512,6 +1513,8 @@ class CuteBackend(Backend):
             # Register them before Inductor turns them into a ReinterpretView;
             # the CuTe handler uses the traced output shape, not a scalar dim.
             return squeeze_lowering
+        if node.target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
+            return NumericExtremumLowering()
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -1569,13 +1572,23 @@ class CuteBackend(Backend):
         from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .literal_dims import annotate_literal_dims
+        from .register_region import plan_register_region
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
             plan_split_single_token_rank1_recurrence,
         )
+        from .topk import plan_topk_root
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
+        device_function.cute_state.topk_plan = plan_topk_root(graphs, tile_strategy)
+        if device_function.cute_state.topk_plan is not None:
+            return
+        device_function.cute_state.register_region_plan = plan_register_region(
+            graphs, tile_strategy
+        )
+        if device_function.cute_state.register_region_plan is not None:
+            return
         direct_affine_requested = (
             config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
         )
@@ -1678,6 +1691,7 @@ class CuteBackend(Backend):
                 "cute_fragment_register_loads",
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
+                "cute_fragment_topk_network",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",
@@ -1752,6 +1766,23 @@ class CuteBackend(Backend):
             or key == "cute_min_blocks_per_mp"
             or key == "cute_matmul_family"
             or key == "cute_warp_mma_warps"
+            or key
+            in (
+                "cute_topk_lanes_per_row",
+                "cute_topk_rows_per_block",
+                "cute_topk_vector_width",
+                "cute_topk_output_vector_width",
+                "cute_topk_value_mode",
+                "cute_topk_key_dtype",
+                "cute_topk_rank_mode",
+                "cute_topk_selection_layout",
+                "cute_topk_sort_network",
+                "cute_topk_key_encoder",
+                "cute_topk_defer_value_gathers",
+                "cute_topk_merge_schedule",
+                "cute_topk_coarse_keys",
+                "cute_topk_key_recovery",
+            )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )
@@ -2630,7 +2661,8 @@ class CuteBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
-        self._check_thread_axis(axis)
+        # Complete root owners can discard this scalar grid setup. Validate
+        # surviving coordinates after ownership lowering and dead-code removal.
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
             f" + {dtype}(cute.arch.thread_idx()[{axis}])"
@@ -2710,7 +2742,7 @@ class CuteBackend(Backend):
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
-        self._check_thread_axis(axis)
+        # A complete root owner can also discard the speculative grid mask.
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
@@ -3087,6 +3119,16 @@ class CuteBackend(Backend):
             return launcher_args
 
         direct_affine_plan = device_function.cute_state.direct_affine_plan
+        topk_plan = device_function.cute_state.topk_plan
+        if topk_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({topk_plan.threads}, 1, 1)"
+            )
+        register_region_plan = device_function.cute_state.register_region_plan
+        if register_region_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({register_region_plan.threads}, 1, 1)"
+            )
         if direct_affine_plan is not None:
             x, y, z = direct_affine_plan.cta_shape
             check_thread_block_dims(
