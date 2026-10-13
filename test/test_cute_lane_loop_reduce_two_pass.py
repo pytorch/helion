@@ -710,9 +710,14 @@ def _jagged_expectations(
     x: torch.Tensor, offsets: torch.Tensor
 ) -> dict[Callable[..., object], tuple[torch.Tensor, ...]]:
     row_sums = _jagged_row_sums(x, offsets)
+    # Cancellation in the two reductions amplifies FP32 oracle rounding when
+    # their results are multiplied. Accumulate the scaled reference in FP64.
+    scaled_rows = _jagged_row_sums(x.double(), offsets)
     return {
         _jagged_row_sums_stored: (row_sums.sum(dim=1),),
-        _jagged_row_sums_scaled: (row_sums * row_sums.sum(dim=1, keepdim=True),),
+        _jagged_row_sums_scaled: (
+            (scaled_rows * scaled_rows.sum(dim=1, keepdim=True)).to(x.dtype),
+        ),
         _jagged_row_sums_running_max: (row_sums.amax(dim=1),),
         _jagged_row_sums_atomically_added: (row_sums.sum(dim=1),),
         _jagged_row_sums_sum_and_max_stored: (

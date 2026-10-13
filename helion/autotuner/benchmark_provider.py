@@ -592,6 +592,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        self._cute_native_batch_records: list[dict[str, Any]] = []
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
         self._no_viable_config_error: Exception | None = None
         self._effective_source_hashes: set[str] = set()
@@ -648,15 +649,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         requests = [
             objective.request(self.kernel, config, fn) for config, fn in members
         ]
+        from ..runtime.cute.native_required import require_cached_native
 
         try:
-            workloads = objective.measure(
-                requests,
-                phase=phase,
-                warmup_ms=1,
-                rep_ms=rep_ms,
-                **({"samples": samples} if samples is not None else {}),
-            )
+            with require_cached_native(self.settings.autotune_cute_native_required):
+                workloads = objective.measure(
+                    requests,
+                    phase=phase,
+                    warmup_ms=1,
+                    rep_ms=rep_ms,
+                    **({"samples": samples} if samples is not None else {}),
+                )
         finally:
             for fn in dict.fromkeys(fn for _, fn in members):
                 self._clear_jit_fast_path_caches(fn)
@@ -1415,6 +1418,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         source_hashes: dict[int, str] = {}
         seen_sources = self._effective_source_hashes
 
+        # Generate only a small lookahead batch, draining every worker before
+        # ordinary parent module import and before any native/timed execution.
+        source_batch = None
+        prepared_sources = {}
+        source_batch_end = 0
+        if self.settings.autotune_cute_source_workers > 1:
+            from ..runtime.cute.source_batch import SourceBatch
+
+            source_batch = SourceBatch.create(self.kernel, self.args)
+
         # Compilation phase
         for i, config in enumerate(all_configs):
             if self._budget_exceeded_synced():
@@ -1424,7 +1437,37 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             captured: list[str] = [""]
             try:
                 with capture_output() as captured, _searching_candidates():
-                    compiled[i] = self.kernel.compile_config(config, allow_print=False)
+                    # A transient foreign thread can decline initial admission.
+                    # Retry after each serial config so even short batches can
+                    # recover; create/prepare retain their quiescence checks.
+                    if (
+                        source_batch is None
+                        and self.settings.autotune_cute_source_workers > 1
+                        and i > 0
+                    ):
+                        from ..runtime.cute.source_batch import SourceBatch
+
+                        source_batch = SourceBatch.create(self.kernel, self.args)
+                    if source_batch is not None and i >= source_batch_end:
+                        source_batch_end = min(
+                            i + self.settings.autotune_cute_source_workers,
+                            len(all_configs),
+                        )
+                        prepared_sources = {
+                            i + offset: source
+                            for offset, source in source_batch.prepare(
+                                all_configs[i:source_batch_end],
+                                self._budget_exceeded_synced,
+                            ).items()
+                        }
+                    if (source := prepared_sources.pop(i, None)) is not None:
+                        compiled[i] = source.bound._compile_config(
+                            config, allow_print=False, prepared_source=source
+                        )
+                    else:
+                        compiled[i] = self.kernel.compile_config(
+                            config, allow_print=False
+                        )
             except Exception as e:
                 results[i] = results[i]._replace(completed_at=time.perf_counter())
                 no_viable_config = (
@@ -1558,8 +1601,40 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         valid_indices = list(compiled.keys())
         configs = [all_configs[i] for i in valid_indices]
 
+        native_record = None
+
+        # Source workers have already drained. Native workers use fresh spawned
+        # interpreters and only fill the ordinary launcher's keyed disk cache.
+        # They all exit before the unchanged validation/measurement path below.
+        if (
+            self.settings.backend == "cute"
+            and self.settings.autotune_cute_native_workers
+        ):
+            from ..runtime.cute.native_pool import warm_native_batch
+
+            native_record = warm_native_batch(
+                self.kernel,
+                configs,
+                fns,
+                self.args,
+                budget_exceeded=self._budget_exceeded_synced,
+            )
+            self._cute_native_batch_records.append(native_record)
+
+        precompile_status: list[Literal["ok", "error", "timeout"]]
         # Precompile phase
-        if self.settings.autotune_precompile:
+        if self.settings.autotune_cute_native_required:
+            from ..runtime.cute.native_required import RequiredNativePrecompileError
+            from ..runtime.cute.native_required import provider_statuses
+
+            if native_record is None:
+                raise RequiredNativePrecompileError(
+                    "Required native workers are disabled"
+                )
+            is_workings, precompile_status = provider_statuses(
+                native_record, len(configs)
+            )
+        elif self.settings.autotune_precompile:
             futures = list(
                 starmap(
                     self._create_precompile_future,
@@ -1570,7 +1645,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 f"{desc} precompiling" if self.settings.autotune_progress_bar else None
             )
             is_workings = PrecompileFuture.wait_for_all(futures, desc=precompile_desc)
-            precompile_status: list[Literal["ok", "error", "timeout"]] = []
+            precompile_status = []
             for future, ok in zip(futures, is_workings, strict=True):
                 reason = future.failure_reason
                 if ok:
@@ -1671,17 +1746,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     source_hash is not None
                     and source_hash in self._compiler_seed_source_hashes
                 )
+                from ..runtime.cute.native_required import require_cached_native
 
-                if self.objective_benchmark is not None:
-                    perf = self._benchmark_function(config, fn, objective_phase=desc)
-                elif compiler_seed_source and source_hash is not None:
-                    perf = self._benchmark_function(
-                        config,
-                        fn,
-                        effective_source_hash=source_hash,
-                    )
-                else:
-                    perf = self._benchmark_function(config, fn)
+                with require_cached_native(self.settings.autotune_cute_native_required):
+                    if self.objective_benchmark is not None:
+                        perf = self._benchmark_function(
+                            config, fn, objective_phase=desc
+                        )
+                    elif compiler_seed_source and source_hash is not None:
+                        perf = self._benchmark_function(
+                            config,
+                            fn,
+                            effective_source_hash=source_hash,
+                        )
+                    else:
+                        perf = self._benchmark_function(config, fn)
                 current_accuracy_failure = (
                     deduplicate_sources or self.objective_benchmark is not None
                 ) and len(self._accuracy_failure_config_ids) > accuracy_failure_count

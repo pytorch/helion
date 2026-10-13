@@ -9,6 +9,7 @@ import torch
 
 from helion._testing import DEVICE
 import helion.runtime
+from helion.runtime.cute.launcher import _cute_disk_cache_key
 from helion.runtime.triton.launcher import _get_persistent_state
 from helion.runtime.triton.launcher import default_launcher as triton_default_launcher
 
@@ -18,6 +19,20 @@ def _tpu_device() -> torch.device:
         return torch.device("tpu")
     except RuntimeError:
         return cast("torch.device", SimpleNamespace(type="tpu", index=None))
+
+
+class TestCuteDiskCache(unittest.TestCase):
+    def test_imported_device_helper_changes_invalidate_compiled_ir(self) -> None:
+        kernel = SimpleNamespace(_helion_cute_source_hash="unchanged-wrapper")
+        args = (kernel, (), (128, 1, 1), (), None, None)
+        with patch("helion.autotuner.base_cache.helion_key", return_value="old"):
+            old_key = _cute_disk_cache_key(*args)
+            self.assertEqual(old_key, _cute_disk_cache_key(*args))
+        with patch("helion.autotuner.base_cache.helion_key", return_value="fixed"):
+            new_key = _cute_disk_cache_key(*args)
+        self.assertIsNotNone(old_key)
+        self.assertIsNotNone(new_key)
+        self.assertNotEqual(old_key, new_key)
 
 
 class TestRuntimeGetNumSm(unittest.TestCase):

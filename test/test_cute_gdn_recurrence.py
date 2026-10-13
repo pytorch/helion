@@ -24,8 +24,10 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from ._cute_aux import _cpu_codegen
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteGdnRecurrenceHeuristic
 from helion._compiler.cute.gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
 from helion._compiler.cute.gdn_recurrence_geometry import GDN_MMA_M
 from helion._compiler.cute.gdn_recurrence_geometry import gdn_acc_load_cols
@@ -47,11 +49,13 @@ from helion._compiler.cute.gdn_recurrence_geometry import gdn_token_group_choice
 from helion._compiler.cute.gdn_recurrence_geometry import gdn_token_splits
 from helion._compiler.cute.gdn_recurrence_geometry import gdn_tokens_per_split
 from helion._compiler.cute.gdn_recurrence_geometry import gdn_update_tile_bytes
-from helion._testing import DEVICE
+from helion._hardware import HardwareInfo
 from helion._testing import EXAMPLES_DIR
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import CUTE_CHAINED_MMA_SCHEDULE_KEY
 from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
 from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
 from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
@@ -66,9 +70,9 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
 _CAPABILITY = (10, 0)
-# The launcher argument checks require CUDA tensors; fake tensors on this
-# device exercise them without a GPU.
-_FAKE_CUDA = torch.device("cuda")
+# Preserve CUDA metadata without querying the current device when CUDA has
+# already been initialized by an earlier test.
+_FAKE_CUDA = torch.device("cuda", 0)
 _PLAN_KIND = "'kind': 'gdn_recurrence_sm100'"
 _SIMT_FALLBACK = "_cute_grouped_reduce_shared_two_stage"
 
@@ -88,10 +92,10 @@ def _fake_inputs(
     gate_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, ...]:
     with FakeTensorMode():
-        k = torch.empty(batch, seqlen, heads, dhead, dtype=dtype, device=DEVICE)
-        w = torch.empty(batch, seqlen, heads, dhead, dtype=dtype, device=DEVICE)
-        u = torch.empty(batch, seqlen, heads, dstate, dtype=dtype, device=DEVICE)
-        g = torch.empty(batch, seqlen, heads, dtype=gate_dtype, device=DEVICE)
+        k = torch.empty(batch, seqlen, heads, dhead, dtype=dtype, device=_FAKE_CUDA)
+        w = torch.empty(batch, seqlen, heads, dhead, dtype=dtype, device=_FAKE_CUDA)
+        u = torch.empty(batch, seqlen, heads, dstate, dtype=dtype, device=_FAKE_CUDA)
+        g = torch.empty(batch, seqlen, heads, dtype=gate_dtype, device=_FAKE_CUDA)
     return k, w, u, g
 
 
@@ -147,7 +151,21 @@ def _gdn_fwd_h_with_head_end(
 def _sm100_environment(
     capability: tuple[int, int] = _CAPABILITY, num_sm: int = 148
 ) -> Iterator[None]:
+    # Explicit CPU metadata agrees with the mocked capability. Keep the real
+    # named-product promotion key while preventing any device-property query.
+    hardware = HardwareInfo(
+        device_kind="cuda",
+        hardware_name={
+            (8, 0): "NVIDIA A100",
+            (9, 0): "NVIDIA H100",
+            (10, 0): "NVIDIA B200",
+            (10, 3): "NVIDIA GB300",
+        }.get(capability, "CPU fixture"),
+        runtime_version="12.8",
+        compute_capability=f"sm{capability[0]}{capability[1]}",
+    )
     with (
+        patch("helion._hardware.get_hardware_info", return_value=hardware),
         patch(
             "helion.runtime.kernel.target_device_capability",
             return_value=capability,
@@ -234,6 +252,7 @@ def _captured_plan(
     overrides: dict[str, object] | None = None,
     kernel: object | None = None,
     inputs: tuple[torch.Tensor, ...] | None = None,
+    allow_unobserved: bool = False,
 ) -> object:
     from helion._compiler.cute import gdn_recurrence
 
@@ -259,8 +278,28 @@ def _captured_plan(
             kernel=kernel,
             inputs=inputs,
         )
+    # Discovery can reject unsupported inputs before the planner is reached.
+    # Other callers retain the exact one-call contract.
+    if allow_unobserved and not captured:
+        return None
     assert len(captured) == 1
     return captured[0]
+
+
+@pytest.mark.parametrize("initialized", [False, True], ids=["cold", "warm"])
+def test_gdn_fake_inputs_do_not_query_current_device(initialized: bool) -> None:
+    with (
+        _cpu_codegen(),
+        patch("torch.cuda.is_initialized", return_value=initialized),
+        patch(
+            "torch.cuda.current_device",
+            side_effect=AssertionError("CUDA current device query forbidden"),
+        ) as current_device,
+    ):
+        inputs = _fake_inputs()
+        assert all(isinstance(tensor, FakeTensor) for tensor in inputs)
+        assert all(tensor.device == torch.device("cuda", 0) for tensor in inputs)
+        current_device.assert_not_called()
 
 
 def test_gdn_recurrence_codegen_emits_sm100_plan() -> None:
@@ -410,6 +449,7 @@ def test_gdn_recurrence_unadmitted_shapes_fall_back(
                 block_v=block_v,
                 shape=shape,
                 overrides={"cute_collective_mma": True},
+                allow_unobserved=True,
             )
             is None
         )
@@ -423,7 +463,8 @@ def test_gdn_recurrence_unadmitted_shapes_fall_back(
 
 
 def test_gdn_recurrence_rejects_sm80() -> None:
-    assert _captured_plan(capability=(8, 0)) is None
+    assert _captured_plan(capability=(8, 0), allow_unobserved=True) is None
+    assert _PLAN_KIND not in _code(capability=(8, 0))
 
 
 @pytest.mark.parametrize(
@@ -434,7 +475,7 @@ def test_gdn_recurrence_rejects_other_dtypes(
     dtype: torch.dtype, gate_dtype: torch.dtype
 ) -> None:
     inputs = _fake_inputs(dtype=dtype, gate_dtype=gate_dtype)
-    assert _captured_plan(inputs=inputs) is None
+    assert _captured_plan(inputs=inputs, allow_unobserved=True) is None
     assert _PLAN_KIND not in _code(inputs=inputs)
     with _sm100_environment():
         bound = _bind(inputs=inputs)
@@ -442,7 +483,9 @@ def test_gdn_recurrence_rejects_other_dtypes(
 
 
 def test_gdn_recurrence_rejects_tile_end_coordinates() -> None:
-    assert _captured_plan(kernel=_gdn_fwd_h_with_head_end) is None
+    assert (
+        _captured_plan(kernel=_gdn_fwd_h_with_head_end, allow_unobserved=True) is None
+    )
     assert _PLAN_KIND not in _code(kernel=_gdn_fwd_h_with_head_end)
     with _sm100_environment():
         bound = _bind(kernel=_gdn_fwd_h_with_head_end)
@@ -667,6 +710,93 @@ def test_gdn_recurrence_rejects_semantic_mutations(
     assert _captured_plan(mutate=mutate) is None
 
 
+@pytest.mark.parametrize(("chunk", "block_v"), [(128, 128), (128, 64), (256, 64)])
+def test_gdn_recurrence_coexists_with_native_chained_dispatch(
+    chunk: int, block_v: int
+) -> None:
+    with (
+        _cpu_codegen(),
+        _sm100_environment(),
+        patch.object(CuteGdnRecurrenceHeuristic, "should_promote", return_value=True),
+    ):
+        bound = _bind(chunk=chunk)
+        spec = bound.config_spec  # type: ignore[attr-defined]
+        assert spec.cute_chained_matmul_search_enabled
+        assert spec.cute_chained_tcgen05_search_enabled
+        generation = ConfigGeneration(spec)
+        default = spec.default_config()
+        assert CUTE_CHAINED_MMA_SCHEDULE_KEY not in default.config
+        assert generation.unflatten(generation.flatten(default)) == default
+        seed = next(
+            seed
+            for seed in spec.compiler_seed_configs
+            if CUTE_GDN_RECURRENCE_STAGES_KEY in seed.config
+            and seed.block_sizes == [block_v]
+        )
+        config = generation.unflatten(generation.flatten(seed))
+        assert CUTE_CHAINED_MMA_SCHEDULE_KEY not in config.config
+        assert spec.normalized_config(config) == config
+        assert _PLAN_KIND in bound.to_code(config)  # type: ignore[attr-defined]
+        plain = spec.normalized_config(helion.Config(block_sizes=[block_v]))
+        assert CUTE_CHAINED_MMA_SCHEDULE_KEY not in plain.config
+
+        common = spec.normalized_config(
+            helion.Config(block_sizes=[block_v], cute_chained_mma_schedule="coalesced")
+        )
+        assert common[CUTE_CHAINED_MMA_SCHEDULE_KEY] == "coalesced"
+        common = generation.unflatten(generation.flatten(common))
+        assert spec.normalized_config(common) == common
+        source = bound.to_code(common)  # type: ignore[attr-defined]
+        assert "chain_loop_index" in source
+        assert _PLAN_KIND not in source
+        conflicting_stages = next(
+            value
+            for value in spec.cute_gdn_recurrence_stages.choices
+            if value != spec.cute_gdn_recurrence_stages.default()
+        )
+        with pytest.raises(
+            exc.InvalidConfig, match="GDN recurrence schedules conflict"
+        ):
+            spec.normalized_config(
+                helion.Config(
+                    block_sizes=[block_v],
+                    cute_chained_mma_schedule="coalesced",
+                    cute_gdn_recurrence_stages=conflicting_stages,
+                )
+            )
+        overrides = {
+            key: seed[key]
+            for key in (
+                CUTE_GDN_RECURRENCE_STAGES_KEY,
+                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+                CUTE_GDN_RECURRENCE_MMA_M_KEY,
+            )
+        }
+        overridden = spec.create_config_generation(overrides=overrides)
+        restored = overridden.unflatten(overridden.flatten(common))
+        assert CUTE_CHAINED_MMA_SCHEDULE_KEY not in restored.config
+        assert {key: restored[key] for key in overrides} == overrides
+
+
+@pytest.mark.parametrize("chunk", [128, 256])
+@pytest.mark.parametrize("dstate", [16, 32, 64])
+def test_gdn_recurrence_reference_is_normalized_without_promotion(
+    chunk: int, dstate: int
+) -> None:
+    with _cpu_codegen(), _sm100_environment():
+        bound = _bind(chunk=chunk, shape={"dstate": dstate})
+        spec = bound.config_spec  # type: ignore[attr-defined]
+        with patch.object(spec, "compiler_default_config", None):
+            reference = spec.autotune_reference_config()
+            assert CUTE_CHAINED_MMA_SCHEDULE_KEY not in reference.config
+            assert spec.normalized_config(reference) == reference
+            assert spec.default_config() == reference
+            generation = ConfigGeneration(spec)
+            assert generation.unflatten(generation.flatten(reference)) == reference
+            assert _PLAN_KIND in bound.to_code(reference)  # type: ignore[attr-defined]
+
+
 def test_gdn_recurrence_search_knobs_and_seeds() -> None:
     with _sm100_environment():
         bound = _bind()
@@ -765,6 +895,21 @@ def test_gdn_recurrence_search_knobs_and_seeds() -> None:
         for seed, config in zip(seeds, normalized, strict=True)
     ] == seeds
     assert len({str(sorted(config.items())) for config in normalized}) == 12
+    generation = ConfigGeneration(spec)
+    flat_seeds = [generation.flatten(helion.Config.from_dict(seed)) for seed in seeds]
+    assert len({tuple(flat) for flat in flat_seeds}) == 12
+    transferred = [
+        config
+        for _, config in generation.seed_flat_config_pairs()
+        if CUTE_CHAINED_MMA_SCHEDULE_KEY not in config.config
+        and CUTE_GDN_RECURRENCE_STAGES_KEY in config.config
+    ]
+    assert len(transferred) == 12
+    for seed, flat in zip(seeds, flat_seeds, strict=True):
+        restored = generation.unflatten(flat)
+        assert CUTE_CHAINED_MMA_SCHEDULE_KEY not in restored.config
+        assert {key: restored[key] for key in seed} == seed
+        assert generation.flatten(restored) == flat
     dimensions = {
         dimension.name: dimension.values
         for dimension in spec.iter_search_dimensions()
@@ -810,9 +955,9 @@ def test_gdn_recurrence_search_knobs_and_seeds() -> None:
         )
     # A depth left to the default follows the (tile, M) pair as well.
     assert (
-        spec.normalized_config(helion.Config(block_sizes=[64], **m64)).config[
-            CUTE_GDN_RECURRENCE_STAGES_KEY
-        ]
+        spec.normalized_config(
+            helion.Config(block_sizes=[64], cute_gdn_recurrence_mma_m=64)
+        ).config[CUTE_GDN_RECURRENCE_STAGES_KEY]
         == 3
     )
     # Token groups follow the (tile, warps, M) triple: two groups need two
@@ -835,9 +980,9 @@ def test_gdn_recurrence_search_knobs_and_seeds() -> None:
     # explicit count the pair cannot split is rejected (or repaired).
     four_warps = {CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY: 4}
     assert (
-        spec.normalized_config(helion.Config(block_sizes=[128], **four_warps)).config[
-            CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
-        ]
+        spec.normalized_config(
+            helion.Config(block_sizes=[128], cute_gdn_recurrence_epilogue_warps=4)
+        ).config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY]
         == 1
     )
     assert (
@@ -1114,23 +1259,40 @@ def test_gdn_recurrence_raises_the_dstate_tile_floor() -> None:
             chunk=16, shape={"dhead": 16, "dstate": 8, "seqlen": 64, "heads": 2}
         )
         unmatched = _bind(chunk=128, shape={"dhead": 128})
+        with patch.object(
+            CuteGdnRecurrenceHeuristic, "register_facts", return_value=frozenset()
+        ):
+            unmatched_without_gdn = _bind(chunk=128, shape={"dhead": 128})
     spec = bound.config_spec  # type: ignore[attr-defined]
     block_spec = spec.block_sizes.block_id_lookup(
         spec.cute_gdn_recurrence_value_block_id
     )
     assert (block_spec.min_size, block_spec.max_size) == (GDN_ADMITTED_BLOCK_V[-1], 32)
     # A state narrower than the smallest tile gets that tile (rows past
-    # dstate are padding); an unmatched kernel keeps the dot minimum's floor.
+    # dstate are padding); an unmatched kernel keeps the other lowerings' floor.
     narrow_spec = narrow.config_spec.block_sizes[0]  # type: ignore[attr-defined]
     assert (narrow_spec.min_size, narrow_spec.max_size) == (16, 16)
-    assert unmatched.config_spec.block_sizes[0].min_size == 1  # type: ignore[attr-defined]
+    assert unmatched.config_spec.block_sizes[0].min_size == (  # type: ignore[attr-defined]
+        unmatched_without_gdn.config_spec.block_sizes[0].min_size  # type: ignore[attr-defined]
+    )
     random.seed(20260930)
-    tiles = {
-        spec.normalized_config(
-            spec.flat_config(lambda fragment: fragment.random())
-        ).config["block_sizes"][0]
-        for _ in range(200)
-    }
+    # Sample the tile and all whole-root knobs, repairing their per-tile
+    # combinations. Common-loop choices have separate compatibility rules.
+    tile_fragment = block_spec._fragment(spec)
+    fields = spec._flat_fields()
+    tiles = set()
+    for _ in range(200):
+        config = helion.Config(block_sizes=[tile_fragment.random()])
+        for key in (
+            CUTE_GDN_RECURRENCE_STAGES_KEY,
+            CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+            CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+            CUTE_GDN_RECURRENCE_MMA_M_KEY,
+        ):
+            config.config[key] = fields[key].random()
+        spec.normalize(config, _fix_invalid=True)
+        assert spec.normalized_config(config) == config
+        tiles.add(config.block_sizes[0])
     assert tiles == {16, 32}
     # An explicit tile below the floor is clamped to it, not compiled.
     assert spec.normalized_config(helion.Config(block_sizes=[8])).config[

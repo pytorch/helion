@@ -174,11 +174,27 @@ def test_original_loop_consumes_the_sum_emitted_by_this_codegen(
     assert _consume(captured) is captured.value
     path = captured.plan.path
     assert path.n_extent == 16
-    assert ast.unparse(captured.plan.expression) == "attn_copy_0 + dot_n_acc"
+    expression = captured.plan.expression
+    assert isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add)
+    assert any(
+        isinstance(node, ast.Assign) and ast.dump(node.value) == ast.dump(expression)
+        for node in ast.walk(ast.parse(captured.source))
+    )
     assert any(
         user.target == torch.ops.aten.sym_size.int for user in path.placeholder.users
     )
     assert "_helion_lane_reduce" not in captured.source
+
+
+def test_positional_route_proposal_requires_the_same_closed_matrix_path(
+    captured: _Capture,
+) -> None:
+    graphs = captured.ctx.cg.codegen_graphs
+    path = captured.plan.path
+    assert completion.candidate_matmul_sum_paths(graphs) == (path,)
+    with _value_escape(path.producer):
+        assert completion.candidate_matmul_sum_paths(graphs) == ()
+    assert completion.candidate_matmul_sum_paths(graphs) == (path,)
 
 
 @pytest.mark.parametrize("axis", [[0], [1], [-2], [-1, -2], []])

@@ -155,8 +155,32 @@ def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
             autotune_effort="none",
         )
         bound = _cpu_bind(kernel, inputs)
-        with pytest.raises(exc.BackendUnsupported, match="K axis split across"):
-            bound.to_code(helion.Config.from_dict(config))
+        if static_shapes and not collective_requested:
+            # The whole-root positional route now owns the complete K axis.
+            # Disabling per-node collective MMA does not disable that route.
+            source = bound.to_code(helion.Config.from_dict(config))
+            assert "ptp_thread" in source
+            assert "synthetic_lane_" not in source
+        else:
+            with pytest.raises(
+                exc.BackendUnsupported, match="K axis split across|lane-split K"
+            ):
+                bound.to_code(helion.Config.from_dict(config))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@skipUnlessBackends(["cute"])
+def test_positional_route_completes_partial_synthetic_k_gpu(dtype: torch.dtype) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(726)
+    a = torch.randn((130, 64), dtype=dtype, device="cuda", generator=generator)
+    b = torch.randn((64, 70), dtype=dtype, device="cuda", generator=generator)
+    config = dict(_config(full_slice=True))
+    config["cute_collective_mma"] = False
+    bound = _full_slice_dot.bind((a, b))
+    bound.set_config(helion.Config.from_dict(config))
+    expected = torch.relu((a * 0.5).float() @ b.float()).to(dtype)
+    torch.testing.assert_close(bound(a, b), expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

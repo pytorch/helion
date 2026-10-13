@@ -90,6 +90,15 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         self._update(node.id, node.ctx)
 
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        pending: list[ast.AST] = [node]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, ast.BinOp):
+                pending.extend((current.right, current.op, current.left))
+            else:
+                self.visit(current)
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if _is_tensor_metadata_read(node) and isinstance(node.value, ast.Name):
             self.rw.tensor_metadata_reads[node.value.id] += 1

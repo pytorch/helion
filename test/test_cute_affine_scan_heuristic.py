@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -12,9 +15,14 @@ from test.test_cute_fixed_token_rank1_recurrence import _precise_fixed_rank1
 from test.test_cute_fixed_token_rank1_recurrence import _to_cuda_fake_tensor
 
 import helion
+from helion._compiler.autotuner_heuristics.cute import CuteAffineScanHeuristic
 import helion.language as hl
 
 pytest.importorskip("cutlass")
+
+if TYPE_CHECKING:
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.device_ir import DeviceIR
 
 
 def _fake_cute_context() -> ExitStack:
@@ -93,6 +101,30 @@ def test_affine_scan_seed_is_algebraic(
     assert seed["indexing"] == "pointer"
     assert seed["pid_type"] == "flat"
     assert seed["cute_affine_scan_schedule"] == schedule
+
+
+def test_single_root_axis_seed_has_no_loop_permutation() -> None:
+    spec = SimpleNamespace(
+        cute_affine_scan_schedule=object(),
+        block_sizes=[SimpleNamespace(min_size=16, max_size=128)],
+        num_threads=SimpleNamespace(valid_block_ids=lambda: {0, 1}),
+    )
+    with (
+        patch(
+            "helion._compiler.autotuner_heuristics.cute._affine_scan_search_geometry",
+            return_value=(0, 1, 3, 1),
+        ),
+        patch(
+            "helion._compiler.autotuner_heuristics.cute._seq_config_list",
+            side_effect=lambda spec, values: list(values.values()),
+        ),
+    ):
+        seeds = CuteAffineScanHeuristic.get_seed_configs(
+            cast("CompileEnvironment", SimpleNamespace(config_spec=spec)),
+            cast("DeviceIR", None),
+        )
+    assert seeds is not None
+    assert seeds[0].config["loop_orders"] == []
 
 
 @helion.kernel(backend="cute", static_shapes=False)

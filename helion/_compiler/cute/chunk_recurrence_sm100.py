@@ -9,16 +9,16 @@ Adapted from FlashInfer's ``kda_chunked_bt16.py`` at pinned commit
 workspace layout, schedule selection, and launch integration around this device
 schedule.  The recurrence keeps FP32 state in TMEM and splits the 16 warps into
 output-drain, state-left, state-right, two tcgen05 issuers, TMA, and service
-roles.  The Helion schedule uses an eight-slot raw-input ring, a six-slot TMA
-completion ring, two TMEM output accumulators, rank-4 factor loads, and a
-seven-slot asynchronous output-SMEM ring.  These choices are explicit in the
+roles. The wide pipeline uses eight raw-input slots, six TMA completion slots,
+and two TMEM output accumulators. The compact pipeline uses six, four, and one
+respectively, with resource budgets for two resident CTAs. Both use rank-4
+factor loads and seven output-SMEM slots. These choices are explicit in the
 wrapper plan, with workspace-layout and device-ABI checks kept separate.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 from typing import cast
 
 import cutlass
@@ -26,68 +26,33 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from . import prepared_tcgen_edge
+from . import warp_specialized_primitives as pipeline_primitives
+from .affine_recurrence_primitives import fmul2
+from .affine_recurrence_primitives import pack_input_b16x2_to_i32
+from .affine_recurrence_primitives import pack_output_b16x2_to_i32
+from .affine_recurrence_primitives import packed_f32x2_binary as packed_f32x2_binary
+from .affine_recurrence_primitives import sub_b16x2_input_dtype
+from .warp_specialized_plan import chained_recurrence_tmem_layout
+from .warp_specialized_primitives import advance_ring_stage
+from .warp_specialized_primitives import matrix_16x16_transposed_lane_coordinates
+from .warp_specialized_primitives import named_barrier_sync
+from .warp_specialized_primitives import segmented_swizzle_b16_element_index
 
-def packed_f32x2_binary(
-    op: Callable,
-    lhs: tuple[cutlass.Float32, cutlass.Float32],
-    rhs: tuple[cutlass.Float32, cutlass.Float32],
-) -> tuple[cutlass.Float32, cutlass.Float32]:
-    """Apply a CUTLASS packed-FP32 primitive to two scalar pairs."""
-
-    lhs_vec = cutlass.Vector.from_elements(lhs, cutlass.Float32)
-    rhs_vec = cutlass.Vector.from_elements(rhs, cutlass.Float32)
-    result = op(lhs_vec, rhs_vec, ftz=False, rnd="rn")
-    return cutlass.Float32(result[0]), cutlass.Float32(result[1])
-
-
-def fmul2(lhs, rhs):
-    return packed_f32x2_binary(prims.mul_packed_f32x2, lhs, rhs)
-
-
-@cute.jit
-def sub_b16x2_input_dtype(
-    lhs: cutlass.Int32,
-    rhs: cutlass.Int32,
-    input_dtype: cutlass.Constexpr,
-) -> cutlass.Int32:
-    """Subtract two packed pairs using the compile-time input dtype."""
-
-    if cutlass.const_expr(input_dtype is cutlass.BFloat16):
-        return cast(
-            "cutlass.Int32",
-            prims.inline_ptx_hl(
-                "sub.bf16x2 {$w0}, {$r0}, {$r1};",
-                write_only_types=[cutlass.Int32],
-                read_only_args=[lhs, rhs],
-            ),
-        )
-    return cast(
-        "cutlass.Int32",
-        prims.inline_ptx_hl(
-            "sub.f16x2 {$w0}, {$r0}, {$r1};",
-            write_only_types=[cutlass.Int32],
-            read_only_args=[lhs, rhs],
-        ),
-    )
-
-
-@cute.jit
-def pack_input_b16x2_to_i32(
-    value0: cutlass.Float32,
-    value1: cutlass.Float32,
-    input_dtype: cutlass.Constexpr,
-):
-    """Pack two FP32 values through the compile-time input 16-bit dtype."""
-
-    return (
-        cutlass.Vector.from_elements(
-            (value0, value1),
-            cutlass.Float32,
-        )
-        .to(input_dtype)
-        .bitcast(cutlass.Int32)[0]
-    )
-
+tma_transfer_wait = pipeline_primitives.wait_mbarrier
+output_ready_arrive = pipeline_primitives.elect_arrive_mbarrier
+output_ready_wait = pipeline_primitives.wait_and_flip_mbarrier
+raw_ready_arrive = pipeline_primitives.elect_arrive_mbarrier
+raw_ready_wait = pipeline_primitives.wait_and_flip_mbarrier
+raw_consumed_arrive = pipeline_primitives.elect_arrive_mbarrier
+raw_consumed_wait = pipeline_primitives.wait_and_flip_mbarrier
+state_input_ready_arrive = pipeline_primitives.elect_arrive_mbarrier
+state_input_ready_wait = pipeline_primitives.wait_and_flip_mbarrier
+update_ready_arrive = pipeline_primitives.elect_arrive_mbarrier
+update_ready_wait = pipeline_primitives.wait_and_flip_mbarrier
+final_state_stored_arrive = pipeline_primitives.elect_arrive_mbarrier
+final_state_stored_wait = pipeline_primitives.wait_and_flip_mbarrier
+tcgen05_wait_acc_buffer_ready = pipeline_primitives.wait_and_flip_mbarrier
 
 BT: int = 16
 
@@ -134,63 +99,33 @@ TCGEN05_STATE_INPUT_PACKED_COLS: int = TCGEN05_STATE_INPUT_LOAD_COLS // 2
 TCGEN05_STATE_K_TMEM_ROW_BLOCKS: int = DV // THREADS_PER_WARP
 
 
-def _tcgen05_accumulator_tmem_cols(n_dim: int) -> int:
-    """Return TMEM columns for an FP32 `[128, n_dim]` accumulator tile."""
-
-    if n_dim <= 0:
-        raise ValueError(f"n_dim must be positive, got {n_dim}")
-    if n_dim % 8 != 0:
-        raise ValueError(f"n_dim must be a multiple of 8, got {n_dim}")
-    return n_dim
-
-
-def _tcgen05_f16_input_tmem_cols(k_dim: int) -> int:
-    """Return TMEM columns for an F16 `[128, k_dim]` A-input staging tile."""
-
-    if k_dim <= 0:
-        raise ValueError(f"k_dim must be positive, got {k_dim}")
-    if k_dim % 2 != 0:
-        raise ValueError(f"k_dim must be even for packed F16 TMEM, got {k_dim}")
-    return k_dim // 2
-
-
-KDA_TMEM_N16_ACC_COLS: int = _tcgen05_accumulator_tmem_cols(BT)
-
-KDA_TMEM_N128_ACC_COLS: int = _tcgen05_accumulator_tmem_cols(DK)
-
-KDA_TMEM_STATE_COLS: int = KDA_TMEM_N128_ACC_COLS
-
-KDA_TMEM_STATE_AS_INPUT_COLS: int = _tcgen05_f16_input_tmem_cols(DK)
-
-KDA_TMEM_SHARED_INPUT_COLS: int = _tcgen05_f16_input_tmem_cols(BT)
-
 KDA_TMEM_SHARED_INPUT_STAGE_COUNT: int = 2
 
 KDA_TMEM_SHARED_ACC_STAGE_COUNT: int = 2
 
-KDA_TMEM_STATE_COL_OFFSET: int = 0
-
-KDA_TMEM_STATE_AS_INPUT_COL_OFFSET: int = (
-    KDA_TMEM_STATE_COL_OFFSET + KDA_TMEM_STATE_COLS
+_TMEM_LAYOUT = chained_recurrence_tmem_layout(
+    state_width=DK,
+    step_width=BT,
+    factor_input_stages=KDA_TMEM_SHARED_INPUT_STAGE_COUNT,
+    auxiliary_accumulator_stages=KDA_TMEM_SHARED_ACC_STAGE_COUNT,
 )
-
-KDA_TMEM_SHARED_INPUT_COL_OFFSET: int = (
-    KDA_TMEM_STATE_AS_INPUT_COL_OFFSET + KDA_TMEM_STATE_AS_INPUT_COLS
-)
-
-KDA_TMEM_QSTATE_ACC_COL_OFFSET: int = (
-    KDA_TMEM_SHARED_INPUT_COL_OFFSET
-    + KDA_TMEM_SHARED_INPUT_STAGE_COUNT * KDA_TMEM_SHARED_INPUT_COLS
-)
-
-KDA_TMEM_SHARED_ACC_COL_OFFSET: int = (
-    KDA_TMEM_QSTATE_ACC_COL_OFFSET + KDA_TMEM_N16_ACC_COLS
-)
-
-KDA_TMEM_QSTATE_ACC_STAGE1_COL_OFFSET: int = (
-    KDA_TMEM_SHARED_ACC_COL_OFFSET
-    + KDA_TMEM_SHARED_ACC_STAGE_COUNT * KDA_TMEM_N16_ACC_COLS
-)
+KDA_TMEM_N16_ACC_COLS = _TMEM_LAYOUT.region("primary_accumulator").columns
+KDA_TMEM_N128_ACC_COLS = _TMEM_LAYOUT.region("state").columns
+KDA_TMEM_STATE_COLS = KDA_TMEM_N128_ACC_COLS
+KDA_TMEM_STATE_AS_INPUT_COLS = _TMEM_LAYOUT.region("state_input").columns
+KDA_TMEM_SHARED_INPUT_COLS = _TMEM_LAYOUT.region("factor_input").columns
+KDA_TMEM_STATE_COL_OFFSET = _TMEM_LAYOUT.region("state").column_offset
+KDA_TMEM_STATE_AS_INPUT_COL_OFFSET = _TMEM_LAYOUT.region("state_input").column_offset
+KDA_TMEM_SHARED_INPUT_COL_OFFSET = _TMEM_LAYOUT.region("factor_input").column_offset
+KDA_TMEM_QSTATE_ACC_COL_OFFSET = _TMEM_LAYOUT.region(
+    "primary_accumulator"
+).column_offset
+KDA_TMEM_SHARED_ACC_COL_OFFSET = _TMEM_LAYOUT.region(
+    "auxiliary_accumulator"
+).column_offset
+KDA_TMEM_QSTATE_ACC_STAGE1_COL_OFFSET = _TMEM_LAYOUT.region(
+    "secondary_accumulator"
+).column_offset
 
 KDA_TMEM_QSTATE_ACC_STAGE_STRIDE_COLS: int = (
     KDA_TMEM_QSTATE_ACC_STAGE1_COL_OFFSET - KDA_TMEM_QSTATE_ACC_COL_OFFSET
@@ -201,21 +136,21 @@ KDA_TMEM_QSTATE_ACC_STAGE_STRIDE_COLS: int = (
 def cta_sync() -> None:
     """Synchronize all threads in the CTA."""
 
-    prims.barrier_cta_sync(0, thread_count=THREADS_PER_CTA)
+    named_barrier_sync(0, THREADS_PER_CTA)
 
 
 @cute.jit
 def tmem_user_sync() -> None:
     """Named barrier for CG1 plus the tcgen05 warp during TMEM lifecycle setup."""
 
-    prims.barrier_cta_sync(NBAR_TMEM_LIFECYCLE_ID, thread_count=TMEM_USER_THREADS)
+    named_barrier_sync(NBAR_TMEM_LIFECYCLE_ID, TMEM_USER_THREADS)
 
 
 @cute.jit
 def output_drain_sync() -> None:
     """Synchronize the four warps that cooperatively drain output TMEM."""
 
-    prims.barrier_cta_sync(NBAR_OUTPUT_DRAIN_ID, thread_count=OUTPUT_DRAIN_THREADS)
+    named_barrier_sync(NBAR_OUTPUT_DRAIN_ID, OUTPUT_DRAIN_THREADS)
 
 
 @cute.jit
@@ -328,16 +263,13 @@ ROLES = WarpRoles()
 def raw_f16_s128_smem_index(token_coord, dim):
     """Return the physical s128 SMEM index for raw F16 q/k/v staging."""
 
-    segment = dim // RAW_F16_TMA_SWIZZLE_ELEMS
-    segment_dim = dim - segment * RAW_F16_TMA_SWIZZLE_ELEMS
-    col_group = segment_dim // RAW_F16_TMA_SWIZZLE_GROUP_ELEMS
-    col_in_group = segment_dim - col_group * RAW_F16_TMA_SWIZZLE_GROUP_ELEMS
-    row_swizzle = token_coord & RAW_F16_TMA_SWIZZLE_ROW_MASK
-    return (
-        segment * RAW_F16_TMA_SEGMENT_ELEMS
-        + token_coord * RAW_F16_TMA_SWIZZLE_ELEMS
-        + ((col_group ^ row_swizzle) * RAW_F16_TMA_SWIZZLE_GROUP_ELEMS)
-        + col_in_group
+    return segmented_swizzle_b16_element_index(
+        token_coord,
+        dim,
+        BT,
+        RAW_F16_TMA_SWIZZLE_ELEMS,
+        RAW_F16_TMA_SWIZZLE_GROUP_ELEMS,
+        RAW_F16_TMA_SWIZZLE_ROW_MASK,
     )
 
 
@@ -349,18 +281,17 @@ def o_smem_swizzle_128b_elem_index(
 ):
     """Return the physical W128 SMEM index for one staged output element."""
 
-    segment = value_dim // O_TMA_SWIZZLE_ELEMS
-    segment_value_dim = value_dim - segment * O_TMA_SWIZZLE_ELEMS
-    col_group = segment_value_dim // O_TMA_SWIZZLE_GROUP_ELEMS
-    col_in_group = segment_value_dim - col_group * O_TMA_SWIZZLE_GROUP_ELEMS
-    row_swizzle = token_coord & O_TMA_SWIZZLE_ROW_MASK
     return (
         o_stage_base
         + O_OUT_OFFSET
-        + segment * BT * O_TMA_SWIZZLE_ELEMS
-        + token_coord * O_TMA_SWIZZLE_ELEMS
-        + ((col_group ^ row_swizzle) * O_TMA_SWIZZLE_GROUP_ELEMS)
-        + col_in_group
+        + segmented_swizzle_b16_element_index(
+            token_coord,
+            value_dim,
+            BT,
+            O_TMA_SWIZZLE_ELEMS,
+            O_TMA_SWIZZLE_GROUP_ELEMS,
+            O_TMA_SWIZZLE_ROW_MASK,
+        )
     )
 
 
@@ -373,12 +304,8 @@ def o_smem_stmatrix_128b_ptr(
 ):
     """Return the per-lane W128 row-start pointer for one 16x16 STSM.T tile."""
 
-    matrix_id = lane // 8
-    row_in_matrix = lane & 7
-    token_block = matrix_id // 2
-    value_block = matrix_id & 1
-    token_coord = token_block * 8 + row_in_matrix
-    value_dim = value_dim_base + value_block * 8
+    token_coord, value_offset = matrix_16x16_transposed_lane_coordinates(lane)
+    value_dim = value_dim_base + value_offset
     smem_idx = o_smem_swizzle_128b_elem_index(
         o_stage_base,
         value_dim,
@@ -391,176 +318,10 @@ def o_smem_stmatrix_128b_ptr(
 def raw_v_ldmatrix_trans_ptr(raw_v_smem, value_dim_base, lane):
     """Return the per-lane row-start pointer for raw V `ldmatrix.x4.trans`."""
 
-    matrix_id = lane // 8
-    row_in_matrix = lane & 7
-    token_block = matrix_id // 2
-    value_block = matrix_id & 1
-    token_coord = token_block * 8 + row_in_matrix
-    value_dim = value_dim_base + value_block * 8
+    token_coord, value_offset = matrix_16x16_transposed_lane_coordinates(lane)
+    value_dim = value_dim_base + value_offset
     smem_idx = raw_f16_s128_smem_index(token_coord, value_dim)
     return raw_v_smem.subview(smem_idx).data_ptr()
-
-
-@cute.jit
-def tma_transfer_wait(tma_mbar, tma_phase) -> None:
-    """Spin until one tma_mbar ring slot's expect_tx transaction completes."""
-
-    while not prims.mbarrier_wait_parity(
-        tma_mbar,
-        tma_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-
-
-@cute.jit
-def output_ready_arrive(output_ready_mbar) -> None:
-    """Signal that this CG1 warp has finished staging output SMEM."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(output_ready_mbar)
-
-
-@cute.jit
-def output_ready_wait(output_ready_mbar, output_ready_phase):
-    """Wait until all CG1 warps have staged the output tile."""
-
-    while not prims.mbarrier_wait_parity(
-        output_ready_mbar,
-        output_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return output_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def raw_ready_arrive(raw_ready_mbar) -> None:
-    """Signal that raw SMEM inputs are ready (k2-chain relay only)."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(raw_ready_mbar)
-
-
-@cute.jit
-def raw_ready_wait(raw_ready_mbar, raw_ready_phase):
-    """Generic mbarrier parity spin-wait.
-
-    The engine-class kernels observe raw readiness directly on the
-    chunk's tma_mbar ring slot (consumer-direct wait); the k2 chain
-    kernels still wait their raw_ready relay ring, and the ws_stored /
-    The deltas_issued relay ring uses this helper too.
-    """
-
-    while not prims.mbarrier_wait_parity(
-        raw_ready_mbar,
-        raw_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return raw_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def raw_consumed_arrive(raw_consumed_mbar) -> None:
-    """Signal that one participating warp has finished raw-slot reads."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(raw_consumed_mbar)
-
-
-@cute.jit
-def raw_consumed_wait(raw_consumed_mbar, raw_consumed_phase):
-    """Wait until the previous chunk no longer reads raw input SMEM."""
-
-    while not prims.mbarrier_wait_parity(
-        raw_consumed_mbar,
-        raw_consumed_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return raw_consumed_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def state_input_ready_arrive(state_input_ready_mbar) -> None:
-    """Signal that this CG1 warp has packed state_as_input TMEM."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(state_input_ready_mbar)
-
-
-@cute.jit
-def state_input_ready_wait(state_input_ready_mbar, state_input_ready_phase):
-    """Wait until all CG1 warps have packed state_as_input TMEM."""
-
-    while not prims.mbarrier_wait_parity(
-        state_input_ready_mbar,
-        state_input_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return state_input_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def update_ready_arrive(update_ready_mbar) -> None:
-    """Signal that this CG1 warp has staged update for qkv MMA."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(update_ready_mbar)
-
-
-@cute.jit
-def update_ready_wait(update_ready_mbar, update_ready_phase):
-    """Wait until all CG1 warps have staged update for qkv MMA."""
-
-    while not prims.mbarrier_wait_parity(
-        update_ready_mbar,
-        update_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return update_ready_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def final_state_stored_arrive(final_state_stored_mbar) -> None:
-    """Signal that this CG1 warp has finished draining final_state TMEM."""
-
-    if prims.elect_sync():
-        prims.mbarrier_arrive(final_state_stored_mbar)
-
-
-@cute.jit
-def final_state_stored_wait(final_state_stored_mbar, final_state_stored_phase):
-    """Wait until CG1 has drained final_state before TMEM deallocation."""
-
-    while not prims.mbarrier_wait_parity(
-        final_state_stored_mbar,
-        final_state_stored_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return final_state_stored_phase ^ cutlass.Int32(1)
-
-
-@cute.jit
-def pack_output_b16x2_to_i32(
-    value0: cutlass.Float32,
-    value1: cutlass.Float32,
-    output_dtype: cutlass.Constexpr,
-):
-    """Pack two FP32 output values through the compile-time 16-bit output dtype."""
-
-    return (
-        cutlass.Vector.from_elements(
-            (value0, value1),
-            cutlass.Float32,
-        )
-        .to(output_dtype)
-        .bitcast(cutlass.Int32)[0]
-    )
 
 
 @cute.jit
@@ -591,19 +352,6 @@ def tcgen05_shared_input_tmem_col_offset(shared_input_stage):
 
 
 @cute.jit
-def advance_ring_stage(
-    stage,
-    step: cutlass.Constexpr,
-    stage_count: cutlass.Constexpr,
-):
-    """Advance a runtime ring index without division or a wrap branch."""
-
-    next_stage = stage + cutlass.Int32(step)
-    wrapped = cutlass.Int32(next_stage >= cutlass.Int32(stage_count))
-    return next_stage - wrapped * cutlass.Int32(stage_count), wrapped
-
-
-@cute.jit
 def tcgen05_store_initial_state_tmem(
     tmem_raw_addr,
     state: cute.Tensor,
@@ -613,7 +361,7 @@ def tcgen05_store_initial_state_tmem(
     warp_idx,
     lane,
 ) -> None:
-    """Initialize recurrent TMEM from the exact DV2 BF16 state."""
+    """Initialize recurrent TMEM from the declared BF16 or FP32 state."""
 
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
@@ -777,50 +525,27 @@ def tcgen05_issue_state_projection_mma(
 ) -> None:
     """Issue state*decay K-slices through tcgen05, optionally committing."""
 
-    tmem_ptr = cutlass.inttoptr(
-        tmem_raw_addr + tmem_col_offset,
-        6,
-        cutlass.Float32,
+    pipeline_primitives.issue_tmem_smem_mma_slices(
+        tcgen05_decay_smem,
+        tmem_raw_addr,
+        acc_ready_mbar,
+        tmem_col_offset,
+        KDA_TMEM_STATE_AS_INPUT_COL_OFFSET,
+        input_dtype,
+        BT,
+        M_DIM,
+        TCGEN05_F16_K_ATOM,
+        TCGEN05_F16_ELEM_BYTES,
+        K_BLOCK_BEGIN,
+        K_BLOCK_END,
+        TCGEN05_STATE_K_B_LEADING_BYTES,
+        TCGEN05_STATE_K_B_STRIDE_BYTES,
+        TCGEN05_SW128_K_PHASES_PER_SLICE,
+        TCGEN05_SW128_BYTES,
+        BT,
+        INITIAL_SCALE_D,
+        COMMIT,
     )
-    idesc = prims.Tcgen05InstrDesc.build(
-        c_dtype=cutlass.Float32,
-        a_dtype=input_dtype,
-        b_dtype=input_dtype,
-        n_dim=BT,
-        m_dim=M_DIM,
-        b_major=0,
-    )
-    desc_k_decay = prims.Tcgen05SmemDesc.build(
-        tcgen05_decay_smem.subview(0),
-        leading_byte_offset=TCGEN05_STATE_K_B_LEADING_BYTES,
-        stride_byte_offset=TCGEN05_STATE_K_B_STRIDE_BYTES,
-        layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
-    )
-
-    for k_block in cutlass.range_constexpr(K_BLOCK_BEGIN, K_BLOCK_END):
-        scale_d = INITIAL_SCALE_D or k_block != K_BLOCK_BEGIN
-        k_decay_offset = (
-            k_block % TCGEN05_SW128_K_PHASES_PER_SLICE
-        ) * TCGEN05_STATE_K_B_K_STEP_BYTES + (
-            k_block // TCGEN05_SW128_K_PHASES_PER_SLICE
-        ) * BT * TCGEN05_SW128_BYTES
-        state_a_tmem = prims.make_tmem_ptr(tmem_raw_addr, cutlass.Int8).subview(
-            KDA_TMEM_STATE_AS_INPUT_COL_OFFSET + k_block * (TCGEN05_F16_K_ATOM // 2)
-        )
-        if prims.elect_sync():
-            prims.tcgen05_mma(
-                prims.Tcgen05MMAKind.F16,
-                prims.CTAGroup.CTA_1,
-                tmem_ptr,
-                state_a_tmem,
-                desc_k_decay.advance_start_address(k_decay_offset),
-                idesc,
-                scale_d,
-            )
-
-    if cutlass.const_expr(COMMIT):
-        if prims.elect_sync():
-            prims.tcgen05_commit(acc_ready_mbar, group=prims.CTAGroup.CTA_1)
 
 
 @cute.jit
@@ -853,19 +578,45 @@ def tcgen05_issue_state_k_mma(
 
 
 @cute.jit
-def tcgen05_wait_acc_buffer_ready(
-    acc_ready_mbar,
-    acc_ready_phase,
+def _issue_prepared_state_k(
+    operand,
+    raw,
+    completion,
+    stage,
+    input_ready,
+    input_phase,
+    dtype: cutlass.Constexpr,
+    BEGIN: cutlass.Constexpr,
+    END: cutlass.Constexpr,
+    INITIALIZED: cutlass.Constexpr,
+    COMMIT: cutlass.Constexpr,
 ):
-    """Wait until a producer commit has filled the corresponding TMEM acc tile."""
-
-    while not prims.mbarrier_wait_parity(
-        acc_ready_mbar,
-        acc_ready_phase,
-        prims.MBarrierWait.TRY,
-    ):
-        pass
-    return acc_ready_phase ^ cutlass.Int32(1)
+    """Original Layout-F owners; the common executor owns wait/issue/commit."""
+    return prepared_tcgen_edge.execute_prepared_issue(
+        (raw, KDA_TMEM_STATE_AS_INPUT_COL_OFFSET),
+        (operand, TCGEN05_STATE_K_B_LEADING_BYTES, TCGEN05_STATE_K_B_STRIDE_BYTES),
+        (raw, stage, KDA_TMEM_SHARED_ACC_COL_OFFSET, KDA_TMEM_N16_ACC_COLS),
+        (dtype, DV_HALF, BT),
+        True,
+        completion,
+        None,
+        input_ready,
+        input_phase,
+        True,
+        True,
+        BEGIN,
+        END,
+        TCGEN05_F16_K_ATOM,
+        (
+            TCGEN05_F16_ELEM_BYTES,
+            TCGEN05_SW128_K_PHASES_PER_SLICE,
+            BT,
+            TCGEN05_SW128_BYTES,
+        ),
+        INITIALIZED,
+        COMMIT,
+        False,
+    )
 
 
 @cute.jit
@@ -895,7 +646,7 @@ def tcgen05_store_final_state_tmem(
     warp_idx,
     lane,
 ) -> None:
-    """Store the live recurrent TMEM state to the exact DV2 BF16 state."""
+    """Store live recurrent TMEM in the declared output state precision."""
 
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
@@ -941,7 +692,7 @@ DIAG_REC_ELEMS: int = DK  # per-chunk fp32 diag record
 
 QK_REC_ELEMS: int = BT * BT  # per-chunk SW32-permuted QK' record
 
-TMEM_ALLOC_COLS: int = 512
+TMEM_ALLOC_COLS: int = _TMEM_LAYOUT.allocated_columns
 
 K2_QSTATE_STAGE_COUNT: int = 2
 
@@ -1096,6 +847,9 @@ def tcgen05_chain_stage_vmx_input_tmem(
     shared_acc_stage,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    valid_tokens=None,
+    PREPARED_EDGE: cutlass.Constexpr[bool] = False,
+    arrival=None,
 ) -> None:
     """M=64 (v - X) fused repack staging.
 
@@ -1119,14 +873,37 @@ def tcgen05_chain_stage_vmx_input_tmem(
     block_ptr0 = cutlass.inttoptr(
         (row_id0 << 16) | projection_col_id, 6, cutlass.Float32
     )
-    state_k0 = prims.tcgen05_ld("16x256b", block_ptr0, num=2)
+    if cutlass.const_expr(PREPARED_EDGE):
+        state_k0, raw_v_regs0 = prepared_tcgen_edge.execute_prepared_read(
+            block_ptr0,
+            None,
+            None,
+            (
+                raw_v_smem,
+                value_dim_base,
+                lane,
+                (
+                    BT,
+                    RAW_F16_TMA_SWIZZLE_ELEMS,
+                    RAW_F16_TMA_SWIZZLE_GROUP_ELEMS,
+                    RAW_F16_TMA_SWIZZLE_ROW_MASK,
+                ),
+            ),
+            None,
+            None,
+            True,
+            "16x256b",
+            2,
+        )
+    else:
+        state_k0 = prims.tcgen05_ld("16x256b", block_ptr0, num=2)
 
-    raw_v_regs0 = prims.ldmatrix(
-        raw_v_ldmatrix_trans_ptr(raw_v_smem, value_dim_base, lane),
-        4,
-        prims.MMALayout.COL,
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        raw_v_regs0 = prims.ldmatrix(
+            raw_v_ldmatrix_trans_ptr(raw_v_smem, value_dim_base, lane),
+            4,
+            prims.MMALayout.COL,
+        )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
 
     packed0 = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
     for reg_idx in cutlass.range_constexpr(4):
@@ -1141,11 +918,86 @@ def tcgen05_chain_stage_vmx_input_tmem(
             input_dtype,
         )
 
+    if cutlass.const_expr(valid_tokens is not None):
+        valid_token_count = cast("cutlass.Int32", valid_tokens)
+        if valid_token_count < BT:
+            # The transposed V fragments pair adjacent token rows. Registers
+            # 0/1 hold tokens 8..15 and registers 2/3 hold tokens 0..7;
+            # lane%4 selects an adjacent pair within that eight-token group.
+            for reg_idx in cutlass.range_constexpr(4):
+                token = (1 - reg_idx // 2) * 8 + (lane % 4) * 2
+                if token >= valid_token_count:
+                    packed0[reg_idx] = cutlass.Int32(0)
+                elif token + 1 >= valid_token_count:
+                    packed0[reg_idx] = packed0[reg_idx] & cutlass.Int32(0xFFFF)
+
     input_block_addr0 = (base_row_id << 16) | input_col_id
     input_block_ptr0 = prims.make_tmem_ptr(input_block_addr0, cutlass.Int8)
-    prims.tcgen05_st("16x128b", input_block_ptr0, packed0[0:4])
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+    if cutlass.const_expr(PREPARED_EDGE):
+        prepared_tcgen_edge.execute_prepared_publication(
+            packed0[0:4], input_block_ptr0, None, None, arrival, True, "16x128b"
+        )
+    else:
+        prims.tcgen05_st("16x128b", input_block_ptr0, packed0[0:4])
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+
+
+@cute.jit
+def prepared_residual_point(
+    state_k0,
+    raw_v_regs0,
+    lane,
+    input_dtype: cutlass.Constexpr,
+    valid_tokens=None,
+):
+    """Original residual point arithmetic; reads/publication belong to actions."""
+    packed0 = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
+    for reg_idx in cutlass.range_constexpr(4):
+        raw_matrix: cutlass.Constexpr[int] = (1 - (reg_idx // 2)) * 2 + (reg_idx & 1)
+        val0, val1 = tcgen05_rhs_token_pair_from_16x256b_fragment(
+            state_k0,
+            reg_idx,
+        )
+        packed0[reg_idx] = sub_b16x2_input_dtype(
+            raw_v_regs0[raw_matrix],
+            pack_input_b16x2_to_i32(val0, val1, input_dtype),
+            input_dtype,
+        )
+
+    if cutlass.const_expr(valid_tokens is not None):
+        valid_token_count = cast("cutlass.Int32", valid_tokens)
+        if valid_token_count < BT:
+            for reg_idx in cutlass.range_constexpr(4):
+                token = (1 - reg_idx // 2) * 8 + (lane % 4) * 2
+                if token >= valid_token_count:
+                    packed0[reg_idx] = cutlass.Int32(0)
+                elif token + 1 >= valid_token_count:
+                    packed0[reg_idx] = packed0[reg_idx] & cutlass.Int32(0xFFFF)
+    return packed0
+
+
+@cute.jit
+def prepared_output_point(
+    loaded0, scale: cutlass.Float32, output_dtype: cutlass.Constexpr
+):
+    """Original output scale/pack, with no hidden accumulator read or store."""
+    stsm_regs0 = cutlass.Array(
+        cutlass.Int32,
+        4,
+        space=cutlass.AddressSpace.rmem,
+    )
+    for reg_idx in cutlass.range_constexpr(4):
+        scaled0_0, scaled0_1 = fmul2(
+            (loaded0[2 * reg_idx], loaded0[2 * reg_idx + 1]),
+            (scale, scale),
+        )
+        stsm_regs0[reg_idx] = pack_output_b16x2_to_i32(
+            scaled0_0,
+            scaled0_1,
+            output_dtype,
+        )
+    return stsm_regs0
 
 
 @cute.jit
@@ -1358,10 +1210,19 @@ def kernel_chain_dv2(
     v: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_chunks: cute.Tensor,
+    initial_state: cute.Tensor,
     state: cute.Tensor,
     out: cute.Tensor,
     head_base: cutlass.Int32,
     SCALE: cutlass.Float32,
+    K2_RAW_STAGE_COUNT: cutlass.Constexpr,
+    K2_TMA_MBAR_STAGE_COUNT: cutlass.Constexpr,
+    K2_QSTATE_STAGE_COUNT: cutlass.Constexpr,
+    TMEM_ALLOC_COLS: cutlass.Constexpr,
+    KDA_CG1_REGS: cutlass.Constexpr,
+    KDA_SERVICE_REGS: cutlass.Constexpr,
+    PREPARED_EDGE: cutlass.Constexpr[bool] = False,
+    CONTINUATION_PROGRAM: cutlass.Constexpr = (),
 ) -> None:
     """kernel 2, DV-split: each CTA owns half the hidden dimension.
 
@@ -1385,6 +1246,10 @@ def kernel_chain_dv2(
     num_chunks = cute.ceil_div(seqlen, BT)
     chunk_base = cutlass.Int32(cu_chunks[bidx])
     input_dtype = v.element_type
+    if cutlass.const_expr(PREPARED_EDGE):
+        assert state.element_type == cutlass.Float32
+        assert K2_RAW_STAGE_COUNT == 8 and K2_TMA_MBAR_STAGE_COUNT == 6
+        assert K2_QSTATE_STAGE_COUNT == 2
 
     # --- mbarriers (identical topology to the base chain) ----------------
     tma_mbar = cutlass.Array(
@@ -1616,49 +1481,126 @@ def kernel_chain_dv2(
             qstate_stage = chunk % K2_QSTATE_STAGE_COUNT
             kr_stage = chunk % 2
             acc_stage = chunk % 2
-            if chunk > 0:
-                prev12 = chunk - cutlass.Int32(1)
-                tcgen05_wait_acc_buffer_ready(
-                    qstate_acc_ready_mbar.subview(prev12 % K2_QSTATE_STAGE_COUNT),
-                    (prev12 // K2_QSTATE_STAGE_COUNT) % 2,
+            if cutlass.const_expr(CONTINUATION_PROGRAM):
+                output_acc = (
+                    tmem_raw_addr,
+                    0,
+                    tcgen05_qstate_acc_tmem_col_offset(qstate_stage),
+                    0,
                 )
-                raw_consumed_arrive(
-                    raw_consumed_mbar.subview(prev12 % K2_RAW_STAGE_COUNT)
+                output_ports = (
+                    (
+                        (tmem_raw_addr, KDA_TMEM_STATE_AS_INPUT_COL_OFFSET),
+                        (
+                            qd_smem.subview(raw_stage * TILE_ELEMS),
+                            TCGEN05_STATE_K_B_LEADING_BYTES,
+                            TCGEN05_STATE_K_B_STRIDE_BYTES,
+                        ),
+                        output_acc,
+                        (input_dtype, DV_HALF, BT),
+                        stateq_done_mbar.subview(kr_stage),
+                        0,
+                        True,
+                        0,
+                        TCGEN05_F16_K_ATOM,
+                        (
+                            TCGEN05_F16_ELEM_BYTES,
+                            TCGEN05_SW128_K_PHASES_PER_SLICE,
+                            BT,
+                            TCGEN05_SW128_BYTES,
+                        ),
+                        128,
+                    ),
+                    (
+                        (
+                            tmem_raw_addr,
+                            tcgen05_shared_input_tmem_col_offset(acc_stage),
+                        ),
+                        (
+                            qk_smem.subview(raw_stage * QK_REC_ELEMS),
+                            TCGEN05_VALUE_PAIRWISE_B_LEADING_BYTES,
+                            TCGEN05_VALUE_PAIRWISE_B_STRIDE_BYTES,
+                        ),
+                        output_acc,
+                        (input_dtype, DV_HALF, BT),
+                        qstate_acc_ready_mbar.subview(qstate_stage),
+                        0,
+                        True,
+                        0,
+                        TCGEN05_F16_K_ATOM,
+                        (TCGEN05_F16_ELEM_BYTES, 1, BT, 32),
+                        32,
+                    ),
                 )
-            raw_ready_wait(
-                raw_ready_mbar.subview(raw_stage),
-                (chunk // K2_RAW_STAGE_COUNT) % 2,
-            )
-            si_phase12 = state_input_ready_wait(state_input_ready_mbar, si_phase12)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            output_ready_wait(
-                output_ready_mbar.subview(qstate_stage),
-                (chunk // K2_QSTATE_STAGE_COUNT + cutlass.Int32(1)) % 2,
-            )
-            tcgen05_issue_state_projection_mma(
-                qd_smem.subview(raw_stage * TILE_ELEMS),
-                tmem_raw_addr,
-                stateq_done_mbar.subview(kr_stage),
-                tcgen05_qstate_acc_tmem_col_offset(qstate_stage),
-                input_dtype,
-                0,
-                DK // TCGEN05_F16_K_ATOM,
-                False,
-                True,
-                DV_HALF,
-            )
-            upd_phase12 = update_ready_wait(update_ready_mbar, upd_phase12)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            xpack_col12 = tcgen05_shared_input_tmem_col_offset(acc_stage)
-            tcgen05_chain_issue_qkv_mma(
-                qk_smem.subview(raw_stage * QK_REC_ELEMS),
-                tmem_raw_addr,
-                xpack_col12,
-                qstate_stage,
-                qstate_acc_ready_mbar.subview(qstate_stage),
-                input_dtype,
-                True,
-            )
+                output_phases = prepared_tcgen_edge.execute_prepared_continuation(
+                    CONTINUATION_PROGRAM,
+                    output_ports,
+                    (
+                        (qstate_acc_ready_mbar, K2_QSTATE_STAGE_COUNT),
+                        (raw_consumed_mbar, K2_RAW_STAGE_COUNT),
+                        raw_ready_mbar.subview(raw_stage),
+                        state_input_ready_mbar,
+                        output_ready_mbar.subview(qstate_stage),
+                        update_ready_mbar,
+                    ),
+                    (
+                        0,
+                        0,
+                        (chunk // K2_RAW_STAGE_COUNT) % 2,
+                        si_phase12,
+                        (chunk // K2_QSTATE_STAGE_COUNT + cutlass.Int32(1)) % 2,
+                        upd_phase12,
+                    ),
+                    chunk,
+                    True,
+                    True,
+                )
+                si_phase12 = output_phases[3]
+                upd_phase12 = output_phases[5]
+            else:
+                if chunk > 0:
+                    prev12 = chunk - cutlass.Int32(1)
+                    tcgen05_wait_acc_buffer_ready(
+                        qstate_acc_ready_mbar.subview(prev12 % K2_QSTATE_STAGE_COUNT),
+                        (prev12 // K2_QSTATE_STAGE_COUNT) % 2,
+                    )
+                    raw_consumed_arrive(
+                        raw_consumed_mbar.subview(prev12 % K2_RAW_STAGE_COUNT)
+                    )
+                raw_ready_wait(
+                    raw_ready_mbar.subview(raw_stage),
+                    (chunk // K2_RAW_STAGE_COUNT) % 2,
+                )
+                si_phase12 = state_input_ready_wait(state_input_ready_mbar, si_phase12)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                output_ready_wait(
+                    output_ready_mbar.subview(qstate_stage),
+                    (chunk // K2_QSTATE_STAGE_COUNT + cutlass.Int32(1)) % 2,
+                )
+                tcgen05_issue_state_projection_mma(
+                    qd_smem.subview(raw_stage * TILE_ELEMS),
+                    tmem_raw_addr,
+                    stateq_done_mbar.subview(kr_stage),
+                    tcgen05_qstate_acc_tmem_col_offset(qstate_stage),
+                    input_dtype,
+                    0,
+                    DK // TCGEN05_F16_K_ATOM,
+                    False,
+                    True,
+                    DV_HALF,
+                )
+                upd_phase12 = update_ready_wait(update_ready_mbar, upd_phase12)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                xpack_col12 = tcgen05_shared_input_tmem_col_offset(acc_stage)
+                tcgen05_chain_issue_qkv_mma(
+                    qk_smem.subview(raw_stage * QK_REC_ELEMS),
+                    tmem_raw_addr,
+                    xpack_col12,
+                    qstate_stage,
+                    qstate_acc_ready_mbar.subview(qstate_stage),
+                    input_dtype,
+                    True,
+                )
 
     # =============== warp 13: tcgen05 issuer (the chain owner) =============
     elif warp_idx == ROLES.tcgen05_mma:
@@ -1677,34 +1619,64 @@ def kernel_chain_dv2(
 
             raw_ready_wait(raw_ready_mbar.subview(raw_stage), raw_phase)
 
-            si_l_phase = state_input_ready_wait(state_input_ready_l_mbar, si_l_phase)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            tcgen05_issue_state_k_mma(
-                kd_stage_smem,
-                tmem_raw_addr,
-                shared_acc_ready_mbar.subview(acc_stage),
-                acc_stage,
-                input_dtype,
-                0,
-                (DK // TCGEN05_F16_K_ATOM) // 2,
-                False,
-                False,
-                DV_HALF,
-            )
-            si_phase = state_input_ready_wait(state_input_ready_mbar, si_phase)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            tcgen05_issue_state_k_mma(
-                kd_stage_smem,
-                tmem_raw_addr,
-                shared_acc_ready_mbar.subview(acc_stage),
-                acc_stage,
-                input_dtype,
-                (DK // TCGEN05_F16_K_ATOM) // 2,
-                DK // TCGEN05_F16_K_ATOM,
-                True,
-                True,
-                DV_HALF,
-            )
+            if cutlass.const_expr(PREPARED_EDGE):
+                si_l_phase = _issue_prepared_state_k(
+                    kd_stage_smem,
+                    tmem_raw_addr,
+                    shared_acc_ready_mbar.subview(acc_stage),
+                    acc_stage,
+                    state_input_ready_l_mbar,
+                    si_l_phase,
+                    input_dtype,
+                    0,
+                    (DK // TCGEN05_F16_K_ATOM) // 2,
+                    False,
+                    False,
+                )
+                si_phase = _issue_prepared_state_k(
+                    kd_stage_smem,
+                    tmem_raw_addr,
+                    shared_acc_ready_mbar.subview(acc_stage),
+                    acc_stage,
+                    state_input_ready_mbar,
+                    si_phase,
+                    input_dtype,
+                    (DK // TCGEN05_F16_K_ATOM) // 2,
+                    DK // TCGEN05_F16_K_ATOM,
+                    True,
+                    True,
+                )
+            else:
+                si_l_phase = state_input_ready_wait(
+                    state_input_ready_l_mbar, si_l_phase
+                )
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                tcgen05_issue_state_k_mma(
+                    kd_stage_smem,
+                    tmem_raw_addr,
+                    shared_acc_ready_mbar.subview(acc_stage),
+                    acc_stage,
+                    input_dtype,
+                    0,
+                    (DK // TCGEN05_F16_K_ATOM) // 2,
+                    False,
+                    False,
+                    DV_HALF,
+                )
+                si_phase = state_input_ready_wait(state_input_ready_mbar, si_phase)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                tcgen05_issue_state_k_mma(
+                    kd_stage_smem,
+                    tmem_raw_addr,
+                    shared_acc_ready_mbar.subview(acc_stage),
+                    acc_stage,
+                    input_dtype,
+                    (DK // TCGEN05_F16_K_ATOM) // 2,
+                    DK // TCGEN05_F16_K_ATOM,
+                    True,
+                    True,
+                    DV_HALF,
+                )
 
             xpack_col = tcgen05_shared_input_tmem_col_offset(acc_stage)
             upd_phase = update_ready_wait(update_ready_mbar, upd_phase)
@@ -1736,7 +1708,7 @@ def kernel_chain_dv2(
         tmem_raw_addr = tmem_ptr_i32.load()
         tcgen05_store_initial_state_tmem(
             tmem_raw_addr,
-            state,
+            initial_state,
             bidx,
             bidy,
             dv_half,
@@ -1774,7 +1746,12 @@ def kernel_chain_dv2(
                 state_input_ready_mbar,
                 1,
             )
-            tcgen05_wait_acc_buffer_ready(shared_acc_ready_mbar.subview(0), 0)
+            if cutlass.const_expr(PREPARED_EDGE):
+                prepared_tcgen_edge.execute_prepared_wait(
+                    shared_acc_ready_mbar.subview(0), 0, True
+                )
+            else:
+                tcgen05_wait_acc_buffer_ready(shared_acc_ready_mbar.subview(0), 0)
             vmx_lane = cute.arch.lane_idx()
             tcgen05_chain_stage_vmx_input_tmem(
                 tmem_raw_addr,
@@ -1784,8 +1761,14 @@ def kernel_chain_dv2(
                 0,
                 0,
                 input_dtype,
+                seqlen
+                if cutlass.const_expr(state.element_type == cutlass.Float32)
+                else None,
+                PREPARED_EDGE,
+                update_ready_mbar,
             )
-            update_ready_arrive(update_ready_mbar)
+            if cutlass.const_expr(not PREPARED_EDGE):
+                update_ready_arrive(update_ready_mbar)
         for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
             prev = chunk - cutlass.Int32(1)
             raw_stage = chunk % K2_RAW_STAGE_COUNT
@@ -1817,9 +1800,14 @@ def kernel_chain_dv2(
                 state_input_ready_mbar,
                 1,
             )
-            tcgen05_wait_acc_buffer_ready(
-                shared_acc_ready_mbar.subview(acc_stage), (chunk // 2) % 2
-            )
+            if cutlass.const_expr(PREPARED_EDGE):
+                prepared_tcgen_edge.execute_prepared_wait(
+                    shared_acc_ready_mbar.subview(acc_stage), (chunk // 2) % 2, True
+                )
+            else:
+                tcgen05_wait_acc_buffer_ready(
+                    shared_acc_ready_mbar.subview(acc_stage), (chunk // 2) % 2
+                )
             vmx_lane = cute.arch.lane_idx()
             tcgen05_chain_stage_vmx_input_tmem(
                 tmem_raw_addr,
@@ -1829,8 +1817,14 @@ def kernel_chain_dv2(
                 acc_stage,
                 acc_stage,
                 input_dtype,
+                seqlen - chunk * BT
+                if cutlass.const_expr(state.element_type == cutlass.Float32)
+                else None,
+                PREPARED_EDGE,
+                update_ready_mbar,
             )
-            update_ready_arrive(update_ready_mbar)
+            if cutlass.const_expr(not PREPARED_EDGE):
+                update_ready_arrive(update_ready_mbar)
         if num_chunks > 0:
             last = num_chunks - cutlass.Int32(1)
             last_kr_phase = (last // 2) % 2
@@ -1978,8 +1972,22 @@ def host_chain_dv2(
     launch_heads: cutlass.Int32,
     SCALE: cutlass.Float32,
     THREADS: cutlass.Constexpr,
+    K2_RAW_STAGE_COUNT: cutlass.Constexpr = 8,
+    K2_TMA_MBAR_STAGE_COUNT: cutlass.Constexpr = 6,
+    K2_QSTATE_STAGE_COUNT: cutlass.Constexpr = 2,
+    TMEM_ALLOC_COLS: cutlass.Constexpr = 512,
+    KDA_CG1_REGS: cutlass.Constexpr = 136,
+    KDA_SERVICE_REGS: cutlass.Constexpr = 56,
+    MIN_BLOCKS_PER_MP: cutlass.Constexpr = 1,
+    initial_state: cute.Tensor | None = None,
+    PREPARED_EDGE: cutlass.Constexpr[bool] = False,
+    CONTINUATION_PROGRAM: cutlass.Constexpr = (),
+    EPOCH_KERNEL: cutlass.Constexpr = None,
 ) -> None:
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
+
+    if cutlass.const_expr(initial_state is None):
+        initial_state = state
 
     cu_seqlens_shape = cast("tuple[int | cutlass.Integer, ...]", cu_seqlens.shape)
     v_shape = cast("tuple[int | cutlass.Integer, ...]", v.shape)
@@ -2073,7 +2081,11 @@ def host_chain_dv2(
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
-    kernel_chain_dv2(
+    launch_kernel = kernel_chain_dv2
+    if cutlass.const_expr(EPOCH_KERNEL is not None):
+        assert not PREPARED_EDGE and not CONTINUATION_PROGRAM
+        launch_kernel = EPOCH_KERNEL
+    launch_kernel(
         tma_desc_kd,
         tma_desc_w,
         tma_desc_qd,
@@ -2084,15 +2096,24 @@ def host_chain_dv2(
         v,
         cu_seqlens,
         cu_chunks,
+        initial_state,
         state,
         out,
         head_base,
         SCALE,
+        K2_RAW_STAGE_COUNT,
+        K2_TMA_MBAR_STAGE_COUNT,
+        K2_QSTATE_STAGE_COUNT,
+        TMEM_ALLOC_COLS,
+        KDA_CG1_REGS,
+        KDA_SERVICE_REGS,
+        PREPARED_EDGE,
+        CONTINUATION_PROGRAM,
     ).launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
         stream=stream,
-        min_blocks_per_mp=1,
+        min_blocks_per_mp=MIN_BLOCKS_PER_MP,
         preferred_smem_carveout=100,
     )
 

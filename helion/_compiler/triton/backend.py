@@ -57,6 +57,9 @@ class TritonBackend(Backend):
         # Triton >= 3.9 removed block pointers (triton-lang/triton#10833).
         return supports_block_ptr()
 
+    def supports_inductor_pointwise_fusion(self) -> bool:
+        return True
+
     @property
     def name(self) -> str:
         return "triton"

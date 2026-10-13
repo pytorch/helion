@@ -19,14 +19,16 @@ class ASTPrinter(_TupleParensRemovedUnparser):
         self._source = self.output = OutputLines(self)
 
     def traverse(self, node: ast.AST | list[ast.AST]) -> None:
+        self._before_traverse(node)
+        super().traverse(node)
+
+    def _before_traverse(self, node: ast.AST | list[ast.AST]) -> None:
         if isinstance(node, ExtendedAST):
             for annotation in node.debug_annotations():
                 if annotation:
                     self.output.insert_annotation(
                         f"{type(node).__name__}: {annotation}"
                     )
-
-        super().traverse(node)
 
 
 def print_ast(node: ast.AST) -> str:

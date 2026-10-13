@@ -13478,7 +13478,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=SimpleNamespace(block_ids=[7]),
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13524,7 +13526,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=None,
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13574,7 +13578,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=SimpleNamespace(block_ids=[11]),
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: CutePackedAffineLoad(
@@ -13623,7 +13629,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=None,
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13666,7 +13674,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=None,
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13776,7 +13786,9 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
-            device_function=SimpleNamespace(config={}),
+            device_function=SimpleNamespace(
+                cute_state=CuteDeviceFunctionState(), config={}
+            ),
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
@@ -13833,11 +13845,12 @@ class TestCuteLowerings(unittest.TestCase):
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             device_function=SimpleNamespace(
+                cute_state=CuteDeviceFunctionState(),
                 config={
                     TCGEN05_STRATEGY_CONFIG_KEY: (
                         Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
                     )
-                }
+                },
             ),
             env={},
         )
@@ -13895,7 +13908,8 @@ class TestCuteLowerings(unittest.TestCase):
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
             device_function=SimpleNamespace(
-                config={TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True}
+                cute_state=CuteDeviceFunctionState(),
+                config={TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True},
             ),
             env={},
         )
@@ -13959,7 +13973,9 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
-            device_function=SimpleNamespace(config={}),
+            device_function=SimpleNamespace(
+                cute_state=CuteDeviceFunctionState(), config={}
+            ),
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
@@ -14022,7 +14038,9 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             fx_node=dot_node,
             codegen=SimpleNamespace(current_grid_state=None, active_device_loops={}),
-            device_function=SimpleNamespace(config={}),
+            device_function=SimpleNamespace(
+                cute_state=CuteDeviceFunctionState(), config={}
+            ),
             env={
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
                 hi: ast.Name(id="hi_tile", ctx=ast.Load()),
@@ -14097,7 +14115,9 @@ class TestCuteLowerings(unittest.TestCase):
                 current_grid_state=SimpleNamespace(block_ids=[11]),
                 active_device_loops={},
             ),
-            device_function=SimpleNamespace(config={}),
+            device_function=SimpleNamespace(
+                cute_state=CuteDeviceFunctionState(), config={}
+            ),
             env={
                 lo: ast.Name(id="lo_tile", ctx=ast.Load()),
                 hi: ast.Name(id="hi_tile", ctx=ast.Load()),

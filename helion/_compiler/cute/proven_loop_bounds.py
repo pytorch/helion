@@ -22,6 +22,79 @@ from .simplify_proven_bounds import _remove_true_and_operands
 
 _LIMIT = (1 << 31) - 1
 _MAX_TERMS = 32
+_MARKER_PREFIX = "_cute_proven_loop_bounds_"
+
+
+_STATEMENT_FIELDS: dict[type[ast.stmt], tuple[str, ...]] = {
+    ast.Assign: ("targets", "value", "type_comment"),
+    ast.AugAssign: ("target", "op", "value"),
+    ast.For: ("target", "iter", "body", "orelse", "type_comment"),
+    ast.If: ("test", "body", "orelse"),
+    ast.With: ("items", "body", "type_comment"),
+    ast.Import: ("names",),
+    ast.ImportFrom: ("module", "names", "level"),
+    ast.Expr: ("value",),
+    ast.Pass: (),
+}
+
+
+def _statement_assigned_names(
+    statements: list[ast.stmt],
+) -> tuple[set[str], int] | None:
+    """Read current targets, after expression bindings have been excluded.
+
+    Canonical fields and list containers make these target occurrences a
+    subset of ast.walk's occurrences. Equal counts then exclude Store/Del
+    names elsewhere. Nonstandard schemas retain the original query, and
+    target subtrees still use the complete AST walk.
+    """
+    if type(statements) is not list:
+        return None
+    names: set[str] = set()
+    occurrences = 0
+    pending = list(statements)
+    while pending:
+        statement = pending.pop()
+        fields = _STATEMENT_FIELDS.get(type(statement))
+        if fields is None or statement._fields != fields:
+            return None
+        targets: list[ast.AST] = []
+        if isinstance(statement, ast.Assign):
+            if type(statement.targets) is not list:
+                return None
+            targets.extend(statement.targets)
+        elif isinstance(statement, (ast.AugAssign, ast.For)):
+            targets.append(statement.target)
+        elif isinstance(statement, ast.With):
+            if type(statement.items) is not list:
+                return None
+            for item in statement.items:
+                if type(item) is not ast.withitem or item._fields != (
+                    "context_expr",
+                    "optional_vars",
+                ):
+                    return None
+                if item.optional_vars is not None:
+                    targets.append(item.optional_vars)
+        if isinstance(statement, (ast.For, ast.If)):
+            if type(statement.body) is not list or type(statement.orelse) is not list:
+                return None
+            pending.extend(statement.body)
+            pending.extend(statement.orelse)
+        elif isinstance(statement, ast.With):
+            if type(statement.body) is not list:
+                return None
+            pending.extend(statement.body)
+        for target in targets:
+            if not isinstance(target, ast.AST):
+                return None
+            for node in ast.walk(target):
+                if isinstance(node, ast.Name) and isinstance(
+                    node.ctx, (ast.Store, ast.Del)
+                ):
+                    names.add(node.id)
+                    occurrences += 1
+    return names, occurrences
 
 
 @dataclass(frozen=True)
@@ -78,6 +151,15 @@ class _Proof:
     intervals: dict[int, tuple[int, int]] = field(default_factory=dict)
     changed: int = 0
     ordinal: int = 0
+    excluded_names: frozenset[str] = frozenset()
+    statement_bindings_only: bool = False
+
+    def assigned_names(self, node: ast.AST) -> set[str]:
+        if self.statement_bindings_only and isinstance(node, ast.stmt):
+            summary = _statement_assigned_names([node])
+            if summary is not None:
+                return summary[0]
+        return _assigned_names(node)
 
     def symbol(self, key: object, low: int, high: int) -> _Form:
         symbol = self.symbols.setdefault(key, len(self.symbols))
@@ -95,6 +177,8 @@ class _Proof:
                 return _Value(node.value, node.value, _Form(node.value))
             return None
         if isinstance(node, ast.Name):
+            if node.id in self.excluded_names:
+                return None
             return context.values.get(node.id)
         axis = _axis_index(node, "thread_idx")
         if axis is not None:
@@ -165,7 +249,19 @@ class _Proof:
                 form = self.symbol(("mod", left.form, divisor), low, high)
         else:
             return None
-        if form is None or _checked_interval(low, high) is None:
+        if form is None:
+            return None
+        # Operand intervals lose correlations such as (base + local) - base.
+        # The immutable affine form retains them. Tighten only after both
+        # operands (and thus every earlier intermediate) have passed the
+        # integer proof; the result must still fit the signed-int32 domain.
+        affine_low = affine_high = form.constant
+        for symbol, coefficient in form.terms:
+            lower, upper = self.intervals[symbol]
+            affine_low += coefficient * (lower if coefficient >= 0 else upper)
+            affine_high += coefficient * (upper if coefficient >= 0 else lower)
+        low, high = max(low, affine_low), min(high, affine_high)
+        if _checked_interval(low, high) is None:
             return None
         if low == high:
             form = _Form(low)
@@ -199,6 +295,19 @@ class _Proof:
         return None
 
     def true_comparison(self, node: ast.Compare, context: _Context) -> bool:
+        if len(node.ops) > 1 and len(node.ops) == len(node.comparators):
+            # Only remove the whole chain when each pure integer comparison
+            # is proved. Unknown or side-effecting middle expressions remain.
+            operands = [node.left, *node.comparators]
+            return all(
+                self.true_comparison(
+                    ast.Compare(left=left, ops=[operation], comparators=[right]),
+                    context,
+                )
+                for left, operation, right in zip(
+                    operands[:-1], node.ops, operands[1:], strict=True
+                )
+            )
         if len(node.ops) != 1 or len(node.comparators) != 1:
             return False
         left = self.value(node.left, context)
@@ -313,12 +422,17 @@ class _Proof:
                     # Tuple results (for example packed arithmetic) need no
                     # interval inference, but every rebound name must forget
                     # its previous proof before subsequent predicates are read.
-                    for target in _assigned_names(statement.targets[0]):
+                    for target in self.assigned_names(statement.targets[0]):
                         context.values.pop(target, None)
+            elif isinstance(statement, ast.AugAssign):
+                # Preserve the in-place operation exactly. Its target's old
+                # interval cannot justify any predicate after the update.
+                assert isinstance(statement.target, ast.Name)
+                context.values.pop(statement.target.id, None)
             elif isinstance(statement, ast.For):
                 induction = self.loop_value(statement, context)
                 local = context.copy()
-                for name in _assigned_names(statement):
+                for name in self.assigned_names(statement):
                     local.values.pop(name, None)
                 if induction is not None:
                     value, symbol, upper = induction
@@ -326,7 +440,7 @@ class _Proof:
                     local.values[statement.target.id] = value
                     local.upper[symbol] = upper
                 statement.body = self.block(statement.body, local)
-                for name in _assigned_names(statement):
+                for name in self.assigned_names(statement):
                     context.values.pop(name, None)
                 statement.orelse = self.block(statement.orelse, context.copy())
             elif isinstance(statement, ast.If):
@@ -340,16 +454,16 @@ class _Proof:
                     continue
                 statement.body = self.block(statement.body, context.copy())
                 statement.orelse = self.block(statement.orelse, context.copy())
-                for name in _assigned_names(statement):
+                for name in self.assigned_names(statement):
                     context.values.pop(name, None)
             elif isinstance(statement, ast.With):
                 local = context.copy()
                 for item in statement.items:
                     if item.optional_vars is not None:
-                        for name in _assigned_names(item.optional_vars):
+                        for name in self.assigned_names(item.optional_vars):
                             local.values.pop(name, None)
                 statement.body = self.block(statement.body, local)
-                for name in _assigned_names(statement):
+                for name in self.assigned_names(statement):
                     context.values.pop(name, None)
             elif isinstance(statement, ast.Expr):
                 statement.value = self.expression(statement.value, context)
@@ -371,6 +485,9 @@ def _supported(statements: list[ast.stmt]) -> bool:
                 )
             ):
                 return False
+        elif isinstance(statement, ast.AugAssign):
+            if not isinstance(statement.target, ast.Name):
+                return False
         elif isinstance(statement, (ast.If, ast.For)):
             if isinstance(statement, ast.For) and not isinstance(
                 statement.target, ast.Name
@@ -380,6 +497,9 @@ def _supported(statements: list[ast.stmt]) -> bool:
                 return False
         elif isinstance(statement, ast.With):
             if not _supported(statement.body):
+                return False
+        elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+            if any(alias.name == "*" for alias in statement.names):
                 return False
         elif not isinstance(statement, (ast.Expr, ast.Pass)):
             return False
@@ -393,6 +513,7 @@ def simplify_proven_loop_bounds(
     thread_block_dims: tuple[int, int, int] | None,
     constexpr_values: dict[str, int],
     block_grid_dims: tuple[int, int, int] | None = None,
+    excluded_names: frozenset[str] = frozenset(),
 ) -> list[ast.stmt]:
     """Keep unknown arithmetic, partial tiles, and all memory-derived bounds."""
     if not enabled or thread_block_dims is None or len(thread_block_dims) != 3:
@@ -415,27 +536,79 @@ def simplify_proven_loop_bounds(
     ):
         return body
     module = ast.Module(body=body, type_ignores=[])
-    if _assigned_names(module) & (set(constexpr_values) | {"cutlass", "cute", "range"}):
-        return body
-    if not _supported(body) or any(
-        isinstance(
-            node,
-            (
-                ast.NamedExpr,
-                ast.Lambda,
-                ast.ListComp,
-                ast.SetComp,
-                ast.DictComp,
-                ast.GeneratorExp,
-                ast.Await,
-                ast.Yield,
-                ast.YieldFrom,
-            ),
-        )
-        for node in ast.walk(module)
+    # Imports remain in their original control scope. Their bindings cannot
+    # supply integer facts, including facts inferred before a later import.
+    imported_names: set[str] = set()
+    assigned_names: set[str] = set()
+    binding_occurrences = 0
+    marker_present = False
+    marker_visibility = True
+    expression_bindings = False
+    binding_expressions = (
+        ast.NamedExpr,
+        ast.Lambda,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.Await,
+        ast.Yield,
+        ast.YieldFrom,
+    )
+    for node in ast.walk(module):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imported_names.update(
+                alias.asname or alias.name.split(".")[0] for alias in node.names
+            )
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                assigned_names.add(node.id)
+                binding_occurrences += 1
+            if not marker_present and node.id.startswith(_MARKER_PREFIX):
+                marker_present = True
+        if isinstance(node, binding_expressions):
+            expression_bindings = True
+        if not marker_present and node.__class__.__name__ in ("BoolOp", "IfExp"):
+            if type(node) is ast.BoolOp:
+                values = node.__dict__.get("values")
+                if (
+                    node._fields != ("op", "values")
+                    or not isinstance(node.__dict__.get("op"), ast.AST)
+                    or type(values) is not list
+                    or not all(isinstance(value, ast.AST) for value in values)
+                ):
+                    marker_visibility = False
+            elif (
+                type(node) is not ast.IfExp
+                or node._fields != ("test", "body", "orelse")
+                or not all(
+                    isinstance(node.__dict__.get(field), ast.AST)
+                    for field in ("test", "body", "orelse")
+                )
+            ):
+                marker_visibility = False
+    imported = frozenset(imported_names)
+    if (assigned_names | imported) & (
+        set(constexpr_values) | {"cutlass", "cute", "range"}
     ):
         return body
-    proof = _Proof(thread_block_dims, block_grid_dims)
+    if not _supported(body) or expression_bindings:
+        return body
+    # No persistent summaries: rewrites may remove an else branch. Every query
+    # below reads the surviving targets again. Equal occurrence counts (not
+    # merely equal name sets) also handle AST nodes shared across two positions.
+    summary = _statement_assigned_names(body)
+    statement_bindings_only = (
+        module._fields == ("body", "type_ignores")
+        and summary is not None
+        and summary[1] == binding_occurrences
+    )
+    proof = _Proof(
+        thread_block_dims,
+        block_grid_dims,
+        excluded_names=excluded_names | imported,
+        statement_bindings_only=statement_bindings_only,
+    )
     context = _Context(
         {
             name: _Value(value, value, _Form(value))
@@ -444,16 +617,25 @@ def simplify_proven_loop_bounds(
     )
     output = proof.block(body, context)
     if proof.changed:
-        occupied = {node.id for node in ast.walk(module) if isinstance(node, ast.Name)}
+        # Canonical statements and rewrite expressions keep existing names
+        # visible to the initial walk. The rewrite only removes names, so an
+        # absent marker remains free. Retain the complete post-rewrite query
+        # for nonstandard schemas and existing markers whose last occurrence
+        # may have disappeared with a proved comparison or discarded branch.
+        occupied = imported
+        if marker_present or not statement_bindings_only or not marker_visibility:
+            occupied = {
+                node.id for node in ast.walk(module) if isinstance(node, ast.Name)
+            } | imported
         ordinal = 0
-        while f"_cute_proven_loop_bounds_{ordinal}_abi_version" in occupied:
+        while f"{_MARKER_PREFIX}{ordinal}_abi_version" in occupied:
             ordinal += 1
         output.insert(
             0,
             ast.Assign(
                 targets=[
                     ast.Name(
-                        id=f"_cute_proven_loop_bounds_{ordinal}_abi_version",
+                        id=f"{_MARKER_PREFIX}{ordinal}_abi_version",
                         ctx=ast.Store(),
                     )
                 ],

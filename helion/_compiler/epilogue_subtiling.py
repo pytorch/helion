@@ -391,6 +391,20 @@ def _reshape_and_split(
     block_id: int | None,
 ) -> list[torch.fx.Node]:
     """Reshape [... N ...] -> [... S, N//S ...] at split_dim and recursively split."""
+    if split_factor > 2 and CompileEnvironment.current().backend_name == "cute":
+        # Split the remaining tile in half at each level. Exposing the
+        # complete factor first creates repeated literal dimensions [2, 2]
+        # that the ordinary CuTe layout cannot distinguish. Each binary
+        # split instead retains one factor coordinate and the remaining
+        # tile coordinate, with the same ordered contiguous leaf pieces.
+        halves = _reshape_and_split(graph, node, split_dim, 2, block_id)
+        return [
+            piece
+            for half in halves
+            for piece in _reshape_and_split(
+                graph, half, split_dim, split_factor // 2, block_id
+            )
+        ]
     val = node.meta["val"]
     piece_size = val.size(split_dim) // split_factor
     reshape_shape = list(val.shape)

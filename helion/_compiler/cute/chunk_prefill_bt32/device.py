@@ -1,0 +1,562 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# pyrefly: ignore-errors
+# ruff: noqa: ANN001, ANN202
+# SPDX-License-Identifier: BSD-3-Clause
+"""BT32 M128 CuTe engine for the explicit centered v2 policy.
+
+The host ABI follows the existing BT16 prototype. Unsupported optional policies
+are rejected at compilation; no argument is silently ignored. Input state is
+separate, immutable FP32 and is copied exactly into authoritative FP32 TMEM.
+"""
+
+from __future__ import annotations
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.experimental.cuda as cuda
+import cutlass.experimental.primitives as prims
+
+from ..chunk_prefill_prepared_state_copy import validate_fast_state_copy_payload
+from ..prepared_state_copy import raw_state_copy_eligible
+from ..prepared_tcgen_edge import initialize_prepared_state_copy
+from ..sequence_order import select_sequence_by_length
+from ..warp_specialized_primitives import initialize_mbarrier_region
+from . import common as cm
+from .factor import factor_loop
+from .issuer import issuer_loop
+from .output import output_loop
+from .state import state_loop
+
+THREADS_PER_CTA = cm.THREADS
+BT = cm.BT
+DK = cm.DK
+DV = cm.DV
+NUMERICAL_POLICY = "centered_bt32_fp32_rhs_v2"
+
+
+@cute.jit
+def init_barriers(smem_base, lane, STATE_COPY_PROGRAM: cutlass.Constexpr = None):
+    """Initialize the packed barrier regions cooperatively in one warp."""
+    initialize_mbarrier_region(
+        smem_base,
+        cm.SINGLE_PRODUCER_BARRIER_OFFSET,
+        cm.SINGLE_PRODUCER_BARRIER_STAGES,
+        cm.SINGLE_PRODUCER_BARRIER_ARRIVALS,
+        lane,
+    )
+    initialize_mbarrier_region(
+        smem_base,
+        cm.FACTOR_TEAM_BARRIER_OFFSET,
+        cm.FACTOR_TEAM_BARRIER_STAGES,
+        cm.FACTOR_TEAM_BARRIER_ARRIVALS,
+        lane,
+    )
+    if lane == 0:
+        prims.mbarrier_init(cm.sptr(smem_base, cm.OUT_EMPTY, cutlass.Int64), 1)
+        prims.mbarrier_init(cm.sptr(smem_base, cm.DONE, cutlass.Int64), 8)
+        if cutlass.const_expr(STATE_COPY_PROGRAM is not None):
+            initialize_prepared_state_copy(STATE_COPY_PROGRAM, smem_base)
+    prims.fence_mbarrier_init()
+
+
+@cute.kernel
+def kernel(
+    desc_q: cutlass.GridConstant[cuda.TensorMap],
+    desc_k: cutlass.GridConstant[cuda.TensorMap],
+    desc_gate: cutlass.GridConstant[cuda.TensorMap],
+    desc_beta: cutlass.GridConstant[cuda.TensorMap],
+    desc_v: cutlass.GridConstant[cuda.TensorMap],
+    desc_out: cutlass.GridConstant[cuda.TensorMap],
+    desc_initial: cutlass.GridConstant[cuda.TensorMap] | None,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    gate: cute.Tensor,
+    beta: cute.Tensor,
+    a_log: cute.Tensor,
+    dt_bias: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor | None,
+    initial_state: cute.Tensor | None,
+    out: cute.Tensor,
+    final_state: cute.Tensor | None,
+    scale: cutlass.Float32,
+    gate_scale_log2: cutlass.Float32,
+    TASK_ORDER: cutlass.Constexpr = "identity",
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    STATE_COPY_PROGRAM: cutlass.Constexpr = None,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    WARP_TILE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
+    GATE_PUBLICATIONS: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
+    thread, _, _ = cute.arch.thread_idx()
+    warp = cute.arch.make_warp_uniform(thread // 32)
+    lane = thread % 32
+    head, sequence, _ = cute.arch.block_idx()
+    head = cute.arch.make_warp_uniform(head)
+    sequence = cute.arch.make_warp_uniform(sequence)
+    if cutlass.const_expr(seq_order is not None):
+        sequence = cute.arch.make_warp_uniform(cutlass.Int32(seq_order[sequence]))
+    elif cutlass.const_expr(TASK_ORDER == "longest_first"):
+        sequence = cute.arch.make_warp_uniform(
+            select_sequence_by_length(cu_seqlens, sequence, thread, cm.THREADS)
+        )
+    begin = cutlass.Int64(cu_seqlens[sequence])
+    end = cutlass.Int64(cu_seqlens[sequence + 1])
+    begin = cute.arch.make_warp_uniform(begin)
+    seqlen = cute.arch.make_warp_uniform(cutlass.Int32(end - begin))
+    num_chunks = cute.arch.make_warp_uniform((seqlen + cm.BT - 1) // cm.BT)
+    heads = cutlass.Int32(q.shape[2])
+    storage = cutlass.Array(
+        cutlass.Uint8, cm.SMEM_BYTES, space=cutlass.AddressSpace.smem, alignment=1024
+    )
+    smem_base = cutlass.Int32(storage.data_ptr().toint())
+    if warp == 10:
+        init_barriers(
+            smem_base,
+            lane,
+            STATE_COPY_PROGRAM if desc_initial is not None else None,
+        )
+    if warp == 0:
+        prims.tcgen05_alloc(
+            cm.sptr(smem_base, cm.TMEM_ADDR, cutlass.Int32),
+            cm.TMEM_COLS,
+            group=prims.CTAGroup.CTA_1,
+        )
+        prims.tcgen05_relinquish_alloc_permit(group=prims.CTAGroup.CTA_1)
+    prims.barrier_cta_sync(0, thread_count=cm.THREADS)
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+    tmem_base = cm.sptr(smem_base, cm.TMEM_ADDR, cutlass.Int32).load()
+    tmem_base = cute.arch.make_warp_uniform(tmem_base)
+    if warp < cm.STATE_LAST_WARP:
+        prims.setmaxregister(cm.STATE_REGISTERS, prims.SetMaxRegisterAction.INCREASE)
+        state_loop(
+            smem_base,
+            tmem_base,
+            desc_initial,
+            initial_state,
+            final_state,
+            sequence,
+            head,
+            seqlen,
+            num_chunks,
+            warp,
+            lane,
+            gate_scale_log2,
+            STATE_PROGRAM=STATE_PROGRAM,
+            STATE_ABI_PROGRAM=STATE_ABI_PROGRAM,
+            STATE_COPY_PROGRAM=STATE_COPY_PROGRAM,
+            STATE_PUBLICATIONS=STATE_PUBLICATIONS,
+        )
+    elif warp < cm.OUTPUT_LAST_WARP:
+        prims.setmaxregister(cm.OUTPUT_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
+        output_loop(
+            smem_base,
+            tmem_base,
+            out,
+            desc_out,
+            begin,
+            seqlen,
+            head,
+            num_chunks,
+            warp,
+            lane,
+            OUTPUT_PROGRAM=OUTPUT_PROGRAM,
+            STATE_PUBLICATIONS=STATE_PUBLICATIONS,
+        )
+    elif warp < cm.SERVICE_LAST_WARP:
+        prims.setmaxregister(cm.SERVICE_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
+        if warp == 9:
+            issuer_loop(smem_base, tmem_base, num_chunks, ISSUE_PROGRAM=ISSUE_PROGRAM)
+    else:
+        prims.setmaxregister(cm.FACTOR_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(desc_initial is not None):
+            if cutlass.const_expr(STATE_COPY_PROGRAM[0] in (2, 3)):
+                # The checked lease ends at the last producer warp. Release
+                # registers before waiting, and wait before any stage access.
+                if warp >= STATE_COPY_PROGRAM[8]:
+                    cm.wait(
+                        cm.sptr(
+                            smem_base,
+                            STATE_COPY_PROGRAM[6]
+                            + (24 if STATE_COPY_PROGRAM[0] == 2 else 16),
+                            cutlass.Int64,
+                        ),
+                        cutlass.Int32(0),
+                    )
+                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        factor_loop(
+            smem_base,
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            a_log,
+            dt_bias,
+            desc_q,
+            desc_k,
+            desc_gate,
+            desc_beta,
+            desc_v,
+            begin,
+            seqlen,
+            head,
+            heads,
+            num_chunks,
+            (warp - cm.FACTOR_FIRST_WARP) // 4,
+            (warp - cm.FACTOR_FIRST_WARP) % 4,
+            lane,
+            scale,
+            gate_scale_log2,
+            PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+            WARP_TILE_PROGRAM=WARP_TILE_PROGRAM,
+            INVERSE_PROGRAM=INVERSE_PROGRAM,
+            FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+            FACTOR_INPUTS=FACTOR_INPUTS,
+            GATE_PUBLICATIONS=GATE_PUBLICATIONS,
+        )
+
+
+@cute.kernel
+def empty_state_copy(
+    initial_state: cute.Tensor | None,
+    final_state: cute.Tensor,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+):
+    from ..prepared_tcgen_edge import execute_prepared_state_abi
+
+    row, _, _ = cute.arch.thread_idx()
+    head, sequence, _ = cute.arch.block_idx()
+    if cutlass.const_expr(STATE_ABI_PROGRAM is not None):
+        execute_prepared_state_abi(
+            STATE_ABI_PROGRAM[2],
+            initial_state,
+            final_state,
+            None,
+            (sequence, head, row),
+        )
+    else:
+        for column in cutlass.range_constexpr(128):
+            value = cutlass.Float32(0.0)
+            if cutlass.const_expr(initial_state is not None):
+                value = initial_state[sequence, head, row, column]
+            final_state[sequence, head, row, column] = value
+
+
+def _validate_metadata(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    raw_gate: cute.Tensor,
+    a_log: cute.Tensor,
+    dt_bias: cute.Tensor,
+    beta: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor | None,
+    state_indices: cute.Tensor | None,
+    initial_state: cute.Tensor | None,
+    out: cute.Tensor,
+    final_state: cute.Tensor | None,
+    state_ckpt: cute.Tensor | None,
+    cu_ckpts: cute.Tensor | None,
+    checkpoint_state_indices: cute.Tensor | None,
+    checkpoint_stride_chunks: cutlass.Constexpr,
+    SAFE_GATE: cutlass.Constexpr,
+    THREADS: cutlass.Constexpr,
+    gate_dtype: cutlass.Constexpr,
+    TASK_ORDER: cutlass.Constexpr,
+    SEGMENT_BEGIN: cutlass.Constexpr,
+    SEGMENT_SIZE: cutlass.Constexpr,
+    SEQUENCE_BEGIN: cutlass.Constexpr,
+    SEQUENCE_COUNT: cutlass.Constexpr,
+):
+    tokens = q.shape[1]
+    if THREADS != cm.THREADS or not SAFE_GATE:
+        raise ValueError("BT32 prototype requires THREADS=1024 and SAFE_GATE=True")
+    if (
+        TASK_ORDER not in ("identity", "longest_first")
+        or SEGMENT_BEGIN != 0
+        or SEGMENT_SIZE != -1
+        or (SEQUENCE_COUNT != 0)
+        or (SEQUENCE_BEGIN != 0)
+        or (checkpoint_stride_chunks != 0)
+        or (state_indices is not None)
+        or (state_ckpt is not None)
+        or (cu_ckpts is not None)
+        or (checkpoint_state_indices is not None)
+    ):
+        raise ValueError(
+            "BT32 supports identity or longest-first unsegmented, unindexed calls"
+        )
+    if seq_order is not None and (
+        seq_order.element_type is not cutlass.Int32
+        or seq_order.shape != (cu_seqlens.shape[0] - 1,)
+        or seq_order.stride != (1,)
+    ):
+        raise ValueError(
+            "seq_order must be contiguous Int32 with one entry per sequence"
+        )
+    if q.shape[0] != 1 or q.shape[3] != 128:
+        raise ValueError("BT32 prototype requires packed [1,T,H,128] inputs")
+    if (
+        q.element_type is not cutlass.BFloat16
+        or k.element_type is not cutlass.BFloat16
+        or v.element_type is not cutlass.BFloat16
+        or (raw_gate.element_type is not cutlass.BFloat16)
+        or (beta.element_type is not cutlass.BFloat16)
+        or (out.element_type is not cutlass.BFloat16)
+        or (a_log.element_type is not cutlass.Float32)
+        or (dt_bias.element_type is not cutlass.Float32)
+        or (gate_dtype is not cutlass.BFloat16)
+    ):
+        raise ValueError(
+            "BT32 prototype requires BF16 activations and FP32 gate parameters"
+        )
+    if initial_state is not None:
+        if initial_state.element_type is not cutlass.Float32:
+            raise ValueError("initial state must be FP32")
+    if final_state is not None:
+        if final_state.element_type is not cutlass.Float32:
+            raise ValueError("final state must be FP32")
+    if tokens > 2147483647 - 31:
+        raise ValueError("BT32 TMA token coordinates require signed Int32 extent")
+
+
+@cute.jit
+def host(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    raw_gate: cute.Tensor,
+    a_log: cute.Tensor,
+    dt_bias: cute.Tensor,
+    beta: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor | None,
+    state_indices: cute.Tensor | None,
+    initial_state: cute.Tensor | None,
+    out: cute.Tensor,
+    final_state: cute.Tensor | None,
+    stream,
+    SCALE: cutlass.Float32,
+    state_ckpt: cute.Tensor | None,
+    cu_ckpts: cute.Tensor | None,
+    checkpoint_state_indices: cute.Tensor | None,
+    checkpoint_stride_chunks: cutlass.Constexpr,
+    SAFE_GATE: cutlass.Constexpr,
+    GATE_SCALE_LOG2: cutlass.Float32,
+    THREADS: cutlass.Constexpr,
+    gate_dtype: cutlass.Constexpr,
+    TASK_ORDER: cutlass.Constexpr = "identity",
+    SEGMENT_BEGIN: cutlass.Constexpr = 0,
+    SEGMENT_SIZE: cutlass.Constexpr = -1,
+    SEQUENCE_BEGIN: cutlass.Constexpr = 0,
+    SEQUENCE_COUNT: cutlass.Constexpr = 0,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    STATE_COPY_PROGRAM: cutlass.Constexpr = None,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    WARP_TILE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
+    GATE_PUBLICATIONS: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
+    if cutlass.const_expr(STATE_COPY_PROGRAM is not None):
+        validate_fast_state_copy_payload(STATE_COPY_PROGRAM)
+        if cutlass.const_expr(STATE_ABI_PROGRAM is None):
+            raise ValueError("raw state copy requires a bound state ABI")
+    _validate_metadata(
+        q,
+        k,
+        v,
+        raw_gate,
+        a_log,
+        dt_bias,
+        beta,
+        cu_seqlens,
+        seq_order,
+        state_indices,
+        initial_state,
+        out,
+        final_state,
+        state_ckpt,
+        cu_ckpts,
+        checkpoint_state_indices,
+        checkpoint_stride_chunks,
+        SAFE_GATE,
+        THREADS,
+        gate_dtype,
+        TASK_ORDER,
+        SEGMENT_BEGIN,
+        SEGMENT_SIZE,
+        SEQUENCE_BEGIN,
+        SEQUENCE_COUNT,
+    )
+    tokens = q.shape[1]
+    heads = q.shape[2]
+    sequences = cu_seqlens.shape[0] - 1
+    if cutlass.const_expr(tokens == 0):
+        if cutlass.const_expr(final_state is not None):
+            empty_state_copy(
+                initial_state, final_state, STATE_ABI_PROGRAM=STATE_ABI_PROGRAM
+            ).launch(grid=(heads, sequences, 1), block=(128, 1, 1), stream=stream)
+    else:
+        qk_layout = cute.make_layout(
+            (64, tokens, 2, heads, 1), stride=(1, 128 * heads, 64, 128, 128)
+        )
+        gv_layout = cute.make_layout((128, heads, tokens), stride=(1, 128, 128 * heads))
+        out_layout = cute.make_layout(
+            (64, tokens, heads, 2), stride=(1, 128 * heads, 128, 64)
+        )
+        desc_q = cuda.create_tensor_map_tiled_from_view(
+            cute.make_tensor(q.iterator, qk_layout),
+            box_dims=(64, 32, 2, 1, 1),
+            stride_order=(0, 1, 2, 3, 4),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+        )
+        desc_k = cuda.create_tensor_map_tiled_from_view(
+            cute.make_tensor(k.iterator, qk_layout),
+            box_dims=(64, 32, 2, 1, 1),
+            stride_order=(0, 1, 2, 3, 4),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+        )
+        desc_gate = cuda.create_tensor_map_tiled_from_view(
+            cute.make_tensor(raw_gate.iterator, gv_layout),
+            box_dims=(128, 1, 32),
+            stride_order=(0, 1, 2),
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
+        beta_layout = cute.make_layout((heads, tokens), stride=(1, heads))
+        desc_beta = cuda.create_tensor_map_tiled_from_view(
+            cute.make_tensor(beta.iterator, beta_layout),
+            box_dims=(8, 32),
+            stride_order=(0, 1),
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
+        desc_v = cuda.create_tensor_map_tiled_from_view(
+            cute.make_tensor(v.iterator, gv_layout),
+            box_dims=(128, 1, 32),
+            stride_order=(0, 1, 2),
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
+        desc_out = cuda.create_tensor_map_tiled_from_view(
+            cute.make_tensor(out.iterator, out_layout),
+            box_dims=(64, 32, 1, 2),
+            stride_order=(0, 1, 2, 3),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+        )
+        desc_initial = None
+        if cutlass.const_expr(
+            STATE_COPY_PROGRAM is not None and initial_state is not None
+        ):
+            if cutlass.const_expr(
+                initial_state.element_type is cutlass.Float32
+                and raw_state_copy_eligible(
+                    initial_state.shape,
+                    initial_state.stride,
+                    initial_state.iterator.alignment,
+                )
+            ):
+                if cutlass.const_expr(STATE_COPY_PROGRAM[0] == 3):
+                    initial_layout = cute.make_layout(
+                        (
+                            32,
+                            initial_state.shape[2],
+                            initial_state.shape[3] // 32,
+                            initial_state.shape[1],
+                            initial_state.shape[0],
+                        ),
+                        stride=(
+                            initial_state.stride[3],
+                            initial_state.stride[2],
+                            32 * initial_state.stride[3],
+                            initial_state.stride[1],
+                            initial_state.stride[0],
+                        ),
+                    )
+                    desc_initial = cuda.create_tensor_map_tiled_from_view(
+                        cute.make_tensor(initial_state.iterator, initial_layout),
+                        box_dims=(
+                            32,
+                            STATE_COPY_PROGRAM[1],
+                            STATE_COPY_PROGRAM[7],
+                            1,
+                            1,
+                        ),
+                        stride_order=(0, 1, 2, 3, 4),
+                        swizzle=cuda.TensorMapSwizzle.s128b,
+                    )
+                else:
+                    initial_layout = cute.make_layout(
+                        (
+                            initial_state.shape[3],
+                            initial_state.shape[2],
+                            initial_state.shape[1],
+                            initial_state.shape[0],
+                        ),
+                        stride=(
+                            initial_state.stride[3],
+                            initial_state.stride[2],
+                            initial_state.stride[1],
+                            initial_state.stride[0],
+                        ),
+                    )
+                    desc_initial = cuda.create_tensor_map_tiled_from_view(
+                        cute.make_tensor(initial_state.iterator, initial_layout),
+                        box_dims=(STATE_COPY_PROGRAM[3], STATE_COPY_PROGRAM[1], 1, 1),
+                        stride_order=(0, 1, 2, 3),
+                        swizzle=cuda.TensorMapSwizzle.s128b,
+                    )
+        kernel(
+            desc_q,
+            desc_k,
+            desc_gate,
+            desc_beta,
+            desc_v,
+            desc_out,
+            desc_initial,
+            q,
+            k,
+            v,
+            raw_gate,
+            beta,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            seq_order,
+            initial_state,
+            out,
+            final_state,
+            SCALE,
+            GATE_SCALE_LOG2,
+            TASK_ORDER=TASK_ORDER,
+            ISSUE_PROGRAM=ISSUE_PROGRAM,
+            STATE_PROGRAM=STATE_PROGRAM,
+            STATE_ABI_PROGRAM=STATE_ABI_PROGRAM,
+            STATE_COPY_PROGRAM=STATE_COPY_PROGRAM,
+            OUTPUT_PROGRAM=OUTPUT_PROGRAM,
+            PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+            WARP_TILE_PROGRAM=WARP_TILE_PROGRAM,
+            INVERSE_PROGRAM=INVERSE_PROGRAM,
+            FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+            FACTOR_INPUTS=FACTOR_INPUTS,
+            GATE_PUBLICATIONS=GATE_PUBLICATIONS,
+            STATE_PUBLICATIONS=STATE_PUBLICATIONS,
+        ).launch(
+            grid=(heads, sequences, 1),
+            block=(THREADS, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=cm.MIN_BLOCKS_PER_MP,
+        )

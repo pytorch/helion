@@ -14,14 +14,27 @@ import torch
 from helion._hardware import HardwareInfo
 from helion._testing import patch_cute_mma_support
 from helion.autotuner.compiler_coverage import same_value
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from helion.autotuner.base_search import PopulationMember
+    from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.config_generation import FlatConfig
     from helion.autotuner.config_spec import ConfigSpec
-    from helion.autotuner.pattern_search import PatternSearch
     from helion.runtime.config import Config
+
+
+def make_unbenchmarked_member(
+    generation: ConfigGeneration, flat: FlatConfig
+) -> PopulationMember | None:
+    """Run real canonicalization and backend viability without starting a search."""
+    search = PatternSearch.__new__(PatternSearch)
+    search.config_gen = generation
+    search.config_spec = generation.config_spec
+    return search.make_unbenchmarked(flat)
 
 
 def with_flat_min_blocks_default(spec: ConfigSpec, config: Config) -> Config:
@@ -41,15 +54,30 @@ def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
     matched to independently normalized immutable declarations and final pins.
     """
     base_calls = []
+    coverage_calls = []
     build_base = search._generate_initial_population_base
+    build_coverage = search._generate_initial_population_with_coverage
 
     def observe_base(**kwargs):
         result = build_base(**kwargs)
         base_calls.append((deepcopy(result), random.getstate()))
         return result
 
-    with patch.object(search, "_generate_initial_population_base", observe_base):
-        result = search._generate_initial_population_flat()
+    def observe_coverage():
+        result = build_coverage()
+        coverage_calls.append(deepcopy(result))
+        return result
+
+    with (
+        patch.object(search, "_generate_initial_population_base", observe_base),
+        patch.object(
+            search, "_generate_initial_population_with_coverage", observe_coverage
+        ),
+    ):
+        final_result = search._generate_initial_population_flat()
+    assert len(coverage_calls) == 1
+    result = coverage_calls[0]
+    _check_full_seed_coverage(search, result, final_result)
     assert len(base_calls) == 1
     base, state = base_calls[0]
     assert len(base) == search.initial_population
@@ -59,7 +87,7 @@ def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
     groups = generation.config_spec.compiler_coverage_groups
     if not groups or not generation.compiler_coverage_enabled:
         assert result == base
-        return result
+        return final_result
 
     declarations = []
     for group in groups:
@@ -108,7 +136,70 @@ def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
         assert effective in search._pinned_finalist_configs
     assert result[len(base) :] == expected_additions
     assert len(result) == search.initial_population + len(expected_additions)
-    return result
+    return final_result
+
+
+def _check_full_seed_coverage(
+    search: PatternSearch, population: list[FlatConfig], result: list[FlatConfig]
+) -> None:
+    """Audit the separate full-effort seed append after declared coverage."""
+    outcomes = search.seed_coverage_outcomes
+    if not search._full_seed_coverage_enabled():
+        assert not outcomes and result == population
+        return
+    generation = search.config_gen
+    spec = generation.config_spec
+    requests = [
+        (f"compiler_seed:{index}", seed, False)
+        for index, seed in enumerate(spec.compiler_seed_configs)
+    ] + [(w.mechanism, w.config, True) for w in spec.compiler_seed_witnesses]
+    assert len(outcomes) == len(requests)
+    seen = set()
+    for row in population:
+        try:
+            seen.add(generation.canonicalize_flat(deepcopy(row))[1])
+        except InvalidConfig:
+            continue
+    additions = []
+    for (origin, requested, supplemental), outcome in zip(
+        requests, outcomes, strict=True
+    ):
+        assert outcome.origin == origin and outcome.requested == requested
+        carrier = deepcopy(requested)
+        if (
+            "pid_type" not in generation._flat_fields()
+            and carrier.config.get("pid_type") == "flat"
+        ):
+            carrier.config.pop("pid_type")
+        try:
+            flat, effective = generation.strict_config_pair(carrier)
+        except InvalidConfig:
+            assert outcome.status.startswith("invalid:") and outcome.effective is None
+            continue
+        if supplemental and any(
+            isinstance(fragment, EnumFragment)
+            and not any(
+                same_value(value, choice) for choice in fragment._active_choices()
+            )
+            for fragment, value in zip(generation.flat_spec, flat, strict=True)
+        ):
+            assert outcome.status.startswith("invalid:") and outcome.effective is None
+            continue
+        assert outcome.effective == effective
+        if supplemental and any(
+            key not in effective.config or effective.config[key] != value
+            for key, value in carrier.config.items()
+        ):
+            assert outcome.status == "overridden"
+            continue
+        if effective in seen:
+            assert outcome.status == "already_present"
+        else:
+            assert outcome.status == "pending"
+            additions.append(flat)
+            seen.add(effective)
+        assert effective in search._pinned_finalist_configs
+    assert result == [*population, *additions]
 
 
 def _pointwise(x: torch.Tensor) -> torch.Tensor:

@@ -476,6 +476,21 @@ class _Settings:
             },
         )
     )
+    autotune_cute_source_workers: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_CUTE_SOURCE_WORKERS", 0
+        )
+    )
+    autotune_cute_native_workers: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_CUTE_NATIVE_WORKERS", 0
+        )
+    )
+    autotune_cute_native_required: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_CUTE_NATIVE_REQUIRED", False
+        )
+    )
     autotune_precompile_jobs: int | None = dataclasses.field(
         default_factory=functools.partial(
             _env_get_optional_int,
@@ -606,6 +621,7 @@ class _Settings:
         )
     )
     autotune_initial_population_strategy: InitialPopulation | None = None
+    autotune_compiler_seed_coverage: bool = True
     torch_compile_fusion: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TORCH_COMPILE_FUSION", False
@@ -757,6 +773,9 @@ class Settings(_Settings):
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
         "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
+        "autotune_cute_source_workers": "Maximum concurrent one-shot CuTe source workers (0 or 1 keeps serial compilation; 2 is a starting opt-in value). Module/native compilation remains in the parent. Unsupported routes remain serial.",
+        "autotune_cute_native_workers": "Maximum spawned CuTe compile-only workers for one provider batch (0 disables; 1..32 enables). Each process may compile multiple requests; all exit before ordinary validation/timing. Unsupported paths and worker failures use the original serial launcher.",
+        "autotune_cute_native_required": "Require bounded CuTe native precompile and cache-only parent execution (default false). Unsupported capture or cache reload fails explicitly; actual compile failures/timeouts retain terminal candidate status. Requires enabled native workers and in-process benchmarking.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_best_of_k": (
@@ -932,6 +951,12 @@ class Settings(_Settings):
             "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
             "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
         ),
+        "autotune_compiler_seed_coverage": (
+            "On single-process CuTe full-effort pattern/LFBO searches, append omitted compiler seeds "
+            "and structural witnesses after the unchanged base population. "
+            "The existing time budget still applies. Set False to retain legacy coverage. "
+            "Distributed tuning, other backends, quick/none and explicit finite searches are unchanged."
+        ),
         "autotune_initial_population_strategy": (
             "Override the initial population strategy for autotuning. "
             "Valid values: 'from_random', 'from_best_available'. "
@@ -1016,6 +1041,24 @@ class Settings(_Settings):
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
+
+        if (
+            type(self.autotune_cute_source_workers) is not int
+            or self.autotune_cute_source_workers < 0
+        ):
+            raise ValueError(
+                "autotune_cute_source_workers must be a nonnegative integer"
+            )
+
+        if type(self.autotune_cute_native_required) is not bool:
+            raise ValueError("autotune_cute_native_required must be a boolean")
+        if (
+            type(self.autotune_cute_native_workers) is not int
+            or not 0 <= self.autotune_cute_native_workers <= 32
+        ):
+            raise ValueError(
+                "autotune_cute_native_workers must be an integer from 0 to 32"
+            )
 
         if self.autotune_best_of_k < 1:
             raise ValueError(

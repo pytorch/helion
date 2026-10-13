@@ -19,8 +19,13 @@ from ..ast_read_writes import ReadWrites
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .cache_policy_loads import cache_hinted_load_helper
+from .hoist_lane_invariant_reductions import _PURE_CUTE_MATH_CALLS
+from .hoist_lane_invariant_reductions import _PURE_OPERATOR_CALLS
+from .hoist_lane_invariant_reductions import _is_allowed_pure_call
+from .hoist_lane_invariant_reductions import _rmem_declaration
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
 _LOAD_MARKER = "_helion_persistent_branch_vec_load"
@@ -206,10 +211,40 @@ def _definition_snapshots(
         required_names = _needed_definition_names(statements, required_names)
     definitions: dict[str, ast.expr] = {}
     definition_reads: dict[str, set[str]] = {}
+    # Fresh register storage is independent of its constructor's namespaces.
+    # Keep object identity separate from frozen expression dependencies: two
+    # identical allocations differ, aliases survive a name rebind, and content
+    # writes invalidate derived values without mutating shape/dtype globals.
+    fresh_bindings: dict[str, int] = {}
+    definition_storage: dict[str, set[int]] = {}
+    next_storage = 0
     result: list[dict[str, ast.expr]] = []
     for statement in statements:
         result.append(dict(definitions))
         exact_definitions = _single_name_definitions([statement])
+        assigned_storage: dict[str, int] = {}
+        assigned_dependencies: dict[str, set[int]] = {}
+        for name, value in exact_definitions.items():
+            reads = {
+                node.id
+                for node in ast.walk(value)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            }
+            assigned_dependencies[name] = set().union(
+                *(definition_storage.get(read, set()) for read in reads),
+                {fresh_bindings[read] for read in reads if read in fresh_bindings},
+            )
+            if (
+                _rmem_declaration(statement) is not None
+                and isinstance(value, ast.Call)
+                and isinstance(value.args[0], ast.Constant)
+                and type(value.args[0].value) is int
+            ):
+                assigned_storage[name] = next_storage
+                assigned_dependencies[name] = {next_storage}
+                next_storage += 1
+            elif isinstance(value, ast.Name) and value.id in fresh_bindings:
+                assigned_storage[name] = fresh_bindings[value.id]
         # Definitions retain source expressions rather than assignment-time
         # values.  Invalidate every definition that transitively depends on a
         # written name before recording the new exact definitions.  Otherwise
@@ -226,17 +261,53 @@ def _definition_snapshots(
         # a read, so invalidate it (and all definitions depending on it) too.
         # This is deliberately conservative for non-name RHS expressions.
         for name in _mutated_value_roots(statement):
+            storage = set(definition_storage.get(name, ()))
+            if name in fresh_bindings:
+                storage.add(fresh_bindings[name])
+            invalidated.update(
+                alias for alias, owner in fresh_bindings.items() if owner in storage
+            )
+            invalidated.update(
+                dependent
+                for dependent, owners in definition_storage.items()
+                if owners & storage
+            )
             definition = definitions.get(name)
-            if definition is not None:
+            if definition is not None and name not in fresh_bindings:
+                # Unknown/non-fresh values retain the original conservative
+                # alias propagation in addition to any known storage ancestry.
                 invalidated.update(definition_reads[name])
+        # Only a binding write forgets object identity. Mutating its contents
+        # retains the allocation/alias relation for subsequent cache accesses.
+        bound_names = {
+            node.id
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+        }
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                bound_names.update(
+                    alias.asname or alias.name.split(".")[0] for alias in node.names
+                )
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                bound_names.add(node.name)
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name:
+                    bound_names.add(node.name)
+        for name in bound_names:
+            fresh_bindings.pop(name, None)
         while invalidated:
             newly_invalidated: set[str] = set()
             for name in tuple(definitions):
                 if name in invalidated or (definition_reads[name] & invalidated):
                     definitions.pop(name)
                     definition_reads.pop(name)
+                    definition_storage.pop(name)
                     newly_invalidated.add(name)
             invalidated = newly_invalidated
+        fresh_bindings.update(assigned_storage)
         for name, value in exact_definitions.items():
             if required_names is not None and name not in required_names:
                 continue
@@ -245,6 +316,7 @@ def _definition_snapshots(
                 return None
             definitions[name] = frozen
             definition_reads[name] = set(ReadWrites.from_ast(frozen).reads)
+            definition_storage[name] = assigned_dependencies[name]
     return result
 
 
@@ -806,12 +878,11 @@ def _scalar_pointers_are_modularly_lane_disjoint(
 ) -> bool:
     """Prove cross-lane disjointness despite different row/checkpoint bases.
 
-    If both pointers advance by the same nonzero lane step and every possible
-    difference between their lane-independent bases is a multiple of ``M``, a
-    cross-iteration dependence is impossible when ``step * delta`` is nonzero
-    modulo ``M`` for every live lane delta (at least ``width`` elements away
-    from zero for vector accesses).  Including the Int32 modulus keeps the
-    proof sound under generated index narrowing.
+    Variable base differences are multiples of ``M``; keep the exact constant
+    displacement separately.  Every signed cross-iteration delta must leave
+    the complete packet intervals disjoint modulo ``M``.  A fixed subpacket
+    offset therefore does not reduce the variable-base modulus.  Including
+    the Int32 modulus keeps the proof sound under generated index narrowing.
     """
     load_root = _single_tensor_iterator_root(load_pointer)
     store_root = _single_tensor_iterator_root(store_pointer)
@@ -848,12 +919,13 @@ def _scalar_pointers_are_modularly_lane_disjoint(
         else:
             base_coefficients.pop(key, None)
     modulus = 1 << 32
-    modulus = math.gcd(modulus, abs(load_form[2] - store_form[2]))
     for coefficient in base_coefficients.values():
         modulus = math.gcd(modulus, abs(coefficient))
+    constant_offset = load_form[2] - store_form[2]
     return modulus > 1 and all(
-        _lane_step_separates(lane_coefficient * delta, modulus, width)
-        for delta in range(1, lane_extent)
+        _lane_step_separates(lane_coefficient * delta + constant_offset, modulus, width)
+        for delta in range(1 - lane_extent, lane_extent)
+        if delta != 0
     )
 
 
@@ -1321,9 +1393,55 @@ class _BranchLocalPersistentVectorizer:
             for node in ast.walk(stmt)
             if isinstance(node, ast.Name)
         }
+        self.body = body
+        self.register_tensors: set[str] | None = None
         self.counter = 0
         self.proven_disjoint_tensor_pairs = proven_disjoint_tensor_pairs
         self.proven_tensor_stride_values = proven_tensor_stride_values
+
+    def _register_tensor_names(self) -> set[str]:
+        if self.register_tensors is not None:
+            return self.register_tensors
+        # Only exact, unaliased register tensors may receive subscript writes
+        # while a readonly global load moves across the lane-loop backedge.
+        tree = ast.Module(body=self.body, type_ignores=[])
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        bindings: dict[str, list[ast.Name]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                bindings.setdefault(node.id, []).append(node)
+        escaped = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and not (
+                isinstance(parent := parents.get(node), ast.Subscript)
+                and parent.value is node
+            )
+        }
+        self.register_tensors = set()
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func) == "cute.make_rmem_tensor"
+            ):
+                continue
+            name = node.targets[0].id
+            if len(bindings[name]) != 1:
+                continue
+            if name not in escaped:
+                self.register_tensors.add(name)
+        return self.register_tensors
 
     def _fresh(self, prefix: str) -> str:
         while True:
@@ -1434,6 +1552,9 @@ class _BranchLocalPersistentVectorizer:
         load_index: int,
         lane_var: str,
         lane_extent: int,
+        *,
+        get_definition_snapshots: Callable[[], list[dict[str, ast.expr]] | None]
+        | None = None,
     ) -> bool:
         """Whether any loop iteration can write storage read by this load.
 
@@ -1445,7 +1566,11 @@ class _BranchLocalPersistentVectorizer:
         """
         load_pointer = load_marker.args[4]
         load_roots = self._pointer_roots(load_pointer)
-        definition_snapshots = _definition_snapshots(body)
+        definition_snapshots = (
+            _definition_snapshots(body)
+            if get_definition_snapshots is None
+            else get_definition_snapshots()
+        )
         if definition_snapshots is None:
             return True
         for store_index, stmt in enumerate(body):
@@ -1489,6 +1614,9 @@ class _BranchLocalPersistentVectorizer:
         store_index: int,
         lane_var: str,
         lane_extent: int,
+        *,
+        get_definition_snapshots: Callable[[], list[dict[str, ast.expr]] | None]
+        | None = None,
     ) -> bool:
         """Whether sinking a store can cross an aliasing memory access.
 
@@ -1500,7 +1628,11 @@ class _BranchLocalPersistentVectorizer:
         same injective lane mapping.
         """
         store_roots = self._pointer_roots(store_marker.args[3])
-        definition_snapshots = _definition_snapshots(body)
+        definition_snapshots = (
+            _definition_snapshots(body)
+            if get_definition_snapshots is None
+            else get_definition_snapshots()
+        )
         if definition_snapshots is None:
             return True
         for access_index, stmt in enumerate(body):
@@ -1560,18 +1692,165 @@ class _BranchLocalPersistentVectorizer:
                     return True
         return False
 
+    def _readonly_prefix_hoist(
+        self, loop: ast.For, block_id: int, width: int
+    ) -> list[ast.stmt]:
+        """Move only packet-address scalar loads with invariant readonly owners.
+
+        The memory-lowering marker already proves packet alignment, unit stride
+        and a complete fragment. This adds no marker and relaxes none of those
+        gates. A selected load and its integer casts retain their exact AST;
+        all original cache writes, scalar masks and numeric operations stay put.
+        """
+        writes = {
+            node.id
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+        }
+        counts: dict[str, int] = {}
+        for node in ast.walk(loop):
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                counts[node.id] = counts.get(node.id, 0) + 1
+        definitions: dict[str, ast.Assign] = {}
+        moved: dict[str, ast.Assign] = {}
+
+        def readonly(pointer: ast.expr) -> bool:
+            roots = self._pointer_roots(pointer)
+            if roots is None:
+                return False
+            for node in ast.walk(loop):
+                if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
+                    node.ctx, (ast.Store, ast.Del)
+                ):
+                    if not (
+                        isinstance(node, ast.Subscript)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id in self._register_tensor_names()
+                    ):
+                        return False
+                if not isinstance(node, ast.Call):
+                    continue
+                store = self._store_pointer(node)
+                if store is not None:
+                    if self._may_alias(roots, self._pointer_roots(store)):
+                        return False
+                    continue
+                if self._load_pointer(node) is not None:
+                    continue
+                name = ast.unparse(node.func)
+                # These existing scalar-purity contracts only establish that
+                # unrelated math cannot mutate the packet-address load's
+                # owner or retained integer wrappers. The math stays in place.
+                if name in _PURE_CUTE_MATH_CALLS or name in _PURE_OPERATOR_CALLS:
+                    continue
+                if name in (
+                    "cutlass.range_constexpr",
+                    "cutlass.Int32",
+                    "cutlass.Int64",
+                    "cutlass.Uint16",
+                    "cutlass.Uint32",
+                    "cutlass.Uint64",
+                    "cutlass.Float32",
+                    "cutlass.BFloat16",
+                    "cutlass.Float16",
+                ):
+                    continue
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
+                    continue
+                # Unknown calls (including barriers/atomics) cannot certify a
+                # readonly owner or unchanged mutable scalar wrappers.
+                return False
+            return True
+
+        def chain(name: str, visiting: set[str]) -> dict[str, ast.Assign] | None:
+            statement = definitions.get(name)
+            if statement is None or counts.get(name) != 1 or name in visiting:
+                return None
+            value = statement.value
+            visiting = visiting | {name}
+            if (
+                isinstance(value, ast.Call)
+                and len(value.args) == 1
+                and not value.keywords
+                and ast.unparse(value.func) in ("cutlass.Int32", "cutlass.Int64")
+                and isinstance(value.args[0], ast.Name)
+            ):
+                dependency = chain(value.args[0].id, visiting)
+                return None if dependency is None else {**dependency, name: statement}
+            load_info = _scalar_load_and_mask(value)
+            if load_info is None:
+                return None
+            load, mask = load_info
+            pointer = _plain_scalar_load_pointer(load)
+            if pointer is None or not _scalar_pointer_calls_are_known(pointer):
+                return None
+            if set(ReadWrites.from_ast(value).reads) & writes:
+                return None
+            # Masked prefix loads remain scalar. Only the independently
+            # marked packet keeps its original mask and zero selection.
+            if mask is not None:
+                return None
+            if not readonly(pointer):
+                return None
+            return {name: statement}
+
+        for statement in loop.body:
+            for node in ast.walk(statement):
+                marker = _marker_call(node, _LOAD_MARKER, 6)
+                if (
+                    marker is None
+                    or _literal(marker.args[0], int) != block_id
+                    or _literal(marker.args[1], int) != width
+                    or _literal(marker.args[2], str) not in _DTYPE_INFO
+                ):
+                    continue
+                for name in ReadWrites.from_ast(marker.args[5]).reads:
+                    dependency = chain(name, set())
+                    if dependency is not None:
+                        moved.update(dependency)
+            if (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+            ):
+                definitions[statement.targets[0].id] = statement
+        if not moved:
+            return []
+        selected = {id(statement) for statement in moved.values()}
+        before = [statement for statement in loop.body if id(statement) in selected]
+        loop.body = [
+            statement for statement in loop.body if id(statement) not in selected
+        ]
+        return before
+
     def _vectorize_loop(
         self, loop: ast.For, block_id: int, width: int
     ) -> tuple[list[ast.stmt], ast.For, list[ast.stmt]]:
         assert isinstance(loop.target, ast.Name)
         lane_var = loop.target.id
+        prefix = self._readonly_prefix_hoist(loop, block_id, width)
         all_local_writes = {
             name for stmt in loop.body for name in ReadWrites.from_ast(stmt).writes
         }
         definitions: dict[str, ast.expr] = {}
-        before: list[ast.stmt] = []
+        before: list[ast.stmt] = prefix
         after: list[ast.stmt] = []
         rewritten_body: list[ast.stmt] = []
+        snapshots: list[dict[str, ast.expr]] | None = None
+        snapshots_valid = False
+
+        def current_definition_snapshots() -> list[dict[str, ast.expr]] | None:
+            nonlocal snapshots, snapshots_valid
+            # Alias checks are read-only. Reuse their reaching definitions only
+            # until this loop is rewritten, including a failed budget proof.
+            if not snapshots_valid:
+                snapshots = _definition_snapshots(loop.body)
+                snapshots_valid = True
+            return snapshots
+
+        subpacket_effects_known: bool | None = None
 
         for stmt_index, stmt in enumerate(loop.body):
             load_markers: list[ast.Call] = []
@@ -1592,11 +1871,20 @@ class _BranchLocalPersistentVectorizer:
                     else None
                 )
                 dtype_info = _DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                packet_width = (
+                    min(width, 16 // dtype_info[1]) if dtype_info is not None else 0
+                )
+                if packet_width and width > packet_width:
+                    if subpacket_effects_known is None:
+                        subpacket_effects_known = self._subpacket_effects_known(loop)
                 if (
                     marker_block == block_id
                     and marker_width == width
                     and isinstance(eviction, str)
                     and dtype_info is not None
+                    and packet_width > 0
+                    and width % packet_width == 0
+                    and (width == packet_width or subpacket_effects_known)
                     and load_info is not None
                     and not self._has_aliasing_write_in_loop(
                         loop.body,
@@ -1604,6 +1892,7 @@ class _BranchLocalPersistentVectorizer:
                         stmt_index,
                         lane_var,
                         width,
+                        get_definition_snapshots=current_definition_snapshots,
                     )
                 ):
                     scalar_load, mask = load_info
@@ -1623,43 +1912,63 @@ class _BranchLocalPersistentVectorizer:
                     )
                     if base is not None:
                         carrier, itemsize, _store_helper = dtype_info
-                        vec_name = self._fresh("_persistent_branch_vec")
                         vector_type = (
-                            f"ir.VectorType.get([{width}], {carrier}.mlir_type)"
+                            f"ir.VectorType.get([{packet_width}], {carrier}.mlir_type)"
                         )
-                        if eviction in _CUTE_CACHE_LOAD_HELPERS:
-                            # An L2-policy marker is not a ``cute.arch.load``
-                            # kwarg: the 16-, 8- and 4-byte packets go
-                            # through the inline-PTX helper of their width.
-                            helper = cache_hinted_load_helper(
-                                eviction, width * itemsize
+                        extracts: list[str] = []
+                        for offset in range(0, width, packet_width):
+                            vec_name = self._fresh("_persistent_branch_vec")
+                            # Offset the already-guarded pointer: both the
+                            # valid base and the inactive anchor cover the
+                            # complete original logical fragment.
+                            pointer = ast.unparse(base)
+                            lane_index = lane_var
+                            if offset:
+                                pointer = f"({pointer}) + {offset}"
+                                lane_index = f"{lane_var} - {offset}"
+                            if eviction in _CUTE_CACHE_LOAD_HELPERS:
+                                # Retain the original cache policy on every
+                                # physical transaction, at its actual width.
+                                helper = cache_hinted_load_helper(
+                                    eviction, packet_width * itemsize
+                                )
+                                load_source = (
+                                    f"{helper}({pointer}, {vector_type})"
+                                    if helper is not None
+                                    else f"cute.arch.load({pointer}, {vector_type})"
+                                )
+                            else:
+                                load_source = (
+                                    f"cute.arch.load({pointer}, {vector_type}"
+                                    f"{eviction})"
+                                )
+                            before.append(
+                                ast.Assign(
+                                    targets=[ast.Name(id=vec_name, ctx=ast.Store())],
+                                    value=ast.parse(load_source, mode="eval").body,
+                                )
                             )
-                            load_source = (
-                                f"{helper}({ast.unparse(base)}, {vector_type})"
-                                if helper is not None
-                                else f"cute.arch.load({ast.unparse(base)}, {vector_type})"
+                            extracts.append(
+                                f"{carrier}({vec_name}[{lane_index}]).bitcast({dtype})"
                             )
-                        else:
-                            load_source = (
-                                f"cute.arch.load({ast.unparse(base)}, {vector_type}"
-                                f"{eviction})"
+                        extract_source = extracts[-1]
+                        for packet in range(len(extracts) - 2, -1, -1):
+                            # The original range_constexpr lane selects one
+                            # packet. No runtime vector indexing or new FP
+                            # operation is introduced.
+                            extract_source = (
+                                f"({extracts[packet]} if {lane_var} < "
+                                f"{(packet + 1) * packet_width} else {extract_source})"
                             )
-                        vector_load = ast.parse(load_source, mode="eval").body
-                        before.append(
-                            ast.Assign(
-                                targets=[ast.Name(id=vec_name, ctx=ast.Store())],
-                                value=vector_load,
-                            )
-                        )
-                        extract = ast.parse(
-                            f"{carrier}({vec_name}[{lane_var}]).bitcast({dtype})",
-                            mode="eval",
-                        ).body
+                        extract = ast.parse(extract_source, mode="eval").body
                         replacement = _ReplaceCall(scalar_load, extract).visit(
                             _clone_expr(original)
                         )
                         assert isinstance(replacement, ast.expr)
                         stmt = _ReplaceCall(marker, replacement).visit(stmt)
+                        # This transformer changes the original statement in
+                        # loop.body; subsequent alias checks need fresh facts.
+                        snapshots_valid = False
                         assert isinstance(stmt, ast.stmt)
 
             store_marker = self._store_marker(stmt)
@@ -1668,6 +1977,12 @@ class _BranchLocalPersistentVectorizer:
                 marker_width = _literal(store_marker.args[1], int)
                 dtype = _literal(store_marker.args[2], str)
                 dtype_info = _DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                packet_width = (
+                    min(width, 16 // dtype_info[1]) if dtype_info is not None else 0
+                )
+                if packet_width and width > packet_width:
+                    if subpacket_effects_known is None:
+                        subpacket_effects_known = self._subpacket_effects_known(loop)
                 mask_arg = store_marker.args[5]
                 mask = (
                     None
@@ -1694,6 +2009,12 @@ class _BranchLocalPersistentVectorizer:
                     marker_block == block_id
                     and marker_width == width
                     and dtype_info is not None
+                    and packet_width > 0
+                    and width % packet_width == 0
+                    and (
+                        width == packet_width
+                        or (dtype == "cutlass.Float32" and subpacket_effects_known)
+                    )
                     and base is not None
                     and not self._has_other_aliasing_access_in_loop(
                         loop.body,
@@ -1701,6 +2022,7 @@ class _BranchLocalPersistentVectorizer:
                         stmt_index,
                         lane_var,
                         width,
+                        get_definition_snapshots=current_definition_snapshots,
                     )
                 ):
                     carrier, _itemsize, store_helper = dtype_info
@@ -1735,20 +2057,43 @@ class _BranchLocalPersistentVectorizer:
                         )
                     )
                     stmt = append
-                    flush = ast.Expr(
-                        value=ast.Call(
-                            func=ast.Name(id=store_helper, ctx=ast.Load()),
-                            args=[
-                                base,
-                                ast.Name(id=values_name, ctx=ast.Load()),
-                            ],
-                            keywords=[],
+                    flushes: list[ast.stmt] = []
+                    for offset in range(0, width, packet_width):
+                        packet_pointer = _clone_expr(base)
+                        packet_values: ast.expr = ast.Name(
+                            id=values_name, ctx=ast.Load()
                         )
-                    )
-                    after.append(
-                        flush
+                        if width > packet_width:
+                            # Original lane values retain their order and bits;
+                            # only the final physical transaction is split.
+                            packet_values = ast.Subscript(
+                                value=packet_values,
+                                slice=ast.Slice(
+                                    lower=ast.Constant(value=offset),
+                                    upper=ast.Constant(value=offset + packet_width),
+                                    step=None,
+                                ),
+                                ctx=ast.Load(),
+                            )
+                            if offset:
+                                packet_pointer = ast.BinOp(
+                                    left=packet_pointer,
+                                    op=ast.Add(),
+                                    right=ast.Constant(value=offset),
+                                )
+                        flushes.append(
+                            ast.Expr(
+                                value=ast.Call(
+                                    func=ast.Name(id=store_helper, ctx=ast.Load()),
+                                    args=[packet_pointer, packet_values],
+                                    keywords=[],
+                                )
+                            )
+                        )
+                    after.extend(
+                        flushes
                         if guard is None
-                        else ast.If(test=_clone_expr(guard), body=[flush], orelse=[])
+                        else [ast.If(test=_clone_expr(guard), body=flushes, orelse=[])]
                     )
                 else:
                     rewritten_body.extend(self._restore_store(store_marker))
@@ -1759,6 +2104,48 @@ class _BranchLocalPersistentVectorizer:
 
         loop.body = self.transform_body(rewritten_body)
         return before, loop, after
+
+    def _subpacket_effects_known(self, loop: ast.For) -> bool:
+        """New multi-packet memory accesses require closed effects across all lanes.
+
+        The original alias proof still checks every store. Unknown calls,
+        synchronization and escaped register storage retain scalar loads.
+        No numeric expression or collective moves with the packet loads.
+        """
+        for node in ast.walk(loop):
+            if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                if not (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in self._register_tensor_names()
+                ):
+                    return False
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                _marker_call(node, _LOAD_MARKER, 6) is not None
+                or _marker_call(node, _STORE_MARKER, 6) is not None
+                or _plain_scalar_store_pointer(node) is not None
+            ):
+                continue
+            name = ast.unparse(node.func)
+            # CUDA coordinates are read-only within a thread's lane loop.
+            # Admit only their zero-argument forms; synchronization and other
+            # architecture operations still prevent memory motion.
+            if (
+                name
+                in ("cute.arch.block_idx", "cute.arch.thread_idx", "cute.arch.lane_idx")
+                and not node.args
+                and not node.keywords
+            ):
+                continue
+            if name.startswith("cute.arch.") and name != "cute.arch.load":
+                return False
+            if not _is_allowed_pure_call(node):
+                return False
+        return True
 
     def transform_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
         result: list[ast.stmt] = []

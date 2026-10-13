@@ -5909,7 +5909,16 @@ def flash_attention_seed_configs(
         )
         if value not in active:
             continue
-        values = {**base_values, **dependencies, key: value}
+        variant_values = base_values
+        family = dependencies.get(FLASH_PIPELINE_FAMILY_KEY)
+        if isinstance(family, str):
+            variant_values = _flash_seed_values(
+                head_dim,
+                num_kv,
+                pipeline_family_override=family,
+                **common,
+            )
+        values = {**variant_values, **dependencies, key: value}
         seeds.append(_flash_config_with_values(block_sizes, values))
 
     # These lowerings interact with row reduction and pipeline depth. Marginal
@@ -14582,7 +14591,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.placeholder_args.add(alibi_arg.name)
     for document_arg in document_args:
         df.placeholder_args.add(document_arg.name)
-    cg.cute_uses_matmul = True
+    cg.record_cute_matmul_layout()
 
     if cfg.topology == "ws_overlap":
         df.cute_state.attention_flash_threads = 256 if cfg.s_stage == 2 else 128

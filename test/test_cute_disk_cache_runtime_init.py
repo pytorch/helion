@@ -14,6 +14,11 @@ import pytest
 def test_fresh_process_cache_runtime_init(tmp_path: Path, mode: str) -> None:
     pytest.importorskip("cutlass")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTE_DSL_ARCH="sm_100a")
+    # The child must test this checkout, including when the environment has an
+    # editable Helion installation pointing at a different worktree.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).resolve().parents[1]), *sys.path]
+    )
     result = subprocess.run(
         [sys.executable, "-B", __file__, "--probe", mode, str(tmp_path)],
         env=env,

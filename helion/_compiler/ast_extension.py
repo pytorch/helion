@@ -19,6 +19,7 @@ from .source_location import UnknownLocation
 from .source_location import current_location
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
     import types
 
@@ -29,6 +30,12 @@ if TYPE_CHECKING:
 
     class _TLS(typing.Protocol):
         active_nodes: list[ExtendedAST]
+
+    class _ASTLocations(typing.Protocol):
+        lineno: int
+        col_offset: int
+        end_lineno: int
+        end_col_offset: int
 
 
 tls: _TLS = typing.cast("_TLS", threading.local())
@@ -330,6 +337,45 @@ class _TupleParensRemovedUnparser(
     # pyrefly: ignore [missing-attribute]
     ast._Unparser
 ):
+    def _before_traverse(self, node: ast.AST | list[ast.AST]) -> None:
+        """Render metadata before visiting a node, including binary children."""
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        # Scalar domain predicates can have long binary spines. Preserve the
+        # stdlib visitor's precedence and left/operator/right order without
+        # adding Python call frames for each binary child.
+        pending: list[tuple[ast.expr | str, int | None]] = [(node, None)]
+        while pending:
+            current, precedence = pending.pop()
+            if isinstance(current, str):
+                self.write(current)
+                continue
+            if precedence is not None:
+                self.set_precedence(precedence, current)
+            if not isinstance(current, ast.BinOp):
+                self.traverse(current)
+                continue
+            if current is not node:
+                self._before_traverse(current)
+            operator = self.binop[current.op.__class__.__name__]
+            operator_precedence = self.binop_precedence[operator]
+            if self.get_precedence(current) > operator_precedence:
+                self.write("(")
+                pending.append((")", None))
+            if operator in self.binop_rassoc:
+                left_precedence = operator_precedence.next()
+                right_precedence = operator_precedence
+            else:
+                left_precedence = operator_precedence
+                right_precedence = operator_precedence.next()
+            pending.extend(
+                (
+                    (current.right, right_precedence),
+                    (f" {operator} ", None),
+                    (current.left, left_precedence),
+                )
+            )
+
     def visit_Tuple(self, node: ast.Tuple) -> None:
         if _needs_to_remove_tuple_parens and isinstance(
             getattr(node, "ctx", None), ast.Store
@@ -489,6 +535,50 @@ class _HelionUnparser(_TupleParensRemovedUnparser):
             ):
                 self.output.insert_location_comment(node._location)
         super().traverse(node)
+
+
+def fix_missing_locations(node: _T) -> _T:
+    """Fill locations with stdlib inheritance and child order, without recursion."""
+    pending: list[tuple[Iterator[ast.AST], int, int, int, int]] = [
+        (iter((node,)), 1, 0, 1, 0)
+    ]
+    while pending:
+        children, lineno, col_offset, end_lineno, end_col_offset = pending[-1]
+        for current in children:
+            location = typing.cast("_ASTLocations", current)
+            if "lineno" in current._attributes:
+                if not hasattr(current, "lineno"):
+                    location.lineno = lineno
+                else:
+                    lineno = location.lineno
+            if "end_lineno" in current._attributes:
+                if getattr(current, "end_lineno", None) is None:
+                    location.end_lineno = end_lineno
+                else:
+                    end_lineno = location.end_lineno
+            if "col_offset" in current._attributes:
+                if not hasattr(current, "col_offset"):
+                    location.col_offset = col_offset
+                else:
+                    col_offset = location.col_offset
+            if "end_col_offset" in current._attributes:
+                if getattr(current, "end_col_offset", None) is None:
+                    location.end_col_offset = end_col_offset
+                else:
+                    end_col_offset = location.end_col_offset
+            pending.append(
+                (
+                    ast.iter_child_nodes(current),
+                    lineno,
+                    col_offset,
+                    end_lineno,
+                    end_col_offset,
+                )
+            )
+            break
+        else:
+            pending.pop()
+    return node
 
 
 def unparse(ast_obj: ast.AST, *, output_origin_lines: bool = True) -> str:

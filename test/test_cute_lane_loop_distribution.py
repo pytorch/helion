@@ -763,11 +763,10 @@ def _chunked_recurrence(x: torch.Tensor, decay: torch.Tensor) -> torch.Tensor:
 
 
 def test_loop_carried_accumulator_keeps_its_per_lane_initialization() -> None:
-    # The chunk loop rewrites ``acc`` per lane, but at distribution time its
-    # update is still written under the loop-output name that a later pass
-    # renames to ``acc``.  Read through the rename groups, the initialization
-    # depends on the lane like the updates and stays inside the vector lane
-    # loop; hoisting it would carry one lane's final value into the next.
+    # The typed loop interface keeps each lane's initial value and each
+    # iteration's next value in distinct register buffers. Initialization
+    # must cover the same element as the carry read and update; it must not
+    # run again inside the chunk loop or reuse another lane's final value.
     x = torch.zeros((2, 3, 1024), dtype=torch.bfloat16)
     decay = torch.ones((2, 3), dtype=torch.float32)
     code = _generate(
@@ -779,7 +778,6 @@ def test_loop_carried_accumulator_keeps_its_per_lane_initialization() -> None:
     )
     function = _kernel_function(code)
     _defined_before_use(function)
-    (vloop,) = _loops(function, "vec_lane_")
     inits = [
         node
         for node in ast.walk(function)
@@ -788,8 +786,49 @@ def test_loop_carried_accumulator_keeps_its_per_lane_initialization() -> None:
         and ast.unparse(node.value) == "cutlass.Float32(0.0)"
     ]
     assert len(inits) == 1, code
-    assert any(node is inits[0] for node in ast.walk(vloop)), code
-    assert any(_loops(stmt, "tile_offset_") for stmt in vloop.body), code
+    (initial_loop,) = [
+        loop
+        for loop in _loops(function, "vec_lane_")
+        if any(node is inits[0] for node in ast.walk(loop))
+    ]
+    (chunk_loop,) = _loops(function, "tile_offset_")
+    assert not any(node is inits[0] for node in ast.walk(chunk_loop)), code
+    (initial_store,) = [
+        node
+        for node in ast.walk(initial_loop)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Subscript)
+        and ast.unparse(node.targets[0].value) == "tile_initial_buffer"
+    ]
+    assert ast.unparse(initial_store.value) == "cutlass.Float32(acc)", code
+    (carry_read,) = [
+        node
+        for node in ast.walk(chunk_loop)
+        if isinstance(node, ast.Subscript)
+        and ast.unparse(node.value) == "tile_loop_value.to_vector()"
+    ]
+    (next_store,) = [
+        node
+        for node in ast.walk(chunk_loop)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Subscript)
+        and ast.unparse(node.targets[0].value) == "tile_next_buffer"
+    ]
+    assert isinstance(initial_store.targets[0], ast.Subscript)
+    assert isinstance(next_store.targets[0], ast.Subscript)
+    assert (
+        ast.unparse(initial_store.targets[0].slice)
+        == ast.unparse(carry_read.slice)
+        == ast.unparse(next_store.targets[0].slice)
+        == "lane_1 * 8 + vec_lane_1"
+    ), code
+    assert function.body.index(chunk_loop) > _index_of(
+        function.body, "tile_loop_value = tile_loop_initial"
+    ), code
+    assert ast.unparse(chunk_loop.body[-2]) == (
+        "tile_next_value = tile_next_buffer.load()"
+    ), code
+    assert ast.unparse(chunk_loop.body[-1]) == "tile_loop_value = tile_next_value", code
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

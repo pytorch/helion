@@ -11,7 +11,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from helion._compiler.cute import direct_affine_emission as emission_impl
 from helion._compiler.cute import direct_affine_replay as replay_impl
+from helion._compiler.cute import direct_affine_templates as templates_impl
 from helion._compiler.cute.direct_affine_plan import DirectAffineCoefficientLayout
 from helion._compiler.cute.direct_affine_plan import DirectAffineMma
 from helion._compiler.cute.direct_affine_plan import DirectAffinePhaseOrder
@@ -38,6 +40,56 @@ from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_rep
 from helion._compiler.cute.direct_affine_replay import resolve_direct_affine_templates
 
 validate_direct_affine_templates = replay_impl._validate_direct_affine_templates
+
+
+@pytest.mark.parametrize(
+    (
+        "step_count",
+        "row_extent",
+        "column_extent",
+        "coefficient_count",
+        "offsets",
+        "total",
+    ),
+    [
+        (
+            3,
+            64,
+            8,
+            18,
+            (0, 16384, 18432, 18560, 20096, 21632, 23168, 24704, 24832),
+            25600,
+        ),
+        (
+            5,
+            128,
+            16,
+            50,
+            (0, 32768, 36864, 37120, 39680, 42240, 44800, 47360, 47488),
+            50048,
+        ),
+    ],
+)
+def test_direct_affine_shared_layout_is_stable(
+    step_count: int,
+    row_extent: int,
+    column_extent: int,
+    coefficient_count: int,
+    offsets: tuple[int, ...],
+    total: int,
+) -> None:
+    plan = SimpleNamespace(
+        step_count=step_count,
+        row_extent=row_extent,
+        feature_extent=128,
+        columns=SimpleNamespace(
+            factor_column_extent=column_extent,
+            coefficient_element_count=coefficient_count,
+        ),
+    )
+    buffers, allocated = emission_impl._shared_layout(cast("Any", plan), "_test")
+    assert tuple(buffer.byte_offset for buffer in buffers) == offsets
+    assert allocated == total
 
 
 def _expression(source: str) -> ast.expr:
@@ -816,6 +868,35 @@ def _compose_with_templates(
         )
 
 
+@pytest.mark.parametrize("feedback", ((False, False, False), (True, False, True)))
+def test_additive_composer_omits_prediction_producers(
+    feedback: tuple[bool, ...],
+) -> None:
+    plan = _plan(3, DirectAffineMma.M16N8)
+    replay = _detached_replay(3)
+    templates = _resolved_templates(
+        entry_state=_value_replay("entry", "row", "feature"),
+        steps=tuple(
+            _step_replay(index)
+            if enabled
+            else dataclasses.replace(_step_replay(index), prediction_vector=None)
+            for index, enabled in enumerate(feedback)
+        ),
+    )
+    emission = _compose_with_templates(
+        replay, plan, _coordinates(plan), _proof(3, replay=replay), templates
+    )
+    assert emission is not None
+    source = "\n".join(
+        ast.unparse(statement) for statement in emission.replacement_statements
+    )
+    for index, enabled in enumerate(feedback):
+        assert (f"prediction_{index}_formula(" in source) is enabled
+    expected_mask = sum(1 << index for index, enabled in enumerate(feedback) if enabled)
+    assert f"FEEDBACK_MASK={expected_mask}" in source
+    assert source.count("HAS_FEEDBACK=False") == feedback.count(False)
+
+
 @pytest.mark.parametrize(
     ("step_count", "mma"),
     [(3, DirectAffineMma.M16N8), (5, DirectAffineMma.M16N16)],
@@ -1139,6 +1220,7 @@ def test_templates_are_derived_without_application_specific_bindings() -> None:
         templates.async_entry_state.row_stride
     )
     assert len(templates.steps) == 3
+    assert templates.steps[1].prediction_vector is not None
     assert "renamed_prediction_1" in ast.unparse(
         templates.steps[1].prediction_vector.statements[0]
     )
@@ -1812,6 +1894,26 @@ def test_validator_rejects_raw_warp_coordinate() -> None:
             )
             is None
         )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        ("cutlass.Int32(cute.arch.thread_idx()[0]) < 128", "True"),
+        ("cute.arch.thread_idx()[0] < 32", "True"),
+        ("cute.arch.thread_idx()[0] < 31", None),
+        ("cute.arch.thread_idx()[2] < 128", None),
+        ("cute.arch.thread_idx()[0] < runtime_extent", None),
+        ("cute.arch.thread_idx()[0] + 1 < 32", None),
+    ),
+)
+def test_replayed_producer_only_discharges_proven_thread_bounds(
+    expression: str, expected: str | None
+) -> None:
+    plan = _plan(3, DirectAffineMma.M16N8)
+    transform = templates_impl._DischargeTrivialThreadBounds(_coordinates(plan))
+    result = transform.visit(_expression(expression))
+    assert ast.unparse(result) == (expected or expression)
 
 
 def test_async_composer_stages_waits_and_replays_packed_state_effects() -> None:

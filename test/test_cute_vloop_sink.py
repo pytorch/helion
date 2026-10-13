@@ -478,7 +478,8 @@ def test_row_only_loads_and_accumulators_become_per_lane(cpu_only: None) -> None
     assert len(_vector_loads(lane_loop.body)) == 1
     # acc, wsum, both lane accumulators and both reduced values are per lane.
     assert code.count("cute.make_rmem_tensor(4, cutlass.Float32)") == 6
-    assert "wsum_frag[vec_lane_1] = wsum_copy + sum_2" in code
+    assert "wsum_incoming = wsum_frag[vec_lane_1]" in code
+    assert "wsum_frag[vec_lane_1] = wsum_incoming + sum_2" in code
     assert "sum_2_lane_acc_frag[vec_lane_1] = sum_2_lane_acc_frag[vec_lane_1] +" in code
     assert code.count(FRAGMENT_REDUCE) == 2
     assert TWO_STAGE_REDUCE not in code

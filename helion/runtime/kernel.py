@@ -50,6 +50,7 @@ from .._argument_device import _find_argument_device as _find_device
 from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._compile_time import measure
+from .._compiler.ast_extension import fix_missing_locations
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
@@ -106,9 +107,11 @@ if TYPE_CHECKING:
         CompilerHeuristicSpecializationFact,
     )
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+    from .._compiler.cute.eviction_relevance import PolicyReceipt
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+    from .cute.source_batch import PreparedSource
     from .cute_structural_config import CuteStructuralPolicyRequest
     from .cute_structural_policy import CuteStructuralPolicy
 
@@ -2356,6 +2359,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             torch.device,
             tuple[Hashable | None, ...],
         ] = {}
+        self._cute_eviction_policy_receipts: dict[str, PolicyReceipt] = {}
         self._compile_cache: dict[Config, CompiledConfig] = {}
         # Shape guards recorded past this index come from code generation.
         self._bind_guard_count = 0
@@ -2695,9 +2699,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             # Work on a copy so the caller's Config is not mutated with defaults
             # specific to this BoundKernel's config_spec.
             config = self._normalized_config_copy(config)
+            from .._compiler.cute.eviction_relevance import collect
+
             with (
                 self._runtime_arg_values_for_codegen(),
                 measure("BoundKernel.generate_ast"),
+                (
+                    collect(config)
+                    if self.settings.backend == "cute"
+                    else contextlib.nullcontext()
+                ) as policy_uses,
             ):
                 self.env.cute_hint_sized_reduction_extents.clear()
                 # pyrefly: ignore [bad-argument-type]
@@ -2724,10 +2735,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             else:
                 body_start = len(root.body)
             body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
-            ast.fix_missing_locations(body_root)
+            fix_missing_locations(body_root)
         # Export after codegen and outside the fake-tensor environment: backends
-        # may capture launch metadata before rewriting the module. Check jax_fn
-        # first because it supports both dependency modes.
+        # may capture launch metadata before rewriting the module. Both optional
+        # rewrites precede the single unparse. Check jax_fn first because it
+        # supports both dependency modes.
         if options is not None and options.jax_fn:
             from .._compiler.output_code_utils import build_jax_fn_module
             from .._compiler.output_code_utils import capture_jax_launch_metadata
@@ -2745,9 +2757,23 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with measure("BoundKernel.unparse"):
             body = unparse(body_root, output_origin_lines=output_origin_lines)
         imports = "\n".join(import_lines)
-        if imports:
-            return f"from __future__ import annotations\n\n{imports}\n\n{body}"
-        return f"from __future__ import annotations\n\n{body}"
+        source = (
+            f"from __future__ import annotations\n\n{imports}\n\n{body}"
+            if imports
+            else f"from __future__ import annotations\n\n{body}"
+        )
+        if (
+            self.settings.backend == "cute"
+            and options is None
+            and not emit_repro_caller
+        ):
+            from .._compiler.cute.eviction_relevance import authority
+
+            assert policy_uses is not None
+            receipt = policy_uses.finish(authority(self), source)
+            if receipt is not None:
+                self._cute_eviction_policy_receipts[receipt.config_key] = receipt
+        return source
 
     def to_triton_code(
         self,
@@ -2776,6 +2802,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
         """
+        return self._compile_config(config, allow_print=allow_print)
+
+    def _compile_config(
+        self,
+        config: ConfigLike | None = None,
+        *,
+        allow_print: bool = True,
+        prepared_source: PreparedSource | None = None,
+    ) -> CompiledConfig:
         if config is None:
             config = self._require_implicit_config()
         requested_config = self._normalize_config(config)
@@ -2791,9 +2826,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         self.env.backend.setup_compile_cache_dir(device_index)
         try:
-            triton_code = self.to_triton_code(
-                config, emit_repro_caller=self.settings.print_output_code
+            triton_code = (
+                prepared_source.consume(self, config)
+                if prepared_source is not None
+                else None
             )
+            consumed_prepared_source = triton_code is not None
+            if triton_code is None:
+                triton_code = self.to_triton_code(
+                    config, emit_repro_caller=self.settings.print_output_code
+                )
             # static_shapes=True keys a distinct BoundKernel per input shape (see
             # _tensor_key), but PyCodeCache keys compiled modules by SOURCE TEXT, so
             # two shapes that emit byte-identical source (e.g. compact_worklist, whose
@@ -2846,6 +2888,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
         self._register_cute_reduction_extent_specializations(config)
+        if consumed_prepared_source and prepared_source is not None:
+            prepared_source.publish_policy_receipt(self, config, rv)
         return rv
 
     def bench_compile_config(

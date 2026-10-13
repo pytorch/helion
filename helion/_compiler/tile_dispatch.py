@@ -334,6 +334,11 @@ class TileStrategyDispatch:
         }
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.positional_root import setup_positional_grid
+
+            if setup_positional_grid(state.codegen, block_ids):
+                return
         strategy = self.block_id_to_strategy[tuple(block_ids)]
         state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)

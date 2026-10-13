@@ -14,6 +14,14 @@ from cutlass._mlir.dialects import vector as _vector_dialect
 import cutlass.cute as cute
 
 
+def zero_u16_vec(width: int) -> object:
+    """An initialized bit-vector for a predicated packet load's inactive arm."""
+    vecty = ir.VectorType.get([width], cutlass.Uint16.mlir_type)
+    return _vector_dialect.from_elements(
+        vecty, [cutlass.Uint16(0).ir_value() for _ in range(width)]
+    )
+
+
 def store_u16_vec(ptr: object, vals: list) -> None:
     """Pack ``len(vals)`` ``cutlass.Uint16`` scalars into one vector value
     and store it through ``ptr`` (a ``cute.Pointer``), emitting a single

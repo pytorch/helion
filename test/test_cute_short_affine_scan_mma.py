@@ -12,6 +12,9 @@ mma = importlib.import_module("helion._compiler.cute.short_affine_scan_mma")
 primitives = importlib.import_module(
     "helion._compiler.cute.affine_recurrence_primitives"
 )
+pipeline_primitives = importlib.import_module(
+    "helion._compiler.cute.warp_specialized_primitives"
+)
 rank1 = importlib.import_module("helion._compiler.cute.single_token_rank1_recurrence")
 
 
@@ -215,6 +218,7 @@ def _sequential_affine_scan(
     observation: torch.Tensor,
     row_input: torch.Tensor,
     update_scale: torch.Tensor,
+    feedback_mask: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     state = initial_state.clone()
     residuals = []
@@ -222,7 +226,9 @@ def _sequential_affine_scan(
     states = []
     for step in range(diagonal.shape[0]):
         state = state * diagonal[step]
-        residual = row_input[step] - state @ prediction[step]
+        residual = row_input[step]
+        if feedback_mask & (1 << step):
+            residual = residual - state @ prediction[step]
         state = state + (update_scale[step] * residual)[:, None] * update[step]
         residuals.append(residual)
         outputs.append(state @ observation[step])
@@ -242,18 +248,23 @@ def _direct_affine_scan(
     row_stride: int,
     source_stride: int,
     role_stride: int,
+    feedback_mask: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     steps = diagonal.shape[0]
     coefficients = diagonal.new_zeros(2 * steps * steps)
     prefix = torch.cumprod(diagonal, dim=0)
-    prediction_projection = initial_state @ (prefix * prediction).T
+    prediction_projection = {
+        target: initial_state @ (prefix[target] * prediction[target])
+        for target in range(steps)
+        if feedback_mask & (1 << target)
+    }
     observation_projection = initial_state @ (prefix * observation).T
 
     for target in range(steps):
         suffix = diagonal.new_ones(diagonal.shape[1])
         for source in range(target, -1, -1):
             weighted_update = update[source] * suffix * update_scale[source]
-            if source < target:
+            if source < target and feedback_mask & (1 << target):
                 coefficients[
                     mma.direct_coefficient_index(
                         target,
@@ -280,19 +291,21 @@ def _direct_affine_scan(
     residuals = []
     outputs = []
     for target in range(steps):
-        residual = row_input[target] - prediction_projection[:, target]
-        for source in range(target):
-            coefficient = coefficients[
-                mma.direct_coefficient_index(
-                    target,
-                    source,
-                    0,
-                    row_stride,
-                    source_stride,
-                    role_stride,
-                )
-            ]
-            residual -= coefficient * residuals[source]
+        residual = row_input[target].clone()
+        if feedback_mask & (1 << target):
+            residual = residual - prediction_projection[target]
+            for source in range(target):
+                coefficient = coefficients[
+                    mma.direct_coefficient_index(
+                        target,
+                        source,
+                        0,
+                        row_stride,
+                        source_stride,
+                        role_stride,
+                    )
+                ]
+                residual -= coefficient * residuals[source]
         residuals.append(residual)
 
         output = observation_projection[:, target]
@@ -325,7 +338,10 @@ def _direct_affine_scan(
 
 
 @pytest.mark.parametrize("step_count", range(2, 9))
-def test_physical_layouts_preserve_affine_scan_algebra(step_count: int) -> None:
+@pytest.mark.parametrize("feedback_mask", (-1, 0, 0b01010101))
+def test_physical_layouts_preserve_affine_scan_algebra(
+    step_count: int, feedback_mask: int
+) -> None:
     generator = torch.Generator().manual_seed(20260914 + step_count)
     rows = 5
     features = 17
@@ -348,6 +364,9 @@ def test_physical_layouts_preserve_affine_scan_algebra(step_count: int) -> None:
     prediction = torch.randn(
         update.shape, dtype=update.dtype, device=update.device, generator=generator
     )
+    for step in range(step_count):
+        if not feedback_mask & (1 << step):
+            prediction[step].fill_(float("nan"))
     observation = torch.randn(
         update.shape, dtype=update.dtype, device=update.device, generator=generator
     )
@@ -366,6 +385,7 @@ def test_physical_layouts_preserve_affine_scan_algebra(step_count: int) -> None:
         observation,
         row_input,
         update_scale,
+        feedback_mask,
     )
     if step_count <= 4:
         layout = (2 * step_count, 2, 1)
@@ -382,6 +402,7 @@ def test_physical_layouts_preserve_affine_scan_algebra(step_count: int) -> None:
         row_stride=layout[0],
         source_stride=layout[1],
         role_stride=layout[2],
+        feedback_mask=feedback_mask,
     )
     for actual_value, expected_value in zip(actual, expected, strict=True):
         torch.testing.assert_close(actual_value, expected_value)
@@ -395,15 +416,25 @@ def test_device_helpers_reuse_shared_primitives() -> None:
     assert mma._store_u32x4_if_valid is primitives.store_u32x4_if_valid
     assert mma.vec8_bf16 is primitives.vec8_bf16
     assert rank1.rank1_store_u32x4_if_valid is primitives.store_u32x4_if_valid
+    assert mma.copy_b16x8_async is pipeline_primitives.copy_b16x8_async
+    assert (
+        mma.segmented_swizzle_b16_element_index
+        is pipeline_primitives.segmented_swizzle_b16_element_index
+    )
 
 
 def test_async_ingress_leaves_wait_and_barrier_to_caller() -> None:
     source = inspect.getsource(mma.stage_state_tile8x8_async_bf16)
-    assert "cp_async_shared_global" in source
-    assert "cp_size=copy_size" in source
+    primitive_source = inspect.getsource(pipeline_primitives.copy_b16x8_async)
+    assert "copy_b16x8_async(" in source
     assert "cp_async_commit_group" in source
     assert "cp_async_wait_group" not in source
     assert "sync_threads" not in source
+    assert "cp_async_shared_global" in primitive_source
+    assert "cp_size=copy_size" in primitive_source
+    assert "assumed_align=16" in primitive_source
+    assert "cp_async_wait_group" not in primitive_source
+    assert "sync_threads" not in primitive_source
 
 
 def test_packed_store_delegates_to_shared_predicated_primitive() -> None:

@@ -721,7 +721,7 @@ def _emit_cute_matmul_n_collapse(
 
     assert isinstance(cg, GenerateAST)
     if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+        cg.record_cute_matmul_layout()
 
     reduction_dtype = cute_scalar_reduction_dtype(lhs_dtype, rhs_dtype, acc_dtype)
     value_dtype = reduction_dtype or lhs_dtype or rhs_dtype or torch.float32
@@ -1053,7 +1053,7 @@ def _emit_cute_matmul(
     per-thread running sum (``cute_atomic_consumer_lane_route``).
     """
     if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+        cg.record_cute_matmul_layout()  # type: ignore[attr-defined]
     reduction_dtype = cute_scalar_reduction_dtype(
         lhs_dtype, rhs_dtype, acc_dtype or out_dtype
     )

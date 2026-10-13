@@ -65,6 +65,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 
 from ... import exc
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
@@ -122,7 +123,7 @@ def _ascending_range_extent(loop: ast.For) -> int | None:
     return arg.value if arg.value >= 1 else None
 
 
-def _is_lane_loop(stmt: ast.AST) -> bool:
+def _is_lane_loop(stmt: ast.AST) -> TypeGuard[ast.For]:
     return isinstance(stmt, ast.For) and bool(
         getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
     )
@@ -192,6 +193,7 @@ class _Hoisted:
     # Index of the trace-time list forwarding this value into the compute
     # phase; ``None`` for pure index arithmetic, which is re-derived there.
     list_index: int | None
+    load_stmt: ast.Assign | None = None
 
 
 @dataclasses.dataclass
@@ -357,11 +359,11 @@ def _emit_load_phase(
     body: list[ast.stmt] = []
     for item in plan.items:
         if isinstance(item, _Hoisted):
-            body.append(_clone_setup(item.stmt))
+            body.append(_clone_setup(item.load_stmt or item.stmt))
             if item.list_index is not None:
                 body.append(
                     statement_from_string(
-                        f"{lists[item.list_index]}.append({item.name})"
+                        f"{lists[item.list_index]}.append({ast.unparse(item.load_stmt.targets[0]) if item.load_stmt else item.name})"
                     )
                 )
         else:
@@ -426,7 +428,13 @@ def _unroll_factor(extent: int, unroll: int, nested_product: int) -> int:
 
 
 def _unroll_one(
-    loop: ast.For, unroll: int, new_var: Callable[[str], str]
+    loop: ast.For,
+    unroll: int,
+    new_var: Callable[[str], str],
+    disjoint: set[frozenset[str]],
+    strides: dict[tuple[str, int], int],
+    rename_groups: dict[str, str],
+    register_names: frozenset[str],
 ) -> list[ast.stmt] | None:
     extent = _ascending_range_extent(loop)
     if (
@@ -439,7 +447,25 @@ def _unroll_one(
     planner = _Planner(loop)
     plan, _deps = planner.plan(loop, extent, set(), [])
     if not plan.load_count():
-        return None
+        from .lane_prefix_snapshots import snapshot_load_prefix
+
+        prefix = snapshot_load_prefix(
+            loop,
+            extent,
+            new_var,
+            disjoint=disjoint,
+            strides=strides,
+            rename_groups=rename_groups,
+            register_names=register_names,
+        )
+        for original, fresh, is_load in prefix:
+            assert isinstance(original.targets[0], ast.Name)
+            index = planner.next_list if is_load else None
+            if is_load:
+                planner.next_list += 1
+            plan.items.append(_Hoisted(original, original.targets[0].id, index, fresh))
+        if not plan.load_count():
+            return None
     factor = _unroll_factor(extent, unroll, plan.nested_product())
     if factor < 2:
         return None
@@ -484,25 +510,54 @@ def _drop_lane_attr(loop: ast.For) -> None:
 
 
 def unroll_lane_loads(
-    body: list[ast.stmt], unroll: int, new_var: Callable[[str], str]
+    body: list[ast.stmt],
+    unroll: int,
+    new_var: Callable[[str], str],
+    *,
+    proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
+    proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
+    rename_groups: dict[str, str] | None = None,
 ) -> tuple[list[ast.stmt], bool]:
     """Apply the loads-first lane unroll to every lane loop reachable from
     ``body``; returns the new body and whether any loop was transformed."""
     fired = False
 
-    def visit(statements: list[ast.stmt]) -> list[ast.stmt]:
+    def visit(
+        statements: list[ast.stmt], register_names: frozenset[str] = frozenset()
+    ) -> list[ast.stmt]:
+        from .persistent_branch_vec import _binding_write_roots
+
         nonlocal fired
         result: list[ast.stmt] = []
+        registers = set(register_names)
         for stmt in statements:
+            before = frozenset(registers)
+            registers.difference_update(_binding_write_roots(stmt))
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Call)
+                and ast.unparse(stmt.value.func) == "cute.make_rmem_tensor"
+            ):
+                registers.add(stmt.targets[0].id)
             if _is_lane_loop(stmt):
-                replacement = _unroll_one(stmt, unroll, new_var)  # type: ignore[arg-type]
+                replacement = _unroll_one(
+                    stmt,
+                    unroll,
+                    new_var,  # type: ignore[arg-type]
+                    proven_disjoint_tensor_pairs or set(),
+                    proven_tensor_stride_values or {},
+                    rename_groups or {},
+                    before,
+                )
                 if replacement is not None:
                     fired = True
                     result.extend(replacement)
                     continue
             elif isinstance(stmt, (ast.For, ast.If, ast.While)):
-                stmt.body = visit(stmt.body)  # type: ignore[assignment]
-                stmt.orelse = visit(stmt.orelse)  # type: ignore[assignment]
+                stmt.body = visit(stmt.body, before)  # type: ignore[assignment]
+                stmt.orelse = visit(stmt.orelse, before)  # type: ignore[assignment]
             result.append(stmt)
         return result
 

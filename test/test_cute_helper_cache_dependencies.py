@@ -86,6 +86,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "chunk_recurrence_warp_dv4",
         ),
         (
+            "gdn_recurrence_sm100",
+            "_compiler/cute/packed_store.py",
+            "chunk_recurrence_sm100",
+        ),
+        (
             "helion_flash",
             "_compiler/cute/_flash_runtime.py",
             "chunk_recurrence_sm100",

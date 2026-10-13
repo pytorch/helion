@@ -13,6 +13,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch.fx import Node
 
@@ -147,11 +148,47 @@ def _dependency_value_replay(
         )
     ):
         return None
+    bounds = _DischargeTrivialThreadBounds(coordinates)
+    statements = tuple(bounds.visit(_clone_ast(statement)) for statement in statements)
     return DirectAffineValueReplay(
         statements=statements,
         value=result,
         bindings=_inferred_bindings(statements, (result,), coordinates),
     )
+
+
+class _DischargeTrivialThreadBounds(ast.NodeTransformer):
+    """Remove hardware bounds proved true over the entire source CTA axis."""
+
+    def __init__(self, coordinates: DirectAffineCoordinates) -> None:
+        self.extents = {
+            axis.thread_axis: axis.thread_extent
+            for axis in (coordinates.row, coordinates.feature)
+        }
+
+    def visit_Compare(self, node: ast.Compare) -> ast.expr:
+        if (
+            len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Lt)
+            and len(node.comparators) == 1
+        ):
+            index = _strip_integer_cast(node.left)
+            bound = _strip_integer_cast(node.comparators[0])
+            if (
+                isinstance(index, ast.Subscript)
+                and isinstance(index.value, ast.Call)
+                and _qualified_name(index.value.func) == "cute.arch.thread_idx"
+                and not index.value.args
+                and not index.value.keywords
+                and isinstance(index.slice, ast.Constant)
+                and type(index.slice.value) is int
+                and isinstance(bound, ast.Constant)
+                and type(bound.value) is int
+                and (extent := self.extents.get(index.slice.value)) is not None
+                and extent <= bound.value
+            ):
+                return ast.Constant(value=True)
+        return node
 
 
 def _is_lane_reduce_call(node: ast.AST) -> bool:
@@ -474,15 +511,27 @@ def _store_details(
 
 
 def _strip_integer_cast(expression: ast.expr) -> ast.expr:
-    while (
-        isinstance(expression, ast.Call)
-        and _qualified_name(expression.func) in _INTEGER_CASTS
-        and len(expression.args) == 1
-        and not expression.keywords
-        and isinstance(expression.args[0], ast.expr)
-    ):
-        expression = expression.args[0]
-    return expression
+    """Normalize casts and zero offsets in an integer coordinate proof."""
+
+    while True:
+        if (
+            isinstance(expression, ast.Call)
+            and _qualified_name(expression.func) in _INTEGER_CASTS
+            and len(expression.args) == 1
+            and not expression.keywords
+            and isinstance(expression.args[0], ast.expr)
+        ):
+            expression = expression.args[0]
+        elif (
+            isinstance(expression, ast.BinOp)
+            and isinstance(expression.op, (ast.Add, ast.Sub))
+            and isinstance(expression.right, ast.Constant)
+            and type(expression.right.value) is int
+            and expression.right.value == 0
+        ):
+            expression = expression.left
+        else:
+            return expression
 
 
 def _flatten_and(expression: ast.expr) -> tuple[ast.expr, ...]:
@@ -636,6 +685,24 @@ def _packed_state_replay(
     slot_guard = _slot_guard(guard, slot)
     if (
         slot_guard is None
+        and isinstance(slot, ast.Constant)
+        and type(slot.value) is int
+    ):
+        base_tensor = access.base.meta.get("val")
+        if isinstance(base_tensor, torch.Tensor) and base_tensor.ndim > 0:
+            extent = base_tensor.shape[0]
+            if isinstance(extent, torch.SymInt) and isinstance(
+                extent.node.expr, sympy.Integer
+            ):
+                extent = int(extent.node.expr)
+            if type(extent) is int and 0 <= slot.value < extent:
+                slot_guard = ast.Constant(value=extent), guard
+    expanded_pointer = _expand_expression_assignments(
+        pointer, scalar.statements[:statement_index]
+    )
+    if (
+        slot_guard is None
+        or expanded_pointer is None
         or not _store_value_is_logical_cast(
             value,
             scalar.logical_value,
@@ -643,8 +710,8 @@ def _packed_state_replay(
             statement_index,
             replay.candidate.region.storage_dtype,
         )
-        or not _contains_expression((pointer,), coordinates.row.source)
-        or not _contains_expression((pointer,), coordinates.feature.source)
+        or not _contains_expression((expanded_pointer,), coordinates.row.source)
+        or not _contains_expression((expanded_pointer,), coordinates.feature.source)
     ):
         return None
     extent, valid = slot_guard
@@ -828,11 +895,16 @@ def _async_entry_replay(
     if len(statement_positions) != 1:
         return None
     statement_index = statement_positions[0]
-    row_stride = _row_stride(pointer, coordinates.row.source)
+    expanded_pointer = _expand_expression_assignments(
+        pointer, entry.statements[:statement_index]
+    )
+    if expanded_pointer is None:
+        return None
+    row_stride = _row_stride(expanded_pointer, coordinates.row.source)
     if (
         row_stride is None
-        or _expression_occurrences(pointer, coordinates.row.source) != 1
-        or _expression_occurrences(pointer, coordinates.feature.source) != 1
+        or _expression_occurrences(expanded_pointer, coordinates.row.source) != 1
+        or _expression_occurrences(expanded_pointer, coordinates.feature.source) != 1
     ):
         return None
     support = _supporting_statements(
@@ -929,6 +1001,8 @@ def resolve_direct_affine_templates(
     for step in region.steps:
         values = tuple(
             _dependency_value_replay(replay, value, coordinates)
+            if value is not None
+            else None
             for value in (
                 step.diagonal,
                 step.prediction_vector,
@@ -938,7 +1012,9 @@ def resolve_direct_affine_templates(
                 step.observation_vector,
             )
         )
-        if any(value is None for value in values):
+        if any(value is None for index, value in enumerate(values) if index != 1) or (
+            step.prediction_vector is not None and values[1] is None
+        ):
             return None
         resolved_values = cast("tuple[DirectAffineValueReplay, ...]", values)
         if any(
@@ -985,7 +1061,7 @@ def resolve_direct_affine_templates(
         steps.append(
             DirectAffineStepReplay(
                 diagonal=cast("DirectAffineValueReplay", values[0]),
-                prediction_vector=cast("DirectAffineValueReplay", values[1]),
+                prediction_vector=values[1],
                 row_input=cast("DirectAffineValueReplay", values[2]),
                 update_scale=cast("DirectAffineValueReplay", values[3]),
                 update_vector=cast("DirectAffineValueReplay", values[4]),
@@ -1459,6 +1535,8 @@ def _template_components(
             step.update_vector,
             step.observation_vector,
         ):
+            if value is None:
+                continue
             yield value.bindings, (*value.statements, value.value)
         output = step.output_effect
         yield output.bindings, (*output.statements, output.logical_value)
@@ -1498,6 +1576,8 @@ def _template_reduction_placement_is_supported(
             step.update_vector,
             step.observation_vector,
         ):
+            if value is None:
+                continue
             if not _feature_reduction_markers_are_supported(
                 value.statements,
                 coordinates,

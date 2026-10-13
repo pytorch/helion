@@ -297,6 +297,31 @@ def test_shape_only_views_do_not_allocate_reduction_dimensions(
         assert CuteBackend().fake_subscript_shape(tensor, index) == expected
 
 
+@pytest.mark.parametrize(
+    "index",
+    [
+        [1, slice(None)],
+        [slice(1, 3), slice(None)],
+        [slice(None), slice(0, 4, 1)],
+    ],
+)
+def test_narrowing_keeps_general_index_shape_path(index: list[object]) -> None:
+    tensor = torch.empty((3, 5))
+    with patch.object(
+        SubscriptIndexing, "compute_shape", return_value=[2, 5]
+    ) as compute:
+        assert CuteBackend().fake_subscript_shape(tensor, index) == [2, 5]
+    compute.assert_called_once_with(tensor, index)
+
+
+@pytest.mark.parametrize(
+    "index", [[slice(None), slice(None, None, 2)], [-1, slice(None)]]
+)
+def test_unsupported_narrowing_still_fails_closed(index: list[object]) -> None:
+    with pytest.raises(exc.InvalidIndexingType):
+        CuteBackend().fake_subscript_shape(torch.empty((3, 5)), index)
+
+
 @pytest.mark.parametrize("topology", ["fa4", "ws_overlap"])
 def test_causal_flash_host_has_no_undefined_block_size(topology: str) -> None:
     from .test_cute_backend import cute_causal_biased_attention

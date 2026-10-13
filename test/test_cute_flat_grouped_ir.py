@@ -220,11 +220,11 @@ def cuda_binding(
 
 @pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize("bits", [32, 64])
-@pytest.mark.parametrize("scalar_group", [False, True])
+@pytest.mark.parametrize("scalar_group_config", [False, True])
 def test_actual_cuda_traced_typed_program_is_proved(
-    static: bool, bits: int, scalar_group: bool
+    static: bool, bits: int, scalar_group_config: bool
 ) -> None:
-    with cuda_binding(static=static, bits=bits, scalar_group=scalar_group) as bound:
+    with cuda_binding(static=static, bits=bits) as bound:
         proof = prove_flat_grouped_rna(bound.env, _host(bound).device_ir)
         assert proof is not None
         assert proof.offset_bits == bits
@@ -257,6 +257,47 @@ def test_actual_cuda_traced_typed_program_is_proved(
                 and proof.b.requires_grad
                 and proof.bias.requires_grad
             )
+        if scalar_group_config:
+            # Choose a scalar group through the configuration, after tracing
+            # has retained the symbolic parent of the jagged row axis.
+            config = bound.config_spec.normalized_config(
+                helion.Config(
+                    block_sizes=[1, 128, 64, 16],
+                    num_threads=[0, 2, 64, 1],
+                    cute_vector_widths=[1, 1, 1, 1],
+                    cute_lane_layouts=["blocked", "strided", "strided", "strided"],
+                    cute_collective_mma=True,
+                    cute_collective_compute="tcgen05",
+                    cute_collective_stages=1,
+                    cute_collective_copy="scalar",
+                    cute_collective_recipe="vector_unrolled",
+                    cute_collective_epilogue="scalar",
+                )
+            )
+            group_slot = list(bound.config_spec.block_sizes.valid_block_ids()).index(
+                proof.group_axis
+            )
+            assert config.block_sizes[group_slot] == 1
+            with bound.env.suspend():
+                code = bound.to_code(config)
+            compile(code, "<scalar-group>", "exec")
+
+
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("bits", [32, 64])
+def test_source_fixed_group_rejects_missing_jagged_parent(
+    static: bool, bits: int
+) -> None:
+    # A literal source block_size=1 loses the symbolic parent during tracing.
+    # Keep the frontend's rejection separate from supported scalar configs.
+    with (
+        pytest.raises(
+            helion.exc.InvalidJaggedTileUsage,
+            match="jagged_tile alone cannot be used without its parent in assignment raw_indices",
+        ),
+        cuda_binding(static=static, bits=bits, scalar_group=True),
+    ):
+        pass
 
 
 @pytest.mark.parametrize("static", [False, True])

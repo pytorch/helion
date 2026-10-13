@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from copy import deepcopy
 from itertools import zip_longest
+import math
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -16,6 +17,22 @@ from torch._inductor.runtime.triton_heuristics import (
 
 from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_ASYNC_GROUP_LIMIT_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_INDEPENDENT_PUBLICATION_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_ISLAND_CONSUMERS_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_LATE_WIDENING_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_LOOP_MMA_ROWS_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_M64_TRANSPOSE_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_PREPARATION_PIPELINE_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_WARP_MMA_ROWS_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_WARP_REGISTER_A_KEY
+from ...autotuner.config_spec import CUTE_CHAINED_WARP_RESULT_TRANSPORT_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_TASK_ORDER_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
@@ -23,8 +40,13 @@ from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
 from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
 from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
 from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
+from ...autotuner.config_spec import CUTE_STATE_TRANSFER_MAX_BITS_KEY
+from ...autotuner.config_spec import CUTE_STATE_TRANSFER_TRANSPORT_KEY
+from ...autotuner.config_spec import VALID_CUTE_CHAINED_LEAF_COUNTS
+from ...autotuner.config_spec import VALID_CUTE_CHAINED_POINTWISE_UNROLLS
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
+from ...exc import InvalidConfig
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import load as language_load
 from ...language.scan_ops import _associative_scan
@@ -32,6 +54,11 @@ from ...runtime.config import Config
 from ..compile_environment import ConfigValueExpression
 from ..compile_environment import FixedBlockSizeSource
 from ..compile_environment import _symint_sympy_expr
+from ..cute import mma_support
+from ..cute.chained_pointwise_inplace import has_inplace_candidate
+from ..cute.chained_pointwise_unroll import has_pointwise_vector_candidate
+from ..cute.chained_scalar_operand_unroll import has_scalar_operand_candidate
+from ..cute.chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINE_KEY
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -98,6 +125,7 @@ from ..cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profil
 from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+from .chained_seed_order import order_chained_seed_configs
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
@@ -112,6 +140,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import MemoryOpFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
+    from ..cute.chained_loop import ChainedLoopPlan
     from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
     from ..cute.gdn_recurrence import GdnRecurrenceGeometry
     from ..cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
@@ -135,21 +164,20 @@ def _seq_config_list(
     ]
 
 
-def _has_async_state_load_candidate(env: CompileEnvironment) -> bool:
+def _has_state_load_store_candidate(
+    env: CompileEnvironment, dtypes: tuple[torch.dtype, ...]
+) -> bool:
     """Cheap device-IR gate for the stricter generated-AST matcher.
 
-    This intentionally admits an input-layout-independent superset: a 16-bit
-    tensor that is both read and written in one graph. The late AST pass proves
-    the exact vector width, row/thread coverage, address equality, and alias
+    This intentionally admits an input-layout-independent superset: a tensor
+    of a requested dtype that is both read and written in one graph. The late
+    AST pass proves the exact vector width, row/thread coverage, address equality,
+    and alias
     facts from cache-specialized metadata.
     """
     by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
     for fact in env.config_spec.memory_op_facts:
-        if (
-            fact.tensor_name is None
-            or fact.dtype not in (torch.float16, torch.bfloat16)
-            or fact.ndim < 2
-        ):
+        if fact.tensor_name is None or fact.dtype not in dtypes or fact.ndim < 2:
             continue
         by_tensor_graph.setdefault((fact.tensor_name, fact.graph_id), []).append(fact)
     return any(
@@ -624,7 +652,7 @@ class CuteAffineScanHeuristic(AutotunerHeuristic):
                     {row_block_id: row_extent // 16, feature_block_id: 32},
                 ),
             ),
-            "loop_orders": [list(reversed(range(root_rank)))],
+            "loop_orders": [list(reversed(range(root_rank)))] if root_rank > 1 else [],
             "num_warps": row_extent // 16,
             "num_stages": 1,
             "indexing": "pointer",
@@ -658,13 +686,20 @@ class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
         if cp_async_supported(
             env.config_spec.target_device_capability
-        ) and _has_async_state_load_candidate(env):
+        ) and _has_state_load_store_candidate(env, (torch.float16, torch.bfloat16)):
             env.config_spec.enable_cute_async_load_pipeline()
             env.config_spec.enable_cute_bf16x2_recurrence()
             env.config_spec.enable_cute_proven_bounds()
             # Generated scheduling consumes exact tensor extents and strides.
             # Make those values part of the bound-kernel cache key so a later
             # dynamic-shape/layout call cannot reuse an incompatible ring.
+            return frozenset({"input_tensor_metadata"})
+        if cp_async_supported(
+            env.config_spec.target_device_capability
+        ) and _has_state_load_store_candidate(env, (torch.float32,)):
+            # Coordinate proofs are independent of half-precision transport
+            # and arithmetic. The unchanged late proof retains unknown bounds.
+            env.config_spec.enable_cute_proven_bounds()
             return frozenset({"input_tensor_metadata"})
         return frozenset()
 
@@ -2178,7 +2213,12 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         # Those search families do not carry collective controls. Their
         # flatten/unflatten path would silently turn these into unrelated
         # native-MMA seeds instead of measuring the requested collective.
-        if spec.cute_tcgen05_search_enabled or spec.cute_flash_search_enabled:
+        if (
+            spec.cute_tcgen05_search_enabled
+            or spec.cute_flash_search_enabled
+            or spec.cute_chained_matmul_search_enabled
+            or spec.cute_chunk_prepare_schedule is not None
+        ):
             return []
         axes = cls._axes(env, device_ir)
         if not axes:
@@ -4975,6 +5015,2467 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
         return config
 
 
+class CuteChainedMatmulHeuristic(AutotunerHeuristic):
+    """Search effective warp-MMA and eligible TCgen05 contraction-DAG knobs."""
+
+    name = "cute_chained_matmul"
+    backend = "cute"
+    promote_seed_to_default = True
+
+    @staticmethod
+    def _loop_extent(
+        env: CompileEnvironment,
+        size: int | sympy.Expr,
+        config: Config | None,
+        *,
+        search_value: int = 64,
+    ) -> int | None:
+        """Resolve a literal/configured extent, never a reduction size hint."""
+        from ..compile_environment import ReductionLoopBlockSizeSource
+
+        if type(size) is int:
+            return size
+        block_id = env.get_block_id(size)
+        if block_id is None:
+            return None
+        block_id = env.canonical_block_id(block_id)
+        info = env.block_sizes[block_id]
+        source = info.block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            return source.value if type(source.value) is int else None
+        if isinstance(source, ReductionLoopBlockSizeSource):
+            return env._search_invariant_extent_for_numel_constraint(info)
+        if block_id not in env.config_spec.block_sizes.valid_block_ids():
+            return None
+        if config is not None:
+            value = info.from_config(config)
+            return value if type(value) is int else None
+        fragment = env.config_spec.block_sizes.block_id_lookup(block_id)
+        return (
+            search_value
+            if fragment.min_size <= search_value <= fragment.max_size
+            else None
+        )
+
+    @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        # A precise whole-root match owns the default; keep common seeds and
+        # explicit schedules available as alternative lowerings.
+        return (
+            env.config_spec.cute_gdn_recurrence_stages is None
+            and super().should_promote(env)
+        )
+
+    @classmethod
+    def _has_loop_m64_candidate(
+        cls, env: CompileEnvironment, loop: ChainedLoopPlan
+    ) -> bool:
+        return bool(loop.region.contractions) and all(
+            any(cls._loop_extent(env, size, None) == 64 for size in dot.shape[:2])
+            for dot in loop.region.contractions
+        )
+
+    @staticmethod
+    def _has_loop_warp_mma_candidate(
+        env: CompileEnvironment, loop: ChainedLoopPlan
+    ) -> bool:
+        """Discover a possible uninitialized stage; emission proves exact geometry.
+
+        Tunable rows describe a search interval here, not the resolved tile.
+        Grouping, transposition, and the chosen threshold are validated only
+        after the configuration has selected physical contraction stages.
+        """
+        from ..compile_environment import FixedBlockSizeSource
+        from ..compile_environment import ReductionLoopBlockSizeSource
+
+        valid = set(env.config_spec.block_sizes.valid_block_ids())
+        for contraction in loop.region.contractions:
+            if contraction.accumulator is not None:
+                continue
+            rows = contraction.shape[0]
+            if isinstance(rows, int):
+                if 0 < rows <= 128:
+                    return True
+                continue
+            block_id = env.get_block_id(rows)
+            if block_id is None:
+                continue
+            block_id = env.canonical_block_id(block_id)
+            source = env.block_sizes[block_id].block_size_source
+            if isinstance(source, FixedBlockSizeSource):
+                if type(source.value) is int and 0 < source.value <= 128:
+                    return True
+            elif isinstance(source, ReductionLoopBlockSizeSource):
+                # Full-slice dimensions can be registered as reduction axes
+                # even when their extent is fixed across the search space.
+                extent = env._search_invariant_extent_for_numel_constraint(
+                    env.block_sizes[block_id]
+                )
+                if extent is not None and 0 < extent <= 128:
+                    return True
+            elif block_id in valid:
+                fragment = env.config_spec.block_sizes.block_id_lookup(block_id)
+                if fragment.min_size <= 128 and fragment.max_size >= 16:
+                    return True
+        return False
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chained_collectives import has_parallel_scan_candidate
+        from ..cute.chained_loop import discover_chained_loop
+        from ..cute.chained_loop import loop_storage_matches_runtime
+        from ..cute.chained_matmul import detect_chained_matmul_search
+        from ..cute.chained_pointwise_residency import has_pointwise_residency_candidate
+        from ..cute.chained_preparation_cut import is_load_only_preparation
+        from ..cute.chained_preparation_cut import late_widening_candidates
+        from ..cute.chained_preparation_cut import plan_preparation_cut
+        from ..cute.chained_root_typed_operands import has_root_typed_operand_candidate
+        from ..cute.chained_root_vector_cache import has_root_vector_candidate
+        from ..cute.chained_row_registers import has_row_register_candidate
+        from ..cute.chained_scan_input import has_scan_input_candidate
+        from ..cute.chained_scratch_layout import has_scratch_candidate
+        from ..cute.chained_warp_pair import has_warp_pair_candidate
+
+        if (
+            "flat" not in env.config_spec.allowed_pid_types
+            or env.settings.autotune_force_persistent
+            or env.settings.autotune_config_overrides.get("pid_type", "flat") != "flat"
+        ):
+            return frozenset()
+        host_function = device_ir.host_function
+        if host_function is None:
+            return frozenset()
+        with host_function:
+            if not detect_chained_matmul_search(device_ir.graphs):
+                return frozenset()
+            contraction_loop = discover_chained_loop(device_ir.graphs)
+            if contraction_loop is not None and not loop_storage_matches_runtime(
+                contraction_loop
+            ):
+                return frozenset()
+            scratch_candidate = has_scratch_candidate(device_ir.graphs)
+            scan_candidate = has_parallel_scan_candidate(device_ir.graphs)
+            scan_input_candidate = has_scan_input_candidate(device_ir.graphs)
+            residency_candidate = has_pointwise_residency_candidate(device_ir.graphs)
+            root_vector_candidate = has_root_vector_candidate(device_ir.graphs)
+            collective_candidate = has_pointwise_residency_candidate(
+                device_ir.graphs, collective_consumers=True
+            )
+            typed_candidate = has_root_typed_operand_candidate(device_ir.graphs)
+            row_register_candidate = has_row_register_candidate(device_ir.graphs, env)
+            warp_pair_candidate = has_warp_pair_candidate(device_ir.graphs, env)
+        spec = env.config_spec
+        spec.cute_chained_matmul_search_enabled = True
+        spec.cute_chained_loop_search_enabled = contraction_loop is not None
+        spec.cute_chained_scratch_layout_search_enabled = scratch_candidate
+        spec.cute_chained_scan_search_enabled = scan_candidate
+        spec.cute_chained_scan_input_search_enabled = scan_input_candidate
+        spec.cute_chained_pointwise_residency_search_enabled = residency_candidate
+        spec.cute_chained_root_vector_cache_search_enabled = root_vector_candidate
+        spec.cute_chained_pointwise_collective_search_enabled = collective_candidate
+        spec.cute_chained_row_register_search_enabled = row_register_candidate
+        spec.cute_chained_warp_register_a_search_enabled = warp_pair_candidate
+        spec.cute_tcgen05_search_enabled = False
+        spec.allowed_pid_types = ("flat",)
+        valid = set(spec.block_sizes.valid_block_ids())
+        for fact in spec.matmul_facts:
+            for block_id, minimum in (
+                (fact.m_block_id, 16),
+                (fact.n_block_id, 8),
+                (fact.k_block_id, 16),
+            ):
+                if block_id is not None and block_id in valid:
+                    block = spec.block_sizes.block_id_lookup(block_id)
+                    block.update_min(minimum)
+                    block.autotuner_min = max(block.autotuner_min, minimum)
+        spec.cute_chained_tcgen05_search_enabled = (
+            mma_support.get_cute_mma_support().tcgen05_f16bf16
+            and (
+                contraction_loop is not None
+                or bool(cls._tcgen05_seed_configs(env, device_ir))
+            )
+        )
+        spec.cute_chained_warp_result_transport_search_enabled = (
+            contraction_loop is None and len(spec.matmul_facts) > 1
+        )
+        spec.cute_chained_typed_operands_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and typed_candidate
+            and bool(cls._tcgen05_seed_configs_for_rows(env, device_ir, 64))
+        )
+        if contraction_loop is not None:
+            with host_function:
+                spec.cute_chained_loop_m64_search_enabled = (
+                    spec.cute_chained_tcgen05_search_enabled
+                    and cls._has_loop_m64_candidate(env, contraction_loop)
+                )
+                spec.cute_chained_warp_mma_search_enabled = (
+                    spec.cute_chained_tcgen05_search_enabled
+                    and cls._has_loop_warp_mma_candidate(env, contraction_loop)
+                )
+                cut = (
+                    plan_preparation_cut(device_ir.graphs)
+                    if spec.cute_chained_tcgen05_search_enabled
+                    else None
+                )
+                spec.cute_chained_load_only_preparation_search_enabled = (
+                    cut is not None and is_load_only_preparation(cut)
+                )
+                spec.cute_chained_preparation_pipeline_search_enabled = (
+                    spec.cute_chained_load_only_preparation_search_enabled
+                    or (
+                        cut is not None
+                        and spec.cute_chained_warp_mma_search_enabled
+                        and mma_support.get_cute_mma_support().warp_f16bf16
+                        and any(
+                            spec.node in cut.preparation
+                            for spec in cut.region.contractions
+                        )
+                        and any(
+                            spec.node in cut.recurrence
+                            for spec in cut.region.contractions
+                        )
+                    )
+                )
+                spec.cute_chained_late_widening_search_enabled = (
+                    spec.cute_chained_preparation_pipeline_search_enabled
+                    and cut is not None
+                    and bool(late_widening_candidates(cut))
+                )
+                spec.cute_chained_grouped_fragment_bridge_search_enabled = (
+                    spec.cute_chained_preparation_pipeline_search_enabled
+                    and cut is not None
+                    and sum(
+                        dot.node in cut.recurrence for dot in cut.region.contractions
+                    )
+                    >= 4
+                )
+                spec.cute_chained_fragment_reuse_search_enabled = (
+                    spec.cute_chained_preparation_pipeline_search_enabled
+                    and cut is not None
+                    and sum(
+                        dot.node in cut.recurrence for dot in cut.region.contractions
+                    )
+                    >= 3
+                )
+                spec.cute_chained_prepared_group_multi_atom_search_enabled = (
+                    spec.cute_chained_preparation_pipeline_search_enabled
+                    and cut is not None
+                    and sum(
+                        dot.node in cut.recurrence
+                        and dot.operand_dtypes[0] in (torch.float16, torch.bfloat16)
+                        and cls._loop_extent(env, dot.shape[2], None, search_value=128)
+                        == 128
+                        for dot in cut.region.contractions
+                    )
+                    >= 2
+                )
+            # TCgen A stages have at least 128 * 16 physical elements, so
+            # scalar staging spans multiple trips even for the widest team.
+            # Exact emission rejects vector-only single-trip configurations.
+            spec.cute_chained_pointwise_unroll_search_enabled = (
+                spec.cute_chained_tcgen05_search_enabled
+            )
+            spec.cute_chained_group_search_enabled = (
+                spec.cute_chained_tcgen05_search_enabled
+                and len(contraction_loop.region.contractions) > 1
+            )
+            return frozenset()
+        spec.cute_chained_direct_output_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            # Sparse multi-dot roots use the same physical M64 MMA family,
+            # but direct output still owns exactly one contraction result.
+            and len(spec.matmul_facts) == 1
+            and bool(cls._tcgen05_seed_configs_for_rows(env, device_ir, 64))
+        )
+        spec.cute_chained_scalar_operand_unroll_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_scalar_operand_candidate(device_ir.graphs)
+            and bool(cls._tcgen05_seed_configs_for_rows(env, device_ir, 64))
+        )
+        spec.cute_chained_group_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and contraction_loop is not None
+            and len(contraction_loop.region.contractions) > 1
+        )
+        spec.cute_chained_pointwise_unroll_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_pointwise_vector_candidate(device_ir.graphs)
+        )
+        spec.cute_chained_pointwise_read_cache_search_enabled = (
+            spec.cute_chained_pointwise_unroll_search_enabled
+        )
+        spec.cute_chained_pointwise_inplace_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_inplace_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_initialized_accumulator import has_initialized_candidate
+
+        spec.cute_chained_initialized_accumulator_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_initialized_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_late_rhs import has_late_rhs_candidate
+
+        spec.cute_chained_late_rhs_reuse_search_enabled = (
+            spec.cute_chained_initialized_accumulator_search_enabled
+            and has_late_rhs_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_k_schedule import has_k_schedule_candidate
+
+        spec.cute_chained_k_schedule_search_enabled = (
+            spec.cute_chained_late_rhs_reuse_search_enabled
+            and has_k_schedule_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_leaf_pipeline import has_leaf_candidate
+
+        spec.cute_chained_leaf_pipeline_search_enabled = (
+            spec.cute_chained_k_schedule_search_enabled
+            and has_leaf_candidate(device_ir.graphs)
+        )
+        return frozenset()
+
+    @classmethod
+    def _tcgen05_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        # Preserve the complete old pool for every formerly admitted root.
+        # Only newly admitted M64 roots acquire a different TCgen05 family.
+        return cls._tcgen05_seed_configs_for_rows(
+            env, device_ir, 128
+        ) or cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
+
+    @classmethod
+    def _tcgen05_seed_configs_for_rows(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rows: int
+    ) -> list[Config]:
+        """Respect semantic dot axes and fixed tiles when seeding resident UMMA.
+
+        This is an admission superset, not the codegen proof: the concrete
+        planner still validates every operand expression, layout, and resource
+        bound. Do not pad root axes or replace explicitly fixed block sizes.
+        """
+        from ..compile_environment import FixedBlockSizeSource
+
+        spec = env.config_spec
+        if len(device_ir.task_families) != 1 or not spec.matmul_facts:
+            return []
+        family = device_ir.task_families[0]
+        seeds = []
+        valid = set(spec.block_sizes.valid_block_ids())
+        for width in (32, 64, 128, 256):
+            requirements: dict[int, int] = {}
+            compatible = True
+            for fact in spec.matmul_facts:
+                for role, block_id, static_extent, tile in (
+                    ("m", fact.m_block_id, fact.static_m, rows),
+                    ("n", fact.n_block_id, fact.static_n, width),
+                    ("k", fact.k_block_id, fact.static_k, fact.static_k),
+                ):
+                    if block_id is None or block_id not in valid:
+                        fixed = static_extent
+                        if block_id is not None and family.axis(block_id) is not None:
+                            source = env.block_sizes[block_id].block_size_source
+                            fixed = (
+                                source.value
+                                if isinstance(source, FixedBlockSizeSource)
+                                and isinstance(source.value, int)
+                                else None
+                            )
+                        if (
+                            fixed is None
+                            or fixed <= 0
+                            or (role == "m" and fixed != rows)
+                            or (role == "n" and (fixed % 32 or not 32 <= fixed <= 256))
+                            or (
+                                rows == 64
+                                and role == "n"
+                                and fixed not in (32, 64, 96, 128, 256)
+                            )
+                            or (role == "k" and fixed % 16)
+                        ):
+                            compatible = False
+                        continue
+                    if (
+                        tile is None
+                        or tile <= 0
+                        or (block_id in requirements and requirements[block_id] != tile)
+                    ):
+                        compatible = False
+                        continue
+                    requirements[block_id] = tile
+                if fact.static_k is None or fact.static_k <= 0 or fact.static_k % 16:
+                    compatible = False
+            blocks = []
+            for block in spec.block_sizes:
+                tile = requirements.get(block.block_id, block.min_size)
+                if not block.min_size <= tile <= block.max_size:
+                    compatible = False
+                blocks.append(tile)
+            by_block = {
+                block.block_id: tile
+                for block, tile in zip(spec.block_sizes, blocks, strict=True)
+            }
+            for axis in family.axes:
+                tile = by_block.get(axis.block_id)
+                if tile is None:
+                    source = env.block_sizes[axis.block_id].block_size_source
+                    tile = (
+                        source.value
+                        if isinstance(source, FixedBlockSizeSource)
+                        and isinstance(source.value, int)
+                        else None
+                    )
+                if (
+                    tile is None
+                    or tile <= 0
+                    or not axis.canonical_origin
+                    or not isinstance(axis.extent, sympy.Integer)
+                    or int(axis.extent) % tile
+                ):
+                    compatible = False
+            if compatible:
+                seeds.extend(
+                    Config(
+                        block_sizes=blocks,
+                        num_warps=4,
+                        pid_type="flat",
+                        cute_chained_mma_schedule="tcgen05_tmem",
+                        cute_chained_pointwise_vectorize=vectorize,
+                        cute_chained_auxiliary_cache=auxiliary_cache,
+                    )
+                    for vectorize in (False, True)
+                    for auxiliary_cache in (False, True)
+                )
+        return dedupe_configs(seeds)
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chained_matmul_search_enabled
+
+    @classmethod
+    def _loop_seed_configs(cls, env: CompileEnvironment) -> list[Config]:
+        import itertools
+
+        spec = env.config_spec
+        choices = [
+            tuple(
+                value
+                for value in (16, 32, 64, 128, 256)
+                if block.min_size <= value <= block.max_size
+            )
+            or (block.min_size,)
+            for block in spec.block_sizes
+        ]
+        # Place the shared TCgen05 candidates beside the conservative warp
+        # candidate, before the bounded pool's alternative producer layouts.
+        schedules = spec._cute_chained_mma_schedules()
+        schedules = tuple(
+            schedule
+            for schedule in ("coalesced", "tcgen05_tmem", *schedules)
+            if schedule in schedules
+        )
+        schedules = tuple(dict.fromkeys(schedules))
+        seeds = list(
+            itertools.islice(
+                (
+                    Config(
+                        block_sizes=list(blocks),
+                        num_warps=warps,
+                        cute_chained_mma_schedule=schedule,
+                        cute_chained_group_contractions=grouped,
+                    )
+                    for blocks in itertools.product(*choices)
+                    for schedule in schedules
+                    for warps in ((4,) if schedule == "tcgen05_tmem" else (4, 8, 2, 1))
+                    for grouped in (
+                        (False, True)
+                        if schedule == "tcgen05_tmem"
+                        and spec.cute_chained_group_search_enabled
+                        else (False,)
+                    )
+                ),
+                96,
+            )
+        )
+        # A physical common TCgen stage has at least 128x16 A elements:
+        # all 128/256/512/1024-thread producer teams perform actual work.
+        # Bound the additional search dimension to one largest-tile parent
+        # per admitted grouping choice, without disturbing root seed pools.
+        for grouped in (False, True):
+            parents = [
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_group_contractions", False) == grouped
+            ]
+            if parents:
+                parent = max(parents, key=lambda seed: math.prod(seed.block_sizes))
+                layout = (
+                    {"cute_chained_scratch_layout": "xor"}
+                    if spec.cute_chained_scratch_layout_search_enabled
+                    else {}
+                )
+                seeds.extend(
+                    Config.from_dict(parent.config | layout | {"num_warps": warps})
+                    for warps in (8, 16, 32)
+                )
+        return seeds
+
+    @classmethod
+    def _base_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        import itertools
+
+        spec = env.config_spec
+        if spec.cute_chained_loop_search_enabled:
+            return cls._loop_seed_configs(env)
+        choices = [
+            tuple(
+                value
+                for value in (16, 32, 64)
+                if block.min_size <= value <= block.max_size
+            )
+            or (block.min_size,)
+            for block in spec.block_sizes
+        ]
+        seeds = [
+            Config(
+                block_sizes=list(blocks),
+                num_warps=warps,
+                pid_type="flat",
+                cute_chained_mma_schedule=schedule,
+            )
+            for warps in (4, 8, 2, 1)
+            for blocks in itertools.product(*choices)
+            for schedule in (
+                "coalesced",
+                "cp_async",
+                "cp_async_register",
+                "cp_async_register_reuse",
+                "cp_async_register_reuse_scan",
+            )
+        ][:96]
+        if spec.cute_chained_tcgen05_search_enabled:
+            tcgen_seeds = cls._tcgen05_seed_configs(env, device_ir)
+            seeds.extend(tcgen_seeds)
+        if spec.cute_chained_pointwise_unroll_search_enabled:
+            pointwise_seeds = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_unroll": factor}
+                )
+                for factor in VALID_CUTE_CHAINED_POINTWISE_UNROLLS[1:]
+                for seed in pointwise_seeds
+            )
+        if spec.cute_chained_pointwise_read_cache_search_enabled:
+            cache_parents = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_read_cache": True}
+                )
+                for seed in cache_parents
+            )
+        if spec.cute_chained_pointwise_inplace_search_enabled:
+            parents = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_inplace_async": True}
+                )
+                for seed in parents
+            )
+        ordered = order_chained_seed_configs(seeds)
+        if not spec.cute_chained_initialized_accumulator_search_enabled:
+            ordered = _with_early_tmem_release_seed(ordered)
+            if (
+                spec.cute_chained_direct_output_search_enabled
+                and not cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+            ):
+                # Newly admitted roots get one useful direct sibling. Existing
+                # M128 pools, multiplicities, ordering and first seed are intact.
+                for index, seed in enumerate(ordered):
+                    if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+                        ordered = [
+                            *ordered[: index + 1],
+                            Config.from_dict(
+                                seed.config | {"cute_chained_direct_output": True}
+                            ),
+                            *ordered[index + 1 :],
+                        ]
+                        break
+            return cls._startup_seed(
+                env,
+                device_ir,
+                _with_last_read_seed(ordered),
+            )
+        result: list[Config] = []
+        for seed in ordered:
+            result.append(seed)
+            if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+                result.append(
+                    Config.from_dict(
+                        seed.config | {"cute_chained_initialized_accumulator": True}
+                    )
+                )
+                if spec.cute_chained_late_rhs_reuse_search_enabled:
+                    result.append(
+                        Config.from_dict(
+                            seed.config
+                            | {
+                                "cute_chained_initialized_accumulator": True,
+                                "cute_chained_late_rhs_reuse": True,
+                            }
+                        )
+                    )
+        return _with_leaf_pipeline_seeds(
+            cls._startup_seed(
+                env,
+                device_ir,
+                _with_last_read_seed(
+                    _with_k_schedule_seeds(
+                        _with_early_tmem_release_seed(result),
+                        enabled=spec.cute_chained_k_schedule_search_enabled,
+                    )
+                ),
+            ),
+            enabled=spec.cute_chained_leaf_pipeline_search_enabled,
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        seeds = cls._seed_configs_without_snapshot_siblings(env, device_ir)
+        if not seeds:
+            return seeds
+        seeds = cls._with_root_typed_operand_seeds(env, device_ir, seeds)
+        seeds = cls._with_root_snapshot_seeds(env, device_ir, seeds)
+        seeds = cls._with_complete_drain_seeds(env, device_ir, seeds)
+        seeds = cls._with_island_consumer_seeds(env, device_ir, seeds)
+        seeds = cls._with_async_vector_store_seeds(env, device_ir, seeds)
+        seeds = cls._with_retained_scan_preparation_seeds(env, device_ir, seeds)
+        seeds = cls._with_root_scalar_operand_unroll_seeds(env, device_ir, seeds)
+        seeds = cls._with_loop_m64_seeds(env, device_ir, seeds)
+        seeds = cls._with_collective_cache_seed(env, seeds)
+        seeds = cls._with_multi_atom_prepared_group_seed(env, device_ir, seeds)
+        seeds = cls._with_grouped_fragment_seed(env, seeds)
+        seeds = cls._with_native_async_vector_seed(env, device_ir, seeds)
+        seeds = cls._with_independent_publication_seed(env, seeds)
+        seeds = cls._with_warp_result_transport_seed(env, seeds)
+        seeds = cls._with_late_widening_seed(env, seeds)
+        seeds = cls._with_async_group_seed(env, seeds)
+        seeds = cls._with_m64_transpose_seed(env, device_ir, seeds)
+        seeds = cls._with_fragment_reuse_seed(env, seeds)
+        seeds = cls._with_rectangular_async_seed(env, seeds)
+        seeds = cls._with_row_register_seed(
+            env, cls._with_m64_completed_store_seed(env, seeds)
+        )
+        seeds = cls._with_scan_input_seed(
+            env,
+            cls._with_parallel_row_seed(env, cls._with_early_carry_seed(env, seeds)),
+        )
+        return cls._with_warp_register_a_seeds(
+            env, cls._with_row_async_copy_seed(env, seeds)
+        )
+
+    @staticmethod
+    def _with_warp_register_a_seeds(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append a register-pair trial and its independent terminal-store trial."""
+        key = CUTE_CHAINED_WARP_REGISTER_A_KEY
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in seeds:
+            if parent.config.get("cute_chained_mma_schedule") != "coalesced":
+                continue
+            additions = []
+            modes = (
+                ("legacy", "direct")
+                if len(env.config_spec.matmul_facts) > 2
+                else ("legacy",)
+            )
+            for mode in modes:
+                proposed = parent.config | {
+                    key: True,
+                    CUTE_CHAINED_WARP_RESULT_TRANSPORT_KEY: mode,
+                }
+                if any(
+                    proposed.get(name) != value
+                    for name, value in env.settings.autotune_config_overrides.items()
+                ):
+                    continue
+                try:
+                    sibling = env.config_spec.normalized_config(proposed)
+                except InvalidConfig:
+                    continue
+                if sibling not in seeds and sibling not in additions:
+                    additions.append(sibling)
+            if additions:
+                return [*seeds, *additions]
+        return seeds
+
+    @staticmethod
+    def _with_row_async_copy_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Try original joined raw copies alongside independent row islands.
+
+        Keep the entire previous pool. Discovery can also supply a serial
+        scan-input publication, whose lifetime ends at its original join.
+        Exact row, scan, affine-copy and publication proofs remain in codegen.
+        """
+        row_key = "cute_chained_pointwise_schedule"
+        scan_key = "cute_chained_scan_input_materialize"
+        fields = env.config_spec._flat_fields()
+        if row_key not in fields:
+            return seeds
+        for parent in reversed(seeds):
+            if (
+                parent.config.get(row_key) != "warp_rows_parallel"
+                or parent.config.get("cute_chained_mma_schedule") != "coalesced"
+            ):
+                continue
+            proposed = parent.config | {"cute_chained_mma_schedule": "cp_async"}
+            if "cute_native_matmul_metadata" in fields:
+                proposed["cute_native_matmul_metadata"] = True
+            if scan_key in fields:
+                proposed[scan_key] = True
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            try:
+                sibling = env.config_spec.normalized_config(proposed)
+            except InvalidConfig:
+                continue
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_scan_input_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append one input-publication choice after the unchanged old pool."""
+        key = "cute_chained_scan_input_materialize"
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in seeds:
+            if parent.config.get("cute_chained_mma_schedule") != "coalesced":
+                continue
+            proposed = parent.config | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            try:
+                env.config_spec._normalize_cute_chained_scan_input(proposed)
+            except InvalidConfig:
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_parallel_row_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One alternate row schedule after the complete unchanged old pool.
+
+        Discovery supplies only static row candidates. Exact independent-island
+        closure, movement and at least one multi-warp batch remain plan proofs.
+        """
+        key = "cute_chained_pointwise_schedule"
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in seeds:
+            if parent.config.get("cute_chained_mma_schedule") != "coalesced":
+                continue
+            proposed = parent.config | {key: "warp_rows_parallel"}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            try:
+                env.config_spec._normalize_cute_chained_pointwise_schedule(proposed)
+            except InvalidConfig:
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_early_carry_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One optional independent carry issue after the unchanged pool."""
+        key = "cute_chained_early_carry_seed"
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in reversed(seeds):
+            proposed = parent.config | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            try:
+                env.config_spec._normalize_cute_chained_early_carry_seed(proposed)
+            except InvalidConfig:
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_m64_completed_store_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One terminal-store alternative after the unchanged M64 pool."""
+        key = "cute_chained_completed_member_store"
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in reversed(seeds):
+            values = parent.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get("cute_chained_group_contractions") is not True
+                or values.get("cute_chained_preparation_pipeline") is not True
+                or values.get("cute_chained_loop_mma_rows", 128) != 64
+                or values.get("cute_chained_pipeline_consumer_warps", 4) != 4
+                or any(
+                    values.get(name)
+                    for name in (
+                        key,
+                        "cute_chained_grouped_fragment_bridge",
+                        "cute_chained_seed_tile_columns",
+                        "cute_chained_drain_tile_columns",
+                        "cute_chained_vector_group",
+                        "cute_chained_output_lease_snapshot",
+                    )
+                )
+            ):
+                continue
+            proposed = values | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_rectangular_async_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One complete-rectangle alternative after the unchanged packet pool."""
+        key = "cute_chained_rectangular_async"
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in reversed(seeds):
+            values = parent.config
+            if (
+                values.get("cute_chained_preparation_pipeline") is not True
+                or values.get("cute_chained_async_vector_store") is not True
+                or values.get(key, False)
+            ):
+                continue
+            proposed = values | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_fragment_reuse_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One bounded operand/seed reuse proposal after the original pool."""
+        key = "cute_chained_fragment_reuse"
+        if not env.config_spec.cute_chained_fragment_reuse_search_enabled:
+            return seeds
+        for parent in reversed(seeds):
+            values = parent.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get("cute_chained_group_contractions") is not True
+                or values.get("cute_chained_preparation_pipeline") is not True
+                or values.get("cute_chained_loop_mma_rows", 128) != 64
+                or values.get("cute_chained_pipeline_consumer_warps", 4) != 4
+                or any(
+                    values.get(name)
+                    for name in (
+                        key,
+                        "cute_chained_grouped_fragment_bridge",
+                        "cute_chained_seed_tile_columns",
+                        "cute_chained_drain_tile_columns",
+                        "cute_chained_vector_group",
+                        "cute_chained_completed_member_store",
+                        "cute_chained_output_lease_snapshot",
+                        "cute_chained_pointwise_cache_bytes",
+                    )
+                )
+            ):
+                continue
+            proposed = values | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @classmethod
+    def _with_m64_transpose_seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Try one physical orientation after the original M64 seed pool."""
+        from ..cute.chained_loop import discover_chained_loop
+
+        key = CUTE_CHAINED_M64_TRANSPOSE_KEY
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        host = device_ir.host_function
+        assert host is not None
+        with host:
+            loop = discover_chained_loop(device_ir.graphs)
+            if loop is None:
+                return seeds
+            for parent in reversed(seeds):
+                if (
+                    parent.config.get(CUTE_CHAINED_LOOP_MMA_ROWS_KEY, 128) != 64
+                    or parent.config.get(key, False)
+                    or not any(
+                        cls._loop_extent(env, dot.shape[0], parent) == 64
+                        and cls._loop_extent(env, dot.shape[1], parent) == 64
+                        for dot in loop.region.contractions
+                    )
+                ):
+                    continue
+                proposed = parent.config | {key: True}
+                if any(
+                    proposed.get(name) != value
+                    for name, value in env.settings.autotune_config_overrides.items()
+                ):
+                    continue
+                sibling = Config.from_dict(proposed)
+                return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_async_group_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One bounded group-limit trial after all original compatible seeds."""
+        key = CUTE_CHAINED_ASYNC_GROUP_LIMIT_KEY
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in reversed(seeds):
+            if (
+                parent.config.get(CUTE_CHAINED_INDEPENDENT_PUBLICATION_KEY) is not True
+                or parent.config.get(CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY) is not True
+                or parent.config.get(key, 1) != 1
+            ):
+                continue
+            proposed = parent.config | {key: 8}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_late_widening_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One raw-image cut trial after the unchanged original seed pool."""
+        key = CUTE_CHAINED_LATE_WIDENING_KEY
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in reversed(seeds):
+            if (
+                parent.config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or parent.config.get("cute_chained_preparation_pipeline") is not True
+                or parent.config.get(key)
+            ):
+                continue
+            proposed = parent.config | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_row_register_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One bounded static-island schedule after the unchanged seed pool."""
+        key = "cute_chained_pointwise_schedule"
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in seeds:
+            if parent.config.get("cute_chained_mma_schedule") != "coalesced":
+                continue
+            proposed = parent.config | {key: "warp_rows"}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            try:
+                env.config_spec._normalize_cute_chained_pointwise_schedule(proposed)
+            except InvalidConfig:
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_warp_result_transport_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One complete-terminal trial after the unchanged original seed pool."""
+        key = CUTE_CHAINED_WARP_RESULT_TRANSPORT_KEY
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in seeds:
+            if parent.config.get("cute_chained_mma_schedule") != "coalesced":
+                continue
+            proposed = parent.config | {key: "packed_direct"}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            try:
+                env.config_spec._normalize_cute_chained_warp_result_transport(proposed)
+            except InvalidConfig:
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_independent_publication_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One optional load-only publication schedule after the unchanged pool."""
+        key = CUTE_CHAINED_INDEPENDENT_PUBLICATION_KEY
+        if key not in env.config_spec._flat_fields():
+            return seeds
+        for parent in reversed(seeds):
+            values = parent.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get("cute_chained_preparation_pipeline") is not True
+                or values.get("cute_chained_preparation_cohorts", 1) != 1
+                or any(
+                    values.get(name, False)
+                    for name in (
+                        key,
+                        "cute_chained_compact_preparation",
+                        "cute_chained_leaf_issue_batching",
+                        "cute_chained_broadcast_retention",
+                        "cute_chained_island_consumers",
+                        "cute_chained_fragment_epilogues",
+                        "cute_chained_operand_retention",
+                        "cute_chained_scan_producer_retention",
+                        "cute_chained_collective_retention",
+                    )
+                )
+                or values.get("cute_chained_leaf_count", 1) != 1
+            ):
+                continue
+            proposed = values | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_native_async_vector_seed(
+        env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """One native-image copy composition after the unchanged seed pool.
+
+        A complete K128 group proposal and a raw half load only motivate a
+        trial. Exact native membership, layout, source identity and guarded
+        packet coverage remain the same-attempt emitter's authority.
+        """
+        from ...language.memory_ops import load
+        from ..cute.chained_preparation_cut import plan_preparation_cut
+
+        key = CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY
+        if key not in env.config_spec._flat_fields() or device_ir.host_function is None:
+            return seeds
+        with device_ir.host_function:
+            cut = plan_preparation_cut(device_ir.graphs)
+        if cut is None or not any(
+            node.target is load
+            and isinstance(value := node.meta.get("val"), torch.Tensor)
+            and value.ndim == 2
+            and value.dtype in (torch.bfloat16, torch.float16)
+            for node in cut.preparation
+        ):
+            return seeds
+        for parent in reversed(seeds):
+            values = parent.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get("cute_chained_preparation_pipeline") is not True
+                or values.get("cute_chained_prepared_group_multi_atom") is not True
+                or values.get(key, False) is not False
+            ):
+                continue
+            proposed = values | {"cute_chained_pointwise_vectorize": True, key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_grouped_fragment_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One optional adjacent fragment proposal after the existing pool."""
+        if not env.config_spec.cute_chained_grouped_fragment_bridge_search_enabled:
+            return seeds
+        for seed in reversed(seeds):
+            values = seed.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get("cute_chained_group_contractions") is not True
+                or values.get("cute_chained_preparation_pipeline") is not True
+                or values.get("cute_chained_loop_mma_rows", 128) != 64
+                or values.get("cute_chained_pipeline_consumer_warps", 4) != 4
+                or any(
+                    values.get(key, False)
+                    for key in (
+                        "cute_chained_seed_tile_columns",
+                        "cute_chained_drain_tile_columns",
+                        "cute_chained_vector_group",
+                        "cute_chained_completed_member_store",
+                        "cute_chained_output_lease_snapshot",
+                    )
+                )
+            ):
+                continue
+            values = values | {"cute_chained_grouped_fragment_bridge": True}
+            if any(
+                values.get(key) != value
+                for key, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(values)
+            return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @classmethod
+    def _with_multi_atom_prepared_group_seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """One complete-K128 image proposal after the unchanged seed pool."""
+        from ..cute.chained_loop import discover_chained_loop
+
+        spec = env.config_spec
+        if not (
+            spec.cute_chained_prepared_group_multi_atom_search_enabled
+            and spec.cute_chained_group_search_enabled
+            and spec.cute_chained_preparation_pipeline_search_enabled
+        ):
+            return seeds
+        host = device_ir.host_function
+        assert host is not None
+        with host:
+            loop = discover_chained_loop(device_ir.graphs)
+            if loop is None:
+                return seeds
+            for seed in reversed(seeds):
+                values = seed.config
+                if (
+                    values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                    or values.get("cute_chained_group_contractions") is not True
+                    or values.get("cute_chained_preparation_pipeline") is not True
+                    or not any(
+                        cls._loop_extent(env, dot.shape[2], seed) == 128
+                        for dot in loop.region.contractions
+                    )
+                ):
+                    continue
+                values = values | {"cute_chained_prepared_group_multi_atom": True}
+                if any(
+                    values.get(key) != value
+                    for key, value in env.settings.autotune_config_overrides.items()
+                ):
+                    continue
+                sibling = Config.from_dict(values)
+                return seeds if sibling in seeds else [*seeds, sibling]
+        return seeds
+
+    @staticmethod
+    def _with_collective_cache_seed(
+        env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """One budgeted collective-event sibling after the unchanged seed pool."""
+        if not env.config_spec.cute_chained_pointwise_collective_search_enabled:
+            return seeds
+        parent = next(
+            (
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "coalesced"
+                and seed.num_warps == 4
+                and not seed.config.get("cute_chained_pointwise_cache_bytes")
+                and not seed.config.get("cute_chained_initialized_accumulator")
+                and not seed.config.get("cute_chained_direct_output")
+            ),
+            None,
+        )
+        if parent is None:
+            return seeds
+        values = parent.config | {
+            "cute_chained_pointwise_cache_bytes": 16384,
+            "cute_chained_pointwise_cache_collectives": True,
+        }
+        if any(
+            values.get(key) != value
+            for key, value in env.settings.autotune_config_overrides.items()
+        ):
+            return seeds
+        sibling = Config.from_dict(values)
+        return seeds if sibling in seeds else [*seeds, sibling]
+
+    @classmethod
+    def _with_loop_m64_seeds(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Append at most one ordinary and one prepared full-M64 loop seed."""
+        from ..cute.chained_loop import discover_chained_loop
+        from ..cute.chained_tcgen_stage import stage_geometry
+
+        spec = env.config_spec
+        if not spec.cute_chained_loop_m64_search_enabled:
+            return seeds
+        host = device_ir.host_function
+        assert host is not None
+        with host:
+            loop = discover_chained_loop(device_ir.graphs)
+            if loop is None:
+                return seeds
+            parents = []
+            for seed in seeds:
+                values = seed.config
+                if (
+                    values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                    or values.get("cute_chained_group_contractions") is not True
+                    or seed.num_warps != 4
+                    or values.get(CUTE_CHAINED_WARP_MMA_ROWS_KEY, 0) != 0
+                    or values.get(CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY, 0) != 0
+                    or values.get(CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY, 0) != 0
+                    or values.get("cute_chained_completed_member_store", False)
+                ):
+                    continue
+                shapes = [
+                    tuple(cls._loop_extent(env, size, seed) for size in dot.shape)
+                    for dot in loop.region.contractions
+                ]
+                if any(
+                    any(size is None for size in shape)
+                    or stage_geometry(
+                        cast("tuple[int, int, int]", shape), native_rows=64
+                    )
+                    is None
+                    for shape in shapes
+                ):
+                    continue
+                parents.append(seed)
+        if not parents:
+            return seeds
+        parent = max(parents, key=lambda seed: math.prod(seed.block_sizes))
+        values = parent.config | {CUTE_CHAINED_LOOP_MMA_ROWS_KEY: 64}
+        candidates = [values]
+        if spec.cute_chained_load_only_preparation_search_enabled:
+            candidates.append(
+                values | {"num_warps": 8, CUTE_CHAINED_PREPARATION_PIPELINE_KEY: True}
+            )
+        additions = []
+        for candidate in candidates:
+            if any(
+                candidate.get(key) != value
+                for key, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(candidate)
+            if sibling not in seeds and sibling not in additions:
+                additions.append(sibling)
+        return [*seeds, *additions]
+
+    @classmethod
+    def _with_root_scalar_operand_unroll_seeds(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Append at most one ordinary and one typed M64 scalar-loop proposal."""
+        spec = env.config_spec
+        if not spec.cute_chained_scalar_operand_unroll_search_enabled:
+            return seeds
+        geometries = {
+            (tuple(seed.block_sizes), seed.num_warps)
+            for seed in cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
+        }
+        result = list(seeds)
+        selected: set[bool] = set()
+        for seed in seeds:
+            typed = bool(seed.get("cute_chained_typed_operands", False))
+            if (
+                typed in selected
+                or seed.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or (tuple(seed.block_sizes), seed.num_warps) not in geometries
+                or seed.get("cute_chained_pointwise_vectorize", False)
+                or seed.get("cute_chained_auxiliary_cache", False)
+                or any(
+                    seed.get(key, default) != default
+                    for key, default in (
+                        ("cute_chained_startup_transfer", "legacy"),
+                        ("cute_chained_snapshot_tile_columns", 0),
+                        ("cute_chained_direct_output", False),
+                    )
+                )
+            ):
+                continue
+            proposed = dict(seed.config, cute_chained_scalar_operand_unroll=8)
+            spec._normalize_cute_chained_scalar_operand_unroll(proposed)
+            result.append(Config.from_dict(proposed))
+            selected.add(typed)
+            if len(selected) == 2:
+                break
+        return result
+
+    @classmethod
+    def _with_root_typed_operand_seeds(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Keep the original pool and add at most two ordinary TCgen cast proposals."""
+        spec = env.config_spec
+        if not spec.cute_chained_typed_operands_search_enabled:
+            return seeds
+        geometries = {
+            (tuple(seed.block_sizes), seed.num_warps)
+            for seed in cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
+        }
+        result = []
+        additions = 0
+        for seed in seeds:
+            result.append(seed)
+            if (
+                additions == 2
+                or seed.config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or (tuple(seed.block_sizes), seed.num_warps) not in geometries
+            ):
+                continue
+            proposed = dict(seed.config, cute_chained_typed_operands=True)
+            try:
+                spec._normalize_cute_chained_typed_operands(proposed)
+            except InvalidConfig:
+                continue
+            result.append(Config.from_dict(proposed))
+            additions += 1
+        return result
+
+    @staticmethod
+    def _with_retained_scan_preparation_seeds(
+        env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Append two retained-scan proposals with completed raw-leaf inputs.
+
+        The semantic preparation cut supplies candidate demand, not leaf or
+        lifetime proof. Original emitters still validate every descriptor,
+        retained owner, scan boundary and complete shared-memory allocation.
+        """
+        from ...language import _tracing_ops
+        from ...language.memory_ops import load
+        from ..cute.chained_preparation_cohorts import plan_preparation_cohorts
+        from ..cute.chained_preparation_cut import plan_preparation_cut
+
+        spec = env.config_spec
+        if (
+            not spec.cute_chained_preparation_pipeline_search_enabled
+            or not spec.cute_chained_tcgen05_search_enabled
+            or not spec.cute_chained_group_search_enabled
+            or not spec.cute_chained_scan_search_enabled
+            or not spec.cute_chained_pointwise_residency_search_enabled
+            or device_ir.host_function is None
+        ):
+            return seeds
+        with device_ir.host_function:
+            cut = plan_preparation_cut(device_ir.graphs)
+        if cut is None or not any(node in cut.preparation for node in cut.region.scans):
+            return seeds
+        raw_count = sum(
+            node.target is load
+            and isinstance(source := node.args[0], torch.fx.Node)
+            and source.target is _tracing_ops._host_tensor
+            and isinstance(value := node.meta.get("val"), torch.Tensor)
+            and value.ndim == 2
+            and value.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            for node in cut.preparation
+        )
+        # Count potential demand without duplicating rectangular-leaf proof.
+        # Unknown/unbounded sets do not justify enlarging the existing search.
+        leaf_count = next(
+            (count for count in VALID_CUTE_CHAINED_LEAF_COUNTS if count >= raw_count),
+            None,
+        )
+        if not raw_count or leaf_count is None:
+            return seeds
+        additions = []
+        seen = set(seeds)
+        selected: set[Config] = set()
+        for parent in seeds:
+            values = parent.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get("cute_chained_group_contractions") is not True
+                or values.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+                or values.get("cute_chained_scan_schedule") != "warp"
+                or values.get("cute_chained_pointwise_vectorize") is not True
+                or not values.get("cute_chained_pointwise_cache_bytes", 0)
+            ):
+                continue
+            consumer = values.get(CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY, 4)
+            if type(consumer) is not int:
+                continue
+            count, remainder = divmod(parent.num_warps - consumer, 4)
+            cohorts = plan_preparation_cohorts(
+                32 * parent.num_warps, 32 * consumer, count, has_tma=True
+            )
+            if remainder or cohorts is None or cohorts.cohort_threads != 128:
+                continue
+            bundle = {
+                "cute_chained_compact_preparation": True,
+                "cute_chained_scan_producer_retention": True,
+                "cute_chained_operand_retention": True,
+                "cute_chained_preparation_cohorts": count,
+                "cute_chained_leaf_pipeline": "rectangular_tma",
+                "cute_chained_leaf_count": leaf_count,
+            }
+            if any(
+                key in values and values[key] != value for key, value in bundle.items()
+            ):
+                continue
+            proposed = values | bundle
+            if any(
+                proposed.get(key) != value
+                for key, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            selected.add(sibling)
+            if sibling not in seen:
+                additions.append(sibling)
+                seen.add(sibling)
+            if len(selected) == 2:
+                break
+        return [*seeds, *additions] if additions else seeds
+
+    @staticmethod
+    def _with_async_vector_store_seeds(
+        env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Append two identity-load transport proposals; retain every old parent.
+
+        A rank-two preparation load motivates a trial, but does not prove its
+        concrete source strides, mask, destination layout or effective use.
+        Those remain the original vector emitter's fail-closed authority.
+        """
+        from ...language.memory_ops import load
+        from ..cute.chained_preparation_cut import plan_preparation_cut
+
+        key = CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY
+        if key not in env.config_spec._flat_fields() or device_ir.host_function is None:
+            return seeds
+        with device_ir.host_function:
+            cut = plan_preparation_cut(device_ir.graphs)
+        if cut is None or not any(
+            node.target is load
+            and isinstance(value := node.meta.get("val"), torch.Tensor)
+            and value.ndim == 2
+            and value.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            for node in cut.preparation
+        ):
+            return seeds
+        additions = []
+        seen = set(seeds)
+        for parent in seeds:
+            values = parent.config
+            if (
+                values.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or values.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+                or values.get("cute_chained_pointwise_vectorize") is not True
+                or values.get(key, False) is not False
+            ):
+                continue
+            proposed = values | {key: True}
+            if any(
+                proposed.get(name) != value
+                for name, value in env.settings.autotune_config_overrides.items()
+            ):
+                continue
+            sibling = Config.from_dict(proposed)
+            if sibling not in seen:
+                additions.append(sibling)
+                seen.add(sibling)
+            if len(additions) == 2:
+                break
+        return seeds + additions if additions else seeds
+
+    @staticmethod
+    def _with_island_consumer_seeds(
+        env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Append at most two graph-matched bundles without changing any parent.
+
+        Only complete singleton groups with zero pointwise cache are planned
+        here. All owners, expressions, reader completions and storage admission
+        remain the original late emitter's authority.
+        """
+        from torch.fx import Node
+
+        from ..compile_environment import FixedBlockSizeSource
+        from ..compile_environment import LoopSpecBlockSizeSource
+        from ..cute.chained_contraction_groups import ContractionGroup
+        from ..cute.chained_island_publication import island_export_cut
+        from ..cute.chained_mma_selection import warp_mma_shape
+        from ..cute.chained_preparation_cohorts import plan_preparation_cohorts
+        from ..cute.chained_preparation_cut import _shape_input
+        from ..cute.chained_preparation_cut import plan_preparation_cut
+        from ..cute.chained_register_islands import plan_register_islands
+        from ..cute.chained_tcgen_stage import stage_geometry
+
+        spec = env.config_spec
+        if (
+            not spec.cute_chained_preparation_pipeline_search_enabled
+            or not spec.cute_chained_tcgen05_search_enabled
+            or not env.settings.fast_math
+            or device_ir.host_function is None
+        ):
+            return seeds
+
+        def block_size(
+            symbol: int | torch.SymInt | sympy.Basic, config: Config
+        ) -> int | None:
+            block = env.get_block_id(symbol)
+            if block is None:
+                return None
+            info = env.block_sizes[env.canonical_block_id(block)]
+            # Other sources can consult a size hint (notably persistent
+            # reductions). They are not exact seed-domain authority.
+            if not isinstance(
+                info.block_size_source, (FixedBlockSizeSource, LoopSpecBlockSizeSource)
+            ):
+                return None
+            value = info.from_config(config)
+            return value if type(value) is int and value >= 0 else None
+
+        def extent(value: int | torch.SymInt, config: Config) -> int | None:
+            if type(value) is int:
+                return value
+            if not isinstance(value, torch.SymInt):
+                return None
+            direct = block_size(value, config)
+            if direct is not None:
+                return direct
+            expr = value.node.expr
+            replacements = {}
+            for symbol in expr.free_symbols:
+                resolved = block_size(symbol, config)
+                if resolved is None:
+                    return None
+                replacements[symbol] = sympy.Integer(resolved)
+            result = expr.xreplace(replacements)
+            return (
+                int(result)
+                if isinstance(result, sympy.Integer) and result >= 0
+                else None
+            )
+
+        with device_ir.host_function:
+            cut = plan_preparation_cut(device_ir.graphs)
+            if cut is None:
+                return seeds
+            region = cut.region
+            additions = []
+            seen = set(seeds)
+            for parent in seeds:
+                config = parent.config
+                if (
+                    config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                    or config.get("cute_chained_group_contractions", False) is not False
+                    or config.get("cute_chained_pointwise_cache_bytes", 0) != 0
+                    or config.get("cute_chained_vector_group", False) is not False
+                    or config.get("cute_chained_broadcast_retention", False)
+                    is not False
+                    or config.get(CUTE_CHAINED_ISLAND_CONSUMERS_KEY, False) is not False
+                ):
+                    continue
+                consumer = config.get(CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY, 4)
+                if type(consumer) is not int:
+                    continue
+                count, remainder = divmod(parent.num_warps - consumer, 4)
+                cohorts = plan_preparation_cohorts(
+                    32 * parent.num_warps,
+                    32 * consumer,
+                    count,
+                    has_tma=config.get("cute_chained_leaf_pipeline")
+                    == "rectangular_tma",
+                )
+                if remainder or cohorts is None or cohorts.cohort_threads != 128:
+                    continue
+                bundle = {
+                    CUTE_CHAINED_PREPARATION_PIPELINE_KEY: True,
+                    CUTE_CHAINED_WARP_MMA_ROWS_KEY: 32,
+                    "cute_chained_preparation_cohorts": count,
+                    "cute_chained_compact_preparation": True,
+                    "cute_chained_register_islands": True,
+                    CUTE_CHAINED_ISLAND_CONSUMERS_KEY: True,
+                }
+                if any(
+                    key in config and config[key] != value
+                    for key, value in bundle.items()
+                ):
+                    continue
+                proposed = config | bundle
+                if any(
+                    key not in proposed or proposed[key] != value
+                    for key, value in env.settings.autotune_config_overrides.items()
+                ):
+                    continue
+                shapes = {}
+                for node in region.nodes:
+                    value = node.meta.get("val")
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    sizes = tuple(extent(size, parent) for size in value.shape)
+                    if any(size is None for size in sizes):
+                        break
+                    shapes[node] = cast("tuple[int, ...]", sizes)
+                else:
+                    groups = []
+                    for index, contraction in enumerate(region.contractions):
+                        lhs, rhs = shapes[contraction.lhs], shapes[contraction.rhs]
+                        if len(lhs) != 2 or len(rhs) != 2 or lhs[1] != rhs[0]:
+                            break
+                        geometry = stage_geometry((lhs[0], rhs[1], lhs[1]))
+                        if geometry is None:
+                            break
+                        groups.append(ContractionGroup((index,), (geometry,)))
+                    else:
+                        # No pointwise cache is requested: empty *extra* entry
+                        # boundaries are the original ungrouped planner input.
+                        islands = plan_register_islands(
+                            region,
+                            tuple(groups),
+                            shapes,
+                            fast_math=env.settings.fast_math,
+                        )
+                        matched = False
+                        for island in islands:
+                            stages = tuple(
+                                stage
+                                for group in island.groups
+                                for stage in group.stages
+                            )
+                            index = stages[-1] + 1
+                            if index >= len(groups) or any(
+                                region.contractions[stage].node not in cut.preparation
+                                for stage in (*stages, index)
+                            ):
+                                continue
+                            group = groups[index]
+                            geometry = group.geometries[0]
+                            dot = region.contractions[index].node
+                            shape = warp_mma_shape(geometry, group)
+                            if shape[0] > 32 or dot.args[2] is not None:
+                                continue
+                            for role, expected in (
+                                ("a", (shape[0], shape[2])),
+                                ("b", (shape[1], shape[2])),
+                            ):
+                                argument, coordinates = geometry.operand(
+                                    role, "row", "column"
+                                )
+                                operand = dot.args[argument]
+                                if (
+                                    not isinstance(operand, Node)
+                                    or coordinates != ("row", "column")
+                                    or shapes[operand] != expected
+                                    or operand.meta["val"].dtype
+                                    not in (torch.bfloat16, torch.float16)
+                                    or any(
+                                        shapes[node] != expected
+                                        for node in island.exports
+                                    )
+                                    or not island_export_cut(
+                                        frozenset(item.node for item in island.values),
+                                        frozenset(island.exports),
+                                        operand,
+                                        dot,
+                                    )
+                                    or not any(
+                                        user is not dot
+                                        and user in cut.preparation
+                                        and not _shape_input(user)
+                                        for user in operand.users
+                                    )
+                                ):
+                                    continue
+                                matched = True
+                        if matched:
+                            sibling = Config.from_dict(proposed)
+                            if sibling not in seen:
+                                additions.append(sibling)
+                                seen.add(sibling)
+                if len(additions) == 2:
+                    break
+        return seeds + additions if additions else seeds
+
+    @classmethod
+    def _with_complete_drain_seeds(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Append two bounded materialization proposals; never alter old parents.
+
+        Static carry shapes or a shared root intermediate motivate this choice.
+        These facts do not authorize a drain: original late stage/endpoint
+        admission must still complete a real materialization and activation.
+        """
+        from ...language.matmul_ops import dot
+        from ..compile_environment import FixedBlockSizeSource
+        from ..device_ir import ForLoopGraphInfo
+
+        spec = env.config_spec
+        if not spec.cute_chained_tcgen05_search_enabled:
+            return seeds
+
+        def static_size(size: int | torch.SymInt) -> int | None:
+            if type(size) is int:
+                return size
+            block = env.get_block_id(size)
+            if block is None:
+                return None
+            source = env.block_sizes[env.canonical_block_id(block)].block_size_source
+            return (
+                source.value
+                if isinstance(source, FixedBlockSizeSource)
+                and type(source.value) is int
+                else None
+            )
+
+        def wide(node: object) -> bool:
+            from torch.fx import Node
+
+            if not isinstance(node, Node):
+                return False
+            value = node.meta.get("val")
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.dtype != torch.float32
+                or value.ndim != 2
+            ):
+                return False
+            rows, columns = map(static_size, value.shape)
+            return (
+                rows == 128
+                and columns is not None
+                and 64 <= columns <= 256
+                and columns % 32 == 0
+            )
+
+        host = device_ir.host_function
+        assert host is not None
+        with host:
+            if spec.cute_chained_loop_search_enabled:
+                candidate = any(
+                    wide(
+                        tuple(graph.graph.find_nodes(op="placeholder"))[
+                            carry.input_index
+                        ]
+                    )
+                    for graph in device_ir.graphs
+                    if isinstance(graph, ForLoopGraphInfo)
+                    and graph.loop_interface is not None
+                    for carry in graph.loop_interface.carries
+                )
+            else:
+                dots = [
+                    node
+                    for graph in device_ir.graphs
+                    for node in graph.graph.nodes
+                    if node.target is dot
+                ]
+
+                def reaches_first(node: object) -> bool:
+                    from torch.fx import Node
+
+                    pending = [node]
+                    seen = set()
+                    while pending:
+                        current = pending.pop()
+                        if current is dots[0]:
+                            return True
+                        if isinstance(current, Node) and current not in seen:
+                            seen.add(current)
+                            pending.extend(current.all_input_nodes)
+                    return False
+
+                candidate = (
+                    len(dots) == 2
+                    and all(node.args[2] is None for node in dots)
+                    and wide(dots[0])
+                    and all(reaches_first(node) for node in dots[1].args[:2])
+                )
+        if not candidate:
+            return seeds
+        siblings = []
+        seen = set(seeds)
+        for parent in seeds:
+            config = parent.config
+            if (
+                config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or config.get(CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY, 0) != 0
+            ):
+                continue
+            if spec.cute_chained_loop_search_enabled:
+                if config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True:
+                    continue
+            elif parent.num_warps != 4 or any(
+                config.get(key, default) != default
+                for key, default in (
+                    ("cute_chained_scratch_layout", "row_major"),
+                    ("cute_chained_pointwise_vectorize", False),
+                    ("cute_chained_vector_group", False),
+                    ("cute_chained_pointwise_unroll", 1),
+                    ("cute_chained_pointwise_read_cache", False),
+                    ("cute_chained_pointwise_inplace_async", False),
+                    ("cute_chained_startup_transfer", "legacy"),
+                    ("cute_chained_leaf_pipeline", "legacy"),
+                    ("cute_chained_tmem_free", "legacy"),
+                    ("cute_chained_seed_tile_columns", 0),
+                    ("cute_chained_pointwise_cache_layout", "auto"),
+                    (CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY, 0),
+                    ("cute_chained_initialized_accumulator", False),
+                    ("cute_chained_late_rhs_reuse", False),
+                    ("cute_chained_direct_output", False),
+                    ("cute_chained_k_schedule", "full"),
+                )
+            ):
+                continue
+            sibling = Config.from_dict(
+                config | {CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY: 32}
+            )
+            if sibling not in seen:
+                siblings.append(sibling)
+                seen.add(sibling)
+                if len(siblings) == 2:
+                    break
+        return [*seeds, *siblings] if siblings else seeds
+
+    @classmethod
+    def _with_root_snapshot_seeds(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        """Insert two bounded transport siblings; retain every old seed object.
+
+        These are ordinary root-pair candidates, not exclusive-edge or geometry
+        proofs. The original late snapshot planner still admits each layout.
+        Adjacency makes the siblings reachable without changing search budgets.
+        """
+        from ...language.matmul_ops import dot
+
+        spec = env.config_spec
+        if (
+            not spec.cute_chained_matmul_search_enabled
+            or not spec.cute_chained_tcgen05_search_enabled
+            or spec.cute_chained_loop_search_enabled
+        ):
+            return seeds
+        dots = [
+            node
+            for graph in device_ir.graphs
+            for node in graph.graph.nodes
+            if node.target is dot
+        ]
+        if len(dots) != 2 or any(node.args[2] is not None for node in dots):
+            return seeds
+        # Match the ordinary root option contract, plus the root-pair's other
+        # incompatible transport choices. Do not repair an existing parent.
+        defaults = (
+            ("cute_chained_pointwise_vectorize", False),
+            ("cute_chained_vector_group", False),
+            ("cute_chained_pointwise_unroll", 1),
+            ("cute_chained_pointwise_read_cache", False),
+            ("cute_chained_pointwise_inplace_async", False),
+            ("cute_chained_startup_transfer", "legacy"),
+            ("cute_chained_leaf_pipeline", "legacy"),
+            ("cute_chained_tmem_free", "legacy"),
+            ("cute_chained_seed_tile_columns", 0),
+            ("cute_chained_pointwise_cache_layout", "auto"),
+            ("cute_chained_scratch_layout", "row_major"),
+            ("cute_chained_auxiliary_cache", False),
+            ("cute_chained_initialized_accumulator", False),
+            ("cute_chained_late_rhs_reuse", False),
+            ("cute_chained_direct_output", False),
+            ("cute_chained_tmem_early_release", False),
+            ("cute_chained_k_schedule", "full"),
+            ("cute_chained_pointwise_cache_bytes", 0),
+            ("cute_chained_preparation_pipeline", False),
+            (CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY, 0),
+        )
+        result = []
+        seen = set(seeds)
+        selected: set[Config] = set()
+        added = 0
+        for parent in seeds:
+            result.append(parent)
+            config = parent.config
+            if (
+                len(selected) == 2
+                or config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+                or parent.num_warps != 4
+                or any(config.get(key, default) != default for key, default in defaults)
+            ):
+                continue
+            sibling = Config.from_dict(
+                config | {CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY: 32}
+            )
+            selected.add(sibling)
+            if sibling not in seen:
+                result.append(sibling)
+                seen.add(sibling)
+                added += 1
+        return result if added else seeds
+
+    @classmethod
+    def _seed_configs_without_snapshot_siblings(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        from ..cute.chained_scratch_layout import has_scratch_candidate
+
+        seeds = cls._base_seed_configs(env, device_ir)
+        if not seeds:
+            return seeds
+        if not env.config_spec.cute_chained_scratch_layout_search_enabled:
+            return cls._with_pipeline_team_seeds(
+                env,
+                cls._with_preparation_pipeline_seeds(
+                    env,
+                    cls._with_loop_warp_mma_seeds(
+                        env,
+                        cls._with_loop_producer_unroll_seeds(
+                            env,
+                            cls._with_pointwise_residency_seeds(
+                                env, cls._with_collective_schedule_seeds(env, seeds)
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        host_function = device_ir.host_function
+        assert host_function is not None
+        with host_function:
+            # Root TCgen may bridge every C through TMEM. A carry or collective
+            # provides an independently materialized buffer; otherwise keep
+            # the conservative coalesced sibling and validate explicit XOR
+            # requests against actual allocations during codegen.
+            tcgen_scratch = has_scratch_candidate(device_ir.graphs, include_dots=False)
+        # Preserve every original seed, its multiplicity and the promoted
+        # default. Add one layout sibling per physical MMA family at the end.
+        schedules: set[str] = set()
+        siblings = []
+        for seed in seeds:
+            schedule = seed.config.get("cute_chained_mma_schedule")
+            if schedule == "tcgen05_tmem" and not tcgen_scratch:
+                continue
+            if schedule in ("coalesced", "tcgen05_tmem") and schedule not in schedules:
+                schedules.add(cast("str", schedule))
+                siblings.append(
+                    Config.from_dict(
+                        seed.config | {"cute_chained_scratch_layout": "xor"}
+                    )
+                )
+        return cls._with_pipeline_team_seeds(
+            env,
+            cls._with_preparation_pipeline_seeds(
+                env,
+                cls._with_loop_warp_mma_seeds(
+                    env,
+                    cls._with_loop_producer_unroll_seeds(
+                        env,
+                        cls._with_pointwise_residency_seeds(
+                            env,
+                            cls._with_collective_schedule_seeds(
+                                env, [*seeds, *siblings]
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    @classmethod
+    def _with_pipeline_team_seeds(
+        cls, env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Keep the complete prior pool and add at most two team-width siblings."""
+        if not env.config_spec.cute_chained_preparation_pipeline_search_enabled:
+            return seeds
+        siblings = []
+        for warps in (16, 32):
+            candidates = [
+                seed
+                for seed in seeds
+                if seed.config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is True
+                and seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.num_warps == warps
+                and seed.config.get(CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY, 4) == 4
+            ]
+            if candidates:
+                parent = max(
+                    reversed(candidates), key=lambda seed: math.prod(seed.block_sizes)
+                )
+                siblings.append(
+                    Config.from_dict(
+                        parent.config | {CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY: 8}
+                    )
+                )
+        return [*seeds, *siblings] if siblings else seeds
+
+    @classmethod
+    def _with_preparation_pipeline_seeds(
+        cls, env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append bounded role-pipeline siblings, keeping the old pool intact.
+
+        Discovery proves a preparation cut; the configured physical planner
+        still proves every stage, image layout and shared-memory capacity.
+        """
+        spec = env.config_spec
+        if not spec.cute_chained_preparation_pipeline_search_enabled:
+            return seeds
+        if spec.cute_chained_load_only_preparation_search_enabled:
+            candidates = [
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.num_warps == 8
+                and seed.config.get("cute_chained_group_contractions") is True
+            ]
+            if not candidates:
+                return seeds
+            parent = max(
+                reversed(candidates), key=lambda seed: math.prod(seed.block_sizes)
+            )
+            values = parent.config | {CUTE_CHAINED_PREPARATION_PIPELINE_KEY: True}
+            values.pop(CUTE_CHAINED_WARP_MMA_ROWS_KEY, None)
+            return [*seeds, Config.from_dict(values)]
+        siblings = []
+        for warps in (8, 16):
+            for grouped in (False, True):
+                candidates = [
+                    seed
+                    for seed in seeds
+                    if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                    and seed.num_warps == warps
+                    and seed.config.get("cute_chained_group_contractions", False)
+                    == grouped
+                ]
+                if candidates:
+                    parent = max(
+                        reversed(candidates),
+                        key=lambda seed: math.prod(seed.block_sizes),
+                    )
+                    siblings.append(
+                        Config.from_dict(
+                            parent.config
+                            | {
+                                CUTE_CHAINED_WARP_MMA_ROWS_KEY: 32,
+                                CUTE_CHAINED_PREPARATION_PIPELINE_KEY: True,
+                            }
+                        )
+                    )
+        return [*seeds, *siblings] if siblings else seeds
+
+    @classmethod
+    def _with_loop_warp_mma_seeds(
+        cls, env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append at most two threshold siblings after the complete old pool."""
+        spec = env.config_spec
+        if (
+            not spec.cute_chained_loop_search_enabled
+            or not spec.cute_chained_warp_mma_search_enabled
+            or spec.cute_chunk_prefill_task_order is not None
+        ):
+            return seeds
+        siblings = []
+        for grouped in (False, True):
+            candidates = [
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.num_warps == 16
+                and seed.config.get("cute_chained_group_contractions", False) == grouped
+            ]
+            if candidates:
+                parent = max(
+                    reversed(candidates), key=lambda seed: math.prod(seed.block_sizes)
+                )
+                siblings.append(
+                    Config.from_dict(
+                        parent.config | {CUTE_CHAINED_WARP_MMA_ROWS_KEY: 32}
+                    )
+                )
+        return [*seeds, *siblings] if siblings else seeds
+
+    @classmethod
+    def _with_loop_producer_unroll_seeds(
+        cls, env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append one bounded-unroll sibling per common-loop grouping choice."""
+        spec = env.config_spec
+        if (
+            not spec.cute_chained_loop_search_enabled
+            or not spec.cute_chained_pointwise_unroll_search_enabled
+            or spec.cute_chunk_prefill_task_order is not None
+        ):
+            return seeds
+        siblings = []
+        for grouped in (False, True):
+            candidates = [
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.num_warps == 16
+                and seed.config.get("cute_chained_group_contractions", False) == grouped
+            ]
+            if candidates:
+                # Latest ties retain the complete scan/cache suffix's choices.
+                parent = max(
+                    reversed(candidates), key=lambda seed: math.prod(seed.block_sizes)
+                )
+                siblings.append(
+                    Config.from_dict(
+                        parent.config | {"cute_chained_pointwise_unroll": 8}
+                    )
+                )
+        return [*seeds, *siblings] if siblings else seeds
+
+    @classmethod
+    def _with_pointwise_residency_seeds(
+        cls, env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append at most two budget seeds after the established complete pool."""
+        spec = env.config_spec
+        if (
+            not spec.cute_chained_pointwise_residency_search_enabled
+            or spec.cute_chunk_prefill_task_order is not None
+        ):
+            return seeds
+        parents = []
+        if spec.cute_chained_loop_search_enabled:
+            for grouped in (False, True):
+                candidates = [
+                    seed
+                    for seed in seeds
+                    if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                    and seed.num_warps == 16
+                    and seed.config.get("cute_chained_group_contractions", False)
+                    == grouped
+                    and seed.config.get("cute_chained_pointwise_vectorize")
+                ]
+                if candidates:
+                    parents.append(
+                        max(
+                            reversed(candidates),
+                            key=lambda seed: (
+                                seed.config.get("cute_chained_scan_schedule") == "warp",
+                                math.prod(seed.block_sizes),
+                            ),
+                        )
+                    )
+        else:
+            for schedule in ("coalesced", "tcgen05_tmem"):
+                parent = next(
+                    (
+                        seed
+                        for seed in seeds
+                        if seed.config.get("cute_chained_mma_schedule") == schedule
+                        and not seed.config.get("cute_chained_initialized_accumulator")
+                        and not seed.config.get("cute_chained_direct_output")
+                    ),
+                    None,
+                )
+                if parent is not None:
+                    parents.append(parent)
+        return (
+            [
+                *seeds,
+                *(
+                    Config.from_dict(
+                        parent.config | {"cute_chained_pointwise_cache_bytes": 4096}
+                    )
+                    for parent in parents
+                ),
+            ]
+            if parents
+            else seeds
+        )
+
+    @classmethod
+    def _with_collective_schedule_seeds(
+        cls, env: CompileEnvironment, seeds: list[Config]
+    ) -> list[Config]:
+        """Append bounded siblings without changing the established seed prefix."""
+        spec = env.config_spec
+        if spec.cute_chunk_prefill_task_order is not None:
+            return seeds
+        siblings = []
+        if spec.cute_chained_loop_search_enabled:
+            for grouped in (False, True):
+                parents = [
+                    seed
+                    for seed in seeds
+                    if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                    and seed.num_warps == 16
+                    and seed.config.get("cute_chained_group_contractions", False)
+                    == grouped
+                ]
+                if not parents:
+                    continue
+                parent = max(parents, key=lambda seed: math.prod(seed.block_sizes))
+                # The measured cooperative producer/vector-load combination is
+                # a seed, not a default or a restriction of the flat search.
+                vector = Config.from_dict(
+                    parent.config | {"cute_chained_pointwise_vectorize": True}
+                )
+                siblings.append(vector)
+                if spec.cute_chained_scan_search_enabled:
+                    siblings.extend(
+                        Config.from_dict(
+                            seed.config | {"cute_chained_scan_schedule": "warp"}
+                        )
+                        for seed in (parent, vector)
+                    )
+        if spec.cute_chained_scan_search_enabled and (
+            not spec.cute_chained_loop_search_enabled or not siblings
+        ):
+            # A common warp-MMA loop can use the collective schedule even on
+            # hardware without TCgen05 producer teams.
+            for schedule in ("coalesced", "tcgen05_tmem"):
+                parent = next(
+                    (
+                        seed
+                        for seed in seeds
+                        if seed.config.get("cute_chained_mma_schedule") == schedule
+                    ),
+                    None,
+                )
+                if parent is not None:
+                    siblings.append(
+                        Config.from_dict(
+                            parent.config | {"cute_chained_scan_schedule": "warp"}
+                        )
+                    )
+        return [*seeds, *siblings] if siblings else seeds
+
+    @classmethod
+    def _startup_seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        from ..cute.chained_startup import has_startup_leaf
+
+        if not has_startup_leaf(device_ir.graphs):
+            return seeds
+        parents = cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+        if parents:
+            return _with_chained_startup_seed(seeds, parents)
+        # Preserve the single-dot direct-result parent. Multi-dot M64 roots
+        # use the ordinary result path; startup only changes their first load.
+        # Never broaden or multiply an M128 pool.
+        parents = cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
+        return _with_chained_startup_seed(
+            seeds,
+            parents,
+            prefer_direct=env.config_spec.cute_chained_direct_output_search_enabled,
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+def _with_leaf_pipeline_seeds(seeds: list[Config], *, enabled: bool) -> list[Config]:
+    """Add a paired TMA sibling to one structural overlap parent."""
+    if enabled:
+        for index, seed in enumerate(seeds):
+            if seed.config.get("cute_chained_k_schedule") == "overlap64":
+                return [
+                    *seeds[: index + 1],
+                    Config.from_dict(
+                        seed.config | {"cute_chained_leaf_pipeline": "paired_tma"}
+                    ),
+                    *seeds[index + 1 :],
+                ]
+    return seeds
+
+
+def _with_chained_startup_seed(
+    seeds: list[Config], parents: list[Config], *, prefer_direct: bool = False
+) -> list[Config]:
+    """Add one typed startup sibling without changing any legacy seed object."""
+    geometries = {(tuple(parent.block_sizes), parent.num_warps) for parent in parents}
+    for index, parent in enumerate(seeds):
+        config = parent.config
+        if (
+            config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+            or "block_sizes" not in config
+            or config.get("cute_chained_k_schedule", "full") != "full"
+            or bool(config.get("cute_chained_direct_output")) != prefer_direct
+            or any(
+                config.get(key)
+                for key in (
+                    "cute_chained_initialized_accumulator",
+                    "cute_chained_late_rhs_reuse",
+                    "cute_chained_startup_transfer",
+                )
+            )
+        ):
+            continue
+        if (tuple(parent.block_sizes), parent.num_warps) in geometries:
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(config | {"cute_chained_startup_transfer": "tma"}),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
+def _with_last_read_seed(seeds: list[Config]) -> list[Config]:
+    """One default-off sibling, after ordering; preserve the full legacy pool."""
+    for index, parent in enumerate(seeds):
+        if parent.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(
+                    parent.config | {"cute_chained_tmem_free": "last_read"}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
+def _with_k_schedule_seeds(seeds: list[Config], *, enabled: bool) -> list[Config]:
+    """Two optional siblings; keep every legacy object in its original order."""
+    if not enabled:
+        return seeds
+    parents = [
+        seed
+        for seed in seeds
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        and seed.config.get("cute_chained_initialized_accumulator")
+        and seed.config.get("cute_chained_late_rhs_reuse")
+        and seed.config.get("cute_chained_pointwise_vectorize")
+        and seed.config.get("cute_chained_pointwise_unroll") == 8
+        and not seed.config.get("cute_chained_pointwise_inplace_async")
+        and not seed.config.get("cute_chained_direct_output")
+    ]
+    if not parents:
+        return seeds
+    parent = next(
+        (
+            seed
+            for seed in parents
+            if seed.config.get("cute_chained_pointwise_read_cache")
+        ),
+        parents[0],
+    )
+    for index, seed in enumerate(seeds):
+        if (
+            seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+            and seed.config.get("block_sizes") == parent.config.get("block_sizes")
+            and seed.config.get("num_warps") == parent.config.get("num_warps")
+        ):
+            return [
+                *seeds[: index + 1],
+                *(
+                    Config.from_dict(parent.config | {"cute_chained_k_schedule": mode})
+                    for mode in ("serial64", "overlap64")
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
+def _with_early_tmem_release_seed(seeds: list[Config]) -> list[Config]:
+    """Add one release-timing sibling without reordering any existing seed."""
+    for index, seed in enumerate(seeds):
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(
+                    seed.config | {"cute_chained_tmem_early_release": True}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
 class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
     """Expose legal BT16 recurrence schedules and register caps."""
 
@@ -5011,6 +7512,7 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
         return (
             env.config_spec.cute_chunk_recurrence_dv_partitions is not None
             and env.config_spec.cute_chunk_recurrence_register_cap is not None
+            and env.config_spec.cute_chunk_recurrence_pipeline is not None
         )
 
     @classmethod
@@ -5019,7 +7521,12 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
     ) -> list[Config] | None:
         fragment = env.config_spec.cute_chunk_recurrence_dv_partitions
         register_cap_fragment = env.config_spec.cute_chunk_recurrence_register_cap
-        if fragment is None or register_cap_fragment is None:
+        pipeline_fragment = env.config_spec.cute_chunk_recurrence_pipeline
+        if (
+            fragment is None
+            or register_cap_fragment is None
+            or pipeline_fragment is None
+        ):
             return None
         register_caps = (
             72,
@@ -5035,12 +7542,90 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
                 {
                     CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY: partitions,
                     CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY: register_cap,
+                    CUTE_CHUNK_RECURRENCE_PIPELINE_KEY: pipeline,
                 }
             )
             for partitions in fragment.choices
             for register_cap in register_caps
             if _cute_chunk_recurrence_config_is_safe(partitions, register_cap)
+            for pipeline in pipeline_fragment.choices
+            if partitions == 2 or pipeline == "wide"
         ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteChunkPrefillHeuristic(AutotunerHeuristic):
+    """Try effective stream schedules and sequence orders for a fused recurrence."""
+
+    name = "cute_chunk_prefill"
+    backend = "cute"
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chunk_prefill import register_chunk_prefill_search
+
+        overrides = env.settings.autotune_config_overrides
+        if (
+            overrides.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is True
+            and overrides.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        ):
+            # Explicit role pipelining owns the common graph's true tile
+            # bounds and fields, independently of contraction grouping.
+            # Its normalizer and physical planner still validate admission.
+            return frozenset()
+        register_chunk_prefill_search(env, device_ir)
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chunk_prefill_task_order is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_prefill_task_order
+        if fragment is None:
+            return None
+        schedule = env.config_spec.cute_chunk_prefill_schedule
+        assert schedule is not None
+        seeds = [
+            Config.from_dict(
+                {
+                    CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: order,
+                    CUTE_CHUNK_PREFILL_SCHEDULE_KEY: value,
+                }
+            )
+            for value in schedule.choices
+            for order in fragment.choices
+        ]
+        state_transfer = env.config_spec.cute_state_transfer_max_bits
+        if state_transfer is not None:
+            # Retain the complete old schedule/order seed block first, then its
+            # full width partners. Neither geometry nor measured winners select it.
+            seeds = [
+                Config.from_dict({**seed, CUTE_STATE_TRANSFER_MAX_BITS_KEY: max_bits})
+                for max_bits in state_transfer.choices
+                for seed in seeds
+            ]
+        state_transport = env.config_spec.cute_state_transfer_transport
+        if state_transport is not None:
+            # Preserve the old prefix and append one sibling per new transport.
+            seeds += [
+                Config.from_dict({**seed, CUTE_STATE_TRANSFER_TRANSPORT_KEY: transport})
+                for transport in state_transport.choices
+                if transport != state_transport.default()
+                for seed in seeds
+            ]
+        return seeds
 
     @classmethod
     def get_seed_config(

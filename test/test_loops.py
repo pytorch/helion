@@ -12,6 +12,10 @@ import torch
 import helion
 from helion import _compat
 from helion._compat import use_tileir_tunables
+from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._compiler.device_ir import LiftTensorArgs
+from helion._compiler.device_ir import LoopCarry
+from helion._compiler.device_ir import LoopInterface
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._compiler.static_loop_unroller import unroll_static_loops
 from helion._testing import DEVICE
@@ -42,6 +46,34 @@ datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 FIXED_BLOCK_SIZE = 16
 BLOCK_SIZE_CHOICES = (32, 256)
+
+
+def test_explicit_loop_interface_preserves_slots_and_graph_copies():
+    initial = torch.empty(4)
+    inputs = LiftTensorArgs(
+        {
+            "left": initial,
+            "right": initial,
+            "captured": (torch.empty(4), {"bias": torch.empty(4)}),
+        }
+    )
+    outputs = LiftTensorArgs({"right": torch.empty(4), "left": torch.empty(4)})
+    interface = LoopInterface.from_args(inputs, outputs)
+    assert interface.input_count == 4
+    assert interface.carries == (LoopCarry(1, 0), LoopCarry(0, 1))
+    assert interface.captures == (2, 3)
+
+    graph = torch.fx.Graph()
+    args = [graph.placeholder(f"arg{i}") for i in range(4)]
+    graph.output((args[1], args[0]))
+    info = ForLoopGraphInfo(
+        graph_id=0, graph=graph, node_args=args, block_ids=[0], loop_interface=interface
+    )
+    copied = info.copy()
+    assert isinstance(copied, ForLoopGraphInfo)
+    assert copied.loop_interface == interface
+    assert copied.graph is not graph
+    assert all(a is not b for a, b in zip(graph.nodes, copied.graph.nodes, strict=True))
 
 
 @helion.kernel
@@ -271,6 +303,34 @@ class TestLoops(RefEagerTestBase, TestCase):
         y = torch.randn([1024], device=DEVICE)
         code, result = code_and_output(fn, (x, y), block_size=128)
         torch.testing.assert_close(result, x * y + 1.0 - x)
+
+    def test_parallel_loop_carried_inputs(self):
+        @helion.kernel(autotune_effort="none")
+        def recurrence(values, steps):
+            steps = hl.specialize(steps)
+            out = torch.empty(
+                (values.size(1),), dtype=values.dtype, device=values.device
+            )
+            for tile in hl.tile(values.size(1)):
+                first = hl.full([tile], 0.25, dtype=torch.float32)
+                second = values[0, tile]
+                for step in hl.grid(steps):
+                    first, second = second, first + values[step, tile]
+                out[tile] = first - second
+            return out
+
+        values = (
+            torch.arange(7 * 64, device=DEVICE, dtype=torch.float32).view(7, 64) / 16
+        )
+        for steps in (0, 1, 7):
+            with self.subTest(steps=steps):
+                _, actual = code_and_output(
+                    recurrence, (values, steps), block_size=[32]
+                )
+                first, second = torch.full_like(values[0], 0.25), values[0]
+                for step in range(steps):
+                    first, second = second, first + values[step]
+                torch.testing.assert_close(actual, first - second, atol=0, rtol=0)
 
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
     def test_static_unroller_rejects_multiple_counter_updates(self) -> None:

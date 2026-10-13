@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .block_scaled_mma import BlockScaledMmaPlan
+    from .chained_matmul import ChainedMatmulPlan
+    from .chunk_prefill import CuteChunkPrefillRegion
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .collective_matmul import CollectiveMmaSite
@@ -41,6 +43,9 @@ if TYPE_CHECKING:
     from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .horizontal_state_codegen import InstalledHorizontalState
+    from .horizontal_state_plan import HorizontalStatePlan
+    from .positional_root import PositionalRootPlan
     from .published_scalars import PublishedScalarRequest
     from .register_producers import RegisterProducerRequest
     from .register_region import RegisterRegionPlan
@@ -52,6 +57,7 @@ if TYPE_CHECKING:
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
     from .topk import CuteTopKPlan
+    from .work_order import WorkOrderPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -654,6 +660,9 @@ class CuteDeviceFunctionState:
         # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
         # no V-loop is sunk after all, codegen restarts with the knob off.
         self.vloop_sink_layout_applied = False
+        # Set only after a complete positional body installs an independent
+        # materialization loop using cute_lane_unroll.
+        self.materialization_unroll_applied = False
         # ``(subject, per-axis thread extents)`` a cross-lane reduce (a staged
         # matmul product sum or a lane-loop reduction marker) assumed for the
         # launch of an ``hl.barrier()`` kernel.  The launcher rejects a final
@@ -662,6 +671,10 @@ class CuteDeviceFunctionState:
         self.explicit_rng_seed_names: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
+        self.work_order_plan: WorkOrderPlan | None = None
+        # Structured tile-loop emission owns its memory scheduling; ordinary
+        # scalar memory lowering must not splice transfers into old wrappers.
+        self.emitting_tile_loop: bool = False
         # SIMT reduction-kernel thread-block cluster width (from the
         # ``cute_cluster_n`` config knob, applied by
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
@@ -846,6 +859,7 @@ class CuteDeviceFunctionState:
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
         self.block_scaled_plan: BlockScaledMmaPlan | None = None
+        self.chunk_prefill_plan: CuteChunkPrefillRegion | None = None
         # Whole-root BT16 KDA recurrence/output schedule. Like the
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
@@ -854,6 +868,22 @@ class CuteDeviceFunctionState:
         # only after the semantic two-contraction graph match and the shape
         # admission limits of the SM100 tcgen05 schedule both hold.
         self.gdn_recurrence_plan: CuteGdnRecurrencePlan | None = None
+        self.chained_matmul_plan: ChainedMatmulPlan | None = None
+        self.horizontal_state_plan: HorizontalStatePlan | None = None
+        self.horizontal_state_body: InstalledHorizontalState | None = None
+        self.positional_root_plan: PositionalRootPlan | None = None
+        # aten.mm nodes whose repeated-axis operands the positional planner
+        # left to the per-node direct mm lowering (see ``positional_root``).
+        self.direct_mm_collision_owners: frozenset[Node] = frozenset()
+        # Synthetic-K dots deferred to the collective operand/ownership proof.
+        # Their scalar fallback is forbidden if that later proof declines.
+        self.collective_lane_collision_owners: frozenset[Node] = frozenset()
+        # Closed FP32 matrix carries whose N fold must complete during codegen.
+        self.collapsed_matmul_sum_owners: frozenset[Node] = frozenset()
+        # Stores whose repeated-axis pointer tile the positional planner left
+        # to the native 2D stack store lowering.
+        self.stack_store_collision_owners: frozenset[Node] = frozenset()
+        self.phi_snapshot_names: set[str] = set()
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the

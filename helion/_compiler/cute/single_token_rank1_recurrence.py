@@ -43,10 +43,10 @@ import torch
 
 from ..compile_environment import CompileEnvironment
 from ._mlir_compat import ir
-from .affine_recurrence_primitives import store_u32x4_if_valid as _store_u32x4_if_valid
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _GeneratedCodeTemplate
 from .fx_matcher import _xyz_grid_fits
+from .packed_store import store_u32x4_if_valid as _store_u32x4_if_valid
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

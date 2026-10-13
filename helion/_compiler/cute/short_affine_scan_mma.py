@@ -33,12 +33,16 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
 
 from .affine_recurrence_primitives import _ldmatrix
-from .affine_recurrence_primitives import ldmatrix_x2_trans
-from .affine_recurrence_primitives import ldmatrix_x4_trans
-from .affine_recurrence_primitives import mma_m16n8k16_bf16
+from .affine_recurrence_primitives import ldmatrix_x2_trans as ldmatrix_x2_trans
+from .affine_recurrence_primitives import ldmatrix_x4_trans as ldmatrix_x4_trans
+from .affine_recurrence_primitives import mma_m16n8k16_bf16 as mma_m16n8k16_bf16
 from .affine_recurrence_primitives import pack_bf16x2
 from .affine_recurrence_primitives import store_u32x4_if_valid as _store_u32x4_if_valid
 from .affine_recurrence_primitives import vec8_bf16
+from .prepared_warp_contraction import execute_prepared_warp_k
+from .warp_specialized_primitives import copy_b16x8_async
+from .warp_specialized_primitives import segmented_swizzle_b16_element_index
+from .warp_specialized_primitives import swizzle_b16_element_index
 
 MMA_M = 16
 MMA_N = 8
@@ -51,8 +55,7 @@ DIRECT_STATE_SEGMENT_FEATURES = 64
 def _swizzle_128b_b16(logical_element):
     """Apply CUTLASS's 128-byte XOR swizzle to one 16-bit element index."""
 
-    byte_offset = logical_element * 2
-    return (byte_offset ^ (((byte_offset >> 7) & 7) << 4)) // 2
+    return swizzle_b16_element_index(logical_element, 7)
 
 
 def direct_factor_index(feature, column, column_extent):
@@ -64,11 +67,13 @@ def direct_factor_index(feature, column, column_extent):
 def direct_state_index(row, feature, row_extent):
     """S128 index for a row-major state split into 64-feature segments."""
 
-    segment = feature // DIRECT_STATE_SEGMENT_FEATURES
-    local_feature = feature - segment * DIRECT_STATE_SEGMENT_FEATURES
-    logical = row * DIRECT_STATE_SEGMENT_FEATURES + local_feature
-    return segment * row_extent * DIRECT_STATE_SEGMENT_FEATURES + _swizzle_128b_b16(
-        logical
+    return segmented_swizzle_b16_element_index(
+        row,
+        feature,
+        row_extent,
+        DIRECT_STATE_SEGMENT_FEATURES,
+        8,
+        7,
     )
 
 
@@ -146,6 +151,7 @@ def precompute_affine_from_buffers_bf16(
     COEFFICIENT_ROW_STRIDE: cutlass.Constexpr[int],
     COEFFICIENT_SOURCE_STRIDE: cutlass.Constexpr[int],
     COEFFICIENT_ROLE_STRIDE: cutlass.Constexpr[int],
+    HAS_FEEDBACK: cutlass.Constexpr[bool] = True,
 ):
     """Build one affine factor pair and its coefficient row.
 
@@ -176,7 +182,8 @@ def precompute_affine_from_buffers_bf16(
     for element in cutlass.range_constexpr(values_per_lane):
         feature = _precompute_feature(lane, element, FEATURE_EXTENT)
         target_index = _vector_index(target, feature, FEATURE_EXTENT)
-        prediction[element] = cutlass.Float32(prediction_smem[target_index])
+        if cutlass.const_expr(HAS_FEEDBACK):
+            prediction[element] = cutlass.Float32(prediction_smem[target_index])
         observation[element] = cutlass.Float32(observation_smem[target_index])
         prefix = cutlass.Float32(1.0)
         for diagonal_index in cutlass.range_constexpr(STEP_COUNT):
@@ -186,9 +193,17 @@ def precompute_affine_from_buffers_bf16(
                         _vector_index(diagonal_index, feature, FEATURE_EXTENT)
                     ]
                 )
-        factor_smem[
-            direct_factor_index(feature, prediction_column, FACTOR_COLUMN_EXTENT)
-        ] = (prefix * prediction[element]).to(cutlass.BFloat16)
+        if cutlass.const_expr(HAS_FEEDBACK):
+            factor_smem[
+                direct_factor_index(feature, prediction_column, FACTOR_COLUMN_EXTENT)
+            ] = (prefix * prediction[element]).to(cutlass.BFloat16)
+        else:
+            # The physical MMA retains paired columns, but this unused column
+            # is never read by the additive consumer. Do not evaluate a fake
+            # prediction: multiplying an infinite state by zero produces NaN.
+            factor_smem[
+                direct_factor_index(feature, prediction_column, FACTOR_COLUMN_EXTENT)
+            ] = cutlass.BFloat16(0.0)
         factor_smem[
             direct_factor_index(feature, observation_column, FACTOR_COLUMN_EXTENT)
         ] = (prefix * observation[element]).to(cutlass.BFloat16)
@@ -205,29 +220,32 @@ def precompute_affine_from_buffers_bf16(
                     update_smem[_vector_index(source, feature, FEATURE_EXTENT)]
                 )
                 weighted_update = update * suffix[element]
-                prediction_dot += prediction[element] * weighted_update
+                if cutlass.const_expr(HAS_FEEDBACK):
+                    prediction_dot += prediction[element] * weighted_update
                 observation_dot += observation[element] * weighted_update
-            prediction_dot = cute.arch.warp_reduction_sum(
-                prediction_dot,
-                threads_in_group=32,
-            )
+            if cutlass.const_expr(HAS_FEEDBACK):
+                prediction_dot = cute.arch.warp_reduction_sum(
+                    prediction_dot,
+                    threads_in_group=32,
+                )
             observation_dot = cute.arch.warp_reduction_sum(
                 observation_dot,
                 threads_in_group=32,
             )
             if lane == 0:
                 update_scale = cutlass.Float32(update_scale_smem[source])
-                if source < target:
-                    coefficient_smem[
-                        direct_coefficient_index(
-                            target,
-                            source,
-                            0,
-                            COEFFICIENT_ROW_STRIDE,
-                            COEFFICIENT_SOURCE_STRIDE,
-                            COEFFICIENT_ROLE_STRIDE,
-                        )
-                    ] = update_scale * prediction_dot
+                if cutlass.const_expr(HAS_FEEDBACK):
+                    if source < target:
+                        coefficient_smem[
+                            direct_coefficient_index(
+                                target,
+                                source,
+                                0,
+                                COEFFICIENT_ROW_STRIDE,
+                                COEFFICIENT_SOURCE_STRIDE,
+                                COEFFICIENT_ROLE_STRIDE,
+                            )
+                        ] = update_scale * prediction_dot
                 coefficient_smem[
                     direct_coefficient_index(
                         target,
@@ -263,21 +281,6 @@ def stage_state_tile8x8_async_bf16(
     the CTA barrier, which permits independent work to overlap the copies.
     """
 
-    aligned_source = cute.make_ptr(
-        source_ptr.dtype,
-        source_ptr.toint(),
-        source_ptr.memspace,
-        assumed_align=16,
-    )
-    aligned_state = cute.make_ptr(
-        state_smem.dtype,
-        state_smem.toint(),
-        state_smem.memspace,
-        assumed_align=16,
-    )
-    copy_size = cutlass.Int32(0)
-    if valid:
-        copy_size = cutlass.Int32(16)
     for row_offset in cutlass.range_constexpr(8):
         source_index = cutlass.Int32(source_base_index) + cutlass.Int32(
             row_offset
@@ -287,12 +290,10 @@ def stage_state_tile8x8_async_bf16(
             state_feature,
             ROW_EXTENT,
         )
-        cute.arch.cp_async_shared_global(
-            aligned_state + cute.assume(cutlass.Int32(state_index), divby=8),
-            aligned_source + source_index,
-            16,
-            "cg",
-            cp_size=copy_size,
+        copy_b16x8_async(
+            state_smem + cute.assume(cutlass.Int32(state_index), divby=8),
+            source_ptr + source_index,
+            valid,
         )
     cute.arch.cp_async_commit_group()
 
@@ -342,37 +343,15 @@ def _project_m16n8_bf16(
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
     )
-    for feature_block in cutlass.range_constexpr(FEATURE_EXTENT // MMA_K):
-        state_fragment = _ldmatrix_x4(
-            state_smem
-            + direct_state_a_fragment_index(
-                lane,
-                row_base,
-                feature_block,
-                ROW_EXTENT,
-            )
-        )
-        factor_fragment = ldmatrix_x2_trans(
-            factor_smem
-            + direct_factor_b_fragment_index(
-                lane,
-                feature_block,
-                DIRECT_FACTOR_COLUMNS_M16N8,
-            )
-        )
-        accumulator = mma_m16n8k16_bf16(
-            state_fragment[0],
-            state_fragment[1],
-            state_fragment[2],
-            state_fragment[3],
-            factor_fragment[0],
-            factor_fragment[1],
-            accumulator[0],
-            accumulator[1],
-            accumulator[2],
-            accumulator[3],
-        )
-    return accumulator
+    return execute_prepared_warp_k(
+        (state_smem, lane, row_base, ROW_EXTENT),
+        (factor_smem, lane),
+        accumulator,
+        None,
+        FEATURE_EXTENT // MMA_K,
+        True,
+        1,
+    )
 
 
 @cute.jit
@@ -424,49 +403,15 @@ def project_retain_affine_m16n16_bf16(
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
     )
-    for feature_block in cutlass.range_constexpr(FEATURE_EXTENT // MMA_K):
-        state_fragment = _ldmatrix_x4(
-            state_smem
-            + direct_state_a_fragment_index(
-                lane,
-                row_base,
-                feature_block,
-                ROW_EXTENT,
-            )
-        )
-        factor_fragment = ldmatrix_x4_trans(
-            factor_smem
-            + direct_factor_b_fragment_index(
-                lane,
-                feature_block,
-                DIRECT_FACTOR_COLUMNS_M16N16,
-            )
-        )
-        low = mma_m16n8k16_bf16(
-            state_fragment[0],
-            state_fragment[1],
-            state_fragment[2],
-            state_fragment[3],
-            factor_fragment[0],
-            factor_fragment[1],
-            accumulator[0],
-            accumulator[1],
-            accumulator[2],
-            accumulator[3],
-        )
-        high = mma_m16n8k16_bf16(
-            state_fragment[0],
-            state_fragment[1],
-            state_fragment[2],
-            state_fragment[3],
-            factor_fragment[2],
-            factor_fragment[3],
-            accumulator[4],
-            accumulator[5],
-            accumulator[6],
-            accumulator[7],
-        )
-        accumulator = (*low, *high)
+    accumulator = execute_prepared_warp_k(
+        (state_smem, lane, row_base, ROW_EXTENT),
+        (factor_smem, lane),
+        accumulator,
+        None,
+        FEATURE_EXTENT // MMA_K,
+        True,
+        2,
+    )
     history = _retain_state_history_bf16(
         state_smem,
         lane,
@@ -508,6 +453,7 @@ def consume_affine_steps(
     COEFFICIENT_ROW_STRIDE: cutlass.Constexpr[int],
     COEFFICIENT_SOURCE_STRIDE: cutlass.Constexpr[int],
     COEFFICIENT_ROLE_STRIDE: cutlass.Constexpr[int],
+    FEEDBACK_MASK: cutlass.Constexpr[int] = -1,
 ):
     """Solve a triangular affine system and form all row observations.
 
@@ -522,38 +468,46 @@ def consume_affine_steps(
     residual_low = cute.make_rmem_tensor(STEP_COUNT, cutlass.Float32)
     residual_high = cute.make_rmem_tensor(STEP_COUNT, cutlass.Float32)
     for target in cutlass.range_constexpr(STEP_COUNT):
-        prediction_low = _projection_value(
-            projection_accumulator,
-            lane,
-            prediction_projection_columns[target],
-            0,
-        )
-        prediction_high = _projection_value(
-            projection_accumulator,
-            lane,
-            prediction_projection_columns[target],
-            1,
-        )
+        if cutlass.const_expr(FEEDBACK_MASK & (1 << target)):
+            prediction_low = _projection_value(
+                projection_accumulator,
+                lane,
+                prediction_projection_columns[target],
+                0,
+            )
+            prediction_high = _projection_value(
+                projection_accumulator,
+                lane,
+                prediction_projection_columns[target],
+                1,
+            )
         residual_low[target] = cutlass.Float32(0.0)
         residual_high[target] = cutlass.Float32(0.0)
         if lane_quad == 0:
-            solved_low = cutlass.Float32(row_input_low[target]) - prediction_low
-            solved_high = cutlass.Float32(row_input_high[target]) - prediction_high
-            for source in cutlass.range_constexpr(target):
-                coefficient = cutlass.Float32(
-                    coefficient_smem[
-                        direct_coefficient_index(
-                            target,
-                            source,
-                            0,
-                            COEFFICIENT_ROW_STRIDE,
-                            COEFFICIENT_SOURCE_STRIDE,
-                            COEFFICIENT_ROLE_STRIDE,
-                        )
-                    ]
-                )
-                solved_low -= coefficient * residual_low[source]
-                solved_high -= coefficient * residual_high[source]
+            if cutlass.const_expr(FEEDBACK_MASK & (1 << target)):
+                # The identical constexpr above defines these warp projections.
+                # pyrefly: ignore [unbound-name]
+                solved_low = cutlass.Float32(row_input_low[target]) - prediction_low
+                # pyrefly: ignore [unbound-name]
+                solved_high = cutlass.Float32(row_input_high[target]) - prediction_high
+                for source in cutlass.range_constexpr(target):
+                    coefficient = cutlass.Float32(
+                        coefficient_smem[
+                            direct_coefficient_index(
+                                target,
+                                source,
+                                0,
+                                COEFFICIENT_ROW_STRIDE,
+                                COEFFICIENT_SOURCE_STRIDE,
+                                COEFFICIENT_ROLE_STRIDE,
+                            )
+                        ]
+                    )
+                    solved_low -= coefficient * residual_low[source]
+                    solved_high -= coefficient * residual_high[source]
+            else:
+                solved_low = cutlass.Float32(row_input_low[target])
+                solved_high = cutlass.Float32(row_input_high[target])
             residual_low[target] = solved_low
             residual_high[target] = solved_high
             row_residual_smem[target * ROW_EXTENT + row_low] = solved_low

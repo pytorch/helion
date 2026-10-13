@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
+    from .cute.chunk_prefill import CuteChunkPrefillRegion
     from .cute.layout import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
@@ -360,9 +361,48 @@ class NodeArgsGraphInfo(GraphInfo):
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class LoopCarry:
+    """A yielded body value feeds one input slot on the next iteration.
+
+    Slots, rather than FX nodes or emitted names, survive graph copies and
+    distinguish carries initialized from the same value.
+    """
+
+    input_index: int
+    output_index: int
+
+
+@dataclasses.dataclass(frozen=True)
+class LoopInterface:
+    """Typed graph ports; signature-changing transforms must remap these slots."""
+
+    input_count: int
+    carries: tuple[LoopCarry, ...]
+
+    @property
+    def captures(self) -> tuple[int, ...]:
+        carried = {carry.input_index for carry in self.carries}
+        return tuple(i for i in range(self.input_count) if i not in carried)
+
+    @staticmethod
+    def from_args(inputs: LiftTensorArgs, outputs: LiftTensorArgs) -> LoopInterface:
+        input_slots = {path: i for i, path in enumerate(inputs.tensor_paths())}
+        return LoopInterface(
+            len(input_slots),
+            tuple(
+                LoopCarry(input_slots[path], i)
+                for i, path in enumerate(outputs.tensor_paths())
+            ),
+        )
+
+
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
+    # Recorded while tracing still knows lexical input/output identities.
+    # None is reserved for synthetic graphs which have no traced interface.
+    loop_interface: LoopInterface | None = None
     # Host AST read/write names for this device loop body (siblings only; see
     # ``_ReadWriteVisitor.visit_For`` in ast_read_writes.py).  Used to insert
     # ``tl.debug_barrier()`` between loops when there is a global RAW dep.
@@ -382,6 +422,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return {
             **super().kwargs(),
             "block_ids": [*self.block_ids],
+            "loop_interface": self.loop_interface,
             "host_loop_reads": self.host_loop_reads,
             "host_loop_writes": self.host_loop_writes,
             # ``needs_barrier_before`` is excluded -- recomputed by GenerateAST
@@ -1040,6 +1081,8 @@ class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
         self.graphs: list[GraphInfo] = []
+        self.cute_semantic_graphs: tuple[GraphInfo, ...] = ()
+        self.cute_chunk_prefill_region: CuteChunkPrefillRegion | None = None
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
@@ -1215,6 +1258,9 @@ class DeviceIR:
         """
         env = CompileEnvironment.current()
         if env.backend_name == "cute":
+            from .cute.work_order import register_work_order_aliases
+
+            register_work_order_aliases(self)
             # Mark provably-FTZ-safe exp sites and explicitly rounded FP32
             # products on the pre-roll graphs so the roller's node_copy
             # carries the marks into the rolled sweeps (consumed by the cute
@@ -1280,6 +1326,10 @@ class DeviceIR:
             ):
                 register_cute_tensor_alias_specializations(env)
         if not rdims:
+            if env.backend_name == "cute":
+                from .cute.loop_state import find_loop
+
+                env.config_spec.cute_loop_schedule_enabled = find_loop(self) is not None
             return
         from .inductor_lowering import ReductionLowering
 
@@ -2461,6 +2511,9 @@ class WalkDeviceAST(NodeVisitor):
                         ) from e
                 else:
                     self.scope[name] = value
+            info = self.device_ir.graphs[graph_idx]
+            assert isinstance(info, ForLoopGraphInfo)
+            info.loop_interface = LoopInterface.from_args(inputs, outputs)
         else:
             raise AssertionError(f"Unexpected loop type {node._loop_type}")
 
@@ -3121,6 +3174,11 @@ class LiftTensorArgs:
     def get_tensor_args(self) -> list[object]:
         return [self.flat_values[i] for i in self.tensor_indices]
 
+    def tensor_paths(self) -> tuple[pytree.KeyPath, ...]:
+        """Stable lexical slots, including leaves of structured arguments."""
+        paths, _ = pytree.tree_flatten_with_path(self.values)
+        return tuple(paths[i][0] for i in self.tensor_indices)
+
     def get_node_args(
         self, tracer: proxy_tensor.PythonKeyTracer
     ) -> list[torch.fx.Node]:
@@ -3600,6 +3658,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 env.cute_half_atomic_output_promotions = promotions
                 rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.chunk_prefill import capture_chunk_prefill_semantics
+
+            capture_chunk_prefill_semantics(device_ir)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         if scaled_contractions:
@@ -3688,7 +3750,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.signed_bitfield import has_signed_byte_field
 
             config_spec.cute_signed_bitfield_bf16_available = (
-                config_spec.target_device_capability == (10, 0)
+                config_spec.target_device_capability is not None
+                and config_spec.target_device_capability[0] == 10
                 and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
             )
             # Enable the flash-attention autotune surface when
@@ -4162,6 +4225,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     ):
                         spec.flatten_loops.append(fspec)
 
+        if env.backend_name == "cute":
+            from .cute.chunk_prefill import finalize_chunk_prefill_semantics
+
+            finalize_chunk_prefill_semantics(device_ir)
         return device_ir
 
 

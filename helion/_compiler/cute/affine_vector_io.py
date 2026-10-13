@@ -456,6 +456,37 @@ def _accesses(
     return result
 
 
+def _affine_lane_scopes(statements: list[ast.stmt]) -> frozenset[int]:
+    """Index only scopes the walker can reach that contain an eligible loop."""
+    eligible: set[int] = set()
+    pending = [(statements, False)]
+    while pending:
+        body, visited = pending.pop()
+        children = [
+            child
+            for statement in body
+            for child in (
+                (statement.body,)
+                if isinstance(statement, ast.For)
+                else (statement.body, statement.orelse)
+                if isinstance(statement, ast.If)
+                else ()
+            )
+        ]
+        if not visited:
+            pending.append((body, True))
+            pending.extend((child, False) for child in children)
+        elif any(id(child) in eligible for child in children) or any(
+            isinstance(statement, ast.For)
+            and isinstance(statement.target, ast.Name)
+            and _LANE.fullmatch(statement.target.id) is not None
+            and _range_extent(statement) in (2, 4, 8)
+            for statement in body
+        ):
+            eligible.add(id(body))
+    return frozenset(eligible)
+
+
 class _Vectorizer:
     def __init__(
         self,
@@ -1040,6 +1071,8 @@ class _Vectorizer:
         outer: dict[str, ast.expr] | None = None,
         multiples: dict[str, int] | None = None,
         int32_names: frozenset[str] = frozenset(),
+        *,
+        _eligible_scopes: frozenset[int] | None = None,
     ) -> list[ast.stmt]:
         # Only loop() can rewrite this scope. Avoid expanding unrelated scalar
         # definitions, while retaining nested candidates and subclass rules.
@@ -1049,6 +1082,14 @@ class _Vectorizer:
             for node in ast.walk(statement)
         ):
             return statements
+        # Subclasses may admit other loop forms (e.g. pure lane packets).
+        # Keep their existing analysis unchanged. This inventory belongs only
+        # to this traversal and is recomputed on the next public body() call.
+        if type(self) is _Vectorizer:
+            if _eligible_scopes is None:
+                _eligible_scopes = _affine_lane_scopes(statements)
+            if id(statements) not in _eligible_scopes:
+                return statements
         outer = dict(outer or {})
         multiples = dict(multiples or {})
         snapshots = self.snapshots(statements)
@@ -1125,6 +1166,7 @@ class _Vectorizer:
                     child_definitions,
                     child_multiples,
                     frozenset(child_int32_names),
+                    _eligible_scopes=_eligible_scopes,
                 )
             elif isinstance(statement, ast.If):
                 statement.body = self.body(
@@ -1132,12 +1174,14 @@ class _Vectorizer:
                     definitions,
                     active_multiples,
                     frozenset(active_int32_names),
+                    _eligible_scopes=_eligible_scopes,
                 )
                 statement.orelse = self.body(
                     statement.orelse,
                     definitions,
                     active_multiples,
                     frozenset(active_int32_names),
+                    _eligible_scopes=_eligible_scopes,
                 )
             result.append(statement)
         return result

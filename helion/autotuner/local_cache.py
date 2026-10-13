@@ -110,13 +110,16 @@ def _search_policy_json_value(
 def _cute_flash_search_policy_hash(
     autotuner: BaseSearch, *, cute_flash_search_enabled: bool
 ) -> str:
-    """Hash the effective built-in search policy for CuTe flash caches.
+    """Hash CuTe flash and explicitly opted-in additive search policies.
 
     A cached quick or explicitly truncated search must not satisfy a later full
     request. Unknown/custom policies get a unique one-shot key; other kernels
     retain their historical cache keys.
     """
-    if not cute_flash_search_enabled:
+    if (
+        not cute_flash_search_enabled
+        and not autotuner.requires_search_policy_cache_key()
+    ):
         return ""
 
     policy = autotuner.cache_policy()

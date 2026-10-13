@@ -685,6 +685,68 @@ def test_finalized_carry_without_a_single_assignment_proof_declines(
         )
 
 
+@pytest.mark.parametrize("tiles", [1, 3])
+def test_dependent_reduction_uses_next_carry_without_updating_each_lane(
+    tiles: int,
+) -> None:
+    first = lanes._lane_reduce_marker_expr(
+        "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    second = lanes._lane_reduce_marker_expr(
+        "scaled", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    loop = lanes._create_lane_loop(
+        "lane",
+        8,
+        _body(
+            "snapshot = carried\nacc_snapshot = accumulator\n"
+            f"partial = lane + 1\nreduced = {first}\n"
+            "next_value = snapshot + reduced\nscaled = partial * next_value\n"
+            f"reduced_again = {second}\n"
+            "next_accumulator = acc_snapshot + reduced_again"
+        ),
+    )
+    renames = {
+        "carried": "carried",
+        "next_value": "carried",
+        "accumulator": "accumulator",
+        "next_accumulator": "accumulator",
+    }
+    lowered = lanes.split_lane_loop_reductions([loop], rename_groups=renames)
+    repeated = lanes._create_lane_loop("tile", tiles, lowered)
+    program = [
+        *_body("carried = 5.0\naccumulator = 2.0"),
+        repeated,
+        *_body("out.store(carried)\nlate_out.store(accumulator)"),
+    ]
+    values, calls = _execute_scalars(program, renames)
+    assert values["out"] == {0: 5.0 + tiles * 36}
+    assert values["late_out"] == {
+        0: 2.0 + sum((5 + step * 36) * 36 for step in range(1, tiles + 1))
+    }
+    assert calls == 0
+
+
+def test_dependent_reduction_direct_carry_still_requires_schedule_proof() -> None:
+    first = lanes._lane_reduce_marker_expr(
+        "partial", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    second = lanes._lane_reduce_marker_expr(
+        "scaled", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    loop = lanes._create_lane_loop(
+        "lane",
+        8,
+        _body(
+            "snapshot = carried\npartial = lane + 1\n"
+            f"reduced = {first}\ncarried = snapshot + reduced\n"
+            f"scaled = partial * carried\nreduced_again = {second}"
+        ),
+    )
+    with pytest.raises(helion.exc.BackendUnsupported, match="once-per-tile"):
+        lanes.split_lane_loop_reductions([loop])
+
+
 def test_owned_marker_cannot_use_an_unproved_direct_restore() -> None:
     loop = lanes._create_lane_loop(
         "lane", 8, _body(f"partial = lane + 1\nreduced = {_marker('lane')}")
@@ -1873,7 +1935,7 @@ def test_owned_marker_in_serial_loop_without_store_declines() -> None:
         f"for mb in range(0, 64, 8):\n"
         f"    partial = lane + mb\n"
         f"    reduced = {_marker('lane')}\n"
-        f"    carried = carried + reduced"
+        f"    consumed = reduced * 2"
     ).body[0]
     assert lanes._is_serial_for(serial_loop)
     loop = lanes._create_lane_loop("lane", 8, [serial_loop])
@@ -1887,7 +1949,7 @@ def test_owned_marker_in_serial_loop_without_store_declines() -> None:
                 f"for mb in range(0, 64, 8):\n"
                 f"    partial = lane + mb\n"
                 f"    reduced = {_marker(None)}\n"
-                f"    carried = carried + reduced"
+                f"    consumed = reduced * 2"
             ).body[0]
         ],
     )

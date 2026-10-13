@@ -400,10 +400,25 @@ def _is_private_store_staging_append(call: ast.Call) -> bool:
 
 
 def _has_only_known_effects(node: ast.AST) -> bool:
+    # A generated, statically shaped register allocation has no external
+    # memory effect. Recognize only its exact declaration call, not arbitrary
+    # calls or escaped constructor expressions. It remains non-hoistable:
+    # _is_allowed_pure_call deliberately does not admit make_rmem_tensor.
+    # Cache writes, aliases and reaching definitions retain their own checks.
+    local_allocations = {
+        id(stmt.value)
+        for stmt in ast.walk(node)
+        if isinstance(stmt, ast.Assign)
+        and _rmem_declaration(stmt) is not None
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.args[0], ast.Constant)
+        and type(stmt.value.args[0].value) is int
+    }
     return all(
         _is_allowed_pure_call(child)
         or _is_store_call(child)
         or _is_private_store_staging_append(child)
+        or id(child) in local_allocations
         for child in ast.walk(node)
         if isinstance(child, ast.Call)
     )
@@ -683,17 +698,13 @@ def _backward_slice(body: list[ast.stmt], target_index: int) -> set[int]:
 
 def _slice_external_reads(body: list[ast.stmt], selected: set[int]) -> set[str]:
     needed: set[str] = set()
+    prior_writes: set[str] = set()
     for index in sorted(selected):
         effects = _statement_effects(body[index])
-        needed.update(
-            set(effects.live_in)
-            - {
-                name
-                for prior in selected
-                if prior < index
-                for name in _statement_effects(body[prior]).writes
-            }
-        )
+        # Reads in this statement see only writes from earlier selected
+        # statements, including the original structured effect semantics.
+        needed.update(set(effects.live_in) - prior_writes)
+        prior_writes.update(effects.writes)
     return needed
 
 
@@ -1085,11 +1096,67 @@ class _ExprContext:
     body_index: int = -1
 
 
+@dataclasses.dataclass(frozen=True)
+class _VectorLoopFacts:
+    assignments: dict[str, list[tuple[int, ast.Assign]]]
+    writes: frozenset[str]
+    mutations: frozenset[str]
+    statements: tuple[ast.stmt, ...]
+    statement_writes: dict[int, frozenset[str]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def writes_and_mutations(self, stmt: ast.stmt) -> frozenset[str]:
+        # Only shared by resolvers in one pre-rewrite candidate collection.
+        # `statements` retains the original nodes; no rewrite occurs while these
+        # summaries are live. Keep raw names so each query applies its current
+        # rename groups and reaching-definition context independently.
+        statement_id = id(stmt)
+        if statement_id not in self.statement_writes:
+            self.statement_writes[statement_id] = _statement_effects(
+                stmt
+            ).writes | _mutation_roots(stmt)
+        return self.statement_writes[statement_id]
+
+
+def _vector_loop_facts(loop: ast.For) -> _VectorLoopFacts:
+    """Analyze a loop once for one candidate collection, before any rewrite."""
+    assignments: dict[str, list[tuple[int, ast.Assign]]] = {}
+    for index, stmt in enumerate(loop.body):
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            assignments.setdefault(stmt.targets[0].id, []).append((index, stmt))
+    writes = frozenset(_statement_effects(loop).writes)
+    mutations = set().union(*(_mutation_roots(stmt) for stmt in loop.body))
+    statements = tuple(node for node in ast.walk(loop) if isinstance(node, ast.stmt))
+    aliases = [
+        (stmt.targets[0].id, stmt.value.id)
+        for stmt in statements
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(stmt.value, ast.Name)
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for left, right in aliases:
+            if left in mutations or right in mutations:
+                previous_size = len(mutations)
+                mutations.update((left, right))
+                changed |= len(mutations) != previous_size
+    return _VectorLoopFacts(assignments, writes, frozenset(mutations), statements)
+
+
 class _VectorExpressionResolver:
     def __init__(
         self,
         *,
         outer_loop: ast.For,
+        loop_facts: _VectorLoopFacts,
         infos: list[_ConstexprLoopInfo],
         cache_stores: dict[str, list[_CacheStore]],
         rmem: dict[str, _RmemInfo],
@@ -1107,36 +1174,10 @@ class _VectorExpressionResolver:
         self.tensor_names = tensor_names
         self.float_scalar_names = float_scalar_names
         self.outer_lane = cast("ast.Name", outer_loop.target).id
-        self.outer_assignments: dict[str, list[tuple[int, ast.Assign]]] = {}
-        for index, stmt in enumerate(outer_loop.body):
-            if (
-                isinstance(stmt, ast.Assign)
-                and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name)
-            ):
-                self.outer_assignments.setdefault(stmt.targets[0].id, []).append(
-                    (index, stmt)
-                )
-        self.outer_writes = set(_statement_effects(outer_loop).writes)
-        self.outer_mutations = set().union(
-            *(_mutation_roots(stmt) for stmt in outer_loop.body)
-        )
-        aliases = [
-            (stmt.targets[0].id, stmt.value.id)
-            for stmt in ast.walk(outer_loop)
-            if isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-            and isinstance(stmt.value, ast.Name)
-        ]
-        changed = True
-        while changed:
-            changed = False
-            for left, right in aliases:
-                if left in self.outer_mutations or right in self.outer_mutations:
-                    previous_size = len(self.outer_mutations)
-                    self.outer_mutations.update((left, right))
-                    changed |= len(self.outer_mutations) != previous_size
+        self.loop_facts = loop_facts
+        self.outer_assignments = loop_facts.assignments
+        self.outer_writes = loop_facts.writes
+        self.outer_mutations = loop_facts.mutations
         self.selected_statement_ids: set[int] = set()
         self.cache_access_ids: dict[str, set[int]] = {}
         self.cache_store_ids: set[int] = set()
@@ -1200,8 +1241,7 @@ class _VectorExpressionResolver:
                 canonical
                 in {
                     _canonical_name(item, self.rename_groups)
-                    for item in set(_statement_effects(prior).writes)
-                    | _mutation_roots(prior)
+                    for item in self.loop_facts.writes_and_mutations(prior)
                 }
                 for prior in context.info.loop.body[body_index + 1 : context.body_index]
             ) or canonical in {
@@ -1230,8 +1270,7 @@ class _VectorExpressionResolver:
                 canonical
                 in {
                     _canonical_name(item, self.rename_groups)
-                    for item in set(_statement_effects(prior).writes)
-                    | _mutation_roots(prior)
+                    for item in self.loop_facts.writes_and_mutations(prior)
                 }
                 for prior in self.outer_loop.body[outer_index + 1 : context.outer_index]
             ) or canonical in {
@@ -1471,6 +1510,9 @@ def _build_vector_candidates(
     rename_groups: dict[str, str],
 ) -> list[_VectorCandidate]:
     candidates: list[_VectorCandidate] = []
+    # Normalization clones expressions; the loop stays unchanged until all
+    # candidates have been collected.  Do not retain these facts across calls.
+    loop_facts: _VectorLoopFacts | None = None
     for info in infos:
         for target_name, sites in info.assignment_sites.items():
             if len(sites) != 1:
@@ -1483,8 +1525,11 @@ def _build_vector_candidates(
                 continue
             if not _candidate_used_later(info, body_index, target_name):
                 continue
+            if loop_facts is None:
+                loop_facts = _vector_loop_facts(loop)
             resolver = _VectorExpressionResolver(
                 outer_loop=loop,
+                loop_facts=loop_facts,
                 infos=infos,
                 cache_stores=stores,
                 rmem=rmem,
@@ -1503,9 +1548,8 @@ def _build_vector_candidates(
                 continue
             selected_statements = [
                 node
-                for node in ast.walk(loop)
-                if isinstance(node, ast.stmt)
-                and id(node) in resolver.selected_statement_ids
+                for node in loop_facts.statements
+                if id(node) in resolver.selected_statement_ids
             ]
             if not selected_statements or not all(
                 _vector_chain_assignment_safe(selected, tensor_names)
@@ -2253,7 +2297,17 @@ def _hoist_reductions_from_loop(
         selected = combined
 
     if not selected:
-        return [loop]
+        # Readonly assignments may be invariant even when every reduction
+        # depends on the current row. Reuse the same reaching-definition,
+        # effect, alias, and profitability checks as after reduction hoisting.
+        return _hoist_repeated_scalar_invariants(
+            loop,
+            lane_var,
+            lane_extent,
+            tensor_names,
+            proven_disjoint_tensor_pairs,
+            rename_groups,
+        )
     store_roots, stores_resolved = _global_store_roots(loop, tensor_names)
     if not stores_resolved or not _loads_may_cross_loop_writes(
         (body[index] for index in sorted(selected)),
@@ -2547,6 +2601,15 @@ def _rewrite_block(
                 for rewritten in replacement:
                     _update_uniform_names(rewritten, known_uniform, rename_groups)
                 continue
+            # Expose scalar invariants in the ordinary row path just as the
+            # guarded/unswitched path does. The existing inner LICM retains
+            # all effect, alias, reaching-definition and profitability checks.
+            stmt.body = _rewrite_inner_constexpr_loops(
+                stmt.body,
+                tensor_names,
+                proven_disjoint_tensor_pairs,
+                rename_groups,
+            )
             vectorized = _hoist_lane_invariant_constexpr_chain(
                 stmt,
                 lane_extent=extent,

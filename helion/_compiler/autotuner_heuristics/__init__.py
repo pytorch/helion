@@ -22,6 +22,8 @@ from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
+from .cute import CuteChainedMatmulHeuristic
+from .cute import CuteChunkPrefillHeuristic
 from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteCollectiveMatmulHeuristic
@@ -62,6 +64,10 @@ from .cute import grouped_row_union_cluster4_carrier
 from .cute import grouped_row_union_paired_clc_carrier
 from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
+from .cute_computed_scan import CuteComputedScanHeuristic
+from .cute_computed_scan import append_computed_scan_seed
+from .cute_computed_sweep import append_computed_sweep_seed
+from .cute_computed_sweep import append_vector_computed_sweep_seed
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_fragment_atomic_aggregation import CuteFragmentAtomicAggregationHeuristic
 from .cute_fragment_atomic_aggregation import (
@@ -143,6 +149,7 @@ from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
 from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
+from .cute_horizontal_state import CuteHorizontalStateHeuristic
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
 from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
@@ -152,8 +159,13 @@ from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
 from .cute_materialized_pdl import register_materialized_pdl_coverage
 from .cute_packed_operand import register_packed_operand_coverage
+from .cute_positional_cache import CutePositionalCacheHeuristic
+from .cute_positional_mma import CutePositionalMmaHeuristic
+from .cute_positional_shared_layout import CutePositionalSharedLayoutHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
+from .cute_row_packets import CuteRowPacketHeuristic
+from .cute_row_packets import append_row_packet_seeds
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_split_k_cluster import CuteSplitKClusterHeuristic
@@ -187,11 +199,17 @@ if TYPE_CHECKING:
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
+        CuteChainedMatmulHeuristic,
+        CutePositionalCacheHeuristic,
+        CutePositionalMmaHeuristic,
+        CutePositionalSharedLayoutHeuristic,
+        CuteComputedScanHeuristic,
         CuteAsyncStateLoadHeuristic,
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
         CuteGdnRecurrenceHeuristic,
         CuteChunkPrepareHeuristic,
+        CuteChunkPrefillHeuristic,
         CuteAffineScanHeuristic,
         CuteTopKHeuristic,
         CuteFlashAttentionHeuristic,
@@ -216,6 +234,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteResidentReductionHeuristic,
         CuteResidentSequenceHeuristic,
         CutePersistentSubwarpRowsHeuristic,
+        CuteRowPacketHeuristic,
         CuteAsyncPersistentSubwarpRowsHeuristic,
         CuteRolledRowLadderHeuristic,
         CuteRolledClusterLadderHeuristic,
@@ -258,6 +277,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentWarpProducerRegionsHeuristic,
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
+        CuteHorizontalStateHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -379,6 +399,7 @@ def compiler_seed_configs(
     )
     env.config_spec.autotuner_heuristics = []
     env.config_spec.compiler_default_config = None
+    env.config_spec.compiler_seed_witnesses = ()
     env.config_spec.compiler_seed_timeout_retry_repetitions = None
     if env.settings.disable_autotuner_heuristics:
         return configs
@@ -485,6 +506,35 @@ def compiler_seed_configs(
             configs.append(
                 Config.from_dict(paired.config | {STARTUP_PREFILL_KEY: True})
             )
+    if env.backend_name == "cute" and env.config_spec.cute_loop_schedule_enabled:
+        from .loop_schedule import loop_schedule_seeds
+
+        siblings = loop_schedule_seeds(env, device_ir)
+        if siblings:
+            # Keep every legacy parent's order and multiplicity, the promoted
+            # default and caller-owned seeds. Only enabled siblings are new.
+            configs[1:1] = siblings
+            env.config_spec.autotuner_heuristics.append("cute_loop_schedule")
+    if env.backend_name == "cute":
+        configs = append_row_packet_seeds(env, device_ir, configs)
+    if env.backend_name == "cute":
+        horizontal = CuteHorizontalStateHeuristic.horizontal_seed(env, device_ir)
+        if horizontal is not None:
+            configs.append(horizontal)
+            env.config_spec.autotuner_heuristics.append(
+                CuteHorizontalStateHeuristic.name
+            )
+    if env.backend_name == "cute":
+        from .cute_row_prefetch import append_row_prefetch_seeds
+
+        configs = append_row_prefetch_seeds(env, device_ir, configs)
+        # New sweep choices follow the complete existing seed population.
+        configs = append_computed_sweep_seed(env, device_ir, configs)
+        configs = append_computed_scan_seed(env, device_ir, configs)
+        configs = append_vector_computed_sweep_seed(env, device_ir, configs)
+        from .chained_seed_witnesses import chained_seed_witnesses
+
+        env.config_spec.compiler_seed_witnesses = chained_seed_witnesses(env, configs)
     return dedupe_configs(configs)
 
 

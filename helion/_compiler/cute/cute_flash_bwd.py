@@ -2541,7 +2541,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     else:
         df.wrapper_only_params.extend(_FLASH_BWD_KERNEL_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())  # type: ignore[union-attr]
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+    cg.record_cute_matmul_layout()  # type: ignore[attr-defined]
     df.cute_state.attention_flash_threads = 512
 
     if two_cta:

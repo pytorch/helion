@@ -4366,10 +4366,10 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     )
 
     assert policy["kind"] == "canonical_cute_flash"
-    # Dense populations retain the explicit standard/resident choices; every
-    # surface also seeds upstream's distinct flat ws_overlap grid.
-    assert policy["raw_config_count"] == (10 if causal else 31)
-    assert len(policy["effective_config_ids"]) == (10 if causal else 30)
+    # Retain standard/resident seeds and the dense flat ws_overlap grid.
+    # Causal flat-family variants use their family defaults and deduplicate.
+    assert policy["raw_config_count"] == (9 if causal else 31)
+    assert len(policy["effective_config_ids"]) == (9 if causal else 30)
     assert len(generation_zero_ids) == 100
     assert set(policy["effective_config_ids"]) <= set(generation_zero_ids)
 
@@ -4382,12 +4382,12 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
         ("attention_output", (2, 32, 262144, 128), 18, 18),
         ("causal_attention_output", (2, 32, 524288, 128), 7, 7),
         ("attention_output", (1, 32, 524288, 64), 21, 20),
-        ("causal_attention_output", (1, 32, 1048576, 64), 13, 13),
+        ("causal_attention_output", (1, 32, 1048576, 64), 12, 12),
         ("attention_output", (8, 32, 524288, 64), 1, 1),
         ("causal_attention_output", (8, 32, 786432, 64), 11, 11),
         ("attention_relu_output", (2, 32, 524288, 64), 21, 20),
         ("causal_attention_relu_output", (2, 32, 1048576, 64), 11, 11),
-        ("causal_attention_output", (2, 32, 65536, 64), 15, 15),
+        ("causal_attention_output", (2, 32, 65536, 64), 14, 14),
     ),
 )
 @skipUnlessCuteAvailable("binding a cute-backend kernel requires the CuTe DSL")

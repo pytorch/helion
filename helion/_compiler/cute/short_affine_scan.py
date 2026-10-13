@@ -9,10 +9,20 @@ The recognized recurrence is deliberately algebraic::
     state = decayed + row_update[:, None] * update_vector[None, :]
     observation = sum(state * observation_vector[None, :], dim=-1)
 
+The prediction, subtraction, and update scale are optional: an additive step
+may instead supply an opaque, state-independent ``row_update`` directly.  A
+region can mix feedback and additive transitions without manufacturing a zero
+prediction or evaluating a subtraction absent from the source.
+
 The observation may already have been distributed over the affine state update
 by :mod:`factor_affine_reductions`.  Both forms prove the same contract.  The
 coefficient producers are intentionally opaque live-ins: discovery neither
 names them nor constrains their formulas.
+
+The current region contract covers storage-rounded entry/checkpoint tensors
+and an FP32 register-carried state between short, unrolled transitions. It does
+not match arbitrary FP32-entry contraction loops; those need their own loop
+and contraction proof rather than a fabricated storage cast.
 
 This module is discovery-only.  It does not annotate FX nodes, mutate a graph,
 or install a backend plan.  A future lowering can consume the explicit region
@@ -100,7 +110,7 @@ class ShortAffineScanStep:
     """One proved transition in a :class:`ShortAffineScanRegion`."""
 
     diagonal: torch.fx.Node = dataclasses.field(repr=False)
-    prediction_vector: torch.fx.Node = dataclasses.field(repr=False)
+    prediction_vector: torch.fx.Node | None = dataclasses.field(repr=False)
     row_input: torch.fx.Node = dataclasses.field(repr=False)
     update_scale: object = dataclasses.field(repr=False)
     update_vector: torch.fx.Node = dataclasses.field(repr=False)
@@ -156,7 +166,7 @@ class ShortAffineScanRegion:
 @dataclasses.dataclass(frozen=True)
 class _StepMatch:
     diagonal: torch.fx.Node
-    prediction_vector: torch.fx.Node
+    prediction_vector: torch.fx.Node | None
     row_input: torch.fx.Node
     update_scale: object
     update_vector: torch.fx.Node
@@ -736,41 +746,12 @@ def _match_step(
         assert vector_view_nodes is not None
         assert update_vector_view is not None
 
-        scaled_residual = _binary_pair(row_update, _MUL_TARGETS)
-        if scaled_residual is None:
+        update_match = _match_row_update(
+            row_update, decayed, incoming_state, rows, features
+        )
+        if update_match is None:
             continue
-        residual: torch.fx.Node | None = None
-        update_scale: object | None = None
-        for maybe_residual, maybe_scale in (
-            scaled_residual,
-            scaled_residual[::-1],
-        ):
-            if (
-                isinstance(maybe_residual, torch.fx.Node)
-                and _binary_pair(maybe_residual, _SUB_TARGETS) is not None
-                and _is_scalar(maybe_scale)
-            ):
-                residual = maybe_residual
-                update_scale = maybe_scale
-                break
-        if residual is None or update_scale is None:
-            continue
-        difference = _binary_pair(residual, _SUB_TARGETS)
-        assert difference is not None
-        row_input, prediction = difference
-        if (
-            not isinstance(row_input, torch.fx.Node)
-            or not isinstance(prediction, torch.fx.Node)
-            or not _is_fp32_shape(row_input, (rows,))
-            or not _is_fp32_shape(prediction, (rows,))
-            or not _is_fp32_shape(residual, (rows,))
-            or not _is_fp32_shape(row_update, (rows,))
-        ):
-            continue
-        prediction_match = _match_reduction_product(prediction, decayed, rows, features)
-        if prediction_match is None:
-            continue
-        prediction_vector, _, prediction_nodes = prediction_match
+        prediction_vector, row_input, update_scale, update_nodes = update_match
 
         output_matches = [
             (store, matched)
@@ -806,9 +787,9 @@ def _match_step(
             | decay_nodes
             | row_view_nodes
             | vector_view_nodes
-            | prediction_nodes
+            | update_nodes
             | output_nodes
-            | {decayed, outer, residual, row_update, state, state_store}
+            | {decayed, outer, state, state_store}
         )
         return _StepMatch(
             diagonal=diagonal,
@@ -826,6 +807,56 @@ def _match_step(
             state_access=state_access,
             owned=frozenset(owned),
         )
+    return None
+
+
+def _match_row_update(
+    row_update: torch.fx.Node,
+    decayed: torch.fx.Node,
+    incoming_state: torch.fx.Node,
+    rows: int,
+    features: int,
+) -> (
+    tuple[torch.fx.Node | None, torch.fx.Node, object, frozenset[torch.fx.Node]] | None
+):
+    """Keep additive producers opaque; otherwise prove the feedback reduction."""
+
+    pending = [row_update]
+    visited: set[torch.fx.Node] = set()
+    while pending:
+        node = pending.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        pending.extend(node.all_input_nodes)
+    if incoming_state not in visited:
+        return None, row_update, 1.0, frozenset()
+
+    scaled_residual = _binary_pair(row_update, _MUL_TARGETS)
+    if scaled_residual is None:
+        return None
+    for residual, scale in (scaled_residual, scaled_residual[::-1]):
+        difference = _binary_pair(residual, _SUB_TARGETS)
+        if difference is None or not _is_scalar(scale):
+            continue
+        row_input, prediction = difference
+        if (
+            not isinstance(residual, torch.fx.Node)
+            or not isinstance(row_input, torch.fx.Node)
+            or not _is_fp32_shape(row_input, (rows,))
+            or not _is_fp32_shape(prediction, (rows,))
+            or not _is_fp32_shape(residual, (rows,))
+        ):
+            continue
+        matched = _match_reduction_product(prediction, decayed, rows, features)
+        if matched is not None:
+            prediction_vector, _, prediction_nodes = matched
+            return (
+                prediction_vector,
+                row_input,
+                scale,
+                prediction_nodes | {residual, row_update},
+            )
     return None
 
 
@@ -1094,6 +1125,20 @@ def _region_from_entry(
     first_position = min(positions[node] for node in owned)
     last_position = max(positions[node] for node in owned)
     interval = tuple(graph_nodes[first_position : last_position + 1])
+    producer_interval = interval
+    # A free feature coordinate may lower to a named identity assignment.
+    # Include that pure prerequisite in the replacement boundary, while
+    # leaving other pre-entry producers as opaque live-ins as before.
+    feature_index = entry_access.indices[-1]
+    if (
+        isinstance(feature_index, torch.fx.Node)
+        and feature_index.op == "call_function"
+        and feature_index.target is torch.ops.prims.iota.default
+        and positions[feature_index] < first_position
+    ):
+        producer_interval = (feature_index, *interval)
+        first_position = positions[feature_index]
+        interval = tuple(graph_nodes[first_position : last_position + 1])
     if any(_node_is_effectful(node) and node not in effects for node in interval):
         return None
 
@@ -1121,7 +1166,7 @@ def _region_from_entry(
         for index in range(len(matches) - 1)
     ):
         return None
-    dependency_match = _dependency_slices(live_ins, owned, interval, positions)
+    dependency_match = _dependency_slices(live_ins, owned, producer_interval, positions)
     if dependency_match is None:
         return None
     dependency_slices, producer_nodes, producer_reads = dependency_match

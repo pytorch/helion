@@ -17,6 +17,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 import helion
+from helion._compiler.cute import positional_root
 from helion._compiler.cute.fragment_epilogue import _is_literal_scalar
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import DEVICE
@@ -133,12 +134,55 @@ def test_fragment_where_codegen(mode: str, n: int) -> None:
     "mode", ["cross_thread_condition", "cross_thread_true", "cross_thread_false"]
 )
 def test_fragment_where_requires_all_local_accumulator_demands(mode: str) -> None:
-    with patch_cute_mma_support(), patch("torch.cuda.is_available", return_value=False):
-        bound = _fragment_where._bind_isolated((*_args("cpu"), mode))
-        # Candidate extraction may succeed, but the ownership proof must not
-        # commit a where whose predicate reads another thread's accumulator.
+    args = _args("cpu")
+    # The same target as test_fragment_where_codegen, where the thread-local
+    # modes commit.  Candidate extraction may succeed, but the ownership proof
+    # must not commit a where that reads another thread's accumulator.  A
+    # transposed accumulator also equates the M and N tile sizes, so the
+    # positional fallback would otherwise claim the root before native codegen.
+    with (
+        patch.object(positional_root, "plan_positional_root", return_value=None),
+        pytest.raises(helion.exc.BackendUnsupported, match="ownership proof"),
+    ):
+        _code(args, mode, 128)
+    if mode == "cross_thread_condition":
+        # Without a repeated axis nothing else owns the root.
         with pytest.raises(helion.exc.BackendUnsupported, match="ownership proof"):
-            bound.to_code(_config(128))
+            _code(args, mode, 128)
+        return
+    # Integrated, the positional fallback owns the root by tensor position
+    # (numerics: test_fragment_where_cross_thread_positional_runtime).
+    code = _code(args, mode, 128)
+    assert "ptp_thread" in code
+    assert "cute.gemm(" not in code
+    assert "tcgen05_epi_where" not in code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("mode", ["cross_thread_true", "cross_thread_false"])
+def test_fragment_where_cross_thread_positional_runtime(mode: str) -> None:
+    args = _args(DEVICE)
+    lhs, rhs, out = args
+    saved = tuple(value.clone() for value in args[:2])
+    bound = _fragment_where._bind_isolated((*args, mode))
+    assert "ptp_thread" in bound.to_code(_config(128))
+    function = bound.compile_config(_config(128))
+    actual = function(*args, mode).clone()
+    acc = lhs.double() @ rhs.double()
+    row = torch.arange(128, device=DEVICE)[None, :, None]
+    col = torch.arange(128, device=DEVICE)[None, None, :]
+    transposed = acc.transpose(-1, -2)
+    expected = (
+        torch.where(row >= col, transposed, acc)
+        if mode == "cross_thread_true"
+        else torch.where(row >= col, acc, transposed)
+    )
+    torch.testing.assert_close(actual, expected.to(lhs.dtype), atol=0.002, rtol=0.01)
+    torch.testing.assert_close(function(*args, mode), actual, atol=0, rtol=0)
+    for value, before in zip(args[:2], saved, strict=True):
+        torch.testing.assert_close(value, before, atol=0, rtol=0)
+    padding = out.as_strided((2, 128, 128), out.stride(), storage_offset=128)
+    assert torch.all(padding == 17)
 
 
 @pytest.mark.parametrize("value", [True, 3, -0.5])

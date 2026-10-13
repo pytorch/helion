@@ -15,6 +15,7 @@ import ast
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Literal
 from typing import cast
 from unittest.mock import patch
 
@@ -131,24 +132,31 @@ def _row_config(
     row_block: int = 1,
     row_threads: int = 0,
     load_eviction_policies: list[str] | None = None,
+    reload_mode: Literal["auto", "register", "gmem"] = "auto",
 ) -> helion.Config:
     spec = bound.config_spec
     reduction = _reduction_block_id(bound)
     extra: dict[str, object] = {}
     if load_eviction_policies is not None:
         extra["load_eviction_policies"] = load_eviction_policies
+    if reload_mode != "auto":
+        extra["cute_reduction_reloads"] = [
+            reload_mode for _ in spec.cute_reduction_reloads.valid_block_ids()
+        ]
     return spec.normalized_config(
-        helion.Config(
-            block_sizes=[row_block for _ in spec.block_sizes.valid_block_ids()],
-            num_threads=[
-                reduction_threads if block_id == reduction else row_threads
-                for block_id in spec.num_threads.valid_block_ids()
-            ],
-            cute_vector_widths=[
-                vec if block_id == reduction else 1
-                for block_id in spec.cute_vector_widths.valid_block_ids()
-            ],
-            **extra,
+        helion.Config.from_dict(
+            {
+                "block_sizes": [row_block for _ in spec.block_sizes.valid_block_ids()],
+                "num_threads": [
+                    reduction_threads if block_id == reduction else row_threads
+                    for block_id in spec.num_threads.valid_block_ids()
+                ],
+                "cute_vector_widths": [
+                    vec if block_id == reduction else 1
+                    for block_id in spec.cute_vector_widths.valid_block_ids()
+                ],
+                **extra,
+            }
         )
     )
 
@@ -324,20 +332,24 @@ def test_whole_warp_thread_request_covers_the_full_row(
 
 
 @skipUnlessBackends(["cute"])
-def test_rms_norm_1024_bf16_one_vector_per_thread_uses_four_warps() -> None:
+@pytest.mark.parametrize("reload_mode", ["auto", "register", "gmem"])
+def test_rms_norm_1024_bf16_one_vector_per_thread_uses_four_warps(
+    reload_mode: Literal["auto", "register", "gmem"],
+) -> None:
     bound, _arguments = _bind_rms_norm(256, 1024, torch.bfloat16)
-    config = _row_config(bound, reduction_threads=128, vec=8)
+    config = _row_config(bound, reduction_threads=128, vec=8, reload_mode=reload_mode)
     assert config.reduction_loops == [None]
     code = bound.to_code(config)
     assert "block=(128, 1, 1)" in code
     _assert_reduces_once_per_reduction(code, reductions=1, group_span=128)
-    # One LDG.128 per thread for x and one for weight; the consume sweep
-    # reuses the x fragment from registers instead of reloading it.
+    # The explicit register policy keeps x across the inv_rms output store.
+    # Auto treats that store as a phase boundary, just like the gmem policy.
     vector_loads = [line for line in code.splitlines() if "cute.arch.load(" in line]
-    assert len(vector_loads) == 2
-    assert sum("x.iterator" in line for line in vector_loads) == 1
+    x_loads = 1 if reload_mode == "register" else 2
+    assert len(vector_loads) == x_loads + 1
+    assert sum("x.iterator" in line for line in vector_loads) == x_loads
     assert sum("weight.iterator" in line for line in vector_loads) == 1
-    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 2
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == x_loads + 1
     # Every thread stores its own vector of ``out`` unguarded; only the
     # broadcast inv_rms result is stored by lane 0 of the row group.
     assert len(_top_level_store_lines(code, "_cute_store_u16_vec")) == 1
@@ -542,6 +554,7 @@ def test_hinted_row_loads_use_the_cache_policy_helper_of_their_width(
             reduction_threads=threads,
             vec=vec,
             load_eviction_policies=["l1_l2_last", "l2_last"],
+            reload_mode="register",
         )
     )
     assert f"block=({threads}, 1, 1)" in code
@@ -557,7 +570,9 @@ def test_hinted_row_loads_use_the_cache_policy_helper_of_their_width(
 @skipUnlessBackends(["cute"])
 def test_fp32_row_uses_eight_warps_with_v4() -> None:
     bound, _arguments = _bind_rms_norm(256, 1024, torch.float32)
-    code = bound.to_code(_row_config(bound, reduction_threads=256, vec=4))
+    code = bound.to_code(
+        _row_config(bound, reduction_threads=256, vec=4, reload_mode="register")
+    )
     assert "block=(256, 1, 1)" in code
     _assert_reduces_once_per_reduction(code, reductions=1, group_span=256)
     assert code.count("ir.VectorType.get([4], cutlass.Uint32.mlir_type)") == 2
@@ -629,12 +644,14 @@ def test_capped_row_keeps_one_warp_vector_loads(
     # is tested against the slice AFTER the cap, where it covers exactly one
     # vector per thread again.
     bound, _arguments = _bind_rms_norm(256, width, dtype)
-    code = bound.to_code(_row_config(bound, reduction_threads=threads, vec=vec))
+    code = bound.to_code(
+        _row_config(bound, reduction_threads=threads, vec=vec, reload_mode="register")
+    )
     _assert_one_warp_vector_row(code, vec=vec, element=element, store=store)
     # Identical to asking for the one warp directly.
     one_warp, _one_warp_arguments = _bind_rms_norm(256, width, dtype)
     assert code == one_warp.to_code(
-        _row_config(one_warp, reduction_threads=32, vec=vec)
+        _row_config(one_warp, reduction_threads=32, vec=vec, reload_mode="register")
     )
 
 

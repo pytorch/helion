@@ -1492,6 +1492,7 @@ class DeviceFunction:
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     proven_tensor_stride_values=self.proven_tensor_stride_values(),
                     dynamic_trip_counts=self.cute_state.dynamic_reduction_trips,
+                    preserve_scalar_invariants=True,
                 )
             # Some exact persistent fragments have addresses defined only
             # inside a runtime branch (for example a loaded state-slot index),
@@ -1581,6 +1582,19 @@ class DeviceFunction:
             from .cute.hoist_lane_invariant_reductions import (
                 hoist_lane_invariant_reductions,
             )
+            from .cute.proven_loop_bounds import simplify_proven_loop_bounds
+
+            # Establish relative lane bounds before deciding whether a
+            # reduction depends on the row loop. Names awaiting a later
+            # rename are excluded from this early scalar proof.
+            kernel_body = simplify_proven_loop_bounds(
+                kernel_body,
+                enabled=bool(self.config.config.get("cute_proven_bounds", False)),
+                thread_block_dims=exact_thread_block_dims,
+                constexpr_values=constexpr_values,
+                excluded_names=frozenset(rename_groups)
+                | frozenset(rename_groups.values()),
+            )
 
             kernel_body = hoist_lane_invariant_reductions(
                 kernel_body,
@@ -1627,6 +1641,7 @@ class DeviceFunction:
                 kernel_body,
                 rename_groups=rename_groups,
                 fast_math=CompileEnvironment.current().settings.fast_math,
+                snapshot_names=self.cute_state.phi_snapshot_names,
             )
             # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
             # ``cute.math.fma`` (the DSL's arith ops carry no contract
@@ -1660,8 +1675,13 @@ class DeviceFunction:
                     kernel_body,
                     lane_unroll,
                     lambda name: self.new_var(name, dce=False),
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                    proven_tensor_stride_values=self.proven_tensor_stride_values(),
+                    rename_groups=rename_groups,
                 )
-                if not unrolled:
+                # Positional materialization may already have consumed this
+                # option before the grid-lane pass; retain its installed body.
+                if not unrolled and not self.cute_state.materialization_unroll_applied:
                     raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
             # P18: software-pipeline the per-iteration vec load by one
@@ -2021,6 +2041,15 @@ class DeviceFunction:
                 statement_from_string(
                     f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
                 )
+            )
+        if (
+            self.cute_state.chained_matmul_plan is not None
+            or self.cute_state.positional_root_plan is not None
+        ):
+            # Positional scalar accesses only require element alignment.
+            # Chained vector copies separately guard promotion to 16 bytes.
+            result.append(
+                statement_from_string(f"{self.name}._helion_cute_pointer_alignment = 1")
             )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:

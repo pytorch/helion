@@ -1633,7 +1633,11 @@ sink = reduced_0 + reduced_1
         split_lane_loop_reductions([loop])
 
 
-def test_dependent_lane_split_preserves_invariant_carried_update() -> None:
+@pytest.mark.parametrize(
+    "snapshot",
+    ["carry_copy = carry", "carry_entry = carry\ncarry_copy = carry_entry"],
+)
+def test_dependent_lane_split_preserves_invariant_carried_update(snapshot: str) -> None:
     from helion._compiler.tile_strategy import _create_lane_loop
     from helion._compiler.tile_strategy import split_lane_loop_reductions
 
@@ -1641,8 +1645,8 @@ def test_dependent_lane_split_preserves_invariant_carried_update() -> None:
         "lane",
         8,
         ast.parse(
-            """
-carry_copy = carry
+            f"""
+{snapshot}
 first = lane + 1
 reduced_0 = _helion_lane_reduce(first, 'sum', cutlass.Float32(0), 16, 1, 0, '', 1, 1)
 second = first + reduced_0
@@ -1976,12 +1980,49 @@ for synthetic_lane_7 in cutlass.range_constexpr(8):
         assert "_persistent_branch_store_values" not in code
 
 
+@pytest.mark.parametrize("store_shift", (1, -1))
+def test_lane_split_plain_scalar_accepts_disjoint_fixed_residue(
+    store_shift: int,
+) -> None:
+    from helion._compiler.tile_strategy import _create_lane_loop
+    from helion._compiler.tile_strategy import split_lane_loop_reductions
+
+    # Scalar loads use residue 0 mod128 and stores use +1/-1. These cannot
+    # alias, including after Int32 index wrap; shifting by128 is different
+    # because it reaches the adjacent lane (covered by the rejection test).
+    for lane_base in (-(2**31) + 3, 0, 2**31 - 5):
+        loads = {(128 * (lane_base + i)) % 2**32 for i in range(8)}
+        stores = {(128 * (lane_base + i) + store_shift) % 2**32 for i in range(8)}
+        assert loads.isdisjoint(stores)
+    loop = _create_lane_loop(
+        "synthetic_lane_7",
+        8,
+        ast.parse(
+            f"""
+lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+loaded = (state.iterator + lane_index * state.layout.stride[1]).load()
+partial = cutlass.Float32(loaded) * cutlass.Float32(loaded)
+reduced = _helion_lane_reduce(partial, 'sum', cutlass.Float32(0), 16, 1, 0, '', 1, 1)
+updated = cutlass.Float32(loaded) + reduced
+(state.iterator + lane_index * state.layout.stride[1] + {store_shift}).store(updated)
+"""
+        ).body,
+    )
+    split = split_lane_loop_reductions(
+        [loop], proven_tensor_stride_values={("state", 1): 128}
+    )
+    code = ast.unparse(ast.Module(body=cast("list[ast.stmt]", split), type_ignores=[]))
+    assert code.count("for synthetic_lane_7 in range(8)") >= 2
+    assert "reduced_lane_acc" in code
+    assert code.count(".store(updated)") == 1
+
+
 @pytest.mark.parametrize(
     ("load_pointer", "store_pointer", "write", "stride_values"),
     (
         (
             "state.iterator + lane_index * state.layout.stride[1]",
-            "state.iterator + lane_index * state.layout.stride[1] + 1",
+            "state.iterator + lane_index * state.layout.stride[1] + 128",
             "({pointer}).store(updated)",
             {("state", 1): 128},
         ),
@@ -2035,7 +2076,7 @@ for synthetic_lane_7 in cutlass.range_constexpr(8):
         ),
     ),
     ids=(
-        "shifted",
+        "cross-lane-shifted",
         "literal-zero-stride",
         "specialized-zero-stride",
         "int32-wrapping-stride",

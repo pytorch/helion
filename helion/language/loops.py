@@ -469,7 +469,7 @@ def _add_config_range_choice(
 
     params = inspect.signature(triton.language.range).parameters
     config_spec = CompileEnvironment.current().config_spec
-    if use_tileir_tunables():
+    if config_spec.backend_name in ("triton", "tileir") and use_tileir_tunables():
         # tileir backend would discard these choices for now
         return
     if allow_static_range:

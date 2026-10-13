@@ -24,6 +24,8 @@ import inspect
 import json
 import linecache
 import logging
+import math
+import operator
 import os
 import sys
 import threading
@@ -39,6 +41,8 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
+from ..._compiler.cute.chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINES
+from ..._compiler.cute.chunk_recurrence_config import chunk_recurrence_pipeline
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from ..._compiler.cute.grouped_full_coverage import full_coverage_index_domain
 from ..._compiler.cute.grouped_row_union import (
@@ -86,6 +90,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from torch.cuda import _POOL_HANDLE
+
+    from .chunk_prefill import PrefillResources
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -301,6 +307,17 @@ def _append_cute_wrapper_plan(
     num_sm: int | None = None,
     schema_key: Sequence[tuple[object, ...]] | None = None,
 ) -> None:
+    if plan.get("kind") == "chained_startup_tma":
+        from .chained_startup import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
+    if plan.get("kind") == "chained_rectangular_leaf_tma":
+        from .chained_rectangular_leaf import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
+
     descriptor_identity = plan.get("wrapped_grouped_descriptors")
     descriptors = (
         WrappedGroupedDescriptorPlan.from_identity(descriptor_identity)
@@ -574,9 +591,25 @@ def _append_cute_wrapper_plan(
         )
         call_args.extend(parameters)
         return
+    if kind == "chunk_prefill_sm100":
+        from .chunk_prefill import validate_plan
+
+        validate_plan(plan)
+        return
+    if kind == "chained_paired_leaf_tma":
+        from .chained_leaf_pipeline import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
     if kind == "chunk_recurrence_sm100":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
+        pipeline_name = plan.get("pipeline", "wide")
+        if not isinstance(pipeline_name, str) or (
+            pipeline_name not in CUTE_CHUNK_RECURRENCE_PIPELINES
+        ):
+            raise exc.BackendUnsupported("cute", "invalid recurrence pipeline")
+        pipeline = chunk_recurrence_pipeline(pipeline_name)
         if (
             plan_int("chunk_size") != 16
             or plan_int("key_size") != 128
@@ -586,13 +619,17 @@ def _append_cute_wrapper_plan(
             or outputs_scaled is not False
             or factor_key_xor != 8
             or plan_int("device_abi") != 2
-            or plan_int("input_stages") != 8
-            or plan_int("tma_stages") != 6
+            or plan_int("smem_bytes") != pipeline.smem_bytes
+            or plan_int("input_stages") != pipeline.input_stages
+            or plan_int("tma_stages") != pipeline.tma_stages
             or plan_int("factor_tma_value_splits") != 2
-            or plan_int("output_acc_stages") != 2
+            or plan_int("output_acc_stages") != pipeline.output_acc_stages
             or plan_int("output_smem_stages") != 7
             or plan_int("output_store_wait_groups") != 6
-            or plan_int("tmem_cols") != 512
+            or plan_int("tmem_cols") != pipeline.tmem_cols
+            or plan.get("compute_registers", 136) != pipeline.compute_registers
+            or plan.get("service_registers", 56) != pipeline.service_registers
+            or plan.get("min_blocks_per_mp", 1) != pipeline.min_blocks_per_mp
         ):
             raise exc.BackendUnsupported(
                 "cute", "invalid SM100 chunk-recurrence schedule ABI"
@@ -1381,6 +1418,34 @@ def _append_cute_wrapper_plan(
             column_major=bool(plan.get("d_column_major")),
         )
         return
+    if kind == "horizontal_state_tma":
+        state_idx = plan_int("state_idx")
+        rows = plan_int("rows")
+        features = plan_int("features")
+        stages = plan_int("stages")
+        dtype = str(plan["dtype"])
+        shape = cast("list[int]", plan["state_shape"])
+        parameters = cast("list[str]", plan["kernel_args"])
+        assert len(parameters) == 4
+        flat = f"{parameters[0]}_flat"
+        body.append(
+            f"    {flat} = cute.make_tensor(arg{state_idx}.iterator, cute.make_layout(({math.prod(shape[:-1])}, {shape[-1]}), stride=({shape[-1]}, 1)))"
+        )
+        for pair, operation in (
+            (parameters[:2], "cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()"),
+            (parameters[2:], "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()"),
+        ):
+            append_tcgen05_epilogue_tma_wrapper(
+                tensor_idx=state_idx,
+                bm=rows,
+                bn=features,
+                stage_count=stages,
+                dtype=dtype,
+                kernel_args=pair,
+                copy_op=operation,
+                tensor_name=flat,
+            )
+        return
     if kind == "tcgen05_aux_tma":
         c_idx = plan_int("c_idx")
         bm = plan_int("bm")
@@ -1958,6 +2023,11 @@ def _append_sm100_chunk_recurrence_host_call(
     values = tensor_arg("v_idx")
     output = tensor_arg("out_idx")
     state = tensor_arg("state_idx")
+    initial_state_arg = (
+        f", initial_state={tensor_arg('initial_state_idx')}"
+        if plan.get("state_dtype") == "float32"
+        else ""
+    )
     cu_seqlens = tensor_arg("cu_seqlens_idx")
     cu_chunks = tensor_arg("cu_chunks_idx")
 
@@ -1985,6 +2055,19 @@ def _append_sm100_chunk_recurrence_host_call(
     append_view("_chunk_gt", gt, gt_shape, gt_stride)
     append_view("_chunk_v", values, activation_shape, activation_stride)
     append_view("_chunk_out", output, activation_shape, activation_stride)
+    pipeline = chunk_recurrence_pipeline(cast("str", plan.get("pipeline", "wide")))
+    continuation_arg = ""
+    if "prepared_continuation" in plan:
+        continuation = plan["prepared_continuation"]
+        if not isinstance(continuation, tuple) or not continuation:
+            raise exc.BackendUnsupported(
+                "cute", "invalid prepared continuation program"
+            )
+        continuation_arg = f", CONTINUATION_PROGRAM={continuation!r}"
+    if "epoch_kernel" in plan:
+        if plan["epoch_kernel"] != "_helion_epoch_kernel" or continuation_arg:
+            raise exc.BackendUnsupported("cute", "invalid complete epoch selection")
+        continuation_arg = ", EPOCH_KERNEL=_helion_epoch_kernel"
     host_call = (
         "    _helion_sm100_chain_host("
         "_chunk_v, "
@@ -1993,7 +2076,10 @@ def _append_sm100_chunk_recurrence_host_call(
         f"{state}, _chunk_out, stream, "
         f"cutlass.Int32(0), cutlass.Int32({heads}), "
         f"cutlass.Float32({output_scale}), "
-        "512)"
+        f"512, {pipeline.input_stages}, {pipeline.tma_stages}, "
+        f"{pipeline.output_acc_stages}, {pipeline.tmem_cols}, "
+        f"{pipeline.compute_registers}, {pipeline.service_registers}, "
+        f"{pipeline.min_blocks_per_mp}{initial_state_arg}{continuation_arg})"
     )
     body.extend(("    _helion_cute_kernel_tag = 'chunk_recurrence_sm100'", host_call))
 
@@ -2213,6 +2299,20 @@ def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -
     cu_seqlens = tensor_arg("cu_seqlens_idx")
     cu_chunks = tensor_arg("cu_chunks_idx")
     output_scale = f"arg{plan_int('scale_idx')}"
+    state_args: tuple[str, ...] = ()
+    if plan.get("state_dtype") == "float32":
+        for name, key in (
+            ("_chunk_initial_state", "initial_state_idx"),
+            ("_chunk_final_state", "state_idx"),
+        ):
+            body.append(
+                f"    {name} = cute.make_tensor({tensor_arg(key)}.iterator, "
+                f"cute.make_layout(({sequences * heads * 128 * 128},), stride=(1,)))"
+            )
+        state_args = (
+            "initial_state=_chunk_initial_state",
+            "final_state=_chunk_final_state",
+        )
     body.extend(
         (
             (
@@ -2243,6 +2343,7 @@ def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -
                     "grid_x",
                     "grid_y",
                     "stream",
+                    *state_args,
                 )
             )
             + ")",
@@ -2382,6 +2483,11 @@ def _create_cute_wrapper(
             call_args.append(name)
             continue
 
+        if kind == "wrapper_host_stream":
+            (_, name) = entry
+            params.append(f"{name}: CUstream")
+            continue
+
         if kind == "wrapper_host_scalar":
             (_, name, scalar_kind) = entry
             assert isinstance(name, str)
@@ -2452,6 +2558,11 @@ def _create_cute_wrapper(
                 "cute", "gathered MMA requires its proved source launch"
             )
         block = (288, 1, 1)
+    prefill_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "chunk_prefill_sm100"
+    ]
+    if prefill_plans and (len(prefill_plans) != 1 or len(wrapper_plans) != 1):
+        raise exc.BackendUnsupported("cute", "fused prefill must own one complete root")
     sm100_recurrence_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "chunk_recurrence_sm100"
     ]
@@ -2550,6 +2661,10 @@ def _create_cute_wrapper(
         )
         arguments.extend((f"cutlass.Float32({alpha})", "stream"))
         body.append("    _helion_block_scaled_entry(" + ", ".join(arguments) + ")")
+    elif prefill_plans:
+        from .chunk_prefill import append_host_call
+
+        append_host_call(body, prefill_plans[0])
     elif sm100_recurrence_plans:
         _append_sm100_chunk_recurrence_host_call(body, sm100_recurrence_plans[0])
     elif warp_dv4_recurrence_plans:
@@ -2566,8 +2681,14 @@ def _create_cute_wrapper(
             )
         )
 
+    helper_sources: tuple[str, ...] = ()
+    if prefill_plans:
+        from .chunk_prefill import prepared_helper_sources
+
+        helper_sources = prepared_helper_sources(prefill_plans[0])
     source = "\n".join(
         [
+            *helper_sources,
             "@cute.jit",
             f"def {func_name}({', '.join(params)}) -> None:",
             *body,
@@ -2575,6 +2696,7 @@ def _create_cute_wrapper(
     )
 
     namespace: dict[str, Any] = {
+        "operator": operator,
         "cutlass": cutlass,
         "cute": cute,
         "CUstream": cuda_driver.CUstream,
@@ -2594,10 +2716,19 @@ def _create_cute_wrapper(
             namespace["_helion_block_scaled_alpha"] = block_scaled_plans[0][
                 "scale_value"
             ]
-    if sm100_recurrence_plans:
+    if prefill_plans:
+        from .chunk_prefill import get_host
+
+        namespace["_helion_chunk_prefill_host"] = get_host(prefill_plans[0])
+    elif sm100_recurrence_plans:
         from ..._compiler.cute.chunk_recurrence_sm100 import host_chain_dv2
 
         namespace["_helion_sm100_chain_host"] = host_chain_dv2
+        if "epoch_kernel" in sm100_recurrence_plans[0]:
+            selected = getattr(cute_kernel, "_helion_cute_epoch_kernel", None)
+            if not callable(selected):
+                raise exc.BackendUnsupported("cute", "missing selected epoch kernel")
+            namespace["_helion_epoch_kernel"] = selected
     elif warp_dv4_recurrence_plans:
         from ..._compiler.cute.chunk_recurrence_dv4_sm100 import _recurrence_entry
 
@@ -2619,6 +2750,11 @@ def _create_cute_wrapper(
         linecache.cache.pop(filename, None)
         raise
     return namespace[func_name]
+
+
+_REQUIRED_NATIVE_CACHE_MISSES: contextvars.ContextVar[list[str] | None] = (
+    contextvars.ContextVar("helion_required_native_cache_misses", default=None)
+)
 
 
 class _CompiledCuteLauncher:
@@ -2662,6 +2798,14 @@ class _CompiledCuteLauncher:
             if self._cache_key is not None:
                 compiled = self._reload_from_disk()
             if compiled is None:
+                misses = _REQUIRED_NATIVE_CACHE_MISSES.get()
+                if misses is not None:
+                    from .native_required import RequiredNativePrecompileError
+
+                    misses.append(str(self._cache_key))
+                    raise RequiredNativePrecompileError(
+                        f"Required native cache missed: {self._cache_key}"
+                    )
                 if self._compile_options is None:
                     compiled = cute.compile(self._jit_func, *args)
                 else:
@@ -2835,6 +2979,8 @@ def _cute_compiled_launcher_discriminator(
     block: tuple[int, int, int],
     compile_options: str | None,
     arch_args: tuple[object, ...] | None,
+    *,
+    pointer_alignment: int = 16,
 ) -> tuple[tuple[object, ...], str, int | None]:
     merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
     num_sm = _cute_num_sm_from_arch_args(arch_args)
@@ -2844,6 +2990,7 @@ def _cute_compiled_launcher_discriminator(
             block,
             merged_compile_options,
             num_sm,
+            pointer_alignment,
         ),
         merged_compile_options,
         num_sm,
@@ -2869,6 +3016,7 @@ def _get_compiled_cute_launcher(
         block,
         compile_options,
         arch_args,
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )
     try:
         # pyrefly: ignore [missing-attribute]
@@ -2945,8 +3093,8 @@ def _cute_disk_cache_key(
     inputs that determine the lowered IR rather than from the IR itself:
     generated device-kernel source, external compiled-helper sources, the
     sources of the Helion helper modules the kernel's globals reference
-    (``referenced_helper_sources``), full input
-    specialization (dtypes, ranks,
+    (``referenced_helper_sources``), Helion's source-content fingerprint, full
+    input specialization (dtypes, ranks,
     pointer alignments, baked shapes/strides, constexpr values), launch shape
     (block/cluster), preferred shared-memory carveout, CuTe compile options,
     the IR-affecting
@@ -2961,6 +3109,8 @@ def _cute_disk_cache_key(
     key; for non-persistent kernels num_sm does not affect codegen, so it only
     costs an occasional cross-GPU miss, never a wrong-kernel reload.
     """
+    from ...autotuner.base_cache import helion_key
+
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
         return None
@@ -2993,6 +3143,10 @@ def _cute_disk_cache_key(
             source_hash,
             helper_sources,
             called_helper_sources,
+            # Generated kernels import device helpers and launcher wrappers.
+            # Their bodies can change without changing generated source, so a
+            # source-only key could reload stale IR after a correctness fix.
+            helion_key(),
             schema_key,
             block,
             wrapper_plans,
@@ -3007,6 +3161,7 @@ def _cute_disk_cache_key(
             cutlass_version,
             num_sm,
             _cute_use_pdl(cute_kernel),
+            _cute_pointer_alignment(cute_kernel),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -3231,6 +3386,8 @@ class _CuteLaunchArgCacheEntry:
     launch_args: tuple[object, ...]
     grouped_static_metadata: tuple[_Tcgen05GroupedStaticMetadataCacheEntry, ...]
     owned_tensors: tuple[torch.Tensor, ...]
+    stream_schedule: PrefillResources | None = None
+    order_args: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -3319,6 +3476,7 @@ class _CuteLastLaunchArgGuard:
     arg_guards: tuple[_CuteLastTensorArgGuard | _CuteLastScalarArgGuard, ...]
     grouped_mutation_guards: tuple[_CuteLastGroupedMutationGuard, ...]
     grouped_launch_contexts: tuple[_CuteGroupedLaunchContext, ...]
+    pointer_alignment: int = 16
 
     def matches(
         self,
@@ -3330,6 +3488,7 @@ class _CuteLastLaunchArgGuard:
             len(args) != self.arg_count
             or grid != self.grid
             or _cute_bake_tensor_shapes_guard(cute_kernel) != self.bake_tensor_shapes
+            or _cute_pointer_alignment(cute_kernel) != self.pointer_alignment
             or _cute_grouped_launch_contexts(cute_kernel, args)
             != self.grouped_launch_contexts
         ):
@@ -3369,7 +3528,7 @@ def _cute_launcher_tensor_layout(
     return arg.ndim, sizes, strides
 
 
-def _cute_pointer_alignment(data_ptr: int) -> int:
+def _cute_data_ptr_alignment(data_ptr: int) -> int:
     """Prove at most 16-byte alignment from the actual argument pointer."""
     return min(16, data_ptr & -data_ptr) if data_ptr else 16
 
@@ -3938,6 +4097,19 @@ def _cute_dynamic_tensormap_contexts(
         contexts.append(
             (layout.device.type, layout.device.index, stream_handle, capture_id)
         )
+    # Mutable prefix checkpoints and sequence-order buffers need the same
+    # origin/capture separation as dynamic descriptors. Both the pointer cache and last-launch guard consume
+    # these contexts, so eager warmup cannot leak scratch into a captured call.
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        if plan.get("kind") == "chunk_prefill_sm100" and (
+            plan.get("schedule", "single") != "single"
+            or plan.get("task_order") == "longest_first_precompute"
+        ):
+            initial = cast("torch.Tensor", args[cast("int", plan["initial_state_idx"])])
+            stream_handle, capture_id = _cuda_stream_capture_context(initial.device)
+            contexts.append(
+                (initial.device.type, initial.device.index, stream_handle, capture_id)
+            )
     return tuple(contexts)
 
 
@@ -4743,11 +4915,32 @@ def _tcgen05_grouped_static_metadata_cache_key(
     )
 
 
+def _cute_pointer_alignment(cute_kernel: object) -> int:
+    """Immutable compiler metadata shared by pointer marshalling and caches."""
+    return cast("int", getattr(cute_kernel, "_helion_cute_pointer_alignment", 16))
+
+
+def _cute_tensor_pointer_alignment(cute_kernel: object, tensor: torch.Tensor) -> int:
+    """Claim the proven pointer alignment, or element alignment when the kernel
+    guards its vector accesses, so element-aligned views share one wrapper."""
+    alignment = _cute_data_ptr_alignment(int(tensor.data_ptr()))
+    kernel_alignment = _cute_pointer_alignment(cute_kernel)
+    if kernel_alignment >= alignment:
+        return alignment
+    return min(alignment, max(kernel_alignment, tensor.element_size()))
+
+
 def _cute_bake_tensor_shapes_guard(cute_kernel: object) -> bool:
     any_obj = cast("Any", cute_kernel)
     wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
+    native_metadata = (
+        getattr(any_obj, "_helion_cute_native_metadata_specialization", False) is True
+    )
     wrapper_plans_disable_bake = bool(wrapper_plans) and any(
-        not _cute_wrapper_plan_bakes_tensor_shapes(plan) for plan in wrapper_plans
+        not _cute_wrapper_plan_bakes_tensor_shapes(
+            plan, native_metadata=native_metadata
+        )
+        for plan in wrapper_plans
     )
     return not bool(
         getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
@@ -5375,7 +5568,12 @@ def _cute_launch_arg_cache_key(
     dynamic_tensormap_contexts: tuple[_CuteGroupedLaunchContext, ...] | None = None,
 ) -> tuple[object, ...]:
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
-    key: list[object] = [len(args), grid, _cute_bake_tensor_shapes_guard(cute_kernel)]
+    key: list[object] = [
+        len(args),
+        grid,
+        _cute_bake_tensor_shapes_guard(cute_kernel),
+        _cute_pointer_alignment(cute_kernel),
+    ]
     if dynamic_tensormap_contexts is None:
         dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     if dynamic_tensormap_contexts:
@@ -5476,6 +5674,10 @@ def _build_cached_cute_schema_and_args(
     args: tuple[object, ...],
     grid: tuple[int, int, int],
 ) -> _CuteLaunchArgCacheEntry:
+    _validate_chained_leaf_arguments(cute_kernel, args)
+    from .horizontal_state import validate_horizontal_state_kernel
+
+    validate_horizontal_state_kernel(cute_kernel, args)
     dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     grouped_launch_contexts = _cute_grouped_launch_contexts(
         cute_kernel,
@@ -5524,17 +5726,23 @@ def _build_cached_cute_schema_and_args(
     return built
 
 
-def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
+def _cute_wrapper_plan_bakes_tensor_shapes(
+    plan: dict[str, object], *, native_metadata: bool = False
+) -> bool:
     kind = str(plan.get("kind", ""))
+    if native_metadata is True and kind == "chained_rectangular_leaf_tma":
+        return True
     if kind in {
         "helion_small_biased_attention",
         "helion_flash_row_mma",
         "helion_warp_mma_gemm",
         "chunk_prepare_tma",
+        "chunk_prefill_sm100",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
         "gdn_recurrence_sm100",
         "gathered_mma_tma",
+        "horizontal_state_tma",
         "block_scaled_mma",
     }:
         return True
@@ -5889,6 +6097,7 @@ def _chunk_recurrence_tensor_map_specs(
         return value
 
     kind = plan.get("kind")
+    state_dtype = plan.get("state_dtype", "bfloat16")
     if (
         kind not in ("chunk_recurrence_sm100", "chunk_recurrence_warp_dv4")
         or plan_int("workspace_layout_version") != 2
@@ -5897,6 +6106,7 @@ def _chunk_recurrence_tensor_map_specs(
         or plan_int("chunk_size") != 16
         or plan_int("key_size") != 128
         or plan_int("value_size") != 128
+        or state_dtype not in ("bfloat16", "float32")
     ):
         raise exc.BackendUnsupported("cute", "unsupported chunk-recurrence ABI")
     total_tokens = plan_int("total_tokens")
@@ -5930,7 +6140,14 @@ def _chunk_recurrence_tensor_map_specs(
         cu_seqlens,
         cu_chunks,
     ) = tuple(_chunk_recurrence_plan_tensor(plan, args, name) for name in names)
+    initial_state = (
+        _chunk_recurrence_plan_tensor(plan, args, "initial_state_idx")
+        if state_dtype == "float32"
+        else state
+    )
+    state_tensors = (state, initial_state) if state_dtype == "float32" else (state,)
     tensors = (kd, qd, ak, aq, g_total, values, output, state, cu_seqlens, cu_chunks)
+    tensors = (*tensors, initial_state)
     if kd.device.type != "cuda" or any(
         tensor.device != kd.device for tensor in tensors
     ):
@@ -5951,7 +6168,16 @@ def _chunk_recurrence_tensor_map_specs(
         (g_total, torch.float32, (heads * total_chunks, 128)),
         (values, torch.bfloat16, (total_tokens * heads, 128)),
         (output, torch.bfloat16, (total_tokens * heads, 128)),
-        (state, torch.bfloat16, (sequences, heads, 128, 128)),
+        (
+            state,
+            torch.float32 if state_dtype == "float32" else torch.bfloat16,
+            (sequences, heads, 128, 128),
+        ),
+        (
+            initial_state,
+            torch.float32 if state_dtype == "float32" else torch.bfloat16,
+            (sequences, heads, 128, 128),
+        ),
         (cu_seqlens, torch.int32, (sequences + 1,)),
         (cu_chunks, torch.int32, (sequences + 1,)),
     )
@@ -6009,19 +6235,27 @@ def _chunk_recurrence_tensor_map_specs(
             raise exc.BackendUnsupported(
                 "cute", f"chunk-recurrence output aliases {name}"
             )
-    for tensor in (*factor_tensors, values, output, cu_seqlens, cu_chunks):
-        if overlaps(state, tensor):
-            raise exc.BackendUnsupported("cute", "chunk-recurrence state aliases input")
+    if state_dtype == "float32" and overlaps(state, initial_state):
+        raise exc.BackendUnsupported(
+            "cute", "FP32 chunk-recurrence states must be disjoint"
+        )
+    for state_tensor in state_tensors:
+        for tensor in (*factor_tensors, values, output, cu_seqlens, cu_chunks):
+            if overlaps(state_tensor, tensor):
+                raise exc.BackendUnsupported(
+                    "cute", "chunk-recurrence state aliases input"
+                )
     factor_begin = kd_ptr
     factor_end = kd_ptr + workspace_bytes
-    for tensor in (values, output, state, cu_seqlens, cu_chunks):
+    for tensor in (values, output, *state_tensors, cu_seqlens, cu_chunks):
         begin, end = byte_range(tensor)
         if begin < factor_end and factor_begin < end:
             raise exc.BackendUnsupported(
                 "cute", "chunk-recurrence factor workspace aliases another argument"
             )
     if any(
-        tensor.data_ptr() % 16 for tensor in (kd, aq, g_total, values, output, state)
+        tensor.data_ptr() % 16
+        for tensor in (kd, aq, g_total, values, output, *state_tensors)
     ):
         raise exc.BackendUnsupported("cute", "chunk-recurrence TMA base is misaligned")
 
@@ -6051,6 +6285,7 @@ def _chunk_recurrence_tensor_map_specs(
         total_chunks=total_chunks,
         sequences=sequences,
         state_ptr=state.data_ptr(),
+        fp32_state=state_dtype == "float32",
     )
 
 
@@ -6085,6 +6320,10 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
 ) -> _CuteLaunchArgCacheEntry:
+    from .chained_startup import validate_arguments
+
+    validate_arguments(cute_kernel, args)
+    _validate_chained_leaf_arguments(cute_kernel, args)
     # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
     # stream is the only launch arg that is not a pure function of
     # (grid, tensor metadata, scalars), so it must not be baked into the cached
@@ -6107,7 +6346,7 @@ def _build_cute_schema_and_args(
             _validate_cute_launcher_tensor(arg)
             ndim, sizes_t, strides_t = _cute_launcher_tensor_layout(arg)
             data_ptr = int(arg.data_ptr())
-            alignment = _cute_pointer_alignment(data_ptr)
+            alignment = _cute_tensor_pointer_alignment(cute_kernel, arg)
             launch_args.append(
                 make_ptr(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
@@ -6174,7 +6413,7 @@ def _build_cute_schema_and_args(
         sizes = tuple(int(tensor.size(d)) for d in range(tensor.ndim))
         strides = tuple(int(tensor.stride(d)) for d in range(tensor.ndim))
         data_ptr = int(tensor.data_ptr())
-        alignment = _cute_pointer_alignment(data_ptr)
+        alignment = _cute_tensor_pointer_alignment(cute_kernel, tensor)
         launch_args.append(
             make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
@@ -6339,6 +6578,37 @@ def _build_cute_schema_and_args(
             launch_args.append(address)
         owned_tensors.append(storage)
 
+    prefill_plans = [
+        plan
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "chunk_prefill_sm100"
+    ]
+    stream_schedule = None
+    order_args = None
+    for plan in prefill_plans:
+        from .chunk_prefill import prefill_resources
+        from .chunk_prefill import validate_args
+
+        validate_args(plan, args)
+        if (
+            plan.get("schedule", "single") != "single"
+            or plan.get("task_order") == "longest_first_precompute"
+        ):
+            stream_schedule = prefill_resources(cute_kernel, plan, args)
+            if stream_schedule.order is not None:
+                append_wrapper_tensor(
+                    "_prefill_order", stream_schedule.order, owned=True
+                )
+                order_args = (
+                    cast("torch.Tensor", args[cast("int", plan["cu_seqlens_idx"])]),
+                    stream_schedule.order,
+                )
+            for index, tensor in enumerate(stream_schedule.states):
+                append_wrapper_tensor(f"_prefill_state{index}", tensor, owned=True)
+            cuda_driver = importlib.import_module("cuda.bindings.driver")
+            for index, stream in enumerate(stream_schedule.streams):
+                schema.append(("wrapper_host_stream", f"_prefill_stream{index}"))
+                launch_args.append(cuda_driver.CUstream(stream.cuda_stream))
     sm100_recurrence_plans = [
         cast("dict[str, object]", plan)
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
@@ -6374,6 +6644,8 @@ def _build_cute_schema_and_args(
         launch_args=tuple(launch_args),
         grouped_static_metadata=tuple(grouped_static_metadata),
         owned_tensors=tuple(owned_tensors),
+        stream_schedule=stream_schedule,
+        order_args=order_args,
     )
 
 
@@ -6483,6 +6755,7 @@ def _cute_last_launch_arg_guard(
         arg_guards=tuple(arg_guards),
         grouped_mutation_guards=tuple(grouped_mutation_guards),
         grouped_launch_contexts=_cute_grouped_launch_contexts(cute_kernel, args),
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )
 
 
@@ -6541,6 +6814,7 @@ class _CuteFastRelaunch:
         "keepalive",
         "last_raw",
         "lock",
+        "pointer_alignment",
         "scalar_guards",
         "tensor_guards",
         "tensor_slots",
@@ -6575,6 +6849,7 @@ class _CuteFastRelaunch:
         device_index: int,
         last_raw: int,
         keepalive: tuple[object, ...],
+        pointer_alignment: int = 16,
     ) -> None:
         self.executor = executor
         self.exe_args = exe_args
@@ -6591,6 +6866,7 @@ class _CuteFastRelaunch:
         self.device_index = device_index
         self.last_raw = last_raw
         self.keepalive = keepalive
+        self.pointer_alignment = pointer_alignment
         self.lock = threading.Lock()
 
     def try_launch(
@@ -6599,12 +6875,14 @@ class _CuteFastRelaunch:
         grid: tuple[int, int, int],
         block: tuple[int, int, int],
         compile_options: str | None,
+        pointer_alignment: int = 16,
     ) -> tuple[bool, object]:
         if (
             len(args) != self.arg_count
             or grid != self.grid
             or block != self.block
             or compile_options != self.compile_options
+            or pointer_alignment != self.pointer_alignment
         ):
             return _CUTE_FASTPATH_MISS
         for (
@@ -6713,12 +6991,15 @@ def _cute_build_fast_relaunch(
     if any(
         plan.get("kind")
         in {
+            "chained_startup_tma",
             "chunk_prepare_tma",
             "chunk_recurrence_sm100",
             "chunk_recurrence_warp_dv4",
             "gdn_recurrence_sm100",
             "gathered_mma_tma",
             "block_scaled_mma",
+            "chained_paired_leaf_tma",
+            "chained_rectangular_leaf_tma",
         }
         for plan in wrapper_plans
     ):
@@ -6932,6 +7213,7 @@ def _cute_build_fast_relaunch(
             device_index=device_index,
             last_raw=raw0,
             keepalive=(base, stream_a, adapted1, exe1),
+            pointer_alignment=_cute_pointer_alignment(cute_kernel),
         )
     except Exception:
         return None
@@ -6954,6 +7236,7 @@ def _cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )[0]
     if discriminator != entry.compiled_discriminator:
         return None
@@ -6979,6 +7262,7 @@ def _set_cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )[0]
     cast("Any", cute_kernel)._helion_cute_last_launch_cache = _CuteLastLaunchCacheEntry(
         arg_guard=arg_guard,
@@ -6986,6 +7270,50 @@ def _set_cute_last_launch_cache_entry(
         launch=launch,
         compiled=compiled,
     )
+
+
+def _launch_cute_entry(compiled: object, launch: _CuteLaunchArgCacheEntry) -> object:
+    resources = launch.stream_schedule
+    if resources is None:
+        return cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+    origin = torch.cuda.current_stream(resources.device)
+    # Serialize only host submissions sharing scratch on the same origin.
+    # Other origin streams have distinct resources and remain independent.
+    with resources.lock:
+        if launch.order_args is not None:
+            from ..._compiler.cute.sequence_order import SEQUENCE_ORDER_THREADS
+
+            # Sorting is part of every timed/captured call. The ready event
+            # is recorded afterward, so segmented workers cannot read stale order.
+            sequences = launch.order_args[1].numel()
+            default_cute_launcher(
+                resources.order_kernel,
+                ((sequences + SEQUENCE_ORDER_THREADS - 1) // SEQUENCE_ORDER_THREADS,),
+                *launch.order_args,
+                block=(SEQUENCE_ORDER_THREADS, 1, 1),
+            )
+        resources.fork(origin)
+        try:
+            return cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+        finally:
+            # Joining on the freshly sampled origin preserves normal stream
+            # ordering and makes allocator record_stream ownership sufficient.
+            resources.join(origin)
+
+
+def _validate_chained_leaf_arguments(
+    cute_kernel: object, args: tuple[object, ...]
+) -> None:
+    """Recheck leaf TensorMap alignment and independence before caches."""
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        if plan.get("kind") == "chained_paired_leaf_tma":
+            from .chained_leaf_pipeline import validate_plan
+
+            validate_plan(plan, args)
+        elif plan.get("kind") == "chained_rectangular_leaf_tma":
+            from .chained_rectangular_leaf import validate_plan
+
+            validate_plan(plan, args)
 
 
 def default_cute_launcher(
@@ -7020,6 +7348,13 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
+    from .chained_startup import validate_arguments
+
+    validate_arguments(cute_kernel, args_tuple)
+    _validate_chained_leaf_arguments(cute_kernel, args_tuple)
+    from .horizontal_state import validate_horizontal_state_kernel
+
+    validate_horizontal_state_kernel(cute_kernel, args_tuple)
     # Metadata-guarded fast relaunch: skips the pointer-keyed caches AND the
     # DSL's per-call marshalling entirely (fresh output allocations change
     # tensor pointers on every call in real workloads, so pointer-keyed
@@ -7027,7 +7362,11 @@ def default_cute_launcher(
     fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
     if isinstance(fastpath, _CuteFastRelaunch):
         hit, result = fastpath.try_launch(
-            args_tuple, grid_xyz, block_xyz, cute_compile_options
+            args_tuple,
+            grid_xyz,
+            block_xyz,
+            cute_compile_options,
+            _cute_pointer_alignment(cute_kernel),
         )
         if hit:
             return result
@@ -7070,10 +7409,7 @@ def _launch_cute_marshalled(
             owned_tensors=last_launch.launch.owned_tensors,
         )
         _record_cute_owned_launch_tensors(last_launch.launch.owned_tensors)
-        return cast("Any", last_launch.compiled)(
-            *last_launch.launch.launch_args,
-            _cute_current_stream(),
-        )
+        return _launch_cute_entry(last_launch.compiled, last_launch.launch)
 
     launch = _build_cached_cute_schema_and_args(cute_kernel, args_tuple, grid_xyz)
     compiled = _get_compiled_cute_launcher(
@@ -7087,7 +7423,7 @@ def _launch_cute_marshalled(
     # Append the CUDA stream fresh on every launch (never cached): under CUDA
     # graph capture the current stream is the capture stream, so the kernel must
     # be issued there and not on a stale stream baked into the cached args.
-    result = cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+    result = _launch_cute_entry(compiled, launch)
     _set_cute_last_launch_cache_entry(
         cute_kernel,
         args_tuple,

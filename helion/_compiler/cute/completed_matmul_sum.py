@@ -17,7 +17,10 @@ from ..compile_environment import CompileEnvironment
 from ..device_ir import ForLoopGraphInfo
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..aten_lowering import LoweringContext
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..helper_function import CodegenInterface
 
@@ -85,6 +88,12 @@ def _fp32_shape(node: Node) -> tuple[object, ...] | None:
 def match_matmul_sum_path(
     cg: GenerateAST, producer: Node, n_block_id: int, n_extent: int
 ) -> MatmulSumPath | None:
+    return _match_matmul_sum_path(cg.codegen_graphs, producer, n_block_id, n_extent)
+
+
+def _match_matmul_sum_path(
+    graphs: Sequence[GraphInfo], producer: Node, n_block_id: int, n_extent: int
+) -> MatmulSumPath | None:
     """Prove one zero-initialized FP32 carry reaches only its final N sum.
 
     GraphInfo.node_args can belong to the pre-codegen graph. Follow the current
@@ -130,7 +139,7 @@ def match_matmul_sum_path(
         or _fp32_shape(placeholder) != shape
     ):
         return None
-    bodies = [info for info in cg.codegen_graphs if info.graph is producer.graph]
+    bodies = [info for info in graphs if info.graph is producer.graph]
     if len(bodies) != 1 or not isinstance(bodies[0], ForLoopGraphInfo):
         return None
     body = bodies[0]
@@ -149,7 +158,7 @@ def match_matmul_sum_path(
         return None
     callers = [
         node
-        for info in cg.codegen_graphs
+        for info in graphs
         for node in info.graph.nodes
         if node.op == "call_function"
         and _tracing_ops.is_for_loop_target(node.target)
@@ -255,6 +264,39 @@ def match_matmul_sum_path(
         n_block_id,
         n_extent,
     )
+
+
+def candidate_matmul_sum_paths(
+    graphs: Sequence[GraphInfo],
+) -> tuple[MatmulSumPath, ...]:
+    """Closed matrix carries eligible for the existing per-node N-fold route.
+
+    This is only a route proposal. The code generator must emit the full N
+    fold and record its actual completion before its consumer can reuse it.
+    """
+    from ..inductor_lowering import ReductionLowering
+
+    blocks = {
+        lowering.block_index
+        for graph in graphs
+        for node in graph.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+        and lowering.reduction_type == "sum"
+    }
+    result = []
+    for graph in graphs:
+        for node in graph.graph.nodes:
+            if node.target is not torch.ops.aten.baddbmm.default:
+                continue
+            shape = _fp32_shape(node)
+            if shape is None or len(shape) != 3 or type(shape[-1]) is not int:
+                continue
+            for block in sorted(blocks):
+                path = _match_matmul_sum_path(graphs, node, block, shape[-1])
+                if path is not None:
+                    result.append(path)
+                    break
+    return tuple(result)
 
 
 def record_completed_matmul_sum(

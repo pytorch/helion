@@ -131,6 +131,7 @@ basic_kernels = import_path(datadir / "basic_kernels.py")
 _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 _TEST_CUTE_FLASH_BACKEND = SimpleNamespace(
+    supports_precompile=lambda: True,
     generated_source_hash=lambda _fn: None,
     autotune_config_is_viable=lambda _config_spec, _config: True,
 )
@@ -138,6 +139,7 @@ _TEST_CUTE_FLASH_BACKEND = SimpleNamespace(
 
 def _cute_flash_test_config_spec() -> SimpleNamespace:
     return SimpleNamespace(
+        backend_name="cute",
         cute_flash_search_enabled=True,
         compiler_coverage_groups=(),
         backend=_TEST_CUTE_FLASH_BACKEND,
@@ -171,6 +173,24 @@ def _stub_flash_conditional_proposals(search: LFBOPatternSearch) -> None:
         return parent, [item for item in proposed if item.config != parent.config], {}
 
     search._flash_conditional_parent_candidates = candidates
+
+
+def _lfbo_search_fixture() -> LFBOPatternSearch:
+    """Initialize objective state for tests of isolated search operations."""
+    search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+    search._objective_training_configs = None
+    return search
+
+
+def _pattern_search_fixture() -> PatternSearch:
+    """Provide the ordinary search interface without binding a GPU kernel."""
+    search = PatternSearch.__new__(PatternSearch)
+    search.settings = Settings(autotune_precompile=None)
+    search.config_spec = SimpleNamespace(
+        backend_name="triton", cute_flash_search_enabled=False
+    )
+    search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+    return search
 
 
 # Pin the arch for config-population goldens: the pointwise seed promotes to the
@@ -497,6 +517,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         config_spec = SimpleNamespace(
             default_config=lambda: helion.Config(block_sizes=[1]),
             cute_flash_search_enabled=False,
+            backend_name="triton",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 supports_precompile=lambda: True,
@@ -2022,11 +2043,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ]
 
         best = make_member(0, 10.0)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.args = ()
         search.best_perf_so_far = best.perf
         search.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: fn.source_hash,
             ),
@@ -2057,7 +2079,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             num_configs_tested=100,
             search_phase_metrics={},
         )
-        search.settings = SimpleNamespace(
+        search.settings = Settings(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=None,
             autotune_timing_method="default",
@@ -2192,14 +2214,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     def test_lfbo_flash_terminal_coordinate_refinement_skips_multi_shape(self):
         best = Mock(spec=PopulationMember)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.args = ()
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
         search._cute_flash_lane_policy_enabled = True
         search._autotune_metrics = SimpleNamespace(search_phase_metrics={})
-        search.settings = SimpleNamespace(
+        search.settings = Settings(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=None,
         )
@@ -2216,9 +2238,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             config=helion.Config(block_sizes=[1, 128, 128]),
             status="ok",
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.args = ()
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True, backend_name="cute"
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -2229,7 +2253,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             num_configs_tested=100,
             search_phase_metrics={},
         )
-        search.settings = SimpleNamespace(
+        search.settings = Settings(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=None,
         )
@@ -2266,7 +2290,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             status="error",
         )
         search = PopulationBasedSearch.__new__(PopulationBasedSearch)
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True, backend_name="cute"
+        )
         search._terminal_refinement_members = {}
         search._pinned_finalist_configs = set()
         search._pinned_finalist_members = {}
@@ -2319,14 +2345,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             config=helion.Config(block_sizes=[1]),
             status="ok",
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.args = ()
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
         search._cute_flash_lane_policy_enabled = True
         search._autotune_metrics = SimpleNamespace(search_phase_metrics={})
-        search.settings = SimpleNamespace(
+        search.settings = Settings(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=1.0,
         )
@@ -2392,11 +2418,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 ]
             return []
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.args = ()
         search.best_perf_so_far = best.perf
         search.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             backend=SimpleNamespace(generated_source_hash=lambda _fn: None),
         )
         search.config_gen = SimpleNamespace(
@@ -2429,7 +2456,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             num_generations=20,
             search_phase_metrics={},
         )
-        search.settings = SimpleNamespace(
+        search.settings = Settings(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=None,
             autotune_timing_method="default",
@@ -2508,7 +2535,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
     def test_pattern_search_block_size_pair_neighbors(self):
-        search = PatternSearch.__new__(PatternSearch)
+        search = _pattern_search_fixture()
         search._visited = set()
         search.config_gen = SimpleNamespace(
             flat_spec=[
@@ -2545,7 +2572,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     def test_pattern_search_skips_overridden_indices(self):
         """Neighbors are not generated along overridden (frozen) indices."""
-        search = PatternSearch.__new__(PatternSearch)
+        search = _pattern_search_fixture()
         search._visited = set()
         search.config_gen = SimpleNamespace(
             flat_spec=[
@@ -2713,6 +2740,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             status="error",
             compile_time=None,
             measurement=None,
+            objective_measurement=None,
         )
 
         with patch.object(search, "benchmark_batch", return_value=[result]):
@@ -2727,7 +2755,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     def test_lfbo_pattern_search_skips_overridden_indices(self):
         """LFBOPatternSearch._generate_neighbors skips overridden indices."""
         random.seed(123)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.num_neighbors = 50
         search.radius = 2
         search.config_gen = SimpleNamespace(
@@ -2777,7 +2805,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         clc = member(1.0, "fa4_clc", "1x1", 5)
         tma_4d = member(5.0, "fa4_tma_4d", "1x1", 6)
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 8
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -2884,7 +2912,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             degree1,
             unqualified,
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search._flash_qualified_compound_config_ids = {
             flash_structural_leaf_from_config(degree2.config.config): {
@@ -2938,7 +2966,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             unrestricted_family_base,
             unrestricted_winner,
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -2993,7 +3021,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         whole_row = member(1.0, True)
         chunked = member(1.1, False)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 3
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3056,7 +3084,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             workload_key=("test",),
         )
         non_flash_kernel = SimpleNamespace(
-            config_spec=SimpleNamespace(cute_flash_search_enabled=False),
+            config_spec=SimpleNamespace(
+                cute_flash_search_enabled=False, backend_name="triton"
+            ),
             settings=Settings(autotune_budget_seconds=None),
         )
         with (
@@ -3121,7 +3151,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         clc = member(3.0, "fa4_clc", "1x1", 5)
         tma = member(3.1, "fa4_tma_4d", "1x1", 6)
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 6
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3202,7 +3232,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 )
             )
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 5
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3249,7 +3279,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             member(1.2, "fa4_clc", "1x1", 4),
             member(1.3, "fa4_tma_4d", "1x1", 5),
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3313,7 +3343,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             member(1.2, "fa4_clc", "1x1", 4),
             member(1.3, "fa4_tma_4d", "1x1", 5),
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3365,7 +3395,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             member(1.2, "fa4_clc", "1x1", 4),
             member(1.3, "fa4_tma_4d", "1x1", 5),
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3408,7 +3438,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         winner = member(0.5, "fa4_2cta", "deg2_16x6", 0)
         ordinary = member(1.0, "fa4", "1x1", 1)
         compound_only_filler = member(1.1, "fa4_2cta", "deg1_16x8", 2)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 5
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3493,7 +3523,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 retained_candidates_per_leaf=policy.retained_candidates_per_leaf,
             )
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = capacity
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3552,7 +3582,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         competitive = member(1.3, "fa4_2cta", "1x1", 3)
         dominated = member(2.01, "ws_overlap", "1x1", 4)
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 5
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3614,7 +3644,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         expected = sorted(
             population, key=lambda item: canonical_config_id(item.config)
         )[:2]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 3
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3669,7 +3699,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             member(1.2, 4, 3),
             member(1.3, 5, 4),
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
@@ -3779,7 +3809,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         global_leaf = flash_structural_leaf_from_config(global_winner.config.config)
         assert global_leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
         policy = get_effort_profile("full").flash_structural_search
@@ -3908,7 +3938,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         ordinary_leaf = flash_structural_leaf_from_config(ordinary_kv2.config.config)
         assert ordinary_leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
         policy = get_effort_profile("full").flash_structural_search
@@ -3990,7 +4020,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(sum(limits), 300)
         self.assertEqual(limits, [75, 150, 75])
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.num_neighbors = 200
         search.num_neighbors_cap = -1
         self.assertEqual(search._flash_qualification_neighbor_limit(), 200)
@@ -4049,7 +4079,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -4173,7 +4203,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -4257,7 +4287,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -4352,7 +4382,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         initial = [member(0), member(1)]
         leaf = flash_structural_leaf_from_config(initial[0].config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -4435,7 +4465,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -4517,7 +4547,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generation.flash_low_confound_schedule_anchor_configs = list
         generation.flash_pipeline_lane_catalog = lambda: {leaf: ()}
         generation.flash_clc_lane_catalog = dict
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = generation
         search.copies = 5
@@ -4589,7 +4619,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             searchable.config,
             *(child.config for child in children),
         ]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -4812,7 +4842,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
         def make_search(generation):
-            search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+            search = _lfbo_search_fixture()
             search.config_gen = generation
 
             def make_unbenchmarked(flat):
@@ -5218,7 +5248,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             config=config,
             status="ok",
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_gen = SimpleNamespace(
             flash_pipeline_lane_witnesses=lambda: {(leaf, stage_key, 3): config},
             flatten=Mock(return_value=flat),
@@ -5250,7 +5280,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
 
         population = [member(0, 1.0), member(1, 2.0)]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.copies = 2
         search.config_spec = _cute_flash_test_config_spec()
         search.flash_structural_search = get_effort_profile(
@@ -5286,7 +5316,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         winning_child = member(None, "fa4", 2)
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.copies = 5
         search.num_neighbors = 300
@@ -5450,7 +5480,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         }
         assert all(leaf is not None for leaf in leaves.values())
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.copies = 14
         search._flash_promoted_path_limit = 14
@@ -5591,7 +5621,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         declined_child = member(None, 2)
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.copies = 5
         search.num_neighbors = 300
@@ -5682,7 +5712,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         declined_child = member(None, 2)
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -5764,7 +5794,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         conditional_children = {stage: member(None, stage, 1) for stage in (2, 3)}
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.copies = 5
         search.num_neighbors = 300
@@ -5933,7 +5963,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         leaf = flash_structural_leaf_from_config(failed.config.config)
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -6074,7 +6104,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         leaf = flash_structural_leaf_from_config(failed_witness.config.config)
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -6209,7 +6239,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             leaf = flash_structural_leaf_from_config(failed_witness.config.config)
             assert leaf is not None
 
-            search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+            search = _lfbo_search_fixture()
             search.config_spec = _cute_flash_test_config_spec()
             search.config_gen = SimpleNamespace(
                 encode_config=lambda flat: flat,
@@ -6329,9 +6359,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         leaf = flash_structural_leaf_from_config(failed_witnesses[2].config.config)
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: source_hashes.get(id(fn))
             ),
@@ -6482,7 +6513,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         leaf = flash_structural_leaf_from_config(base.config.config)
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -6635,7 +6666,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             leaf = flash_structural_leaf_from_config(witness.config.config)
             assert leaf is not None
 
-            search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+            search = _lfbo_search_fixture()
             search.config_spec = _cute_flash_test_config_spec()
             search.config_gen = SimpleNamespace(
                 encode_config=lambda flat: flat,
@@ -6800,7 +6831,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -7033,7 +7064,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         }
         leaf = flash_structural_leaf_from_config(initial[0].config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             _key_to_flat_indices={
@@ -7197,7 +7228,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertIsNotNone(orphan_leaf.compound_exp2_packet)
         self.assertNotEqual(ordinary_leaf.softmax_disc, orphan_leaf.softmax_disc)
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -7310,7 +7341,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         compound_leaf = flash_structural_leaf_from_config(transfers[0].config.config)
         assert ordinary_leaf is not None and compound_leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -7605,7 +7636,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         initial = [member(1), member(2)]
         leaf = flash_structural_leaf_from_config(initial[0].config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -7713,7 +7744,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         }
         leaf = flash_structural_leaf_from_config(anchors[0].config.config)
         assert leaf is not None
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -7895,7 +7926,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         leaf = flash_structural_leaf_from_config(initial.config.config)
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -8197,7 +8228,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         leaf = flash_structural_leaf_from_config(depth_2.config.config)
         assert leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
@@ -8321,7 +8352,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertTrue(metrics["completed"])
 
     def test_lfbo_only_full_flash_unrestricted_path_exhausts_budget(self):
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = _cute_flash_test_config_spec()
         search.flash_structural_search = get_effort_profile(
             "full"
@@ -8338,18 +8369,22 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             "quick"
         ).flash_structural_search
         self.assertFalse(search._path_exhausts_generation_budget(()))
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False, backend_name="triton"
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
         self.assertFalse(search._path_exhausts_generation_budget(()))
 
     def test_lfbo_pipeline_qualification_is_flash_policy_gated(self):
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.max_generations = 20
         search.config_gen = Mock()
 
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False, backend_name="triton"
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -8381,7 +8416,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             current = member(0)
             neighbors = iter(member(index) for index in range(1, 10))
-            search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+            search = _lfbo_search_fixture()
             search.max_generations = 4
             search.patience = 0
             search.frac_selected = 1.0
@@ -8430,7 +8465,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             config=config,
             status="ok",
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         search.best_available_pad_random = True
         search.initial_population = 1
@@ -8458,7 +8493,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_configs = None
         search.train_source_hashes = None
         search._fit_surrogate = Mock()
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False, backend_name="triton"
+        )
         search._cute_flash_lane_policy_enabled = False
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._finalize = lambda: config
@@ -8484,7 +8521,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
 
         generated = [member(0, 2.0), member(1, 1.0)]
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         search.best_available_pad_random = True
         search.initial_population = 1
@@ -8552,7 +8589,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         constrained_leaf = flash_structural_leaf_from_config(constrained.config.config)
         assert constrained_leaf is not None
         constraints = LFBOPatternSearch._flash_leaf_constraints(constrained_leaf)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         search.best_available_pad_random = True
         search.initial_population = 1
@@ -8617,7 +8654,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             config=config,
             status="ok",
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
         search.best_available_pad_random = True
         search.initial_population = 1
@@ -8690,9 +8727,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=([-1], [4])),
         )
-        search = PatternSearch.__new__(PatternSearch)
+        config_gen.compiler_coverage_enabled = False
+        search = _pattern_search_fixture()
         search.config_spec = config_gen.config_spec
         search.config_gen = config_gen
+        search.config_spec = config_gen.config_spec
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
         )
@@ -8733,8 +8772,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=AssertionError("quick search must not pad")),
         )
-        search = PatternSearch.__new__(PatternSearch)
+        config_gen.compiler_coverage_enabled = False
+        search = _pattern_search_fixture()
         search.config_gen = config_gen
+        search.config_spec = config_gen.config_spec
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
         )
@@ -8765,6 +8806,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         exact_space = Mock(return_value=exact_configs)
         config_gen = ConfigGeneration.__new__(ConfigGeneration)
+        config_gen.compiler_coverage_enabled = False
         config_gen.config_spec = _cute_flash_test_config_spec()
         config_gen._config_value_priors = {}
         config_gen.default_flat = lambda: [0]
@@ -8786,8 +8828,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             side_effect=AssertionError("an enumerated space must not draw randomly")
         )
 
-        random_search = PatternSearch.__new__(PatternSearch)
+        random_search = _pattern_search_fixture()
         random_search.config_gen = config_gen
+        random_search.config_spec = config_gen.config_spec
         random_search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_RANDOM
         )
@@ -8802,8 +8845,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             for flat in dict.fromkeys(tuple(flat) for flat in random_population)
         ]
 
-        best_search = PatternSearch.__new__(PatternSearch)
+        best_search = _pattern_search_fixture()
         best_search.config_gen = config_gen
+        best_search.config_spec = config_gen.config_spec
         best_search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
         )
@@ -8849,8 +8893,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=AssertionError("population is complete")),
         )
-        search = PatternSearch.__new__(PatternSearch)
+        config_gen.compiler_coverage_enabled = False
+        search = _pattern_search_fixture()
         search.config_gen = config_gen
+        search.config_spec = config_gen.config_spec
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
         )
@@ -9021,7 +9067,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         retained = member(3, "deg2_16x6")
         unselected = member(4, "deg2_16x6")
         by_flat = {2: rejected, 3: retained, 4: unselected}
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.max_generations = 1
         search.patience = 1
         search.frac_selected = 1.0
@@ -9146,7 +9192,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         required_leaf = LFBOPatternSearch._flash_structural_leaf(current)
         assert required_leaf is not None
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.max_generations = 1
         search.patience = 1
         search.frac_selected = 1.0
@@ -9179,7 +9225,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     def test_lfbo_pattern_search_generate_neighbors(self):
         """Test LFBOPatternSearch._generate_neighbors method."""
         random.seed(123)
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.num_neighbors = 50
         search.radius = 2
         search.config_gen = SimpleNamespace(
@@ -9335,7 +9381,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )[:n_sorted]
             return [member for member, _ in ranked]
 
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_gen = SimpleNamespace(encode_config=lambda flat: [flat[0]])
         search.similarity_penalty = 0.35
         search.log = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
@@ -13303,6 +13349,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             backend_name="cute",
             cute_flash_search_enabled=True,
         )
+        search.config_gen = SimpleNamespace(compiler_coverage_enabled=False)
         search.initial_population = pattern.initial_population
         search.copies = pattern.copies
         search.max_generations = max_generations
@@ -13715,6 +13762,8 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             RandomSearch,
         )
         aliases = {"benchmark_provider_cls": "benchmark_provider"}
+        # Objective inputs belong to the workload domain key, not the algorithm.
+        runtime_parameters = {"benchmark_objective", "objective_timing"}
         secrets = {
             LLMGuidedSearch: {"api_key"},
         }
@@ -13735,9 +13784,15 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                     for name in inspect.signature(search_cls.__init__).parameters
                     if name not in {"self", "kernel", "args"}
                 }
+                for name in parameters & runtime_parameters:
+                    self.assertIsNone(
+                        inspect.signature(search_cls.__init__).parameters[name].default
+                    )
                 search = object.__new__(search_cls)
+                search.settings = Settings(backend="cute", autotune_precompile=None)
                 search.config_spec = _cute_flash_test_config_spec()
-                for name in parameters | inherited_fields:
+                search.config_gen = SimpleNamespace(compiler_coverage_enabled=False)
+                for name in (parameters - runtime_parameters) | inherited_fields:
                     setattr(search, name, 1)
                 if hasattr(search, "flash_structural_search"):
                     search.flash_structural_search = get_effort_profile(
@@ -13755,7 +13810,9 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                 policy_keys = set(policy)
                 classified = {
                     aliases.get(name, name)
-                    for name in parameters - secrets.get(search_cls, set())
+                    for name in parameters
+                    - secrets.get(search_cls, set())
+                    - runtime_parameters
                 }
                 self.assertLessEqual(classified, policy_keys)
 
@@ -13958,6 +14015,10 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
         # external ``Cache(autotuner)`` constructor path.
         class _MinimalSearch:
             timing_policy = None
+            objective_benchmark = None
+
+            def requires_search_policy_cache_key(self) -> bool:
+                return False
 
             def _validate_timing_policy(self):
                 validate_timing_policy(self.timing_policy, None, self.settings)
@@ -13999,6 +14060,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
 
         config = helion.Config(block_sizes=[16])
         search = SimpleNamespace(
+            objective_benchmark=None,
             settings=helion.Settings(autotune_best_of_k=1),
             autotune=Mock(return_value=config),
         )
@@ -14026,6 +14088,10 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
 
         class MockTrialSearch:
             timing_policy = None
+            objective_benchmark = None
+
+            def requires_search_policy_cache_key(self) -> bool:
+                return False
 
             def _validate_timing_policy(self):
                 validate_timing_policy(self.timing_policy, None, self.settings)
@@ -14115,6 +14181,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
             autotune_log_level=0,
         )
         search = SimpleNamespace(
+            objective_benchmark=None,
             settings=settings,
             log=Mock(),
             config_spec=_cute_flash_test_config_spec(),
@@ -14153,6 +14220,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
             autotune_log_level=0,
         )
         search = SimpleNamespace(
+            objective_benchmark=None,
             settings=settings,
             log=Mock(),
             config_spec=_cute_flash_test_config_spec(),
@@ -14191,6 +14259,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
             autotune_log_level=0,
         )
         search = SimpleNamespace(
+            objective_benchmark=None,
             settings=settings,
             log=Mock(),
             config_spec=_cute_flash_test_config_spec(),
@@ -14229,9 +14298,12 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
             autotune_log_level=0,
         )
         search = SimpleNamespace(
+            objective_benchmark=None,
             settings=settings,
             log=Mock(),
-            config_spec=SimpleNamespace(cute_flash_search_enabled=False),
+            config_spec=SimpleNamespace(
+                cute_flash_search_enabled=False, backend_name="triton"
+            ),
         )
         cache = LocalAutotuneCache.__new__(LocalAutotuneCache)
         cache.autotuner = search
@@ -14267,6 +14339,10 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
 
         class MockSearch:
             timing_policy = None
+            objective_benchmark = None
+
+            def requires_search_policy_cache_key(self) -> bool:
+                return False
 
             def _validate_timing_policy(self):
                 validate_timing_policy(self.timing_policy, None, self.settings)
@@ -14368,6 +14444,10 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
 
         class SingleTrialSearch:
             timing_policy = None
+            objective_benchmark = None
+
+            def requires_search_policy_cache_key(self) -> bool:
+                return False
 
             def _validate_timing_policy(self):
                 validate_timing_policy(self.timing_policy, None, self.settings)
@@ -14732,8 +14812,10 @@ class TestSeedPopulationFallback(TestCase):
                 search_config.initial_population_strategy, "from_best_available"
             )
             self.assertFalse(search_config.best_available_pad_random)
-        spec = SimpleNamespace(cute_flash_search_enabled=False)
-        flash_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        spec = SimpleNamespace(cute_flash_search_enabled=False, backend_name="triton")
+        flash_spec = SimpleNamespace(
+            cute_flash_search_enabled=True, backend_name="cute"
+        )
         best_available = InitialPopulationStrategy.FROM_BEST_AVAILABLE
         self.assertEqual(
             random_fallback_population_target(best_available, False, spec, 30), 30
@@ -15182,10 +15264,14 @@ class TestAutotuneBudget(TestCase):
         # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
         # its attributes, so new __init__ fields don't need to be added here.
         config_spec = SimpleNamespace(
-            backend=SimpleNamespace(supports_precompile=lambda: True),
             default_config=lambda: helion.Config(block_sizes=[1]),
             compiler_seed_timeout_retry_repetitions=None,
             cute_flash_search_enabled=False,
+            backend_name="triton",
+            backend=SimpleNamespace(
+                supports_precompile=lambda: True,
+                get_do_bench=lambda: None,
+            ),
         )
         kernel = SimpleNamespace(
             settings=settings,
@@ -15490,7 +15576,9 @@ class TestAutotuneBudget(TestCase):
         search._pinned_finalist_configs = set()
         search._pinned_finalist_members = {}
         search.population = []
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True, backend_name="cute"
+        )
         search.kernel = SimpleNamespace(
             env=SimpleNamespace(process_group_name="autotune")
         )
@@ -15577,6 +15665,7 @@ class TestAutotuneBudget(TestCase):
         provider.settings.autotune_precompile = None
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=False,
+            backend_name="triton",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 should_deduplicate_generated_sources=lambda config_spec: False
@@ -15619,6 +15708,7 @@ class TestAutotuneBudget(TestCase):
 
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=generated_source_hash,
@@ -15715,6 +15805,7 @@ class TestAutotuneBudget(TestCase):
         provider.settings.autotune_progress_bar = False
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: fn.source_hash,
@@ -15791,7 +15882,7 @@ class TestAutotuneBudget(TestCase):
             failed_config,
             status=results[1].status,
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.config_spec = provider.config_spec
         self.assertEqual(
             search._flash_terminal_member_result(failed_member)["source_hash"],
@@ -15812,6 +15903,7 @@ class TestAutotuneBudget(TestCase):
         provider.settings.autotune_progress_bar = False
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: fn.source_hash,
@@ -15892,6 +15984,7 @@ class TestAutotuneBudget(TestCase):
         provider.settings.autotune_progress_bar = False
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: fn.source_hash,
@@ -15933,6 +16026,7 @@ class TestAutotuneBudget(TestCase):
         provider = self._make_stub_provider()
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: fn.source_hash,
@@ -16015,6 +16109,7 @@ class TestAutotuneBudget(TestCase):
         provider = self._make_stub_provider()
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=3,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: "shared",
@@ -16043,6 +16138,7 @@ class TestAutotuneBudget(TestCase):
         provider = self._make_stub_provider()
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=3,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: "shared",
@@ -16091,6 +16187,7 @@ class TestAutotuneBudget(TestCase):
 
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=generated_source_hash,
@@ -16137,6 +16234,7 @@ class TestAutotuneBudget(TestCase):
         provider = self._make_stub_provider()
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=False,
+            backend_name="triton",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: "shared",
@@ -16163,6 +16261,7 @@ class TestAutotuneBudget(TestCase):
         provider = self._make_stub_provider()
         provider.config_spec = SimpleNamespace(
             cute_flash_search_enabled=True,
+            backend_name="cute",
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 generated_source_hash=lambda fn: "shared",
@@ -16374,7 +16473,7 @@ class TestAutotuneBudget(TestCase):
             compile_time=None,
             measurement=None,
         )
-        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search = _lfbo_search_fixture()
         search.population = [member]
         search._compiler_seed_members = []
         search._benchmarked_members = {}
@@ -17060,7 +17159,9 @@ class TestPolishDescent(TestCase):
     def _make_search(self, polish_rounds: int) -> LFBOTreeSearch:
         search = object.__new__(LFBOTreeSearch)
         search.polish_rounds = polish_rounds
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False, backend_name="triton"
+        )
         search.min_improvement_delta = 0.001
         search.log = Mock()
         search._budgeted_range = lambda *args: iter(range(*args))

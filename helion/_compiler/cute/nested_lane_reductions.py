@@ -234,6 +234,16 @@ def normalize_nested_lane_reductions(
     # and subsequent lowering still run unchanged.
     if not any(lanes._find_lane_reduce_call(statement) for statement in body):
         return body
+    # Only an actual lane loop can be rewritten below. Fully native bodies
+    # contain ordinary loops, so skip scalar-definition expansion for them.
+    if not any(
+        isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == getattr(node, lanes.HELION_LANE_LOOP_VAR_ATTR, None)
+        for statement in body
+        for node in ast.walk(statement)
+    ):
+        return body
 
     shadowed_globals = {
         node.id

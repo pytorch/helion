@@ -225,6 +225,31 @@ def _block_index_name(
     return name if isinstance(name, str) and name.isidentifier() else None
 
 
+def _generated_axis_is_identity(
+    codegen: GenerateAST, source_node: torch.fx.Node, index_name: str | None
+) -> bool:
+    """Accept a strategy coordinate or its exact, owned zero-offset alias."""
+
+    found, generated = codegen.codegen_result_for_node(source_node)
+    if not found or not isinstance(generated, ast.Name) or index_name is None:
+        return False
+    if generated.id == index_name:
+        return True
+    entries = codegen.statements_owned_by_node(source_node)
+    if len(entries) != 1:
+        return False
+    statement = entries[0][1]
+    if (
+        not isinstance(statement, ast.Assign)
+        or len(statement.targets) != 1
+        or not isinstance(statement.targets[0], ast.Name)
+        or statement.targets[0].id != generated.id
+    ):
+        return False
+    normalized = _FoldCoordinateZeros().visit(_clone_ast(statement.value))
+    return isinstance(normalized, ast.Name) and normalized.id == index_name
+
+
 def _resolve_axis_sources(
     candidate: DirectAffineCandidate,
     codegen: GenerateAST,
@@ -267,12 +292,14 @@ def _resolve_axis_sources(
         matching_blocks = [
             block_id
             for block_id in grid.block_thread_axes
-            if _block_index_name(codegen, grid, block_id) == generated.id
+            if _generated_axis_is_identity(
+                codegen, feature, _block_index_name(codegen, grid, block_id)
+            )
         ]
         if len(matching_blocks) != 1:
             return None
         (feature_block_id,) = matching_blocks
-        feature_index_name = generated.id
+        feature_index_name = _block_index_name(codegen, grid, feature_block_id)
     if row_block_id == feature_block_id:
         return None
     try:
@@ -351,13 +378,22 @@ class _FoldCoordinateZeros(ast.NodeTransformer):
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         node = cast("ast.BinOp", self.generic_visit(node))
         if isinstance(node.op, ast.Add):
-            if isinstance(node.left, ast.Constant) and node.left.value == 0:
+            if (
+                isinstance(node.left, ast.Constant)
+                and type(node.left.value) is int
+                and node.left.value == 0
+            ):
                 return node.right
-            if isinstance(node.right, ast.Constant) and node.right.value == 0:
+            if (
+                isinstance(node.right, ast.Constant)
+                and type(node.right.value) is int
+                and node.right.value == 0
+            ):
                 return node.left
         if (
             isinstance(node.op, ast.Sub)
             and isinstance(node.right, ast.Constant)
+            and type(node.right.value) is int
             and node.right.value == 0
         ):
             return node.left
@@ -386,9 +422,7 @@ def _axis_expression(
     # not the generated coordinate used by memory pointers.  Conversely, a
     # free arange has no tile metadata, so require its recorded result to be
     # exactly the inferred synthetic strategy coordinate.
-    if synthetic and (
-        not isinstance(generated, ast.Name) or generated.id != index_name
-    ):
+    if synthetic and not _generated_axis_is_identity(codegen, source_node, index_name):
         return None
     source = ast.Name(id=index_name, ctx=ast.Load())
     visible = (

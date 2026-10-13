@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import enum
 import math
 from typing import TYPE_CHECKING
+
+import torch.distributed as dist
 
 from .. import exc
 from .base_search import PopulationBasedSearch
@@ -10,6 +13,8 @@ from .base_search import PopulationMember
 from .base_search import performance
 from .compiler_coverage import coverage_policy
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
+from .seed_coverage import SeedCoverageOutcome
+from .seed_coverage import append_seed_coverage
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -62,6 +67,8 @@ def random_fallback_population_target(
 
 class PatternSearch(PopulationBasedSearch):
     """Search that explores single-parameter perturbations around the current best."""
+
+    seed_coverage_outcomes: Sequence[SeedCoverageOutcome] = ()
 
     def __init__(
         self,
@@ -129,8 +136,10 @@ class PatternSearch(PopulationBasedSearch):
             initial_population
         )
         self.num_neighbors_cap = num_neighbors_cap
+        self.eviction_policy_aliases_skipped = 0
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
+        self.seed_coverage_outcomes: list[SeedCoverageOutcome] = []
 
     def _algorithm_cache_policy(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -143,6 +152,7 @@ class PatternSearch(PopulationBasedSearch):
             "initial_population_strategy": self.initial_population_strategy,
             "best_available_pad_random": self.best_available_pad_random,
             "num_neighbors_cap": self.num_neighbors_cap,
+            "eviction_policy_pruning_version": 1,
             "finishing_rounds": self.finishing_rounds,
             "compile_timeout_lower_bound": self.compile_timeout_lower_bound,
             "compile_timeout_quantile": self.compile_timeout_quantile,
@@ -150,6 +160,17 @@ class PatternSearch(PopulationBasedSearch):
         policy = coverage_policy(self.config_spec.compiler_coverage_groups)
         if policy is not None:
             result["compiler_coverage"] = policy
+        if self._full_seed_coverage_enabled():
+            result["full_compiler_seed_coverage"] = {
+                "version": 2,
+                "base_sampling": "unchanged",
+                "overflow": "ordered-strict-seeds-then-supplemental",
+                "overflow_batching": "uncapped-grouped-budgeted-single",
+                "witnesses": tuple(
+                    witness.policy()
+                    for witness in self.config_spec.compiler_seed_witnesses
+                ),
+            }
         return result
 
     @classmethod
@@ -174,7 +195,39 @@ class PatternSearch(PopulationBasedSearch):
             **super().get_kwargs_from_profile(profile, settings),
         }
 
+    def requires_search_policy_cache_key(self) -> bool:
+        return self._full_seed_coverage_enabled()
+
+    def _full_seed_coverage_enabled(self) -> bool:
+        return (
+            self.config_spec.backend_name == "cute"
+            and self.settings.autotune_effort == "full"
+            and self.settings.autotune_compiler_seed_coverage
+            and not self.settings.disable_autotuner_heuristics
+            and self.config_gen.compiler_coverage_enabled
+            and self.initial_population > 0
+            and not self.config_spec.cute_flash_search_enabled
+            and self.kernel.env.process_group_name is None
+            and not dist.is_initialized()
+        )
+
     def _generate_initial_population_flat(self) -> list[FlatConfig]:
+        population = self._generate_initial_population_with_coverage()
+        self.seed_coverage_outcomes = []
+        if not self._full_seed_coverage_enabled():
+            return population
+        population, self.seed_coverage_outcomes = append_seed_coverage(
+            population, self.config_gen
+        )
+        for outcome in self.seed_coverage_outcomes:
+            if outcome.effective is not None and outcome.status in (
+                "pending",
+                "already_present",
+            ):
+                self.pin_finalist_config(outcome.effective)
+        return population
+
+    def _generate_initial_population_with_coverage(self) -> list[FlatConfig]:
         # Empty registries retain the exact old builder, cache lookup and draws.
         if not self.config_gen.config_spec.compiler_coverage_groups:
             return self._generate_initial_population_base()
@@ -320,6 +373,124 @@ class PatternSearch(PopulationBasedSearch):
             return population
         return self._replace_backend_rejected_initial_configs(
             population, self.initial_population
+        )
+
+    def benchmark_initial_population(
+        self,
+        members: list[PopulationMember],
+        *,
+        random_fallback_target: int | None = None,
+        visited: set[Config] | None = None,
+        desc: str = "Initial population",
+    ) -> list[PopulationMember]:
+        pending = {
+            outcome.effective: outcome
+            for outcome in self.seed_coverage_outcomes
+            if outcome.status == "pending" and outcome.effective is not None
+        }
+        if not pending:
+            try:
+                return super().benchmark_initial_population(
+                    members,
+                    random_fallback_target=random_fallback_target,
+                    visited=visited,
+                    desc=desc,
+                )
+            finally:
+                if self.seed_coverage_outcomes:
+                    self._record_seed_coverage_outcomes(members)
+        base = [member for member in members if member.config not in pending]
+        additions = [member for member in members if member.config in pending]
+        admitted = {member.config for member in additions}
+        for config, outcome in pending.items():
+            if config not in admitted:
+                outcome.status = "not_admitted"
+        # Keep ordinary base batching. Uncapped overflow uses the same batch
+        # provider so source/native compilation can share its worker pool.
+        # Budgeted overflow stays one-at-a-time to preserve the exact
+        # unsubmitted tail; provider cancellation still owns each call.
+        compile_error: Exception | None = None
+        try:
+            self.benchmark_population(base, desc=desc, raise_if_no_viable_config=False)
+            compile_error = self.benchmark_provider.take_no_viable_config_error()
+            batches = (
+                [additions]
+                if additions and self.settings.autotune_budget_seconds is None
+                else [[member] for member in additions]
+            )
+            for batch in batches:
+                outcomes = [pending[member.config] for member in batch]
+                if self._autotune_budget_exceeded_across_ranks():
+                    for member, outcome in zip(batch, outcomes, strict=True):
+                        outcome.status = "unattempted_budget"
+                        member.perfs.append(math.inf)
+                    continue
+                for outcome in outcomes:
+                    outcome.status = "submitted"
+                self.benchmark_population(
+                    batch,
+                    desc="Compiler seed coverage",
+                    raise_if_no_viable_config=False,
+                )
+                error = self.benchmark_provider.take_no_viable_config_error()
+                if error is not None:
+                    compile_error = error
+                # A provider can cancel after the preceding check. An error
+                # at that boundary cannot prove an actual compile attempt.
+                for member, outcome in zip(batch, outcomes, strict=True):
+                    outcome.status = (
+                        "provider_interrupted_or_failed"
+                        if member.status == "error"
+                        and self._autotune_budget_exceeded_across_ranks()
+                        else member.status
+                    )
+                    outcome.effective = member.config
+        finally:
+            for row in self.seed_coverage_outcomes:
+                if row.status == "pending":
+                    row.status = "unattempted_interrupted"
+                elif row.status == "submitted":
+                    row.status = "provider_interrupted"
+            self._record_seed_coverage_outcomes(members)
+        if not any(math.isfinite(member.perf) for member in members):
+            if random_fallback_target is None:
+                if compile_error is not None:
+                    raise compile_error
+                raise exc.NoConfigFound
+        # Original fallback, rebenchmark, objective validation and subsequent
+        # pruning still own selection. Nothing is pre-scored by this policy.
+        return self._finish_initial_population(
+            members,
+            random_fallback_target=random_fallback_target,
+            visited=visited,
+            initial_compile_error=compile_error,
+        )
+
+    def _record_seed_coverage_outcomes(
+        self, members: Sequence[PopulationMember]
+    ) -> None:
+        phase = self._autotune_metrics.search_phase_metrics
+        if phase is None:
+            phase = {}
+            self._autotune_metrics.search_phase_metrics = phase
+        statuses = {member.config: member.status for member in members}
+        phase["compiler_seed_coverage"] = [
+            {
+                "origin": row.origin,
+                "status": row.status,
+                "population_status": None
+                if row.effective is None
+                else statuses.get(row.effective),
+                "requested": copy.deepcopy(row.requested.config),
+                "effective": None
+                if row.effective is None
+                else copy.deepcopy(row.effective.config),
+            }
+            for row in self.seed_coverage_outcomes
+        ]
+        self.log(
+            "Compiler seed coverage outcomes: "
+            + repr([(row.origin, row.status) for row in self.seed_coverage_outcomes])
         )
 
     def _random_fallback_population_target(self) -> int | None:
@@ -503,4 +674,29 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
+        from .._compiler.cute.eviction_relevance import receipt_for
+        from ..runtime.kernel import BoundKernel
+
+        if isinstance(self.kernel, BoundKernel):
+            receipt = receipt_for(
+                self.kernel,
+                self.kernel._normalized_config_copy(
+                    self.config_gen.unflatten(list(base))
+                ),
+            )
+            if receipt is not None:
+                retained = []
+                for neighbor in neighbors:
+                    try:
+                        candidate = self.kernel._normalized_config_copy(
+                            self.config_gen.unflatten(list(neighbor))
+                        )
+                    except exc.InvalidConfig:
+                        retained.append(neighbor)
+                        continue
+                    if receipt.excludes(candidate):
+                        self.eviction_policy_aliases_skipped += 1
+                    else:
+                        retained.append(neighbor)
+                neighbors = retained
         return self.shrink_neighbors(neighbors)

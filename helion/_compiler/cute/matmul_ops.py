@@ -152,6 +152,14 @@ def _(state: CodegenState) -> object:
         is not None
     ):
         return collective
+    if (
+        state.fx_node
+        in state.device_function.cute_state.collective_lane_collision_owners
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "K axis split across threads requires admitted collective dot ownership",
+        )
     static_k_extent = None
     if k_block_id is None and state.fx_node is not None:
         lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None

@@ -22,12 +22,18 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteStateTransferMaxBitsLiteral = Literal[256, 128]
+CuteStateTransferTransportLiteral = Literal[
+    "register", "tma", "tma_pipelined", "tma_planar"
+]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
     "direct_m16n8_v1",
     "direct_m16n16_v1",
 ]
 CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
+CutePositionalSharedLayoutLiteral = Literal["column", "row", "xor"]
+CuteComputedScanScheduleLiteral = Literal["warp", "staged_warp"]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
@@ -62,10 +68,13 @@ class Config(Mapping[str, object]):
         cute_async_load_group_rows: int | None = None,
         cute_async_load_cache: CuteAsyncLoadCacheLiteral | None = None,
         cute_async_store_policy: CuteAsyncStorePolicyLiteral | None = None,
+        cute_state_transfer_max_bits: CuteStateTransferMaxBitsLiteral | None = None,
+        cute_state_transfer_transport: CuteStateTransferTransportLiteral | None = None,
         cute_bf16x2_recurrence: bool | None = None,
         cute_signed_bitfield_bf16: bool | None = None,
         cute_proven_bounds: bool | None = None,
         cute_affine_scan_schedule: CuteAffineScanScheduleLiteral | None = None,
+        cute_state_update_schedule: str | None = None,
         cute_rng_packet: bool | None = None,
         cute_independent_reduction: bool | None = None,
         cute_replicated_reduction: bool | None = None,
@@ -76,6 +85,11 @@ class Config(Mapping[str, object]):
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
+        cute_positional_pointwise_cache_bytes: int | None = None,
+        cute_positional_mma: bool | None = None,
+        cute_positional_mma_warps_m: int | None = None,
+        cute_positional_shared_layout: CutePositionalSharedLayoutLiteral | None = None,
+        cute_computed_scan_schedule: CuteComputedScanScheduleLiteral | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -122,6 +136,14 @@ class Config(Mapping[str, object]):
             cute_async_load_cache: PTX cp.async cache policy ("cg" or "ca").
             cute_async_store_policy: Cache policy for the matching in-place
                 16-byte state store ("default" or "l2_evict_last").
+            cute_state_transfer_max_bits: Maximum external-state transfer width
+                for a bound CuTe state ABI: 256 (default) or 128 bits. Alignment
+                and validity checks may still select narrower transfers.
+            cute_state_transfer_transport: Initialization transport for a bound
+                CuTe state ABI: "register" (default), "tma", "tma_pipelined", or
+                "tma_planar" (two raw32 planes per transfer).
+                TMA requires a
+                compatible state graph and shared-memory binding.
             cute_bf16x2_recurrence: Pack a structurally proven BF16 rank-one
                 recurrence into native BF16x2 operations.
             cute_signed_bitfield_bf16: Convert proved signed byte fields to BF16
@@ -169,6 +191,20 @@ class Config(Mapping[str, object]):
                 Torch implementations or unsupported bindings use the original
                 operations. Available only for typed, independent host pairs
                 or a terminal sum/cast with an effect-free return prefix.
+            cute_positional_pointwise_cache_bytes: Root-wide shared-memory byte
+                budget for typed computed operands reused by positional scalar
+                contractions. Zero (default) disables caching. Each publication
+                is local to one contraction and repeats inside lexical loops.
+            cute_positional_mma: Enable precision-compatible warp MMA for proved
+                contractions within positional roots. Disabled by default.
+            cute_positional_mma_warps_m: MMA warp partition along M, a positive
+                divisor of num_warps. Defaults to 2 when divisible, otherwise 1.
+            cute_computed_scan_schedule: Complete computed prefix schedule: warp
+                evaluates inputs during the scan; staged_warp first publishes
+                them cooperatively into a padded FP32 shared image.
+            cute_positional_shared_layout: Positional shared-tile layout:
+                "column" (default), "row", or an in-row "xor" permutation.
+                XOR falls back to row layout when its coordinate proof fails.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -239,10 +275,13 @@ class Config(Mapping[str, object]):
             "cute_async_load_group_rows": cute_async_load_group_rows,
             "cute_async_load_cache": cute_async_load_cache,
             "cute_async_store_policy": cute_async_store_policy,
+            "cute_state_transfer_max_bits": cute_state_transfer_max_bits,
+            "cute_state_transfer_transport": cute_state_transfer_transport,
             "cute_bf16x2_recurrence": cute_bf16x2_recurrence,
             "cute_signed_bitfield_bf16": cute_signed_bitfield_bf16,
             "cute_proven_bounds": cute_proven_bounds,
             "cute_affine_scan_schedule": cute_affine_scan_schedule,
+            "cute_state_update_schedule": cute_state_update_schedule,
             "cute_rng_packet": cute_rng_packet,
             "cute_independent_reduction": cute_independent_reduction,
             "cute_replicated_reduction": cute_replicated_reduction,
@@ -253,6 +292,11 @@ class Config(Mapping[str, object]):
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,
+            "cute_positional_pointwise_cache_bytes": cute_positional_pointwise_cache_bytes,
+            "cute_positional_mma": cute_positional_mma,
+            "cute_positional_mma_warps_m": cute_positional_mma_warps_m,
+            "cute_positional_shared_layout": cute_positional_shared_layout,
+            "cute_computed_scan_schedule": cute_computed_scan_schedule,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -520,6 +564,20 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteAsyncStorePolicyLiteral",
             self.config.get("cute_async_store_policy", "default"),
+        )
+
+    @property
+    def cute_state_transfer_max_bits(self) -> CuteStateTransferMaxBitsLiteral:
+        return cast(
+            "CuteStateTransferMaxBitsLiteral",
+            self.config.get("cute_state_transfer_max_bits", 256),
+        )
+
+    @property
+    def cute_state_transfer_transport(self) -> CuteStateTransferTransportLiteral:
+        return cast(
+            "CuteStateTransferTransportLiteral",
+            self.config.get("cute_state_transfer_transport", "register"),
         )
 
     @property

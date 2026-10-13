@@ -563,6 +563,10 @@ class BaseSearch(BaseAutotuner):
             assert measurement is not None
             measurement.validate(self.timing_policy)
 
+    def requires_search_policy_cache_key(self) -> bool:
+        """Whether an additive search policy must partition ordinary caches."""
+        return False
+
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
         """Return explicit behavior-affecting state for a built-in search."""
         return None
@@ -649,6 +653,11 @@ class BaseSearch(BaseAutotuner):
                 ),
                 "autotune_benchmark_timeout": settings.autotune_benchmark_timeout,
                 "autotune_precompile": settings.autotune_precompile,
+                **(
+                    {"autotune_cute_native_required": True}
+                    if settings.autotune_cute_native_required
+                    else {}
+                ),
                 "autotune_precompile_jobs": settings.autotune_precompile_jobs,
                 "autotune_ignore_errors": settings.autotune_ignore_errors,
                 "autotune_best_of_k": settings.autotune_best_of_k,
@@ -2070,11 +2079,27 @@ class PopulationBasedSearch(BaseSearch):
             desc=desc,
             raise_if_no_viable_config=random_fallback_target is None,
         )
+        return self._finish_initial_population(
+            members, random_fallback_target=random_fallback_target, visited=visited
+        )
+
+    def _finish_initial_population(
+        self,
+        members: list[PopulationMember],
+        *,
+        random_fallback_target: int | None,
+        visited: set[Config] | None,
+        initial_compile_error: Exception | None = None,
+    ) -> list[PopulationMember]:
+        """Apply the original fallback after ordinary or seed-coverage batches."""
         if random_fallback_target is None or any(
             math.isfinite(member.perf) for member in members
         ):
             return members
-        compile_error = self.benchmark_provider.take_no_viable_config_error()
+        compile_error = (
+            initial_compile_error
+            or self.benchmark_provider.take_no_viable_config_error()
+        )
         seen = {member.config for member in members} if visited is None else visited
         fallback: list[PopulationMember] = []
         # The padding helper re-adds the seeds first, so pad past them.

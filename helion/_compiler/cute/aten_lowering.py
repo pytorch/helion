@@ -434,6 +434,17 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None or static_k_extent is not None
         else cute_static_serial_matmul_k_extent(lhs_node, rhs_node)
     )
+    if (
+        serial_k_extent is None
+        and node in ctx.cg.device_function.cute_state.direct_mm_collision_owners
+    ):
+        # The positional planner left this mm's repeated-axis operand to the
+        # direct path, which reads it by position; the per-thread fallback
+        # would see only its diagonal.
+        raise exc.BackendUnsupported(
+            "cute",
+            "aten.mm over a repeated-axis operand requires the direct mm lowering",
+        )
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -921,7 +932,17 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         static_k_extent=static_k_extent,
     )
     if n_collapse_result is not None:
+        if node in ctx.cg.device_function.cute_state.collapsed_matmul_sum_owners:
+            completed = ctx.cg.device_function.cute_state.completed_matmul_sums
+            if not any(record.path.producer is node for record in completed.values()):
+                raise exc.BackendUnsupported(
+                    "cute", "collapsed matrix carry requires its completed N fold"
+                )
         return n_collapse_result
+    if node in ctx.cg.device_function.cute_state.collapsed_matmul_sum_owners:
+        raise exc.BackendUnsupported(
+            "cute", "collapsed matrix carry requires its completed N fold"
+        )
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
         assert k_block_id is not None

@@ -99,6 +99,8 @@ def make_search(
     # benchmark provider or binding/launching a device kernel.
     settings = Settings(
         backend="cute",
+        # This fixture isolates the pre-existing coordinate coverage policy.
+        autotune_compiler_seed_coverage=False,
         autotune_seed_configs=seeds,
         autotune_config_overrides=overrides or {},
         disable_autotuner_heuristics=disabled,

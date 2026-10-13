@@ -303,6 +303,8 @@ class LFBOPatternSearch(PatternSearch):
                 # loop (see polish_rounds).
                 "lfbo_version": 3,
                 "polish_rounds": self.polish_rounds,
+                "polish_stop_version": 1,
+                "main_path_stop_version": 1,
                 "num_neighbors": self.num_neighbors,
                 "radius": self.radius,
                 "frac_selected": self.frac_selected,
@@ -897,6 +899,9 @@ class LFBOPatternSearch(PatternSearch):
             return
         current = self.best
         for round_num in self._budgeted_range(1, rounds + 1):
+            # Remeasuring current can make it slower. Keep the pre-round global
+            # score immutable so timing noise cannot masquerade as progress.
+            incumbent_perf = self.best.perf
             candidates = [current]
             for flat_config in PatternSearch._generate_neighbors(
                 self, current.flat_values
@@ -919,7 +924,15 @@ class LFBOPatternSearch(PatternSearch):
                 f"Polish round {round_num}: {len(candidates) - 1} neighbors, "
                 f"best {self.format_performance(best.perf)}"
             )
-            if self._check_early_stopping(best, current):
+            if (
+                self._check_early_stopping(best, current)
+                or not best.perf < incumbent_perf
+                or (
+                    math.isfinite(incumbent_perf)
+                    and incumbent_perf > 0
+                    and 1.0 - best.perf / incumbent_perf < self.min_improvement_delta
+                )
+            ):
                 break
             current = best
 
@@ -5164,9 +5177,20 @@ class LFBOPatternSearch(PatternSearch):
             if len(candidates) <= 1:
                 self.log(f"Copy {copy_idx} finish because of no candidates")
                 return  # no new candidates, stop searching
+            # The caller remeasures current in place. Keep its pre-generation
+            # score so a slower remeasurement cannot count as path progress.
+            incumbent_perf = current.perf
             yield candidates  # yield new population to benchmark in parallel
             best = min(candidates, key=performance)
-            if not disable_early_stopping and self._check_early_stopping(best, current):
+            if not disable_early_stopping and (
+                self._check_early_stopping(best, current)
+                or not best.perf < incumbent_perf
+                or (
+                    math.isfinite(incumbent_perf)
+                    and incumbent_perf > 0
+                    and 1.0 - best.perf / incumbent_perf < self.min_improvement_delta
+                )
+            ):
                 if patience > 0:
                     patience -= 1
                 else:

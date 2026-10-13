@@ -96,6 +96,7 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/gdn_recurrence_sm100.py",
         "_compiler/cute/gdn_recurrence_geometry.py",
         "_compiler/cute/affine_recurrence_primitives.py",
+        "_compiler/cute/packed_store.py",
     ),
 }
 

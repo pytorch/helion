@@ -474,11 +474,14 @@ class CompileEnvironment:
         # view of a user input cannot acquire it merely because it has no direct
         # replayable input source.
         self._symbolically_exact_layout_storages: set[torch.UntypedStorage] = set()
-        # Storage of every fresh wrapper allocation, whatever its layout proof:
-        # its base is allocator-aligned, so a static storage offset decides the
-        # base alignment of any view of it.
+        # Alignment provenance includes every fresh factory, while
+        # whole-root ownership proofs distinguish empty from initialized data.
         self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
         self._zero_filled_allocation_storages: set[torch.UntypedStorage] = set()
+        self.fresh_allocation_storages: set[torch.UntypedStorage] = set()
+        # Value-initialized factories have disjoint storage but grant no layout
+        # proof to existing whole-root routes.
+        self.fresh_initialized_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -1050,6 +1053,19 @@ class CompileEnvironment:
         self._fresh_allocation_storages.add(result_storage)
         if _factory_fills_positive_zero(factory, args, kwargs):
             self._zero_filled_allocation_storages.add(result_storage)
+        if factory in (
+            torch.zeros,
+            torch.ones,
+            torch.full,
+            torch.zeros_like,
+            torch.ones_like,
+            torch.full_like,
+        ):
+            self.fresh_initialized_storages.add(result_storage)
+            return
+        if factory not in (torch.empty, torch.empty_like):
+            return
+        self.fresh_allocation_storages.add(result_storage)
         is_exact = False
         if factory is torch.empty:
             is_exact = True

@@ -312,10 +312,11 @@ def test_loop_carried_guard_is_not_unswitched() -> None:
         "invalid = False\n        (out.iterator + row).store(0)",
     )
     result = _rewrite(source)
-    assert len(result) == 1
-    loop = cast("ast.For", result[0])
+    loop = cast("ast.For", result[-1])
     assert isinstance(loop, ast.For)
     assert isinstance(loop.body[-1], ast.If)
+    assert "invalid = False" in ast.unparse(loop)
+    assert not any(isinstance(stmt, ast.If) for stmt in result)
 
 
 def test_effectful_guard_expression_is_not_unswitched() -> None:
@@ -354,8 +355,8 @@ def test_selected_cache_backedge_rejects_reduction_hoist() -> None:
     result = _rewrite(source)
     assert isinstance(result[-1], ast.If)
     lifted = result[-1]
-    assert len(lifted.orelse) == 1
-    assert isinstance(lifted.orelse[0], ast.For)
+    _assert_reduction_stays_in_row(lifted.orelse)
+    assert "_fuse_cache_0[0] = other" in ast.unparse(lifted.orelse[-1])
 
 
 def test_selected_result_backedge_rejects_reduction_hoist() -> None:
@@ -367,8 +368,16 @@ def test_selected_result_backedge_rejects_reduction_hoist() -> None:
     result = _rewrite(source)
     assert isinstance(result[-1], ast.If)
     lifted = result[-1]
-    assert len(lifted.orelse) == 1
-    assert isinstance(lifted.orelse[0], ast.For)
+    _assert_reduction_stays_in_row(lifted.orelse)
+    assert "norm = cutlass.Float32(0)" in ast.unparse(lifted.orelse[-1])
+
+
+def _assert_reduction_stays_in_row(body: list[ast.stmt]) -> None:
+    # Independently safe coefficient loads may move, but the reduction and
+    # the mutation that prevents lifting it must remain in the row loop.
+    assert isinstance(body[-1], ast.For)
+    assert "warp_reduction_sum" in ast.unparse(body[-1])
+    assert all("warp_reduction_sum" not in ast.unparse(stmt) for stmt in body[:-1])
 
 
 def test_inner_licm_rejects_late_reaching_definition() -> None:
@@ -517,7 +526,9 @@ def test_guard_depending_on_outer_thread_value_is_not_unswitched() -> None:
         proven_disjoint_tensor_pairs=_DISJOINT,
         uniform_names={"base", "batch", "row_base", "vector_type"},
     )
-    assert isinstance(result[1], ast.For)
+    assert isinstance(result[-1], ast.For)
+    assert any(isinstance(stmt, ast.If) for stmt in result[-1].body)
+    assert not any(isinstance(stmt, ast.If) for stmt in result)
 
 
 def test_guard_uniformity_tracks_prior_rename_alias_write() -> None:
@@ -586,8 +597,8 @@ def test_reduction_hoist_rejects_external_staging_mutation() -> None:
     result = _rewrite(source)
     assert isinstance(result[-1], ast.If)
     lifted = result[-1]
-    assert len(lifted.orelse) == 1
-    assert isinstance(lifted.orelse[0], ast.For)
+    _assert_reduction_stays_in_row(lifted.orelse)
+    assert ".append(row_lane)" in ast.unparse(lifted.orelse[-1])
 
 
 def test_identical_repeated_scalar_definitions_hoist_once() -> None:

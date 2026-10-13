@@ -1740,6 +1740,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         default_flat = config_gen.default_flat()
         search = PatternSearch.__new__(PatternSearch)
         search.config_gen = config_gen
+        search.config_spec = config_gen.config_spec
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
         )
