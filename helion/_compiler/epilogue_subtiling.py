@@ -411,6 +411,8 @@ def _new_subtile_index_node(
     piece_block_size: int | torch.SymInt,
     block_id: int,
 ) -> torch.fx.Node:
+    from .aten_lowering import alias_lowering
+
     piece_offset = piece_idx * piece_shape_size
     # The piece starts at its offset within the tile, past any offset the
     # store adds to the tile's index (``tile.index + k``).
@@ -418,6 +420,9 @@ def _new_subtile_index_node(
     node = graph.call_function(operator.add, (base_index_node, 0))
     node.meta = {
         **base_index_node.meta,
+        # This node adds zero to one runtime input. Its source's cached
+        # lowering can require additional runtime offset inputs.
+        "lowering": alias_lowering,
         "val": base_index_node.meta["val"] + piece_offset,
         "tile_with_offset": {
             "block_id": block_id,

@@ -761,8 +761,13 @@ class TestEpilogueSubtiling(TestCase):
         expected = torch.zeros_like(output)
         expected[:, 8:] = 2.0 * (args[0] @ args[1])
         torch.testing.assert_close(output, expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("tl.split", code)
-        self.assertEqual(code.count("tl.atomic_add("), 2)
+        if _get_backend() == "tileir":
+            # TileIR keeps atomic epilogues unsplit.
+            _assert_no_split_codegen(self, code)
+            self.assertEqual(code.count("tl.atomic_add("), 1)
+        else:
+            self.assertIn("tl.split", code)
+            self.assertEqual(code.count("tl.atomic_add("), 2)
 
     @onlyBackends("triton")
     @skipIfRefEager("test checks generated backend code")

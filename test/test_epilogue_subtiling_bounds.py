@@ -10,7 +10,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 @helion.kernel(autotune_effort="none")
@@ -26,9 +28,27 @@ def padded_pointwise(x: torch.Tensor) -> torch.Tensor:
 def shifted_range_pointwise(
     x: torch.Tensor, out: torch.Tensor, begin: int, end: int, shift: int
 ) -> torch.Tensor:
+    for tile_n in hl.tile(begin, end):
+        out[tile_n.index + shift] = x[tile_n] + 1.0
+    return out
+
+
+@helion.kernel(static_shapes=False, autotune_effort="none")
+def specialized_shifted_range_pointwise(
+    x: torch.Tensor, out: torch.Tensor, begin: int, end: int, shift: int
+) -> torch.Tensor:
     shift = hl.specialize(shift)
     for tile_n in hl.tile(begin, end):
         out[tile_n.index + shift] = x[tile_n] + 1.0
+    return out
+
+
+@helion.kernel(static_shapes=False, autotune_effort="none")
+def shifted_descriptor_pointwise(
+    x: torch.Tensor, out: torch.Tensor, shift: int
+) -> torch.Tensor:
+    for tile_m, tile_n in hl.tile([0, 32], x.size()):
+        out[tile_m, tile_n.index + shift] = x[tile_m, tile_n] + 1.0
     return out
 
 
@@ -52,18 +72,23 @@ def device_range_pointwise(
 
 @helion.kernel(static_shapes=False, autotune_effort="none")
 def shifted_range_atomic_add(
-    x: torch.Tensor, out: torch.Tensor, begin: int, end: int
+    x: torch.Tensor, out: torch.Tensor, begin: int, end: int, shift: int
 ) -> torch.Tensor:
     for tile_n in hl.tile(begin, end):
-        hl.atomic_add(out, [tile_n.index + 8], x[tile_n] + 1.0)
+        hl.atomic_add(out, [tile_n.index + shift], x[tile_n] + 1.0)
     return out
 
 
 @onlyBackends("triton")
 class TestEpilogueSubtilingBounds(TestCase):
-    def _assert_split(self, code: str, split_factor: int, op: str = "store") -> None:
-        self.assertIn("tl.split", code)
-        self.assertEqual(code.count(f"tl.{op}("), split_factor)
+    def _assert_split(
+        self, code: str, split_factor: int | None, op: str = "tl.store"
+    ) -> None:
+        if split_factor is None:
+            self.assertNotIn("tl.split", code)
+        else:
+            self.assertIn("tl.split", code)
+        self.assertEqual(code.count(f"{op}("), split_factor or 1)
 
     @skipIfRefEager("test requires epilogue subtiling")
     def test_ragged_tile_with_padded_output(self) -> None:
@@ -81,26 +106,48 @@ class TestEpilogueSubtilingBounds(TestCase):
                         indexing="pointer",
                         epilogue_subtile=split_factor,
                     )
-                    if split_factor is None:
-                        self.assertNotIn("tl.split", code)
-                        self.assertEqual(code.count("tl.store("), 1)
-                    else:
-                        self._assert_split(code, split_factor)
+                    self._assert_split(code, split_factor)
                     torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
     @skipIfRefEager("test requires epilogue subtiling")
     def test_shifted_output_with_runtime_range(self) -> None:
         x = torch.arange(96, device=DEVICE, dtype=torch.float32)
-        for begin, end, shift in ((7, 57, 8), (12, 51, -4)):
-            expected = torch.full([136], -9.0, device=DEVICE)
-            expected[begin + shift : end + shift] = x[begin:end] + 1.0
-            for split_factor in (2, 4):
+        ranges = ((7, 57, 8), (12, 51, -4), (3, 67, 12), (5, 53, 0))
+        for split_factor in (None, 2, 4):
+            with self.subTest(split_factor=split_factor):
+                out = torch.full([136], -9.0, device=DEVICE)
+                bound = shifted_range_pointwise.bind((x, out, *ranges[0]))
+                config = helion.Config(
+                    block_sizes=[32], indexing="pointer", epilogue_subtile=split_factor
+                )
+                code = bound.to_code(config)
+                compiled = bound.compile_config(config, allow_print=False)
+                self._assert_split(code, split_factor)
+                # Reuse the same compiled callable with new runtime scalar values.
+                for begin, end, shift in ranges:
+                    with self.subTest(begin=begin, end=end, shift=shift):
+                        out.fill_(-9.0)
+                        expected = torch.full_like(out, -9.0)
+                        expected[begin + shift : end + shift] = x[begin:end] + 1.0
+                        output = compiled(x, out, begin, end, shift)
+                        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("test requires epilogue subtiling")
+    def test_shifted_output_with_specialized_shift(self) -> None:
+        """Explicit specialization remains valid after the runtime lowering fix."""
+        x = torch.arange(96, device=DEVICE, dtype=torch.float32)
+        for begin, end, shift in ((7, 57, 8), (12, 51, -4), (5, 53, 0)):
+            for split_factor in (None, 2, 4):
                 with self.subTest(
                     begin=begin, end=end, shift=shift, split_factor=split_factor
                 ):
-                    out = torch.full_like(expected, -9.0)
+                    out = torch.full([136], -9.0, device=DEVICE)
+                    expected = torch.full_like(out, -9.0)
+                    expected[begin + shift : end + shift] = x[begin:end] + 1.0
+                    # Bind each specialized value separately rather than reusing
+                    # a callable whose shift was fixed during compilation.
                     code, output = code_and_output(
-                        shifted_range_pointwise,
+                        specialized_shifted_range_pointwise,
                         (x, out, begin, end, shift),
                         block_sizes=[32],
                         indexing="pointer",
@@ -108,6 +155,33 @@ class TestEpilogueSubtilingBounds(TestCase):
                     )
                     self._assert_split(code, split_factor)
                     torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("test requires epilogue subtiling")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_descriptor_store_with_runtime_shift(self) -> None:
+        x = torch.arange(8 * 64, device=DEVICE, dtype=torch.float32).reshape(8, 64)
+        for split_factor in (None, 2, 4):
+            with self.subTest(split_factor=split_factor):
+                out = torch.full_like(x, -9.0)
+                bound = shifted_descriptor_pointwise.bind((x, out, -8))
+                config = helion.Config(
+                    block_sizes=[8, 32],
+                    indexing=["pointer", "tensor_descriptor"],
+                    epilogue_subtile=split_factor,
+                )
+                code = bound.to_code(config)
+                compiled = bound.compile_config(config, allow_print=False)
+                self._assert_split(code, split_factor, "_desc.store")
+                self.assertNotIn("tl.store(", code)
+                # A full tile with a matching end permits TMA, and each aligned
+                # shift keeps the stored interval inside the destination.
+                for shift in (-8, -16, -24, 0):
+                    with self.subTest(shift=shift):
+                        out.fill_(-9.0)
+                        expected = torch.full_like(out, -9.0)
+                        expected[:, 32 + shift : x.size(1) + shift] = x[:, 32:] + 1.0
+                        output = compiled(x, out, shift)
+                        torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
     @skipIfRefEager("test requires epilogue subtiling")
     def test_transposed_output_with_two_ragged_dims(self) -> None:
@@ -151,22 +225,31 @@ class TestEpilogueSubtilingBounds(TestCase):
     @skipIfRefEager("test requires epilogue subtiling")
     def test_atomic_add_with_shifted_runtime_range(self) -> None:
         x = torch.arange(96, device=DEVICE, dtype=torch.float32)
-        begin, end = 7, 57
-        expected = torch.full([136], 5.0, device=DEVICE)
-        expected[begin + 8 : end + 8] += x[begin:end] + 1.0
-        for split_factor in (2, 4):
+        ranges = ((7, 57, 8), (12, 51, -4), (3, 67, 12), (5, 53, 0))
+        for split_factor in (None, 2, 4):
             with self.subTest(split_factor=split_factor):
-                out = torch.full_like(expected, 5.0)
-                code, output = code_and_output(
-                    shifted_range_atomic_add,
-                    (x, out, begin, end),
+                out = torch.full([136], 5.0, device=DEVICE)
+                bound = shifted_range_atomic_add.bind((x, out, *ranges[0]))
+                config = helion.Config(
                     block_sizes=[32],
                     indexing="pointer",
                     atomic_indexing="pointer",
                     epilogue_subtile=split_factor,
                 )
-                self._assert_split(code, split_factor, "atomic_add")
-                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+                code = bound.to_code(config)
+                compiled = bound.compile_config(config, allow_print=False)
+                # TileIR intentionally leaves atomic epilogues unsplit.
+                expected_split_factor = (
+                    None if _get_backend() == "tileir" else split_factor
+                )
+                self._assert_split(code, expected_split_factor, "tl.atomic_add")
+                for begin, end, shift in ranges:
+                    with self.subTest(begin=begin, end=end, shift=shift):
+                        out.fill_(5.0)
+                        expected = torch.full_like(out, 5.0)
+                        expected[begin + shift : end + shift] += x[begin:end] + 1.0
+                        output = compiled(x, out, begin, end, shift)
+                        torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
