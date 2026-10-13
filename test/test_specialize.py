@@ -1126,7 +1126,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(atomic_column(a, out.clone()), expected)
 
     @skipIfRefEager("stack tensors are not supported in ref eager mode")
-    @skipIfNotTriton("CuTe stack tensors do not support dynamic shapes")
+    @skipUnlessBackends(["triton", "cute"])
     def test_size_one_stack_tensor_store(self):
         """A stack tensor store at ``M == 1``: the target dim must not be
         guarded to 1 by the store, and once a load guards it, the store
@@ -1251,7 +1251,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                         )
 
     @skipIfRefEager("stack tensors are not supported in ref eager mode")
-    @skipIfNotTriton("CuTe stack tensors do not support dynamic shapes")
+    @skipUnlessBackends(["triton", "cute"])
     def test_size_one_broadcast_stack_load_feeds_reduction(self):
         """A stack tensor load that broadcasts a size-1 dim onto a wider tile
         must also be 0 past the tile's extent before a reduction over it."""
