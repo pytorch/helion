@@ -1063,6 +1063,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         *RADIX_CONFIG_KEYS,
         "num_threads",
         "cute_vector_widths",
+        "constexpr_range",
+        "flydsl_load_cache_modifier",
+        "flydsl_waves_per_eu",
+        "flydsl_cr_max_tiles",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_reduction_schedule",
@@ -1201,6 +1205,17 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_pre_broadcast",
         "pallas_internal_scratch",
         "cute_vector_widths",
+        # FlyDSL: emit range_constexpr for small reduction tile counts so the
+        # loaded input vectors can be register-cached across two passes (2-read HBM).
+        "constexpr_range",
+        # FlyDSL: BufferCopy cache modifier (0=cached, 2=non-temporal/bypass L1).
+        "flydsl_load_cache_modifier",
+        # FlyDSL: waves_per_eu occupancy hint (0=auto, 2/4/8=target waves per EU).
+        "flydsl_waves_per_eu",
+        # FlyDSL: hard VGPR cap (--amdgpu-num-vgpr=N); 0=no cap.
+        "flydsl_maxnreg",
+        # FlyDSL: max tiles to unroll with constexpr_range (0 = default 16).
+        "flydsl_cr_max_tiles",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_reduction_schedule",
@@ -7747,6 +7762,13 @@ class ConfigSpec:
                 and self.pallas_fold_dot_lhs_cast_search_enabled
             ):
                 fields["pallas_fold_dot_lhs_cast"] = BooleanFragment()
+        # FlyDSL register-caching: emit range_constexpr (in_local[] pattern, 2-read
+        # HBM) when the tile count is small enough.  Registering as a BooleanFragment
+        # lets the beam-search neighbor generator flip it True<->False so autotune can
+        # reliably discover the faster variant rather than depending on whether the
+        # initial candidate list happened to include a constexpr_range=True entry.
+        if self.supports_config_key("constexpr_range"):
+            fields["constexpr_range"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(AUTOTUNED_MAXNREG)
@@ -8230,6 +8252,7 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         size_hint: int,
         allow_non_power_of_two: bool = False,
         allow_full_extent: bool = False,
+        allow_wide_persistent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -8243,6 +8266,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if self.allow_full_extent and self.size_hint >= 8:
             return next_power_of_2(self.size_hint)
         return None
+        # When True, _normalize preserves chunk >= size_hint instead of
+        # collapsing to None.  Set by backends that use the single-iteration
+        # looped path for register caching (allow_wide_persistent_reduction).
+        self.allow_wide_persistent = allow_wide_persistent
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -8305,7 +8332,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         if value is None:
             return None
-        if (
+        # For wide-persistent configs (FlyDSL chunk=N single-pass), allow
+        # non-power-of-two chunk values so non-POT N can be offered as a
+        # persistent single-iteration candidate.
+        if self.allow_wide_persistent and isinstance(value, int) and value > 0:
+            normalized: int | None = value
+        elif (
             self.allow_non_power_of_two
             and type(value) is int
             and value >= 8
@@ -8337,16 +8369,20 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # multi-pass kernel like layer_norm reuses the loaded inputs across
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
-        # sync regardless of how the value was generated. CuTe can opt into
+        # sync regardless of how the value was generated.CuTe can opt into
         # a distinct explicit full-loop encoding; None remains persistent.
         # This distinction does not waive multi-pass cache correctness checks.
-        if (
-            isinstance(normalized, int)
-            and normalized >= self.size_hint
-            and normalized & (normalized - 1) == 0
-            and normalized != self._full_extent_chunk()
-        ):
-            return None
+        # Exception: backends that set allow_wide_persistent_reduction use the
+        # single-iteration looped path for register caching (in_local[] across
+        # reduce+normalize passes), so preserve chunk >= size_hint for them.
+        if isinstance(normalized, int) and normalized >= self.size_hint:
+            if (
+                (normalized & (normalized - 1) == 0 
+                and normalized != self._full_extent_chunk())        
+                or not self.allow_wide_persistent
+            ):
+                return None
+
         return normalized
 
     def _fill_missing(self) -> None:
