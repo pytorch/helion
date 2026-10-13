@@ -5051,7 +5051,10 @@ class TestPallas(TestCase):
         self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 2)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
+    @xfailIfPallasInterpret(
+        "emit_pipeline closure-reading an outer BlockSpec ref is unsupported "
+        "in JAX Pallas interpret mode"
+    )
     def test_pipeline_tensor_with_scalar_access(self) -> None:
         """A pipeline tensor with scalar access should keep HBM, not be overridden to SMEM."""
         args = (

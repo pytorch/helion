@@ -1509,6 +1509,87 @@ class TestPallasClampedRefs(TestCase):
         torch.testing.assert_close(out, torch.cat([x, y], dim=1))
 
 
+# out = (x @ w[:, :half]) * (x @ w[:, half:]): the inner loop loads w at two
+# column windows, w[k, n] and w[k, n.index + half].
+@helion.kernel(backend="pallas")
+def gate_up_product(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    half = w.shape[1] // 2
+    out = torch.empty((M, half), dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, half]):
+        gate = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        up = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            a = x[tile_m, tile_k]
+            gate = gate + torch.matmul(a, w[tile_k, tile_n])
+            up = up + torch.matmul(a, w[tile_k, tile_n.index + half])
+        out[tile_m, tile_n] = (gate * up).to(out.dtype)
+    return out
+
+
+# gate_up_product with the offset window, w[k, n.index + half], loaded first.
+@helion.kernel(backend="pallas")
+def up_gate_product(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    half = w.shape[1] // 2
+    out = torch.empty((M, half), dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, half]):
+        gate = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        up = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            a = x[tile_m, tile_k]
+            up = up + torch.matmul(a, w[tile_k, tile_n.index + half])
+            gate = gate + torch.matmul(a, w[tile_k, tile_n])
+        out[tile_m, tile_n] = (gate * up).to(out.dtype)
+    return out
+
+
+# out = x @ w plus row 1 of each k tile of w: the inner loop loads w at its
+# tile and at row tile_k.begin + 1, which lies inside that tile.
+@helion.kernel(backend="pallas")
+def matmul_plus_tile_row(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    N = w.shape[1]
+    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            acc = acc + torch.matmul(x[tile_m, tile_k], w[tile_k, tile_n])
+            acc = acc + w[tile_k.begin + 1, tile_n][None, :]
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasInnerLoopWindows(TestCase):
+    """One tensor accessed at several windows inside an inner loop."""
+
+    @parametrize("kernel", [gate_up_product, up_gate_product])
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_tile_and_offset_tile_windows(self, kernel, loop_type: str) -> None:
+        torch.manual_seed(0)
+        x = torch.randint(-2, 3, (64, 256)).to(DEVICE, torch.float32)
+        w = torch.randint(-2, 3, (256, 512)).to(DEVICE, torch.float32)
+        _code, out = code_and_output(
+            kernel, (x, w), block_sizes=[32, 128, 128], pallas_loop_type=loop_type
+        )
+        torch.testing.assert_close(out, (x @ w[:, :256]) * (x @ w[:, 256:]))
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_tile_and_in_tile_row_share_window(self, loop_type: str) -> None:
+        torch.manual_seed(0)
+        x = torch.randint(-2, 3, (64, 256)).to(DEVICE, torch.float32)
+        w = torch.randint(-2, 3, (256, 256)).to(DEVICE, torch.float32)
+        _code, out = code_and_output(
+            matmul_plus_tile_row,
+            (x, w),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(out, x @ w + w[1::128].sum(0))
+
+
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)
 instantiate_parametrized_tests(TestPallasJaggedCarryBmm)
 instantiate_parametrized_tests(TestPallasMultipleOfPromises)
@@ -1516,3 +1597,4 @@ instantiate_parametrized_tests(TestPallasJaggedIndexing)
 instantiate_parametrized_tests(TestPallasJaggedReductions)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)
 instantiate_parametrized_tests(TestPallasVmemScalarLoad)
+instantiate_parametrized_tests(TestPallasInnerLoopWindows)
