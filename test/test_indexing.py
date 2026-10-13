@@ -4043,6 +4043,141 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
+    def test_tensor_index_into_size_one_dim(self):
+        """A tensor index into a size-1 dim drops out of the offset, which
+        then broadcasts over the index's tile: an atomic must keep the tile's
+        mask (a one-bin histogram counted every lane of the block) and
+        broadcast its pointer, and a load feeding a reduction must zero the
+        lanes past the tile's extent."""
+        for static_shapes in (True, False):
+
+            @helion.kernel(
+                static_shapes=static_shapes, config=helion.Config(block_sizes=[16])
+            )
+            def histogram(idx: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+                for tile in hl.tile(idx.size(0)):
+                    hl.atomic_add(counts, [idx[tile]], 1)
+                return counts
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 32]),
+            )
+            def scatter_add_rows(
+                idx: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+            ) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(x.size()):
+                    hl.atomic_add(out, [idx[tile_m], tile_n], x[tile_m, tile_n])
+                return out
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[32, 16]),
+            )
+            def gather_column_sums(idx: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+                out = x.new_empty([x.size(1)])
+                for tile_n in hl.tile(x.size(1)):
+                    acc = hl.zeros([tile_n], dtype=torch.float32)
+                    for tile_m in hl.tile(idx.size(0)):
+                        acc += x[idx[tile_m], tile_n].sum(0)
+                    out[tile_n] = acc
+                return out
+
+            for m in (1, 4):
+                with self.subTest(static_shapes=static_shapes, m=m):
+                    idx = torch.zeros(m, dtype=torch.int64, device=DEVICE)
+                    counts = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+                    torch.testing.assert_close(
+                        histogram(idx, counts), counts.new_tensor([m])
+                    )
+                    # Ref mode cannot shape an atomic_add result for a tensor
+                    # index next to a tile outside of compilation.
+                    if not self._in_ref_eager_mode:
+                        x = torch.randn(m, 64, device=DEVICE)
+                        out = torch.zeros(1, 64, device=DEVICE)
+                        torch.testing.assert_close(
+                            scatter_add_rows(idx, x, out), x.sum(0, keepdim=True)
+                        )
+                    row = torch.randn(1, 64, device=DEVICE)
+                    torch.testing.assert_close(gather_column_sums(idx, row), row[0] * m)
+
+    def test_tensor_index_groups_into_size_one_dims(self):
+        """Several index tensors into size-1 dims: their offsets broadcast,
+        loads keep the shared tile masks (which guard the other indices'
+        offsets) and are 0 past the tile's extent, and a load that guards a
+        dynamic size to 1 makes the tensor-indexed access see it."""
+        for static_shapes in (True, False):
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 16]),
+            )
+            def gather_pairs_sum(
+                ia: torch.Tensor, ib: torch.Tensor, x: torch.Tensor
+            ) -> torch.Tensor:
+                out = x.new_empty([ib.size(0)])
+                for tile_n in hl.tile(ib.size(0)):
+                    acc = hl.zeros([tile_n], dtype=torch.float32)
+                    for tile_m in hl.tile(ia.size(0)):
+                        a = ia[tile_m]
+                        b = ib[tile_n]
+                        acc += x[a[:, None], b[None, :]].sum(0)
+                    out[tile_n] = acc
+                return out
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 16]),
+            )
+            def scatter_add_2d(
+                idx: torch.Tensor, v: torch.Tensor, out: torch.Tensor
+            ) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(idx.size()):
+                    hl.atomic_add(out, [idx[tile_m, tile_n]], v[tile_m, tile_n])
+                return out
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[32, 16]),
+            )
+            def tile_and_gathered_sums(
+                idx: torch.Tensor, x: torch.Tensor, y: torch.Tensor
+            ) -> torch.Tensor:
+                out = x.new_empty([x.size(1)])
+                for tile_n in hl.tile(x.size(1)):
+                    acc = hl.zeros([tile_n], dtype=torch.float32)
+                    for tile_m in hl.tile(idx.size(0)):
+                        acc += (x[tile_m, tile_n] + y[tile_m, tile_n]).sum(0)
+                        acc += x[idx[tile_m], tile_n].sum(0)
+                    out[tile_n] = acc
+                return out
+
+            with self.subTest(static_shapes=static_shapes):
+                ia = torch.zeros(5, dtype=torch.int64, device=DEVICE)
+                ib = torch.randint(0, 40, (20,), device=DEVICE)
+                x = torch.randn(1, 40, device=DEVICE)
+                torch.testing.assert_close(
+                    gather_pairs_sum(ia, ib, x), x[0, ib] * 5, rtol=1e-4, atol=1e-4
+                )
+                idx = torch.zeros(5, 20, dtype=torch.int64, device=DEVICE)
+                v = torch.randn(5, 20, device=DEVICE)
+                out = torch.zeros(1, device=DEVICE)
+                torch.testing.assert_close(
+                    scatter_add_2d(idx, v, out),
+                    v.sum().reshape(1),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+                idx = torch.zeros(5, dtype=torch.int64, device=DEVICE)
+                x = torch.randn(1, 64, device=DEVICE)
+                y = torch.randn(5, 64, device=DEVICE)
+                torch.testing.assert_close(
+                    tile_and_gathered_sums(idx, x, y),
+                    (x + y).sum(0) + x[0] * 5,
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+
     def test_broadcast_tile_store_of_a_shifted_or_gathered_load(self):
         """The broadcast store writes element ``j`` at its own index tensor's
         ``j``-th entry, not at the coordinate the value was loaded from."""
