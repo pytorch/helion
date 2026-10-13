@@ -911,7 +911,10 @@ class Settings(_Settings):
             "Defaults to 'LocalAutotuneCache'."
         ),
         "autotune_benchmark_fn": (
-            "Custom benchmark function for rebenchmarking during autotuning. "
+            "Custom benchmark function for initial candidate measurements and "
+            "rebenchmarking during autotuning. Initial candidates pass one "
+            "callable with repeat=50; finalist passes may contain multiple callables. "
+            "Runs in process even when subprocess benchmarking is enabled. "
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."

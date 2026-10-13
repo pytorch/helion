@@ -739,6 +739,73 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(result, 1.25)
         clear.assert_called_once_with(compiled_fn)
 
+    def test_initial_benchmark_uses_custom_timer(self) -> None:
+        observed: list[tuple[int, int]] = []
+        benchmark_output = object()
+
+        def custom_timer(
+            fns: list[Callable[[], object]],
+            *,
+            repeat: int,
+            desc: str | None = None,
+        ) -> list[float]:
+            observed.append((len(fns), repeat))
+            self.assertIs(fns[0](), benchmark_output)
+            return [0.0125]
+
+        settings = Settings(
+            autotune_accuracy_check=False,
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+            autotune_benchmark_subprocess=True,
+            autotune_benchmark_fn=custom_timer,
+        )
+        search = self._make_search(settings, args=("arg0",))
+        compiled_fn = Mock(return_value=None)
+        bench_fn = Mock(return_value=benchmark_output)
+        search.kernel.bench_compile_config = Mock(return_value=bench_fn)
+        with (
+            patch("torch.accelerator.synchronize", autospec=True),
+            patch("helion.autotuner.benchmark_provider.do_bench") as default_timer,
+            patch.object(
+                search.benchmark_provider, "_benchmark_function_subprocess"
+            ) as subprocess_timer,
+            patch.object(
+                search.benchmark_provider, "_clear_jit_fast_path_caches"
+            ) as clear,
+        ):
+            result = search.benchmark_provider._benchmark_function("cfg", compiled_fn)
+        self.assertEqual(result, 0.0125)
+        self.assertEqual(observed, [(1, 50)])
+        default_timer.assert_not_called()
+        subprocess_timer.assert_not_called()
+        clear.assert_called_once_with(compiled_fn)
+        self.assertEqual(bench_fn.call_args, call("arg0"))
+
+    def test_initial_custom_timer_rejects_invalid_results(self) -> None:
+        for timing in ([], [0.1, 0.2], [float("nan")], [0.0], [-0.5]):
+            with self.subTest(timing=timing):
+                settings = Settings(
+                    autotune_accuracy_check=False,
+                    autotune_precompile=None,
+                    autotune_log_level=logging.CRITICAL,
+                    autotune_ignore_errors=True,
+                    autotune_benchmark_fn=lambda fns, repeat, timing=timing: timing,
+                )
+                search = self._make_search(settings)
+                compiled_fn = Mock(return_value=None)
+                search.kernel.bench_compile_config = Mock(return_value=Mock())
+                with (
+                    patch("torch.accelerator.synchronize", autospec=True),
+                    patch.object(
+                        search.benchmark_provider, "_clear_jit_fast_path_caches"
+                    ),
+                ):
+                    result = search.benchmark_provider._benchmark_function(
+                        "cfg", compiled_fn
+                    )
+                self.assertEqual(result, float("inf"))
+
     def test_benchmark_function_clears_jit_fast_path_caches_on_error(self):
         settings = Settings(
             autotune_ignore_errors=True,

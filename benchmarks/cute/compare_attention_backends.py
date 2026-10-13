@@ -10664,15 +10664,22 @@ def _import_fa4() -> types.ModuleType:
     import flash_attn.cute as fc  # pyrefly: ignore[missing-import]
     import flash_attn.cute.utils as fu  # pyrefly: ignore[missing-import]
 
-    fu.fma_packed_f32x2 = functools.partial(cute.arch.fma_packed_f32x2, rnd="rn")
-    fu.mul_packed_f32x2 = functools.partial(cute.arch.mul_packed_f32x2, rnd="rn")
-    fu.add_packed_f32x2 = functools.partial(cute.arch.add_packed_f32x2, rnd="rn")
-    fu.sub_packed_f32x2 = functools.partial(
-        cute.arch.calc_packed_f32x2_op,
-        src_c=None,
-        calc_func=nvvm.sub_packed_f32x2,
-        rnd="rn",
-    )
+    # Older checkouts exposed wrappers here; current FA4 calls cute.arch
+    # directly. Only replace a wrapper when that checkout actually owns it.
+    packed_wrappers = {
+        "fma_packed_f32x2": functools.partial(cute.arch.fma_packed_f32x2, rnd="rn"),
+        "mul_packed_f32x2": functools.partial(cute.arch.mul_packed_f32x2, rnd="rn"),
+        "add_packed_f32x2": functools.partial(cute.arch.add_packed_f32x2, rnd="rn"),
+        "sub_packed_f32x2": functools.partial(
+            cute.arch.calc_packed_f32x2_op,
+            src_c=None,
+            calc_func=nvvm.sub_packed_f32x2,
+            rnd="rn",
+        ),
+    }
+    for name, replacement in packed_wrappers.items():
+        if name in vars(fu):
+            setattr(fu, name, replacement)
     return fc
 
 

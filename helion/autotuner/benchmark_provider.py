@@ -1198,6 +1198,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     def _subprocess_benchmark_enabled(self) -> bool:
         """Subprocess benchmark path is opt-in and skipped for distributed /
         mutated-arg kernels where the worker's simple job shape doesn't fit."""
+        if self.settings.autotune_benchmark_fn is not None:
+            return False
         if not self.settings.autotune_benchmark_subprocess:
             return False
         if self._args_unpicklable:
@@ -1846,7 +1848,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_callable = functools.partial(
                     benchmark_function, *working_args
                 )
-                if benchmark_runner in (do_bench, do_bench_generic):
+                if self.settings.autotune_benchmark_fn is not None:
+                    timings = self.settings.autotune_benchmark_fn(
+                        [benchmark_callable], repeat=50
+                    )
+                    if len(timings) != 1:
+                        raise ValueError(
+                            "autotune_benchmark_fn must return one timing per callable"
+                        )
+                    res = timings[0]
+                    if not isinstance(res, float) or math.isnan(res) or res <= 0:
+                        raise ValueError(
+                            "autotune_benchmark_fn timings must be positive floats"
+                        )
+                elif benchmark_runner in (do_bench, do_bench_generic):
                     # The exact callable ran immediately above.
                     res = benchmark_runner(
                         benchmark_callable,
