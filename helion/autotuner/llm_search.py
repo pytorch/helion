@@ -692,10 +692,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         for round_num in self._budgeted_range(1, self.max_rounds):
             if self._run_refinement_round(round_num, state):
                 break
-
-        best = self.final_rebenchmark_best(self.best)
-        best = self.run_finishing_phase(best, self.finishing_rounds)
-        return best.config
+        return self._finalize()
 
     def _log_search_stats(self) -> None:
         """Report how much time went to LLM calls and benchmarking."""
