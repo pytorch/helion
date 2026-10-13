@@ -7,6 +7,9 @@ first and the short ones fill the tail (report 02 §6.9; the per-item trip
 count of a BlockMask varies with the mask, and a plain strided order over
 ``(bh, pair)`` was measured 6-8% behind the non-persistent grid at 15-40%
 density).
+
+``flex_split_workspace`` allocates the split-KV walk's partial-output
+workspace and arrival counters (``cute_flash_kv_split``).
 """
 
 from __future__ import annotations
@@ -20,6 +23,79 @@ from torch.utils.weak import WeakIdKeyDictionary
 # exactly like ``document_tile_bounds`` / ``row_bound_work_table``. Inference
 # tensors carry no version counter and are never cached.
 _FLEX_ITEM_TABLE_CACHE: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+# Split-KV workspaces per (device, stream, items, splits, head dim): the
+# partial buffers are never cleared (every split writes its rows before any
+# merge reads them) and the counters reset themselves (the last arriver
+# zeroes its counter), so one allocation serves every launch on a stream.
+_FLEX_SPLIT_WORKSPACE_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+
+
+def flex_split_workspace_elems(
+    items: int, splits: int, head_dim_v: int
+) -> tuple[int, int, int]:
+    """Element counts of the three regions of the split-KV workspace: the
+    fp32 partial output tiles, the fp32 row-statistics tiles and the int32
+    arrival counters (in that order, all 4-byte elements)."""
+    return (
+        items * splits * 2 * 128 * head_dim_v,
+        items * splits * 2 * 128 * 2,
+        items * 2 * 4,
+    )
+
+
+def flex_split_workspace(
+    like: torch.Tensor, *, items: int, splits: int, head_dim_v: int
+) -> torch.Tensor:
+    """Workspace of the split-KV list walk (``cute_flash_kv_split``).
+
+    One flat fp32 buffer on ``like``'s device: ``items * splits * 2``
+    unnormalized (128, head_dim_v) output tiles, then as many (128, 2)
+    row-statistics tiles (row max, row sum), then ``items * 2 * 4`` arrival
+    counters (per item, 128-row stage and 32-row warp group; int32 bits in
+    fp32 slots, the device recasts them), zero between launches. One tensor,
+    so a launch pays one host lookup and one kernel argument.
+
+    Re-entrancy: the buffer is cached per device and CUDA stream, so
+    launches on one stream (ordered) share it and launches on different
+    streams get their own; two concurrent launches of the kernel on the
+    SAME stream are impossible, and a launch on another stream never sees
+    another stream's buffer. Under CUDA-graph capture the buffer is
+    allocated inside the capture (the graph's private pool; the counters'
+    zeroing becomes a memset node) and is not cached. The partial region
+    holds no state across launches (uninitialized memory is only ever read
+    after the writing split's release), the counters do (each returns to
+    zero before its launch ends).
+    """
+    partial_elems, stat_elems, counter_elems = flex_split_workspace_elems(
+        items, splits, head_dim_v
+    )
+
+    def build() -> torch.Tensor:
+        workspace = torch.empty(
+            partial_elems + stat_elems + counter_elems,
+            dtype=torch.float32,
+            device=like.device,
+        )
+        # Only the counters need a value (an fp32 zero is an int32 zero).
+        workspace[partial_elems + stat_elems :].zero_()
+        return workspace
+
+    if like.is_cuda:
+        if torch.cuda.is_current_stream_capturing():
+            return build()
+        # The raw stream handle: the Stream object constructor costs 2.5 us
+        # per launch; this is the accessor inductor's wrappers use.
+        stream = torch._C._cuda_getCurrentRawStream(like.device.index)
+    else:
+        stream = None
+    key = (like.device, stream, items, splits, head_dim_v)
+    cached = _FLEX_SPLIT_WORKSPACE_CACHE.get(key)
+    if cached is None:
+        cached = build()
+        _FLEX_SPLIT_WORKSPACE_CACHE[key] = cached
+    return cached
 
 
 def _dense_tiles(count: torch.Tensor, index: torch.Tensor, num_kv: int) -> torch.Tensor:

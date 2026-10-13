@@ -6,6 +6,7 @@
 # generated Helion module DOES carry ``from __future__ import annotations`` at
 # its top, so the struct + the inline-traced rescale helper must live here, in a
 # real module compiled without that flag, and be imported by the generated code.
+from collections.abc import Sequence
 from dataclasses import dataclass
 import functools
 from functools import partial
@@ -3833,6 +3834,192 @@ def fa4_correction_epilogue_to_smem_scoped(
         if cutlass.const_expr(relu_output):
             relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
+
+
+@dsl_user_op
+def fa4_correction_epilogue_merge_to_smem_scoped(
+    flash_pvt: object,
+    tOtO0: cute.Tensor,
+    tOtO1: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    w0: object,
+    w1: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``fa4_correction_epilogue_to_smem_scoped`` over two output accumulators
+    of the same rows: ``O0 * w0 + O1 * w1`` (the FlexAttention list walk's
+    dead-stage split, whose two softmax warpgroups each took half of one
+    stage's tiles; the weights carry the merged normalizer)."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (128, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=False,
+    )
+    cO = cute.make_identity_tensor((128, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO0_i = cute.logical_divide(tOtO0, cute.make_layout((128, corr_tile_size)))
+    tOtO1_i = cute.logical_divide(tOtO1, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO0_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO0_t2r = thr_t2r.partition_S(tOtO0_i[(None, None), None])
+    tOtO1_t2r = thr_t2r.partition_S(tOtO1_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg0 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        reg1 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO0_t2r[None, 0, 0, i], reg0)
+        cute.copy(tiled_t2r, tOtO1_t2r[None, 0, 0, i], reg1)
+        reg0.store(reg0.load() * w0 + reg1.load() * w1)
+        cvt_copy(tiled_r2s, reg0, tOsO_r2s[None, 0, 0, i])
+
+
+def _fa4_split_tile_partitions(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    tiles: Sequence[cute.Tensor],
+    tidx: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+) -> tuple[object, list[cute.Tensor], list[cute.Tensor], cute.Tensor]:
+    """The t2r tiled copy of the correction epilogue over ``tOtO`` and this
+    thread's partitions of the (128, head_dim) gmem ``tiles`` in the same
+    fragment order: ``(tiled_t2r, tmem fragments, gmem fragments,
+    coordinate fragment)`` (the split-KV partial store and merge address the
+    workspace tiles exactly like the staged epilogue addresses ``sO``)."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (128, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=False,
+    )
+    chunk = cute.make_layout((128, corr_tile_size))
+    cO = cute.make_identity_tensor((128, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO_i = cute.logical_divide(flash_pvt_copy.partition_C(cO), chunk)
+    tOtO_i = cute.logical_divide(tOtO, chunk)
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    gmem = []
+    for tile in tiles:
+        tOgT_i = cute.logical_divide(
+            flash_pvt_copy.get_slice(0).partition_C(tile), chunk
+        )
+        gmem.append(thr_t2r.partition_D(tOgT_i[(None, None), None]))
+    return tiled_t2r, [tOtO_t2r], gmem, tOcO_t2r
+
+
+@dsl_user_op
+def fa4_split_partial_store(
+    flash_pvt: object,
+    tOtO0: cute.Tensor,
+    tOtO1: cute.Tensor | None,
+    gP: cute.Tensor,
+    tidx: object,
+    w0: object,
+    w1: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Split-KV walk (``cute_flash_kv_split``): store this thread's rows of the
+    unnormalized fp32 partial output ``O0 * w0 (+ O1 * w1)`` to the (128,
+    head_dim) workspace tile ``gP``. ``tOtO1`` None: one accumulator; ``w0``
+    None: unscaled (the dead-stage split merges a split CTA's two
+    accumulators here, with the merged statistics stored beside them)."""
+    tiled_t2r, (tOtO0_t2r,), (tOgP_t2r,), tOcO_t2r = _fa4_split_tile_partitions(
+        flash_pvt, tOtO0, (gP,), tidx, head_dim, corr_tile_size, o_dtype
+    )
+    tOtO1_t2r = None
+    if tOtO1 is not None:
+        chunk = cute.make_layout((128, corr_tile_size))
+        tOtO1_i = cute.logical_divide(tOtO1, chunk)
+        tOtO1_t2r = (
+            cast("Any", tiled_t2r)
+            .get_slice(tidx)
+            .partition_S(tOtO1_i[(None, None), None])
+        )
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg0 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO0_t2r[None, 0, 0, i], reg0)
+        if tOtO1_t2r is not None:
+            reg1 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+            cute.copy(tiled_t2r, tOtO1_t2r[None, 0, 0, i], reg1)
+            reg0.store(reg0.load() * w0 + reg1.load() * w1)
+        elif w0 is not None:
+            reg0.store(reg0.load() * w0)
+        cute.autovec_copy(reg0, tOgP_t2r[None, 0, 0, i])
+
+
+@dsl_user_op
+def fa4_split_merge_store(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    partials: Sequence[cute.Tensor],
+    weights: Sequence[object],
+    gO: cute.Tensor,
+    tidx: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Split-KV walk: ``O = sum_j partials[j] * weights[j]`` over this
+    thread's rows (the weights carry the merged normalizer; fixed split
+    order, so the result does not depend on which CTA merges), cast to
+    ``o_dtype`` and stored to the (128, head_dim) output tile ``gO``.
+    ``tOtO`` only lends the accumulator layout the fragments follow."""
+    _, _, gmem, tOcO_t2r = _fa4_split_tile_partitions(
+        flash_pvt, tOtO, (gO, *partials), tidx, head_dim, corr_tile_size, o_dtype
+    )
+    tOgO_t2r, *tOgP_t2r = gmem
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        acc = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.autovec_copy(tOgP_t2r[0][None, 0, 0, i], acc)
+        acc.store(acc.load() * weights[0])
+        for j in range(1, len(partials)):
+            part = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+            cute.autovec_copy(tOgP_t2r[j][None, 0, 0, i], part)
+            acc.store(acc.load() + part.load() * weights[j])
+        out = cute.make_rmem_tensor(reg_src.shape, o_dtype)
+        out.store(acc.load().to(o_dtype))
+        cute.autovec_copy(out, tOgO_t2r[None, 0, 0, i])
 
 
 @dsl_user_op

@@ -6,7 +6,7 @@
 
 The renderer (``flash_score_mod.py``) emits calls to these helpers through the
 backend's library-import table (``_cute_flex_tanh``, ``_cute_flex_load_vec``,
-``_cute_flex_load_window``,
+``_cute_flex_load_window``, ``_cute_flex_lane_below``,
 ``_cute_flex_fmod``, ``_cute_flex_remainder``); everything else in a rendered
 hook is plain CuTe DSL scalar code.
 """
@@ -83,6 +83,23 @@ def load_window(
         values.extend(load_vec(base + width * k, width, dtype))
     values.extend(load_vec(last_ptr, width, dtype))
     return values
+
+
+def lane_below(limit: object, width: int) -> cutlass.Int32:
+    """The ``width``-bit word whose bits ``j < limit`` are set (``limit``
+    clamped to ``[0, width]``): one bound of a keep-word lane interval.
+
+    ``1 << 32`` is poison in the DSL's ``Int32`` shift, so the full 32-bit
+    word is selected rather than shifted into.
+    """
+    t = cutlass.max(cutlass.Int32(limit), cutlass.Int32(0))
+    if width < 32:
+        t = cutlass.min(t, cutlass.Int32(width))
+        return (cutlass.Int32(1) << t) - cutlass.Int32(1)
+    full = t >= cutlass.Int32(32)
+    t = cutlass.min(t, cutlass.Int32(31))
+    partial = (cutlass.Int32(1) << t) - cutlass.Int32(1)
+    return cutlass.Int32(cutlass.select_(full, cutlass.Int32(-1), partial))
 
 
 def fmod(a: object, b: object) -> object:

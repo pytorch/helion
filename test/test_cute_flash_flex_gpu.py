@@ -58,6 +58,11 @@ PAIR_BODY: dict[str, object] = {
     cute_flash.FLASH_PERSISTENT_KEY: False,
     cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2",
     cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+    # The seeded default splits a small grid's KV walk over several CTAs
+    # (``cute_flash_kv_split``, 4 for most of these shapes); the pinned
+    # bodies keep the one-CTA walk, ``test_split_kv_walk_matches_the_unsplit_kernel``
+    # covers the splits.
+    cute_flash.FLASH_KV_SPLIT_KEY: 1,
 }
 PAIR_DESC: dict[str, object] = {
     **PAIR_BODY,
@@ -381,6 +386,278 @@ def test_random_table_mask_with_empty_rows_is_stable_under_repeated_launches() -
     assert torch.equal(out_again, out)
 
 
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "body"),
+    [
+        pytest.param(2048, 2048, PAIR_DESC, id="asymmetric-desc"),
+        pytest.param(2048, 2048, STAGED_ASC, id="asymmetric-asc"),
+        pytest.param(128, 2176, STAGED_ASC, id="dead-second-stage"),
+        # The TMA epilogue of a ragged query length stores no dead tile
+        # (``test_ragged_query_tma_epilogue_is_bitwise_the_staged_store``).
+        pytest.param(128, 2176, PAIR_DESC, id="dead-second-stage-tma-store"),
+    ],
+)
+def test_absent_stage_mma_skip_is_bitwise_the_unskipped_kernel(
+    q_seq: int, kv_seq: int, body: dict[str, object]
+) -> None:
+    """``cute_flash_flex_skip_absent``: a random table mask (the two 128-row
+    stages of a pair rarely share a tile, so each stage is absent on most
+    steps) and a 128-row query (one pair whose second stage is dead on every
+    step) give the same bits with the MMA skip on and off: a skipped stage's
+    softmax zero-stores P, and a zero P adds nothing."""
+    batch, heads = 4, 8
+    torch.manual_seed(2)
+    table = (
+        torch.rand(batch, heads, q_seq // 128, -(-kv_seq // 128), device=DEVICE) < 0.35
+    ).to(torch.int32)
+    table[0, 1, 0] = 0  # an empty row (a stage absent on every step)
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, mask_mod=table_mask)
+    off_fn, off_cfg = _compile_flex(
+        args, {**body, cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: False}
+    )
+    on_fn, on_cfg = _compile_flex(
+        args, {**body, cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True}
+    )
+    assert not off_cfg.flex_skip_absent
+    assert on_cfg.flex_skip_absent
+    out_off, lse_off = off_fn(*args)
+    out_on, lse_on = on_fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out_on, out_off)
+    assert torch.equal(lse_on, lse_off)
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_on, lse_on, out_ref, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("q_seq", [64, 128, 384, 1152])
+def test_ragged_query_tma_epilogue_is_bitwise_the_staged_store(q_seq: int) -> None:
+    """The TMA output store of a ragged query length (``M % 256 != 0``) stores
+    only the live rows of the last pair: a full tile through TMA, a half-live
+    tile through the row-guarded vector store, a dead tile not at all. Its
+    128-row box over the coalesced (S, D, B) output view used to land in the
+    next head's first rows (zeros for a dead second stage, racing that head's
+    own store). Bitwise the staged vector store of the same body (the same
+    sO contents, another store path) and close to torch at every head."""
+    batch, heads, kv_seq = 4, 8, 2176
+    torch.manual_seed(4)
+    table = (
+        torch.rand(batch, heads, -(-q_seq // 128), -(-kv_seq // 128), device=DEVICE)
+        < 0.4
+    ).to(torch.int32)
+    table[0, 1, 0] = 0  # an empty row (zeros and -inf, nothing else)
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, mask_mod=table_mask)
+    staged = {
+        **PAIR_DESC,
+        cute_flash.FLASH_EPI_TMA_KEY: False,
+        cute_flash.FLASH_EPI_STG_KEY: True,
+    }
+    out_tma, lse_tma = _run_flex(args, PAIR_DESC)
+    out_stg, lse_stg = _run_flex(args, staged)
+    assert torch.equal(out_tma, out_stg)
+    assert torch.equal(lse_tma, lse_stg)
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_tma, lse_tma, out_ref, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "splits"),
+    [
+        pytest.param(128, 2176, True, id="128-row-query"),
+        pytest.param(384, 2176, True, id="ragged-last-pair"),
+        pytest.param(2048, 2048, False, id="two-live-stages"),
+    ],
+)
+def test_dead_stage_split_merges_both_softmax_warpgroups(
+    q_seq: int, kv_seq: int, splits: bool
+) -> None:
+    """``cute_flash_flex_dead_stage_split``: a pair whose second stage sees no
+    tile walks the first stage's tiles on both softmax warpgroups and merges
+    the two partial softmaxes; the result matches the unsplit kernel within
+    the merge's rounding and the reference within bf16 tolerance. A pair with
+    two live stages renders the split-capable body but never splits: bitwise
+    the unsplit kernel."""
+    batch, heads = 4, 8
+    torch.manual_seed(3)
+    table = (
+        torch.rand(batch, heads, -(-q_seq // 128), -(-kv_seq // 128), device=DEVICE)
+        < 0.4
+    ).to(torch.int32)
+    table[0, 1, 0] = 0  # an empty row: its stage is absent on every step
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, mask_mod=table_mask)
+    skip = {**STAGED_ASC, cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True}
+    off_fn, off_cfg = _compile_flex(
+        args, {**skip, cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: False}
+    )
+    on_fn, on_cfg = _compile_flex(
+        args, {**skip, cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True}
+    )
+    assert not off_cfg.flex_dead_stage_split
+    assert on_cfg.flex_dead_stage_split
+    out_off, lse_off = off_fn(*args)
+    out_on, lse_on = on_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_on, lse_on, out_ref, lse_ref)
+    if splits:
+        # The split items' two partial softmaxes are merged in another
+        # summation order: equal within fp32 rounding, not bitwise.
+        torch.testing.assert_close(
+            out_on.float(), out_off.float(), atol=1e-2, rtol=1e-2
+        )
+        finite = torch.isfinite(lse_off)
+        torch.testing.assert_close(lse_on[finite], lse_off[finite], atol=1e-3, rtol=0)
+        assert torch.equal(lse_on[~finite], lse_off[~finite])
+    else:
+        assert torch.equal(out_on, out_off)
+        assert torch.equal(lse_on, lse_off)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("kv_split", [2, 4])
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "body", "dead_split"),
+    [
+        pytest.param(64, 2176, STAGED_ASC, False, id="m64-staged"),
+        pytest.param(128, 2176, PAIR_DESC, False, id="m128-tma"),
+        pytest.param(128, 8320, PAIR_DESC, True, id="m128-dead-split-three-words"),
+        pytest.param(384, 2176, STAGED_ASC, True, id="m384-ragged-dead-split"),
+        pytest.param(2048, 2048, PAIR_DESC, False, id="aligned-tma"),
+        pytest.param(
+            2048 + 128,
+            2048,
+            {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: True},
+            False,
+            id="ragged-persistent",
+        ),
+    ],
+)
+def test_split_kv_walk_matches_the_unsplit_kernel(
+    kv_split: int, q_seq: int, kv_seq: int, body: dict[str, object], dead_split: bool
+) -> None:
+    """``cute_flash_kv_split``: every work item's KV walk over two or four
+    CTAs, each walking a contiguous slice of the union walk and the last
+    arriving warp of each 32-row group merging the partial outputs in split
+    order. A random table mask with an empty row and an empty head (zeros
+    and ``-inf``), ragged query lengths (M = 64, 128, 384, 2176), the
+    dead-stage split on and off and the persistent item loop: within the
+    merge's rounding of the unsplit kernel (another summation order, LSE
+    within 1e-3; the empty rows bitwise) and close to torch; repeated
+    launches agree bitwise (the arrival counters reset themselves)."""
+    batch, heads = 4, 8
+    torch.manual_seed(5)
+    table = (
+        torch.rand(batch, heads, -(-q_seq // 128), -(-kv_seq // 128), device=DEVICE)
+        < 0.4
+    ).to(torch.int32)
+    table[0, 1, 0] = 0  # an empty row
+    table[1, 3] = 0  # an empty head
+    if q_seq >= 256:
+        table[2, 5, 1] = 0  # a dead second stage of a live first stage
+
+    def table_mask(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return hl.load(table, [b, h, q_idx // 128, kv_idx // 128]) != 0
+
+    def table_mask_ref(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return table[b, h, q_idx // 128, kv_idx // 128] != 0
+
+    q, k, v = _qkv(batch, heads, q_seq, kv_seq)
+    block_mask = create_block_mask(
+        table_mask_ref,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        device=DEVICE,
+        BLOCK_SIZE=(128, 128),
+    )
+    args = _flex_args(q, k, v, _identity, block_mask, mask_mod=table_mask)
+    base = {
+        **body,
+        cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: dead_split,
+        cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: dead_split,
+    }
+    one_fn, one_cfg = _compile_flex(args, {**base, cute_flash.FLASH_KV_SPLIT_KEY: 1})
+    split_fn, split_cfg = _compile_flex(
+        args, {**base, cute_flash.FLASH_KV_SPLIT_KEY: kv_split}
+    )
+    assert one_cfg.kv_split == 1 and split_cfg.kv_split == kv_split
+    assert split_cfg.flex_dead_stage_split is dead_split
+    out_one, lse_one = one_fn(*args)
+    out_split, lse_split = split_fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out_split, lse_split, out_ref, lse_ref)
+    torch.testing.assert_close(out_split.float(), out_one.float(), atol=1e-2, rtol=1e-2)
+    finite = torch.isfinite(lse_one)
+    assert torch.equal(finite, torch.isfinite(lse_split))
+    torch.testing.assert_close(lse_split[finite], lse_one[finite], atol=1e-3, rtol=0)
+    assert torch.equal(lse_split[~finite], lse_one[~finite])
+    assert torch.all(out_split[~finite] == 0)
+    for _ in range(3):
+        out_again, lse_again = split_fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out_again, out_split)
+        assert torch.equal(lse_again, lse_split)
+
+
 def _copy_tables(args: tuple[Any, ...], block_mask: Any) -> None:
     """Rewrite the kernel's four tables in place from ``block_mask``."""
     full_num = block_mask.full_kv_num_blocks
@@ -447,3 +724,50 @@ def test_persistent_list_walk_is_bitwise_the_grid_and_follows_table_rewrites() -
     )
     _copy_tables(args, block_mask)
     check()
+
+
+def _dilated(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    diff = torch.abs(q_idx - kv_idx)
+    return (diff <= 512) & (diff % 2 == 0)
+
+
+def _temporal(b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    q_tok = (q_idx - 128) % 512
+    kv_tok = (kv_idx - 128) % 512
+    return (kv_idx < 128) | (q_idx < 128) | (torch.abs(q_tok - kv_tok) < 64)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("mask", [_dilated, _temporal], ids=["dilated", "temporal"])
+@pytest.mark.parametrize(
+    "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
+)
+def test_keep_word_mask_form_is_bitwise_the_element_form(
+    mask: Callable[..., Any], overrides: dict[str, object]
+) -> None:
+    """``cute_flash_flex_mask_form``: the per-chunk keep word (lane intervals,
+    the parity pattern, lane-affine remainders, the tile-uniform ``kv < 128``)
+    applied through the R2P select chain writes the same ``-inf`` pattern as
+    the per-element predicate, at 16- and 32-column chunks and with a
+    half-live last pair; both match torch."""
+    batch, heads, seq = 2, 4, 2048 + 128
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        mask, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    results: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for form in ("bitmask", "element"):
+        fn, resolved = _compile_flex(
+            args, {**overrides, cute_flash.FLASH_FLEX_MASK_FORM_KEY: form}
+        )
+        assert resolved.flex_mask_form == form
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        results[form] = (out, lse)
+    out, lse = results["bitmask"]
+    assert torch.equal(out, results["element"][0])
+    assert torch.equal(lse, results["element"][1])
+    out_ref, lse_ref = _reference(q, k, v, None, block_mask)
+    _assert_close_to_reference(out, lse, out_ref, lse_ref)

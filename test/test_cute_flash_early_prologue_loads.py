@@ -239,7 +239,12 @@ def _load_warp_prologue(code: str) -> str:
 
 
 def test_knob_is_an_appended_schema_axis() -> None:
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == KEY
+    # Appended once behind the axes it was introduced after; knobs added later
+    # (the flex list walk's) append behind it in turn, so the tail itself is
+    # not pinned.
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys.count(KEY) == 1
+    assert keys.index(KEY) > keys.index(cute_flash.FLASH_CAUSAL_HEAD_PAIR_KEY)
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__[
             KEY.removeprefix("cute_flash_")
