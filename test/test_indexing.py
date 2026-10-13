@@ -4090,14 +4090,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(
                         histogram(idx, counts), counts.new_tensor([m])
                     )
-                    # Ref mode cannot shape an atomic_add result for a tensor
-                    # index next to a tile outside of compilation.
-                    if not self._in_ref_eager_mode:
-                        x = torch.randn(m, 64, device=DEVICE)
-                        out = torch.zeros(1, 64, device=DEVICE)
-                        torch.testing.assert_close(
-                            scatter_add_rows(idx, x, out), x.sum(0, keepdim=True)
-                        )
+                    x = torch.randn(m, 64, device=DEVICE)
+                    out = torch.zeros(1, 64, device=DEVICE)
+                    torch.testing.assert_close(
+                        scatter_add_rows(idx, x, out), x.sum(0, keepdim=True)
+                    )
                     row = torch.randn(1, 64, device=DEVICE)
                     torch.testing.assert_close(gather_column_sums(idx, row), row[0] * m)
 
