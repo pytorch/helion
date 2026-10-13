@@ -2331,7 +2331,6 @@ class DeviceFunction:
             name: aliases[0] for name, aliases in self._variable_renames.items()
         }
         rw = ReadWrites.from_list([*self.preamble, *self.body])
-        # shortcut: Long dead chains take quadratic work; use a worklist if common.
         while True:
             previous_rw = rw
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
