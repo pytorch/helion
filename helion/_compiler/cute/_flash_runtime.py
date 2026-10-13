@@ -132,6 +132,8 @@ def flash_fa4_shared_storage(
     separate_kv: bool = False,
     kv_tile_n: int = 128,
     kv_cta_group_size: int = 1,
+    head_dim_v: int | None = None,
+    uneven_kv_ring: bool = False,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -155,14 +157,36 @@ def flash_fa4_shared_storage(
     Allocate its per-CTA extent, matching make_smem_layout_b. Query/output
     storage stays local and is unchanged. A two-CTA cluster using local MMA
     still passes kv_cta_group_size=1.
+    ``head_dim_v`` is the V/O head dim when it differs from the Q/K
+    ``head_dim`` (the 192/128 MLA pair): sQ keeps ``head_dim``, every aliased
+    K/V slot is the wider tile (V's TMA box lands at the K stage stride), and
+    the separate V ring / ``sO`` follow the V width. ``uneven_kv_ring`` is
+    FA4's three-slot [wide, narrow, wide] aliased ring for that pair: the
+    stage stride is half a K plus half a V tile and the ring ends one wide
+    tile after the last stride (see ``uneven_kv_ring_slot``).
     """
     assert kv_cta_group_size in (1, 2)
     assert kv_tile_n % kv_cta_group_size == 0
+    if head_dim_v is None:
+        head_dim_v = head_dim
+    kv_slot_dim = max(head_dim, head_dim_v)
     softmax_threads = 128
-    kv_elements = kv_tile_n * head_dim * kv_stage // kv_cta_group_size
+    k_elements = kv_tile_n * head_dim * kv_stage // kv_cta_group_size
+    v_elements = kv_tile_n * head_dim_v * kv_stage // kv_cta_group_size
+    if uneven_kv_ring:
+        # The pair's one-CTA ring: no cooperative partition of the slots.
+        assert not separate_kv
+        assert head_dim_v != head_dim
+        assert kv_cta_group_size == 1
+        kv_ring_elems = (
+            kv_tile_n * (head_dim + head_dim_v) // 2 * (kv_stage - 1)
+            + kv_tile_n * kv_slot_dim
+        )
+    else:
+        kv_ring_elems = kv_tile_n * kv_slot_dim * kv_stage // kv_cta_group_size
     clc_response_size = clc_stages * 4 if use_clc_scheduler else 0
     clc_mbar_size = clc_stages * 2 if use_clc_scheduler else 0
-    separate_o_size = 128 * head_dim * 2 if epi_tma else 0
+    separate_o_size = 128 * head_dim_v * 2 if epi_tma else 0
 
     if separate_kv:
 
@@ -193,8 +217,8 @@ def flash_fa4_shared_storage(
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
-            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
-            sV: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, k_elements], 1024]
+            sV: cute.struct.Align[cute.struct.MemRange[dtype, v_elements], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
         return SharedStorage
@@ -235,8 +259,10 @@ def flash_fa4_shared_storage(
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
-            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
-            sO: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim * 2], 1024]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
+            sO: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim_v * 2], 1024
+            ]
 
         return SharedStorage
 
@@ -273,9 +299,33 @@ def flash_fa4_shared_storage(
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
-        sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
 
     return SharedStorage
+
+
+@cute.jit
+def uneven_kv_ring_slot(
+    slot: cute.Tensor, index: cutlass.Int32, shift_elems: int
+) -> cute.Tensor:
+    """Address an operand's slot of FA4's uneven [wide, narrow, wide] K/V ring.
+
+    ``slot`` is the ring tensor already sliced at stage ``index`` with the
+    uneven stage stride (half a K plus half a V tile). The even slots sit at
+    their strided addresses; the odd slot is shifted by half the width
+    difference toward the operand it holds: ``shift_elems`` is positive for
+    the narrow operand (V, which fills the middle) and negative for the wide
+    one (K, which reaches back into the previous round's drained K bytes).
+    K and V alternate through the ring and the depth is odd, so which operand
+    a slot holds is fixed by the operand of the load, not by the round. The
+    shift is a whole number of 1024-byte swizzle periods (checked by the
+    schedule), so the swizzled pointer stays valid.
+    """
+    # ``divby=512`` elements is the 1024-byte swizzle period of the 2-byte
+    # operands: it tells the DSL the shifted pointer keeps the alignment the
+    # swizzled layout (and the TMA / descriptor consumers) assume.
+    offset = cute.assume((index & 1) * shift_elems, divby=512)
+    return cute.make_tensor(slot.iterator + offset, slot.layout)
 
 
 @functools.cache
@@ -1416,6 +1466,23 @@ def row_kv_begin_mask_t2r(
     mask_r2p_sm100_range(tLDrS, row_lb - block_start, row_idx + 1 - block_start)
 
 
+def row_kv_begin_mask_t2r_chunk(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_lb: cutlass.Int32,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    chunk_idx: int,
+) -> None:
+    """Per-row-bound-mask one FA4 32-column score chunk after a T2R load
+    (the chunk origin shifts both range bounds, as in
+    ``sliding_window_mask_t2r_chunk``)."""
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    chunk_cols = cute.size(tLDrS.shape)
+    block_start = n_block * 128 + cutlass.Int32(chunk_idx * chunk_cols)
+    mask_r2p_sm100_range(tLDrS, row_lb - block_start, row_idx + 1 - block_start)
+
+
 def _row_kv_begin_clamped(value: object, limit: cutlass.Int32) -> cutlass.Int32:
     """A lower-bound table entry clamped to ``[0, limit]`` as an exact Int32.
 
@@ -1440,6 +1507,40 @@ def row_kv_begin_row_bound(
     ``[0, row_idx + 1]`` (``row_idx + 1`` leaves the row without a key)."""
     lb = cast("Any", lb_tensor)
     return _row_kv_begin_clamped(lb[row_idx, lb_bh], row_idx + cutlass.Int32(1))
+
+
+def rcp_approx_ftz_or_zero(row_sum: Float32) -> Float32:
+    """``rcp_approx_ftz(row_sum)``, or 0 when the row sum is 0.
+
+    A per-row KV lower bound can leave a query row with no visible key; its
+    probabilities are all zero, so the output row must be 0 (the
+    FlexAttention / FA4 convention) rather than ``0 * inf``.  The fa4 body
+    (the kind's default family) publishes exactly 0 for such a row
+    (``row_kv_begin_row_sum``), so the ``== 0`` test is exact.  Every other
+    row's sum is at least about 1 (its row max contributes ``exp2(0)``), far
+    from the subnormal range where ``rcp.approx.ftz`` flushes; the approximate
+    reciprocal is then within 1 ulp of the ws_overlap body's exact divide.
+    """
+    return Float32(
+        cutlass.select_(row_sum == Float32(0.0), Float32(0.0), rcp_approx_ftz(row_sum))
+    )
+
+
+def row_kv_begin_row_sum(row_sum: Float32, row_max: Float32) -> Float32:
+    """The row sum a per-row KV lower bound plan publishes to its normalizer:
+    exactly 0 when the row max is still ``-inf`` (no visible key).
+
+    The hardware exp2 of a masked (``-inf``) score is 0, but the polynomial
+    exp2 packets evaluate it as the clamped argument ``-127``: the degree-2
+    constant term (``_POLY_EX2_DEG2[0]``, not exactly 1) shifted down by 127
+    binades is a subnormal of about 2e-41 per lane, so an empty row's sum is a
+    nonzero subnormal that ``rcp.approx.ftz`` flushes to ``inf`` (and the
+    output row to ``0 * inf``).  The row max tells the two cases apart
+    exactly: it is ``-inf`` if and only if every score of the row was masked.
+    """
+    return Float32(
+        cutlass.select_(row_max == -cutlass.Float32.inf, Float32(0.0), row_sum)
+    )
 
 
 def row_kv_begin_bounds_warp(

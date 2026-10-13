@@ -18,7 +18,13 @@ DOCUMENT_MASK_KIND = "document_mask"
 # one, including a separately applied causal mask, declines the lowering). A
 # row whose bound lies past the row sees no key: the lowering returns 0 for it
 # (the FlexAttention / FA4 convention) where the kernel source and the Triton
-# lowering produce NaN from ``0 * inf``.
+# lowering produce NaN from ``0 * inf``. As an interval kind it defaults to
+# the fa4 pair body, whose normalizer is every fa4 plan's ``rcp.approx.ftz``
+# of the row sum (plus the exp2 pipe split) rather than the ws_overlap body's
+# exact divide: a non-empty row's sum is at least about 1 (its row max
+# contributes ``exp2(0)``), so the reciprocal is within 1 ulp and the
+# flush-to-zero never fires; an empty row's published sum is exactly 0
+# (``row_kv_begin_row_sum``) and maps to a 0 output row.
 ROW_KV_BEGIN_MASK_KIND = "row_kv_begin_mask"
 SOFTCAP_KIND = "softcap"
 LOWERED_SCORE_KINDS = frozenset(
@@ -51,6 +57,16 @@ SPARSE_TILE_MASK_KINDS = frozenset(
         ROW_KV_BEGIN_MASK_KIND,
     }
 )
+# ``(q/k head dim, v/o head dim)`` pairs the fused flash path hosts. The
+# asymmetric pair is the MLA prefill shape (192-wide Q/K, 128-wide V/O); only
+# the FA4 topology carries it (sQ and the K ring scale with the first dim, the
+# V box, TMEM output and epilogue with the second).
+FLASH_HEAD_DIM_PAIRS = frozenset({(64, 64), (128, 128), (192, 128)})
+
+
+def flash_head_dims_supported(head_dim: int, head_dim_v: int) -> bool:
+    """True when ``(head_dim, head_dim_v)`` is a fused-flash head-dim pair."""
+    return (head_dim, head_dim_v) in FLASH_HEAD_DIM_PAIRS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,6 +99,18 @@ class AttentionScorePlan:
     # (``heads_q // heads_kv``), so they carry ``batch // kv_group`` leading
     # entries. ``1`` is plain multi-head attention.
     kv_group: int = 1
+    # V/O head dim when it differs from the Q/K head dim (``head_dim`` keeps
+    # the Q/K width the softmax scale is derived from); ``None`` is the
+    # symmetric case.
+    head_dim_v: int | None = None
+
+    @property
+    def value_head_dim(self) -> int:
+        return self.head_dim if self.head_dim_v is None else self.head_dim_v
+
+    @property
+    def asymmetric_head_dims(self) -> bool:
+        return self.value_head_dim != self.head_dim
 
     @property
     def is_causal(self) -> bool:
@@ -170,13 +198,11 @@ class AttentionScorePlan:
     def requires_ws_overlap(self) -> bool:
         """Pruned plans whose active tiles are not one contiguous interval per
         query tile keep the ws_overlap body (its per-tile activity predicate);
-        interval plans run on every family. The per-row KV lower bound is an
-        interval kind whose range prelude and boundary mask are emitted for
-        the ws_overlap body's single resident query tile only, so it keeps
-        that body too."""
-        return self.has_kv_tile_pruning and (
-            not self.has_contiguous_kv_interval or bool(self.row_kv_begin_masks)
-        )
+        interval plans (including the per-row KV lower bound, whose range
+        prelude is evaluated per resident query tile) may also run on the fa4
+        pair body (the two families that host KV-tile-pruned masks; the
+        resolver pins the rest away)."""
+        return self.has_kv_tile_pruning and not self.has_contiguous_kv_interval
 
     def has_lowering(self) -> bool:
         seen_mask = False

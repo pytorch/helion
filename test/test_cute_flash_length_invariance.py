@@ -1990,17 +1990,19 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     for key, value in resident_defaults.items():
         assert _active_choices(enum_fragments[key]) == frozenset((value,))
     assert set(resident_defaults.items()) <= set(active_values)
-    # 61: the ws surface pins every dimension it cannot vary to one value,
+    # 63: the ws surface pins every dimension it cannot vary to one value,
     # including the KV tile width, the query-tile height, the one-pass
     # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
     # the (fa4-only) per-chunk P release, the affine bias lowering
-    # (``cute_flash_bias_form``, live only with an ALiBi/relative bias) and
-    # the two row-program knobs (``cute_flash_row_warps``,
-    # ``cute_flash_row_tile_m`` of the ``row_mma`` family); the two-warpgroup
-    # body measures both of its O epilogues (``cute_flash_epi_stg``).
+    # (``cute_flash_bias_form``, live only with an ALiBi/relative bias), the
+    # two row-program knobs (``cute_flash_row_warps``,
+    # ``cute_flash_row_tile_m`` of the ``row_mma`` family) and the asymmetric
+    # pair's fa4 knobs (``cute_flash_uneven_kv_ring``, ``cute_flash_o_over_q``);
+    # the two-warpgroup body measures both of its O epilogues
+    # (``cute_flash_epi_stg``).
     # Resident-only coordinates add exactly three inactive singletons; keep
     # the upstream bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 61
+    assert len(active_values) - len(resident_defaults) <= 63
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -3547,3 +3549,43 @@ def test_persistent_loop_canonicalizes_for_clc() -> None:
     )
     assert resolved.use_clc_scheduler
     assert resolved.persistent_loop == "while"
+
+
+@pytest.mark.parametrize(
+    ("mask_kind", "standard_causal_output"),
+    (
+        ("sliding_window_mask", True),
+        ("prefix_lm_mask", True),
+        ("row_kv_begin_mask", True),
+        ("document_mask", False),
+    ),
+)
+@pytest.mark.parametrize("num_kv", (16, 64))
+def test_pruned_mask_surfaces_have_a_complete_coverage_design(
+    mask_kind: str, standard_causal_output: bool, num_kv: int
+) -> None:
+    # The KV-tile-pruned masks search the fa4 pair body and ws_overlap; every
+    # value their fragments offer must survive normalization (the dense hd64
+    # body's statistics transport and persistent loop are pinned for them).
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=num_kv,
+        num_bh=64,
+        dtype=torch.bfloat16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        has_kv_tile_pruning=True,
+        standard_causal_output=standard_causal_output,
+        has_score_modifiers=True,
+        plain_row_body=False,
+        score_modifier_kinds=(mask_kind,),
+    )
+    generation = ConfigGeneration(spec)
+    with _memoized_flash_fragments():
+        configs = generation.flash_deterministic_population_configs()
+    assert configs
+    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    generation.validate_flash_structural_coverage()
