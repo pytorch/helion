@@ -36,6 +36,7 @@ from helion._compiler.cute.flash_score_mod import flex_aux_smem_staged
 from helion._compiler.cute.flash_score_mod import flex_coalesce_smem_bytes
 from helion._compiler.cute.flash_score_mod import flex_coalesce_steps
 from helion._compiler.cute.flash_score_mod import flex_coalesce_widths
+from helion._compiler.cute.flash_score_mod import flex_hook_ops
 from helion._compiler.cute.flash_score_mod import flex_hook_params
 from helion._compiler.cute.flash_score_mod import flex_prefetch_count
 from helion._compiler.cute.flash_score_mod import flex_prefetch_regs
@@ -1723,6 +1724,24 @@ class TestCuteFlexScoreMod(TestCase):
         self.assertEqual(flex_coalesce_smem_bytes((4,), 128, 16), 8 * 32 * 80)
         self.assertEqual(flex_coalesce_smem_bytes((1,), 128, 16), 0)
         self.assertEqual(flex_coalesce_smem_bytes((), 128, 32), 0)
+        # The score hook's per-element operations (the chunk-loop roll's
+        # default fact): graphormer-edge's three gathers, selects, sums and
+        # division; nothing for the mask-only plans.
+        self.assertEqual(flex_hook_ops(plan, _BOUNDS), 23)
+        ops = {
+            "graphormer_spatial": 3,
+            "sandwich": 5,
+            "strided_runs": 13,
+            "extra_ops": 54,
+            "flamingo": 0,
+            "shared_prefix": 0,
+        }
+        for name, count in ops.items():
+            other = next(c for c in _CASES if c.name == name)
+            _code, other_plan, _tables, _values = _render_case(
+                other, with_tail=False, bounds=True
+            )
+            self.assertEqual(flex_hook_ops(other_plan, _BOUNDS), count, name)
 
     def test_coop_runtime_redistributes_rows_and_is_bank_conflict_free(self) -> None:
         """The runtime helpers on a simulated warp: 32 lanes run

@@ -112,6 +112,9 @@ class FlashSearchSurface(NamedTuple):
     # (``flash_score_mod.flex_coalesce_steps``): the cooperative request
     # width knob's choices resolve against them.
     flex_coalesce_steps: tuple[int, ...] = ()
+    # Per-element operations of the score hook
+    # (``flash_score_mod.flex_hook_ops``): the chunk-loop roll's default.
+    flex_hook_ops: int = 0
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3618,6 +3621,7 @@ def flex_search_surface(
     is not a decline; a declared ceiling below 128 is.
     """
     from .cute.cute_flash import _flash_flex_coalesce_steps
+    from .cute.cute_flash import _flash_flex_hook_ops
     from .cute.cute_flash import _flash_flex_prefetch_regs
     from .cute.cute_flash import _flash_output_requires_tma
     from .cute.flash_score_mod import flex_aux_smem_candidates
@@ -3670,6 +3674,9 @@ def flex_search_surface(
             plan, num_bh, match.heads or num_bh, match.num_kv
         ),
         flex_coalesce_steps=_flash_flex_coalesce_steps(
+            plan, num_bh, match.heads or num_bh, match.num_kv
+        ),
+        flex_hook_ops=_flash_flex_hook_ops(
             plan, num_bh, match.heads or num_bh, match.num_kv
         ),
     )

@@ -1708,6 +1708,7 @@ class ConfigSpec:
         self._cute_flash_flex_aux_smem_candidates: tuple[int, ...] = ()
         self._cute_flash_flex_prefetch_regs: tuple[int, ...] = ()
         self._cute_flash_flex_coalesce_steps: tuple[int, ...] = ()
+        self._cute_flash_flex_hook_ops: int = 0
         # The kernel's ``fast_math`` setting: the polynomial exp2 packets are
         # approximations and reach the flash surface only under it. Recorded
         # by ``enable_cute_flash_search`` and passed to every flash surface
@@ -2027,6 +2028,7 @@ class ConfigSpec:
                 flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
                 flex_prefetch_regs=self._cute_flash_flex_prefetch_regs,
                 flex_coalesce_steps=self._cute_flash_flex_coalesce_steps,
+                flex_hook_ops=self._cute_flash_flex_hook_ops,
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
@@ -2087,6 +2089,7 @@ class ConfigSpec:
             flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
             flex_prefetch_regs=self._cute_flash_flex_prefetch_regs,
             flex_coalesce_steps=self._cute_flash_flex_coalesce_steps,
+            flex_hook_ops=self._cute_flash_flex_hook_ops,
         )
 
     def _cute_flash_config_topology(self, config: Mapping[str, object]) -> str:
@@ -2614,6 +2617,7 @@ class ConfigSpec:
         flex_aux_smem_candidates: Sequence[int] = (),
         flex_prefetch_regs: Sequence[int] = (),
         flex_coalesce_steps: Sequence[int] = (),
+        flex_hook_ops: int = 0,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
@@ -2658,6 +2662,7 @@ class ConfigSpec:
         self._cute_flash_flex_aux_smem_candidates = tuple(flex_aux_smem_candidates)
         self._cute_flash_flex_prefetch_regs = tuple(flex_prefetch_regs)
         self._cute_flash_flex_coalesce_steps = tuple(flex_coalesce_steps)
+        self._cute_flash_flex_hook_ops = flex_hook_ops
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -3356,6 +3361,10 @@ class ConfigSpec:
                     device_sm_count=self._cute_flash_device_sm_count,
                     fast_math=self._cute_flash_fast_math,
                     q_seq=self._cute_flash_q_seq,
+                    flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
+                    flex_prefetch_regs=self._cute_flash_flex_prefetch_regs,
+                    flex_coalesce_steps=self._cute_flash_flex_coalesce_steps,
+                    flex_hook_ops=self._cute_flash_flex_hook_ops,
                 )
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)

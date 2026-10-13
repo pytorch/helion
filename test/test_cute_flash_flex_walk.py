@@ -498,7 +498,7 @@ def test_flex_prefetch_knob_is_searched_only_with_per_chunk_table_loads() -> Non
     to the smallest one with the same loads and depth at the config's chunk
     width; resolved to 0 off flex plans."""
     key = cute_flash.FLASH_FLEX_PREFETCH_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-2] == key
+    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-3] == key
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_prefetch"].default
         == 0
@@ -591,14 +591,15 @@ def test_flex_prefetch_knob_is_searched_only_with_per_chunk_table_loads() -> Non
 
 def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
     """``cute_flash_flex_coalesce`` (bytes per row of one warp-cooperative
-    table request): an appended schema axis, default 0 (the per-lane
-    vectors), search choices = the widths giving distinct per-run request
-    widths at some chunk width whose staging fits the surface's bodies, a
-    requested width canonical to the smallest one with the same per-run
-    widths at the config's chunk width (0 where its staging leaves no
-    two-deep ring); resolved to 0 off flex plans."""
+    table request): an appended schema axis, default the widest width whose
+    staging fits the surface's bodies (the stream on wherever it fits),
+    search choices = the widths giving distinct per-run request widths at
+    some chunk width whose staging fits, a requested width canonical to
+    the smallest one with the same per-run widths at the config's chunk
+    width (0 where its staging leaves no two-deep ring); resolved to 0 off
+    flex plans."""
     key = cute_flash.FLASH_FLEX_COALESCE_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-2] == key
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_coalesce"].default
         == 0
@@ -630,19 +631,21 @@ def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
     # spans cap both runs at 64 (74 KB, fits).
     pair = fragments((4, 12))
     assert set(active(pair)) == {0, 32, 64}
-    assert pair[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    assert pair[key].default() == 64  # pyrefly: ignore[missing-attribute]
     assert cute_flash.flash_flex_coalesce_choices((4, 12), 128) == (0,)
+    assert cute_flash.flash_flex_coalesce_default((4, 12), 128) == 0
     # A bf16 unit-stride run: 64-byte spans at 32 columns (32 at 16), so
     # 128 is 64 everywhere.
     half = fragments((2,))
     assert set(active(half)) == {0, 32, 64}
-    assert half[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    assert half[key].default() == 64  # pyrefly: ignore[missing-attribute]
     # A byte run: 32-byte spans at 32 columns only.
     byte = fragments((1,))
     assert set(active(byte)) == {0, 32}
-    assert byte[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    assert byte[key].default() == 32  # pyrefly: ignore[missing-attribute]
     # One int32 vector (graphormer-spatial): 36 KB at 32 columns fits.
     assert cute_flash.flash_flex_coalesce_choices((4,), 64) == (0, 32, 64, 128)
+    assert cute_flash.flash_flex_coalesce_default((4,), 64) == 128
     none = fragments(())
     assert active(none) == (0,)
     assert none[key].default() == 0  # pyrefly: ignore[missing-attribute]
@@ -653,8 +656,12 @@ def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
     assert active(dense) == (0,)
 
     steps = (4, 12)
+    # The default (64) at BODY's 16 columns: one slot.
     plain = _resolve(BODY, flex_coalesce_steps=steps)
-    assert (plain.flex_coalesce, plain.flex_coalesce_slots) == (0, 0)
+    assert (plain.flex_coalesce, plain.flex_coalesce_slots) == (64, 1)
+    assert (
+        _resolve({**BODY, key: 0}, flex_coalesce_steps=steps).flex_coalesce_slots == 0
+    )
     # BODY has 16-column chunks: 64-byte spans, so 128 resolves to 64.  The
     # pair's staging is 72 KB per ring slot there: one slot fits beside the
     # two Q tiles, the two staged O tiles and a three-deep ring, two do not.
@@ -684,6 +691,9 @@ def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
     staged = _resolve({**wide, key: 128}, flex_coalesce_steps=steps)
     assert staged.flex_coalesce == 0
     assert staged.kv_stage == 3
+    # ... and so does the default there (the campaign's edge pin renders as
+    # before).
+    assert _resolve(wide, flex_coalesce_steps=steps).flex_coalesce == 0
     over_q = {**wide, cute_flash.FLASH_O_OVER_Q_KEY: True}
     fitted = _resolve({**over_q, key: 128}, flex_coalesce_steps=steps)
     assert (fitted.flex_coalesce, fitted.flex_coalesce_slots, fitted.kv_stage) == (
@@ -717,7 +727,10 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
-    for steps, expected in (((4, 12), (0, 32, 64)), ((4,), (0, 32, 64, 128))):
+    for steps, hook_ops, expected in (
+        ((4, 12), 23, (0, 32, 64)),
+        ((4,), 3, (0, 32, 64, 128)),
+    ):
         with (
             patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
             patch(
@@ -748,13 +761,30 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
                 flex_aux_smem_candidates=(1552,),
                 flex_prefetch_regs=(32, 96),
                 flex_coalesce_steps=steps,
+                flex_hook_ops=hook_ops,
             )
-            fragment = spec._cute_flash_autotune_fragments()[
-                cute_flash.FLASH_FLEX_COALESCE_KEY
-            ]
-            assert tuple(fragment.search_choices) == expected  # pyrefly: ignore[missing-attribute]
+            fragments = spec._cute_flash_autotune_fragments()
+            fragment = fragments[cute_flash.FLASH_FLEX_COALESCE_KEY]
+            assert set(fragment.search_choices) == set(expected)  # pyrefly: ignore[missing-attribute]
+            assert fragment.default() == max(expected)  # pyrefly: ignore[missing-attribute]
+            rolled = fragments[cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY]
+            assert rolled.default() is (hook_ops >= 16)  # pyrefly: ignore[missing-attribute]
             generation = spec.create_config_generation()
             assert generation.flash_structural_coverage_uncovered_values() == []
+            # The seeds carry the fact-based defaults (canonicalized per
+            # body): the stream at every seed whose body holds it, the roll
+            # for the large hook.
+            seeds = spec.autotune_seed_configs()
+            assert seeds
+            widths = {
+                seed.config.get(cute_flash.FLASH_FLEX_COALESCE_KEY) for seed in seeds
+            }
+            assert max(expected) in widths and None not in widths
+            rolls = {
+                seed.config.get(cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY)
+                for seed in seeds
+            }
+            assert rolls == {hook_ops >= 16}
 
 
 def test_codegen_binds_the_cooperative_staging_buffer() -> None:
@@ -814,6 +844,113 @@ def test_codegen_binds_the_cooperative_staging_buffer() -> None:
     assert "flex_coop_bytes=81920" in narrow_storage
     assert "flex_coop_bytes" not in plain
     assert "sFlexCoop" not in plain
+
+
+def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> None:
+    """``cute_flash_flex_rolled_chunks``: an appended schema axis, default
+    on where the score hook renders 16 or more per-element operations
+    (``flex_hook_ops``: graphormer-edge 23) and off below, searched on
+    list-walk plans (pinned off elsewhere); on, PASS1's chunk loop is a
+    dynamic ``cutlass.range`` (one chunk body per stage), the cooperative
+    stream's next-tile choice a select, and the register prefetch budget
+    resolves to 0 (its slot lists cannot take a runtime chunk index)."""
+    key = cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY
+    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    assert (
+        cute_flash.FlashAttentionConfig.__dataclass_fields__[
+            "flex_rolled_chunks"
+        ].default
+        is False
+    )
+    assert (key, True) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+    with patch.dict(os.environ, {}, clear=True):
+        flex = cute_flash.flash_autotune_fragments(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            score_modifier_kinds=(FLEX_SCORE_KIND,),
+        )
+        dense = cute_flash.flash_autotune_fragments(
+            HEAD_DIM, 16, dtype=torch.bfloat16, num_bh=NUM_BH
+        )
+    assert set(flex[key].search_choices) == {False, True}  # pyrefly: ignore[missing-attribute]
+    assert flex[key].default() is False  # pyrefly: ignore[missing-attribute]
+    assert tuple(dense[key].search_choices) == (False,)  # pyrefly: ignore[missing-attribute]
+    with patch.dict(os.environ, {}, clear=True):
+        large = cute_flash.flash_autotune_fragments(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            score_modifier_kinds=(FLEX_SCORE_KIND,),
+            flex_hook_ops=23,
+        )
+    assert large[key].default() is True  # pyrefly: ignore[missing-attribute]
+    assert cute_flash.flash_flex_rolled_chunks_default(15) is False
+    assert cute_flash.flash_flex_rolled_chunks_default(16) is True
+    regs = (32, 96)
+    plain = _resolve(BODY, flex_prefetch_regs=regs)
+    assert (plain.flex_rolled_chunks, plain.flex_prefetch) == (False, 64)
+    # graphormer-edge's hook (23 operations) rolls by default, which pins
+    # the register ring off; a config may still say otherwise.
+    by_fact = _resolve(BODY, flex_prefetch_regs=regs, flex_hook_ops=23)
+    assert (by_fact.flex_rolled_chunks, by_fact.flex_prefetch) == (True, 0)
+    assert (
+        _resolve(
+            {**BODY, key: False}, flex_prefetch_regs=regs, flex_hook_ops=23
+        ).flex_rolled_chunks
+        is False
+    )
+    rolled = _resolve({**BODY, key: True}, flex_prefetch_regs=regs)
+    assert (rolled.flex_rolled_chunks, rolled.flex_prefetch) == (True, 0)
+    rolled = _resolve(
+        {**BODY, key: True, cute_flash.FLASH_FLEX_PREFETCH_KEY: 128},
+        flex_prefetch_regs=regs,
+    )
+    assert (rolled.flex_rolled_chunks, rolled.flex_prefetch) == (True, 0)
+    assert _resolve({key: True}, has_list_walk=False).flex_rolled_chunks is False
+
+    from helion._compiler.cute.flash_score_mod import FlexHookCode
+
+    plan = _gather_plan()
+    stub = cute_flash.render_flex_hook
+
+    def streaming(*args: object, **kwargs: object) -> FlexHookCode:
+        code = stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+        if kwargs.get("coalesce"):
+            return FlexHookCode(
+                code.item_prelude,
+                code.tile_prologue,
+                code.chunk_body,
+                chunk_issue=" " * 16 + "'flex issue'\n",
+                chunk_consume=" " * 16 + "'flex consume'\n",
+                coop_slots=int(kwargs["coop_slots"]),  # pyrefly: ignore[bad-argument-type]
+            )
+        return code
+
+    with patch.object(cute_flash, "render_flex_hook", streaming):
+        src = _render(
+            _resolve(
+                {**BODY, key: True, cute_flash.FLASH_FLEX_COALESCE_KEY: 128},
+                flex_coalesce_steps=(4,),
+            ),
+            plan,
+        )
+    assert src.count("for flash_ci in cutlass.range(flash_LD_CHUNKS):") == 2
+    assert "for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):" not in src
+    assert (
+        "flash_flex_pkv = cutlass.Int32(cutlass.select_(flash_ci + 4 < flash_LD_CHUNKS, "
+        "flash_kv, flash_kv_peek))"
+    ) in src
+    assert "flash_flex_ps = flash_ci % 4" in src
+    unrolled = _render(_resolve({**BODY, key: False}, flex_coalesce_steps=(4,)), plan)
+    assert "for flash_ci in cutlass.range(flash_LD_CHUNKS):" not in unrolled
+    assert (
+        unrolled.count("for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):") == 2
+    )
 
 
 def test_codegen_splices_the_cooperative_stream() -> None:

@@ -105,6 +105,7 @@ from .flash_score_mod import flex_aux_smem_staged
 from .flash_score_mod import flex_coalesce_smem_bytes
 from .flash_score_mod import flex_coalesce_steps
 from .flash_score_mod import flex_coalesce_widths
+from .flash_score_mod import flex_hook_ops
 from .flash_score_mod import flex_prefetch_regs
 from .flash_score_mod import flex_prefetch_schedule
 from .flash_score_mod import render_flex_hook
@@ -2540,6 +2541,20 @@ class FlashAttentionConfig:
     # leaves a two-deep K/V ring beside the staged aux tables; the lead of
     # the ``cp.async`` stream in chunks.  0 with ``flex_coalesce`` 0.
     flex_coalesce_slots: int = 0
+    # Roll PASS1's chunk loop of the flex softmax body (a dynamic
+    # ``cutlass.range`` over the 16/32-column chunks instead of the unrolled
+    # ``range_constexpr``): the hook body is emitted once per stage instead
+    # of once per chunk (CPU SASS of the edge kernel at 16 columns: 22.8k ->
+    # 7.1k instructions).  With the data stalls gone (the cooperative
+    # stream) the unrolled hook is instruction-fetch bound (ncu:
+    # no_instruction stalls 6.8 per issue), so the smaller body is the
+    # lever; the register prefetch ring (Python lists indexed by the chunk)
+    # cannot roll, so the roll pins ``flex_prefetch`` to 0.  Default on where
+    # the score hook renders ``FLASH_FLEX_ROLLED_CHUNKS_MIN_OPS`` or more
+    # per-element operations (``flex_hook_ops``: graphormer-edge 23, the
+    # table-free hooks 2-6), off below (searched either way).  Only the flex
+    # list-walk plans realize it; elsewhere False.
+    flex_rolled_chunks: bool = False
     # Skip the MMA work of query stage 0's fully masked KV tile. With two
     # 128-row query tiles (2p, 2p+1) per CTA and 128-wide KV tiles both stages
     # walk KV tiles 0..2p+1, but tile 2p+1 lies entirely above stage 0's
@@ -3828,6 +3843,7 @@ def resolve_flash_config(
     flex_aux_smem_candidates: Sequence[int] = (),
     flex_prefetch_regs: Sequence[int] = (),
     flex_coalesce_steps: Sequence[int] = (),
+    flex_hook_ops: int = 0,
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
 
@@ -3881,6 +3897,8 @@ def resolve_flash_config(
     the hook's coalescible row-table runs (``flex_coalesce_steps``): the
     cooperative request width resolves to the smallest choice with the same
     per-run widths at the config's chunk width, to 0 without such runs.
+    *flex_hook_ops* is the score hook's per-element operation count
+    (``flex_hook_ops``): the chunk-loop roll's default.
     """
 
     # *head_dim_v* is the V/O head dim when it differs from the Q/K
@@ -5380,7 +5398,7 @@ def resolve_flash_config(
         ]
     )
     flex_coalesce = _flash_flex_coalesce_resolve(
-        _cfg, flex_coalesce_steps, s_load_repetition
+        _cfg, flex_coalesce_steps, s_load_repetition, head_dim
     )
     flex_coop_slot_bytes = flex_coalesce_smem_bytes(
         flex_coalesce_steps, flex_coalesce, s_load_repetition
@@ -5648,8 +5666,18 @@ def resolve_flash_config(
                 f"{flex_mask_form_cfg!r}"
             )
         flex_mask_form = str(flex_mask_form_cfg)
+    # The rolled chunk loop (list-walk plans).  Its dynamic chunk index
+    # cannot index the register prefetch ring, so the roll turns the ring off.
+    flex_rolled_chunks = False
+    if has_list_walk:
+        flex_rolled_chunks_cfg = _cfg(FLASH_FLEX_ROLLED_CHUNKS_KEY)
+        flex_rolled_chunks = (
+            flash_flex_rolled_chunks_default(flex_hook_ops)
+            if flex_rolled_chunks_cfg is None
+            else bool(flex_rolled_chunks_cfg)
+        )
     flex_prefetch = 0
-    if flex_prefetch_regs:
+    if flex_prefetch_regs and not flex_rolled_chunks:
         flex_prefetch = flash_flex_prefetch_default(flex_prefetch_regs)
         flex_prefetch_cfg = _cfg(FLASH_FLEX_PREFETCH_KEY)
         if flex_prefetch_cfg is not None:
@@ -5907,6 +5935,7 @@ def resolve_flash_config(
         flex_prefetch=flex_prefetch,
         flex_coalesce=flex_coalesce,
         flex_coalesce_slots=flex_coalesce_slots,
+        flex_rolled_chunks=flex_rolled_chunks,
         causal_skip_dead_tile=causal_skip_dead_tile,
         causal_stagger=causal_stagger,
         causal_head_pair=causal_head_pair,
@@ -6184,6 +6213,7 @@ FLASH_FLEX_MASK_FORM_KEY = "cute_flash_flex_mask_form"
 FLASH_FLEX_AUX_SMEM_KEY = "cute_flash_flex_aux_smem"
 FLASH_FLEX_PREFETCH_KEY = "cute_flash_flex_prefetch"
 FLASH_FLEX_COALESCE_KEY = "cute_flash_flex_coalesce"
+FLASH_FLEX_ROLLED_CHUNKS_KEY = "cute_flash_flex_rolled_chunks"
 FLASH_CAUSAL_SKIP_DEAD_TILE_KEY = "cute_flash_causal_skip_dead_tile"
 FLASH_CAUSAL_STAGGER_KEY = "cute_flash_causal_stagger"
 FLASH_CAUSAL_HEAD_PAIR_KEY = "cute_flash_causal_head_pair"
@@ -6322,6 +6352,10 @@ FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] =
         FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_SOFTMAX_DISC_KEY: True,
     },
+    (FLASH_FLEX_ROLLED_CHUNKS_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
     # Segment-aligned tiling of the per-row KV lower bound: the
     # non-persistent FA4 pair body with a staged epilogue in its own ``sO``
     # (the item loop reloads Q, so the output cannot live in the Q stages).
@@ -6452,6 +6486,7 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_FLEX_AUX_SMEM_KEY,
     FLASH_FLEX_PREFETCH_KEY,
     FLASH_FLEX_COALESCE_KEY,
+    FLASH_FLEX_ROLLED_CHUNKS_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -6560,6 +6595,7 @@ def flash_effective_config_values(
         FLASH_FLEX_AUX_SMEM_KEY: config.flex_aux_smem,
         FLASH_FLEX_PREFETCH_KEY: config.flex_prefetch,
         FLASH_FLEX_COALESCE_KEY: config.flex_coalesce,
+        FLASH_FLEX_ROLLED_CHUNKS_KEY: config.flex_rolled_chunks,
     }
 
 
@@ -6761,11 +6797,6 @@ def flash_flex_prefetch_default(regs: Sequence[int]) -> int:
 # runs (``FlashAttentionConfig.flex_coalesce``; the widths of
 # ``flex_coop_layout.COOP_WIDTHS`` plus off).
 FLASH_FLEX_COALESCE_CHOICES: tuple[int, ...] = (0, 32, 64, 128)
-# Off: the stream pays with the rolled chunk loop and costs without it (see
-# ``flex_coalesce``), so the per-lane vectors stay the default and the search
-# measures the widths; every cold autotune of the graphormer variants chose a
-# width (64 at 16-column chunks, 128 at 32).
-FLASH_FLEX_COALESCE_DEFAULT = 0
 
 
 def flash_flex_coalesce_canonical(
@@ -6816,14 +6847,14 @@ def flash_flex_coalesce_choices(steps: Sequence[int], head_dim: int) -> tuple[in
 
 
 def _flash_flex_coalesce_resolve(
-    cfg: Callable[[str], object], steps: Sequence[int], chunk_cols: int
+    cfg: Callable[[str], object], steps: Sequence[int], chunk_cols: int, head_dim: int
 ) -> int:
     """The resolved cooperative request width: the default (or the config's
     value, validated) canonicalized against the plan's coalescible runs at
     the config's chunk width; 0 without such runs."""
     if not steps:
         return 0
-    width = flash_flex_coalesce_default(steps)
+    width = flash_flex_coalesce_default(steps, head_dim)
     requested = cfg(FLASH_FLEX_COALESCE_KEY)
     if requested is not None:
         if requested not in FLASH_FLEX_COALESCE_CHOICES:
@@ -6835,12 +6866,27 @@ def _flash_flex_coalesce_resolve(
     return flash_flex_coalesce_canonical(width, steps, chunk_cols)
 
 
-def flash_flex_coalesce_default(steps: Sequence[int]) -> int:
-    """The default width of a plan with coalescible runs
-    (``FLASH_FLEX_COALESCE_DEFAULT``, off); 0 without such runs."""
+def flash_flex_coalesce_default(steps: Sequence[int], head_dim: int) -> int:
+    """The default width of a plan with coalescible runs: the widest searched
+    width (``flash_flex_coalesce_choices``: its staging fits beside a
+    two-deep K/V ring on the surface's smallest body), so the stream is on
+    by default wherever it fits; 0 without such runs."""
     if not steps:
         return 0
-    return FLASH_FLEX_COALESCE_DEFAULT
+    return max(flash_flex_coalesce_choices(steps, head_dim))
+
+
+# Per-element operations of the score hook from which the chunk-loop roll
+# defaults on: the unrolled body of a hook this large is instruction-fetch
+# bound once its loads stop stalling (graphormer-edge, 23 operations: the
+# roll alone 1.06-1.30x, with the stream 1.74x at the pins); the small hooks
+# (2-6 operations) keep the unrolled body by default and the search decides.
+FLASH_FLEX_ROLLED_CHUNKS_MIN_OPS = 16
+
+
+def flash_flex_rolled_chunks_default(hook_ops: int) -> bool:
+    """Whether a list-walk plan rolls PASS1's chunk loop by default."""
+    return hook_ops >= FLASH_FLEX_ROLLED_CHUNKS_MIN_OPS
 
 
 def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T, ...]:
@@ -8179,6 +8225,10 @@ def flash_attention_seed_configs(
     fast_math: bool = False,
     has_list_walk: bool = False,
     q_seq: int | None = None,
+    flex_aux_smem_candidates: Sequence[int] = (),
+    flex_prefetch_regs: Sequence[int] = (),
+    flex_coalesce_steps: Sequence[int] = (),
+    flex_hook_ops: int = 0,
 ) -> tuple[Config, ...]:
     """Return measured starting points plus generic structural coverage.
 
@@ -8197,6 +8247,13 @@ def flash_attention_seed_configs(
     sibling; the causal hd64 hybrid body and the pruned hybrid source variant
     take the surface's default packet with their cadence and loop split) and
     the duplicates that creates are folded.
+
+    The flex hook's knobs (``cute_flash_flex_aux_smem`` / ``_prefetch`` /
+    ``_coalesce`` / ``_rolled_chunks``) take their fact-based defaults in
+    every seed (``flex_aux_smem_candidates``, ``flex_prefetch_regs``,
+    ``flex_coalesce_steps``, ``flex_hook_ops``: the stream on where its
+    staging fits, the roll on for a large hook), so a cold search starts
+    from the measured combination instead of from the knobs pinned off.
     """
 
     if num_kv is None:
@@ -9245,6 +9302,23 @@ def flash_attention_seed_configs(
         unique.extend(
             _flash_stateful_joint_seed_configs(unique, joint_fragments, resolve_seed)
         )
+    if has_list_walk:
+        # The seed helpers build their values without the flex facts (the
+        # knobs' fact-less defaults are off); give every seed the facts'
+        # defaults, which the spec's normalization canonicalizes per body.
+        flex_values = {
+            FLASH_FLEX_AUX_SMEM_KEY: flash_flex_aux_smem_default(
+                flex_aux_smem_candidates
+            ),
+            FLASH_FLEX_PREFETCH_KEY: flash_flex_prefetch_default(flex_prefetch_regs),
+            FLASH_FLEX_COALESCE_KEY: flash_flex_coalesce_default(
+                flex_coalesce_steps, head_dim
+            ),
+            FLASH_FLEX_ROLLED_CHUNKS_KEY: flash_flex_rolled_chunks_default(
+                flex_hook_ops
+            ),
+        }
+        unique = [Config.from_dict({**seed.config, **flex_values}) for seed in unique]
     return tuple(unique)
 
 
@@ -9372,6 +9446,7 @@ def flash_autotune_fragments(
     flex_aux_smem_candidates: Sequence[int] = (),
     flex_prefetch_regs: Sequence[int] = (),
     flex_coalesce_steps: Sequence[int] = (),
+    flex_hook_ops: int = 0,
 ) -> dict[str, ConfigSpecFragment]:
     """Build a legality-driven, length-invariant flash search surface.
 
@@ -9400,9 +9475,11 @@ def flash_autotune_fragments(
     budget (default 64) to the budgets that prefetch distinct load sets at
     distinct depths; without such loads it is pinned to 0.
     ``flex_coalesce_steps`` (the bytes per column of the hook's coalescible
-    row-table runs) opens the cooperative request width (default 0) to the
-    widths that give distinct per-run widths and whose staging fits the
-    surface's bodies; without such runs it is pinned to 0.
+    row-table runs) opens the cooperative request width (default: the widest
+    that fits) to the widths that give distinct per-run widths and whose
+    staging fits the surface's bodies; without such runs it is pinned to 0.
+    ``flex_hook_ops`` (the score hook's per-element operations) sets the
+    chunk-loop roll's default (on from ``FLASH_FLEX_ROLLED_CHUNKS_MIN_OPS``).
     """
 
     if tmem_rowmax_compatible is None:
@@ -10746,11 +10823,16 @@ def flash_autotune_fragments(
             else (flash_flex_prefetch_default(flex_prefetch_regs),),
         ),
         FLASH_FLEX_COALESCE_KEY: enum(
-            flash_flex_coalesce_default(flex_coalesce_steps),
+            flash_flex_coalesce_default(flex_coalesce_steps, head_dim),
             FLASH_FLEX_COALESCE_CHOICES,
             flash_flex_coalesce_choices(flex_coalesce_steps, head_dim)
             if has_list_walk and flex_coalesce_steps
-            else (flash_flex_coalesce_default(flex_coalesce_steps),),
+            else (flash_flex_coalesce_default(flex_coalesce_steps, head_dim),),
+        ),
+        FLASH_FLEX_ROLLED_CHUNKS_KEY: enum(
+            has_list_walk and flash_flex_rolled_chunks_default(flex_hook_ops),
+            (False, True),
+            (False, True) if has_list_walk else (False,),
         ),
     }
     if valid_family == "fa4_alt":
@@ -10851,6 +10933,7 @@ def flash_config_from_config(
     flex_aux_smem_candidates: Sequence[int] = (),
     flex_prefetch_regs: Sequence[int] = (),
     flex_coalesce_steps: Sequence[int] = (),
+    flex_hook_ops: int = 0,
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -10883,6 +10966,7 @@ def flash_config_from_config(
         flex_aux_smem_candidates=flex_aux_smem_candidates,
         flex_prefetch_regs=flex_prefetch_regs,
         flex_coalesce_steps=flex_coalesce_steps,
+        flex_hook_ops=flex_hook_ops,
     )
 
 
@@ -15062,6 +15146,17 @@ def _flash_flex_coalesce_steps(
     if not score_plan.is_flex:
         return ()
     return flex_coalesce_steps(
+        score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
+    )
+
+
+def _flash_flex_hook_ops(
+    score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
+) -> int:
+    """The score hook's per-element operation count (0 off flex)."""
+    if not score_plan.is_flex:
+        return 0
+    return flex_hook_ops(
         score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
     )
 
@@ -19506,17 +19601,32 @@ if warp_idx == 15:
                         # from its slot (its group waited for) ahead of the
                         # t2r copy, then chunk ``ci + slots`` -- of the
                         # walk's next tile once past the chunk count -- is
-                        # copied into the freed slot.
+                        # copied into the freed slot.  Rolled, the chunk
+                        # index is a runtime value: the tile is a select.
+                        next_tile = (
+                            f"cutlass.Int32(cutlass.select_(flash_ci + {slots} < flash_LD_CHUNKS, flash_kv, flash_kv_peek))"
+                            if cfg.flex_rolled_chunks
+                            else f"flash_kv if flash_ci + {slots} < flash_LD_CHUNKS else flash_kv_peek"
+                        )
                         in_loop += (
                             "\n"
                             + _flash_flex_hook_lines(consume, " " * 16).rstrip()
                             + f"\n                flash_flex_pc = (flash_ci + {slots}) % flash_LD_CHUNKS"
                             + f"\n                flash_flex_ps = flash_ci % {slots}"
-                            + f"\n                flash_flex_pkv = flash_kv if flash_ci + {slots} < flash_LD_CHUNKS else flash_kv_peek\n"
+                            + f"\n                flash_flex_pkv = {next_tile}\n"
                             + _flash_flex_hook_lines(issue, " " * 16).rstrip()
                         )
+                    # The rolled loop (``cute_flash_flex_rolled_chunks``):
+                    # one chunk body per stage; the register ring (Python
+                    # slot lists) is off there (the resolver pins it).
+                    assert not (cfg.flex_rolled_chunks and prefetch and depth)
+                    chunk_range = (
+                        "cutlass.range"
+                        if cfg.flex_rolled_chunks
+                        else "cutlass.range_constexpr"
+                    )
                     return f"""            flash_ld_shape = tLDcS[None, 0, None, None].shape{pre_loop}
-            for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):
+            for flash_ci in {chunk_range}(flash_LD_CHUNKS):
                 flash_disc_frg = cute.make_rmem_tensor(flash_ld_shape, cutlass.Float32){in_loop}
                 cute.copy({ld}, {ldt}[None, flash_ci, None, None], flash_disc_frg){transform}
                 flash_row_max = _helion_flash_rt._fmax_reduce_chunk_balanced(flash_disc_frg, flash_row_max)
@@ -22289,6 +22399,9 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             score_plan, batch, plan.tensor_4d_heads or batch, num_kv
         ),
         flex_coalesce_steps=_flash_flex_coalesce_steps(
+            score_plan, batch, plan.tensor_4d_heads or batch, num_kv
+        ),
+        flex_hook_ops=_flash_flex_hook_ops(
             score_plan, batch, plan.tensor_4d_heads or batch, num_kv
         ),
         target_device_capability=(

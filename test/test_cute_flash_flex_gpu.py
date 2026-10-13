@@ -494,6 +494,11 @@ def _spatial_score_args(seed: int) -> tuple[Any, ...]:
 # suite's 60 s per-test timeout under CI's eight xdist workers on one B200.
 _MULTI_COMPILE_TIMEOUT = pytest.mark.timeout(300)
 
+# The prefetch and coalescing budgets below assume the unrolled PASS1 chunk
+# loop: the rolled loop (``cute_flash_flex_rolled_chunks``, on by default for
+# the edge-like hook's size) has no register prefetch ring.
+UNROLLED: dict[str, object] = {cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: False}
+
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -507,12 +512,13 @@ def test_next_chunk_table_prefetch_is_bitwise_the_in_chunk_loads(
     """``cute_flash_flex_prefetch``: the row-table vector and the shared
     strided run issued ahead (budgets 32: the vector one chunk ahead, and
     128: both one ahead at 32 columns, two ahead at 16) give the same
-    output and LSE as the in-chunk loads, on partial and full tiles."""
+    output and LSE as the in-chunk loads, on partial and full tiles; the
+    body is pinned unrolled (``UNROLLED``)."""
     args = _edge_like_score_args(4)
     results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for budget in (0, 32, 128):
         fn, resolved = _compile_flex(
-            args, {**overrides, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
+            args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
         )
         assert resolved.flex_prefetch == budget
         out, lse = fn(*args)
@@ -539,7 +545,7 @@ def test_deep_table_prefetch_lead_is_bitwise_the_in_chunk_loads(
     deep: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for budget in (0, 128):
         fn, resolved = _compile_flex(
-            args, {**overrides, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
+            args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
         )
         assert resolved.flex_prefetch == budget
         out, lse = fn(*args)
@@ -588,10 +594,11 @@ def test_cooperative_table_loads_are_bitwise_the_per_lane_vectors(
     buffer give the same output and LSE as the per-lane vectors, with and
     without the ring prefetch, on partial and full tiles; at 16-column
     chunks the 64-byte spans cap the request at 64, so the pair_desc body
-    offers no 128."""
+    offers no 128.  The body is pinned unrolled (``UNROLLED``) so the ring
+    prefetch cases exist."""
     args = _edge_like_score_args(5)
     fn, resolved = _compile_flex(
-        args, {**overrides, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
+        args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
     )
     assert resolved.flex_coalesce == 0
     out_ref, lse_ref = fn(*args)
@@ -601,6 +608,7 @@ def test_cooperative_table_loads_are_bitwise_the_per_lane_vectors(
             args,
             {
                 **overrides,
+                **UNROLLED,
                 cute_flash.FLASH_FLEX_COALESCE_KEY: width,
                 cute_flash.FLASH_FLEX_PREFETCH_KEY: prefetch,
             },
@@ -629,19 +637,57 @@ def test_cooperative_loads_of_the_spatial_vector_table_are_bitwise(
     offers and gives the same output and LSE as the per-lane vectors."""
     args = _spatial_score_args(5)
     fn, resolved = _compile_flex(
-        args, {**overrides, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
+        args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
     )
     assert resolved.flex_coalesce == 0
     out_ref, lse_ref = fn(*args)
     torch.cuda.synchronize()
     fn, resolved = _compile_flex(
-        args, {**overrides, cute_flash.FLASH_FLEX_COALESCE_KEY: 128}
+        args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 128}
     )
     assert resolved.flex_coalesce == width
     out, lse = fn(*args)
     torch.cuda.synchronize()
     assert torch.equal(out, out_ref)
     assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("overrides", "width"),
+    [(PAIR_DESC, 64), (WIDE_OVER_Q, 128)],
+    ids=["pair_desc_16", "over_q_32"],
+)
+def test_rolled_chunk_loop_is_bitwise_the_unrolled_kernel(
+    overrides: dict[str, object], width: int
+) -> None:
+    """The rolled PASS1 chunk loop (``cute_flash_flex_rolled_chunks``), with
+    and without the cp.async stream, gives the same output and LSE as the
+    unrolled per-lane kernel."""
+    args = _spatial_score_args(5)
+    fn, resolved = _compile_flex(
+        args, {**overrides, **UNROLLED, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
+    )
+    assert not resolved.flex_rolled_chunks
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    for coalesce in (0, width):
+        fn, resolved = _compile_flex(
+            args,
+            {
+                **overrides,
+                cute_flash.FLASH_FLEX_COALESCE_KEY: coalesce,
+                cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY: True,
+            },
+        )
+        assert resolved.flex_rolled_chunks and resolved.flex_prefetch == 0
+        assert resolved.flex_coalesce == coalesce
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out, out_ref), coalesce
+        assert torch.equal(lse, lse_ref), coalesce
 
 
 @skipIfNotCUDA()
