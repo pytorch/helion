@@ -765,6 +765,47 @@ def _grouped_gemm_kernel(lhs, rhs, offsets):
     return out
 
 
+# ``_grouped_gemm_kernel`` accumulating through ``hl.dot(acc=...)``.
+@helion.kernel(backend="pallas", static_shapes=True)
+def _grouped_gemm_dot_kernel(lhs, rhs, offsets):
+    M, K = lhs.size()
+    G, _, N = rhs.size()
+    out = torch.empty(M, N, dtype=lhs.dtype, device=lhs.device)
+    for g in hl.grid(G):
+        s = offsets[g]
+        e = offsets[g + 1]
+        for tile_m in hl.tile(s, e):
+            for tile_n in hl.tile(0, N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(0, K):
+                    acc = hl.dot(lhs[tile_m, tile_k], rhs[g, tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+# ``_grouped_gemm_kernel`` minus each tile's column sums. The sums mix the rows
+# of a tile, so its loads keep the row mask. What a tile sums depends on how the
+# rows are tiled (block size, sublane-aligned work items), so there is no single
+# eager reference and only the generated code is checked.
+@helion.kernel(backend="pallas", static_shapes=True)
+def _grouped_gemm_centered_kernel(lhs, rhs, offsets):
+    M, K = lhs.size()
+    G, _, N = rhs.size()
+    out = torch.empty(M, N, dtype=lhs.dtype, device=lhs.device)
+    for g in hl.grid(G):
+        s = offsets[g]
+        e = offsets[g + 1]
+        for tile_m in hl.tile(s, e):
+            for tile_n in hl.tile(0, N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(0, K):
+                    acc = acc + torch.matmul(
+                        lhs[tile_m, tile_k], rhs[g, tile_k, tile_n]
+                    )
+                out[tile_m, tile_n] = (acc - acc.sum(0, keepdim=True)).to(out.dtype)
+    return out
+
+
 def _eager_grouped_gemm(lhs, rhs, offsets):
     """Rows ``[0, offsets[-1])`` of the grouped GEMM (later rows are undefined)."""
     out = torch.empty(int(offsets[-1]), rhs.shape[2], dtype=lhs.dtype)
@@ -1677,14 +1718,14 @@ class TestStaticInnerLoopWorklist(unittest.TestCase):
     ``kernel.bind`` traces with fake tensors.
     """
 
-    def _bound(self, dtype=torch.bfloat16):
+    def _bound(self, dtype=torch.bfloat16, kernel=_grouped_gemm_kernel):
         offsets = _offsets([5, 0, 20, 7])
         args = (
             torch.randn(int(offsets[-1]), 128, dtype=dtype),
             torch.randn(4, 128, 256, dtype=dtype),
             offsets,
         )
-        return _grouped_gemm_kernel.bind(args)
+        return kernel.bind(args)
 
     def test_detects_static_inner_loops(self):
         bound = self._bound()
@@ -1784,6 +1825,39 @@ class TestStaticInnerLoopWorklist(unittest.TestCase):
         args = [ast.unparse(arg) for arg in call.args[2:]]  # after kernel, grid
         return args, {kw.arg: kw.value for kw in call.keywords}
 
+    @staticmethod
+    def _lhs_load(code):
+        (line,) = [
+            line.strip()
+            for line in code.splitlines()
+            if line.strip().startswith("load = lhs")
+        ]
+        return line
+
+    def test_row_local_tiles_load_unowned_rows_unmasked(self):
+        # Each output row reads only the same lhs row, and the carry store keeps
+        # only the owned rows (``jnp.where``), so the rows a tile does not own
+        # need not be zeroed on load.
+        for kernel in (_grouped_gemm_kernel, _grouped_gemm_dot_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                code = self._bound(kernel=kernel).to_triton_code(
+                    _worklist_config([32, 256, 128])
+                )
+                self.assertNotIn("mask", self._lhs_load(code))
+                self.assertIn("jnp.where(mask_", code)
+
+        # Row-mixing ops (column sum) or non-worklist carry stores keep the
+        # load mask.
+        for kernel, loop_type in (
+            (_grouped_gemm_centered_kernel, "unroll"),
+            (_grouped_gemm_kernel, "fori_loop"),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__, loop_type=loop_type):
+                code = self._bound(kernel=kernel).to_triton_code(
+                    _worklist_config([32, 256, 128], loop_type=loop_type)
+                )
+                self.assertIn("* mask_", self._lhs_load(code))
+
 
 @skipUnlessPallas("compact worklist numerics need Pallas TPU")
 class TestStaticInnerLoopNumerics(unittest.TestCase):
@@ -1794,11 +1868,21 @@ class TestStaticInnerLoopNumerics(unittest.TestCase):
     the reference's.
     """
 
-    def _check(self, lengths, *, extra_rows=0, buffer_counts=None):
+    def _check(
+        self,
+        lengths,
+        *,
+        extra_rows=0,
+        extra_fill=None,
+        buffer_counts=None,
+        kernel=_grouped_gemm_kernel,
+    ):
         offsets = _offsets(lengths)
         total = int(offsets[-1])
         torch.manual_seed(0)
         lhs = torch.randn(total + extra_rows, 128, dtype=torch.bfloat16)
+        if extra_fill is not None:
+            lhs[total:] = extra_fill
         rhs = torch.randn(len(lengths), 128, 256, dtype=torch.bfloat16)
         ref = _eager_grouped_gemm(lhs, rhs, offsets)
         args = (lhs.to(DEVICE), rhs.to(DEVICE), offsets.to(DEVICE))
@@ -1807,8 +1891,9 @@ class TestStaticInnerLoopNumerics(unittest.TestCase):
                 config = dict(_worklist_config([block, 256, 128]))
                 if buffer_counts is not None:
                     config["pallas_worklist_buffer_count"] = buffer_counts
-                code, out = code_and_output(_grouped_gemm_kernel, args, **config)
+                code, out = code_and_output(kernel, args, **config)
                 self.assertIn("_compact_fill_worklist=_fill_worklist", code)
+                self.assertNotIn("mask", TestStaticInnerLoopWorklist._lhs_load(code))
                 torch.testing.assert_close(out[:total].cpu(), ref, rtol=2e-2, atol=2e-2)
 
     def test_empty_owners(self):
@@ -1823,6 +1908,18 @@ class TestStaticInnerLoopNumerics(unittest.TestCase):
 
     def test_rows_past_the_last_offset(self):
         self._check([5, 0, 20, 7], extra_rows=19)
+
+    def test_unowned_nan_rows_stay_out(self):
+        # The last owner ends mid-sublane, so its last tile reads (unmasked)
+        # NaN rows past the last offset; they must not reach the owned rows.
+        for kernel in (_grouped_gemm_kernel, _grouped_gemm_dot_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check(
+                    [5, 0, 20, 9],
+                    extra_rows=19,
+                    extra_fill=float("nan"),
+                    kernel=kernel,
+                )
 
     def test_buffer_counts(self):
         self._check([5, 40, 3, 30, 70], buffer_counts=[3, 4, 2])

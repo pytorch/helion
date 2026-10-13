@@ -15,15 +15,16 @@ dynamically slice):
 from __future__ import annotations
 
 import dataclasses
+import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import cast
 
+import torch
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
-
-    import torch
 
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.device_ir import GraphInfo
@@ -489,3 +490,180 @@ def emit_carry_store(
         )
     )
     return True
+
+
+def unowned_rows_never_stored(state: CodegenState, block_id: int) -> bool:
+    """Whether loads may leave unowned rows of ``block_id`` unmasked.
+
+    True when every op on ``block_id`` computes each row only from the same
+    row of its operands (``_is_row_local``) and every store through
+    ``block_id`` is a compact-window carry store whose ``jnp.where`` selects
+    only the owned rows (``_is_owned_row_store``).
+    """
+    cache = state.device_function.unmasked_row_tiles
+    result = cache.get(block_id)
+    if result is None:
+        result = cache[block_id] = _unowned_rows_never_stored(state, block_id)
+    return result
+
+
+def _unowned_rows_never_stored(state: CodegenState, block_id: int) -> bool:
+    if block_id not in state.device_function.carry_tiles:
+        return False
+    for ginfo in state.codegen.codegen_graphs:
+        for node in ginfo.graph.nodes:
+            if node.op in ("placeholder", "output"):
+                continue
+            if not _is_row_local(state, node, block_id):
+                return False
+    return True
+
+
+def _row_positions(value: object, block_id: int) -> tuple[int, ...]:
+    """Where ``block_id`` sits in a tensor value, counted from the last dim
+    (broadcasting aligns dims from the right); empty for a non-tensor."""
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if not isinstance(value, torch.Tensor):
+        return ()
+    env = CompileEnvironment.current()
+    return tuple(
+        value.ndim - dim
+        for dim, size in enumerate(value.size())
+        if env.resolve_block_id(size) == block_id
+    )
+
+
+def _matmul_operands(target: object) -> tuple[int, int] | None:
+    """``(lhs, rhs)`` arg positions of a matrix product, else None."""
+    from helion.language import matmul_ops
+
+    aten = torch.ops.aten
+    if target in (
+        aten.mm.default,
+        aten.bmm.default,
+        aten.matmul.default,
+        matmul_ops.dot,
+    ):
+        return 0, 1
+    if target in (aten.addmm.default, aten.baddbmm.default):
+        return 1, 2
+    return None
+
+
+def _is_owned_row_store(
+    state: CodegenState, node: torch.fx.Node, block_id: int
+) -> bool:
+    """Whether ``node`` is a compact-window carry store of the row tile, whose
+    ``jnp.where`` keeps only the rows the work item owns (``emit_carry_store``).
+    """
+    from helion._compiler.pallas.codegen import _is_compact_aligned_load
+    from helion._compiler.pallas.plan_tiling import TilePattern
+    from helion.language import _tracing_ops
+
+    target = node.args[0]
+    if not (
+        isinstance(target, torch.fx.Node) and target.target is _tracing_ops._host_tensor
+    ):
+        return False
+    tensor = target.meta.get("val")
+    patterns = node.meta.get("indexing_patterns") or ()
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.ndim == 2
+        and len(patterns) == 2
+        and isinstance(patterns[0], TilePattern)
+        and patterns[0].block_id == block_id
+        and getattr(patterns[1], "block_id", None) not in (None, block_id)
+        and _is_compact_aligned_load(state, block_id, tensor)
+    )
+
+
+def _is_row_local(state: CodegenState, node: torch.fx.Node, block_id: int) -> bool:
+    """Whether ``node`` computes each row of ``block_id`` from the same row of
+    its operands.
+
+    A conservative allowlist: true for nodes that do not touch ``block_id``,
+    and for
+
+    - loop and branch bookkeeping: ``_for_loop``, ``_for_loop_step``,
+      ``_while_loop``, ``_if``, ``_phi``, ``_new_var``, ``_mask_to``,
+      ``sym_size``, and ``getitem`` of a loop or branch result;
+    - ``hl.full`` (e.g. ``hl.zeros``);
+    - loads that index ``block_id`` with the tile itself;
+    - compact-window carry stores (``_is_owned_row_store``);
+    - pointwise ops whose operands have the rows at the result's position or
+      not at all;
+    - ``mm``, ``bmm``, ``matmul``, ``hl.dot``, ``addmm``, and ``baddbmm``
+      with the rows on the lhs only.
+
+    False for any other op.
+    """
+    from helion._compiler.pallas.plan_tiling import TilePattern
+    from helion.language import _tracing_ops
+    from helion.language import creation_ops
+    from helion.language.memory_ops import load
+    from helion.language.memory_ops import store
+
+    rows = _row_positions(node.meta.get("val"), block_id)
+    operand_rows = [
+        _row_positions(arg.meta.get("val"), block_id) for arg in node.all_input_nodes
+    ]
+    if not rows and not any(operand_rows):
+        return True
+    target = node.target
+    if target in (
+        _tracing_ops._for_loop,
+        _tracing_ops._for_loop_step,
+        _tracing_ops._while_loop,
+        _tracing_ops._if,
+        _tracing_ops._phi,
+        _tracing_ops._new_var,
+        _tracing_ops._mask_to,
+        torch.ops.aten.sym_size.int,
+    ):
+        return True
+    if target is operator.getitem:
+        # Picks one result of a loop or branch; indexing a tensor picks rows.
+        source = node.args[0]
+        return isinstance(source, torch.fx.Node) and not isinstance(
+            source.meta.get("val"), torch.Tensor
+        )
+    if target is creation_ops.full:
+        return True
+    if target is load:
+        patterns = node.meta.get("indexing_patterns")
+        return (
+            not any(operand_rows)
+            and patterns is not None
+            and all(
+                isinstance(pattern, TilePattern)
+                for pattern in patterns
+                if getattr(pattern, "block_id", None) == block_id
+            )
+        )
+    if target is store:
+        return _is_owned_row_store(state, node, block_id)
+    if torch.Tag.pointwise in getattr(target, "tags", ()):
+        # Elementwise with broadcasting: operands carry the row at the result's
+        # (right-aligned) position, or not at all.
+        return len(rows) == 1 and all(r in ((), rows) for r in operand_rows)
+    operands = _matmul_operands(target)
+    if operands is None:
+        return False
+    # The result's rows are lhs's rows (dim -2). rhs, which every row reads
+    # whole, must not carry the row dim; an added accumulator must carry it
+    # on its own rows.
+    lhs, rhs = (node.args[i] for i in operands)
+    if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
+        return False
+    addends = [arg for arg in node.all_input_nodes if arg is not lhs and arg is not rhs]
+    return (
+        rows == (2,)
+        and _row_positions(lhs.meta.get("val"), block_id) == (2,)
+        and not _row_positions(rhs.meta.get("val"), block_id)
+        and all(
+            _row_positions(arg.meta.get("val"), block_id) in ((), (2,))
+            for arg in addends
+        )
+    )

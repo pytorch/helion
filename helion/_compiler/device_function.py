@@ -618,6 +618,9 @@ class DeviceFunction:
         # One scratch per output buffer (a tile may feed several stores),
         # allocated at the store.
         self.carry_scratch: dict[CarryScratchKey, str] = {}
+        # Pallas: jagged row block_id -> whether loads may leave its unowned
+        # rows unmasked (``ordered_carry.unowned_rows_never_stored``).
+        self.unmasked_row_tiles: dict[int, bool] = {}
 
     def mark_pallas_remote_copy_operand(self, tensor: torch.Tensor) -> None:
         self.pallas_remote_copy_tensor_ids.add(id(tensor))
