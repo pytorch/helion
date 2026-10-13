@@ -3745,6 +3745,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     flex_aux_smem_candidates=flash_shape.flex_aux_smem_candidates,
                     flex_prefetch_regs=flash_shape.flex_prefetch_regs,
                     flex_coalesce_steps=flash_shape.flex_coalesce_steps,
+                    flex_hook_ops=flash_shape.flex_hook_ops,
                 )
             elif gated_surface is not None:
                 # The fused gated body owns the whole root; tcgen05 matmul

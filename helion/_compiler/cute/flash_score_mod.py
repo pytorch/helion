@@ -2957,6 +2957,32 @@ def flex_coalesce_widths(
 COOP_WARPS = 8
 
 
+def flex_hook_ops(
+    plan: AttentionScorePlan, coord_bounds: Sequence[int | None] | None
+) -> int:
+    """Per-element operations of the score hook: the score region's nodes
+    placed in the element loop (loads, arithmetic, selects; not the aliases,
+    literals and aux placeholders), at 32-column chunks.  The plan fact the
+    chunk-loop roll (``cute_flash_flex_rolled_chunks``) takes its default
+    from: the unrolled body is this count times the columns of a tile,
+    times the hooks and the stages.  0 without a score region (the mask
+    hook runs on partial tiles only)."""
+    if not isinstance(plan.score_region, FlexRegion):
+        return 0
+    analyzer = _Analyzer(plan, 32, coord_bounds)
+    infos = [analyzer.analyze(plan.score_region, "s")]
+    if isinstance(plan.mask_region, FlexRegion):
+        infos.append(analyzer.analyze(plan.mask_region, "m"))
+    _demote_item_values(infos, ITEM_LIVE_CAP)
+    return sum(
+        1
+        for node, meta in infos[0].nodes.items()
+        if node.op == "call_function"
+        and meta.cls == _ELEMENT
+        and meta.role not in ("alias", "literal", "aux")
+    )
+
+
 def flex_coalesce_smem_bytes(
     steps: Sequence[int], coalesce: int, chunk_cols: int
 ) -> int:
