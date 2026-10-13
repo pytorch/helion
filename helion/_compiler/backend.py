@@ -88,6 +88,8 @@ class FlashSearchSurface(NamedTuple):
     causal_resident_compatible: bool = False
     # V/O head dim when it differs from the Q/K ``head_dim`` (MLA prefill).
     head_dim_v: int | None = None
+    # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain attention).
+    kv_group: int = 1
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3532,6 +3534,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 ),
                 score_modifier_kinds=pattern.score_plan.modifier_kinds,
                 head_dim_v=pattern.score_plan.head_dim_v,
+                kv_group=pattern.score_plan.kv_group,
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(

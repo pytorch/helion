@@ -1343,6 +1343,22 @@ def cute_reduction_with_nested_tiles(x: torch.Tensor, w: torch.Tensor) -> torch.
     return out
 
 
+def _fast_math_variant(kernel: object) -> object:
+    """The same kernel with the ``fast_math`` setting.
+
+    The polynomial exp2 packets (``deg2_16x6``, the ``deg1`` routes, the hybrid
+    packet and the degree-2 cadences of the causal resident packet) are
+    approximations and reach the flash surface only under it.
+    """
+    return helion.kernel(
+        kernel.fn,  # pyrefly: ignore[missing-attribute]
+        settings=dataclasses.replace(
+            kernel.settings,  # pyrefly: ignore[missing-attribute]
+            fast_math=True,
+        ),
+    )
+
+
 @helion.kernel(backend="cute", static_shapes=True)
 def cute_dense_attention(q_in, k_in, v_in):
     m_dim = q_in.size(-2)
@@ -4841,6 +4857,7 @@ class TestCuteBackend(TestCase):
                         modifier_kinds=(DENSE_SCORE_KIND,),
                         head_dim_v=None,
                         asymmetric_head_dims=False,
+                        kv_group=1,
                     ),
                 )
                 for requires_ws in requires_ws_order
@@ -5170,7 +5187,7 @@ class TestCuteBackend(TestCase):
         k = torch.randn(2, 4, 1024, 192, dtype=torch.bfloat16, device=DEVICE)
         v = torch.randn(2, 4, 1024, 128, dtype=torch.bfloat16, device=DEVICE)
         code, out = code_and_output(
-            cute_causal_attention_dv,
+            _fast_math_variant(cute_causal_attention_dv),
             (q, k, v),
             block_sizes=[1, 128, 128],
             cute_flash_exp2_packet="causal_hd128_resident3_013_prefetch2_deg2_early_acquire",
@@ -5209,7 +5226,11 @@ class TestCuteBackend(TestCase):
                 # config may not carry non-zero offsets (the normalizer rejects
                 # them as it does for the plain ``xu`` schedule).
                 code, out = code_and_output(
-                    cute_causal_attention_dv,
+                    # The sparse (16/2) cadence is a polynomial packet; the
+                    # hardware-only sibling is exact and needs no opt-in.
+                    _fast_math_variant(cute_causal_attention_dv)
+                    if res
+                    else cute_causal_attention_dv,
                     (q, k, v),
                     block_sizes=[1, 128, 128],
                     cute_flash_exp2_packet=packet,
@@ -5508,13 +5529,15 @@ class TestCuteBackend(TestCase):
             "cute_flash_disc_pipe": 2,
             "cute_flash_epi_tma": True,
         }
+        # The resident packet's degree-2 cadence is fast_math-only.
+        kernel = _fast_math_variant(cute_gqa_causal_attention)
         _code_off, out_off = code_and_output(
-            cute_gqa_causal_attention,
+            kernel,
             (q, k, v),
             cute_flash_causal_mask_storeback=False,
             **knobs,
         )
-        code, out = code_and_output(cute_gqa_causal_attention, (q, k, v), **knobs)
+        code, out = code_and_output(kernel, (q, k, v), **knobs)
         self.assertTrue(_flash_fired(code))
         self.assertIn("fa4_disc_exp_convert_store_resident3_013_prefetch2", code)
         self.assertIn("fa4_disc_rowmax_causal_store_balanced(", code)
@@ -5633,13 +5656,15 @@ class TestCuteBackend(TestCase):
             "cute_flash_disc_pipe": 2,
             "cute_flash_epi_tma": True,
         }
+        # The resident packet's degree-2 cadence is fast_math-only.
+        kernel = _fast_math_variant(cute_gqa_causal_attention)
         code_off, out_off = code_and_output(
-            cute_gqa_causal_attention,
+            kernel,
             (q, k, v),
             cute_flash_causal_skip_dead_tile=False,
             **knobs,
         )
-        code, out = code_and_output(cute_gqa_causal_attention, (q, k, v), **knobs)
+        code, out = code_and_output(kernel, (q, k, v), **knobs)
         self.assertTrue(_flash_fired(code))
         self.assertIn("fa4_disc_exp_convert_store_resident3_013_prefetch2", code)
         self.assertNotIn("shift_ptx_smem_desc(", code_off)
@@ -5668,6 +5693,464 @@ class TestCuteBackend(TestCase):
             )
         else:
             self.assertEqual(code, code_off)
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+        self.assertTrue(torch.equal(out, out_off))
+
+    def test_flash_attention_causal_stagger_matches_sdpa(self) -> None:
+        """``cute_flash_causal_stagger`` (on wherever the resolved K/V ring is
+        at least four deep; the hd64 campaign seeds pin it off): stage 0
+        walks KV tiles 2p..0 one tile ahead of stage 1, both diagonal
+        tiles share step 0 and stage 0 finishes a step early. The output is
+        bitwise identical to the unstaggered walk on the paired rep16 body
+        (static descriptors), the rep32 split body, the unsplit descending
+        body and the grouped MMA issue order; the ascending body ignores it."""
+        q, k, v = (
+            torch.randn(1, 2, 768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True
+        )
+        # (s_load_rep, disc_pipe, KV order, loop split, interleaved MMA issue,
+        # static Q descriptors)
+        bodies = (
+            (16, 1, "descending", True, True, True),
+            (32, 2, "descending", True, True, False),
+            (32, 2, "descending", False, True, False),
+            (32, 2, "descending", True, False, False),
+            (32, 2, "ascending", False, True, False),
+        )
+        stage0_bound = "flash_num_active_kv0 = flash_num_active_kv - cutlass.Int32(1)"
+        for s_load_rep, disc_pipe, order, split, interleave, static_desc in bodies:
+            with self.subTest(
+                s_load_rep=s_load_rep,
+                disc_pipe=disc_pipe,
+                order=order,
+                split=split,
+                interleave=interleave,
+                static_desc=static_desc,
+            ):
+                knobs: dict[str, object] = {
+                    "block_sizes": [1, 128, 128],
+                    "cute_flash_topology": "fa4",
+                    "cute_flash_causal_kv_order": order,
+                    "cute_flash_causal_loop_split": split,
+                    "cute_flash_exp2_packet": "4x1",
+                    "cute_flash_e2e_schedule": "8/2",
+                    "cute_flash_masked_e2e_schedule": "xu" if split else "inherit",
+                    "cute_flash_s_load_rep": s_load_rep,
+                    "cute_flash_disc_pipe": disc_pipe,
+                    "cute_flash_epi_tma": True,
+                    "cute_flash_mma_interleave": interleave,
+                    "cute_flash_precompute_qk_desc": static_desc,
+                    "cute_flash_kv_stage": 4,
+                }
+                # Both renders request the knob explicitly so the pair is
+                # deterministic whatever the default resolves to.
+                code_off, (out_off, lse_off) = code_and_output(
+                    cute_causal_attention,
+                    (q, k, v),
+                    cute_flash_causal_stagger=False,
+                    **knobs,
+                )
+                code, (out, lse) = code_and_output(
+                    cute_causal_attention,
+                    (q, k, v),
+                    cute_flash_causal_stagger=True,
+                    **knobs,
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertNotIn(stage0_bound, code_off)
+                # Without the key the four-deep descending bodies take the
+                # on-where-legal default; the ascending body cannot stagger.
+                self.assertEqual(
+                    code if order == "descending" else code_off,
+                    code_and_output(cute_causal_attention, (q, k, v), **knobs)[0],
+                )
+                if order == "descending":
+                    self.assertIn(stage0_bound, code)
+                    self.assertNotIn("fa4_disc_zero_store(", code)
+                    self.assertIn(
+                        "for flash_i in cutlass.range(flash_num_active_kv - 2, unroll=1)",
+                        code,
+                    )
+                    self.assertIn(
+                        "flash_v_prev = flash_kv_cons.wait_and_advance()", code
+                    )
+                    self.assertNotIn("shift_ptx_smem_desc(", code)
+                else:
+                    self.assertEqual(code, code_off)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+                self.assertTrue(torch.equal(out, out_off))
+                self.assertTrue(torch.equal(lse, lse_off))
+
+    def test_flash_attention_causal_stagger_hd128_resident_matches_sdpa(self) -> None:
+        """The hd128 resident grouped-query body (the gqa-causal winners) with
+        the output staged in the Q stages and a five-deep ring staggers with
+        bitwise identical output; the three-deep ring of the campaign winner
+        pins the knob off and renders the dead-tile skip instead."""
+        torch.manual_seed(11)
+        q, k, v = self._gqa_qkv(768, 128, torch.bfloat16)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), is_causal=True, enable_gqa=True
+        ).to(torch.bfloat16)
+        knobs: dict[str, object] = {
+            "block_sizes": [1, 128, 128],
+            "cute_flash_topology": "fa4",
+            "cute_flash_causal_kv_order": "descending",
+            "cute_flash_causal_loop_split": True,
+            "cute_flash_exp2_packet": (
+                "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+            ),
+            "cute_flash_s_load_rep": 32,
+            "cute_flash_disc_pipe": 2,
+            "cute_flash_epi_tma": True,
+            "cute_flash_o_over_q": True,
+            "cute_flash_kv_stage": 5,
+        }
+        # The resident packet's degree-2 cadence is fast_math-only.
+        kernel = _fast_math_variant(cute_gqa_causal_attention)
+        code_off, out_off = code_and_output(
+            kernel,
+            (q, k, v),
+            cute_flash_causal_stagger=False,
+            **knobs,
+        )
+        code, out = code_and_output(kernel, (q, k, v), **knobs)
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("fa4_disc_exp_convert_store_resident3_013_prefetch2", code)
+        self.assertIn("flash_fa4_shared_storage(128, 5,", code)
+        self.assertIn("cute.recast_ptr(sQ.iterator, _flash_osl.inner)", code)
+        resolved = resolve_flash_config(
+            128,
+            q.shape[2] // 128,
+            {key: value for key, value in knobs.items() if key != "block_sizes"},
+            dtype=torch.bfloat16,
+            num_bh=q.shape[0] * q.shape[1],
+            is_causal=True,
+            standard_causal_output=True,
+            target_device_capability=torch.cuda.get_device_capability(DEVICE),
+        )
+        if resolved.causal_stagger:
+            self.assertIn("flash_num_active_kv0", code)
+            self.assertNotIn("shift_ptx_smem_desc(", code)
+            self.assertIn("shift_ptx_smem_desc(", code_off)
+        else:
+            # The resident-native route pins the stagger off (and the skip).
+            self.assertEqual(code, code_off)
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+        self.assertTrue(torch.equal(out, out_off))
+        # The campaign winner's three-deep ring cannot hold a slot across two
+        # steps: the knob is pinned off and the render keeps the dead-tile skip.
+        shallow, out_shallow = code_and_output(
+            kernel,
+            (q, k, v),
+            **{**knobs, "cute_flash_kv_stage": 3, "cute_flash_o_over_q": False},
+        )
+        self.assertNotIn("flash_num_active_kv0", shallow)
+        self.assertIn("flash_fa4_shared_storage(128, 3,", shallow)
+        self.assertTrue(torch.equal(out_shallow, out_off))
+
+    def test_flash_attention_causal_head_pair_matches_sdpa(self) -> None:
+        """``cute_flash_causal_head_pair`` (searched and seeded on grouped-query
+        causal fa4 plans with an even group and the TMA store; default off):
+        the two query stages
+        are two consecutive query heads of one K/V head at the same tile, so
+        both walk t+1 KV tiles and share the head's K/V stream. The output
+        (and the LSE) is bitwise identical to the one-head pair body -- the
+        staggered deep-ring hd128 body, the dead-tile-skip shallow-ring hd128
+        body and the hd64 rep16 body -- for groups 4, 2 and 8, and for six
+        head pairs in four-pair launch groups (the pair decode's residual
+        group)."""
+        torch.manual_seed(11)
+        hd128: dict[str, object] = {
+            "block_sizes": [1, 128, 128],
+            "cute_flash_topology": "fa4",
+            "cute_flash_causal_kv_order": "descending",
+            "cute_flash_causal_loop_split": True,
+            "cute_flash_exp2_packet": (
+                "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+            ),
+            "cute_flash_s_load_rep": 32,
+            "cute_flash_disc_pipe": 2,
+            "cute_flash_epi_tma": True,
+            "cute_flash_o_over_q": True,
+            "cute_flash_kv_stage": 5,
+        }
+        hd64: dict[str, object] = {
+            "block_sizes": [1, 128, 128],
+            "cute_flash_topology": "fa4",
+            "cute_flash_causal_kv_order": "descending",
+            "cute_flash_causal_loop_split": True,
+            "cute_flash_exp2_packet": "4x1",
+            "cute_flash_e2e_schedule": "8/2",
+            "cute_flash_masked_e2e_schedule": "xu",
+            "cute_flash_s_load_rep": 16,
+            "cute_flash_disc_pipe": 1,
+            "cute_flash_epi_tma": True,
+            "cute_flash_precompute_qk_desc": True,
+            "cute_flash_kv_stage": 4,
+            # The stagger defaults on wherever its four-deep ring is legal;
+            # this fixture is hd64's measured dead-tile-skip body (the
+            # deep-ring hd128 case covers the staggered one-head body).
+            "cute_flash_causal_stagger": False,
+        }
+        # (kernel, batch, heads_q, heads_kv, seq, head_dim, dtype, knobs,
+        #  one-head body, pair-decode lines)
+        # The hd128 body carries the resident packet's degree-2 cadence,
+        # which is fast_math-only.
+        cases = (
+            (
+                _fast_math_variant(cute_gqa_causal_attention),
+                2,
+                8,
+                2,
+                768,
+                128,
+                torch.bfloat16,
+                hd128,
+                "flash_num_active_kv0",
+                (),
+            ),
+            (
+                _fast_math_variant(cute_gqa_causal_attention),
+                2,
+                8,
+                4,
+                512,
+                128,
+                torch.bfloat16,
+                {**hd128, "cute_flash_kv_stage": 3, "cute_flash_o_over_q": False},
+                "fa4_disc_zero_store(",
+                (),
+            ),
+            (
+                cute_gqa_causal_attention_with_lse,
+                2,
+                8,
+                1,
+                512,
+                64,
+                torch.float16,
+                hd64,
+                "fa4_disc_zero_store(",
+                (),
+            ),
+            # Twelve batch heads of a group of two in launch groups of eight
+            # batch heads (four pairs) at four tiles: six pairs are one whole
+            # group and FA4's residual group of two pairs, the pair decode's
+            # residual branch (every earlier case's pairs divide the group).
+            (
+                cute_gqa_causal_attention_with_lse,
+                3,
+                4,
+                2,
+                512,
+                64,
+                torch.float16,
+                {**hd64, "cute_flash_causal_lpt_swizzle": 8},
+                "fa4_disc_zero_store(",
+                (
+                    "flash_lpt_group = flash_pid // 16",
+                    "if flash_lpt_group < 1:",
+                    "flash_m_tile_raw = flash_lpt_mod // 4",
+                    "flash_bh = (flash_lpt_group * 4 + flash_lpt_mod % 4) * 2",
+                    "flash_m_tile_raw = flash_lpt_mod // 2",
+                    "flash_bh = (flash_lpt_group * 4 + flash_lpt_mod % 2) * 2",
+                ),
+            ),
+        )
+        for (
+            kernel,
+            batch,
+            heads_q,
+            heads_kv,
+            seq,
+            head_dim,
+            dtype,
+            knobs,
+            one_head,
+            pair_decode,
+        ) in cases:
+            with self.subTest(
+                batch=batch,
+                heads_q=heads_q,
+                heads_kv=heads_kv,
+                seq=seq,
+                head_dim=head_dim,
+            ):
+                q, k, v = self._gqa_qkv(
+                    seq,
+                    head_dim,
+                    dtype,
+                    batch=batch,
+                    heads_q=heads_q,
+                    heads_kv=heads_kv,
+                )
+                code_off, out_off = code_and_output(kernel, (q, k, v), **knobs)
+                code, out = code_and_output(
+                    kernel, (q, k, v), cute_flash_causal_head_pair=True, **knobs
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertNotIn("flash_bh1 = flash_bh + 1", code_off)
+                self.assertIn(one_head, code_off)
+                # The default is off: the explicit False renders the same body.
+                self.assertEqual(
+                    code_off,
+                    code_and_output(
+                        kernel, (q, k, v), cute_flash_causal_head_pair=False, **knobs
+                    )[0],
+                )
+                # The knob defaults off: resolve the requested body to learn
+                # whether this target realizes it (the resident-native route
+                # pins it off).
+                resolved = resolve_flash_config(
+                    head_dim,
+                    seq // 128,
+                    {
+                        **{k: v for k, v in knobs.items() if k != "block_sizes"},
+                        "cute_flash_causal_head_pair": True,
+                    },
+                    dtype=dtype,
+                    num_bh=q.shape[0] * heads_q,
+                    is_causal=True,
+                    standard_causal_output=True,
+                    target_device_capability=torch.cuda.get_device_capability(DEVICE),
+                    kv_group=heads_q // heads_kv,
+                )
+                if resolved.causal_head_pair:
+                    group = heads_q // heads_kv
+                    self.assertIn("flash_bh1 = flash_bh + 1", code)
+                    self.assertIn("flash_m_tile1 = flash_m_tile0", code)
+                    self.assertIn("tQgQ0[None, flash_q_mma_tile0]", code)
+                    self.assertIn("tQgQ1[None, flash_q_mma_tile1]", code)
+                    self.assertIn("tOgO_tma[None, flash_m_tile1, 0, flash_bh1]", code)
+                    self.assertIn(f"flash_bh // {group}", code)
+                    self.assertNotIn("fa4_disc_zero_store(", code)
+                    self.assertNotIn("flash_num_active_kv0", code)
+                    self.assertNotIn("flash_m_pair", code)
+                    for line in pair_decode:
+                        self.assertIn(line, code)
+                    if kernel is cute_gqa_causal_attention_with_lse:
+                        self.assertIn("flash_local_tidx, flash_bh1]", code)
+                else:
+                    # The resident-native route pins the head pair off.
+                    self.assertEqual(code, code_off)
+                if kernel is cute_gqa_causal_attention_with_lse:
+                    out, lse = out
+                    out_off, lse_off = out_off
+                    self.assertTrue(torch.equal(lse, lse_off))
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q.float(), k.float(), v.float(), is_causal=True, enable_gqa=True
+                ).to(dtype)
+                torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+                self.assertTrue(torch.equal(out, out_off))
+
+    def test_flash_attention_causal_head_pair_needs_an_even_group(self) -> None:
+        """Plain attention and a group of three have no two consecutive query
+        heads sharing a K/V head: the requested knob is pinned off and the
+        render is the one-head body's."""
+        knobs: dict[str, object] = {
+            "block_sizes": [1, 128, 128],
+            "cute_flash_topology": "fa4",
+            "cute_flash_causal_kv_order": "descending",
+            "cute_flash_causal_loop_split": True,
+            "cute_flash_exp2_packet": "4x1",
+            "cute_flash_e2e_schedule": "8/2",
+            "cute_flash_masked_e2e_schedule": "xu",
+            "cute_flash_s_load_rep": 16,
+            "cute_flash_disc_pipe": 1,
+            "cute_flash_epi_tma": True,
+            "cute_flash_kv_stage": 4,
+        }
+        for heads_q, heads_kv in ((4, 4), (6, 2)):
+            with self.subTest(heads_q=heads_q, heads_kv=heads_kv):
+                q, k, v = self._gqa_qkv(
+                    512, 64, torch.float16, batch=1, heads_q=heads_q, heads_kv=heads_kv
+                )
+                code, out = code_and_output(
+                    cute_gqa_causal_attention,
+                    (q, k, v),
+                    cute_flash_causal_head_pair=True,
+                    **knobs,
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertNotIn("flash_bh1", code)
+                self.assertEqual(
+                    code,
+                    code_and_output(cute_gqa_causal_attention, (q, k, v), **knobs)[0],
+                )
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_causal_head_pair_early_prologue_loads_match(
+        self,
+    ) -> None:
+        """``cute_flash_early_prologue_loads`` on the head pair: warp 0's
+        pre-sync copies read each stage's Q tile from its own head's view
+        (``tQgQ0`` / ``tQgQ1``, as the load warp's dropped copies did), so the
+        paired hd64 body's output and LSE are bitwise identical with and
+        without the knob."""
+        knobs: dict[str, object] = {
+            "block_sizes": [1, 128, 128],
+            "cute_flash_topology": "fa4",
+            "cute_flash_causal_kv_order": "descending",
+            "cute_flash_causal_loop_split": True,
+            "cute_flash_exp2_packet": "4x1",
+            "cute_flash_e2e_schedule": "8/2",
+            "cute_flash_masked_e2e_schedule": "xu",
+            "cute_flash_s_load_rep": 16,
+            "cute_flash_disc_pipe": 1,
+            "cute_flash_epi_tma": True,
+            "cute_flash_precompute_qk_desc": True,
+            "cute_flash_kv_stage": 4,
+            "cute_flash_causal_stagger": False,
+            "cute_flash_causal_head_pair": True,
+        }
+        q, k, v = self._gqa_qkv(512, 64, torch.float16, batch=2, heads_q=8, heads_kv=2)
+        code_off, (out_off, lse_off) = code_and_output(
+            cute_gqa_causal_attention_with_lse, (q, k, v), **knobs
+        )
+        code, (out, lse) = code_and_output(
+            cute_gqa_causal_attention_with_lse,
+            (q, k, v),
+            cute_flash_early_prologue_loads=True,
+            **knobs,
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertNotIn("defer_sync", code_off)
+        self.assertEqual(code.count("defer_sync=True"), 2)
+        fence = code.index("cute.arch.mbarrier_init_fence()")
+        sync = code.index("cute.arch.sync_threads()", fence)
+        early = code[code.index("if warp_idx == 0:", fence) : sync]
+        self.assertEqual(early.count("cute.copy("), 4)
+        self.assertNotIn("acquire_and_advance", early)
+        resolved = resolve_flash_config(
+            64,
+            512 // 128,
+            {k: v for k, v in knobs.items() if k != "block_sizes"},
+            dtype=torch.float16,
+            num_bh=q.shape[0] * q.shape[1],
+            is_causal=True,
+            standard_causal_output=True,
+            target_device_capability=torch.cuda.get_device_capability(DEVICE),
+            kv_group=4,
+        )
+        if resolved.causal_head_pair:
+            self.assertIn("flash_bh1 = flash_bh + 1", code)
+            self.assertIn("tQgQ0[None, flash_q_mma_tile0]", early)
+            self.assertIn("tQgQ1[None, flash_q_mma_tile1]", early)
+            self.assertNotIn("tQgQ[", code)
+        else:
+            # The resident-native route pins the head pair off: the one-head
+            # body's early block reads the one-head view.
+            self.assertIn("tQgQ[None, flash_q_mma_tile0]", early)
+        self.assertTrue(torch.equal(lse, lse_off))
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), is_causal=True, enable_gqa=True
+        ).to(torch.float16)
         torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
         self.assertTrue(torch.equal(out, out_off))
 
@@ -5762,7 +6245,7 @@ class TestCuteBackend(TestCase):
                 if packet == "deg1_16x8":
                     config["cute_flash_kv_stage"] = 2
                 code, out = code_and_output(
-                    cute_dense_attention,
+                    _fast_math_variant(cute_dense_attention),
                     (q, k, v),
                     **config,
                 )
@@ -5780,6 +6263,7 @@ class TestCuteBackend(TestCase):
             (cute_dense_attention_with_lse, False),
             (cute_softcap_attention, False),
         )
+        polynomial = {"deg1_8x2_corr10", "deg1_16x8", "deg2_16x6"}
         for kernel, expected_standard in cases:
             with self.subTest(kernel=kernel.__name__):
                 bound = kernel.bind((target, target, target))
@@ -5787,16 +6271,29 @@ class TestCuteBackend(TestCase):
                     bound.config_spec._cute_flash_standard_dense_output,
                     expected_standard,
                 )
+                # The polynomial packets are approximations: they are seeded
+                # only when the kernel opted into fast_math, and then only
+                # for the standard dense output.
+                self.assertFalse(bound.config_spec._cute_flash_fast_math)
                 packet_seeds = {
                     seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
                     for seed in bound.config_spec.compiler_seed_configs
                 }
-                self.assertEqual(
-                    bool(packet_seeds & {"deg1_8x2_corr10", "deg1_16x8"}),
-                    expected_standard,
+                self.assertFalse(packet_seeds & polynomial)
+                fast_math_bound = _fast_math_variant(kernel).bind(
+                    (target, target, target)
                 )
-                has_degree2_seed = "deg2_16x6" in packet_seeds
-                self.assertEqual(has_degree2_seed, expected_standard)
+                self.assertTrue(fast_math_bound.config_spec._cute_flash_fast_math)
+                fast_math_packet_seeds = {
+                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                    for seed in fast_math_bound.config_spec.compiler_seed_configs
+                }
+                self.assertEqual(
+                    fast_math_packet_seeds >= polynomial, expected_standard
+                )
+                self.assertEqual(
+                    bool(fast_math_packet_seeds & polynomial), expected_standard
+                )
 
     def test_flash_attention_auxiliary_outputs_have_no_causal_degree1_seed(
         self,
@@ -7835,10 +8332,27 @@ class TestCuteBackend(TestCase):
             "cute_flash_disc_pipe": 2,
             "cute_flash_split_p_arrive": True,
         }
+        # The hybrid packet is a polynomial packet: the kernels opt into
+        # fast_math to pin it.
         for kernel, dtype, window, prefix in (
-            (cute_sliding_window_1024_attention, torch.bfloat16, 1024, None),
-            (cute_sliding_window_1024_attention, torch.float16, 1024, None),
-            (cute_prefix_lm_200_attention, torch.bfloat16, None, 200),
+            (
+                _fast_math_variant(cute_sliding_window_1024_attention),
+                torch.bfloat16,
+                1024,
+                None,
+            ),
+            (
+                _fast_math_variant(cute_sliding_window_1024_attention),
+                torch.float16,
+                1024,
+                None,
+            ),
+            (
+                _fast_math_variant(cute_prefix_lm_200_attention),
+                torch.bfloat16,
+                None,
+                200,
+            ),
         ):
             torch.manual_seed(0)
             q, k, v = (
@@ -7881,12 +8395,29 @@ class TestCuteBackend(TestCase):
                     dtype=dtype,
                     has_kv_tile_pruning=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )[key]
                 self.assertIn("hybrid_deg1_16x8", pruned.choices)
                 self.assertIn("hybrid_deg1_16x8", pruned.search_choices or ())
                 self.assertNotIn("deg2_16x6", pruned.choices)
+                # The hybrid packet is a polynomial packet: without the
+                # fast_math setting the pruned surface keeps the exact packets.
+                gated = _cute_flash.flash_autotune_fragments(
+                    64,
+                    16,
+                    num_bh=8,
+                    dtype=dtype,
+                    has_kv_tile_pruning=True,
+                    standard_causal_output=True,
+                )[key]
+                self.assertNotIn("hybrid_deg1_16x8", gated.choices)
             document = _cute_flash.flash_autotune_fragments(
-                64, 16, num_bh=8, dtype=torch.bfloat16, has_kv_tile_pruning=True
+                64,
+                16,
+                num_bh=8,
+                dtype=torch.bfloat16,
+                has_kv_tile_pruning=True,
+                fast_math=True,
             )[key]
             self.assertNotIn("hybrid_deg1_16x8", document.choices)
             locked = _cute_flash.flash_autotune_fragments(
@@ -7897,6 +8428,7 @@ class TestCuteBackend(TestCase):
                 has_kv_tile_pruning=True,
                 requires_ws_overlap=True,
                 standard_causal_output=True,
+                fast_math=True,
             )[key]
             self.assertNotIn("hybrid_deg1_16x8", locked.choices)
             request = {
@@ -7909,6 +8441,7 @@ class TestCuteBackend(TestCase):
                 "dtype": torch.bfloat16,
                 "has_kv_tile_pruning": True,
                 "standard_causal_output": True,
+                "fast_math": True,
             }
             resolved = resolve_flash_config(64, 16, request, **common)
             self.assertEqual(resolved.exp2_packet, "hybrid_deg1_16x8")
@@ -7928,9 +8461,18 @@ class TestCuteBackend(TestCase):
                 self.assertTrue(canonical.causal_loop_split)
                 self.assertEqual(canonical.causal_kv_order, "descending")
             no_standard_output = resolve_flash_config(
-                64, 16, request, dtype=torch.bfloat16, has_kv_tile_pruning=True
+                64,
+                16,
+                request,
+                dtype=torch.bfloat16,
+                has_kv_tile_pruning=True,
+                fast_math=True,
             )
             self.assertEqual(no_standard_output.exp2_packet, "1x1")
+            no_fast_math = resolve_flash_config(
+                64, 16, request, **{**common, "fast_math": False}
+            )
+            self.assertEqual(no_fast_math.exp2_packet, "1x1")
             # The compound-packet canonicalization seeds the split structure.
             overrides = _cute_flash._flash_compound_exp2_packet_overrides(
                 64,
@@ -7940,20 +8482,29 @@ class TestCuteBackend(TestCase):
                 is_causal=False,
                 has_kv_tile_pruning=True,
                 standard_causal_output=True,
+                fast_math=True,
             )
             self.assertEqual(overrides[_cute_flash.FLASH_PIPELINE_FAMILY_KEY], "fa4")
             self.assertTrue(overrides[_cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY])
-            self.assertEqual(
-                _cute_flash._flash_compound_exp2_packet_overrides(
-                    64,
-                    16,
-                    {key: "hybrid_deg1_16x8"},
-                    dtype=torch.bfloat16,
-                    is_causal=False,
-                    has_kv_tile_pruning=True,
-                ),
-                {},
-            )
+            for ineligible in (
+                {"has_kv_tile_pruning": True, "fast_math": True},
+                {
+                    "has_kv_tile_pruning": True,
+                    "standard_causal_output": True,
+                    "fast_math": False,
+                },
+            ):
+                self.assertEqual(
+                    _cute_flash._flash_compound_exp2_packet_overrides(
+                        64,
+                        16,
+                        {key: "hybrid_deg1_16x8"},
+                        dtype=torch.bfloat16,
+                        is_causal=False,
+                        **ineligible,
+                    ),
+                    {},
+                )
 
     def _run_row_kv_begin(
         self,
@@ -8104,7 +8655,7 @@ class TestCuteBackend(TestCase):
             for _ in range(3)
         )
         code, out = code_and_output(
-            cute_row_kv_begin_mask_attention,
+            _fast_math_variant(cute_row_kv_begin_mask_attention),
             (q, k, v, kv_begin),
             block_sizes=[1, 128, 128],
             cute_flash_pipeline_family="fa4",
@@ -8153,7 +8704,9 @@ class TestCuteBackend(TestCase):
                 )
                 with self.subTest(packet=packet, dtype=dtype):
                     code, out = code_and_output(
-                        cute_row_kv_begin_mask_attention,
+                        _fast_math_variant(cute_row_kv_begin_mask_attention)
+                        if packet == "hybrid_deg1_16x8"
+                        else cute_row_kv_begin_mask_attention,
                         (q, k, v, kv_begin),
                         block_sizes=[1, 128, 128],
                         cute_flash_pipeline_family="fa4",
@@ -9965,6 +10518,7 @@ class TestCuteBackend(TestCase):
                     _cute_flash.FLASH_E2E_OFFSET0_KEY: 10,
                 },
                 standard_dense_output=True,
+                fast_math=True,
             )
             dense_bf16 = resolve_flash_config(
                 64, 512, force_two_cta, dtype=torch.bfloat16

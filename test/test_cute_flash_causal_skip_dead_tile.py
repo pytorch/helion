@@ -346,6 +346,8 @@ def test_resolver_pins_the_knob_off_on_the_resident_native_route() -> None:
     same seed on SM100, without a target, or at a KV size without a resident
     policy row keeps the skip."""
     with patch.dict(os.environ, {}, clear=True):
+        # The resident-native route is keyed on the degree-2 packet, which
+        # only the fast_math surface offers.
         seed = cute_flash.flash_attention_seed_config(
             64,
             512,
@@ -353,13 +355,22 @@ def test_resolver_pins_the_knob_off_on_the_resident_native_route() -> None:
             is_causal=True,
             standard_causal_output=True,
             target_device_capability=(10, 3),
+            fast_math=True,
         )
         assert seed is not None
         # The target seed carries the pinned value (its fragment default is
         # the descending fa4 body's), so it equals its normalized form; the
         # resolutions below drop the key to exercise each target's default.
         assert seed.config[KEY] is False
-        body = {key: value for key, value in seed.config.items() if key != KEY}
+        # The staggered walk (``cute_flash_causal_stagger``) takes this seed's
+        # deep ring on every other target and pins the skip off itself; keep
+        # it off here so the resolutions below exercise the skip's own pin.
+        body = {
+            key: value
+            for key, value in seed.config.items()
+            if key not in (KEY, cute_flash.FLASH_CAUSAL_STAGGER_KEY)
+        }
+        body[cute_flash.FLASH_CAUSAL_STAGGER_KEY] = False
 
         def resolve(
             capability: tuple[int, int] | None, num_kv: int = 512, **overrides: object
@@ -372,6 +383,7 @@ def test_resolver_pins_the_knob_off_on_the_resident_native_route() -> None:
                 is_causal=True,
                 standard_causal_output=True,
                 target_device_capability=capability,
+                fast_math=True,
             )
 
         def render(

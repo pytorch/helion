@@ -4809,6 +4809,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             dtype=torch.float16,
             block_size_targets={0: 1, 1: 128, 2: 128},
             standard_dense_output=True,
+            # The compound variants below exist on the fast_math surface only.
+            fast_math=True,
         )
 
         def make_search(generation):
@@ -4993,6 +4995,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
     def test_flash_initial_prefix_second_witnesses_only_ordinary_leaves(self):
+        # The compound (polynomial exp2 packet) leaves this test tells apart
+        # from the ordinary ones exist on the fast_math surface only.
         with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
             spec = ConfigSpec(
                 backend=CuteBackend(),
@@ -5008,6 +5012,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             dtype=torch.float16,
             block_size_targets={0: 1, 1: 128, 2: 128},
             standard_dense_output=True,
+            fast_math=True,
         )
         fragments = cute_flash.flash_autotune_fragments(
             64,
@@ -5015,6 +5020,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             num_bh=64,
             dtype=torch.float16,
             standard_dense_output=True,
+            fast_math=True,
         )
         ws_values = cute_flash.flash_effective_config_values(
             cute_flash.resolve_flash_config(
@@ -5024,6 +5030,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 dtype=torch.float16,
                 num_bh=64,
                 standard_dense_output=True,
+                fast_math=True,
             )
         )
         live_prefix_keys = {
@@ -13037,7 +13044,15 @@ class TestCuteAutotuner(TestCase):
             block_sizes=[1, 128, 128],
             cute_flash_exp2_packet="deg2_16x6",
         )
-        long_bound.config_spec.normalize(manual_packet)
+        # The degree-2 polynomial packet is an approximation: without the
+        # fast_math setting it is not a legal value; with it the manual packet
+        # keeps its measured cadence.
+        with self.assertRaisesRegex(exc.InvalidConfig, "deg2_16x6"):
+            long_bound.config_spec.normalize(copy.deepcopy(manual_packet))
+        fast_math_bound = helion.kernel(
+            flash_attention.fn, backend="cute", static_shapes=True, fast_math=True
+        ).bind((long_q, long_k, long_v))
+        fast_math_bound.config_spec.normalize(manual_packet)
         self.assertEqual(
             manual_packet.config[cute_flash.FLASH_EXP2_PACKET_KEY],
             "deg2_16x6",
@@ -13072,19 +13087,21 @@ class TestCuteAutotuner(TestCase):
         with self.assertRaises(exc.InvalidConfig):
             long_bound.config_spec.normalize(invalid_manual)
 
-        for config in (
-            family_compound,
-            family_two_cta,
-            source_schedule,
-            manual_values,
-            manual_packet,
+        fast_math_gen = ConfigGeneration(fast_math_bound.config_spec)
+        for generation, config in (
+            (long_gen, family_compound),
+            (long_gen, family_two_cta),
+            (long_gen, source_schedule),
+            (long_gen, manual_values),
+            # The degree-2 packet is legal on the fast_math surface only.
+            (fast_math_gen, manual_packet),
         ):
-            flat = long_gen.flatten(config)
-            long_gen.encode_config(flat)
+            flat = generation.flatten(config)
+            generation.encode_config(flat)
             expected = dict(config.config)
             expected.pop("cute_vector_widths", None)
             expected.pop("cute_lane_layouts", None)
-            self.assertEqual(long_gen.unflatten(flat).config, expected)
+            self.assertEqual(generation.unflatten(flat).config, expected)
 
         random_configs = [long_gen.random_config() for _ in range(24)]
         self.assertGreater(

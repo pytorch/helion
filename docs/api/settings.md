@@ -122,8 +122,9 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.fast_math
 
    If ``True``, enable fast math approximations. This activates both Helion-level optimizations
-   (e.g. fast sigmoid) and Inductor-level fast math (flush-to-zero exp, fast online softmax,
-   etc.). May reduce numerical precision and change NaN/Inf behavior. Default is ``False``.
+   (e.g. fast sigmoid, the CuTe flash-attention polynomial exp2 packets) and Inductor-level fast
+   math (flush-to-zero exp, fast online softmax, etc.). May reduce numerical precision and change
+   NaN/Inf behavior. Default is ``False``.
    Controlled by ``HELION_FAST_MATH=1``.
 
 .. autoattribute:: Settings.persistent_reserved_sms

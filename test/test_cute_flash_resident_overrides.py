@@ -31,17 +31,23 @@ def test_fixed_controls_remove_only_incompatible_resident_search_choices(
     # The expanded domain requires two independent complete coverage designs.
     # Keep all 100 configs and allow both designs to finish under a bounded timeout.
     head_dim = 64 if dtype is torch.float16 else 128
+    # A pinned polynomial packet needs the fast_math surface, the only one
+    # that offers it.
+    fast_math = value in flash._FLASH_FAST_MATH_EXP2_PACKETS
     spec = (
         _causal_spec(head_dim, 32, dtype)
         if causal
-        else _dense_spec(head_dim, 48, dtype)
+        else _dense_spec(head_dim, 48, dtype, fast_math=fast_math)
     )
     overrides = {key: value}
     if not causal and key == flash.FLASH_P_STORE_REP_KEY:
         # Rep32 P stores require Rep32 S loads and cannot use the upstream
         # per-chunk P16 release; pin both when asking for a complete design.
+        # The stage-local softmax setup needs Rep16 P stores too: without
+        # fast_math no polynomial-packet row forces them behind the pin.
         overrides[flash.FLASH_S_LOAD_REP_KEY] = 32
         overrides[flash.FLASH_P_CHUNK_ARRIVE_KEY] = False
+        overrides[flash.FLASH_SOFTMAX_SETUP_KEY] = "shared"
     generation = spec.create_config_generation(overrides=overrides)
     resident = "resident_stateful" if causal else "resident_value_graph"
     saved = random.getstate()
@@ -176,8 +182,12 @@ def test_unpaired_store_override_retains_unrelated_coverage_gap(
     )
     expected = [(flash.FLASH_S_LOAD_REP_KEY, 16)]
     if dtype is torch.float16:
-        # The FP16 dense domain advertises per-chunk P release, whose P16
-        # layout cannot survive this P32 override. Keep that gap visible too.
-        expected.append((flash.FLASH_P_CHUNK_ARRIVE_KEY, True))
+        # The FP16 hd64 domain advertises the stage-local softmax setup, which
+        # needs Rep16 P stores; without fast_math no polynomial-packet row
+        # forces them behind this override. Keep that gap visible too.
+        expected.append((flash.FLASH_SOFTMAX_SETUP_KEY, "stage_local"))
+    # The dense domains advertise per-chunk P release, whose P16 layout
+    # cannot survive this P32 override. Keep that gap visible too.
+    expected.append((flash.FLASH_P_CHUNK_ARRIVE_KEY, True))
     with _memoized_flash_fragments():
         assert generation.flash_structural_coverage_uncovered_values() == expected

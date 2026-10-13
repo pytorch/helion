@@ -2214,6 +2214,16 @@ class FlashAttentionConfig:
     # quarter of PV instead of the 3/4-split's late start. Same stores, same MMA
     # order: bitwise identical to the split release.
     p_chunk_arrive: bool = False
+    # Issue the first work item's Q0/Q1/K/V TMA loads from warp 0 right after
+    # the mbarrier-init fence, before the CTA-wide prologue sync, with both TMA
+    # pipelines created ``defer_sync`` (one prologue sync instead of three).
+    # The copies target the pipelines' full barriers directly; the load warp's
+    # unchanged acquires post the arrive.expect_tx afterwards (an mbarrier
+    # tx-count may run negative in between), so the ring state is unchanged
+    # and the outputs are bitwise identical. Plain one-CTA, non-persistent fa4
+    # ring only (no cluster, CLC, local/4-D TMA, segment tiling, uneven or
+    # separate rings, no staged first-load order).
+    early_prologue_loads: bool = False
     # TMEM P-store repetition for the FA4 softmax P path. Upstream FA4 exposes
     # this as a useful hd64 lever: 16 preserves the original 4-way staged-P
     # chunks, while 32 halves the r2t chunk count and is searched on dense hd64.
@@ -2398,6 +2408,39 @@ class FlashAttentionConfig:
     # (s4096 neutral) and -1.1% on causal hd64 at s8192. Default on for the
     # descending plain causal fa4 PTX body.
     causal_skip_dead_tile: bool = False
+    # Fully staggered one-head schedule. The descending two-stage walk puts
+    # the two query tiles' diagonal KV tiles in different steps: step 0 runs
+    # stage 1's diagonal (2p+1) beside stage 0's dead tile and step 1 stage
+    # 0's diagonal (2p) beside a full stage-1 tile, so the one-head pair pays
+    # two masked-dominated steps per CTA where FA4's packed tile pays one.
+    # Staggered, stage 0 starts at its own diagonal: at step i stage 1
+    # processes KV tile 2p+1-i and stage 0 tile 2p-i, both diagonals share
+    # step 0, there is no dead tile, and stage 0 finishes one step early so
+    # its correction epilogue overlaps stage 1's last step. Each K/V slot is
+    # then live across two steps (stage 0 at step i, stage 1 at step i+1),
+    # which needs an aliased ring of at least four slots; the resolver pins
+    # the knob off below that depth, the dead-tile skip off under it, and the
+    # output stays bitwise identical per row (same per-row arithmetic).
+    causal_stagger: bool = False
+    # Head-pair schedule for grouped-query causal plans. The two 128-row query
+    # stages are two consecutive query heads (2j, 2j+1) of ONE K/V head at the
+    # SAME query tile t instead of two adjacent tiles (2p, 2p+1) of one head:
+    # both stages then walk t+1 KV tiles (no half step, no dead tile, both
+    # diagonal tiles in step 0 under the same mask), the K/V stream is shared
+    # between the two heads exactly as FA4's pack_gqa shares it, and the grid
+    # holds one CTA per (head pair, tile) -- FA4-pack's length distribution
+    # (64 CTAs per length 1..16 at b4 h32 kv8 s2048) -- while Q/O/LSE keep
+    # their plain per-head layouts (per-stage batch head ``2j + s``). Legal on
+    # the dead-tile skip's body (the descending plain causal fa4 PTX pair) with
+    # the TMA output store and the chunked softmax when ``kv_group`` is even
+    # (two consecutive heads share a K/V head only then); the skip and the
+    # stagger are pinned off under it. Per row the arithmetic is unchanged.
+    # Measured on gqa-causal b4 h32 kv8 hd128 (B200, power-capped do_bench
+    # regime): -0.55% at s2048, +0.4% at s4096, +2.5% at s8192 against the
+    # staggered one-head body -- the step saving is latency, not energy
+    # (equal joules per kernel; the body clocks 4% lower at the power cap),
+    # so the default is off and the search measures it where legal.
+    causal_head_pair: bool = False
     # KV tile width for the FA4 score/probability tile. 128 is the historical
     # fixed value. A wider tile amortizes the per-KV-tile softmax correction --
     # which sits on the critical path -- over more columns; FA4's tuned sm_103
@@ -2572,23 +2615,32 @@ _FLASH_EXP2_PACKET_PARAMS: dict[str, tuple[int, int]] = {
     "8x1": (8, 1),
     "8x2": (8, 2),
 }
-# Polynomial exp2 packets.  The degree-2 pass (``_POLY_EX2_DEG2``; the
-# degree-1 route is an alias of it) is an approximation of ``ex2.approx``, not
-# a bitwise reordering, and today no surface gates it on the kernel's
-# ``fast_math`` setting: the dense fp16 hd64 packets, the causal hd64 packets,
-# the pruned-interval hd64 hybrid packet (``pruned_split_d64`` in
-# ``flash_autotune_fragments`` and the second pruned source-variant seed in
-# ``flash_attention_seed_configs``), the dense bf16 hd128 degree-2 packet
-# and the causal hd128 / (192, 128) resident packets all search it ungated
-# (commit 66c7f7f1 on the attention-hd128 branch is the pending gate; the
-# asymmetric-pair test pins the hd128 standing).  A gate that lands has to
-# cover every ``_FLASH_DEG2_EXP2_PACKET`` / ``_FLASH_HYBRID_EXP2_PACKET`` /
-# ``_FLASH_DEG1_EXP2_PACKETS`` / resident-packet site: the fragment choices,
-# the seeds (generic, pruned, causal hd64 and the sm_103 tables), the compound
-# packet overrides, the resolver and the codegen entry.  The hardware-only
-# resident sibling (``..._prefetch2_xu_early_acquire``, residue zero: every
-# exp2 on the XU pipe, ``degree2`` false in ``_flash_disc_exp2_codegen_params``)
-# is exempt from such a gate: it runs no polynomial.
+# Polynomial exp2 packets.  The degree-2 minimax pass (``_POLY_EX2_DEG2``;
+# the ``deg1`` routes are aliases of it) is an approximation of
+# ``ex2.approx``, not a bitwise reordering: its bf16 probabilities and fp32
+# row statistics are not those of the exact pass (the bf16 output stays at
+# its rounding floor; an fp32 LSE output moves by up to 2.5e-3).  Under the
+# numerics rule an approximation is not a searchable autotuner choice without
+# the user's opt-in, so every packet that runs the polynomial
+# (``_FLASH_FAST_MATH_EXP2_PACKETS`` below: the dense fp16 hd64 packets, the
+# causal hd64 degree-2 and hybrid packets, the pruned-interval hd64 hybrid
+# packet, the dense bf16 hd128 degree-2 packet and the three polynomial
+# cadences of the causal hd128 / (192, 128) resident packet) reaches the
+# flash surface only under the kernel's ``fast_math`` setting.  The setting
+# is threaded as an explicit ``fast_math`` keyword through every site that
+# must agree: the fragment choices and search choices and the target-policy
+# value widening (``flash_autotune_fragments``), the compound packet
+# overrides (``_flash_compound_exp2_packet_overrides``: ``{}`` means "not
+# effective"), the resolver (``resolve_flash_config``: a request resolves to
+# the exact default packet, which also covers ``HELION_CUTE_FLASH_EXP2_PACKET``),
+# the seeds (generic, resident pair, causal hd64 hybrid, pruned source
+# variant and the sm_103 tables, each keeping its structure with an exact
+# substitute packet where legal), ``flash_config_from_config`` and the
+# codegen entry.  ``ConfigSpec`` records the setting when the flash search is
+# enabled and passes it to every call it makes.  The hardware-only resident
+# sibling (``..._prefetch2_xu_early_acquire``, residue zero: every exp2 on
+# the XU pipe, ``degree2`` false in ``_flash_disc_exp2_codegen_params``) runs
+# no polynomial and is exempt.
 _FLASH_DEG2_EXP2_PACKET = "deg2_16x6"
 _FLASH_HYBRID_EXP2_PACKET = "hybrid_deg1_16x8"
 _FLASH_DEG1_EXP2_PACKET = "deg1_16x8"
@@ -2666,6 +2718,45 @@ _FLASH_MANUAL_EXP2_PACKET_SCHEDULES: dict[str, tuple[int, int]] = {
     ),
     _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_XU_EARLY_ACQUIRE_EXP2_PACKET: (16, 0),
 }
+# The compound packets that run the polynomial exp2 on some pairs of every
+# period (a residue greater than zero): reachable under ``fast_math`` only.
+# Every compound packet but the hardware-only resident sibling.
+_FLASH_FAST_MATH_EXP2_PACKETS: frozenset[str] = frozenset(
+    packet
+    for packet, (_, e2e_res) in _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.items()
+    if e2e_res > 0
+)
+assert (
+    frozenset(_FLASH_MANUAL_EXP2_PACKET_PARAMS)
+    - {_FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_XU_EARLY_ACQUIRE_EXP2_PACKET}
+    == _FLASH_FAST_MATH_EXP2_PACKETS
+)
+
+
+def _flash_exp2_packet_admitted(packet: object, fast_math: bool) -> bool:
+    """Whether ``packet`` may appear on a surface with the given setting.
+
+    The polynomial packets (``_FLASH_FAST_MATH_EXP2_PACKETS``) run an
+    approximation of the hardware exp2: every surface that offers, seeds,
+    canonicalizes or resolves a packet asks this predicate and withholds
+    them unless the kernel's ``fast_math`` setting is on.
+    """
+    return fast_math or packet not in _FLASH_FAST_MATH_EXP2_PACKETS
+
+
+def _flash_exp2_packet_exact_substitute(
+    packet: object, default_packet: object
+) -> object:
+    """Return the exact packet that stands in for a withheld polynomial packet.
+
+    Seeds written against a polynomial packet keep their structure without
+    fast_math: the causal resident cadences take the hardware-only resident
+    sibling (the same resident softmax/correction schedule with every exp2 on
+    the XU pipe), every other packet the surface's default packet.
+    """
+    if packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS:
+        return _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_XU_EARLY_ACQUIRE_EXP2_PACKET
+    return default_packet
 
 
 def _flash_manual_exp2_packet_schedule_name(packet: str) -> str:
@@ -2758,6 +2849,7 @@ def _flash_compound_exp2_packet_overrides(
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
     head_dim_v: int | None = None,
+    fast_math: bool = False,
 ) -> dict[str, object]:
     """Canonicalize only the structural requirements of a polynomial packet.
 
@@ -2765,7 +2857,9 @@ def _flash_compound_exp2_packet_overrides(
     resident packet is a softmax/correction schedule over the ``kv_tile_n``
     score columns and the ``head_dim_v``-wide output accumulators, so it is
     keyed on the value width (render-proven: the pair's resident body differs
-    from hd128's only at the Q/K-width sites).
+    from hd128's only at the Q/K-width sites). *fast_math* (the kernel's
+    setting) admits the polynomial packets; without it such a packet is not
+    effective (``{}``), like a packet whose body the kernel does not run.
 
     Packet cadence and barrier prerequisites are part of the algorithm.  Phase
     offsets, register budgets, wait policy, pipeline depth, and other
@@ -2780,6 +2874,9 @@ def _flash_compound_exp2_packet_overrides(
         FLASH_S_LOAD_REP_KEY: 32,
     }
     if packet not in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
+        return {}
+    if not _flash_exp2_packet_admitted(packet, fast_math):
+        # An approximation: not effective without the fast_math setting.
         return {}
 
     def with_required_family(
@@ -2921,6 +3018,40 @@ def _flash_compound_exp2_packet_overrides(
                 },
             )
     return {}
+
+
+def _flash_hybrid_exp2_packet_structure(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
+    standard_causal_output: bool,
+) -> dict[str, object]:
+    """Return the structure the hybrid packet pins on a body (the packet aside).
+
+    The compound overrides of ``hybrid_deg1_16x8`` read from the surface that
+    offers it (fa4, the 16/8 cadence on both loop segments, the two-deep
+    chunked PASS2 with the split P arrival, the descending loop split, the
+    packet's repetitions and query-slot count); ``{}`` where the body is not
+    eligible for the packet. Seeds written against the packet keep this
+    structure on the surface's exact default packet without ``fast_math``.
+    """
+    return _flash_compound_exp2_packet_overrides(
+        head_dim,
+        num_kv,
+        {FLASH_EXP2_PACKET_KEY: _FLASH_HYBRID_EXP2_PACKET},
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_causal_output=standard_causal_output,
+        fast_math=True,
+    )
 
 
 class _FlashDiscExp2CodegenParams(NamedTuple):
@@ -3114,6 +3245,49 @@ def _flash_causal_mask_storeback_default(legal: bool) -> bool:
     return legal and _flash_bool_env("HELION_CUTE_FLASH_CAUSAL_MASK_STOREBACK", True)
 
 
+def _flash_early_prologue_loads_legal(
+    *,
+    topology: str,
+    persistent: bool,
+    has_kv_tile_pruning: bool,
+    q_tile_count: int,
+    use_2cta_instrs: bool,
+    use_cga2_local_cta: bool,
+    use_clc_scheduler: bool,
+    separate_kv_rings: bool,
+    local_tma_partition: bool,
+    tensor_4d_tma: bool,
+    uneven_kv_ring: bool,
+    asymmetric_head_dims: bool,
+    row_bound_tiling: str,
+    alternating_warpgroups: bool,
+    first_load_order: int,
+) -> bool:
+    """Whether the pre-sync prologue loads apply: the plain one-CTA fa4 pair
+    body with one aliased K/V ring, whose two Q tiles and first K/V tile are
+    the only loads before the CTA-wide prologue sync. A pruned KV interval
+    (sliding-window, prefix-LM, document masks) starts the load warp at the
+    work item's own first/last active tile, which the pre-sync copies (issued
+    from the ring's fixed first index) do not follow."""
+    return (
+        topology == "fa4"
+        and not persistent
+        and not has_kv_tile_pruning
+        and q_tile_count == 2
+        and not use_2cta_instrs
+        and not use_cga2_local_cta
+        and not use_clc_scheduler
+        and not separate_kv_rings
+        and not local_tma_partition
+        and not tensor_4d_tma
+        and not uneven_kv_ring
+        and not asymmetric_head_dims
+        and row_bound_tiling != "segment"
+        and not alternating_warpgroups
+        and first_load_order != FLASH_FIRST_LOAD_ORDER_STAGED
+    )
+
+
 def _flash_causal_skip_dead_tile_legal(
     *,
     pipeline_family: str,
@@ -3168,6 +3342,164 @@ def _flash_causal_skip_dead_tile_default(legal: bool) -> bool:
     return legal and _flash_bool_env("HELION_CUTE_FLASH_CAUSAL_SKIP_DEAD_TILE", True)
 
 
+FLASH_CAUSAL_STAGGER_MIN_KV_STAGE = 4
+# Ring depth the staggered seeds carry per head size: the deepest the hd128
+# pair fits with its output in the Q stages (four and five measured alike),
+# and the minimum for hd64, where every extra slot measured slower.
+_FLASH_CAUSAL_STAGGER_SEED_KV_STAGE: dict[int, int] = {128: 5, 64: 4}
+
+
+def _flash_causal_stagger_legal(
+    *,
+    pipeline_family: str,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    score_modifier_kinds: Sequence[str],
+    mma_ptx: bool,
+    q_tile_count: int,
+    kv_tile_n: int,
+    q_tile_m: int,
+    causal_kv_order: str,
+    causal_two_cta: bool,
+    use_2cta_instrs: bool,
+    alternating_warpgroups: bool,
+    p_chunk_arrive: bool,
+    kv_stage: int,
+    uneven_kv_ring: bool,
+) -> bool:
+    """Where ``cute_flash_causal_stagger`` can offset the two query stages.
+
+    The staggered walk is the dead-tile skip's body (the descending plain
+    causal fa4 PTX pair) with stage 0 one KV tile ahead of stage 1, so every
+    K/V slot is read by stage 0 at one step and by stage 1 at the next.
+    ``FLASH_CAUSAL_STAGGER_MIN_KV_STAGE`` is a tuning bound, not a legality
+    bound: with the ring filled in order the MMA warp's acquire/release
+    order cannot deadlock at two or three slots either (item 2i+3 waits on
+    item 2i, released a step earlier), but the slot held across the step
+    leaves no look-ahead for the next tile's loads below four, and four
+    measured level with five, so the knob is pinned off on shallower rings
+    (``kv_stage`` is the resolved, budget-clamped depth). FA4's uneven
+    three-slot ring is excluded the same way.
+    """
+    return (
+        _flash_causal_skip_dead_tile_legal(
+            pipeline_family=pipeline_family,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            score_modifier_kinds=score_modifier_kinds,
+            mma_ptx=mma_ptx,
+            q_tile_count=q_tile_count,
+            kv_tile_n=kv_tile_n,
+            q_tile_m=q_tile_m,
+            causal_kv_order=causal_kv_order,
+            causal_two_cta=causal_two_cta,
+            use_2cta_instrs=use_2cta_instrs,
+            alternating_warpgroups=alternating_warpgroups,
+            p_chunk_arrive=p_chunk_arrive,
+        )
+        and not uneven_kv_ring
+        and kv_stage >= FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+    )
+
+
+def _flash_causal_stagger_default(legal: bool) -> bool:
+    """Value of ``cute_flash_causal_stagger`` for a config without it.
+
+    On wherever the knob is legal unless ``HELION_CUTE_FLASH_CAUSAL_STAGGER=0``
+    turns it off, like the dead-tile skip's default: the hd128 pair measured
+    ahead of the same ring unstaggered at every length (gqa-causal b4h32kv8:
+    -1.1% at s2048, -0.6% at s4096 and s8192). A shape's preference for the
+    plain walk lives in its seeds, not here: the causal hd64 campaign bodies
+    in ``flash_attention_seed_configs`` pin the key off (at the winner at
+    s2048, 0.5-1% behind at s4096 / s8192) and the search measures both
+    values wherever it is legal. The resolver and the autotune fragment's
+    default share this, so the env kill switch reaches the seeded and
+    coverage configs (which carry the key explicitly) as well as
+    hand-written configs that leave it out.
+    """
+    return legal and _flash_bool_env("HELION_CUTE_FLASH_CAUSAL_STAGGER", True)
+
+
+def _flash_causal_head_pair_legal(
+    *,
+    pipeline_family: str,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    score_modifier_kinds: Sequence[str],
+    mma_ptx: bool,
+    q_tile_count: int,
+    kv_tile_n: int,
+    q_tile_m: int,
+    causal_kv_order: str,
+    causal_two_cta: bool,
+    use_2cta_instrs: bool,
+    alternating_warpgroups: bool,
+    p_chunk_arrive: bool,
+    kv_group: int,
+    epi_tma: bool,
+    softmax_disc: bool,
+    persistent: bool,
+    local_tma_partition: bool,
+    tensor_4d_tma: bool,
+    row_bound_tiling: str,
+) -> bool:
+    """Where ``cute_flash_causal_head_pair`` can pair two heads at one tile.
+
+    The head pair is the dead-tile skip's body (the descending plain causal
+    fa4 PTX pair) with its two query stages addressing two consecutive query
+    heads of one K/V head at the same tile, so the plan must be grouped-query
+    with an even group (heads ``2j`` and ``2j + 1`` share a K/V head exactly
+    when ``kv_group`` is even), the output must go out through the TMA store
+    (the per-stage O coordinates are written for it) on the chunked softmax,
+    and the work items must be decoded once per CTA (non-persistent, no
+    per-work-item TMA partition, no 4D tensor maps, no segment tiling).
+    """
+    return (
+        _flash_causal_skip_dead_tile_legal(
+            pipeline_family=pipeline_family,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            score_modifier_kinds=score_modifier_kinds,
+            mma_ptx=mma_ptx,
+            q_tile_count=q_tile_count,
+            kv_tile_n=kv_tile_n,
+            q_tile_m=q_tile_m,
+            causal_kv_order=causal_kv_order,
+            causal_two_cta=causal_two_cta,
+            use_2cta_instrs=use_2cta_instrs,
+            alternating_warpgroups=alternating_warpgroups,
+            p_chunk_arrive=p_chunk_arrive,
+        )
+        and kv_group >= 2
+        and kv_group % 2 == 0
+        and epi_tma
+        and softmax_disc
+        and not persistent
+        and not local_tma_partition
+        and not tensor_4d_tma
+        and row_bound_tiling != "segment"
+    )
+
+
+def _flash_causal_head_pair_default(legal: bool) -> bool:
+    """Value of ``cute_flash_causal_head_pair`` for a config without it.
+
+    Off unless ``HELION_CUTE_FLASH_CAUSAL_HEAD_PAIR=1`` turns the default on
+    where the knob is legal: the head pair measured -0.55% at s2048 but
+    +0.4% at s4096 and +2.5% at s8192 against the staggered one-head body on
+    the grouped-query hd128 campaign shapes (the saved MMA-issue steps cost
+    no energy, and under B200's power cap the body clocks lower), so the
+    search decides per shape from the seeded structure. The resolver and
+    the autotune fragment's default share this, so the env switch reaches
+    the seeded and coverage configs as well as hand-written configs that
+    leave the key out; the seeds that describe a one-head body (the
+    staggered walk, the packet seeds with the dead-tile skip, hd64's
+    measured bodies and hybrid seed) pin the knob off, so a search under
+    the opt-in still starts from them.
+    """
+    return legal and _flash_bool_env("HELION_CUTE_FLASH_CAUSAL_HEAD_PAIR", False)
+
+
 def resolve_flash_config(
     head_dim: int,
     num_kv: int,
@@ -3193,6 +3525,8 @@ def resolve_flash_config(
     row_mma_aux_dtypes: Sequence[str] = (),
     target_device_capability: tuple[int, int] | None = None,
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
 
@@ -3221,6 +3555,12 @@ def resolve_flash_config(
     SM103 tmem-row-reduce lowering): the dead-tile skip is pinned off there
     (``_flash_causal_resident_native_candidate``) so that the effective
     identity dedupes the two values of a knob the render cannot realize.
+    *kv_group* is the grouped-query divisor (``heads_q // heads_kv``; 1 for
+    plain attention): the head-pair schedule exists only for even groups.
+    *fast_math* (the ``fast_math`` setting) admits the polynomial exp2
+    packets (``_FLASH_FAST_MATH_EXP2_PACKETS``), approximations; without it a
+    request for one of them, from the config or from
+    ``HELION_CUTE_FLASH_EXP2_PACKET``, resolves to the exact default packet.
     """
 
     # *head_dim_v* is the V/O head dim when it differs from the Q/K
@@ -3278,6 +3618,7 @@ def resolve_flash_config(
             standard_dense_output=standard_dense_output,
             standard_causal_output=standard_causal_output,
             head_dim_v=head_dim_v,
+            fast_math=fast_math,
         )
         if packet_config is not None
         else {}
@@ -3699,6 +4040,12 @@ def resolve_flash_config(
         # The per-chunk release is written for the dense chunked pass with Rep16
         # P stores and the PTX PV stream (the waits live inside that stream).
         p_chunk_arrive = False
+    early_prologue_loads = _flash_bool_env(
+        "HELION_CUTE_FLASH_EARLY_PROLOGUE_LOADS", False
+    )
+    early_prologue_loads_cfg = _cfg(FLASH_EARLY_PROLOGUE_LOADS_KEY)
+    if early_prologue_loads_cfg is not None:
+        early_prologue_loads = bool(early_prologue_loads_cfg)
     precompute_qk_desc_default = False
     precompute_qk_desc = _flash_bool_env(
         "HELION_CUTE_FLASH_PRECOMPUTE_QK_DESC", precompute_qk_desc_default
@@ -4337,7 +4684,8 @@ def resolve_flash_config(
             # The degree-2 pass is held to the bf16 output's rounding floor
             # (max abs error unchanged vs the exact pass); an fp32 LSE output
             # exposes the row sum (LSE error 1e-4 -> 2.5e-3 measured), so plain
-            # row bodies with an LSE store keep the exact pass.
+            # row bodies with an LSE store keep the exact pass. The fast_math
+            # gate below withholds every polynomial packet otherwise.
             standard_dense_output
             and not is_causal
             and use_2cta_instrs
@@ -4367,6 +4715,10 @@ def resolve_flash_config(
             and exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
         )
     )
+    if not _flash_exp2_packet_admitted(exp2_packet, fast_math):
+        # The polynomial packets are approximations; without the fast_math
+        # setting the request (config or env) resolves to the exact default.
+        manual_exp2_eligible = False
     if exp2_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
         if not manual_exp2_eligible:
             exp2_packet = exp2_packet_default
@@ -4802,6 +5154,7 @@ def resolve_flash_config(
         disc_pipe_depth = 1
         split_p_arrive = True
         p_chunk_arrive = False
+        early_prologue_loads = False
         p_store_repetition = 16
         s_load_repetition = 32
         precompute_qk_desc = False
@@ -4896,6 +5249,86 @@ def resolve_flash_config(
         causal_skip_dead_tile = bool(causal_skip_dead_tile_cfg)
     if not causal_skip_dead_tile_legal:
         causal_skip_dead_tile = False
+    # The staggered walk needs the dead-tile skip's body and a ring deep
+    # enough to hold each K/V slot across the two stages' steps; it has no
+    # dead tile, so the skip is pinned off under it (one identity per render).
+    causal_stagger_legal = _flash_causal_stagger_legal(
+        pipeline_family=pipeline_family,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        score_modifier_kinds=score_modifier_kinds,
+        mma_ptx=mma_ptx,
+        q_tile_count=q_tile_count,
+        kv_tile_n=kv_tile_n,
+        q_tile_m=q_tile_m,
+        causal_kv_order=causal_kv_order,
+        causal_two_cta=causal_two_cta,
+        use_2cta_instrs=use_2cta_instrs,
+        alternating_warpgroups=alternating_warpgroups,
+        p_chunk_arrive=p_chunk_arrive,
+        kv_stage=kv_stage,
+        uneven_kv_ring=uneven_kv_ring,
+    )
+    causal_stagger = _flash_causal_stagger_default(causal_stagger_legal)
+    causal_stagger_cfg = _cfg(FLASH_CAUSAL_STAGGER_KEY)
+    if causal_stagger_cfg is not None:
+        causal_stagger = bool(causal_stagger_cfg)
+    if not causal_stagger_legal:
+        causal_stagger = False
+    if causal_stagger:
+        causal_skip_dead_tile = False
+    # The head pair puts both query stages at one tile: no dead tile to skip
+    # and nothing to stagger, so both are pinned off under it (one identity
+    # per render).
+    causal_head_pair_legal = _flash_causal_head_pair_legal(
+        pipeline_family=pipeline_family,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        score_modifier_kinds=score_modifier_kinds,
+        mma_ptx=mma_ptx,
+        q_tile_count=q_tile_count,
+        kv_tile_n=kv_tile_n,
+        q_tile_m=q_tile_m,
+        causal_kv_order=causal_kv_order,
+        causal_two_cta=causal_two_cta,
+        use_2cta_instrs=use_2cta_instrs,
+        alternating_warpgroups=alternating_warpgroups,
+        p_chunk_arrive=p_chunk_arrive,
+        kv_group=kv_group,
+        epi_tma=epi_tma,
+        softmax_disc=softmax_disc,
+        persistent=persistent,
+        local_tma_partition=local_tma_partition,
+        tensor_4d_tma=tensor_4d_tma,
+        row_bound_tiling=row_bound_tiling,
+    )
+    causal_head_pair = _flash_causal_head_pair_default(causal_head_pair_legal)
+    causal_head_pair_cfg = _cfg(FLASH_CAUSAL_HEAD_PAIR_KEY)
+    if causal_head_pair_cfg is not None:
+        causal_head_pair = bool(causal_head_pair_cfg)
+    if not causal_head_pair_legal:
+        causal_head_pair = False
+    if causal_head_pair:
+        causal_skip_dead_tile = False
+        causal_stagger = False
+    if not _flash_early_prologue_loads_legal(
+        topology=topology,
+        persistent=persistent,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        q_tile_count=q_tile_count,
+        use_2cta_instrs=use_2cta_instrs,
+        use_cga2_local_cta=use_cga2_local_cta,
+        use_clc_scheduler=use_clc_scheduler,
+        separate_kv_rings=separate_kv_rings,
+        local_tma_partition=local_tma_partition,
+        tensor_4d_tma=tensor_4d_tma,
+        uneven_kv_ring=uneven_kv_ring,
+        asymmetric_head_dims=asymmetric_head_dims,
+        row_bound_tiling=row_bound_tiling,
+        alternating_warpgroups=alternating_warpgroups,
+        first_load_order=first_load_order,
+    ):
+        early_prologue_loads = False
     resolved = FlashAttentionConfig(
         s_stage=s_stage,
         kv_stage=kv_stage,
@@ -4940,6 +5373,7 @@ def resolve_flash_config(
         disc_pipe_depth=disc_pipe_depth,
         split_p_arrive=split_p_arrive,
         p_chunk_arrive=p_chunk_arrive,
+        early_prologue_loads=early_prologue_loads,
         p_store_repetition=p_store_repetition,
         s_load_repetition=s_load_repetition,
         precompute_qk_desc=precompute_qk_desc,
@@ -4979,6 +5413,8 @@ def resolve_flash_config(
         causal_loop_split=causal_loop_split,
         causal_mask_storeback=causal_mask_storeback,
         causal_skip_dead_tile=causal_skip_dead_tile,
+        causal_stagger=causal_stagger,
+        causal_head_pair=causal_head_pair,
         kv_tile_n=kv_tile_n,
         q_tile_m=q_tile_m,
         ws_one_pass=ws_one_pass,
@@ -4987,7 +5423,11 @@ def resolve_flash_config(
         o_over_q=o_over_q,
         row_bound_tiling=row_bound_tiling,
     )
-    if resolved.causal_skip_dead_tile and (
+    if (
+        resolved.causal_skip_dead_tile
+        or resolved.causal_stagger
+        or resolved.causal_head_pair
+    ) and (
         explicit_stateful
         or _flash_causal_resident_native_candidate(
             target_device_capability=target_device_capability,
@@ -5003,8 +5443,15 @@ def resolve_flash_config(
         # ``resident_stateful`` lowering, which reuses its body) runs a full
         # first step instead of the zero store: no dead tile to skip, and the
         # render is the full walk either way, so the identity carries False
-        # (the emitter asserts it).
-        resolved = dataclasses.replace(resolved, causal_skip_dead_tile=False)
+        # (the emitter asserts it). The staggered walk is written for the
+        # chunked bodies' segments and is pinned off on the same route, as is
+        # the head pair (not measured there).
+        resolved = dataclasses.replace(
+            resolved,
+            causal_skip_dead_tile=False,
+            causal_stagger=False,
+            causal_head_pair=False,
+        )
     return resolved
 
 
@@ -5236,6 +5683,9 @@ FLASH_TENSOR_4D_TMA_KEY = "cute_flash_tensor_4d_tma"
 FLASH_CAUSAL_LOOP_SPLIT_KEY = "cute_flash_causal_loop_split"
 FLASH_CAUSAL_MASK_STOREBACK_KEY = "cute_flash_causal_mask_storeback"
 FLASH_CAUSAL_SKIP_DEAD_TILE_KEY = "cute_flash_causal_skip_dead_tile"
+FLASH_CAUSAL_STAGGER_KEY = "cute_flash_causal_stagger"
+FLASH_CAUSAL_HEAD_PAIR_KEY = "cute_flash_causal_head_pair"
+FLASH_EARLY_PROLOGUE_LOADS_KEY = "cute_flash_early_prologue_loads"
 FLASH_PERSISTENT_LOOP_KEY = "cute_flash_persistent_loop"
 FLASH_SP_ROW_SUM_KEY = "cute_flash_sp_row_sum"
 FLASH_SOFTMAX_LOWERING_KEY = "cute_flash_softmax_lowering"
@@ -5337,6 +5787,30 @@ FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] =
         FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_CAUSAL_KV_ORDER_KEY: "descending",
     },
+    # The staggered walk holds each K/V slot across two steps: the descending
+    # fa4 pair with a ring of at least four slots (the hd128 pair reaches that
+    # depth only with the output staged in the dead Q stages).
+    (FLASH_CAUSAL_STAGGER_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        FLASH_KV_STAGE_KEY: FLASH_CAUSAL_STAGGER_MIN_KV_STAGE,
+        FLASH_EPI_TMA_KEY: True,
+        FLASH_O_OVER_Q_KEY: True,
+    },
+    # The head pair addresses two heads' tiles through the TMA output store
+    # on the descending fa4 pair with the chunked softmax.
+    (FLASH_CAUSAL_HEAD_PAIR_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        FLASH_EPI_TMA_KEY: True,
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    # The pre-sync prologue loads exist only on the non-persistent one-CTA fa4
+    # ring (the resolver clears them elsewhere).
+    (FLASH_EARLY_PROLOGUE_LOADS_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_PERSISTENT_KEY: False,
+    },
 }
 FLASH_ROWMAX_KEY = "cute_flash_rowmax"
 
@@ -5409,6 +5883,9 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_CAUSAL_MASK_STOREBACK_KEY,
     FLASH_ROW_BOUND_TILING_KEY,
     FLASH_CAUSAL_SKIP_DEAD_TILE_KEY,
+    FLASH_CAUSAL_STAGGER_KEY,
+    FLASH_CAUSAL_HEAD_PAIR_KEY,
+    FLASH_EARLY_PROLOGUE_LOADS_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -5507,6 +5984,9 @@ def flash_effective_config_values(
         FLASH_CAUSAL_MASK_STOREBACK_KEY: config.causal_mask_storeback,
         FLASH_ROW_BOUND_TILING_KEY: config.row_bound_tiling,
         FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: config.causal_skip_dead_tile,
+        FLASH_CAUSAL_STAGGER_KEY: config.causal_stagger,
+        FLASH_CAUSAL_HEAD_PAIR_KEY: config.causal_head_pair,
+        FLASH_EARLY_PROLOGUE_LOADS_KEY: config.early_prologue_loads,
     }
 
 
@@ -5854,6 +6334,8 @@ def _flash_seed_values(
     pipeline_family_override: str | None = None,
     target_device_capability: tuple[int, int] | None = None,
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> dict[str, object]:
     fragments = flash_autotune_fragments(
         head_dim,
@@ -5877,6 +6359,8 @@ def _flash_seed_values(
         pipeline_family_override=pipeline_family_override,
         target_device_capability=target_device_capability,
         head_dim_v=head_dim_v,
+        kv_group=kv_group,
+        fast_math=fast_math,
     )
     return {key: fragment.default() for key, fragment in fragments.items()}
 
@@ -5902,6 +6386,25 @@ def _flash_seed_set_all(
 ) -> bool:
     for key, value in values.items():
         if not _flash_seed_set(seed, fragments, key, value):
+            return False
+    return True
+
+
+def _flash_seed_set_structure(
+    seed: dict[str, object],
+    fragments: Mapping[str, ConfigSpecFragment],
+    structure: Mapping[str, object],
+) -> bool:
+    """Set a compound packet's structure on a seed built for an exact packet.
+
+    The derived keys (``FLASH_DERIVED_CONFIG_KEYS``, retained by
+    normalization but not sampled) are set as given; every other key must be
+    a legal choice of its fragment, as the exact packet pins none of them.
+    """
+    for key, value in structure.items():
+        if key in FLASH_DERIVED_CONFIG_KEYS:
+            seed[key] = value
+        elif not _flash_seed_set(seed, fragments, key, value):
             return False
     return True
 
@@ -6103,6 +6606,8 @@ def _flash_target_seed_templates(
     has_score_modifiers: bool = False,
     score_modifier_kinds: Sequence[str] = (),
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Project every target template onto the current implementation's legality.
 
@@ -6137,10 +6642,47 @@ def _flash_target_seed_templates(
         expected = {**template, FLASH_Q_TILE_COUNT_KEY: 2}
         if expected[FLASH_PIPELINE_FAMILY_KEY] not in allowed_families:
             continue
+        # The tables are written against polynomial packets, which only the
+        # fast_math surface offers: legality is checked on the table with the
+        # surface's exact default packet in the polynomial one's place
+        # (``_flash_target_policy_values``; the seed builder substitutes the
+        # same way). A substituted table round-trips modulo the knobs the
+        # packet implied (the packet itself, its masked cadence and offsets),
+        # whose resolved values the seed builder carries; every other value
+        # must survive, so a body that normalizes the table's structure away
+        # (the fused row epilogue) still excludes it.
+        packet = expected.get(FLASH_EXP2_PACKET_KEY)
+        exact_table = packet is None or _flash_exp2_packet_admitted(packet, fast_math)
+        legality = expected
+        if not exact_table:
+            default_packet = resolve_flash_config(
+                head_dim,
+                num_kv,
+                {k: v for k, v in expected.items() if k != FLASH_EXP2_PACKET_KEY},
+                dtype=dtype,
+                num_bh=num_bh,
+                is_causal=is_causal,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+                tmem_rowmax_compatible=tmem_rowmax_compatible,
+                causal_resident_compatible=causal_resident_compatible,
+                target_device_capability=target_device_capability,
+                supports_tensor_4d_tma=supports_tensor_4d_tma,
+                has_row_epilogue=has_row_epilogue,
+                plain_row_body=plain_row_body,
+                has_score_modifiers=has_score_modifiers,
+                score_modifier_kinds=score_modifier_kinds,
+                head_dim_v=head_dim_v,
+                kv_group=kv_group,
+                fast_math=fast_math,
+            ).exp2_packet
+            legality, _ = _flash_target_policy_values(
+                expected, default_packet=default_packet, fast_math=fast_math
+            )
         resolved = resolve_flash_config(
             head_dim,
             num_kv,
-            expected,
+            legality,
             dtype=dtype,
             num_bh=num_bh,
             is_causal=is_causal,
@@ -6155,8 +6697,19 @@ def _flash_target_seed_templates(
             has_score_modifiers=has_score_modifiers,
             score_modifier_kinds=score_modifier_kinds,
             head_dim_v=head_dim_v,
+            kv_group=kv_group,
+            fast_math=fast_math,
         )
-        if not _flash_config_matches_tuning_values(resolved, expected):
+        if not _flash_config_matches_tuning_values(
+            resolved,
+            expected
+            if exact_table
+            else {
+                key: value
+                for key, value in legality.items()
+                if key not in _FLASH_PACKET_IMPLIED_TABLE_KEYS
+            },
+        ):
             continue
         if output_requires_tma and not resolved.epi_tma:
             continue
@@ -6347,6 +6900,50 @@ def _flash_causal_resident_native_candidate(
     )
 
 
+# Table values a withheld polynomial packet implied: the seed built from the
+# substituted table carries the resolver's values for them.
+_FLASH_PACKET_IMPLIED_TABLE_KEYS = frozenset(
+    {
+        FLASH_EXP2_PACKET_KEY,
+        FLASH_MASKED_E2E_SCHEDULE_KEY,
+        FLASH_E2E_OFFSET_KEY,
+        FLASH_E2E_OFFSET0_KEY,
+    }
+)
+
+
+def _flash_target_policy_values(
+    policy_values: Mapping[str, object],
+    *,
+    default_packet: object,
+    fast_math: bool,
+) -> tuple[dict[str, object], bool]:
+    """Return a target tuning table's values for the kernel's ``fast_math``.
+
+    The sm_103 tables are written against polynomial exp2 packets (the causal
+    template against the degree-2 packet, the dense rows against
+    ``deg1_8x2_corr10``), which only the fast_math surface offers. Without the
+    setting the table keeps its structure (family, cadence, ring depth, loop
+    split, registers, ...) with the surface's exact default packet in the
+    polynomial one's place. The second value is whether the table is seeded
+    as written. A substituted table is one more seed next to the generic
+    ones, not the body the target measured: the seed built from it carries
+    the resolver's values for the knobs the packet implied (the resident
+    native route's pins of the dead-tile skip, the staggered walk and the
+    head pair follow the exact packet, so the causal template staggers where
+    its ring allows; a masked cadence equal to the main one normalizes to
+    ``inherit``) and the table's values for everything else.
+    """
+    values = dict(policy_values)
+    packet = values.get(FLASH_EXP2_PACKET_KEY)
+    if packet is None or _flash_exp2_packet_admitted(packet, fast_math):
+        return values, True
+    values[FLASH_EXP2_PACKET_KEY] = _flash_exp2_packet_exact_substitute(
+        packet, default_packet
+    )
+    return values, False
+
+
 def _flash_validated_target_seed(
     *,
     head_dim: int,
@@ -6367,6 +6964,9 @@ def _flash_validated_target_seed(
     has_score_modifiers: bool = False,
     score_modifier_kinds: Sequence[str] = (),
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
+    exact_table: bool = True,
 ) -> Config:
     """Build a target seed and reject policies normalized by config resolution.
 
@@ -6375,6 +6975,9 @@ def _flash_validated_target_seed(
     statistics transport and row-sum form, the partial-tile KV width) exactly
     as normalization does, so for those bodies the seed carries the resolved
     values instead of being rejected: it then equals its normalized form.
+    *exact_table* is False when the table's polynomial packet was replaced by
+    the exact default (``_flash_target_policy_values``, no fast_math): the
+    seed then carries the resolved values too instead of being rejected.
 
     The dead-tile skip is resolved for *target_device_capability*: its
     fragment default is the descending fa4 body's, but the target's
@@ -6405,11 +7008,22 @@ def _flash_validated_target_seed(
         has_score_modifiers=has_score_modifiers,
         target_device_capability=target_device_capability,
         score_modifier_kinds=score_modifier_kinds,
+        kv_group=kv_group,
+        fast_math=fast_math,
     )
     actual = flash_effective_config_values(resolved)
-    skip_key = FLASH_CAUSAL_SKIP_DEAD_TILE_KEY
-    if skip_key in seed.config and seed.config[skip_key] != actual[skip_key]:
-        seed = Config.from_dict({**seed.config, skip_key: actual[skip_key]})
+    # The dead-tile skip, the staggered walk and the head pair default on
+    # where they are legal and are pinned off elsewhere (the resident-native
+    # route, a ring too shallow for the stagger, a plan without an even
+    # grouped-query divisor): the seed carries the resolved value so it
+    # equals its normalized form.
+    for pinned_key in (
+        FLASH_CAUSAL_SKIP_DEAD_TILE_KEY,
+        FLASH_CAUSAL_STAGGER_KEY,
+        FLASH_CAUSAL_HEAD_PAIR_KEY,
+    ):
+        if pinned_key in seed.config and seed.config[pinned_key] != actual[pinned_key]:
+            seed = Config.from_dict({**seed.config, pinned_key: actual[pinned_key]})
     mismatches = {
         key: (value, actual.get(key))
         for key, value in expected.items()
@@ -6417,7 +7031,7 @@ def _flash_validated_target_seed(
     }
     if not mismatches:
         return seed
-    if plain_row_body and not has_row_epilogue:
+    if exact_table and plain_row_body and not has_row_epilogue:
         raise ValueError(
             "flash target tuning policy does not round-trip through config "
             f"resolution: {mismatches!r}"
@@ -6453,6 +7067,8 @@ def _flash_target_seed_configs(
     has_score_modifiers: bool = False,
     score_modifier_kinds: Sequence[str] = (),
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> tuple[Config, ...]:
     if tmem_rowmax_compatible is None:
         tmem_rowmax_compatible = standard_dense_output or standard_causal_output
@@ -6474,6 +7090,8 @@ def _flash_target_seed_configs(
         "has_score_modifiers": has_score_modifiers,
         "score_modifier_kinds": score_modifier_kinds,
         "head_dim_v": head_dim_v,
+        "kv_group": kv_group,
+        "fast_math": fast_math,
     }
     families = _flash_legal_autotune_pipeline_families(
         head_dim, num_kv, output_requires_tma=False, requested_family=None, **common
@@ -6500,7 +7118,15 @@ def _flash_target_seed_configs(
             **common,
         )
         values = {key: fragment.default() for key, fragment in fragments.items()}
-        if not _flash_seed_set_all(values, fragments, template):
+        # The tables are written against polynomial packets; without fast_math
+        # the template keeps its structure with the surface's exact default
+        # packet in the polynomial one's place (``_flash_target_policy_values``).
+        template_values, exact_table = _flash_target_policy_values(
+            template,
+            default_packet=values[FLASH_EXP2_PACKET_KEY],
+            fast_math=fast_math,
+        )
+        if not _flash_seed_set_all(values, fragments, template_values):
             raise AssertionError("legal flash target template is absent from fragments")
         # Preserve the row-reduction implementation of former target seeds.
         # Instruction legality is independent of the template's historical length.
@@ -6533,13 +7159,16 @@ def _flash_target_seed_configs(
                 has_score_modifiers=has_score_modifiers,
                 score_modifier_kinds=score_modifier_kinds,
                 head_dim_v=head_dim_v,
+                kv_group=kv_group,
+                fast_math=fast_math,
+                exact_table=exact_table,
                 values={
                     "block_sizes": block_sizes,
                     **values,
                     FLASH_Q_TILE_COUNT_KEY: 2,
                 },
                 expected={
-                    **template,
+                    **template_values,
                     FLASH_Q_TILE_COUNT_KEY: 2,
                     FLASH_ROWMAX_KEY: rowmax,
                 },
@@ -6572,6 +7201,8 @@ def flash_attention_seed_config(
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     seed_kind: str = "default",
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> Config | None:
     """Return the first legal template in deterministic order, or a generic seed.
 
@@ -6604,6 +7235,8 @@ def flash_attention_seed_config(
             plain_row_body=plain_row_body,
             has_score_modifiers=has_score_modifiers,
             score_modifier_kinds=score_modifier_kinds,
+            kv_group=kv_group,
+            fast_math=fast_math,
         )
         if target_seeds:
             return target_seeds[0]
@@ -6631,6 +7264,8 @@ def flash_attention_seed_config(
         has_score_modifiers=has_score_modifiers,
         target_device_capability=target_device_capability,
         score_modifier_kinds=score_modifier_kinds,
+        kv_group=kv_group,
+        fast_math=fast_math,
     )
     if seed_kind == "default":
         return _flash_config_with_values(block_sizes, values)
@@ -6750,6 +7385,8 @@ def flash_attention_seed_configs(
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     device_sm_count: int = 0,
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> tuple[Config, ...]:
     """Return measured starting points plus generic structural coverage.
 
@@ -6759,6 +7396,13 @@ def flash_attention_seed_configs(
 
     ``device_sm_count`` (0 when unknown) lets a problem whose 128-row tiles
     cannot fill the device seed the 64-row tile of the flat ws_overlap grid.
+
+    ``fast_math`` (the kernel's setting) admits the polynomial exp2 packets.
+    Without it every seed written against one keeps its structure with an
+    exact substitute (the resident pair seeds take the hardware-only resident
+    sibling; the causal hd64 hybrid body and the pruned hybrid source variant
+    take the surface's default packet with their cadence and loop split) and
+    the duplicates that creates are folded.
     """
 
     if num_kv is None:
@@ -6786,6 +7430,8 @@ def flash_attention_seed_configs(
         "target_device_capability": target_device_capability,
         "score_modifier_kinds": score_modifier_kinds,
         "head_dim_v": head_dim_v,
+        "kv_group": kv_group,
+        "fast_math": fast_math,
     }
     fragments = flash_autotune_fragments(head_dim, num_kv, **common)
     base_values = {key: fragment.default() for key, fragment in fragments.items()}
@@ -6851,13 +7497,23 @@ def flash_attention_seed_configs(
             FLASH_EPI_TMA_KEY: True,
             FLASH_CORR_TILE_SIZE_KEY: 16,
         }
-        resident_packet = (
-            _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET
-        )
-        sparse_resident_packet = _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_16X2_EARLY_ACQUIRE_EXP2_PACKET
         hardware_resident_packet = (
             _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_XU_EARLY_ACQUIRE_EXP2_PACKET
         )
+        # The polynomial cadences are fast_math-only; without the setting the
+        # same structures are seeded on the hardware-only sibling (its phase
+        # offsets are dead and dropped below) and folded where they coincide.
+        resident_packet: object = (
+            _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET
+        )
+        sparse_resident_packet: object = _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_16X2_EARLY_ACQUIRE_EXP2_PACKET
+        if not fast_math:
+            resident_packet = _flash_exp2_packet_exact_substitute(
+                resident_packet, base_values[FLASH_EXP2_PACKET_KEY]
+            )
+            sparse_resident_packet = _flash_exp2_packet_exact_substitute(
+                sparse_resident_packet, base_values[FLASH_EXP2_PACKET_KEY]
+            )
         # The hd128 causal winners' register split, the fragment default one
         # (200/64/48) and FA4's row for the shape (192/72/56) are the measured
         # splits of the staged structure.
@@ -6929,6 +7585,14 @@ def flash_attention_seed_configs(
             },
         )
         for overrides in pair_seed_overrides:
+            if _flash_manual_exp2_packet_hardware_cadence(
+                overrides.get(FLASH_EXP2_PACKET_KEY)
+            ):
+                overrides = {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in (FLASH_E2E_OFFSET_KEY, FLASH_E2E_OFFSET0_KEY)
+                }
             values = dict(base_values)
             if not _flash_seed_set_all(values, fragments, overrides):
                 continue
@@ -6948,11 +7612,120 @@ def flash_attention_seed_configs(
                         standard_dense_output=standard_dense_output,
                         standard_causal_output=standard_causal_output,
                         head_dim_v=head_dim_v,
+                        fast_math=fast_math,
                     )
                 )
             seed = _flash_config_with_values(block_sizes, values)
             if seed not in seeds:
                 seeds.append(seed)
+
+    stagger_fragment = fragments[FLASH_CAUSAL_STAGGER_KEY]
+    assert isinstance(stagger_fragment, EnumFragment)
+    stagger_choices = (
+        stagger_fragment.choices
+        if stagger_fragment.search_choices is None
+        else stagger_fragment.search_choices
+    )
+    if True in stagger_choices and "fa4" in families:
+        # The staggered one-head schedule needs the descending split walk
+        # and a four-deep aliased ring; the hd128 pair reaches that depth
+        # only with the output staged in the dead Q stages. Seed it on the
+        # target seed's knobs (the measured body of the shape) and on the
+        # fragment defaults, so the search starts from the structure instead
+        # of having to assemble it axis by axis.
+        stagger_depth = _FLASH_CAUSAL_STAGGER_SEED_KV_STAGE.get(
+            head_dim, FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+        )
+        stagger_structure: dict[str, object] = {
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_KV_STAGE_KEY: stagger_depth,
+            FLASH_CAUSAL_STAGGER_KEY: True,
+            FLASH_CAUSAL_HEAD_PAIR_KEY: False,
+        }
+        if (
+            _flash_aliased_kv_stage_cap(
+                head_dim, head_dim_v=head_dim_v, stage_output=True
+            )
+            < stagger_depth
+        ):
+            stagger_structure[FLASH_EPI_TMA_KEY] = True
+            stagger_structure[FLASH_EPI_STG_KEY] = False
+            stagger_structure[FLASH_O_OVER_Q_KEY] = True
+        stagger_parents: list[dict[str, object]] = []
+        for target_seed in target_seeds:
+            stagger_parents.append(
+                {
+                    key: value
+                    for key, value in target_seed.config.items()
+                    if key in fragments
+                }
+            )
+        stagger_parents.append(dict(base_values))
+        for parent in stagger_parents:
+            values = dict(parent)
+            if not _flash_seed_set_all(values, fragments, stagger_structure):
+                continue
+            seed = _flash_config_with_values(block_sizes, values)
+            if seed not in seeds:
+                seeds.append(seed)
+
+    head_pair_fragment = fragments[FLASH_CAUSAL_HEAD_PAIR_KEY]
+    assert isinstance(head_pair_fragment, EnumFragment)
+    head_pair_choices = (
+        head_pair_fragment.choices
+        if head_pair_fragment.search_choices is None
+        else head_pair_fragment.search_choices
+    )
+    if True in head_pair_choices and "fa4" in families:
+        # The head pair (two consecutive query heads of one K/V head at one
+        # tile) needs the descending split walk and the TMA output store.
+        # Seed it on the target seed's knobs (the measured body of the shape)
+        # and on the fragment defaults, each with the shape's own ring and
+        # with the staggered seeds' deep ring (the grouped-query winners'
+        # structure), so the search starts from the structure instead of
+        # having to assemble it axis by axis.
+        head_pair_structure: dict[str, object] = {
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_EPI_STG_KEY: False,
+            FLASH_CAUSAL_HEAD_PAIR_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
+            FLASH_CAUSAL_STAGGER_KEY: False,
+        }
+        head_pair_depth = _FLASH_CAUSAL_STAGGER_SEED_KV_STAGE.get(
+            head_dim, FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+        )
+        deep_head_pair_structure: dict[str, object] = {
+            **head_pair_structure,
+            FLASH_KV_STAGE_KEY: head_pair_depth,
+        }
+        if (
+            _flash_aliased_kv_stage_cap(
+                head_dim, head_dim_v=head_dim_v, stage_output=True
+            )
+            < head_pair_depth
+        ):
+            deep_head_pair_structure[FLASH_O_OVER_Q_KEY] = True
+        head_pair_parents: list[dict[str, object]] = []
+        for target_seed in target_seeds:
+            head_pair_parents.append(
+                {
+                    key: value
+                    for key, value in target_seed.config.items()
+                    if key in fragments
+                }
+            )
+        head_pair_parents.append(dict(base_values))
+        for parent in head_pair_parents:
+            for structure in (head_pair_structure, deep_head_pair_structure):
+                values = dict(parent)
+                if not _flash_seed_set_all(values, fragments, structure):
+                    continue
+                seed = _flash_config_with_values(block_sizes, values)
+                if seed not in seeds:
+                    seeds.append(seed)
 
     packet_fragment = fragments[FLASH_EXP2_PACKET_KEY]
     assert isinstance(packet_fragment, EnumFragment)
@@ -6961,11 +7734,47 @@ def flash_attention_seed_configs(
         if packet_fragment.search_choices is None
         else packet_fragment.search_choices
     )
-    for packet in packets:
+    # Without fast_math the polynomial packets leave the surface. Each one's
+    # seed keeps its structure (the parent family and cadence the compound
+    # overrides pin: the degree-3 cadence of the same period, the discounted
+    # PASS2, the descending loop split) on its exact substitute
+    # (``_flash_exp2_packet_exact_substitute``); the duplicates this creates
+    # (the three resident cadences all on the hardware-only sibling) are
+    # folded below.
+    withheld_packets: tuple[object, ...] = ()
+    if not fast_math:
+        fast_math_fragment = flash_autotune_fragments(
+            head_dim, num_kv, **{**common, "fast_math": True}
+        )[FLASH_EXP2_PACKET_KEY]
+        assert isinstance(fast_math_fragment, EnumFragment)
+        withheld_packets = tuple(
+            packet
+            for packet in (
+                fast_math_fragment.choices
+                if fast_math_fragment.search_choices is None
+                else fast_math_fragment.search_choices
+            )
+            if packet not in packets
+        )
+    for packet in (*packets, *withheld_packets):
         if packet == base_values[FLASH_EXP2_PACKET_KEY]:
             continue
+        withheld = packet in withheld_packets
+        seed_packet = (
+            _flash_exp2_packet_exact_substitute(
+                packet, base_values[FLASH_EXP2_PACKET_KEY]
+            )
+            if withheld
+            else packet
+        )
         values = dict(base_values)
         values[FLASH_EXP2_PACKET_KEY] = packet
+        # The packet seeds are the shape's measured one-head bodies (the
+        # dead-tile skip where it is legal): the opt-in head-pair default
+        # (``HELION_CUTE_FLASH_CAUSAL_HEAD_PAIR=1``) does not convert them,
+        # so a search under it still starts from the skip bodies; the
+        # head-pair seeds proper carry the paired structure.
+        values[FLASH_CAUSAL_HEAD_PAIR_KEY] = False
         if packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
             # A compound packet seed owns its required parent family. Normal
             # search configs keep an explicit family, where a conflicting child
@@ -6984,8 +7793,30 @@ def flash_attention_seed_configs(
                 standard_dense_output=standard_dense_output,
                 standard_causal_output=standard_causal_output,
                 head_dim_v=head_dim_v,
+                # A withheld packet's structure is read from the surface
+                # that offers it; the packet itself is replaced below.
+                fast_math=fast_math or withheld,
             )
         )
+        values[FLASH_EXP2_PACKET_KEY] = seed_packet
+        if withheld and seed_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
+            # The hardware-only resident sibling owns its own cadence.
+            values.update(
+                _flash_compound_exp2_packet_overrides(
+                    head_dim,
+                    num_kv,
+                    values,
+                    dtype=dtype,
+                    is_causal=is_causal,
+                    has_kv_tile_pruning=has_kv_tile_pruning,
+                    requires_ws_overlap=requires_ws_overlap,
+                    small_biased_candidate=small_biased_candidate,
+                    standard_dense_output=standard_dense_output,
+                    standard_causal_output=standard_causal_output,
+                    head_dim_v=head_dim_v,
+                    fast_math=fast_math,
+                )
+            )
         seeds.append(_flash_config_with_values(block_sizes, values))
 
     # The family loop seeds ``fa4_local_tma`` (per-CTA TMA partitioning) with
@@ -7049,10 +7880,13 @@ def flash_attention_seed_configs(
     # seven-stage K/V ring and the two-deep PASS2 wins at s8192. The nearest
     # generic seeds are 6-8 knobs away and a cold search's own pick
     # re-measured 1-2% behind the campaign winners, so each body is seeded as
-    # measured. Neither the dead stage-0 tile skip nor the halved L2 launch
-    # group pays at head_dim 64 (skip: equal at s2048, -0.4% at s4096, -0.6%
-    # at s8192; shift: -0.4% to -1.2%), so the seeds pin them off; the
-    # fragments still search both.
+    # measured. Neither the dead stage-0 tile skip, the halved L2 launch
+    # group nor the staggered walk pays at head_dim 64 (skip: equal at
+    # s2048, -0.4% at s4096, -0.6% at s8192; shift: -0.4% to -1.2%; stagger:
+    # at the winner at s2048, 0.5-1% behind at s4096 / s8192, and the s8192
+    # body's seven-stage ring would otherwise take the resolver's
+    # on-where-legal default), so the seeds pin all three off; the fragments
+    # still search each of them.
     if head_dim == 64 and is_causal and standard_causal_output and "fa4" in families:
         causal_fa4_fragments = flash_autotune_fragments(
             head_dim,
@@ -7117,6 +7951,9 @@ def flash_attention_seed_configs(
                     FLASH_PRECOMPUTE_QK_DESC_KEY: True,
                     FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
                     FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
+                    FLASH_CAUSAL_STAGGER_KEY: False,
+                    FLASH_CAUSAL_HEAD_PAIR_KEY: False,
+                    FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
                     **measured_body,
                 },
             ):
@@ -7124,45 +7961,80 @@ def flash_attention_seed_configs(
             pair_seed = _flash_config_with_values(block_sizes, pair_values)
             if pair_seed not in seeds:
                 seeds.append(pair_seed)
-        if _FLASH_HYBRID_EXP2_PACKET in packets:
+        # The s4096 body: the hybrid packet's structure (fa4, the 16/8 cadence
+        # on both loop segments, the two-deep chunked PASS2 with the split P
+        # arrival, the descending loop split) with its measured knobs. The
+        # packet itself is fast_math-only; without the setting the same body
+        # is seeded on the surface's exact default packet with the structure
+        # the packet pins (``_flash_hybrid_exp2_packet_structure``).
+        hybrid_structure = _flash_hybrid_exp2_packet_structure(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_causal_output=standard_causal_output,
+        )
+        hybrid_seed_packet = (
+            _FLASH_HYBRID_EXP2_PACKET
+            if _FLASH_HYBRID_EXP2_PACKET in packets
+            else base_values[FLASH_EXP2_PACKET_KEY]
+            if hybrid_structure
+            else None
+        )
+        if hybrid_seed_packet is not None:
             hybrid_values = dict(base_values)
-            hybrid_values[FLASH_EXP2_PACKET_KEY] = _FLASH_HYBRID_EXP2_PACKET
-            hybrid_values.pop(FLASH_PIPELINE_FAMILY_KEY, None)
-            hybrid_values.update(
-                _flash_compound_exp2_packet_overrides(
-                    head_dim,
-                    num_kv,
-                    hybrid_values,
-                    dtype=dtype,
-                    is_causal=is_causal,
-                    has_kv_tile_pruning=has_kv_tile_pruning,
-                    requires_ws_overlap=requires_ws_overlap,
-                    small_biased_candidate=small_biased_candidate,
-                    standard_dense_output=standard_dense_output,
-                    standard_causal_output=standard_causal_output,
+            hybrid_values[FLASH_EXP2_PACKET_KEY] = hybrid_seed_packet
+            if hybrid_seed_packet == _FLASH_HYBRID_EXP2_PACKET:
+                hybrid_values.pop(FLASH_PIPELINE_FAMILY_KEY, None)
+                hybrid_values.update(
+                    _flash_compound_exp2_packet_overrides(
+                        head_dim,
+                        num_kv,
+                        hybrid_values,
+                        dtype=dtype,
+                        is_causal=is_causal,
+                        has_kv_tile_pruning=has_kv_tile_pruning,
+                        requires_ws_overlap=requires_ws_overlap,
+                        small_biased_candidate=small_biased_candidate,
+                        standard_dense_output=standard_dense_output,
+                        standard_causal_output=standard_causal_output,
+                        fast_math=fast_math,
+                    )
                 )
-            )
-            if hybrid_values.get(
-                FLASH_EXP2_PACKET_KEY
-            ) == _FLASH_HYBRID_EXP2_PACKET and _flash_seed_set_all(
-                hybrid_values,
-                fragments,
-                {
-                    FLASH_EPI_TMA_KEY: True,
-                    FLASH_CAUSAL_KV_ORDER_KEY: "descending",
-                    FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
-                    FLASH_PRECOMPUTE_QK_DESC_KEY: True,
-                    FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
-                    FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
-                    FLASH_SOFTMAX_REGS_KEY: 200,
-                    FLASH_CORR_REGS_KEY: 64,
-                    FLASH_OTHER_REGS_KEY: 48,
-                    FLASH_RESCALE_THRESHOLD_KEY: 8.0,
-                    FLASH_RESCALE_CHUNK_COLS_KEY: 8,
-                    FLASH_E2E_OFFSET_KEY: 0,
-                    FLASH_E2E_OFFSET0_KEY: 4,
-                    FLASH_FIRST_LOAD_ORDER_KEY: 2,
-                },
+                structure_set = True
+            else:
+                structure_set = _flash_seed_set_structure(
+                    hybrid_values, fragments, hybrid_structure
+                )
+            if (
+                structure_set
+                and hybrid_values.get(FLASH_EXP2_PACKET_KEY) == hybrid_seed_packet
+                and _flash_seed_set_all(
+                    hybrid_values,
+                    fragments,
+                    {
+                        FLASH_EPI_TMA_KEY: True,
+                        FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+                        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+                        FLASH_PRECOMPUTE_QK_DESC_KEY: True,
+                        FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
+                        FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
+                        FLASH_CAUSAL_STAGGER_KEY: False,
+                        FLASH_CAUSAL_HEAD_PAIR_KEY: False,
+                        FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
+                        FLASH_SOFTMAX_REGS_KEY: 200,
+                        FLASH_CORR_REGS_KEY: 64,
+                        FLASH_OTHER_REGS_KEY: 48,
+                        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+                        FLASH_RESCALE_CHUNK_COLS_KEY: 8,
+                        FLASH_E2E_OFFSET_KEY: 0,
+                        FLASH_E2E_OFFSET0_KEY: 4,
+                        FLASH_FIRST_LOAD_ORDER_KEY: 2,
+                    },
+                )
             ):
                 hybrid_seed = _flash_config_with_values(block_sizes, hybrid_values)
                 if hybrid_seed not in seeds:
@@ -7244,9 +8116,13 @@ def flash_attention_seed_configs(
         # winners' 16/8 (0.303 vs 0.329 ms, 0.933 vs 1.015 ms at s8192).
         # The hd64 hybrid packet (the causal winners' structure: descending
         # three-segment split, 16/8 cadence) carries the same knobs; the
-        # variant loop adds it only where the packet is a searchable choice
-        # (a polynomial exp2 seed, ungated by fast_math like the fragment
-        # choice: see the note at ``_FLASH_DEG2_EXP2_PACKET``).
+        # variant loop adds it only where the packet is a searchable choice.
+        # The packet is a polynomial exp2 seed and fast_math-only (see the
+        # note at ``_FLASH_DEG2_EXP2_PACKET``): where the fast_math surface
+        # offers it and the setting is off, the same structure
+        # (``_flash_hybrid_exp2_packet_structure``) is seeded on the
+        # surface's default packet. A body that never offers the packet
+        # (hd128, the document-id mask) gets neither variant.
         # Measured at s8192 on B200: prefix-LM 0.930 -> 0.876 ms (6% faster
         # than 8/2, ahead of flex-cute), sliding-window 0.300 -> 0.316 ms
         # (the 16-iteration cadence does not fit its ~10-tile work items), so
@@ -7264,19 +8140,34 @@ def flash_attention_seed_configs(
                 "fa4",
                 {FLASH_E2E_SCHEDULE_KEY: "8/2", **pruned_fa4_structure},
             ),
-            (
-                FLASH_EXP2_PACKET_KEY,
-                _FLASH_HYBRID_EXP2_PACKET,
-                {
-                    FLASH_PIPELINE_FAMILY_KEY: "fa4",
-                    FLASH_E2E_SCHEDULE_KEY: "16/8",
-                    FLASH_MASKED_E2E_SCHEDULE_KEY: "16/8",
-                    FLASH_CAUSAL_KV_ORDER_KEY: "descending",
-                    FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
-                    **pruned_fa4_structure,
-                },
-            ),
         )
+        pruned_hybrid_packet = (
+            _FLASH_HYBRID_EXP2_PACKET
+            if _FLASH_HYBRID_EXP2_PACKET in packets
+            else base_values[FLASH_EXP2_PACKET_KEY]
+            if _FLASH_HYBRID_EXP2_PACKET in withheld_packets
+            else None
+        )
+        if pruned_hybrid_packet is not None:
+            source_variants += (
+                (
+                    FLASH_EXP2_PACKET_KEY,
+                    pruned_hybrid_packet,
+                    {
+                        **_flash_hybrid_exp2_packet_structure(
+                            head_dim,
+                            num_kv,
+                            dtype=dtype,
+                            is_causal=is_causal,
+                            has_kv_tile_pruning=has_kv_tile_pruning,
+                            requires_ws_overlap=requires_ws_overlap,
+                            small_biased_candidate=small_biased_candidate,
+                            standard_causal_output=standard_causal_output,
+                        ),
+                        **pruned_fa4_structure,
+                    },
+                ),
+            )
     if (
         has_kv_tile_pruning
         and not requires_ws_overlap
@@ -7540,6 +8431,8 @@ def _flash_legal_autotune_pipeline_families(
     has_score_modifiers: bool = False,
     score_modifier_kinds: Sequence[str] = (),
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> tuple[str, ...]:
     """Enumerate families whose requested structure survives normalization."""
     candidates = (
@@ -7579,6 +8472,7 @@ def _flash_legal_autotune_pipeline_families(
             num_kv,
             requested,
             head_dim_v=head_dim_v,
+            kv_group=kv_group,
             dtype=dtype,
             num_bh=num_bh,
             is_causal=is_causal,
@@ -7592,6 +8486,7 @@ def _flash_legal_autotune_pipeline_families(
             has_row_epilogue=has_row_epilogue,
             has_score_modifiers=has_score_modifiers,
             score_modifier_kinds=score_modifier_kinds,
+            fast_math=fast_math,
         )
         if effective.pipeline_family != family:
             continue
@@ -7626,12 +8521,19 @@ def flash_autotune_fragments(
     topology_override: str | None = None,
     pipeline_family_override: str | None = None,
     head_dim_v: int | None = None,
+    kv_group: int = 1,
+    fast_math: bool = False,
 ) -> dict[str, ConfigSpecFragment]:
     """Build a legality-driven, length-invariant flash search surface.
 
     Sequence length participates only in structural proofs such as even-pair or
     four-tile cluster alignment.  Within one legality class, defaults, active
     choices, and their ordering are identical for every length.
+
+    ``fast_math`` (the kernel's setting) admits the polynomial exp2 packets
+    (``_FLASH_FAST_MATH_EXP2_PACKETS``) to the packet choices, the search
+    choices and the target-policy value widening; without it the surface
+    offers the exact packets only.
     """
 
     if tmem_rowmax_compatible is None:
@@ -7686,6 +8588,8 @@ def flash_autotune_fragments(
         has_score_modifiers=has_score_modifiers,
         target_device_capability=target_device_capability,
         score_modifier_kinds=score_modifier_kinds,
+        kv_group=kv_group,
+        fast_math=fast_math,
     )
     # The asymmetric (192, 128) pair: only the plain fa4 family hosts it, its
     # aliased ring slots are the wider K tile, and staged O fits only when the
@@ -7700,8 +8604,42 @@ def flash_autotune_fragments(
     # default (the dense pair) would make every staged-epilogue child a
     # three-parent value, which the coverage design cannot witness.
     pair_fa4 = asymmetric_head_dims and fa4_eligible and defaults.topology == "fa4"
+    # The staggered causal walk (``cute_flash_causal_stagger``) needs an
+    # aliased ring of ``FLASH_CAUSAL_STAGGER_MIN_KV_STAGE`` slots; where a
+    # separate staged-output buffer leaves no room for that depth (hd128)
+    # the output staged in the dead Q stages is the ring's only route, so
+    # the knob is searched on that body too.
+    causal_stagger_body_eligible = (
+        fa4_eligible
+        and defaults.topology == "fa4"
+        and _flash_causal_skip_dead_tile_legal(
+            pipeline_family="fa4",
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            score_modifier_kinds=score_modifier_kinds,
+            mma_ptx=defaults.mma_ptx,
+            q_tile_count=2,
+            kv_tile_n=128,
+            q_tile_m=128,
+            causal_kv_order="descending",
+            causal_two_cta=False,
+            use_2cta_instrs=False,
+            alternating_warpgroups=False,
+            p_chunk_arrive=False,
+        )
+    )
+    stagger_needs_o_over_q = (
+        causal_stagger_body_eligible
+        and _flash_aliased_kv_stage_cap(
+            head_dim, head_dim_v=head_dim_v, stage_output=True
+        )
+        < FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+        <= _flash_aliased_kv_stage_cap(
+            head_dim, head_dim_v=head_dim_v, stage_output=False
+        )
+    )
     o_over_q_eligible = (
-        pair_fa4
+        (pair_fa4 or stagger_needs_o_over_q)
         and not defaults.persistent
         and _flash_o_over_q_supported(
             head_dim,
@@ -7812,6 +8750,7 @@ def flash_autotune_fragments(
         has_score_modifiers=has_score_modifiers,
         score_modifier_kinds=score_modifier_kinds,
         head_dim_v=head_dim_v,
+        fast_math=fast_math,
     )
     if valid_family is None and valid_topology is not None:
         active_families = tuple(
@@ -8284,6 +9223,44 @@ def flash_autotune_fragments(
         if causal_skip_dead_tile_searchable
         else (defaults.causal_skip_dead_tile,),
     )
+    # The staggered walk is searched on the same body where the ring depth
+    # search reaches the slots it needs (the resolver pins a True proposal
+    # off below that depth, as for every other axis it depends on).
+    kv_stage_reach = (
+        kv_stage.choices
+        if kv_stage.search_choices is None
+        else tuple(kv_stage.search_choices)
+    )
+    causal_stagger_searchable = causal_skip_dead_tile_searchable and any(
+        isinstance(depth, int) and depth >= FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
+        for depth in kv_stage_reach
+    )
+    causal_stagger = enum(
+        _flash_causal_stagger_default(True)
+        if causal_stagger_searchable
+        else defaults.causal_stagger,
+        (False, True),
+        (False, True) if causal_stagger_searchable else (defaults.causal_stagger,),
+    )
+    # The pre-sync prologue loads: searched where the plain fa4 family itself
+    # is in the search (a fixed fa4_* family's rings never take the knob, and
+    # the witness of its dependency entry would put the plain family on that
+    # surface), the KV interval is not pruned and the K/V rings are one
+    # aliased ring (the asymmetric pair's are not); the resolver clears the
+    # knob off the rest of that body.
+    early_prologue_loads_searchable = (
+        fa4_search_eligible
+        and "fa4" in active_families
+        and not has_kv_tile_pruning
+        and not asymmetric_head_dims
+    )
+    early_prologue_loads = enum(
+        defaults.early_prologue_loads,
+        (False, True),
+        (False, True)
+        if early_prologue_loads_searchable
+        else (defaults.early_prologue_loads,),
+    )
     role_chain_supported = any(
         flags is not None
         and flags.topology == "fa4"
@@ -8394,6 +9371,57 @@ def flash_autotune_fragments(
             (defaults.epi_stg_gmem,),
         )
 
+    # The head pair (``cute_flash_causal_head_pair``): two consecutive query
+    # heads of one K/V head at the same tile. Searched on the dead-tile skip's
+    # body for grouped-query plans with an even group where the search reaches
+    # the TMA output store it addresses the two heads' tiles through (the
+    # resolver pins a True proposal off elsewhere, as for every other axis it
+    # depends on).
+    epi_tma_reach = (
+        epi_tma.choices
+        if epi_tma.search_choices is None
+        else tuple(epi_tma.search_choices)
+    )
+    softmax_disc_reach = (
+        softmax_disc.choices
+        if softmax_disc.search_choices is None
+        else tuple(softmax_disc.search_choices)
+    )
+    causal_head_pair_searchable = (
+        causal_skip_dead_tile_searchable
+        and True in epi_tma_reach
+        and True in softmax_disc_reach
+        and _flash_causal_head_pair_legal(
+            pipeline_family="fa4",
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            score_modifier_kinds=score_modifier_kinds,
+            mma_ptx=defaults.mma_ptx,
+            q_tile_count=2,
+            kv_tile_n=128,
+            q_tile_m=128,
+            causal_kv_order="descending",
+            causal_two_cta=False,
+            use_2cta_instrs=False,
+            alternating_warpgroups=False,
+            p_chunk_arrive=False,
+            kv_group=kv_group,
+            epi_tma=True,
+            softmax_disc=True,
+            persistent=False,
+            local_tma_partition=False,
+            tensor_4d_tma=False,
+            row_bound_tiling="global",
+        )
+    )
+    causal_head_pair = enum(
+        _flash_causal_head_pair_default(True)
+        if causal_head_pair_searchable
+        else defaults.causal_head_pair,
+        (False, True),
+        (False, True) if causal_head_pair_searchable else (defaults.causal_head_pair,),
+    )
+
     if defaults.topology == "fa4":
         wait_hint = enum(defaults.wait_hint, (10_000_000, 0), (10_000_000, 0))
         mma_interleave = enum(defaults.mma_interleave, (True, False), (True, False))
@@ -8410,46 +9438,41 @@ def flash_autotune_fragments(
         # packet envelope.
         packet_values = list(_FLASH_EXP2_PACKET_PARAMS)
         packet_search = list(_FLASH_EXP2_PACKET_PARAMS)
+    # The compound packets of each body. The polynomial ones are
+    # approximations and join the surface (choices and search choices) only
+    # under the fast_math setting: see the note at ``_FLASH_DEG2_EXP2_PACKET``.
+    compound_packets: tuple[str, ...] = ()
     if d64_fa4:
         if dtype is torch.float16 and standard_dense_d64 and cluster_aligned:
-            packet_values.extend(
-                (
-                    _FLASH_DEG2_EXP2_PACKET,
-                    _FLASH_DEG1_EXP2_PACKET,
-                    _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
-                )
-            )
-            packet_search.extend(
-                (
-                    _FLASH_DEG2_EXP2_PACKET,
-                    _FLASH_DEG1_EXP2_PACKET,
-                    _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
-                )
+            compound_packets = (
+                _FLASH_DEG2_EXP2_PACKET,
+                _FLASH_DEG1_EXP2_PACKET,
+                _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
             )
         elif dtype is torch.float16 and standard_causal_d64:
-            packet_values.append(_FLASH_DEG2_EXP2_PACKET)
-            packet_search.append(_FLASH_DEG2_EXP2_PACKET)
-            packet_values.append(_FLASH_HYBRID_EXP2_PACKET)
-            packet_search.append(_FLASH_HYBRID_EXP2_PACKET)
+            compound_packets = (_FLASH_DEG2_EXP2_PACKET, _FLASH_HYBRID_EXP2_PACKET)
         elif (dtype is torch.bfloat16 and standard_causal_d64) or pruned_split_d64:
             # The pruned kinds take the hybrid packet in both I/O dtypes.
-            # Ungated by fast_math like every other polynomial packet site:
-            # see the note at ``_FLASH_DEG2_EXP2_PACKET``.
-            packet_values.append(_FLASH_HYBRID_EXP2_PACKET)
-            packet_search.append(_FLASH_HYBRID_EXP2_PACKET)
+            compound_packets = (_FLASH_HYBRID_EXP2_PACKET,)
     elif (
         bf16_d128_compound_packet_eligible
         and not is_causal
         and standard_dense_output
         and cluster_aligned
     ):
-        packet_values.append(_FLASH_DEG2_EXP2_PACKET)
-        packet_search.append(_FLASH_DEG2_EXP2_PACKET)
+        compound_packets = (_FLASH_DEG2_EXP2_PACKET,)
     elif (
         bf16_value_d128_causal_packet_eligible and is_causal and standard_causal_output
     ):
-        packet_values.extend(_FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKET_CHOICES)
-        packet_search.extend(_FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKET_CHOICES)
+        # Without fast_math only the hardware-only resident sibling remains.
+        compound_packets = _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKET_CHOICES
+    admitted_packets = [
+        packet
+        for packet in compound_packets
+        if _flash_exp2_packet_admitted(packet, fast_math)
+    ]
+    packet_values.extend(admitted_packets)
+    packet_search.extend(admitted_packets)
     if valid_family is not None:
         packet_search = [
             packet
@@ -8477,6 +9500,7 @@ def flash_autotune_fragments(
                 plain_row_body=plain_row_body,
                 has_score_modifiers=has_score_modifiers,
                 score_modifier_kinds=score_modifier_kinds,
+                fast_math=fast_math,
             ).exp2_packet
             == packet
         ]
@@ -8753,6 +9777,9 @@ def flash_autotune_fragments(
         FLASH_CAUSAL_MASK_STOREBACK_KEY: causal_mask_storeback,
         FLASH_ROW_BOUND_TILING_KEY: row_bound_tiling,
         FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: causal_skip_dead_tile,
+        FLASH_CAUSAL_STAGGER_KEY: causal_stagger,
+        FLASH_CAUSAL_HEAD_PAIR_KEY: causal_head_pair,
+        FLASH_EARLY_PROLOGUE_LOADS_KEY: early_prologue_loads,
     }
     if valid_family == "fa4_alt":
         for key, value in (
@@ -8795,12 +9822,22 @@ def flash_autotune_fragments(
         has_score_modifiers=has_score_modifiers,
         score_modifier_kinds=score_modifier_kinds,
         head_dim_v=head_dim_v,
+        kv_group=kv_group,
+        fast_math=fast_math,
         output_requires_tma=output_requires_tma,
         tmem_rowmax_compatible=tmem_rowmax_compatible,
         causal_resident_compatible=causal_resident_compatible,
     )
     for template in templates:
-        for key, value in template.items():
+        # The tables are written against polynomial packets; without fast_math
+        # the widening below admits the table's structure with the exact
+        # default packet in their place, never the polynomial packet itself.
+        template_values, _exact_table = _flash_target_policy_values(
+            template,
+            default_packet=exp2_packet.default(),
+            fast_math=fast_math,
+        )
+        for key, value in template_values.items():
             fragment = cast("EnumFragment", fragments[key])
             if value not in fragment.choices:
                 search_choices = fragment.search_choices
@@ -8837,6 +9874,7 @@ def flash_config_from_config(
     has_score_modifiers: bool = False,
     target_device_capability: tuple[int, int] | None = None,
     score_modifier_kinds: Sequence[str] = (),
+    fast_math: bool = False,
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -8864,6 +9902,7 @@ def flash_config_from_config(
         has_score_modifiers=has_score_modifiers,
         target_device_capability=target_device_capability,
         score_modifier_kinds=score_modifier_kinds,
+        fast_math=fast_math,
     )
 
 
@@ -12860,6 +13899,22 @@ def emit_flash_fa4_device_body(
         and not use_2cta_instrs
         and not use_cga2_local_cta
     )
+    early_prologue_loads = cfg.early_prologue_loads
+    if early_prologue_loads:
+        assert not (
+            persistent
+            or pruned_interval
+            or use_2cta_instrs
+            or use_cga2_local_cta
+            or use_clc_scheduler
+            or separate_kv_rings
+            or use_local_tma_partition
+            or use_tensor_4d_tma
+            or segment_tiling
+            or uneven_kv_ring
+            or asymmetric_kv_ring
+            or cfg.first_load_order == FLASH_FIRST_LOAD_ORDER_STAGED
+        ), "the pre-sync prologue loads need the plain one-CTA fa4 ring"
     if segment_tiling:
         assert not persistent
         assert not use_tensor_4d_tma
@@ -13125,6 +14180,50 @@ tOtO1 = tOtO1_full
     # gmem slices depend on flash_bh and are computed in setup too. Persistent: the
     # decode + per-work-item gmem slices move INSIDE each role's strided while loop
     # (see _flash_fa4_wrap); setup computes only work-item-independent state.
+    # The head pair: the two query stages are two consecutive query heads
+    # (``flash_bh``, ``flash_bh + 1``) of one K/V head at the same tile, so
+    # both walk ``t + 1`` KV tiles (no dead tile, no half step, both
+    # diagonals in step 0) and share the head's K/V stream. Only the Q loads,
+    # the O stores and the LSE rows address a per-stage head; the MMA,
+    # softmax, correction and loader bodies are the plain walk's. The
+    # resolver's legality is the skip's plus an even grouped-query divisor,
+    # the TMA output store and the chunked softmax; a config built past it
+    # cannot render.
+    causal_head_pair = (
+        cfg.causal_head_pair
+        and is_causal
+        and causal_desc_kv
+        and q_stage == 2
+        and not cfg.causal_two_cta
+        and not use_2cta_instrs
+    )
+    assert not (causal_head_pair and use_causal_resident_native)
+    if causal_head_pair:
+        assert cfg.pipeline_family == "fa4"
+        assert cfg.mma_ptx
+        assert cfg.q_tile_m == 128
+        assert cfg.kv_tile_n == 128
+        assert cfg.epi_tma
+        assert cfg.softmax_disc
+        assert not cfg.p_chunk_arrive
+        assert not cfg.alternating_warpgroups
+        assert not persistent
+        assert not pruned_interval
+        assert not segment_tiling
+        assert not use_local_tma_partition
+        assert not use_tensor_4d_tma
+        assert not use_cga2_local_cta
+        assert kv_group >= 2 and kv_group % 2 == 0
+        assert num_bh % 2 == 0
+        assert row_epilogue is None
+        assert not aux_smem_staging
+
+    def _stage_bh(stage: str) -> str:
+        # The query batch head a stage's Q tile, O tile and LSE rows belong
+        # to: the head pair's stage ``s`` is head ``flash_bh + s``; every
+        # other body addresses one head.
+        return f"flash_bh{stage}" if causal_head_pair else "flash_bh"
+
     lpt_swizzle = 1
     if interval_kv:
         # Every interval plan (causal and the pruned masks) walks the
@@ -13175,6 +14274,44 @@ else:
 flash_m_pair = {num_m_pairs - 1} - flash_m_pair_raw
 flash_m_tile0 = flash_m_pair * 2
 flash_m_tile1 = flash_m_pair * 2 + 1
+flash_q_mma_tile0 = flash_m_tile0
+flash_q_mma_tile1 = flash_m_tile1"""
+    if causal_head_pair:
+        # One work item per (head pair, 128-row tile): the same CTA count as
+        # the one-head pair grid (``num_bh // 2`` pairs x ``2 * num_m_pairs``
+        # tiles). FA4's LPT order with the L2-sized launch group converted to
+        # head pairs (a group of S batch heads is S // 2 pairs): the pair is
+        # the fastest index inside a group and the tile descends, with FA4's
+        # residual group when the pairs do not divide into whole groups.
+        num_m_tiles = 2 * num_m_pairs
+        num_bh_pairs = num_bh // 2
+        pair_swizzle = max(1, min(lpt_swizzle // 2, num_bh_pairs))
+        pair_group_tiles = pair_swizzle * num_m_tiles
+        pair_quotient = num_bh_pairs // pair_swizzle
+        pair_remainder = num_bh_pairs % pair_swizzle
+        pair_residual = max(pair_remainder, 1)
+        if pair_remainder == 0:
+            pair_decode = f"""
+flash_m_tile_raw = flash_lpt_mod // {pair_swizzle}
+flash_bh = (flash_lpt_group * {pair_swizzle} + (flash_lpt_mod % {pair_swizzle})) * 2"""
+        else:
+            pair_decode = f"""
+flash_m_tile_raw = cutlass.Int32(0)
+flash_bh = cutlass.Int32(0)
+if flash_lpt_group < {pair_quotient}:
+    flash_m_tile_raw = flash_lpt_mod // {pair_swizzle}
+    flash_bh = (flash_lpt_group * {pair_swizzle} + (flash_lpt_mod % {pair_swizzle})) * 2
+else:
+    flash_m_tile_raw = flash_lpt_mod // {pair_residual}
+    flash_bh = (flash_lpt_group * {pair_swizzle} + (flash_lpt_mod % {pair_residual})) * 2"""
+        causal_setup_pid = f"""
+flash_pid = cutlass.Int32(cute.arch.block_idx()[0])
+flash_lpt_group = flash_pid // {pair_group_tiles}
+flash_lpt_mod = flash_pid % {pair_group_tiles}{pair_decode}
+flash_m_tile0 = {num_m_tiles - 1} - flash_m_tile_raw
+flash_m_tile1 = flash_m_tile0
+flash_bh0 = flash_bh
+flash_bh1 = flash_bh + 1
 flash_q_mma_tile0 = flash_m_tile0
 flash_q_mma_tile1 = flash_m_tile1"""
     if cfg.causal_two_cta:
@@ -13258,6 +14395,12 @@ flash_batch = flash_bh // {tensor_4d_heads}
 tQgQ = tQgQ_qdl[None, None, 0, flash_head, flash_batch]
 tKgK = tKgK_kdl[None, None, 0, flash_head, flash_batch]
 tVgV = tVgV_dkl[None, 0, None, flash_head, flash_batch]"""
+    elif causal_head_pair:
+        setup_gmem_slice = f"""
+tQgQ0 = tQgQ_qdl[None, None, 0, flash_bh0]
+tQgQ1 = tQgQ_qdl[None, None, 0, flash_bh1]
+tKgK = tKgK_kdl[None, None, 0, {kv_bh}]
+tVgV = tVgV_dkl[None, 0, None, {kv_bh}]"""
     else:
         setup_gmem_slice = f"""
 tQgQ = tQgQ_qdl[None, None, 0, flash_bh]
@@ -13440,6 +14583,65 @@ flash_v_prod, flash_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(
         if cfg.p_chunk_arrive
         else ""
     )
+    # The TMA pipelines, MMA slices and TMA partitions: after the prologue sync
+    # (default) or, with the pre-sync prologue loads, before the init fence so
+    # warp 0 can issue the first work item's loads ahead of the sync.
+    pipeline_setup = f"""flash_q_bytes = cute.size_in_bytes({io_dtype}, cute.select(_flash_qsl, mode=[0, 1, 2])){q_tma_byte_scale}
+flash_k_bytes = cute.size_in_bytes({io_dtype}, cute.select(_flash_ksl, mode=[0, 1, 2])){kv_tma_byte_scale}
+flash_q_prod, flash_q_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(
+    num_stages={q_stage},
+    producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread),
+    consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread),
+    tx_count=flash_q_bytes, barrier_storage=storage.q_mbar_ptr.data_ptr(){q_tma_cluster_arg}).make_participants()
+{kv_pipeline_setup}
+
+flash_qkt = _flash_qk_mma.get_slice(flash_mma_tile_coord_v)
+flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
+{setup_tma_partitions}"""
+    # The head pair loads each stage's tile from its own head's Q view.
+    load_q0_view = "tQgQ0" if causal_head_pair else "tQgQ"
+    load_q1_view = "tQgQ1" if causal_head_pair else "tQgQ"
+    early_pipeline_setup = ""
+    early_prologue_load_block = ""
+    late_pipeline_setup = pipeline_setup
+    if early_prologue_loads:
+        assert pipeline_setup.count(").make_participants()") == 2
+        early_pipeline_setup = (
+            pipeline_setup.replace(
+                ").make_participants()", ", defer_sync=True).make_participants()"
+            )
+            + "\n"
+        )
+        late_pipeline_setup = ""
+        # Stage indices follow the load warp's acquire order: Q0/Q1 take Q stages
+        # 0/1 and K/V the ring's stages 0/1 in every first-load order.
+        early_first_kv = f"{kv_loop_bound} - cutlass.Int32(1)" if desc_kv else "0"
+        early_q0 = (
+            f"    cute.copy(_flash_tma_q, {load_q0_view}[None, flash_q_mma_tile0], tQsQ[None, 0],\n"
+            "              tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 0)"
+        )
+        early_q1 = (
+            f"    cute.copy(_flash_tma_q, {load_q1_view}[None, flash_q_mma_tile1], tQsQ[None, 1],\n"
+            "              tma_bar_ptr=storage.q_mbar_ptr.data_ptr() + 1)"
+        )
+        early_k0 = (
+            f"    cute.copy(_flash_tma_k, tKgK[None, {early_first_kv}], tKsK[None, 0],\n"
+            "              tma_bar_ptr=storage.kv_mbar_ptr.data_ptr() + 0)"
+        )
+        early_v0 = (
+            f"    cute.copy(_flash_tma_v, tVgV[None, {early_first_kv}], tVsV[None, 1],\n"
+            "              tma_bar_ptr=storage.kv_mbar_ptr.data_ptr() + 1)"
+        )
+        early_prologue_load_block = (
+            "# Pre-sync prologue loads: warp 0 (whose elected lane initialized the\n"
+            "# pipeline mbarriers) issues the first work item's Q0/Q1/K/V copies\n"
+            "# against the full barriers; the load warp arms them afterwards.\n"
+            "if warp_idx == 0:\n"
+            + _flash_fa4_load_prologue_for_order(
+                cfg.first_load_order, early_q0, early_k0, early_q1, early_v0
+            )
+            + "\n"
+        )
     setup = f"""
 tidx, _, _ = cute.arch.thread_idx()
 warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -13479,8 +14681,8 @@ if tidx == 0:{prologue_init}
         cute.arch.mbarrier_init(flash_s0_corr_empty_ptr + flash_st, 128)
         cute.arch.mbarrier_init(flash_s1_corr_full_ptr + flash_st, 128)
         cute.arch.mbarrier_init(flash_s1_corr_empty_ptr + flash_st, 128)
-cute.arch.mbarrier_init_fence()
-cute.arch.sync_threads()
+{early_pipeline_setup}cute.arch.mbarrier_init_fence()
+{early_prologue_load_block}cute.arch.sync_threads()
 
 # TMEM allocator: warp 12 (MMA warp) is the sole allocator. Match FA4's narrower
 # retrieve barrier: only MMA, softmax, and correction warps wait for the TMEM
@@ -13492,18 +14694,7 @@ flash_tmem = cutlass_utils_flash.TmemAllocator(
     storage.tmem_holding_buf.ptr, barrier_for_retrieve=flash_tmem_user_bar,
     allocator_warp_id=12, is_two_cta={use_2cta_instrs!s},
     two_cta_tmem_dealloc_mbar_ptr=flash_tmem_dealloc_ptr)
-flash_q_bytes = cute.size_in_bytes({io_dtype}, cute.select(_flash_qsl, mode=[0, 1, 2])){q_tma_byte_scale}
-flash_k_bytes = cute.size_in_bytes({io_dtype}, cute.select(_flash_ksl, mode=[0, 1, 2])){kv_tma_byte_scale}
-flash_q_prod, flash_q_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(
-    num_stages={q_stage},
-    producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread),
-    consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread),
-    tx_count=flash_q_bytes, barrier_storage=storage.q_mbar_ptr.data_ptr(){q_tma_cluster_arg}).make_participants()
-{kv_pipeline_setup}
-
-flash_qkt = _flash_qk_mma.get_slice(flash_mma_tile_coord_v)
-flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
-{setup_tma_partitions}
+{late_pipeline_setup}
     """
 
     tmem_fragment_setup = f"""    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, {kv_n}))
@@ -13908,8 +15099,8 @@ if warp_idx == 15:
             "[None, None, None, {mtile}, 0, flash_head, flash_batch]"
         )
     else:
-        epi_tma_gmem0 = f"tOgO_tma[None, {output_m_tile0}, 0, flash_bh]"
-        epi_tma_gmem1 = f"tOgO_tma[None, {output_m_tile1}, 0, flash_bh]"
+        epi_tma_gmem0 = f"tOgO_tma[None, {output_m_tile0}, 0, {_stage_bh('0')}]"
+        epi_tma_gmem1 = f"tOgO_tma[None, {output_m_tile1}, 0, {_stage_bh('1')}]"
         epi_stg_mO_cur = (
             # The output view shifted to the segment's first row (the
             # segment-relative tile ids then address it like the loads).
@@ -14181,10 +15372,10 @@ if warp_idx == 15:
     load_q0_src = "0" if local_load_views else "flash_q_mma_tile0"
     load_q1_src = "1" if local_load_views else "flash_q_mma_tile1"
     load_q0 = f"""        flash_qe0 = flash_q_prod.acquire_and_advance()
-        cute.copy(_flash_tma_q, tQgQ[None, {load_q0_src}], tQsQ[None, flash_qe0.index],
+        cute.copy(_flash_tma_q, {load_q0_view}[None, {load_q0_src}], tQsQ[None, flash_qe0.index],
                   tma_bar_ptr=flash_qe0.barrier)"""
     load_q1 = f"""        flash_qe1 = flash_q_prod.acquire_and_advance()
-        cute.copy(_flash_tma_q, tQgQ[None, {load_q1_src}], tQsQ[None, flash_qe1.index],
+        cute.copy(_flash_tma_q, {load_q1_view}[None, {load_q1_src}], tQsQ[None, flash_qe1.index],
                   tma_bar_ptr=flash_qe1.barrier)"""
     load_k_prod = "flash_k_prod" if separate_kv_rings else "flash_kv_prod"
     load_v_prod = "flash_v_prod" if separate_kv_rings else "flash_kv_prod"
@@ -14225,6 +15416,15 @@ if warp_idx == 15:
     load_v0 = f"""        flash_kve = {load_v_prod}.acquire_and_advance()
         cute.copy(_flash_tma_v, tVgV[None, {load_first_kv}], {v_load_slot},
                   tma_bar_ptr=flash_kve.barrier)"""
+    if early_prologue_loads:
+        # Warp 0 issued these copies before the prologue sync; the load warp
+        # only arms the barriers (acquire_and_advance posts arrive.expect_tx).
+        assert load_first_kv == (
+            f"{kv_loop_bound} - cutlass.Int32(1)" if desc_kv else "0"
+        )
+        load_q0, load_q1, load_k0, load_v0 = (
+            text.split("\n")[0] for text in (load_q0, load_q1, load_k0, load_v0)
+        )
     staged_first_load = cfg.first_load_order == FLASH_FIRST_LOAD_ORDER_STAGED
     if staged_first_load:
         # First work item only: hold Q1/V0 (and the K/V ring behind them) until
@@ -14367,6 +15567,36 @@ if warp_idx == 15:
         assert cfg.kv_tile_n == 128
         assert not cfg.p_chunk_arrive
         assert not cfg.alternating_warpgroups
+    # The staggered one-head schedule: stage 0 walks KV tiles 2p..0 while
+    # stage 1 walks 2p+1..0, one tile ahead in the descending order, so both
+    # diagonal tiles share step 0 and there is no dead tile (the skip is
+    # pinned off under it). The resolver's legality is the skip's plus the
+    # ring depth; a config built past it cannot render.
+    causal_stagger = (
+        cfg.causal_stagger
+        and is_causal
+        and causal_desc_kv
+        and q_stage == 2
+        and not cfg.causal_two_cta
+        and not use_2cta_instrs
+    )
+    assert not (causal_stagger and use_causal_resident_native)
+    assert not (causal_stagger and skip_dead_tile)
+    assert not (causal_head_pair and skip_dead_tile)
+    assert not (causal_head_pair and causal_stagger)
+    if causal_stagger:
+        assert cfg.pipeline_family == "fa4"
+        assert cfg.mma_ptx
+        assert cfg.q_tile_m == 128
+        assert cfg.kv_tile_n == 128
+        assert not cfg.p_chunk_arrive
+        assert not cfg.alternating_warpgroups
+        assert not uneven_kv_ring
+        assert not separate_kv_rings
+        assert not persistent
+        assert not pruned_interval
+        assert not segment_tiling
+        assert kv_stage >= FLASH_CAUSAL_STAGGER_MIN_KV_STAGE
     if cfg.mma_ptx:
         # Each CTA owns 128 Q rows even when a CtaGroup.TWO MMA spans 256 rows.
         # SMEM descriptors use 16-byte units, so derive the stage stride from
@@ -14402,12 +15632,16 @@ if warp_idx == 15:
                 zero_init=True{gemm_cta_group_arg})"""
 
         else:
+            # The shared descriptors start one stage stride before the first
+            # issue's slot: QK0 (-) leads the plain walk, QK1 (+) the
+            # staggered one (stage 1 is the leading stage there).
+            qk_desc_declared_stage = 0 if causal_stagger else q_stage - 1
             qk_desc_head = f"""
     flash_q_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(
         sQ, _helion_flash_ptx.Major.K)
     _helion_flash_ptx.declare_ptx_smem_desc(
         _helion_flash_ptx.make_smem_desc_start_addr(
-            sQ[None, None, None, {q_stage - 1}].iterator),
+            sQ[None, None, None, {qk_desc_declared_stage}].iterator),
         flash_q_smem_base, tSrQ[None, None, None, 0].layout,
         "helion_flash_q_smem_desc")
     flash_k_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(
@@ -14556,6 +15790,119 @@ if warp_idx == 15:
 {textwrap.indent(_mma_commit_s_ready("1"), "            ")}
             flash_k_full.release()"""
 
+        def _pv_gemm(stage: str, v_state: str) -> str:
+            # One PV issue of ``stage`` reading the V tile of ``v_state`` (the
+            # staggered walk's stage 1 reads the slot stage 0 read last step).
+            v_slot = _v_ring_slot(
+                f"sV[None, None, None, {v_state}.index]", f"{v_state}.index"
+            )
+            split_wait_arg = pv0_split_wait_arg if stage == "0" else pv1_split_wait_arg
+            return f"""_helion_flash_ptx.gemm_ptx_precomputed_pv_ts(
+                flash_o{stage}_addr, {pv_p0 if stage == "0" else pv_p1},
+                _helion_flash_ptx.make_smem_desc_start_addr(
+                    {v_slot}.iterator),
+                flash_v_smem_base,
+                tOrP{stage}[None, None, None, 0].layout,
+                tOrV[None, None, None, 0].layout,
+                "helion_flash_pv_mma_idesc",{split_wait_arg}
+                zero_init=flash_o_zero{stage}{gemm_cta_group_arg}{pv_wait_hint_arg})"""
+
+        def _mma_stagger_steady_body() -> str:
+            # Step i of the staggered walk, stage 1 first: it is the leading
+            # stage (its diagonal QK issues from the first K tile, stage 0's
+            # from the second, and every step keeps S1 ahead of S0), so the
+            # in-order MMA warp waits on the P that lands first. Stage 1
+            # finishes KV tile 2p+1-i and scores 2p-i from the slots stage 0
+            # acquired last step (released after this second read); stage 0
+            # finishes 2p-i and scores 2p-i-1 from the two slots acquired now.
+            if cfg.mma_interleave:
+                return f"""
+            # stage 1: PV1(2p+1-i) from last step's V slot, then QK1(2p-i) from its K slot.
+            {_mma_wait_p_ready("1")}
+            {_pv_gemm("1", "flash_v_prev")}
+            flash_o_zero1 = cutlass.Boolean(False)
+            flash_v_prev.release()
+{_qk_gemm("1", "flash_k_prev")}
+{textwrap.indent(_mma_commit_s_ready("1"), "            ")}
+            flash_k_prev.release()
+            # stage 0: PV0(2p-i) (pfor2 wait folded inside the gemm) then QK0(2p-i-1).
+            flash_v_full = {mma_v_cons}.wait_and_advance()
+            {_mma_wait_p_ready("0")}
+            {_pv_gemm("0", "flash_v_full")}
+            flash_o_zero0 = cutlass.Boolean(False)
+            flash_k_full = {mma_k_cons}.wait_and_advance()
+{_qk_gemm("0", "flash_k_full")}
+{textwrap.indent(_mma_commit_s_ready("0"), "            ")}"""
+            return f"""
+            # grouped issue: finish both PV stages before starting either next QK.
+            {_mma_wait_p_ready("1")}
+            {_pv_gemm("1", "flash_v_prev")}
+            flash_o_zero1 = cutlass.Boolean(False)
+            flash_v_prev.release()
+            flash_v_full = {mma_v_cons}.wait_and_advance()
+            {_mma_wait_p_ready("0")}
+            {_pv_gemm("0", "flash_v_full")}
+            flash_o_zero0 = cutlass.Boolean(False)
+{_qk_gemm("1", "flash_k_prev")}
+{textwrap.indent(_mma_commit_s_ready("1"), "            ")}
+            flash_k_prev.release()
+            flash_k_full = {mma_k_cons}.wait_and_advance()
+{_qk_gemm("0", "flash_k_full")}
+{textwrap.indent(_mma_commit_s_ready("0"), "            ")}"""
+
+        def _mma_stagger_inner() -> str:
+            # The shared-register Q descriptors are declared at stage 0 for
+            # this walk, so its QK1-before-QK0 order alternates +/- naturally.
+            return f"""        flash_q0_full = flash_q_cons.wait_and_advance()
+
+        # PROLOGUE (staggered): QK1(2p+1)->S1 from the first K tile once Q1
+        # landed, then QK0(2p)->S0 from the second K tile: both diagonal
+        # tiles are scored before step 0. The first V tile and the second K
+        # tile stay held for stage 1's step-0 PV1 and QK1.
+        flash_k_full = {mma_k_cons}.wait_and_advance(){mma_prologue_signal}
+        flash_q1_full = flash_q_cons.wait_and_advance()
+{textwrap.indent(_qk_gemm("1", "flash_k_full").lstrip(), "        ")}
+{textwrap.indent(_mma_commit_s_ready("1"), "        ")}
+        flash_k_full.release()
+        flash_v_prev = {mma_v_cons}.wait_and_advance()
+        flash_k_prev = {mma_k_cons}.wait_and_advance()
+{textwrap.indent(_qk_gemm("0", "flash_k_prev").lstrip(), "        ")}
+{textwrap.indent(_mma_commit_s_ready("0"), "        ")}
+
+        # STEADY: i = 0..2p-1. Stage 1 at KV tile 2p+1-i, stage 0 at 2p-i;
+        # each K/V slot is released after its second reader (stage 1).
+        flash_o_zero0 = cutlass.Boolean(True)
+        flash_o_zero1 = cutlass.Boolean(True)
+        for flash_i in cutlass.range({kv_loop_bound} - 2, unroll=1):{_mma_stagger_steady_body()}
+            flash_v_prev = flash_v_full
+            flash_k_prev = flash_k_full
+            flash_pfor_phase ^= 1
+
+        flash_q0_full.release()
+
+        # STAGE-0 TAIL (step 2p): stage 1 runs PV1(1) and QK1(0), then PV0(0)
+        # commits O0; stage 0's correction epilogue overlaps from here.
+        {_mma_wait_p_ready("1")}
+        {_pv_gemm("1", "flash_v_prev")}
+        flash_o_zero1 = cutlass.Boolean(False)
+        flash_v_prev.release()
+{textwrap.indent(_qk_gemm("1", "flash_k_prev").lstrip(), "        ")}
+{textwrap.indent(_mma_commit_s_ready("1"), "        ")}
+        flash_k_prev.release()
+        flash_q1_full.release()
+        flash_v_full = {mma_v_cons}.wait_and_advance()
+        {_mma_wait_p_ready("0")}
+        {_pv_gemm("0", "flash_v_full")}
+{textwrap.indent(_mma_commit_o_ready("0"), "        ")}
+        flash_pfor_phase ^= 1
+
+        # STAGE-1 TAIL (step 2p+1): PV1(0) commits O1.
+        {_mma_wait_p_ready("1")}
+        {_pv_gemm("1", "flash_v_full")}
+{textwrap.indent(_mma_commit_o_ready("1"), "        ")}
+        flash_v_full.release()
+        flash_pfor_phase ^= 1"""
+
         mma_steady_body = _mma_steady_body(pv0_live_issue)
         steady_loop_bound = kv_loop_bound_minus_1
         dead_tile_step = ""
@@ -14626,6 +15973,8 @@ if warp_idx == 15:
         # The 2 epilogue PV waits did NOT flip pfor_phase; flip once so the carried
         # parity matches the next work-item's correction pre-arrive (spike L1973-1977).
         flash_pfor_phase ^= 1"""
+        if causal_stagger:
+            mma_inner = _mma_stagger_inner()
     else:
         mma_head = f"""    cute.arch.setmaxregister_decrease({cfg.other_regs})
     flash_tmem.allocate(512)
@@ -15123,6 +16472,25 @@ if warp_idx == 15:
             if use_2cta_instrs
             else f"flash_m_tile{stage}"
         )
+        # The staggered walk starts stage 0 at its own diagonal: its KV trip
+        # count is one short of the pair's and the dead tile's zero store is
+        # gone (its first tile is the masked diagonal, as stage 1's is).
+        stage_staggered = causal_stagger and stage == "0"
+        stage_kv_bound = "flash_num_active_kv0" if stage_staggered else kv_loop_bound
+        stage_segment = (
+            dataclasses.replace(
+                softmax_segment,
+                loop_bound=stage_kv_bound,
+                kv_expr=f"{stage_kv_bound} - cutlass.Int32(1) - flash_kv_iter",
+            )
+            if stage_staggered
+            else softmax_segment
+        )
+        # The head pair puts stage 0 at its own diagonal too: its first tile
+        # is masked like stage 1's, not the dead tile the zero store serves.
+        stage_zero_first_tile = (
+            stage == "0" and not stage_staggered and not causal_head_pair
+        )
 
         def _format_disc_pass2(
             name: str,
@@ -15296,7 +16664,7 @@ if warp_idx == 15:
         elif has_lse:
             lse_store = _flash_lse_store(
                 f"flash_m_tile{stage} * 128 + flash_local_tidx",
-                "flash_bh",
+                _stage_bh(stage),
                 "        ",
                 lse_scale=score_plan.lse_scale,
             )
@@ -15636,7 +17004,7 @@ if warp_idx == 15:
                     ):
                         masked_segment, unmasked_segment = (
                             _flash_causal_split_softmax_segments(
-                                kv_loop_bound,
+                                stage_kv_bound,
                                 stage,
                                 split_range_proof=causal_split_proof,
                             )
@@ -15645,7 +17013,7 @@ if warp_idx == 15:
                             masked_segment,
                             masked_rowmax_block,
                             f"            flash_p_sum = {pass2_masked_call}",
-                            zero_first_tile=stage == "0",
+                            zero_first_tile=stage_zero_first_tile,
                         )
                         unmasked_loop = _format_disc_loop(
                             unmasked_segment,
@@ -15664,10 +17032,12 @@ if warp_idx == 15:
                 else:
                     rowmax_block = masked_rowmax_block
                 loop = _format_disc_loop(
-                    softmax_segment,
+                    stage_segment,
                     rowmax_block,
                     pass2_block,
-                    zero_first_tile=is_causal and causal_desc_kv and stage == "0",
+                    zero_first_tile=is_causal
+                    and causal_desc_kv
+                    and stage_zero_first_tile,
                 )
                 return f"""{row_bound_prelude}        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
@@ -15751,7 +17121,7 @@ if warp_idx == 15:
                 ):
                     masked_segment, unmasked_segment = (
                         _flash_causal_split_softmax_segments(
-                            kv_loop_bound,
+                            stage_kv_bound,
                             stage,
                             split_range_proof=causal_split_proof,
                         )
@@ -15760,7 +17130,7 @@ if warp_idx == 15:
                         masked_segment,
                         direct_causal_rowmax,
                         direct_causal_pass2,
-                        zero_first_tile=stage == "0",
+                        zero_first_tile=stage_zero_first_tile,
                     )
                     # The proven split always executes a nonempty masked prefix
                     # before entering its unmasked suffix.
@@ -15794,10 +17164,10 @@ if warp_idx == 15:
             # fold + the staged-P pfor/pfor2 arrives, freeing each chunk before the
             # next. Peak live = ONE 32-elem fragment -> fits the 200-grant zero-spill.
             loop = _format_disc_loop(
-                softmax_segment,
+                stage_segment,
                 rowmax_block,
                 pass2_block,
-                zero_first_tile=is_causal and causal_desc_kv and stage == "0",
+                zero_first_tile=is_causal and causal_desc_kv and stage_zero_first_tile,
             )
             return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
@@ -16292,7 +17662,7 @@ if warp_idx == 15:
             )
         else:
             loop = _format_fa4_online_softmax_loop(
-                softmax_segment,
+                stage_segment,
                 _dense_iteration(sp_score_load, sp_rowmax),
                 stage=stage,
                 wait_hint=cfg.wait_hint,
@@ -16365,6 +17735,12 @@ if warp_idx == 15:
         "flash_tiled_score_st0",
         "tScoreSTtS0",
     )
+    if causal_stagger:
+        # Stage 0's staggered walk: KV tiles 2p..0, one fewer than the pair's.
+        softmax0_inner = (
+            f"        flash_num_active_kv0 = {kv_loop_bound} - cutlass.Int32(1)\n"
+            + softmax0_inner
+        )
     softmax1_inner = _softmax_inner(
         "1",
         "flash_tiled_ld1",
@@ -16767,6 +18143,8 @@ if warp_idx == 15:
             cfg.exp2_packet == _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
             and not acknowledged_stat_pipeline
         )
+        # The staggered walk's leading stage is stage 1: its alpha lands first.
+        or causal_stagger
         else f"{corr_stage0}\n{corr_stage1}"
     )
     corr_row_prologue = "" if softmax_row_epilogue else row_prologue
@@ -16776,6 +18154,31 @@ if warp_idx == 15:
 {_corr_epi("1", corr_output_m_tile1)}
 {corr_epi_empty_toggle}
 {corr_cons_advance.rstrip()}
+        flash_o_full_phase ^= 1"""
+    elif causal_stagger:
+        # Staggered walk: stage 0 publishes one alpha fewer than stage 1 (its
+        # walk is one tile shorter), so the shared loop runs N-2 steps, then
+        # stage 1's last alpha follows alone, then stage 0's epilogue, then
+        # the slot index toggles, then stage 1's epilogue. The order is what
+        # puts each row sum in the right slot: stage 0 publishes N-2 alphas
+        # and its row sum at slots 0..N-2, so the row sum sits at the index
+        # the loop stopped at; stage 1's sits one toggle later. Stage 1 leads
+        # throughout: its last rescale goes before stage 0's epilogue so its
+        # last PV is never queued behind it; that epilogue still overlaps
+        # stage 1's last softmax step.
+        assert not fa4_stat_pipeline
+        corr_inner = f"""{corr_row_prologue}        for flash_kv in cutlass.range({kv_loop_bound} - 2, unroll=1):
+{corr_steady_stages}
+{textwrap.indent(corr_cons_advance.rstrip(), "    ")}
+        # Stage 1's last alpha (its walk is one tile longer than stage 0's).
+{textwrap.indent(textwrap.dedent(corr_stage1), "        ").rstrip()}
+        # Final: divide by row_sum, cast, store (waits MMA's last-tile O_full).
+{_corr_epi("0", corr_output_m_tile0)}
+        {_corr_release_p_ready("0")}
+{corr_cons_advance.rstrip()}
+{_corr_epi("1", corr_output_m_tile1)}
+        {_corr_release_p_ready("1")}
+{corr_epi_empty_toggle}
         flash_o_full_phase ^= 1"""
     else:
         corr_inner = f"""{corr_row_prologue}{corr_stat_dummy}        for flash_kv in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
@@ -17626,6 +19029,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         target_device_capability=(
             CompileEnvironment.current().config_spec.target_device_capability
         ),
+        kv_group=kv_group,
+        fast_math=env.settings.fast_math,
     )
     if _flash_output_requires_tma(batch, seq, head_dim_v) and not cfg.epi_tma:
         return False

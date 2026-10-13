@@ -3735,6 +3735,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     device_sm_count=_cuda_num_sms_or_zero(
                         CompileEnvironment.current().device
                     ),
+                    kv_group=flash_shape.kv_group,
+                    fast_math=CompileEnvironment.current().settings.fast_math,
                 )
             elif gated_surface is not None:
                 # The fused gated body owns the whole root; tcgen05 matmul

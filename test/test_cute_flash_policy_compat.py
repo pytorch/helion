@@ -24,7 +24,10 @@ def _config_spec(
     dtype: torch.dtype = torch.float16,
     is_causal: bool = True,
     requires_ws_overlap: bool = False,
+    fast_math: bool = True,
 ) -> ConfigSpec:
+    # The compatibility fixtures project onto the degree-2 packets, which the
+    # surface offers under fast_math only.
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 3))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
@@ -38,6 +41,7 @@ def _config_spec(
         requires_ws_overlap=requires_ws_overlap,
         standard_dense_output=not is_causal,
         standard_causal_output=is_causal,
+        fast_math=fast_math,
     )
     return spec
 
