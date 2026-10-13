@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from torch._inductor.utils import triton_type
 
 from ... import exc
 from ...language import _decorators
@@ -199,6 +200,34 @@ def _(state: CodegenState) -> ast.AST:
     offset = indices.broadcast_offset(state, output_size)
 
     exp_ast, val_ast = _to_ast_values([exp_expr, val_expr])
+    # Triton's CAS neither broadcasts nor converts cmp and val to the
+    # pointer's block and element type (a value computed in float32 for a
+    # float16 target is not converted either), so make them match.
+    dtype = triton_type(target.dtype)
+    shape = state.tile_strategy.shape_str(output_size)
+
+    def as_operand(proxy: object, value: ast.AST) -> ast.AST:
+        if not output_size:
+            # A literal Triton already types like the target needs no cast
+            if (
+                isinstance(proxy, int)
+                and not isinstance(proxy, bool)
+                and target.dtype == torch.int32
+                and -(2**31) <= proxy < 2**31
+            ) or (isinstance(proxy, float) and target.dtype == torch.float32):
+                return value
+            return expr_from_string(f"tl.cast({{value}}, {dtype})", value=value)
+        rank = proxy.ndim if isinstance(proxy, torch.Tensor) else 0
+        if 0 < rank < len(output_size):
+            # Broadcasting aligns trailing dims
+            dims = ["None"] * (len(output_size) - rank) + [":"] * rank
+            value = expr_from_string(f"{{value}}[{', '.join(dims)}]", value=value)
+        return expr_from_string(
+            f"tl.broadcast_to(tl.cast({{value}}, {dtype}), {shape})", value=value
+        )
+
+    exp_ast = as_operand(state.proxy_arg(2), exp_ast)
+    val_ast = as_operand(state.proxy_arg(3), val_ast)
     if indices.has_mask():
         mask = state.codegen.lift(indices.mask_expr, dce=True, prefix="cas_mask").id
         exp = state.codegen.lift(exp_ast, dce=True, prefix="cas_exp").id
