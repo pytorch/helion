@@ -142,6 +142,8 @@ def _render(
     tail_mask: bool,
     stage: int = 0,
     bounds: bool = False,
+    chunk_cols: int = _CHUNK_COLS,
+    mask_form: str = "bitmask",
 ) -> FlexHookCode:
     return render_flex_hook(
         plan,
@@ -151,7 +153,7 @@ def _render(
         m_tile_expr=f"flash_m_tile{stage}",
         kv_tile_expr="flash_kv",
         chunk_expr="flash_ci",
-        chunk_cols=_CHUNK_COLS,
+        chunk_cols=chunk_cols,
         indent=16,
         with_score=with_score,
         with_mask=with_mask,
@@ -159,6 +161,7 @@ def _render(
         row_coord_expr="tLDcS[0][0]",
         device_function=_StubDeviceFunction(),  # pyrefly: ignore [bad-argument-type]
         coord_bounds=_BOUNDS if bounds else None,
+        mask_form=mask_form,
     )
 
 
@@ -220,12 +223,13 @@ class _ChunkCoords:
 class _Coords:
     """``tLDcS`` of one thread: ``[None, ci, None, None]`` chunk slices and ``[0]``."""
 
-    def __init__(self, row: int) -> None:
+    def __init__(self, row: int, chunk_cols: int = _CHUNK_COLS) -> None:
         self.row = row
+        self.chunk_cols = chunk_cols
 
     def __getitem__(self, key: object) -> object:
         if isinstance(key, tuple):
-            return _ChunkCoords(self.row, key[1] * _CHUNK_COLS)
+            return _ChunkCoords(self.row, key[1] * self.chunk_cols)
         if key == 0:
             return (self.row, 0)
         raise IndexError(key)
@@ -314,6 +318,9 @@ def _namespace() -> dict[str, object]:
         "_cute_flex_remainder": operator.mod,
         "_cute_flex_load_vec": _load_vec,
         "_cute_flex_load_window": _load_window,
+        "_cute_flex_lane_below": lambda limit, width: (
+            (1 << max(0, min(int(limit), width))) - 1
+        ),
         "_helion_flash_rt": types.SimpleNamespace(mask_r2p_sm100_rank1=_mask_tail),
     }
 
@@ -331,6 +338,7 @@ def _emulate(
     scale: float | None = None,
     rows: Sequence[int] = _ROWS,
     stage: int = 0,
+    chunk_cols: int = _CHUNK_COLS,
 ) -> torch.Tensor:
     """Run the three blocks per thread row and return the masked/transformed tile."""
     prelude = compile(textwrap.dedent(code.item_prelude), "<item_prelude>", "exec")
@@ -347,7 +355,7 @@ def _emulate(
                 "_flash_kv_tail_cols": kv_tail_cols,
                 f"flash_m_tile{stage}": m_tile,
                 "flash_kv": kv_tile,
-                "tLDcS": _Coords(row),
+                "tLDcS": _Coords(row, chunk_cols),
             }
         )
         for i, tensor in enumerate(fake_aux):
@@ -358,12 +366,12 @@ def _emulate(
             ns["_flash_scale"] = scale
         exec(prelude, ns)
         exec(prologue, ns)
-        for ci in range(128 // _CHUNK_COLS):
-            frg = result[row, ci * _CHUNK_COLS : (ci + 1) * _CHUNK_COLS].tolist()
+        for ci in range(128 // chunk_cols):
+            frg = result[row, ci * chunk_cols : (ci + 1) * chunk_cols].tolist()
             ns["flash_ci"] = ci
             ns["flash_disc_frg"] = frg
             exec(body, ns)
-            result[row, ci * _CHUNK_COLS : (ci + 1) * _CHUNK_COLS] = torch.tensor(
+            result[row, ci * chunk_cols : (ci + 1) * chunk_cols] = torch.tensor(
                 frg, dtype=torch.float64
             )
     return result.float()
@@ -887,7 +895,12 @@ def _build(case: _Case, tables: Sequence[torch.Tensor]) -> AttentionScorePlan:
 
 
 def _render_case(
-    case: _Case, *, with_tail: bool, bounds: bool = False
+    case: _Case,
+    *,
+    with_tail: bool,
+    bounds: bool = False,
+    chunk_cols: int = _CHUNK_COLS,
+    mask_form: str = "bitmask",
 ) -> tuple[FlexHookCode, AttentionScorePlan, list[torch.Tensor], list[object]]:
     tables, scalar_values = _case_inputs(case)
     with _environment(fast_math=case.fast_math):
@@ -898,16 +911,31 @@ def _render_case(
             with_mask=case.mask is not None,
             tail_mask=with_tail,
             bounds=bounds,
+            chunk_cols=chunk_cols,
+            mask_form=mask_form,
         )
     return code, plan, tables, scalar_values
 
 
 @skipUnlessCuteAvailable("renders CuTe DSL source through the cute backend")
 class TestCuteFlexScoreMod(TestCase):
-    def _check_case(self, case: _Case, *, bounds: bool = False) -> None:
+    def _check_case(
+        self,
+        case: _Case,
+        *,
+        bounds: bool = False,
+        chunk_cols: int = _CHUNK_COLS,
+        mask_form: str = "bitmask",
+    ) -> None:
         gen = torch.Generator().manual_seed(1)
         codes = {
-            with_tail: _render_case(case, with_tail=with_tail, bounds=bounds)
+            with_tail: _render_case(
+                case,
+                with_tail=with_tail,
+                bounds=bounds,
+                chunk_cols=chunk_cols,
+                mask_form=mask_form,
+            )
             for with_tail in (False, True)
         }
         for bh, m_tile, kv_tile, tail in case.geometries:
@@ -927,6 +955,7 @@ class TestCuteFlexScoreMod(TestCase):
                 aux_tensors=tables,
                 scalar_values=scalar_values,
                 scale=scale_value,
+                chunk_cols=chunk_cols,
             )
             expected = _reference(
                 case.score,
@@ -956,6 +985,23 @@ class TestCuteFlexScoreMod(TestCase):
         for case in _CASES:
             with self.subTest(case=case.name):
                 self._check_case(case, bounds=True)
+
+    def test_emulation_matrix_element_form(self) -> None:
+        """The per-element mask form (the ``"element"`` knob value)."""
+        for case in _CASES:
+            if case.mask is None:
+                continue
+            with self.subTest(case=case.name):
+                self._check_case(case, mask_form="element")
+
+    def test_emulation_matrix_sixteen_column_chunks(self) -> None:
+        """``s_load_rep == 16``: 16-bit keep words, 16-column spans."""
+        for case in _CASES:
+            if case.mask is None:
+                continue
+            for mask_form in ("bitmask", "element"):
+                with self.subTest(case=case.name, mask_form=mask_form):
+                    self._check_case(case, chunk_cols=16, mask_form=mask_form)
 
     def test_proven_loads_drop_guards_and_diagonal_gathers_take_windows(self) -> None:
         case = next(c for c in _CASES if c.name == "sandwich")
@@ -1023,11 +1069,28 @@ class TestCuteFlexScoreMod(TestCase):
 
     def test_kv_tile_division_renders_in_tile_prologue(self) -> None:
         case = next(c for c in _CASES if c.name == "batchify")
-        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, mask_form="element"
+        )
         self.assertIn("// cutlass.Int32(512)", code.tile_prologue)
         self.assertIn("(flash_flex0_kvbase) // cutlass.Int32(512)", code.tile_prologue)
-        # ``kv % 512`` is per element and Python-mod.
-        self.assertIn("_cute_python_mod(", code.chunk_body)
+        # ``kv % 512`` is the tile's first-column remainder (a mask: 512 is a
+        # power of two) plus the chunk column, plus the lane per element.
+        self.assertIn(
+            "flash_flex0m_remainder_1_u = flash_flex0_kvbase & cutlass.Int32(511)",
+            code.tile_prologue,
+        )
+        self.assertIn(
+            "flash_flex0m_remainder_1_c = flash_flex0m_remainder_1_u + "
+            "cutlass.Int32(tLDcS[None, flash_ci, None, None][0][1])",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "flash_flex0m_remainder_1 = flash_flex0m_remainder_1_c + "
+            "cutlass.Int32(flash_flex_i)",
+            code.chunk_body,
+        )
+        self.assertNotIn("_cute_python_mod(", code.chunk_body)
         self.assertNotIn("// cutlass.Int32(512)", code.chunk_body)
         # The per-row half (``q // 512``, ``q % 512``) is item-invariant.
         self.assertIn("flash_flex0_q // flash_flex0m_div_t0", code.item_prelude)
@@ -1102,10 +1165,39 @@ class TestCuteFlexScoreMod(TestCase):
 
     def test_remainder_is_python_mod(self) -> None:
         case = next(c for c in _CASES if c.name == "svg_temporal")
-        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
-        self.assertIn("_cute_python_mod(cutlass.Int32(", code.chunk_body)
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, mask_form="element"
+        )
+        # ``(q - 128) % 512`` (negative on the first rows) is Python-mod in
+        # the prelude; ``(kv - 128) % 512`` is lane-affine over the tile.
         self.assertIn("_cute_python_mod(cutlass.Int32(", code.item_prelude)
+        self.assertIn(
+            "flash_flex0m_remainder_1_u = (flash_flex0_kvbase + cutlass.Int32(-128))"
+            " & cutlass.Int32(511)",
+            code.tile_prologue,
+        )
         self.assertNotIn(" % ", code.chunk_body)
+        self.assertNotIn(" % ", code.tile_prologue)
+        self.assertNotIn("_cute_python_mod(", code.chunk_body)
+        # ``kv < 128`` is constant over a 128-column tile.
+        self.assertIn(
+            "flash_flex0m_lt_1 = operator.lt((flash_flex0_kvbase + cutlass.Int32(-128)),"
+            " cutlass.Int32(0))",
+            code.tile_prologue,
+        )
+
+        # A non-power-of-two span modulus keeps the Python-mod helper.
+        def mask_mod_384(score, b, h, q_idx, kv_idx):
+            return (kv_idx % 384) <= (q_idx % 384)
+
+        with _environment():
+            region, aux, scalars = build_flex_region(mask_mod_384)
+            plan = _plan(None, region, aux, scalars)
+            code = _render(plan, with_score=False, with_mask=True, tail_mask=False)
+        self.assertIn(
+            "_cute_python_mod(flash_flex0_kvbase, cutlass.Int32(384))",
+            code.tile_prologue,
+        )
 
     def test_tail_mask_is_applied_after_the_selects(self) -> None:
         case = next(c for c in _CASES if c.name == "sigmoid_act")
@@ -1321,3 +1413,221 @@ class TestCuteFlexScoreMod(TestCase):
             code = _render(plan, with_score=False, with_mask=False, tail_mask=True)
         self.assertEqual(code.item_prelude, "")
         self.assertIn("mask_r2p_sm100_rank1", code.chunk_body)
+
+    # -- keep-word peephole -------------------------------------------------
+
+    def _bitmask_lines(self, code: FlexHookCode) -> tuple[list[str], list[str]]:
+        """(word lines of the chunk block, lines of the element loop)."""
+        lines = [line for line in code.chunk_body.splitlines() if line.strip()]
+        loop = next(i for i, line in enumerate(lines) if "for flash_flex_i" in line)
+        return lines[:loop], lines[loop + 1 :]
+
+    def test_bitmask_interval_and_parity_words(self) -> None:
+        """dilated-sw: ``|q - kv| <= 512`` is a lane interval (two ``below``
+        bounds), ``|q - kv| % 2 == 0`` the ``0x55555555`` pattern shifted by
+        the row's parity (item-invariant), applied by one lane-bit select."""
+        case = next(c for c in _CASES if c.name == "dilated_sw")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0_q) - flash_flex0_cbase"
+            " - cutlass.Int32(512), 32)",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0_q) - flash_flex0_cbase"
+            " + cutlass.Int32(513), 32)",
+            code.chunk_body,
+        )
+        self.assertIn("* cutlass.Int32(1431655765)", code.item_prelude)
+        self.assertIn("& cutlass.Int32(1)", code.item_prelude)
+        _words, element = self._bitmask_lines(code)
+        self.assertEqual(len(element), 1)
+        self.assertIn(
+            "cutlass.select_(cutlass.Boolean(flash_flex0m_w6 & (cutlass.Int32(1) << "
+            "cutlass.Int32(flash_flex_i))), cutlass.Float32(flash_disc_frg[flash_flex_i]),"
+            " -cutlass.Float32.inf)",
+            element[0],
+        )
+        for text in ("abs(", "_cute_python_mod(", "operator."):
+            self.assertNotIn(text, code.chunk_body)
+        # 16-column chunks: 16-bit words, complements masked to the chunk.
+        code16, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, chunk_cols=16
+        )
+        self.assertIn(", 16)", code16.chunk_body)
+        self.assertIn("~flash_flex0m_w0 & cutlass.Int32(65535)", code16.chunk_body)
+        self.assertIn("* cutlass.Int32(21845)", code16.item_prelude)
+
+    def test_bitmask_lane_affine_remainder_and_uniform_broadcast(self) -> None:
+        """svg-temporal: ``(kv - 128) % 512`` is lane-affine over the tile,
+        the band ``|q_tok - kv_tok| < 64`` an interval, ``kv < 128`` a
+        tile-uniform comparison OR-ed in as a broadcast word."""
+        case = next(c for c in _CASES if c.name == "svg_temporal")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn(
+            "flash_flex0m_lt_1 = operator.lt((flash_flex0_kvbase + cutlass.Int32(-128)),"
+            " cutlass.Int32(0))",
+            code.tile_prologue,
+        )
+        self.assertIn(
+            "cutlass.select_(flash_flex0m_bitwise_or, cutlass.Int32(-1), cutlass.Int32(0))",
+            code.tile_prologue,
+        )
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0m_remainder) - "
+            "flash_flex0m_remainder_1_c - cutlass.Int32(63), 32)",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0m_remainder) - "
+            "flash_flex0m_remainder_1_c + cutlass.Int32(64), 32)",
+            code.chunk_body,
+        )
+        words, element = self._bitmask_lines(code)
+        self.assertEqual(len(element), 1)
+        # No per-element remainder: the lane-affine form is only read by the
+        # word thresholds.
+        self.assertNotIn("+ cutlass.Int32(flash_flex_i)", code.chunk_body)
+        self.assertEqual(len([w for w in words if "_cute_flex_lane_below" in w]), 2)
+
+    def test_bitmask_block_equality_and_period_pattern(self) -> None:
+        """jetspec-training: ``kv_rel // 16 == q_block`` is the half-open
+        block ``[q_block * 16, q_block * 16 + 16)``; ``kv_off <= q_off`` with
+        period 16 < 32 is the residue pattern ``below(q_off + 1, 16)``
+        replicated (``* 0x10001``) with no rotation (``(-640) % 16 == 0``)."""
+        case = next(c for c in _CASES if c.name == "jetspec_training")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0m_div) * cutlass.Int32(16)"
+            " - flash_flex0_cbase + cutlass.Int32(640), 32)",
+            code.chunk_body,
+        )
+        self.assertIn("+ cutlass.Int32(656), 32)", code.chunk_body)
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0m_remainder) + "
+            "cutlass.Int32(1), 16)",
+            code.item_prelude,
+        )
+        self.assertIn("* cutlass.Int32(65537)", code.item_prelude)
+        self.assertNotIn(">>", code.item_prelude)
+        _words, element = self._bitmask_lines(code)
+        self.assertEqual(len(element), 1)
+
+    def test_bitmask_runtime_thresholds_from_row_tables(self) -> None:
+        case = next(c for c in _CASES if c.name == "shared_prefix")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn(
+            "_cute_flex_lane_below(cutlass.Int32(flash_flex0m_load) - flash_flex0_cbase, 32)",
+            code.chunk_body,
+        )
+        _words, element = self._bitmask_lines(code)
+        self.assertEqual(len(element), 1)
+        self.assertEqual(code.chunk_body.count("_cute_flex_lane_below"), 4)
+
+    def test_bitmask_mixed_with_per_element_table_term(self) -> None:
+        """global-sw: the window interval and the row's flag fold into a word;
+        the per-column flag (a vector load) stays per element and is OR-ed
+        with the word's lane bit."""
+        case = next(c for c in _CASES if c.name == "global_sw")
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True
+        )
+        self.assertIn(
+            "cutlass.select_(flash_flex0m_load, cutlass.Int32(-1), cutlass.Int32(0))",
+            code.item_prelude,
+        )
+        self.assertIn(
+            "flash_flex0m_bitwise_or = cutlass.Boolean(flash_flex0m_w5 & "
+            "(cutlass.Int32(1) << cutlass.Int32(flash_flex_j",
+            code.chunk_body.replace("flash_flex_i", "flash_flex_j"),
+        )
+        self.assertIn("_cute_flex_load_vec(", code.chunk_body)
+        self.assertIn(
+            "flash_flex0m_bitwise_or_1 = flash_flex0m_bitwise_or | flash_flex0m_load_1",
+            code.chunk_body,
+        )
+        self.assertNotIn("abs(", code.chunk_body)
+
+    def test_bitmask_declines_per_column_tables_and_fmod(self) -> None:
+        for name in ("flamingo", "int_fmod", "python_semantics"):
+            case = next(c for c in _CASES if c.name == name)
+            code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+            self.assertNotIn("_w0", code.chunk_body, name)
+            self.assertNotIn("_cute_flex_lane_below", code.chunk_body, name)
+        # A uniform predicate (sta2d) keeps the plain per-element select.
+        case = next(c for c in _CASES if c.name == "sta2d")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertNotIn("_w0", code.chunk_body + code.tile_prologue)
+        element = _render_case(case, with_tail=False, mask_form="element")[0]
+        for block, other in zip(code, element, strict=True):
+            self.assertEqual(sorted(block.splitlines()), sorted(other.splitlines()))
+
+    def test_bitmask_with_score_region_and_tail(self) -> None:
+        case = next(c for c in _CASES if c.name == "rel_bias")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=True)
+        lines = [line.strip() for line in code.chunk_body.splitlines() if line.strip()]
+        self.assertTrue(
+            lines[-2].startswith(
+                "flash_disc_frg[flash_flex_i] = cutlass.Float32(cutlass.select_("
+                "cutlass.Boolean(flash_flex0m_w6 & "
+            )
+        )
+        self.assertIn("mask_r2p_sm100_rank1", lines[-1])
+
+    def test_uniform_comparison_and_remainder_classes(self) -> None:
+        """``kv < 512`` / ``kv // 64`` / ``kv % 64`` over 128- and 32-column
+        spans: the hoisted part lands in the tile / chunk block."""
+        case = next(c for c in _CASES if c.name == "block_diffusion")
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, mask_form="element"
+        )
+        self.assertIn(
+            "operator.lt((flash_flex0_kvbase + cutlass.Int32(-512)), cutlass.Int32(0))",
+            code.tile_prologue,
+        )
+        case = next(c for c in _CASES if c.name == "natten2d")
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, mask_form="element"
+        )
+        self.assertIn(
+            "flash_flex0m_remainder_1_u = flash_flex0_cbase & cutlass.Int32(63)",
+            code.chunk_body,
+        )
+        self.assertIn("(flash_flex0_cbase) // cutlass.Int32(64)", code.chunk_body)
+
+        # ``kv <= 1023`` is ``kv < 1024``: tile-uniform; ``kv <= 1024`` is not.
+        def mask_le(score, b, h, q_idx, kv_idx):
+            return (kv_idx <= 1023) & (kv_idx <= 1024) & (q_idx >= 0)
+
+        with _environment():
+            region, aux, scalars = build_flex_region(mask_le)
+            plan = _plan(None, region, aux, scalars)
+            code = _render(
+                plan,
+                with_score=False,
+                with_mask=True,
+                tail_mask=False,
+                mask_form="element",
+            )
+        self.assertIn(
+            "flash_flex0m_le = operator.le((flash_flex0_kvbase + cutlass.Int32(-1023)),"
+            " cutlass.Int32(0))",
+            code.tile_prologue,
+        )
+        self.assertIn(
+            "flash_flex0m_le_1 = operator.le(flash_flex0_kv,", code.chunk_body
+        )
+
+    def test_unknown_mask_form_is_rejected(self) -> None:
+        case = next(c for c in _CASES if c.name == "dilated_sw")
+        tables, _values = _case_inputs(case)
+        with _environment():
+            plan = _build(case, tables)
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                _render(
+                    plan,
+                    with_score=False,
+                    with_mask=True,
+                    tail_mask=False,
+                    mask_form="r2p",
+                )

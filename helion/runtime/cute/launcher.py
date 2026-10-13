@@ -804,6 +804,9 @@ def _append_cute_wrapper_plan(
         # so each SM gets one CTA that strides over many work tiles.
         persistent = bool(plan.get("persistent"))
         total_tiles = plan_int("total_tiles", default=batch * (seq // 128))
+        # The split-KV list walk (``cute_flash_kv_split``): that many CTAs
+        # per pair item (the device body decodes the split id).
+        kv_split = plan_int("kv_split", default=1)
         pass_dynamic_tile_counts = plan.get("topology") != "fa4"
         hd = head_dim
         hd_v = head_dim_v
@@ -1113,14 +1116,16 @@ def _append_cute_wrapper_plan(
             assert num_sm is not None and num_sm > 0
             ctas_per_sm = max(1, plan_int("persistent_ctas_per_sm", 1))
             max_ctas = ((num_sm * ctas_per_sm) // cluster_m) * cluster_m
-            grid_cap = min(total_tiles * cluster_m, max_ctas)
+            grid_cap = min(total_tiles * kv_split * cluster_m, max_ctas)
             body.append(f"    grid_x = cutlass.Int32({grid_cap})")
         elif plan.get("topology") == "fa4":
             # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
-            # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs.
-            # The default root grid would launch batch * seq // 128; override it
-            # to the halved fa4 tile count.
-            body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
+            # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs
+            # (times the split-KV factor). The default root grid would launch
+            # batch * seq // 128; override it to the halved fa4 tile count.
+            body.append(
+                f"    grid_x = cutlass.Int32({total_tiles * kv_split * cluster_m})"
+            )
         elif q_tile_m != 128:
             # 64-row ws_overlap tiles: one CTA per (bh, 64-row tile), twice the
             # default 128-row root grid.
@@ -1167,6 +1172,10 @@ def _append_cute_wrapper_plan(
             call_args.append("_flash_scale")
         if epi_tma:
             call_args.extend(["_flash_tma_o", "_flash_osl"])
+            if plan.get("epi_tma_ragged"):
+                # A ragged query length's partial tiles take the vector
+                # store over the plain O view.
+                call_args.append("_flash_mO")
         elif epi_stg:
             call_args.append("_flash_osl")
         call_args.extend(f"_flash_mEpiAux{index}" for index in range(epi_aux_count))

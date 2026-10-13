@@ -26,6 +26,7 @@ from helion._compiler.cute.attention_plan import FLEX_SCORE_KIND
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion.exc import InvalidConfig
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -327,6 +328,13 @@ def test_fragments_offer_only_the_fa4_family_and_pinned_structure() -> None:
     assert active(cute_flash.FLASH_PIPELINE_FAMILY_KEY) == ("fa4",)
     # v1.5: static strided persistence is searched for list walks (default off).
     assert set(active(cute_flash.FLASH_PERSISTENT_KEY)) == {False, True}
+    # v1.5: the MMA warp's absent-stage skip is searched (default off).
+    assert set(active(cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY)) == {False, True}
+    assert fragments[cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY].default() is False
+    # The split-KV walk is searched over every split (default 1 without a
+    # device to seed it from).
+    assert active(cute_flash.FLASH_KV_SPLIT_KEY) == (1, 2, 4)
+    assert fragments[cute_flash.FLASH_KV_SPLIT_KEY].default() == 1
     assert active(cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY) == (False,)
     assert active(cute_flash.FLASH_EARLY_PROLOGUE_LOADS_KEY) == (False,)
     assert active(cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY) == ("inherit",)
@@ -338,6 +346,61 @@ def test_fragments_offer_only_the_fa4_family_and_pinned_structure() -> None:
         "descending",
     }
     assert fragments[cute_flash.FLASH_CAUSAL_KV_ORDER_KEY].default() == "descending"
+
+
+def test_flex_mask_form_knob_is_searched_only_with_a_mask_region() -> None:
+    """``cute_flash_flex_mask_form`` (the keep word vs. the per-element
+    predicate): an appended schema axis, default ``"bitmask"``, searched on
+    flex plans with a mask region, pinned to the default elsewhere, and
+    resolved away on non-flex plans."""
+    key = cute_flash.FLASH_FLEX_MASK_FORM_KEY
+    # Appended behind the axes it was introduced after (an inserted axis
+    # would reshuffle every later axis's coverage rows).
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys.count(key) == 1
+    assert keys.index(key) > keys.index(cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY)
+    assert (
+        cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_mask_form"].default
+        == "bitmask"
+    )
+    assert (key, "element") in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+
+    def active(fragments: dict[str, object]) -> tuple[object, ...]:
+        fragment = fragments[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        search = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if search is None else tuple(search)
+
+    with patch.dict(os.environ, {}, clear=True):
+        flex_mask = cute_flash.flash_autotune_fragments(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            flex_has_mask_region=True,
+            score_modifier_kinds=(FLEX_SCORE_KIND,),
+        )
+        flex_score_only = cute_flash.flash_autotune_fragments(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            score_modifier_kinds=(FLEX_SCORE_KIND,),
+        )
+        dense = cute_flash.flash_autotune_fragments(
+            HEAD_DIM, 16, dtype=torch.bfloat16, num_bh=NUM_BH
+        )
+    assert active(flex_mask) == ("bitmask", "element")
+    assert active(flex_score_only) == ("bitmask",)
+    assert active(dense) == ("bitmask",)
+    assert flex_mask[key].default() == "bitmask"  # pyrefly: ignore[missing-attribute]
+    assert _resolve({**BODY, key: "element"}).flex_mask_form == "element"
+    assert _resolve(BODY).flex_mask_form == "bitmask"
+    assert _resolve({key: "element"}, has_list_walk=False).flex_mask_form == "bitmask"
+    with pytest.raises(InvalidConfig):
+        _resolve({**BODY, key: "r2p"})
 
 
 def test_fragment_surface_is_length_invariant_for_the_list_walk() -> None:
@@ -557,13 +620,23 @@ def test_ragged_query_length_guards_the_staged_store_and_the_lse(q_seq: int) -> 
         assert src.count("if flash_local_tidx < flash_live_rows0:") == 1
         assert src.count("if flash_local_tidx < flash_live_rows1:") == 1
         assert "flash_m_tile0 * 128 + flash_local_tidx, flash_bh]" in src
-    # The staged vector store takes the row-guarded variant; the TMA store
-    # clips to the tensor extent by itself.
-    assert staged.count("fa4_store_o_smem_to_gmem_rows(") == 2
-    assert "tOcO_epi, flash_live_rows0, cutlass.BFloat16)" in staged
-    assert "tOcO_epi, flash_live_rows1, cutlass.BFloat16)" in staged
-    assert "_rows(" not in tma
-    assert "cute.copy(_flash_tma_o, tOsO_tma[None, 1]" in tma
+    # The staged vector store takes the row-guarded variant. The TMA store
+    # does not clip at the query length (the descriptor's sequence and batch
+    # modes coalesce, so a box past the length lands in the next head's
+    # rows): its epilogue is a hybrid, a full tile through TMA, a half-live
+    # tile through the row-guarded vector store over the plain output view,
+    # a dead tile stores nothing.
+    for src in (staged, tma):
+        assert src.count("fa4_store_o_smem_to_gmem_rows(") == 2
+        assert "tOcO_epi, flash_live_rows0, cutlass.BFloat16)" in src
+        assert "tOcO_epi, flash_live_rows1, cutlass.BFloat16)" in src
+    for stage in ("0", "1"):
+        assert f"if flash_live_rows{stage} == cutlass.Int32(128):" in tma
+        assert f"elif flash_live_rows{stage} > cutlass.Int32(0):" in tma
+        assert f"cute.copy(_flash_tma_o, tOsO_tma[None, {stage}]" in tma
+    assert "flash_mO_stg_cur = _flash_mO[None, None, flash_bh]" in tma
+    assert "_flash_mO[" not in staged
+    assert "cp_async_bulk_wait_group(1, read=True)" not in tma
 
 
 def test_aligned_query_length_keeps_the_unguarded_stores() -> None:
@@ -572,6 +645,11 @@ def test_aligned_query_length_keeps_the_unguarded_stores() -> None:
     assert "_rows(" not in src
     assert src.count("fa4_store_o_smem_to_gmem(") == 2
     assert "if flash_local_tidx <" not in src
+    # The aligned TMA epilogue keeps the pipelined two-stage TMA store.
+    tma = _render(_resolve(BODY), _flex_plan())
+    assert "flash_live_rows" not in tma
+    assert "_rows(" not in tma and "_flash_mO[" not in tma
+    assert "cp_async_bulk_wait_group(1, read=True)" in tma
 
 
 @pytest.mark.parametrize("with_mask", [False, True])
@@ -952,18 +1030,7 @@ def _mma_block(src: str) -> str:
 
 
 def _resolve_with_skip(config: dict[str, object]) -> cute_flash.FlashAttentionConfig:
-    with patch.dict(
-        os.environ, {"HELION_CUTE_FLASH_FLEX_SKIP_ABSENT": "1"}, clear=True
-    ):
-        return cute_flash.resolve_flash_config(
-            HEAD_DIM,
-            16,
-            config,
-            dtype=torch.bfloat16,
-            num_bh=NUM_BH,
-            has_list_walk=True,
-            score_modifier_kinds=(FLEX_SCORE_KIND,),
-        )
+    return _resolve({**config, cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True})
 
 
 def test_mma_warp_skips_the_absent_stage_and_keeps_the_protocol() -> None:
@@ -1015,7 +1082,9 @@ def test_mma_warp_skips_the_absent_stage_and_keeps_the_protocol() -> None:
     assert "flash_flex_pv_live0 = flash_flex_qk_live0" in mma
 
 
-def test_mma_skip_is_opt_in_and_off_by_default() -> None:
+def test_mma_skip_is_a_searched_knob_off_by_default() -> None:
+    # The knob's contract (schema position, witness, fragment, env default)
+    # is in ``test_cute_flash_flex_skip_absent.py``.
     cfg = _resolve(BODY)
     assert not cfg.flex_skip_absent
     src = _render(cfg, _flex_plan(mask_region=object()))
@@ -1267,6 +1336,32 @@ def test_codegen_binds_the_host_sorted_item_table_for_the_persistent_walk() -> N
     )
     assert "_helion_flash_flex_item_table" not in plain
     assert "_flash_mFlexItems" not in plain
+
+
+@pytest.mark.parametrize("seq", [2048, 2048 + 128])
+def test_ragged_tma_epilogue_passes_the_plain_output_view(seq: int) -> None:
+    """A ragged query length under the TMA epilogue stores the last pair's
+    partial tiles through the row-guarded vector store, which addresses the
+    plain (S, D, B) output view: the launcher passes it after the TMA params
+    (``epi_tma_ragged``); aligned lengths keep the TMA-only signature."""
+    code = _codegen_with_flex_plan(
+        seq,
+        {
+            "block_sizes": [1, 128, 128],
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            cute_flash.FLASH_EPI_TMA_KEY: True,
+            cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        },
+    )
+    ragged = seq % 256 != 0
+    assert "'epi_tma': True" in code
+    assert ("'epi_tma_ragged': True" in code) == ragged
+    signature = code.split("def _helion__probe_attention(")[1].split(")")[0]
+    params = [param.strip() for param in signature.split(",")]
+    assert "_flash_mOt" in params and "_flash_tma_o" in params
+    assert ("_flash_mO" in params) == ragged
+    assert ("_flash_tma_o, _flash_osl, _flash_mO" in code) == ragged
+    assert ("fa4_store_o_smem_to_gmem_rows(" in code) == ragged
 
 
 def test_persistence_stays_pinned_off_for_interval_plans_and_is_searched_for_flex() -> (

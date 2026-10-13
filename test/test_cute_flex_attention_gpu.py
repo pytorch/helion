@@ -57,6 +57,10 @@ FLEX_CONFIG: dict[str, object] = {
     cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
     cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
     cute_flash.FLASH_EPI_TMA_KEY: True,
+    # The seeded default splits a small grid's KV walk over several CTAs
+    # (``cute_flash_kv_split``); these tests pin the one-CTA walk (the dense
+    # kernel comparisons are bitwise only there).
+    cute_flash.FLASH_KV_SPLIT_KEY: 1,
 }
 # The dense comparison body: the same structure plus the pins the resolver
 # applies to the list walk, requested explicitly for the dense plan.

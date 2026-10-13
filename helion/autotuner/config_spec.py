@@ -2018,6 +2018,9 @@ class ConfigSpec:
                 has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                 has_list_walk=self._cute_flash_has_list_walk,
+                flex_has_mask_region=self._cute_flash_flex_has_mask_region,
+                device_sm_count=self._cute_flash_device_sm_count,
+                q_seq=self._cute_flash_q_seq,
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
@@ -3337,6 +3340,7 @@ class ConfigSpec:
                     block_size_targets=self._cute_flash_block_size_target_list(),
                     device_sm_count=self._cute_flash_device_sm_count,
                     fast_math=self._cute_flash_fast_math,
+                    q_seq=self._cute_flash_q_seq,
                 )
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)

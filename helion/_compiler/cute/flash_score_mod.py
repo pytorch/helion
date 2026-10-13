@@ -28,6 +28,17 @@ Rendering rules (``artifacts/attn-sparse-2026-10-10/spec_interfaces.md`` §2):
   aligned chunk base gives one vector load per group of lanes; anything else
   is a per-element gather.  Gathers clamp the index, load unconditionally and
   ``select_`` zero for out-of-range coordinates (no per-element ``IfExp``).
+* Comparisons of ``kv_idx + c`` whose half-open threshold is a multiple of
+  the tile / chunk width are constant over it (``kvcmp``), and
+  ``(kv_idx + c) % m`` with ``m`` and ``c`` multiples of the width is the
+  first lane's remainder plus the lane offset (``kvmod``).
+* In the ``"bitmask"`` mask form a mask predicate that is, per chunk, a
+  boolean combination of lane intervals (comparisons of lane-linear
+  integers, ``abs``, ``x // c`` block bounds, ``x % m`` residue patterns)
+  is built as one keep word per chunk from lane-uniform values and applied
+  through the constexpr bit-test select chain that ptxas turns into R2P +
+  predicated selects; operands outside that language stay per element and
+  read the lane bits of the foldable ones.
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ import ast
 import dataclasses
 import inspect
 import math
+import operator
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -156,6 +168,46 @@ _FLOORDIV_TARGETS = frozenset(
 _ADD_TARGETS = frozenset({torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar})
 _SUB_TARGETS = frozenset({torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar})
 _MUL_TARGETS = frozenset({torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar})
+# Boolean connectives of a mask predicate (the keep-word peephole combines
+# their operands' lane words bitwise).
+_BOOL_AND_TARGETS = frozenset(
+    {
+        torch.ops.aten.bitwise_and.Tensor,
+        torch.ops.aten.bitwise_and.Scalar,
+        torch.ops.aten.logical_and.default,
+    }
+)
+_BOOL_OR_TARGETS = frozenset(
+    {
+        torch.ops.aten.bitwise_or.Tensor,
+        torch.ops.aten.bitwise_or.Scalar,
+        torch.ops.aten.logical_or.default,
+    }
+)
+_BOOL_XOR_TARGETS = frozenset(
+    {
+        torch.ops.aten.bitwise_xor.Tensor,
+        torch.ops.aten.bitwise_xor.Scalar,
+        torch.ops.aten.logical_xor.default,
+    }
+)
+_BOOL_NOT_TARGETS = frozenset(
+    {torch.ops.aten.bitwise_not.default, torch.ops.aten.logical_not.default}
+)
+_ABS_TARGET = torch.ops.aten.abs.default
+# ``a cmp b`` as ``b cmp' a`` and as ``not (a cmp b)``.
+_FLIP_COMPARE = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
+_NEGATE_COMPARE = {
+    "lt": "ge",
+    "le": "gt",
+    "gt": "le",
+    "ge": "lt",
+    "eq": "ne",
+    "ne": "eq",
+}
+# Mask forms of ``render_flex_hook``: the per-chunk keep word applied through
+# the R2P select chain, or the per-element predicate.
+MASK_FORMS = ("bitmask", "element")
 _COMPARE_OPERATORS = {
     torch.ops.aten.gt.Tensor: "gt",
     torch.ops.aten.gt.Scalar: "gt",
@@ -300,6 +352,13 @@ class _NodeInfo:
     in_bounds: bool = False
     window: int = 0
     window_sign: int = 1
+    # ``kvcmp`` (a comparison of ``kv_idx + c`` constant over a tile / chunk)
+    # and ``kvmod`` (``(kv_idx + c) % m`` whose remainder is lane-affine over
+    # a tile / chunk): the class of the hoisted part, the offset ``c`` and,
+    # for ``kvcmp``, the comparison of ``base + c`` against zero.
+    uniform_cls: int = _ELEMENT
+    offset: int = 0
+    cmp_op: str = ""
 
 
 @dataclasses.dataclass
@@ -309,6 +368,84 @@ class _RegionInfo:
     nodes: dict[Node, _NodeInfo]
     placeholders: list[Node]
     output: Node
+
+
+@dataclasses.dataclass(frozen=True)
+class _Lin:
+    """A lane-linear integer of one chunk: ``coef * j + sum(k * term) + const``
+    over the lane index ``j`` (``kv_idx = cbase + j``); ``terms`` are rendered
+    lane-uniform ``Int32`` expressions, ``cls`` the placement class of the
+    uniform part."""
+
+    coef: int
+    # ``(expression, multiplier, placement class)`` per uniform term.
+    terms: tuple[tuple[str, int, int], ...]
+    const: int
+
+    @property
+    def cls(self) -> int:
+        return max([_ITEM, *(cls for _expr, _value, cls in self.terms)])
+
+    @staticmethod
+    def constant(value: int) -> _Lin:
+        return _Lin(0, (), value)
+
+    @staticmethod
+    def term(expr: str, cls: int, coef: int = 0) -> _Lin:
+        return _Lin(coef, ((expr, 1, cls),), 0)
+
+    def add(self, other: _Lin, sign: int = 1) -> _Lin:
+        terms = {key: (value, cls) for key, value, cls in self.terms}
+        for key, value, cls in other.terms:
+            terms[key] = (terms.get(key, (0, cls))[0] + sign * value, cls)
+        return _Lin(
+            self.coef + sign * other.coef,
+            tuple(sorted((k, v, c) for k, (v, c) in terms.items() if v != 0)),
+            self.const + sign * other.const,
+        )
+
+    def scale(self, factor: int) -> _Lin:
+        if factor == 0:
+            return _Lin.constant(0)
+        return _Lin(
+            self.coef * factor,
+            tuple((k, v * factor, c) for k, v, c in self.terms),
+            self.const * factor,
+        )
+
+    def uniform_expr(self) -> str:
+        """The uniform part (without ``coef * j``) as an ``Int32`` expression."""
+        parts: list[str] = []
+        for key, value, _cls in self.terms:
+            if value == 1:
+                parts.append(key)
+            elif value == -1:
+                parts.append(f"-{key}")
+            else:
+                parts.append(f"{key} * cutlass.Int32({value})")
+        if self.const or not parts:
+            parts.append(
+                f"-cutlass.Int32({-self.const})"
+                if self.const < 0
+                else f"cutlass.Int32({self.const})"
+            )
+        expr = parts[0]
+        for part in parts[1:]:
+            expr = (
+                f"{expr} - {part[1:]}" if part.startswith("-") else f"{expr} + {part}"
+            )
+        return expr
+
+
+@dataclasses.dataclass(frozen=True)
+class _Word:
+    """A chunk keep word: ``expr`` names an ``Int32`` whose bit ``j`` is the
+    predicate at lane ``j``, or ``None`` for a lane-uniform predicate whose
+    rendered Boolean is ``uniform``; ``cls`` is the placement class."""
+
+    expr: str | None
+    uniform: str | None
+    cls: int
 
 
 def _class_of(deps: frozenset[str]) -> int:
@@ -508,7 +645,11 @@ class _Analyzer:
                     )
             return _NodeInfo("pointwise", deps, None)
         if target in _REMAINDER_TARGETS:
+            if is_int and (kvmod := self._kvmod(node, nodes)) is not None:
+                return kvmod
             return _NodeInfo("pymod" if is_int else "remainder_f", deps, None)
+        if target in _COMPARE_OPERATORS and (kvcmp := self._kvcmp(node, nodes)):
+            return kvcmp
         if target in _FMOD_TARGETS:
             return _NodeInfo("fmod", deps, None)
         if target is torch.ops.aten.tanh.default:
@@ -543,6 +684,67 @@ class _Analyzer:
             inner = self._affine_of(node.args[0], nodes)
             affine = inner.scale(-1) if inner is not None else None
         return _NodeInfo("pointwise", deps, affine)
+
+    def _spans(self) -> tuple[tuple[int, int, frozenset[str]], ...]:
+        """``(span, class, deps)`` of the lane spans a ``kv_idx + c`` form can
+        be hoisted over: the 128-column tile, then the chunk."""
+        return (
+            (128, _TILE, frozenset({_T_KVT})),
+            (self.chunk_cols, _CHUNK, frozenset({_T_KVT, _T_CHUNK})),
+        )
+
+    def _kvcmp(self, node: Node, nodes: dict[Node, _NodeInfo]) -> _NodeInfo | None:
+        """A comparison ``kv_idx + c <op> 0`` (either operand order, ``kv``
+        coefficient +-1, no other coordinate) that is constant over a tile or
+        a chunk: in half-open form the threshold is a multiple of the span."""
+        op = _COMPARE_OPERATORS[cast("Any", node.target)]
+        if op in ("eq", "ne") or len(node.args) < 2:
+            return None
+        left = self._affine_of(node.args[0], nodes)
+        right = self._affine_of(node.args[1], nodes)
+        if left is None or right is None:
+            return None
+        d = left.add(right, -1)
+        if d.coeffs != (("kv", 1),) and d.coeffs != (("kv", -1),):
+            return None
+        c = d.const
+        if d.coeffs[0][1] == -1:
+            c, op = -c, _FLIP_COMPARE[op]
+        # ``base + j + c <op> 0`` over ``j in [0, span)``: ``lt`` / ``ge``
+        # split at ``j = -c - base``, ``le`` / ``gt`` at ``j = 1 - c - base``;
+        # with ``base`` a multiple of the span the lanes agree when the
+        # threshold is one too, and the value is that of ``base + c``.
+        threshold = -c if op in ("lt", "ge") else 1 - c
+        for span, cls, deps in self._spans():
+            if threshold % span == 0:
+                return _NodeInfo(
+                    "kvcmp", deps, None, uniform_cls=cls, offset=c, cmp_op=op
+                )
+        return None
+
+    def _kvmod(self, node: Node, nodes: dict[Node, _NodeInfo]) -> _NodeInfo | None:
+        """``(kv_idx + c) % m`` with ``m`` and ``c`` multiples of a span: the
+        remainder is ``(base + c) % m`` at the span's first lane plus the lane
+        offset (no wrap inside the span)."""
+        x = node.args[0]
+        m = _int_constant(node.args[1])
+        if not isinstance(x, Node) or m is None or m <= 0:
+            return None
+        x_affine = nodes[x].affine
+        if x_affine is None or not x_affine.is_kv_plus_const():
+            return None
+        c = x_affine.const
+        for span, cls, deps in self._spans():
+            if m % span == 0 and c % span == 0:
+                return _NodeInfo(
+                    "kvmod",
+                    deps | {_T_LANE},
+                    None,
+                    divisor=m,
+                    uniform_cls=cls,
+                    offset=c,
+                )
+        return None
 
     def _load(self, node: Node, nodes: dict[Node, _NodeInfo]) -> _NodeInfo:
         source, indices = node.args[0], node.args[1]
@@ -751,6 +953,13 @@ class _HookEmitter:
         self.roots_emitted: set[str] = set()
         self.values: dict[tuple[str, Node], str] = {}
         self.vector_width = 0
+        # Keep words of the mask region's predicate nodes (``None``: the node
+        # has no word form) and the per-region word counter.
+        self.words: dict[tuple[str, Node], _Word | None] = {}
+        self.word_count: dict[str, int] = {}
+        self.word_names: dict[tuple[str, str], str] = {}
+        # ``kvmod`` nodes: the remainder at the chunk's first lane.
+        self.kvmod_lane0: dict[tuple[str, Node], str] = {}
 
     # -- naming / placement -------------------------------------------------
 
@@ -820,7 +1029,14 @@ class _HookEmitter:
         if key in self.values:
             return self.values[key]
         meta = info.nodes[node]
-        result = self._render(info, node, meta)
+        word = self.words.get(key)
+        if word is not None and word.expr is not None and _T_LANE in meta.deps:
+            # A lane-dependent predicate with a keep word, read per element by
+            # an operand the peephole could not fold: its lane bit.
+            result = self.name_for(info, node)
+            self.emit(_ELEMENT, f"{result} = {self.lane_bit(word.expr)}")
+        else:
+            result = self._render(info, node, meta)
         self.values[key] = result
         return result
 
@@ -856,6 +1072,10 @@ class _HookEmitter:
             self._load(info, node, meta, name)
         elif role == "kvdiv":
             self._kvdiv(info, node, meta, name)
+        elif role == "kvcmp":
+            self._kvcmp(info, node, meta, name)
+        elif role == "kvmod":
+            self._kvmod(info, node, meta, name)
         elif role == "pymod":
             self._pymod(info, node, meta, name)
         elif role in ("remainder_f", "fmod"):
@@ -974,6 +1194,454 @@ class _HookEmitter:
         else:
             expr = f"{t}({x})"
         self.emit(meta.cls, f"{name} = {expr}")
+
+    def _span_base(self, meta: _NodeInfo) -> str:
+        base = self.root("kvbase") if meta.uniform_cls == _TILE else self.root("cbase")
+        if meta.offset:
+            return f"({base} + cutlass.Int32({meta.offset}))"
+        return base
+
+    def _kvcmp(self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str) -> None:
+        # Constant over the span: the comparison of its first lane's
+        # ``kv_idx + c`` against zero (analyzer ``_kvcmp``).
+        self.emit(
+            meta.cls,
+            f"{name} = operator.{meta.cmp_op}({self._span_base(meta)}, cutlass.Int32(0))",
+        )
+
+    def _kvmod_lane0(self, info: _RegionInfo, node: Node) -> str:
+        """``(kv_idx + c) % m`` at the chunk's first lane: the span's
+        first-lane remainder (a power-of-two ``m`` is a mask; two's complement
+        gives the non-negative Python remainder) plus the chunk's column."""
+        key = (info.tag, node)
+        if key in self.kvmod_lane0:
+            return self.kvmod_lane0[key]
+        meta = info.nodes[node]
+        name = self.name_for(info, node)
+        m = meta.divisor
+        base = self._span_base(meta)
+        if m & (m - 1) == 0:
+            remainder = f"{base} & cutlass.Int32({m - 1})"
+        else:
+            remainder = f"_cute_python_mod({base}, cutlass.Int32({m}))"
+        self.emit(meta.uniform_cls, f"{name}_u = {remainder}")
+        lane0 = f"{name}_u"
+        if meta.uniform_cls == _TILE:
+            lane0 = f"{name}_c"
+            self.emit(
+                _CHUNK,
+                f"{lane0} = {name}_u + cutlass.Int32({self.coord_tensor}[0][1])",
+            )
+        self.kvmod_lane0[key] = lane0
+        return lane0
+
+    def _kvmod(self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str) -> None:
+        lane0 = self._kvmod_lane0(info, node)
+        self.emit(_ELEMENT, f"{name} = {lane0} + cutlass.Int32({_ELEM})")
+
+    # -- keep words -----------------------------------------------------------
+    #
+    # A mask predicate restricted to one chunk is, lane by lane, bit ``j`` of
+    # a ``chunk_cols``-bit word.  Comparisons of lane-linear integers
+    # (``+-j`` plus lane-uniform terms) give half-open lane intervals from
+    # ``_cute_flex_lane_below``; block equalities on ``x // c`` are the same
+    # intervals scaled; ``x % m`` against a residue set is a rotated,
+    # replicated period pattern; ``abs`` splits into two sides; the
+    # connectives are bitwise.  The word is built once per chunk from
+    # lane-uniform values and applied through the constexpr bit-test select
+    # chain (``lane_bit``), which ptxas turns into R2P + predicated selects.
+    # Anything else keeps its per-element value; a connective with one word
+    # operand and one per-element operand reads the word's lane bit.
+
+    def full_word(self) -> str:
+        width = self.chunk_cols
+        return "-1" if width == 32 else str((1 << width) - 1)
+
+    def lane_bit(self, word: str) -> str:
+        return f"cutlass.Boolean({word} & (cutlass.Int32(1) << cutlass.Int32({_ELEM})))"
+
+    def new_word(self, tag: str, cls: int, expr: str) -> str:
+        """Name an ``Int32`` word expression (once per distinct text)."""
+        key = (tag, expr)
+        if key in self.word_names:
+            return self.word_names[key]
+        index = self.word_count.get(tag, 0)
+        self.word_count[tag] = index + 1
+        name = f"{self.prefix()}{tag}_w{index}"
+        self.emit(cls, f"{name} = cutlass.Int32({expr})")
+        self.word_names[key] = name
+        return name
+
+    def word_expr(self, tag: str, word: _Word) -> str:
+        if word.expr is not None:
+            return word.expr
+        assert word.uniform is not None
+        return self.new_word(
+            tag,
+            word.cls,
+            f"cutlass.select_({word.uniform}, cutlass.Int32({self.full_word()}), "
+            "cutlass.Int32(0))",
+        )
+
+    def word_not(self, tag: str, word: _Word) -> _Word:
+        if word.expr is None:
+            assert word.uniform is not None
+            return _Word(None, f"(~{word.uniform})", word.cls)
+        expr = f"~{word.expr}"
+        if self.chunk_cols < 32:
+            expr = f"{expr} & cutlass.Int32({self.full_word()})"
+        return _Word(self.new_word(tag, word.cls, expr), None, word.cls)
+
+    def word_binary(self, tag: str, op: str, a: _Word, b: _Word) -> _Word:
+        cls = max(a.cls, b.cls)
+        if a.expr is None and b.expr is None:
+            return _Word(None, f"({a.uniform} {op} {b.uniform})", cls)
+        expr = f"{self.word_expr(tag, a)} {op} {self.word_expr(tag, b)}"
+        return _Word(self.new_word(tag, cls, expr), None, cls)
+
+    def below_word(self, tag: str, limit: _Lin) -> _Word:
+        """Lanes ``j < limit`` (``limit`` lane-uniform)."""
+        expr = f"_cute_flex_lane_below({limit.uniform_expr()}, {self.chunk_cols})"
+        return _Word(self.new_word(tag, limit.cls, expr), None, limit.cls)
+
+    def interval_word(self, tag: str, op: str, limit: _Lin) -> _Word:
+        """Lanes ``j <op> limit`` (``limit`` lane-uniform)."""
+        if op == "lt":
+            return self.below_word(tag, limit)
+        if op == "le":
+            return self.below_word(tag, limit.add(_Lin.constant(1)))
+        if op == "ge":
+            return self.word_not(tag, self.below_word(tag, limit))
+        if op == "gt":
+            return self.word_not(tag, self.below_word(tag, limit.add(_Lin.constant(1))))
+        equal = self.word_binary(
+            tag,
+            "&",
+            self.below_word(tag, limit.add(_Lin.constant(1))),
+            self.word_not(tag, self.below_word(tag, limit)),
+        )
+        if op == "eq":
+            return equal
+        assert op == "ne"
+        return self.word_not(tag, equal)
+
+    def compare_word(self, tag: str, left: _Lin, right: _Lin, op: str) -> _Word | None:
+        """Word of ``left <op> right`` for lane-linear operands."""
+        d = left.add(right, -1)
+        if d.coef == 0:
+            return _Word(
+                None, f"operator.{op}({d.uniform_expr()}, cutlass.Int32(0))", d.cls
+            )
+        if d.coef not in (1, -1):
+            return None
+        if d.coef == -1:
+            d, op = d.scale(-1), _FLIP_COMPARE[op]
+        # ``j + u <op> 0``  <=>  ``j <op> -u``
+        return self.interval_word(tag, op, dataclasses.replace(d, coef=0).scale(-1))
+
+    def lane_linear(self, info: _RegionInfo, value: object) -> _Lin | None:
+        if not isinstance(value, Node):
+            constant = _int_constant(value)
+            return None if constant is None else _Lin.constant(constant)
+        meta = info.nodes[value]
+        constant = _int_constant(value)
+        if constant is not None and meta.role == "literal":
+            return _Lin.constant(constant)
+        dtype = _node_dtype(value)
+        if dtype is None or not _is_int_dtype(dtype):
+            return None
+        if _T_LANE not in meta.deps:
+            return _Lin.term(f"cutlass.Int32({self.value(info, value)})", meta.cls)
+        if meta.role == "kv":
+            return _Lin.term(self.root("cbase"), _CHUNK, coef=1)
+        if meta.role == "alias":
+            return self.lane_linear(info, value.args[0])
+        if meta.role == "kvmod":
+            return _Lin.term(self._kvmod_lane0(info, value), _CHUNK, coef=1)
+        if meta.role == "convert":
+            source = value.args[0]
+            assert isinstance(source, Node)
+            source_dtype = _node_dtype(source)
+            if source_dtype is None or not _is_int_dtype(source_dtype):
+                return None
+            return self.lane_linear(info, source)
+        target = value.target
+        if target in _ADD_TARGETS or target in _SUB_TARGETS:
+            if value.kwargs.get("alpha", 1) != 1:
+                return None
+            left = self.lane_linear(info, value.args[0])
+            right = self.lane_linear(info, value.args[1])
+            if left is None or right is None:
+                return None
+            return left.add(right, 1 if target in _ADD_TARGETS else -1)
+        if target in _MUL_TARGETS:
+            left = self.lane_linear(info, value.args[0])
+            right = self.lane_linear(info, value.args[1])
+            if left is None or right is None:
+                return None
+            if right.coef == 0 and not right.terms:
+                return left.scale(right.const)
+            if left.coef == 0 and not left.terms:
+                return right.scale(left.const)
+            return None
+        if target is torch.ops.aten.neg.default:
+            inner = self.lane_linear(info, value.args[0])
+            return None if inner is None else inner.scale(-1)
+        return None
+
+    def abs_word(
+        self, info: _RegionInfo, tag: str, inner: object, other: object, op: str
+    ) -> _Word | None:
+        """``abs(inner) <op> other`` with ``other`` lane-uniform: two sides."""
+        x = self.lane_linear(info, inner)
+        y = self.lane_linear(info, other)
+        if x is None or y is None or y.coef != 0:
+            return None
+        if op in ("lt", "le"):
+            # |x| < y  <=>  x < y and x > -y
+            a = self.compare_word(tag, x, y, op)
+            b = self.compare_word(tag, x, y.scale(-1), _FLIP_COMPARE[op])
+            return None if a is None or b is None else self.word_binary(tag, "&", a, b)
+        if op in ("gt", "ge"):
+            a = self.compare_word(tag, x, y, op)
+            b = self.compare_word(tag, x, y.scale(-1), _FLIP_COMPARE[op])
+            return None if a is None or b is None else self.word_binary(tag, "|", a, b)
+        a = self.compare_word(tag, x, y, "eq")
+        b = self.compare_word(tag, x, y.scale(-1), "eq")
+        if a is None or b is None:
+            return None
+        equal = self.word_binary(tag, "|", a, b)
+        return equal if op == "eq" else self.word_not(tag, equal)
+
+    def floordiv_word(
+        self, info: _RegionInfo, tag: str, x: object, c: object, other: object, op: str
+    ) -> _Word | None:
+        """``x // c <op> other`` (``c > 0``, ``other`` lane-uniform) as
+        half-open bounds on ``x``: ``x // c >= y  <=>  x >= y * c`` and
+        ``x // c < y  <=>  x < y * c``."""
+        divisor = _int_constant(c)
+        if divisor is None or divisor <= 0:
+            return None
+        lx = self.lane_linear(info, x)
+        ly = self.lane_linear(info, other)
+        if lx is None or ly is None or ly.coef != 0:
+            return None
+        low = ly.scale(divisor)
+        high = ly.add(_Lin.constant(1)).scale(divisor)
+        if op == "ge":
+            return self.compare_word(tag, lx, low, "ge")
+        if op == "lt":
+            return self.compare_word(tag, lx, low, "lt")
+        if op == "le":
+            return self.compare_word(tag, lx, high, "lt")
+        if op == "gt":
+            return self.compare_word(tag, lx, high, "ge")
+        a = self.compare_word(tag, lx, low, "ge")
+        b = self.compare_word(tag, lx, high, "lt")
+        if a is None or b is None:
+            return None
+        equal = self.word_binary(tag, "&", a, b)
+        return equal if op == "eq" else self.word_not(tag, equal)
+
+    def mod_word(
+        self, info: _RegionInfo, tag: str, node: Node, other: object, op: str
+    ) -> _Word | None:
+        """``x % m <op> other`` with ``m < chunk_cols``: the residue pattern of
+        one period, rotated by the first lane's residue and replicated over
+        the chunk.  ``abs(x) % m`` against zero is ``x % m`` against zero."""
+        x, m_arg = node.args[0], node.args[1]
+        m = _int_constant(m_arg)
+        width = self.chunk_cols
+        if m is None or m <= 0 or m >= width or not isinstance(x, Node):
+            return None
+        y = self.lane_linear(info, other)
+        if y is None or y.coef != 0:
+            return None
+        y_static = y.const if not y.terms else None
+        if x.target is _ABS_TARGET:
+            if op not in ("eq", "ne") or y_static != 0:
+                return None
+            x = x.args[0]
+        lx = self.lane_linear(info, x)
+        if lx is None or lx.coef not in (1, -1):
+            return None
+        period_mask = (1 << m) - 1
+        # Residues ``r in [0, m)`` with ``r <op> y``: a static word when ``y``
+        # is a constant, else built from the period's ``below`` words.
+        pattern: int | str
+        if y_static is not None:
+            pattern = sum(
+                1 << r for r in range(m) if getattr(operator, op)(r, y_static)
+            )
+        elif lx.coef == -1:
+            return None
+        else:
+            below = f"_cute_flex_lane_below({{}}, {m})"
+            y_expr = y.uniform_expr()
+            y1_expr = y.add(_Lin.constant(1)).uniform_expr()
+            if op == "lt":
+                pattern = below.format(y_expr)
+            elif op == "le":
+                pattern = below.format(y1_expr)
+            elif op == "ge":
+                pattern = f"~{below.format(y_expr)} & cutlass.Int32({period_mask})"
+            elif op == "gt":
+                pattern = f"~{below.format(y1_expr)} & cutlass.Int32({period_mask})"
+            else:
+                equal = f"{below.format(y1_expr)} & ~{below.format(y_expr)}"
+                pattern = (
+                    equal
+                    if op == "eq"
+                    else f"~({equal}) & cutlass.Int32({period_mask})"
+                )
+        # The first lane's residue ``u0 = u % m``; terms that are multiples
+        # of the chunk width (the chunk base) vanish when ``m`` divides it.
+        uniform = dataclasses.replace(lx, coef=0)
+        if width % m == 0:
+            cbase = self.root("cbase")
+            uniform = _Lin(
+                0, tuple(t for t in uniform.terms if t[0] != cbase), uniform.const
+            )
+        if lx.coef == -1:
+            # Lanes hold ``u - j``: residue ``r`` sits at ``j = u0 - r``, the
+            # reflected pattern rotated left.
+            assert isinstance(pattern, int)
+            pattern = sum(1 << ((-r) % m) for r in range(m) if pattern & (1 << r))
+        cls = uniform.cls
+        if not uniform.terms:
+            u0: int | str = uniform.const % m
+        elif m & (m - 1) == 0:
+            u0 = f"({uniform.uniform_expr()}) & cutlass.Int32({m - 1})"
+        else:
+            u0 = f"_cute_python_mod({uniform.uniform_expr()}, cutlass.Int32({m}))"
+        rotate_left = lx.coef == -1
+        if isinstance(pattern, int) and isinstance(u0, int):
+            shift = u0 if rotate_left else (m - u0) % m
+            rotated: int | str = (
+                (pattern << shift) | (pattern >> (m - shift))
+            ) & period_mask
+        elif u0 == 0:
+            assert isinstance(pattern, str)
+            rotated = self.new_word(tag, cls, pattern)
+        else:
+            if isinstance(u0, int):
+                u0_expr = f"cutlass.Int32({u0})"
+                back_expr = f"cutlass.Int32({m - u0})"
+            else:
+                u0_name = self.new_word(tag, cls, u0)
+                u0_expr = u0_name
+                back_expr = f"(cutlass.Int32({m}) - {u0_name})"
+            p = (
+                f"cutlass.Int32({pattern})"
+                if isinstance(pattern, int)
+                else self.new_word(tag, cls, pattern)
+            )
+            if rotate_left:
+                rotated = f"(({p} << {u0_expr}) | ({p} >> {back_expr})) & cutlass.Int32({period_mask})"
+            else:
+                rotated = f"(({p} >> {u0_expr}) | ({p} << {back_expr})) & cutlass.Int32({period_mask})"
+        replicate = sum(1 << (k * m) for k in range(-(-width // m)))
+        if isinstance(rotated, int):
+            word_value = (rotated * replicate) & ((1 << width) - 1)
+            if width == 32 and word_value >= 1 << 31:
+                word_value -= 1 << 32
+            return _Word(self.new_word(tag, _ITEM, str(word_value)), None, _ITEM)
+        if replicate >= 1 << 31:
+            replicate -= 1 << 32
+        expr = f"({rotated}) * cutlass.Int32({replicate})"
+        if width < 32:
+            expr = f"({expr}) & cutlass.Int32({self.full_word()})"
+        return _Word(self.new_word(tag, cls, expr), None, cls)
+
+    def predicate_word(self, info: _RegionInfo, tag: str, node: Node) -> _Word | None:
+        op = _COMPARE_OPERATORS[cast("Any", node.target)]
+        x, y = node.args[0], node.args[1]
+        x_dtype = _node_dtype(x) if isinstance(x, Node) else None
+        y_dtype = _node_dtype(y) if isinstance(y, Node) else None
+        if x_dtype is torch.bool and y_dtype is torch.bool and op in ("eq", "ne"):
+            assert isinstance(x, Node) and isinstance(y, Node)
+            a = self.mask_word(info, x)
+            b = self.mask_word(info, y)
+            if a is None or b is None:
+                return None
+            different = self.word_binary(tag, "^", a, b)
+            return different if op == "ne" else self.word_not(tag, different)
+        if x_dtype is torch.bool or y_dtype is torch.bool:
+            return None
+        for lhs, rhs, side_op in ((x, y, op), (y, x, _FLIP_COMPARE[op])):
+            if not isinstance(lhs, Node) or _T_LANE not in info.nodes[lhs].deps:
+                continue
+            if lhs.target is _ABS_TARGET:
+                return self.abs_word(info, tag, lhs.args[0], rhs, side_op)
+            if (operands := _floordiv_operands(lhs)) is not None:
+                return self.floordiv_word(
+                    info, tag, operands[0], operands[1], rhs, side_op
+                )
+            if info.nodes[lhs].role == "pymod":
+                return self.mod_word(info, tag, lhs, rhs, side_op)
+        lx = self.lane_linear(info, x)
+        ly = self.lane_linear(info, y)
+        if lx is None or ly is None:
+            return None
+        return self.compare_word(tag, lx, ly, op)
+
+    def mask_word(self, info: _RegionInfo, node: Node) -> _Word | None:
+        """The keep word of a predicate node, or ``None``."""
+        key = (info.tag, node)
+        if key in self.words:
+            return self.words[key]
+        self.words[key] = None
+        word = self._mask_word(info, node)
+        self.words[key] = word
+        return word
+
+    def _mask_word(self, info: _RegionInfo, node: Node) -> _Word | None:
+        meta = info.nodes[node]
+        tag = info.tag
+        if _node_dtype(node) is not torch.bool:
+            return None
+        if _T_LANE not in meta.deps:
+            return _Word(None, self.value(info, node), meta.cls)
+        if meta.role == "alias":
+            return self.mask_word(info, cast("Node", node.args[0]))
+        if meta.role == "convert":
+            source = node.args[0]
+            assert isinstance(source, Node)
+            if _node_dtype(source) is not torch.bool:
+                return None
+            return self.mask_word(info, source)
+        target = node.target
+        if target in _BOOL_NOT_TARGETS:
+            inner = self.mask_word(info, cast("Node", node.args[0]))
+            return None if inner is None else self.word_not(tag, inner)
+        for targets, op in (
+            (_BOOL_AND_TARGETS, "&"),
+            (_BOOL_OR_TARGETS, "|"),
+            (_BOOL_XOR_TARGETS, "^"),
+        ):
+            if target in targets:
+                words = [
+                    self.mask_word(info, arg) if isinstance(arg, Node) else None
+                    for arg in node.args[:2]
+                ]
+                if words[0] is None or words[1] is None:
+                    return None
+                return self.word_binary(tag, op, words[0], words[1])
+        if target in _WHERE_TARGETS:
+            if not all(isinstance(arg, Node) for arg in node.args[:3]):
+                return None
+            c, a, b = (self.mask_word(info, cast("Node", arg)) for arg in node.args[:3])
+            if c is None or a is None or b is None:
+                return None
+            return self.word_binary(
+                tag,
+                "|",
+                self.word_binary(tag, "&", c, a),
+                self.word_binary(tag, "&", self.word_not(tag, c), b),
+            )
+        if target in _COMPARE_OPERATORS:
+            return self.predicate_word(info, tag, node)
+        return None
 
     def _pointwise(
         self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str
@@ -1218,7 +1886,19 @@ class _HookEmitter:
 
     # -- assembly -----------------------------------------------------------
 
-    def render_region(self, info: _RegionInfo) -> str:
+    def render_region(self, info: _RegionInfo, *, keep_word: bool = False) -> str:
+        """Render the region; its output's expression.
+
+        With ``keep_word`` (a mask region in the bitmask form) the output is
+        rendered through the keep-word peephole: a lane word (returned as the
+        ``lane_bit`` Boolean of the element) when the whole predicate folds,
+        else the per-element value whose foldable operands read lane bits.
+        """
+        if keep_word:
+            word = self.mask_word(info, info.output)
+            if word is not None and word.expr is not None:
+                return self.lane_bit(word.expr)
+            return self.value(info, info.output)
         for node in info.region.graph.nodes:
             if node.op != "call_function":
                 continue
@@ -1294,8 +1974,14 @@ def render_flex_hook(
     tile_indent: int | None = None,
     device_function: DeviceFunction | None = None,
     coord_bounds: Sequence[int | None] | None = None,
+    mask_form: str = "bitmask",
 ) -> FlexHookCode:
     """Render the flex hook of ``stage`` for one PASS1 chunk.
+
+    ``mask_form`` selects how the mask region's predicate reaches the
+    ``-inf`` select: ``"bitmask"`` folds it into a per-chunk keep word where
+    the peephole applies (``_HookEmitter.mask_word``) and tests the lane bit
+    per element; ``"element"`` evaluates it per element.
 
     Every ``FlexHookCode`` field is complete newline-terminated lines; the
     emitter dedents and re-indents them (``indent`` is the chunk body's
@@ -1351,7 +2037,14 @@ def render_flex_hook(
         emitter.vector_width = min(widths)
         if chunk_cols % emitter.vector_width != 0:
             emitter.vector_width = 0
-    outputs = {info.tag: emitter.render_region(info) for info in infos}
+    if mask_form not in MASK_FORMS:
+        raise _unsupported(f"unknown mask form {mask_form!r}")
+    outputs = {
+        info.tag: emitter.render_region(
+            info, keep_word=info.tag == "m" and mask_form == "bitmask"
+        )
+        for info in infos
+    }
 
     store: str | None = None
     score_out = outputs.get("s")
