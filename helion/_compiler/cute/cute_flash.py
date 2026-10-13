@@ -97,7 +97,16 @@ from .flash_schedule import fa4_schedule_fits
 from .flash_schedule import max_fa4_kv_depth
 from .flash_schedule import verify_flash_schedule
 from .flash_score_mod import MASK_FORMS
+from .flash_score_mod import FlexAuxSmem
 from .flash_score_mod import FlexHookCode
+from .flash_score_mod import flex_aux_smem_candidates
+from .flash_score_mod import flex_aux_smem_layout
+from .flash_score_mod import flex_aux_smem_staged
+from .flash_score_mod import flex_coalesce_smem_bytes
+from .flash_score_mod import flex_coalesce_steps
+from .flash_score_mod import flex_coalesce_widths
+from .flash_score_mod import flex_prefetch_regs
+from .flash_score_mod import flex_prefetch_schedule
 from .flash_score_mod import render_flex_hook
 from .flash_tuning import FLASH_FLOAT16_MAX_LOG2
 from .flash_tuning import FlashCausalSeedTemplate
@@ -1886,6 +1895,7 @@ def _flash_aliased_kv_stage_cap(
     kv_tile_n: int = 128,
     use_2cta_instrs: bool = False,
     head_dim_v: int | None = None,
+    aux_smem_bytes: int = 0,
 ) -> int:
     """Largest legal aliased K/V depth for the requested output storage.
 
@@ -1893,7 +1903,9 @@ def _flash_aliased_kv_stage_cap(
     that fits in shared memory drops with it. ``head_dim_v`` names the V/O
     width of the asymmetric pair (its ring slots are the wider K tile); FA4's
     uneven three-slot layout of that pair has its own fit check
-    (``_flash_uneven_kv_ring_supported``).
+    (``_flash_uneven_kv_ring_supported``).  ``aux_smem_bytes`` is shared
+    memory the body adds outside the tiles (the flex hook's cooperative
+    table staging).
     """
     return max_fa4_kv_depth(
         FlashScheduleSpec(
@@ -1904,6 +1916,7 @@ def _flash_aliased_kv_stage_cap(
             cta_count=2 if use_2cta_instrs else 1,
             cooperative_mma=use_2cta_instrs,
             head_dim_v=head_dim_v,
+            aux_smem_bytes=aux_smem_bytes,
         )
     )
 
@@ -2470,6 +2483,63 @@ class FlashAttentionConfig:
     # chain; ``"element"`` evaluates the predicate per score element.  Only
     # the flex plans realize it; elsewhere it is pinned to the default.
     flex_mask_form: str = "bitmask"
+    # Byte budget of the flex hook's shared-memory aux staging
+    # (``flash_score_mod.flex_aux_smem_layout``): the aux tables read by
+    # data-dependent gathers are copied into the fa4 shared storage once per
+    # CTA, in plan order while the padded total fits, and their gathers
+    # become sentinel-guarded 32-bit shared-memory loads instead of clamped
+    # and selected global loads.  0 (the default) stages nothing: the
+    # staging trades the LSU path for the MIO queue the softmax warps share
+    # with their exp2 and TMEM traffic (+6.6% on three gathers per element,
+    # -1.1% on one), so the search decides.  Only flex plans with a
+    # candidate table realize it (``FLASH_FLEX_AUX_SMEM_CHOICES``; a budget
+    # resolves to the smallest choice staging the same tables); elsewhere 0.
+    flex_aux_smem: int = 0
+    # Register budget (32-bit registers per thread) of the flex hook's
+    # table prefetch (``flash_score_mod.render_flex_hook`` ``prefetch_regs``):
+    # the per-chunk vector / run / window loads of chunk ``c + depth`` are
+    # issued at the top of PASS1's iteration ``c``, ahead of the t2r copy,
+    # into a ring of ``depth + 1`` register slots the chunk body reads.
+    # Loads are taken in region order while their chunk data fits the
+    # budget and the budget's multiple of the taken set is the depth
+    # (``flex_prefetch_schedule``): the compiler already runs these loads
+    # one chunk ahead on its own, so the lever is the deeper lead that
+    # covers the L2 latency of the per-row table vectors (ncu: the hook's
+    # stalls sit on the consumers of those loads).  0 issues nothing ahead.
+    # Only flex plans with such loads realize it
+    # (``FLASH_FLEX_PREFETCH_CHOICES``; a budget resolves to the smallest
+    # choice with the same loads and depth); elsewhere 0.
+    flex_prefetch: int = 0
+    # Bytes per table row of one warp-cooperative request of the flex hook's
+    # row-table runs (``flash_score_mod.render_flex_hook`` ``coalesce``): in
+    # the fa4 softmax layout a warp's 32 lanes own 32 consecutive rows, so
+    # the per-lane 16-byte vectors of a chunk touch 32 lines per request
+    # (ncu: 31 sectors per request, the L1TEX pipe at 85% on
+    # graphormer-edge).  Under the knob the warp copies each chunk block in
+    # requests of ``flex_coalesce`` bytes per row (whole lines of 4 / 8 / 16
+    # rows at 128 / 64 / 32: 8x / 4x / 2x fewer L1 wavefronts) with
+    # ``cp.async`` straight into a per-warp shared-memory staging ring
+    # (``sFlexCoop``, ``flex_coalesce_slots`` chunk slots of ``32 x sum(chunk
+    # span + 16)`` bytes per warp) and each lane reads its row back once the
+    # chunk's group has landed: no table data round-trips through registers
+    # on the softmax warps' critical path, and the next tile's first chunks
+    # are in flight through PASS2 and the statistics handoff (ncu on
+    # graphormer-edge s2048: the hook's long-scoreboard stalls gone, L1TEX
+    # 77% -> 21% of peak).  It pays once the hook body is not instruction-
+    # fetch bound (``flex_rolled_chunks``): 1.74x on graphormer-edge s512 /
+    # s2048 and 1.23x on graphormer-spatial s2048 at their pins with both,
+    # level to slower alone.  0 (the default) keeps the per-lane vectors; the
+    # search decides.  Only flex plans with a run whose leading indices are
+    # proven affine forms realize it (``FLASH_FLEX_COALESCE_CHOICES``; a
+    # width resolves to the smallest choice with the same per-run request
+    # widths at the config's chunk width, to 0 where its staging leaves no
+    # two-deep ring); elsewhere 0.
+    flex_coalesce: int = 0
+    # Chunk slots of the cooperative staging ring (derived, not searched):
+    # the largest of 4 / 2 / 1 whose ``slots x flex_coalesce_smem_bytes``
+    # leaves a two-deep K/V ring beside the staged aux tables; the lead of
+    # the ``cp.async`` stream in chunks.  0 with ``flex_coalesce`` 0.
+    flex_coalesce_slots: int = 0
     # Skip the MMA work of query stage 0's fully masked KV tile. With two
     # 128-row query tiles (2p, 2p+1) per CTA and 128-wide KV tiles both stages
     # walk KV tiles 0..2p+1, but tile 2p+1 lies entirely above stage 0's
@@ -3755,6 +3825,9 @@ def resolve_flash_config(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_aux_smem_candidates: Sequence[int] = (),
+    flex_prefetch_regs: Sequence[int] = (),
+    flex_coalesce_steps: Sequence[int] = (),
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
 
@@ -3797,6 +3870,17 @@ def resolve_flash_config(
     statistics handoff, 128-wide KV tiles, a staged output epilogue (the
     row-guarded stores of a ragged query length), no pre-sync prologue loads
     and no loop split (one loop with a per-step tile status).
+    *flex_aux_smem_candidates* are the padded sizes of the flex hook's
+    shared-memory staging candidates (``flex_aux_smem_candidates``, plan
+    order): the budget knob resolves to the smallest choice staging the same
+    tables, to 0 without candidates.  *flex_prefetch_regs* are the registers
+    of the hook's prefetchable per-chunk table loads at 32 columns
+    (``flex_prefetch_regs``): the prefetch budget resolves to the smallest
+    choice prefetching the same loads at the config's chunk width, to 0
+    without such loads.  *flex_coalesce_steps* are the bytes per column of
+    the hook's coalescible row-table runs (``flex_coalesce_steps``): the
+    cooperative request width resolves to the smallest choice with the same
+    per-run widths at the config's chunk width, to 0 without such runs.
     """
 
     # *head_dim_v* is the V/O head dim when it differs from the Q/K
@@ -5271,6 +5355,38 @@ def resolve_flash_config(
         mma_ptx=mma_ptx,
     ):
         uneven_kv_ring = False
+    # The flex hook's shared-memory regions come out of the K/V ring's
+    # budget: the staged aux tables (``cute_flash_flex_aux_smem``) and the
+    # warp-cooperative table staging (``cute_flash_flex_coalesce``, the
+    # chunk block of every coalescible run per softmax warp: ~74 KB for the
+    # graphormer-edge pair at 16-column chunks, ~140 KB at 32).  A staging
+    # that leaves no two-deep ring resolves the request width to 0.
+    flex_aux_smem = 0
+    if flex_aux_smem_candidates:
+        flex_aux_smem = flash_flex_aux_smem_default(flex_aux_smem_candidates)
+        flex_aux_smem_cfg = _cfg(FLASH_FLEX_AUX_SMEM_KEY)
+        if flex_aux_smem_cfg is not None:
+            if flex_aux_smem_cfg not in FLASH_FLEX_AUX_SMEM_CHOICES:
+                raise InvalidConfig(
+                    f"{FLASH_FLEX_AUX_SMEM_KEY} must be one of "
+                    f"{FLASH_FLEX_AUX_SMEM_CHOICES}, got {flex_aux_smem_cfg!r}"
+                )
+            flex_aux_smem = flash_flex_aux_smem_canonical(
+                int(cast("int", flex_aux_smem_cfg)), flex_aux_smem_candidates
+            )
+    flex_aux_bytes = sum(
+        flex_aux_smem_candidates[
+            : flex_aux_smem_staged(flex_aux_smem_candidates, flex_aux_smem)
+        ]
+    )
+    flex_coalesce = _flash_flex_coalesce_resolve(
+        _cfg, flex_coalesce_steps, s_load_repetition
+    )
+    flex_coop_slot_bytes = flex_coalesce_smem_bytes(
+        flex_coalesce_steps, flex_coalesce, s_load_repetition
+    )
+    flex_coalesce_slots = 1 if flex_coop_slot_bytes else 0
+    flex_coop_bytes = flex_coop_slot_bytes
     if uneven_kv_ring:
         kv_stage = UNEVEN_KV_RING_DEPTH
     elif (
@@ -5282,12 +5398,33 @@ def resolve_flash_config(
         # Cooperative MMA partitions each K/V slot across its two CTAs. A
         # wider tile still fits fewer stages, and exceeding the budget fails
         # with cudaErrorInvalidValue rather than falling back.
+        cap_options: dict[str, object] = {
+            "head_dim_v": head_dim_v,
+            "stage_output": (epi_tma or epi_stg) and not o_over_q,
+            "kv_tile_n": kv_tile_n,
+            "use_2cta_instrs": use_2cta_instrs,
+        }
+        # The stream's ring: the deepest of 4 / 2 / 1 chunk slots that
+        # leaves a two-deep K/V ring; none fitting turns the width off.
+        flex_coalesce_slots = 0
+        for slots in (4, 2, 1) if flex_coop_slot_bytes else ():
+            if (
+                _flash_aliased_kv_stage_cap(
+                    head_dim,
+                    aux_smem_bytes=flex_aux_bytes + slots * flex_coop_slot_bytes,
+                    **cap_options,  # pyrefly: ignore[bad-argument-type]
+                )
+                >= 2
+            ):
+                flex_coalesce_slots = slots
+                break
+        if not flex_coalesce_slots:
+            flex_coalesce = 0
+        flex_coop_bytes = flex_coalesce_slots * flex_coop_slot_bytes
         aliased_kv_stage_cap = _flash_aliased_kv_stage_cap(
             head_dim,
-            head_dim_v=head_dim_v,
-            stage_output=(epi_tma or epi_stg) and not o_over_q,
-            kv_tile_n=kv_tile_n,
-            use_2cta_instrs=use_2cta_instrs,
+            aux_smem_bytes=flex_aux_bytes + flex_coop_bytes,
+            **cap_options,  # pyrefly: ignore[bad-argument-type]
         )
         kv_stage = min(max(kv_stage, 2), aliased_kv_stage_cap)
     pipeline_family = _flash_pipeline_family_from_flags(
@@ -5511,6 +5648,20 @@ def resolve_flash_config(
                 f"{flex_mask_form_cfg!r}"
             )
         flex_mask_form = str(flex_mask_form_cfg)
+    flex_prefetch = 0
+    if flex_prefetch_regs:
+        flex_prefetch = flash_flex_prefetch_default(flex_prefetch_regs)
+        flex_prefetch_cfg = _cfg(FLASH_FLEX_PREFETCH_KEY)
+        if flex_prefetch_cfg is not None:
+            if flex_prefetch_cfg not in FLASH_FLEX_PREFETCH_CHOICES:
+                raise InvalidConfig(
+                    f"{FLASH_FLEX_PREFETCH_KEY} must be one of "
+                    f"{FLASH_FLEX_PREFETCH_CHOICES}, got {flex_prefetch_cfg!r}"
+                )
+            flex_prefetch = int(cast("int", flex_prefetch_cfg))
+        flex_prefetch = flash_flex_prefetch_canonical(
+            flex_prefetch, flex_prefetch_regs, s_load_repetition
+        )
     # The dead stage-0 tile exists where the two 128-row query tiles share one
     # 128-wide KV walk that starts at stage 1's diagonal: the descending plain
     # causal fa4 PTX body (the zero store is stage 0's first masked step).
@@ -5752,6 +5903,10 @@ def resolve_flash_config(
         causal_loop_split=causal_loop_split,
         causal_mask_storeback=causal_mask_storeback,
         flex_mask_form=flex_mask_form,
+        flex_aux_smem=flex_aux_smem,
+        flex_prefetch=flex_prefetch,
+        flex_coalesce=flex_coalesce,
+        flex_coalesce_slots=flex_coalesce_slots,
         causal_skip_dead_tile=causal_skip_dead_tile,
         causal_stagger=causal_stagger,
         causal_head_pair=causal_head_pair,
@@ -6026,6 +6181,9 @@ FLASH_TENSOR_4D_TMA_KEY = "cute_flash_tensor_4d_tma"
 FLASH_CAUSAL_LOOP_SPLIT_KEY = "cute_flash_causal_loop_split"
 FLASH_CAUSAL_MASK_STOREBACK_KEY = "cute_flash_causal_mask_storeback"
 FLASH_FLEX_MASK_FORM_KEY = "cute_flash_flex_mask_form"
+FLASH_FLEX_AUX_SMEM_KEY = "cute_flash_flex_aux_smem"
+FLASH_FLEX_PREFETCH_KEY = "cute_flash_flex_prefetch"
+FLASH_FLEX_COALESCE_KEY = "cute_flash_flex_coalesce"
 FLASH_CAUSAL_SKIP_DEAD_TILE_KEY = "cute_flash_causal_skip_dead_tile"
 FLASH_CAUSAL_STAGGER_KEY = "cute_flash_causal_stagger"
 FLASH_CAUSAL_HEAD_PAIR_KEY = "cute_flash_causal_head_pair"
@@ -6131,6 +6289,38 @@ FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] =
     },
     (FLASH_KV_SPLIT_KEY, 4): {
         FLASH_PIPELINE_FAMILY_KEY: "fa4",
+    },
+    (FLASH_FLEX_AUX_SMEM_KEY, 4096): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_AUX_SMEM_KEY, 16384): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_PREFETCH_KEY, 32): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_PREFETCH_KEY, 64): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_PREFETCH_KEY, 128): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_COALESCE_KEY, 32): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_COALESCE_KEY, 64): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
+    (FLASH_FLEX_COALESCE_KEY, 128): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
     },
     # Segment-aligned tiling of the per-row KV lower bound: the
     # non-persistent FA4 pair body with a staged epilogue in its own ``sO``
@@ -6259,6 +6449,9 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_FLEX_DEAD_STAGE_SPLIT_KEY,
     FLASH_FLEX_MASK_FORM_KEY,
     FLASH_KV_SPLIT_KEY,
+    FLASH_FLEX_AUX_SMEM_KEY,
+    FLASH_FLEX_PREFETCH_KEY,
+    FLASH_FLEX_COALESCE_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -6364,7 +6557,44 @@ def flash_effective_config_values(
         FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: config.flex_dead_stage_split,
         FLASH_FLEX_MASK_FORM_KEY: config.flex_mask_form,
         FLASH_KV_SPLIT_KEY: config.kv_split,
+        FLASH_FLEX_AUX_SMEM_KEY: config.flex_aux_smem,
+        FLASH_FLEX_PREFETCH_KEY: config.flex_prefetch,
+        FLASH_FLEX_COALESCE_KEY: config.flex_coalesce,
     }
+
+
+# Byte budgets of the flex hook's shared-memory aux staging; the default is
+# off (the staging is a trade-off the search decides, see
+# ``FlashAttentionConfig.flex_aux_smem``).
+FLASH_FLEX_AUX_SMEM_CHOICES: tuple[int, ...] = (0, 4096, 16384)
+FLASH_FLEX_AUX_SMEM_DEFAULT_BUDGET = 0
+
+
+def flash_flex_aux_smem_canonical(budget: int, candidates: Sequence[int]) -> int:
+    """The smallest ``FLASH_FLEX_AUX_SMEM_CHOICES`` budget staging the same
+    leading ``candidates`` (padded table sizes, ``flex_aux_smem_candidates``)
+    as ``budget``: the effective identity of the knob."""
+    staged = flex_aux_smem_staged(candidates, budget)
+    for choice in FLASH_FLEX_AUX_SMEM_CHOICES:
+        if flex_aux_smem_staged(candidates, choice) == staged:
+            return choice
+    return 0
+
+
+def flash_flex_aux_smem_default(candidates: Sequence[int]) -> int:
+    return flash_flex_aux_smem_canonical(FLASH_FLEX_AUX_SMEM_DEFAULT_BUDGET, candidates)
+
+
+def flash_flex_aux_smem_choices(candidates: Sequence[int]) -> tuple[int, ...]:
+    """The budgets that stage distinct table sets (always including 0)."""
+    return tuple(
+        sorted(
+            {
+                flash_flex_aux_smem_canonical(choice, candidates)
+                for choice in FLASH_FLEX_AUX_SMEM_CHOICES
+            }
+        )
+    )
 
 
 def _flash_dense_resident_workload_supported(
@@ -6476,6 +6706,141 @@ def _flash_tmem_rowmax_supported(
             target_device_capability
         ).hardware.supports_tmem_row_reduce
     )
+
+
+# Register budgets of the flex hook's next-chunk table prefetch.
+FLASH_FLEX_PREFETCH_CHOICES: tuple[int, ...] = (0, 32, 64, 128)
+# 64: two chunks of lead over a 32-register table at 32 columns (four at 16);
+# 32 reproduces the compiler's own one-chunk schedule (a no-op), 64 measured
+# -0.8% on graphormer-spatial and graphormer-edge at s2048 (ABAB, GPU 7).
+FLASH_FLEX_PREFETCH_DEFAULT = 64
+
+
+def flash_flex_prefetch_canonical(
+    budget: int, regs: Sequence[int], chunk_cols: int
+) -> int:
+    """The smallest ``FLASH_FLEX_PREFETCH_CHOICES`` budget prefetching the
+    same loads at the same depth as ``budget`` at ``chunk_cols``-column
+    chunks: ``regs`` are the loads' registers at 32 columns
+    (``flex_prefetch_regs``), scaled to the chunk width."""
+    scaled = [-(-size * chunk_cols // 32) for size in regs]
+    chunks = 128 // chunk_cols
+    schedule = flex_prefetch_schedule(scaled, budget, chunks)
+    for choice in FLASH_FLEX_PREFETCH_CHOICES:
+        if flex_prefetch_schedule(scaled, choice, chunks) == schedule:
+            return choice
+    return 0
+
+
+def flash_flex_prefetch_choices(regs: Sequence[int]) -> tuple[int, ...]:
+    """The budgets that prefetch distinct load sets at some chunk width
+    (always including 0)."""
+    choices = {0}
+    for chunk_cols in (16, 32):
+        choices.update(
+            flash_flex_prefetch_canonical(choice, regs, chunk_cols)
+            for choice in FLASH_FLEX_PREFETCH_CHOICES
+        )
+    return tuple(sorted(choices))
+
+
+def flash_flex_prefetch_default(regs: Sequence[int]) -> int:
+    """The default budget of a plan with per-chunk table loads: the
+    ``FLASH_FLEX_PREFETCH_DEFAULT`` budget canonicalized against the loads
+    (at 16-column chunks, the width with the deeper lead), so the default is
+    always one of the searched choices.  A plan whose only per-chunk load is
+    an 8-register byte vector reaches the depth cap at 32 already; 64 would
+    resolve to 32 at every chunk width and could never be covered.  0 without
+    such loads."""
+    if not regs:
+        return 0
+    return flash_flex_prefetch_canonical(FLASH_FLEX_PREFETCH_DEFAULT, regs, 16)
+
+
+# Bytes per row of one warp-cooperative request of the flex hook's row-table
+# runs (``FlashAttentionConfig.flex_coalesce``; the widths of
+# ``flex_coop_layout.COOP_WIDTHS`` plus off).
+FLASH_FLEX_COALESCE_CHOICES: tuple[int, ...] = (0, 32, 64, 128)
+# Off: the stream pays with the rolled chunk loop and costs without it (see
+# ``flex_coalesce``), so the per-lane vectors stay the default and the search
+# measures the widths; every cold autotune of the graphormer variants chose a
+# width (64 at 16-column chunks, 128 at 32).
+FLASH_FLEX_COALESCE_DEFAULT = 0
+
+
+def flash_flex_coalesce_canonical(
+    width: int, steps: Sequence[int], chunk_cols: int
+) -> int:
+    """The smallest ``FLASH_FLEX_COALESCE_CHOICES`` width giving every
+    coalescible run (``steps``: bytes per column, ``flex_coalesce_steps``)
+    the same request width as ``width`` at ``chunk_cols``-column chunks:
+    the effective identity of the knob."""
+    widths = flex_coalesce_widths(steps, width, chunk_cols)
+    for choice in FLASH_FLEX_COALESCE_CHOICES:
+        if flex_coalesce_widths(steps, choice, chunk_cols) == widths:
+            return choice
+    return 0
+
+
+def _flash_flex_coalesce_fits(
+    steps: Sequence[int], width: int, chunk_cols: int, head_dim: int
+) -> bool:
+    """Whether the staging of ``width`` at ``chunk_cols`` leaves a two-deep
+    ring on the flex surface's smallest body (two Q tiles, the two staged O
+    tiles the list walk pins): the bodies the search can reach."""
+    return (
+        max_fa4_kv_depth(
+            FlashScheduleSpec(
+                head_dim=head_dim,
+                kv_depth=2,
+                stage_output=True,
+                aux_smem_bytes=flex_coalesce_smem_bytes(steps, width, chunk_cols),
+            )
+        )
+        >= 2
+    )
+
+
+def flash_flex_coalesce_choices(steps: Sequence[int], head_dim: int) -> tuple[int, ...]:
+    """The widths that give distinct per-run request widths at some chunk
+    width whose staging fits the surface's bodies (always including 0): the
+    graphormer-edge pair's 136 KB at 32 columns fits no searched body at
+    hd64, so 128 is not offered there while 64 / 32 are (at 16 columns)."""
+    choices = {0}
+    for chunk_cols in (16, 32):
+        for choice in FLASH_FLEX_COALESCE_CHOICES:
+            width = flash_flex_coalesce_canonical(choice, steps, chunk_cols)
+            if width and _flash_flex_coalesce_fits(steps, width, chunk_cols, head_dim):
+                choices.add(width)
+    return tuple(sorted(choices))
+
+
+def _flash_flex_coalesce_resolve(
+    cfg: Callable[[str], object], steps: Sequence[int], chunk_cols: int
+) -> int:
+    """The resolved cooperative request width: the default (or the config's
+    value, validated) canonicalized against the plan's coalescible runs at
+    the config's chunk width; 0 without such runs."""
+    if not steps:
+        return 0
+    width = flash_flex_coalesce_default(steps)
+    requested = cfg(FLASH_FLEX_COALESCE_KEY)
+    if requested is not None:
+        if requested not in FLASH_FLEX_COALESCE_CHOICES:
+            raise InvalidConfig(
+                f"{FLASH_FLEX_COALESCE_KEY} must be one of "
+                f"{FLASH_FLEX_COALESCE_CHOICES}, got {requested!r}"
+            )
+        width = int(cast("int", requested))
+    return flash_flex_coalesce_canonical(width, steps, chunk_cols)
+
+
+def flash_flex_coalesce_default(steps: Sequence[int]) -> int:
+    """The default width of a plan with coalescible runs
+    (``FLASH_FLEX_COALESCE_DEFAULT``, off); 0 without such runs."""
+    if not steps:
+        return 0
+    return FLASH_FLEX_COALESCE_DEFAULT
 
 
 def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T, ...]:
@@ -9004,6 +9369,9 @@ def flash_autotune_fragments(
     flex_has_mask_region: bool = False,
     device_sm_count: int = 0,
     q_seq: int | None = None,
+    flex_aux_smem_candidates: Sequence[int] = (),
+    flex_prefetch_regs: Sequence[int] = (),
+    flex_coalesce_steps: Sequence[int] = (),
 ) -> dict[str, ConfigSpecFragment]:
     """Build a legality-driven, length-invariant flash search surface.
 
@@ -9024,6 +9392,17 @@ def flash_autotune_fragments(
     ``device_sm_count`` and ``q_seq`` (0 / None when unknown) seed the list
     walk's split-KV knob from the item count of the fa4 pair grid
     (``_flash_kv_split_seed``); the KV length never enters the surface.
+    ``flex_aux_smem_candidates`` (the padded sizes of the hook's
+    shared-memory staging candidates) opens the staging budget (default 0)
+    to the budgets that stage distinct table sets; without candidates it is
+    pinned to 0.  ``flex_prefetch_regs`` (the registers of the hook's
+    prefetchable per-chunk table loads at 32 columns) opens the prefetch
+    budget (default 64) to the budgets that prefetch distinct load sets at
+    distinct depths; without such loads it is pinned to 0.
+    ``flex_coalesce_steps`` (the bytes per column of the hook's coalescible
+    row-table runs) opens the cooperative request width (default 0) to the
+    widths that give distinct per-run widths and whose staging fits the
+    surface's bodies; without such runs it is pinned to 0.
     """
 
     if tmem_rowmax_compatible is None:
@@ -10352,6 +10731,27 @@ def flash_autotune_fragments(
             MASK_FORMS,
             MASK_FORMS if has_list_walk and flex_has_mask_region else ("bitmask",),
         ),
+        FLASH_FLEX_AUX_SMEM_KEY: enum(
+            flash_flex_aux_smem_default(flex_aux_smem_candidates),
+            FLASH_FLEX_AUX_SMEM_CHOICES,
+            flash_flex_aux_smem_choices(flex_aux_smem_candidates)
+            if has_list_walk and flex_aux_smem_candidates
+            else (flash_flex_aux_smem_default(flex_aux_smem_candidates),),
+        ),
+        FLASH_FLEX_PREFETCH_KEY: enum(
+            flash_flex_prefetch_default(flex_prefetch_regs),
+            FLASH_FLEX_PREFETCH_CHOICES,
+            flash_flex_prefetch_choices(flex_prefetch_regs)
+            if has_list_walk and flex_prefetch_regs
+            else (flash_flex_prefetch_default(flex_prefetch_regs),),
+        ),
+        FLASH_FLEX_COALESCE_KEY: enum(
+            flash_flex_coalesce_default(flex_coalesce_steps),
+            FLASH_FLEX_COALESCE_CHOICES,
+            flash_flex_coalesce_choices(flex_coalesce_steps, head_dim)
+            if has_list_walk and flex_coalesce_steps
+            else (flash_flex_coalesce_default(flex_coalesce_steps),),
+        ),
     }
     if valid_family == "fa4_alt":
         for key, value in (
@@ -10448,6 +10848,9 @@ def flash_config_from_config(
     score_modifier_kinds: Sequence[str] = (),
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_aux_smem_candidates: Sequence[int] = (),
+    flex_prefetch_regs: Sequence[int] = (),
+    flex_coalesce_steps: Sequence[int] = (),
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -10477,6 +10880,9 @@ def flash_config_from_config(
         score_modifier_kinds=score_modifier_kinds,
         fast_math=fast_math,
         has_list_walk=has_list_walk,
+        flex_aux_smem_candidates=flex_aux_smem_candidates,
+        flex_prefetch_regs=flex_prefetch_regs,
+        flex_coalesce_steps=flex_coalesce_steps,
     )
 
 
@@ -14249,6 +14655,85 @@ def _flash_flex_walk_step(
     return lines
 
 
+def _flash_flex_walk_peek(
+    rem_prefix: str,
+    words: int,
+    *,
+    target: str,
+    descending: bool,
+    indent: str,
+) -> list[str]:
+    """Lines reading the walk's next tile out of the remaining union bitmask
+    without consuming it (the scan of ``_flash_flex_walk_step``, no clear):
+    ``target`` is the next tile, 0 when no tile remains (the loads the hook
+    prefetches for it are then dead)."""
+    lines = [f"{indent}{target} = cutlass.Int32(0)"]
+    order = range(words) if descending else reversed(range(words))
+    for word in order:
+        value = f"{rem_prefix}{word}"
+        if not descending:
+            value = f"({value} & (cutlass.Int32(0) - {value}))"
+        lines.append(
+            f"{indent}{target} = cutlass.Int32(cutlass.select_({rem_prefix}{word} != 0, "
+            f"cutlass.Int32({word * 32 + 31}) - cutlass.Int32(cute.arch.clz({value})), "
+            f"{target}))"
+        )
+    return lines
+
+
+def _flash_flex_prefetch_fill(
+    blocks: Sequence[str], depth: int, tile: str, *, indent: str, init: bool
+) -> str:
+    """The hook's prefetch block run for chunks ``0 .. depth - 1`` of KV tile
+    ``tile`` into ring slots ``0 .. depth - 1``, then chunk 0 again into slot
+    ``depth`` (the same addresses: the compiler merges the loads) so every
+    slot of the loop-carried ring holds a value of the same structure;
+    ``init`` creates the slots (the first fill of a work item).  ``blocks``
+    are the (deduplicated) prefetch blocks of the stage's hooks."""
+    lines = [f"{indent}flash_flex_pkv = {tile}"]
+    for slot in range(depth + 1):
+        chunk = slot if slot < depth else 0
+        lines.extend(
+            (
+                f"{indent}flash_flex_pc = {chunk}",
+                f"{indent}flash_flex_ps = {slot}",
+                f"{indent}flash_flex_pf_init = {init and slot == 0}",
+                *(
+                    _flash_flex_hook_lines(block, indent).rstrip("\n")
+                    for block in blocks
+                ),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _flash_flex_stream_fill(
+    blocks: Sequence[str], slots: int, tile: str, *, indent: str
+) -> str:
+    """The cooperative stream's issue blocks run for chunks ``0 .. slots -
+    1`` of KV tile ``tile`` into staging slots ``0 .. slots - 1`` after
+    every earlier copy has landed (the slots may still hold a previous
+    item's or an absent tile's copies) and the warp has passed its reads.
+    ``blocks`` are the (deduplicated) issue blocks of the stage's hooks."""
+    lines = [
+        f"{indent}cute.arch.cp_async_wait_group(0)",
+        f"{indent}cute.arch.sync_warp()",
+        f"{indent}flash_flex_pkv = {tile}",
+    ]
+    for slot in range(slots):
+        lines.extend(
+            (
+                f"{indent}flash_flex_pc = {slot}",
+                f"{indent}flash_flex_ps = {slot}",
+                *(
+                    _flash_flex_hook_lines(block, indent).rstrip("\n")
+                    for block in blocks
+                ),
+            )
+        )
+    return "\n".join(lines)
+
+
 def _flash_flex_split_status_lines(stage: str, words: int, *, indent: str) -> list[str]:
     """Lines overriding ``flash_flex_status`` on a split item
     (``flash_flex_split``): the two stages take the first stage's tiles
@@ -14540,6 +15025,88 @@ def _flash_flex_split_trim_lines(
             )
     lines += [f"flash_flex_u{word} = flash_flex_k{word}" for word in range(words)]
     lines.append("flash_num_active_kv = cutlass.max(cutlass.Int32(1), flash_flex_cnt)")
+    return lines
+
+
+def _flash_flex_coord_bounds(
+    score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
+) -> tuple[int | None, ...]:
+    """Coordinate bounds of every (live or dead) row and column the walk
+    evaluates the hook on: the pair's 256 rows up to the last pair, the KV
+    tiles up to ``num_kv`` (the renderer's static bounds proof);
+    ``num_heads`` is the query head count the ``b`` / ``h`` roots divide
+    ``flash_bh`` by."""
+    return (
+        num_bh // num_heads,
+        num_heads,
+        None if score_plan.q_seq is None else -(-score_plan.q_seq // 256) * 256,
+        num_kv * 128,
+    )
+
+
+def _flash_flex_prefetch_regs(
+    score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
+) -> tuple[int, ...]:
+    """The prefetch budget fact of a flex plan (empty off flex)."""
+    if not score_plan.is_flex:
+        return ()
+    return flex_prefetch_regs(
+        score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
+    )
+
+
+def _flash_flex_coalesce_steps(
+    score_plan: AttentionScorePlan, num_bh: int, num_heads: int, num_kv: int
+) -> tuple[int, ...]:
+    """The cooperative-width fact of a flex plan (empty off flex)."""
+    if not score_plan.is_flex:
+        return ()
+    return flex_coalesce_steps(
+        score_plan, _flash_flex_coord_bounds(score_plan, num_bh, num_heads, num_kv)
+    )
+
+
+def _flash_flex_aux_smem_fill(
+    score_plan: AttentionScorePlan, layout: Sequence[FlexAuxSmem]
+) -> list[str]:
+    """Bind and fill the hook's shared-memory aux copies (unindented lines of
+    the CTA-wide setup, before the setup ``sync_threads``).
+
+    ``storage.sFlexAux`` holds the staged tables back to back at their
+    ``byte_offset``; the 512 threads copy each table element by element
+    (``_flash_aux{i}.iterator`` -> ``_flash_aux{i}_smem``, the hook's
+    pointer in the table's dtype, bytes for a bool table) and thread
+    ``numel % 512`` writes the zero sentinel the renderer's out-of-range
+    gathers select.
+    """
+    from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLOpOverrides
+
+    lines = ["flash_flex_aux_smem = storage.sFlexAux.data_ptr()"]
+    for entry in layout:
+        buffer = score_plan.aux_buffers[entry.aux_index]
+        dtype = (
+            "cutlass.Int8"
+            if buffer.dtype is torch.bool
+            else CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE[buffer.dtype]
+        )
+        pointer = f"_flash_aux{entry.aux_index}_smem"
+        source = f"_flash_aux{entry.aux_index}.iterator"
+        passes = -(-(entry.numel + 1) // 512)
+        bind = (
+            f"{pointer} = cute.recast_ptr(flash_flex_aux_smem + "
+            f"{entry.byte_offset // 4}, dtype={dtype})"
+        )
+        lines.extend(
+            (
+                bind,
+                f"for flash_fa in cutlass.range_constexpr({passes}):",
+                "    flash_fa_i = tidx + flash_fa * 512",
+                f"    if flash_fa_i < {entry.numel}:",
+                f"        ({pointer} + flash_fa_i).store(({source} + flash_fa_i).load())",
+                f"    if flash_fa_i == {entry.numel}:",
+                f"        ({pointer} + flash_fa_i).store({dtype}(0))",
+            )
+        )
     return lines
 
 
@@ -15055,6 +15622,18 @@ def emit_flash_fa4_device_body(
         assert acknowledged_stat_pipeline
     if use_causal_stateful_softmax:
         assert acknowledged_stat_pipeline
+    # The flex hook's warp-cooperative table staging (``cute_flash_flex_coalesce``):
+    # one buffer per softmax warp, sized by the widest request of the hook's
+    # runs at this chunk width (the renderer derives the same layout); part of
+    # the verified schedules' shared memory and of the storage below.
+    flex_coop_bytes = 0
+    if flex_body and cfg.flex_coalesce:
+        assert num_heads is not None
+        flex_coop_bytes = cfg.flex_coalesce_slots * flex_coalesce_smem_bytes(
+            _flash_flex_coalesce_steps(score_plan, num_bh, num_heads, num_kv),
+            cfg.flex_coalesce,
+            cfg.s_load_repetition,
+        )
     verified_shared_memory_bytes: int | None = None
     if separate_kv_rings:
         assert not use_cga2_local_cta
@@ -15069,6 +15648,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    aux_smem_bytes=flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     cta_count=2 if use_2cta_instrs else 1,
@@ -15098,6 +15678,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    aux_smem_bytes=flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     cta_count=2,
@@ -15130,6 +15711,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    aux_smem_bytes=flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     causal=True,
@@ -15157,6 +15739,7 @@ def emit_flash_fa4_device_body(
                 FlashScheduleSpec(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
+                    aux_smem_bytes=flex_coop_bytes,
                     kv_depth=kv_stage,
                     query_slots_per_cta=q_stage,
                     causal=is_causal,
@@ -15365,6 +15948,28 @@ def emit_flash_fa4_device_body(
         storage_extra_args += f", head_dim_v={hd_v}"
     if uneven_kv_ring:
         storage_extra_args += ", uneven_kv_ring=True"
+    # The flex hook's shared-memory aux staging: the staged tables' region
+    # at the end of the storage, filled by every thread of the CTA before
+    # the setup sync (the softmax warps read it after).
+    flex_aux_layout = (
+        flex_aux_smem_layout(score_plan, cfg.flex_aux_smem) if flex_body else []
+    )
+    flex_aux_smem_setup = ""
+    if flex_aux_layout:
+        flex_aux_bytes = sum(entry.padded_bytes for entry in flex_aux_layout)
+        storage_extra_args += f", flex_aux_bytes={flex_aux_bytes}"
+        flex_aux_smem_setup = "\n" + "\n".join(
+            _flash_flex_aux_smem_fill(score_plan, flex_aux_layout)
+        )
+    if flex_coop_bytes:
+        storage_extra_args += f", flex_coop_bytes={flex_coop_bytes}"
+        flex_aux_smem_setup += "\n_flash_flex_coop_smem = storage.sFlexCoop.data_ptr()"
+    if flex_aux_layout or flex_coop_bytes:
+        # The schedule model's byte count is a conservative bound once the
+        # hook's regions sit in the padding below ``sQ`` (within 528 bytes of
+        # the struct, above it); the exact-size check stays for the bodies
+        # it was built for.
+        verified_shared_memory_bytes = None
     prefetch_epi_tma = (
         "\n    cute_cpasync_flash.prefetch_descriptor(_flash_tma_o)"
         if cfg.epi_tma
@@ -16007,7 +16612,7 @@ flash_local_tidx = tidx % 128{prefetch_descriptors}
 _flash_storage_cls = _helion_flash_rt.flash_fa4_shared_storage(
     {hd}, {kv_stage}, {q_stage}, {s_corr_stage}, {io_dtype}{storage_extra_args}){storage_size_assert}
 smem = cutlass_utils_flash.SmemAllocator()
-storage = smem.allocate(_flash_storage_cls)
+storage = smem.allocate(_flash_storage_cls){flex_aux_smem_setup}
 sQ = storage.sQ.get_tensor(_flash_qsl.outer, swizzle=_flash_qsl.inner)
 {smem_kv_setup}
 flash_scale_t = storage.sScale.get_tensor({scale_layout})
@@ -18114,7 +18719,7 @@ if warp_idx == 15:
         ld: str,
         ldt: str,
         score_m_tile_expr: str,
-        modifier_rowmax_block: Callable[[str], str],
+        modifier_rowmax_block: Callable[..., str],
         *,
         pass2_block: str,
         pass2_masked_block: str,
@@ -18149,15 +18754,16 @@ if warp_idx == 15:
             "chunk_expr": "flash_ci",
             "chunk_cols": cfg.s_load_repetition,
             "mask_form": cfg.flex_mask_form,
+            "aux_smem_budget": cfg.flex_aux_smem,
+            "prefetch_regs": cfg.flex_prefetch,
+            "coalesce": cfg.flex_coalesce,
+            "coop_slots": cfg.flex_coalesce_slots or 1,
             "indent": 16,
             # Coordinate bounds of every (live or dead) row and column the
             # walk evaluates the hook on: the pair's 256 rows up to the last
             # pair, the KV tiles up to ``num_kv``.
-            "coord_bounds": (
-                num_bh // num_heads,
-                num_heads,
-                None if score_plan.q_seq is None else -(-score_plan.q_seq // 256) * 256,
-                num_kv * 128,
+            "coord_bounds": _flash_flex_coord_bounds(
+                score_plan, num_bh, num_heads, num_kv
             ),
         }
         hooks: list[FlexHookCode] = []
@@ -18165,6 +18771,13 @@ if warp_idx == 15:
             "            flash_row_max = _helion_flash_rt.fa4_disc_rowmax_balanced(\n"
             f"                {ld}, {ldt}, tLDcS, flash_row_max, flash_LD_CHUNKS)"
         )
+        # The hook's table prefetch (``cute_flash_flex_prefetch``) spans KV
+        # steps: the ring of chunk slots is filled for the walk's next tile
+        # after every step's PASS1 (and for the first tile before the loop)
+        # from a non-consuming peek of the walk, so the vectors of a tile are
+        # in flight through the previous step's PASS2, its prologue and the
+        # S wait instead of heading the tile.
+        cross_tile = cfg.flex_prefetch > 0
         if with_score:
             full_hook = render_flex_hook(
                 score_plan,
@@ -18175,7 +18788,13 @@ if warp_idx == 15:
             )
             hooks.append(full_hook)
             full_rowmax_block = modifier_rowmax_block(
-                "\n" + _flash_flex_hook_lines(full_hook.chunk_body, " " * 16).rstrip()
+                "\n" + _flash_flex_hook_lines(full_hook.chunk_body, " " * 16).rstrip(),
+                full_hook.chunk_prefetch,
+                full_hook.prefetch_depth,
+                cross_tile,
+                consume=full_hook.chunk_consume,
+                issue=full_hook.chunk_issue,
+                slots=full_hook.coop_slots,
             )
         else:
             full_rowmax_block = dense_rowmax_block
@@ -18197,7 +18816,14 @@ if warp_idx == 15:
             )
             hooks.append(masked_hook)
             masked_rowmax_block = modifier_rowmax_block(
-                "\n" + _flash_flex_hook_lines(masked_hook.chunk_body, " " * 16).rstrip()
+                "\n"
+                + _flash_flex_hook_lines(masked_hook.chunk_body, " " * 16).rstrip(),
+                masked_hook.chunk_prefetch,
+                masked_hook.prefetch_depth,
+                cross_tile,
+                consume=masked_hook.chunk_consume,
+                issue=masked_hook.chunk_issue,
+                slots=masked_hook.coop_slots,
             )
             rowmax_block = f"""            if flash_flex_needs_mask:
 {textwrap.indent(masked_rowmax_block, "    ")}
@@ -18220,6 +18846,40 @@ if warp_idx == 15:
         ) + _flash_flex_unique_blocks(
             [_flash_flex_hook_lines(hook.item_prelude, " " * 8) for hook in hooks]
         )
+        prefetch_depth = max((hook.prefetch_depth for hook in hooks), default=0)
+        prefetch_blocks = list(
+            dict.fromkeys(hook.chunk_prefetch for hook in hooks if hook.chunk_prefetch)
+        )
+        # The cooperative table stream (``cute_flash_flex_coalesce``): the
+        # issue blocks of the stage's hooks (one text where both agree) fill
+        # the ring for the first tile before the loop and for the peeked
+        # next tile at an absent step; the in-loop issues live in the
+        # PASS1 blocks.
+        coop_slots = max((hook.coop_slots for hook in hooks), default=0)
+        issue_blocks = list(
+            dict.fromkeys(hook.chunk_issue for hook in hooks if hook.chunk_issue)
+        )
+        peek_lines: list[str] = []
+        first_tile = "0"
+        needs_peek = prefetch_depth or coop_slots
+        if needs_peek and list_walk:
+            peek_lines = _flash_flex_walk_peek(
+                "flash_flex_rem",
+                words,
+                target="flash_kv_peek",
+                descending=desc_kv,
+                indent="            ",
+            )
+        elif needs_peek:
+            peek_lines = [
+                (
+                    "            flash_kv_peek = cutlass.max(flash_kv - cutlass.Int32(1), cutlass.Int32(0))"
+                    if desc_kv
+                    else f"            flash_kv_peek = cutlass.min(flash_kv + cutlass.Int32(1), {kv_loop_bound} - cutlass.Int32(1))"
+                )
+            ]
+            if desc_kv:
+                first_tile = f"{kv_loop_bound} - cutlass.Int32(1)"
         if list_walk:
             tile_prologue_lines = [
                 *_flash_flex_walk_step(
@@ -18229,6 +18889,7 @@ if warp_idx == 15:
                     descending=desc_kv,
                     indent="            ",
                 ),
+                *peek_lines,
                 _flash_flex_status_line(
                     f"flash_flex_p{list_stage}_",
                     f"flash_flex_f{list_stage}_",
@@ -18250,6 +18911,7 @@ if warp_idx == 15:
                     if desc_kv
                     else "            flash_kv = flash_kv_iter"
                 ),
+                *peek_lines,
                 f"            flash_flex_status = cutlass.Int32({2 if with_mask else 1})",
             ]
         if needs_mask_line:
@@ -18271,6 +18933,60 @@ if warp_idx == 15:
         segment = _FlashSoftmaxLoopSegment(
             loop_var="flash_kv_iter", loop_bound=kv_loop_bound
         )
+        pre_loop_fill = ""
+        tile_epilogue = ""
+        first_peek = (
+            _flash_flex_walk_peek(
+                "flash_flex_rem",
+                words,
+                target="flash_kv_peek",
+                descending=desc_kv,
+                indent="        ",
+            )
+            if list_walk
+            else [f"        flash_kv_peek = {first_tile}"]
+        )
+        pre_loop_parts: list[str] = []
+        epilogue_parts: list[str] = []
+        if prefetch_depth:
+            # The first tile's fill before the loop (a peek of the initial
+            # words on the list walk), the next tile's after every PASS1.
+            pre_loop_parts.append(
+                _flash_flex_prefetch_fill(
+                    prefetch_blocks,
+                    prefetch_depth,
+                    "flash_kv_peek",
+                    indent=" " * 8,
+                    init=True,
+                )
+            )
+            epilogue_parts.append(
+                _flash_flex_prefetch_fill(
+                    prefetch_blocks,
+                    prefetch_depth,
+                    "flash_kv_peek",
+                    indent=" " * 12,
+                    init=False,
+                )
+            )
+        if coop_slots:
+            # The stream: chunks ``0 .. slots - 1`` of the first tile before
+            # the loop; on an absent step (PASS1 skipped, nothing issued for
+            # the next tile) the same chunks of the peeked tile.
+            pre_loop_parts.append(
+                _flash_flex_stream_fill(
+                    issue_blocks, coop_slots, "flash_kv_peek", indent=" " * 8
+                )
+            )
+            epilogue_parts.append(
+                "            if flash_flex_status == 0:\n"
+                + _flash_flex_stream_fill(
+                    issue_blocks, coop_slots, "flash_kv_peek", indent=" " * 16
+                )
+            )
+        if pre_loop_parts:
+            pre_loop_fill = "\n".join([*first_peek, *pre_loop_parts])
+            tile_epilogue = "\n".join(epilogue_parts)
         loop = format_disc_loop(
             segment,
             rowmax_block,
@@ -18278,7 +18994,10 @@ if warp_idx == 15:
             zero_first_tile=True,
             zero_tile_condition="flash_flex_status != 0",
             tile_prologue=tile_prologue,
+            tile_epilogue=tile_epilogue,
         )
+        if pre_loop_fill:
+            loop = f"{pre_loop_fill}\n{loop}"
         return f"""{item_prelude}        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
 {loop}
@@ -18660,6 +19379,7 @@ if warp_idx == 15:
                 early_alpha_acquire: bool = False,
                 tile_prologue: str = "",
                 zero_tile_condition: str | None = None,
+                tile_epilogue: str = "",
             ) -> str:
                 # ``zero_tile_condition`` names the tiles that are computed
                 # (the others publish zero P); it defaults to the loop's
@@ -18693,11 +19413,15 @@ if warp_idx == 15:
                     segment.not_first_condition,
                     known_not_first=segment.continues_previous_segment,
                 )
+                # ``tile_epilogue`` (the flex hook's cross-tile prefetch fill)
+                # runs after PASS1 on every step, computed or not, ahead of
+                # PASS2.
+                epilogue = f"{tile_epilogue}\n" if tile_epilogue else ""
                 iteration = _FlashOnlineSoftmaxIteration(
                     load_and_reduce=loop_rowmax_block,
                     alpha_pre_probability=alpha_block,
                     alpha_publish_pre_probability=alpha_publish,
-                    probability_update=f"""{minus_scale_block}
+                    probability_update=f"""{epilogue}{minus_scale_block}
             flash_p_sum = cutlass.Float32(0.0)
 {loop_pass2_block}""",
                     tile_prologue=f"\n{tile_prologue}" if tile_prologue else "",
@@ -18732,10 +19456,68 @@ if warp_idx == 15:
                         row_kv_begin_guard=False,
                     )
 
-                def _modifier_rowmax_block(transform: str) -> str:
-                    return f"""            flash_ld_shape = tLDcS[None, 0, None, None].shape
+                def _modifier_rowmax_block(
+                    transform: str,
+                    prefetch: str = "",
+                    depth: int = 0,
+                    cross_tile: bool = False,
+                    *,
+                    consume: str = "",
+                    issue: str = "",
+                    slots: int = 0,
+                ) -> str:
+                    # The flex hook's table prefetch: chunks ``0 .. depth -
+                    # 1`` before the loop (the first run creates the
+                    # slots), chunk ``(ci + depth) % chunks`` at the top of
+                    # iteration ``ci`` ahead of the t2r copy into ring slot
+                    # ``(ci + depth) % (depth + 1)`` (chunk ``ci - 1``'s,
+                    # freed); the last iterations' wrap-around loads are
+                    # dead code: no ``if`` (the DSL rejects Python
+                    # containers reshaped inside one).  ``flash_flex_pc`` /
+                    # ``flash_flex_ps`` (Python ints) are the prefetched
+                    # chunk and its slot.
+                    pre_loop = ""
+                    in_loop = ""
+                    if prefetch and depth:
+                        lines = _flash_flex_hook_lines(prefetch, " " * 12).rstrip()
+                        if cross_tile:
+                            # The ring arrived filled for this tile (the
+                            # cross-tile fill of the previous step / the
+                            # pre-loop fill): only bind the tile.
+                            pre_loop = "\n            flash_flex_pkv = flash_kv"
+                        else:
+                            pre_loop = (
+                                "\n            flash_flex_pkv = flash_kv"
+                                + "".join(
+                                    f"\n            flash_flex_pc = {d}"
+                                    f"\n            flash_flex_ps = {d}"
+                                    f"\n            flash_flex_pf_init = {d == 0}\n{lines}"
+                                    for d in range(depth)
+                                )
+                            )
+                        inner = _flash_flex_hook_lines(prefetch, " " * 16).rstrip()
+                        in_loop = (
+                            f"\n                flash_flex_pc = (flash_ci + {depth}) % flash_LD_CHUNKS"
+                            f"\n                flash_flex_ps = (flash_ci + {depth}) % {depth + 1}"
+                            f"\n                flash_flex_pf_init = False\n{inner}"
+                        )
+                    if issue and slots:
+                        # The cooperative stream: the chunk's rows are read
+                        # from its slot (its group waited for) ahead of the
+                        # t2r copy, then chunk ``ci + slots`` -- of the
+                        # walk's next tile once past the chunk count -- is
+                        # copied into the freed slot.
+                        in_loop += (
+                            "\n"
+                            + _flash_flex_hook_lines(consume, " " * 16).rstrip()
+                            + f"\n                flash_flex_pc = (flash_ci + {slots}) % flash_LD_CHUNKS"
+                            + f"\n                flash_flex_ps = flash_ci % {slots}"
+                            + f"\n                flash_flex_pkv = flash_kv if flash_ci + {slots} < flash_LD_CHUNKS else flash_kv_peek\n"
+                            + _flash_flex_hook_lines(issue, " " * 16).rstrip()
+                        )
+                    return f"""            flash_ld_shape = tLDcS[None, 0, None, None].shape{pre_loop}
             for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):
-                flash_disc_frg = cute.make_rmem_tensor(flash_ld_shape, cutlass.Float32)
+                flash_disc_frg = cute.make_rmem_tensor(flash_ld_shape, cutlass.Float32){in_loop}
                 cute.copy({ld}, {ldt}[None, flash_ci, None, None], flash_disc_frg){transform}
                 flash_row_max = _helion_flash_rt._fmax_reduce_chunk_balanced(flash_disc_frg, flash_row_max)
                 cute.copy({score_st}, flash_disc_frg, {score_stt}[None, flash_ci, None, None])
@@ -21502,6 +22284,13 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         score_modifier_kinds=score_plan.modifier_kinds,
         row_mma_aligned=row_mma_aligned,
         row_mma_aux_dtypes=row_mma_aux_dtypes,
+        flex_aux_smem_candidates=flex_aux_smem_candidates(score_plan),
+        flex_prefetch_regs=_flash_flex_prefetch_regs(
+            score_plan, batch, plan.tensor_4d_heads or batch, num_kv
+        ),
+        flex_coalesce_steps=_flash_flex_coalesce_steps(
+            score_plan, batch, plan.tensor_4d_heads or batch, num_kv
+        ),
         target_device_capability=(
             CompileEnvironment.current().config_spec.target_device_capability
         ),

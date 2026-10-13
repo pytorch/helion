@@ -24,10 +24,22 @@ Rendering rules (``artifacts/attn-sparse-2026-10-10/spec_interfaces.md`` §2):
   are capped (``ITEM_LIVE_CAP``) and the cheapest are demoted to the tile
   prologue.
 * Captured loads are classified against the KV lane: lane-free indices give a
-  single guarded load; a unit-stride last index ``kv_idx + c`` with a 16-byte
-  aligned chunk base gives one vector load per group of lanes; anything else
-  is a per-element gather.  Gathers clamp the index, load unconditionally and
-  ``select_`` zero for out-of-range coordinates (no per-element ``IfExp``).
+  single guarded load; a single lane index ``kv_idx + c`` at a dimension of
+  stride ``s`` with literal trailing indices (the strided-run form; ``s == 1``
+  is the plain lane-contiguous vector) reads a group of lanes' contiguous run
+  as 16-byte vectors shared by every load of the same table and lane-free
+  indices; a proven lane-affine ``+-kv_idx`` last index reads a two-lane
+  window; anything else is a per-element gather.  Every index proven inside
+  the table by the coordinate bounds loses its guard and clamp; the rest
+  clamp, load unconditionally and ``select_`` zero for out-of-range
+  coordinates (no per-element ``IfExp``).  Tables staged in shared memory
+  (``flex_aux_smem_layout``) are read from the copy, a gather's out-of-range
+  coordinate selecting the copy's zero sentinel instead of clamping.  A run
+  whose leading indices are proven affine forms with a row pitch of a line
+  or more is, under ``coalesce``, fetched warp-cooperatively (requests of
+  ``coalesce`` bytes per row covering whole lines of a few rows), staged
+  per warp in shared memory and read back by the row owners a group at a
+  time (``flex_score_mod_runtime.coop_fetch`` / ``coop_stage``).
 * Comparisons of ``kv_idx + c`` whose half-open threshold is a multiple of
   the tile / chunk width are constant over it (``kvcmp``), and
   ``(kv_idx + c) % m`` with ``m`` and ``c`` multiples of the width is the
@@ -73,6 +85,8 @@ from ..device_function import DeviceFunction
 from ..source_location import SourceLocation
 from .attention_plan import FlexAuxBuffer
 from .attention_plan import FlexRegion
+from .flex_coop_layout import COOP_WIDTHS
+from .flex_coop_layout import coop_pitch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -91,6 +105,33 @@ class FlexHookCode(NamedTuple):
     tile_prologue: str
     # Inside the PASS1 chunk loop after the t2r copy (nested loops inside).
     chunk_body: str
+    # The table loads of a later chunk (``render_flex_hook(prefetch_regs=
+    # ...)``): lines for the chunk whose index the emitter binds to
+    # ``flash_flex_pc`` (a Python int), run before the chunk loop for chunks
+    # ``0 .. prefetch_depth - 1`` (``flash_flex_pf_init`` set on the first
+    # run: the slots are created) and at the top of each iteration for
+    # chunk ``(flash_ci + prefetch_depth) % chunks`` (the last iterations'
+    # wrap-around loads land in free slots, dead code), ahead of the t2r
+    # copy, into ring slot ``flash_flex_ps`` (``(flash_ci + prefetch_depth)
+    # % (prefetch_depth + 1)``, the slot chunk ``flash_ci - 1`` freed) of
+    # the ``prefetch_depth + 1`` Python slots the chunk body reads.
+    chunk_prefetch: str = ""
+    prefetch_depth: int = 0
+    # The warp-cooperative table stream (``render_flex_hook(coalesce=...,
+    # coop_slots=S)``): ``chunk_issue`` copies chunk ``flash_flex_pc`` of
+    # KV tile ``flash_flex_pkv`` into staging slot ``flash_flex_ps`` (Python
+    # ints the emitter binds) with ``cp.async`` and commits the group;
+    # ``chunk_consume`` waits for chunk ``flash_ci``'s group (``S - 1``
+    # newer groups may stay in flight), reads the lane's staged rows of
+    # slot ``flash_ci % S`` into the chunk's run lists and frees the slot
+    # (a warp sync on each side).  The emitter runs the consume block at
+    # the top of every PASS1 iteration ahead of the t2r copy and the issue
+    # block right after it for chunk ``ci + S`` (the walk's next tile once
+    # past the chunk count), issues chunks ``0 .. S - 1`` of the first tile
+    # before the KV loop and of the next tile at an absent step.
+    chunk_issue: str = ""
+    chunk_consume: str = ""
+    coop_slots: int = 0
 
 
 # Item-invariant values held in registers across the KV loop.
@@ -102,6 +143,25 @@ _TILE = 1
 _CHUNK = 2
 _GROUP = 3
 _ELEMENT = 4
+# The prefetch block of the next chunk: its chunk-level lines and its group
+# loop (``render_flex_hook(prefetch_regs=...)``).
+_PCHUNK = 5
+_PGROUP = 6
+# The cooperative stream's issue block (chunk ``flash_flex_pc`` of tile
+# ``flash_flex_pkv`` into slot ``flash_flex_ps``) and its consume block (the
+# staged rows of chunk ``flash_ci``).
+_PISSUE = 7
+_PCONSUME = 8
+# The chunk index the emitter binds for the prefetch block, the ring slot
+# the prefetched data goes to (the unwrapped position: the chunk index wraps
+# around at the end of the loop while the slot keeps rotating) and the flag
+# it sets for the block's first run of a KV step (the slots are created then).
+_PREFETCH_CHUNK = "flash_flex_pc"
+_PREFETCH_SLOT = "flash_flex_ps"
+_PREFETCH_INIT = "flash_flex_pf_init"
+# The KV tile the prefetch block loads from (the current tile for the
+# in-tile chunks, the walk's next tile for the cross-tile fill).
+_PREFETCH_TILE = "flash_flex_pkv"
 
 # Dependence tokens.
 _T_B = "b"
@@ -207,6 +267,7 @@ _NEGATE_COMPARE = {
 }
 # Mask forms of ``render_flex_hook``: the per-chunk keep word applied through
 # the R2P select chain, or the per-element predicate.
+
 MASK_FORMS = ("bitmask", "element")
 _COMPARE_OPERATORS = {
     torch.ops.aten.gt.Tensor: "gt",
@@ -345,10 +406,24 @@ class _NodeInfo:
     aux_index: int = -1
     scalar_index: int = -1
     divisor: int = 0
+    # Loads: the strided-run vector form (``_Analyzer._run``): the natural
+    # lane count of one group (0: no run form), the element stride between
+    # lanes along the run and the constant offset of the entry inside a
+    # lane's ``run_stride`` elements.  The plain lane-contiguous vector form
+    # is ``run_stride == 1``.
     vector_width: int = 0
-    # Loads: every index proven inside the table from the coordinate bounds
-    # (no guard, no clamp); the window form's lane count and the sign of the
-    # last index's ``kv_idx`` coefficient.
+    run_stride: int = 1
+    run_offset: int = 0
+    # Loads in the run form: the element distance between the rows of
+    # consecutive query indices when every leading index is a proven affine
+    # form (``_Analyzer._coop_step``; the warp-cooperative block form), 0
+    # otherwise.
+    coop_step: int = 0
+    # Loads: per index dimension, whether the index is proven inside the
+    # table from the coordinate bounds (no guard, no clamp on that
+    # dimension); ``in_bounds`` is the conjunction.  The window form's lane
+    # count and the sign of the last index's ``kv_idx`` coefficient.
+    proven: tuple[bool, ...] = ()
     in_bounds: bool = False
     window: int = 0
     window_sign: int = 1
@@ -778,35 +853,141 @@ class _Analyzer:
                     f"{node.name}: index {index!r} must be a tensor or int literal"
                 )
         info = _NodeInfo("load", frozenset(deps), None, aux_index=aux_index)
-        info.in_bounds = self._in_bounds(indices, buffer, nodes)
-        info.vector_width = self._vector_width(node, buffer, nodes)
+        info.proven = self._proven_dims(indices, buffer, nodes)
+        info.in_bounds = all(info.proven)
+        info.vector_width, info.run_stride, info.run_offset = self._run(
+            indices, buffer, nodes
+        )
+        if info.vector_width:
+            info.coop_step = self._coop_step(indices, buffer, nodes, info.proven)
         if info.in_bounds and not info.vector_width:
             info.window, info.window_sign = self._window(indices, buffer, nodes)
         return info
 
-    def _in_bounds(
+    def _proven_dims(
         self,
         indices: Sequence[object],
         buffer: FlexAuxBuffer,
         nodes: dict[Node, _NodeInfo],
-    ) -> bool:
-        """Every index is an affine form of the coordinates whose range over
-        the kernel's coordinate bounds lies inside the table."""
+    ) -> tuple[bool, ...]:
+        """Per dimension: the index is an affine form of the coordinates
+        whose range over the kernel's coordinate bounds lies inside the
+        table (a constant index is proven by its value)."""
+        proven: list[bool] = []
         for dim, index in enumerate(indices):
             size = buffer.shape[dim]
             if isinstance(index, Node):
                 affine = nodes[index].affine
                 interval = None if affine is None else affine.interval(self.bounds)
                 if interval is None:
-                    return False
+                    proven.append(False)
+                    continue
                 lo, hi = interval
             else:
                 constant = _int_constant(index)
                 assert constant is not None
                 lo = hi = constant
-            if lo < 0 or hi >= size:
-                return False
-        return True
+            proven.append(lo >= 0 and hi < size)
+        return tuple(proven)
+
+    def _run(
+        self,
+        indices: Sequence[object],
+        buffer: FlexAuxBuffer,
+        nodes: dict[Node, _NodeInfo],
+    ) -> tuple[int, int, int]:
+        """``(lanes, stride, offset)`` of the strided-run vector form, or
+        ``(0, 1, 0)``.
+
+        The load's single lane-dependent index is ``kv_idx + c`` at a
+        dimension of element stride ``stride``; the indices after it are
+        int literals inside their extents over row-major inner dimensions
+        (so a lane's entry sits ``offset`` elements into its ``stride``-wide
+        slice); the indices before it are lane-free with 16-byte aligned
+        strides.  A group of ``lanes`` consecutive lanes then reads one
+        contiguous, 16-byte aligned run of ``lanes * stride`` elements
+        (``lanes`` is the least count whose run is whole 16-byte vectors);
+        the chunk base is ``lanes``-aligned when ``c`` is, and a group never
+        straddles the dimension's extent when that extent is too.  The
+        plain lane-contiguous vector form is ``stride == 1``.
+        """
+        lane_dims = [
+            dim
+            for dim, index in enumerate(indices)
+            if isinstance(index, Node) and _T_LANE in nodes[index].deps
+        ]
+        if len(lane_dims) != 1:
+            return 0, 1, 0
+        d = lane_dims[0]
+        affine = nodes[cast("Node", indices[d])].affine
+        if affine is None or not affine.is_kv_plus_const():
+            return 0, 1, 0
+        itemsize = buffer.dtype.itemsize
+        inner = 1
+        offset = 0
+        for k in range(len(indices) - 1, d, -1):
+            constant = _int_constant(indices[k])
+            if (
+                constant is None
+                or not 0 <= constant < buffer.shape[k]
+                or buffer.strides[k] != inner
+            ):
+                return 0, 1, 0
+            offset += constant * inner
+            inner *= buffer.shape[k]
+        stride = buffer.strides[d]
+        if stride != inner or stride <= 0:
+            return 0, 1, 0
+        lanes = _VECTOR_BYTES // math.gcd(_VECTOR_BYTES, stride * itemsize)
+        if (
+            buffer.shape[d] % lanes
+            or affine.const % lanes
+            or self.chunk_cols % lanes
+            or 128 % lanes
+        ):
+            return 0, 1, 0
+        for k in range(d):
+            if (buffer.strides[k] * itemsize) % _VECTOR_BYTES:
+                return 0, 1, 0
+        return lanes, stride, offset
+
+    def _coop_step(
+        self,
+        indices: Sequence[object],
+        buffer: FlexAuxBuffer,
+        nodes: dict[Node, _NodeInfo],
+        proven: Sequence[bool],
+    ) -> int:
+        """The row step (elements) of the warp-cooperative block form of a
+        run, or 0.
+
+        The lanes of a warp own 32 consecutive rows (``q = q0 + lane``), so
+        the run's rows differ by the ``q`` coefficients of the leading
+        indices times their strides; a lane can address another lane's row
+        when every leading index is a proven affine form (no clamp, no
+        guard: the bounds cover every row of the pair).  Rows closer than a
+        line already coalesce in the per-lane form, so the step must span
+        at least a line.
+        """
+        lane_dim = next(
+            dim
+            for dim, index in enumerate(indices)
+            if isinstance(index, Node) and _T_LANE in nodes[index].deps
+        )
+        step = 0
+        for dim in range(lane_dim):
+            if not proven[dim]:
+                return 0
+            index = indices[dim]
+            if not isinstance(index, Node):
+                continue
+            affine = nodes[index].affine
+            if affine is None:
+                return 0
+            step += affine.as_dict().get("q", 0) * buffer.strides[dim]
+        if abs(step) * buffer.dtype.itemsize < 128:
+            return 0
+        return step
 
     def _window(
         self,
@@ -834,32 +1015,6 @@ class _Analyzer:
             if buffer.strides[dim] % lanes != 0:
                 return 0, 1
         return lanes, affine.kv_coefficient()
-
-    def _vector_width(
-        self, node: Node, buffer: FlexAuxBuffer, nodes: dict[Node, _NodeInfo]
-    ) -> int:
-        """Natural lane-contiguous vector width of a load, or 0 (gather)."""
-        indices = cast("Sequence[object]", node.args[1])
-        if not indices or buffer.strides[-1] != 1:
-            return 0
-        last = indices[-1]
-        if not isinstance(last, Node):
-            return 0
-        affine = nodes[last].affine
-        if affine is None or not affine.is_kv_plus_const():
-            return 0
-        itemsize = buffer.dtype.itemsize
-        width = _VECTOR_WIDTH.get(itemsize, 0)
-        if width == 0:
-            return 0
-        if buffer.shape[-1] % width != 0 or affine.const % width != 0:
-            return 0
-        for dim, index in enumerate(indices[:-1]):
-            if isinstance(index, Node) and _T_LANE in nodes[index].deps:
-                return 0
-            if (buffer.strides[dim] * itemsize) % _VECTOR_BYTES != 0:
-                return 0
-        return width
 
 
 def _demote_item_values(infos: list[_RegionInfo], cap: int) -> None:
@@ -949,10 +1104,41 @@ class _HookEmitter:
             _CHUNK: [],
             _GROUP: [],
             _ELEMENT: [],
+            _PCHUNK: [],
+            _PGROUP: [],
+            _PISSUE: [],
+            _PCONSUME: [],
         }
+        # The coordinate tensor of the prefetched chunk.
+        self.prefetch_coord = re.sub(
+            rf"\b{re.escape(chunk_expr)}\b", _PREFETCH_CHUNK, coord_tensor
+        )
+        # Keys ``(tag, node)`` of the loads whose chunk loads are prefetched
+        # (``_prefetch_plan``) and the chunks of lead (ring of ``depth + 1``
+        # slots).
+        self.prefetched: frozenset[tuple[str, Node]] = frozenset()
+        self.prefetch_depth = 1
         self.roots_emitted: set[str] = set()
         self.values: dict[tuple[str, Node], str] = {}
+        # Lanes of the group loop (the largest natural lane count of the
+        # run-form loads; 0 without any).
         self.vector_width = 0
+        # Aux indices whose table is read from the shared-memory copy
+        # (``_flash_aux{i}_smem``, ``flex_aux_smem_layout``).
+        self.staged: frozenset[int] = frozenset()
+        # Runs already loaded, by (aux index, group lanes, stride, lane-free
+        # index values, proof): ``(run name, guard name, streamed)``.
+        self.runs: dict[tuple[object, ...], tuple[str, str | None, bool]] = {}
+        # The warp-cooperative block form (``render_flex_hook(coalesce=
+        # ...)``): per coalescible run (``_coop_runs`` key) its request
+        # width, staged row pitch and region offset in the warp's staging
+        # buffer, and the buffer's bytes (``_coop_layout``; the emitter sizes
+        # the storage from the same layout).
+        self.coop_layout: dict[tuple[object, ...], tuple[int, int, int]] = {}
+        self.coop_warp_bytes = 0
+        # Slots of the warp's staging ring (chunks of lead); set by the
+        # renderer with the layout.
+        self.coop_slots = 1
         # Keep words of the mask region's predicate nodes (``None``: the node
         # has no word form) and the per-region word counter.
         self.words: dict[tuple[str, Node], _Word | None] = {}
@@ -1018,9 +1204,110 @@ class _HookEmitter:
                 f"{var} = {self.root('kvbase')} + "
                 f"cutlass.Int32({self.coord_tensor}[{_ELEM}][1])",
             )
+        elif name == "pkvbase":
+            # The prefetched tile's first column (the emitter binds the tile).
+            self.emit(
+                _PCHUNK,
+                f"{var} = cutlass.Int32({_PREFETCH_TILE}) * cutlass.Int32(128)",
+            )
+        elif name == "pcbase":
+            # The prefetched chunk's first column / group base.
+            self.emit(
+                _PCHUNK,
+                f"{var} = {self.root('pkvbase')} + "
+                f"cutlass.Int32({self.prefetch_coord}[0][1])",
+            )
+        elif name == "pgbase":
+            self.emit(
+                _PGROUP,
+                f"{var} = {self.root('pkvbase')} + cutlass.Int32("
+                f"{self.prefetch_coord}[{_GROUP_VAR} * {self.vector_width}][1])",
+            )
+        elif name == "lane":
+            # The thread's lane: the fa4 t2r layout (32x32b) gives warp ``w``
+            # of a stage rows ``32 w .. 32 w + 31`` in lane order.
+            self.emit(
+                _ITEM,
+                f"{var} = cutlass.Int32({self.row_coord_expr}) % cutlass.Int32(32)",
+            )
+        elif name == "coopbuf":
+            # The warp's staging ring (``coop_slots`` chunk slots): the
+            # stage's warpgroup holds warps ``4 stage .. 4 stage + 3`` of the
+            # eight softmax warps.
+            assert self.coop_warp_bytes
+            self.emit(
+                _ITEM,
+                f"{var} = _flash_flex_coop_smem + (cutlass.Int32({self.stage * 4}) + "
+                f"cutlass.Int32({self.row_coord_expr}) // cutlass.Int32(32)) * "
+                f"cutlass.Int32({self.coop_slots * self.coop_warp_bytes})",
+            )
+        elif name == "ikvbase":
+            # The issued tile's first column (the emitter binds the tile).
+            self.emit(
+                _PISSUE,
+                f"{var} = cutlass.Int32({_PREFETCH_TILE}) * cutlass.Int32(128)",
+            )
+        elif name == "icbase":
+            # The issued chunk's first column.
+            self.emit(
+                _PISSUE,
+                f"{var} = {self.root('ikvbase')} + "
+                f"cutlass.Int32({self.prefetch_coord}[0][1])",
+            )
         else:
             raise AssertionError(name)
         return var
+
+    def coop_lane(self, width: int) -> tuple[str, str, str]:
+        """``(lane, slot, delta)`` of the cooperative requests of ``width``
+        bytes per row: the lane, its 16-byte slot and its request row minus
+        its own row (``coop_lane_map``), emitted once per item."""
+        lane = self.root("lane")
+        key = f"coop{width}"
+        row = f"{self.prefix()}_coopr{width}"
+        slot = f"{self.prefix()}_coops{width}"
+        delta = f"{self.prefix()}_coopd{width}"
+        if key not in self.roots_emitted:
+            self.roots_emitted.add(key)
+            self.emit(_ITEM, f"{row}, {slot} = _cute_flex_coop_lane({lane}, {width})")
+            self.emit(_ITEM, f"{delta} = {row} - {lane}")
+        return lane, slot, delta
+
+    def coop_entry(
+        self, info: _RegionInfo, node: Node, meta: _NodeInfo
+    ) -> tuple[int, int, int] | None:
+        """``(request width, pitch, offset)`` of a load's run in the warp's
+        staging buffer when the run is fetched cooperatively, else None."""
+        if not meta.coop_step:
+            return None
+        entry = self.coop_layout.get(_coop_key(info, node, meta))
+        if entry is None or entry[0] == 0:
+            return None
+        return entry
+
+    def parity_slot(self, chunk: str) -> str:
+        """The ring slot of a chunk: the prefetch block writes the slot the
+        emitter binds (``flash_flex_ps``), the body reads its chunk's."""
+        if chunk == _PREFETCH_CHUNK:
+            return f"[{_PREFETCH_SLOT}]"
+        return f"[{chunk} % {self.prefetch_depth + 1}]"
+
+    def prefetch_slots(self, var: str, value: str | None = None) -> None:
+        """Create ``var``'s ring of ``depth + 1`` slots at the first prefetch
+        of a KV step (the emitter's ``flash_flex_pf_init``) and fill the
+        prefetched chunk's slot with ``value`` (an empty group list by
+        default).  The lists live inside the chunk loop's block (the DSL
+        rejects a Python container reshaped across a dynamic ``if``); the
+        creation is a trace-time conditional."""
+        self.emit(
+            _PCHUNK,
+            f"{var} = [None] * {self.prefetch_depth + 1} if {_PREFETCH_INIT} else {var}",
+        )
+        self.emit(
+            _PCHUNK,
+            f"{var}{self.parity_slot(_PREFETCH_CHUNK)} = "
+            f"{'[]' if value is None else value}",
+        )
 
     # -- values -------------------------------------------------------------
 
@@ -1700,12 +1987,23 @@ class _HookEmitter:
 
     def _load(self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str) -> None:
         buffer = self.plan.aux_buffers[meta.aux_index]
-        tensor = f"_flash_aux{meta.aux_index}"
+        staged = meta.aux_index in self.staged
+        pointer_base = (
+            f"_flash_aux{meta.aux_index}_smem"
+            if staged
+            else f"_flash_aux{meta.aux_index}.iterator"
+        )
         t = self.dtype_str(buffer.dtype)
         zero = f"{t}(False)" if buffer.dtype is torch.bool else f"{t}(0)"
         indices = cast("Sequence[object]", node.args[1])
-        proven = meta.in_bounds
-        width = self.vector_width if meta.vector_width and meta.cls == _ELEMENT else 0
+        proven = meta.proven
+        width = 0
+        if meta.vector_width and meta.cls == _ELEMENT:
+            # The common group covers whole 16-byte vectors of this run when
+            # the load's natural lane count divides it (both are powers of
+            # two, so a smaller common group never does).
+            if self.vector_width % meta.vector_width == 0:
+                width = self.vector_width
         window = meta.window if meta.cls == _ELEMENT and not width else 0
         if width:
             load_cls = _GROUP
@@ -1713,11 +2011,18 @@ class _HookEmitter:
             load_cls = _CHUNK
         else:
             load_cls = meta.cls
-        last_dim = len(indices) - 1
+        lane_dim = len(indices) - 1
+        if width:
+            lane_dim = next(
+                dim
+                for dim, index in enumerate(indices)
+                if isinstance(index, Node) and _T_LANE in info.nodes[index].deps
+            )
         guards: list[str] = []
         offsets: list[str] = []
+        index_exprs: list[str] = []
         for dim, index in enumerate(indices):
-            if (width or window) and dim == last_dim:
+            if (width or window) and dim >= lane_dim:
                 break
             size, stride = buffer.shape[dim], buffer.strides[dim]
             index_var = f"{name}_i{dim}"
@@ -1725,21 +2030,23 @@ class _HookEmitter:
                 # The cast lives where the index value does (an item-invariant
                 # row index is cast once per item, not once per lane).
                 dim_cls = min(info.nodes[index].cls, load_cls)
-                self.emit(
-                    dim_cls, f"{index_var} = cutlass.Int32({self.value(info, index)})"
-                )
+                index_expr = self.value(info, index)
+                self.emit(dim_cls, f"{index_var} = cutlass.Int32({index_expr})")
             else:
                 constant = _int_constant(index)
                 assert constant is not None
+                index_expr = str(constant)
                 self.emit(_ITEM, f"{index_var} = cutlass.Int32({constant})")
-            if not proven:
+            index_exprs.append(index_expr)
+            if not proven[dim]:
                 guards.append(
                     f"({index_var} >= cutlass.Int32(0)) & ({index_var} < cutlass.Int32({size}))"
                 )
             if stride == 0:
                 continue
-            if proven:
-                # Every index is inside the table: no clamp.
+            if proven[dim] or staged:
+                # Inside the table (or redirected to the staged copy's
+                # sentinel below): no clamp.
                 offsets.append(f"{index_var} * cutlass.Int32({stride})")
                 continue
             clamped = (
@@ -1747,20 +2054,6 @@ class _HookEmitter:
                 f"cutlass.Int32({size - 1}))"
             )
             offsets.append(f"{clamped} * cutlass.Int32({stride})")
-        if not width and not window:
-            pointer = f"{tensor}.iterator" + "".join(
-                f" + {offset}" for offset in offsets
-            )
-            load = f"{t}(({pointer}).load())"
-            if proven:
-                self.emit(load_cls, f"{name} = {load}")
-                return
-            guard = " & ".join(guards)
-            self.emit(load_cls, f"{name}_ok = {guard}")
-            self.emit(
-                load_cls, f"{name} = {t}(cutlass.select_({name}_ok, {load}, {zero}))"
-            )
-            return
         if buffer.dtype is torch.bool:
             # A bool table is loaded as bytes: ``cutlass.Boolean``'s MLIR type
             # is ``i1`` and a ``vector<16xi1>`` load traps the DSL's lowering
@@ -1774,11 +2067,44 @@ class _HookEmitter:
                 return f"{vec_t}({value}) != {vec_t}(0)"
             return f"{t}({value})"
 
-        last = cast("Node", indices[last_dim])
+        if not width and not window:
+            offset = " + ".join(offsets) if offsets else "cutlass.Int32(0)"
+            if not guards:
+                pointer = f"{pointer_base} + {offset}"
+                if staged and buffer.dtype is torch.bool:
+                    load = f"{t}({lane_value(f'({pointer}).load()')})"
+                else:
+                    load = f"{t}(({pointer}).load())"
+                self.emit(load_cls, f"{name} = {load}")
+                return
+            guard = " & ".join(guards)
+            self.emit(load_cls, f"{name}_ok = {guard}")
+            if staged:
+                # The staged copy carries one zero element past the table:
+                # an out-of-range coordinate reads it instead of clamping
+                # the address and selecting the value.
+                sentinel = _aux_numel(buffer)
+                self.emit(
+                    load_cls,
+                    f"{name}_off = cutlass.Int32(cutlass.select_({name}_ok, {offset}, "
+                    f"cutlass.Int32({sentinel})))",
+                )
+                load = f"({pointer_base} + {name}_off).load()"
+                if buffer.dtype is torch.bool:
+                    load = lane_value(load)
+                self.emit(load_cls, f"{name} = {t}({load})")
+                return
+            load = f"{t}(({pointer_base} + {offset}).load())"
+            self.emit(
+                load_cls, f"{name} = {t}(cutlass.select_({name}_ok, {load}, {zero}))"
+            )
+            return
+
+        last = cast("Node", indices[lane_dim])
         affine = info.nodes[last].affine
         assert affine is not None
-        size = buffer.shape[last_dim]
-        pointer = f"{tensor}.iterator" + "".join(f" + {o}" for o in offsets)
+        size = buffer.shape[lane_dim]
+        pointer = pointer_base + "".join(f" + {o}" for o in offsets)
         if window:
             self._window_load(
                 name,
@@ -1789,31 +2115,199 @@ class _HookEmitter:
                 size=size,
                 vec_t=vec_t,
                 lane_value=lane_value,
+                prefetch=(info.tag, node) in self.prefetched,
             )
             return
-        # Lane-contiguous last index ``kv_idx + c``: one vector load per group
-        # of ``width`` lanes, selected per lane.  ``gbase`` is the group's
-        # first KV index; the group never straddles the table end because
-        # ``shape[-1] % width == 0`` and the base is ``width``-aligned.
-        lo = f"{name}_lo"
-        offset = f" + cutlass.Int32({affine.const})" if affine.const else ""
-        self.emit(_GROUP, f"{lo} = {self.root('gbase')}{offset}")
-        lane = lane_value(f"{name}_vec[{_LANE_VAR}]")
-        if proven:
-            self.emit(
-                _GROUP,
-                f"{name}_vec = _cute_flex_load_vec({pointer} + {lo}, {width}, {vec_t})",
+        # Strided-run vector form: one group of ``width`` lanes reads the
+        # contiguous run of ``width * stride`` elements from the group's
+        # first KV index (``gbase``) as whole 16-byte vectors; lane ``j``
+        # of the group is entry ``j * stride + offset`` of the run.  Loads of
+        # the same table with the same lane-free indices share the run.
+        # The group never straddles the dimension's extent because
+        # ``shape[dim] % width == 0`` and the base is ``width``-aligned.
+        stride = meta.run_stride
+        itemsize = buffer.dtype.itemsize
+        vectors = width * stride * itemsize // _VECTOR_BYTES
+        per_vector = _VECTOR_BYTES // itemsize
+        coop = self.coop_entry(info, node, meta)
+        key = (meta.aux_index, width, stride, tuple(index_exprs), tuple(proven))
+        shared = self.runs.get(key)
+        if shared is None and coop is not None:
+            shared = self._coop_load(
+                info,
+                node,
+                meta,
+                name,
+                buffer=buffer,
+                pointer_base=pointer_base,
+                offsets=offsets,
+                affine=affine,
+                lane_dim=lane_dim,
+                per_vector=per_vector,
+                vec_t=vec_t,
+                entry=coop,
             )
+            self.runs[key] = shared
+        elif shared is None:
+            # Prefetched: the group loads of the next chunk are issued in the
+            # prefetch block into the chunk-parity slot of a Python list
+            # (one entry per group); the group block reads its entry.
+            prefetch = (info.tag, node) in self.prefetched
+            group_cls = _PGROUP if prefetch else _GROUP
+            lo = f"{name}_lo"
+            offset = f" + cutlass.Int32({affine.const})" if affine.const else ""
+            gbase = self.root("pgbase" if prefetch else "gbase")
+            self.emit(group_cls, f"{lo} = {gbase}{offset}")
+            run = f"{name}_vec" if vectors == 1 else f"{name}_run"
+            ok: str | None = None
+            if not proven[lane_dim]:
+                guards.append(
+                    f"({lo} >= cutlass.Int32(0)) & ({lo} < cutlass.Int32({size}))"
+                )
+                lo = f"cutlass.min(cutlass.max({lo}, cutlass.Int32(0)), cutlass.Int32({size - width}))"
+            if guards:
+                ok = f"{name}_ok"
+                guard = " & ".join(guards)
+                if prefetch:
+                    self.prefetch_slots(f"{ok}_pf")
+                    self.emit(
+                        _PGROUP,
+                        f"{ok}_pf{self.parity_slot(_PREFETCH_CHUNK)}.append({guard})",
+                    )
+                    self.emit(
+                        _GROUP,
+                        f"{ok} = {ok}_pf{self.parity_slot(self.chunk_expr)}[{_GROUP_VAR}]",
+                    )
+                else:
+                    self.emit(_GROUP, f"{ok} = {guard}")
+            scaled = lo if stride == 1 else f"({lo}) * cutlass.Int32({stride})"
+            if vectors == 1:
+                load = (
+                    f"_cute_flex_load_vec({pointer} + {scaled}, {per_vector}, {vec_t})"
+                )
+            else:
+                load = (
+                    f"_cute_flex_load_run({pointer} + {scaled}, {vectors}, "
+                    f"{per_vector}, {vec_t})"
+                )
+            if prefetch:
+                self.prefetch_slots(f"{run}_pf")
+                self.emit(
+                    _PGROUP,
+                    f"{run}_pf{self.parity_slot(_PREFETCH_CHUNK)}.append({load})",
+                )
+                self.emit(
+                    _GROUP,
+                    f"{run} = {run}_pf{self.parity_slot(self.chunk_expr)}[{_GROUP_VAR}]",
+                )
+            else:
+                self.emit(_GROUP, f"{run} = {load}")
+            shared = (run, ok, False)
+            self.runs[key] = shared
+        run, ok, streamed = shared
+        # A streamed run holds the lane's whole chunk span (indexed by the
+        # element); a group run its ``width`` lanes.
+        column = _ELEM if streamed else _LANE_VAR
+        slot = column if stride == 1 else f"{column} * {stride}"
+        if meta.run_offset:
+            slot = f"{slot} + {meta.run_offset}"
+        lane = lane_value(f"{run}[{slot}]")
+        if ok is None:
             self.emit(_ELEMENT, f"{name} = {t}({lane})")
             return
-        guards.append(f"({lo} >= cutlass.Int32(0)) & ({lo} < cutlass.Int32({size}))")
-        clamped = f"cutlass.min(cutlass.max({lo}, cutlass.Int32(0)), cutlass.Int32({size - width}))"
-        self.emit(_GROUP, f"{name}_ok = {' & '.join(guards)}")
-        self.emit(
-            _GROUP,
-            f"{name}_vec = _cute_flex_load_vec({pointer} + {clamped}, {width}, {vec_t})",
+        self.emit(_ELEMENT, f"{name} = {t}(cutlass.select_({ok}, {lane}, {zero}))")
+
+    def _coop_load(
+        self,
+        info: _RegionInfo,
+        node: Node,
+        meta: _NodeInfo,
+        name: str,
+        *,
+        buffer: FlexAuxBuffer,
+        pointer_base: str,
+        offsets: Sequence[str],
+        affine: _Affine,
+        lane_dim: int,
+        per_vector: int,
+        vec_t: str,
+        entry: tuple[int, int, int],
+    ) -> tuple[str, str | None, bool]:
+        """The warp-cooperative stream form of a run (``coop_step`` set).
+
+        The chunk's 32-row block is copied in requests of ``request`` bytes
+        per row straight into the run's region of a staging slot
+        (``_cute_flex_coop_issue``: each lane copies its slot of the rows
+        ``coop_lane_map`` assigns it, at the owner's leading offsets shifted
+        by the lane's row delta times the row step, with ``cp.async``) in
+        the issue block; the consume block reads the lane's staged row of
+        the current chunk's slot into the run list the element block
+        indexes.  An unproven lane dimension keeps the owner's per-group
+        guard (the copy clamps its addresses into the table).  Returns
+        ``(run, guard, True)``.
+        """
+        request, pitch, region = entry
+        indices = cast("Sequence[object]", node.args[1])
+        stride = meta.run_stride
+        itemsize = buffer.dtype.itemsize
+        size = buffer.shape[lane_dim]
+        units = self.chunk_cols * stride * itemsize // request
+        slots = self.coop_slots
+        slot_elems = self.coop_warp_bytes // itemsize
+        pitch_elems = pitch // itemsize
+        lane, slot, delta = self.coop_lane(request)
+        buffer_ptr = self.root("coopbuf")
+        # The run's region of slot 0 in the table's dtype and the lane's row.
+        stage = f"{name}_sp"
+        row = f"{name}_rsp"
+        base_ptr = f"{buffer_ptr} + {region}" if region else buffer_ptr
+        self.emit(_ITEM, f"{stage} = cute.recast_ptr({base_ptr}, dtype={vec_t})")
+        self.emit(_ITEM, f"{row} = {stage} + {lane} * {pitch_elems}")
+        # The lane's copy row base: the owner's leading offsets live at the
+        # leading indices' class (item-invariant for the loads the stream
+        # carries across tiles).
+        cb_cls = max(
+            [
+                _ITEM,
+                *(
+                    info.nodes[index].cls
+                    for index in indices[:lane_dim]
+                    if isinstance(index, Node)
+                ),
+            ]
         )
-        self.emit(_ELEMENT, f"{name} = {t}(cutlass.select_({name}_ok, {lane}, {zero}))")
+        cb = f"{name}_cb"
+        base = " + ".join(offsets) if offsets else "cutlass.Int32(0)"
+        self.emit(cb_cls, f"{cb} = {base} + {delta} * cutlass.Int32({meta.coop_step})")
+        offset = f" + cutlass.Int32({affine.const})" if affine.const else ""
+        lo = f"{name}_lo"
+        self.emit(_PISSUE, f"{lo} = {self.root('icbase')}{offset}")
+        ok: str | None = None
+        limit = ""
+        if not meta.proven[lane_dim]:
+            glo = f"{name}_glo"
+            ok = f"{name}_ok"
+            self.emit(_GROUP, f"{glo} = {self.root('gbase')}{offset}")
+            self.emit(
+                _GROUP,
+                f"{ok} = ({glo} >= cutlass.Int32(0)) & ({glo} < cutlass.Int32({size}))",
+            )
+            limit = f", {size * stride - per_vector}"
+        scaled = lo if stride == 1 else f"({lo}) * cutlass.Int32({stride})"
+        self.emit(
+            _PISSUE,
+            f"_cute_flex_coop_issue({pointer_base} + {cb}, {scaled}, {slot}, "
+            f"{meta.coop_step}, {request}, {units}, {per_vector}, {vec_t}, "
+            f"{stage} + {_PREFETCH_SLOT} * {slot_elems}, {lane}, {pitch_elems}{limit})",
+        )
+        run = f"{name}_run"
+        vectors = self.chunk_cols * stride * itemsize // _VECTOR_BYTES
+        self.emit(
+            _PCONSUME,
+            f"{run} = _cute_flex_load_run({row} + ({self.chunk_expr} % {slots}) * "
+            f"{slot_elems}, {vectors}, {per_vector}, {vec_t})",
+        )
+        return run, ok, True
 
     def _window_load(
         self,
@@ -1826,6 +2320,7 @@ class _HookEmitter:
         size: int,
         vec_t: str,
         lane_value: Callable[[str], str],
+        prefetch: bool = False,
     ) -> None:
         """Lane-affine last index ``+-kv_idx + rest`` proven inside the table.
 
@@ -1841,9 +2336,10 @@ class _HookEmitter:
         """
         positive: list[str] = []
         negative: list[str] = []
+        chunk_cls = _PCHUNK if prefetch else _CHUNK
         for root, coef in affine.coeffs:
             if root == "kv":
-                base = self.root("cbase")
+                base = self.root("pcbase" if prefetch else "cbase")
                 if sign < 0:
                     base = f"({base} + cutlass.Int32({self.chunk_cols - 1}))"
                 (negative if coef < 0 else positive).append(base)
@@ -1856,22 +2352,35 @@ class _HookEmitter:
         first = " + ".join(terms) + "".join(f" - {term}" for term in negative)
         lo = f"{name}_lo"
         base = f"{name}_wb"
-        self.emit(_CHUNK, f"{lo} = {first}")
-        self.emit(_CHUNK, f"{base} = {lo} & cutlass.Int32({-lanes})")
-        self.emit(_CHUNK, f"{name}_m = {lo} - {base}")
+        self.emit(chunk_cls, f"{lo} = {first}")
+        self.emit(chunk_cls, f"{base} = {lo} & cutlass.Int32({-lanes})")
+        self.emit(chunk_cls, f"{name}_m = {lo} - {base}")
         bits = lanes.bit_length() - 1
-        for bit in range(bits):
-            self.emit(
-                _CHUNK,
-                f"{name}_m{bit} = ({name}_m & cutlass.Int32({1 << bit})) != cutlass.Int32(0)",
-            )
         count = self.chunk_cols // lanes + 1
         last = f"cutlass.min({base} + cutlass.Int32({self.chunk_cols}), cutlass.Int32({size - lanes}))"
-        self.emit(
-            _CHUNK,
-            f"{name}_win = _cute_flex_load_window({pointer} + {base}, "
-            f"{pointer} + {last}, {count}, {lanes}, {vec_t})",
+        window_load = (
+            f"_cute_flex_load_window({pointer} + {base}, "
+            f"{pointer} + {last}, {count}, {lanes}, {vec_t})"
         )
+        # Prefetched: the window and its misalignment bits are computed for
+        # the next chunk into the parity slots; the chunk block reads them.
+        for bit in range(bits):
+            flag = f"({name}_m & cutlass.Int32({1 << bit})) != cutlass.Int32(0)"
+            if prefetch:
+                self.prefetch_slots(f"{name}_m{bit}_pf", flag)
+                self.emit(
+                    _CHUNK,
+                    f"{name}_m{bit} = {name}_m{bit}_pf{self.parity_slot(self.chunk_expr)}",
+                )
+            else:
+                self.emit(_CHUNK, f"{name}_m{bit} = {flag}")
+        if prefetch:
+            self.prefetch_slots(f"{name}_win_pf", window_load)
+            self.emit(
+                _CHUNK, f"{name}_win = {name}_win_pf{self.parity_slot(self.chunk_expr)}"
+            )
+        else:
+            self.emit(_CHUNK, f"{name}_win = {window_load}")
         slot = _ELEM if sign > 0 else f"{self.chunk_cols - 1} - {_ELEM}"
 
         def tree(low: int, bit: int) -> str:
@@ -1975,6 +2484,10 @@ def render_flex_hook(
     device_function: DeviceFunction | None = None,
     coord_bounds: Sequence[int | None] | None = None,
     mask_form: str = "bitmask",
+    aux_smem_budget: int = 0,
+    prefetch_regs: int = 0,
+    coalesce: int = 0,
+    coop_slots: int = 1,
 ) -> FlexHookCode:
     """Render the flex hook of ``stage`` for one PASS1 chunk.
 
@@ -1982,6 +2495,28 @@ def render_flex_hook(
     ``-inf`` select: ``"bitmask"`` folds it into a per-chunk keep word where
     the peephole applies (``_HookEmitter.mask_word``) and tests the lane bit
     per element; ``"element"`` evaluates it per element.
+
+    ``aux_smem_budget`` (bytes) selects the aux tables read from a
+    shared-memory copy (``flex_aux_smem_layout``: the data-dependent-gather
+    candidates in plan order while the padded total fits); their loads read
+    the ``_flash_aux{i}_smem`` pointers the emitter binds and fills.
+
+    ``prefetch_regs`` (32-bit registers per thread) selects the per-chunk
+    table loads (vector / run groups, windows) issued ahead and how many
+    chunks ahead (``flex_prefetch_schedule``: loads in region order while
+    their chunk data fits the budget, then the budget's multiple of the
+    taken set as the depth); ``chunk_prefetch`` carries their block,
+    ``prefetch_depth`` the lead.
+
+    ``coalesce`` (bytes per row of one warp-cooperative request, a
+    ``COOP_WIDTHS`` value or 0) streams the runs with a proven affine row
+    step (``_NodeInfo.coop_step``) through the per-warp staging ring the
+    emitter binds (``_flash_flex_coop_smem``: ``coop_slots`` chunk slots of
+    ``flex_coalesce_smem_bytes`` bytes) with ``cp.async``: ``chunk_issue``
+    copies a chunk's block, ``chunk_consume`` reads the lane's rows (see
+    ``FlexHookCode``); a run's request is the knob capped at the power of
+    two dividing its bytes per row (``coop_request_width``).  Streamed runs
+    leave the register prefetch (``prefetch_regs``) to the other loads.
 
     Every ``FlexHookCode`` field is complete newline-terminated lines; the
     emitter dedents and re-indents them (``indent`` is the chunk body's
@@ -2027,16 +2562,28 @@ def render_flex_hook(
         row_coord_expr=row_coord_expr,
         device_function=device_function,
     )
-    widths = [
-        meta.vector_width
-        for info in infos
-        for meta in info.nodes.values()
-        if meta.role == "load" and meta.vector_width and meta.cls == _ELEMENT
-    ]
-    if widths:
-        emitter.vector_width = min(widths)
-        if chunk_cols % emitter.vector_width != 0:
-            emitter.vector_width = 0
+    emitter.staged = frozenset(
+        entry.aux_index for entry in flex_aux_smem_layout(plan, aux_smem_budget)
+    )
+    # The natural lane counts are powers of two dividing the chunk: the
+    # largest covers every run in whole vectors.
+    emitter.vector_width = _group_width(infos)
+    emitter.coop_layout, emitter.coop_warp_bytes = _coop_layout(
+        _coop_runs(plan, infos), coalesce, chunk_cols
+    )
+    emitter.coop_slots = coop_slots
+    emitter.prefetched, emitter.prefetch_depth = _prefetch_plan(
+        plan,
+        infos,
+        chunk_cols,
+        emitter.vector_width,
+        prefetch_regs,
+        streamed=frozenset(
+            key
+            for key, (width, _pitch, _region) in emitter.coop_layout.items()
+            if width
+        ),
+    )
     if mask_form not in MASK_FORMS:
         raise _unsupported(f"unknown mask form {mask_form!r}")
     outputs = {
@@ -2095,12 +2642,36 @@ def render_flex_hook(
             f"_flash_kv_tail_cols - {chunk_expr} * {chunk_cols})"
         )
 
+    issue_lines: list[str] = list(emitter.blocks[_PISSUE])
+    consume_lines: list[str] = []
+    if issue_lines:
+        issue_lines.append("cute.arch.cp_async_commit_group()")
+        consume_lines = [
+            f"cute.arch.cp_async_wait_group({coop_slots - 1})",
+            "cute.arch.sync_warp()",
+            *emitter.blocks[_PCONSUME],
+            "cute.arch.sync_warp()",
+        ]
+    prefetch_lines: list[str] = list(emitter.blocks[_PCHUNK])
+    if emitter.blocks[_PGROUP]:
+        assert emitter.vector_width
+        prefetch_lines.append(
+            f"for {_GROUP_VAR} in cutlass.range_constexpr("
+            f"{chunk_cols // emitter.vector_width}):"
+        )
+        prefetch_lines.extend(_indent_lines(emitter.blocks[_PGROUP], 4))
+
     item_pad = indent - 8 if item_indent is None else item_indent
     tile_pad = indent - 4 if tile_indent is None else tile_indent
     return FlexHookCode(
         _join_lines(_indent_lines(emitter.blocks[_ITEM], max(item_pad, 0))),
         _join_lines(_indent_lines(emitter.blocks[_TILE], max(tile_pad, 0))),
         _join_lines(_indent_lines(chunk_lines, indent)),
+        _join_lines(_indent_lines(prefetch_lines, indent)),
+        emitter.prefetch_depth if prefetch_lines else 0,
+        _join_lines(_indent_lines(issue_lines, indent)),
+        _join_lines(_indent_lines(consume_lines, indent)),
+        coop_slots if issue_lines else 0,
     )
 
 
@@ -2110,6 +2681,413 @@ def _scalar_kind(value: object) -> str:
     if isinstance(value, torch.SymFloat):
         return "float32"
     return "int32"
+
+
+def _load_chunk_regs(
+    plan: AttentionScorePlan,
+    info: _RegionInfo,
+    node: Node,
+    meta: _NodeInfo,
+    chunk_cols: int,
+    width: int,
+) -> tuple[tuple[object, ...], int] | None:
+    """``(run key, 32-bit registers per thread of one chunk's data)`` of a
+    load in a per-chunk vector / run / window form, or ``None``.  Loads
+    sharing a run share the key (and the registers); ``width`` is the group
+    lane count of the render."""
+    if meta.role != "load" or meta.cls != _ELEMENT:
+        return None
+    itemsize = plan.aux_buffers[meta.aux_index].dtype.itemsize
+    indices = cast("Sequence[object]", node.args[1])
+    # The block may load another KV tile's chunk (the cross-tile fill), so
+    # every lane-free index must be item-invariant.
+    if any(
+        isinstance(index, Node)
+        and _T_LANE not in info.nodes[index].deps
+        and not info.nodes[index].deps <= _ITEM_TOKENS
+        for index in indices
+    ):
+        return None
+    if meta.vector_width and width % meta.vector_width == 0:
+        # The run is keyed by the indices before the lane dimension (the
+        # literal trailing indices select the entry inside the run).
+        lane_dim = next(
+            dim
+            for dim, index in enumerate(indices)
+            if isinstance(index, Node) and _T_LANE in info.nodes[index].deps
+        )
+        key: tuple[object, ...] = (
+            "run",
+            info.tag,
+            meta.aux_index,
+            width,
+            meta.run_stride,
+            tuple(indices[:lane_dim]),
+            meta.proven,
+        )
+        return key, -(-(chunk_cols * meta.run_stride * itemsize) // 4)
+    if meta.window:
+        regs = -(-((chunk_cols // meta.window + 1) * meta.window * itemsize) // 4)
+        return ("window", info.tag, node), regs
+    return None
+
+
+def _chunk_load_regs(
+    plan: AttentionScorePlan,
+    infos: Sequence[_RegionInfo],
+    chunk_cols: int,
+    width: int,
+) -> list[tuple[tuple[object, ...], int, list[tuple[str, Node]]]]:
+    """The per-chunk table loads in region and graph order: ``(run key,
+    registers, loads sharing the key)``."""
+    order: list[tuple[object, ...]] = []
+    entries: dict[tuple[object, ...], tuple[int, list[tuple[str, Node]]]] = {}
+    for info in infos:
+        for node, meta in info.nodes.items():
+            entry = _load_chunk_regs(plan, info, node, meta, chunk_cols, width)
+            if entry is None:
+                continue
+            key, regs = entry
+            if key not in entries:
+                order.append(key)
+                entries[key] = (regs, [])
+            entries[key][1].append((info.tag, node))
+    return [(key, *entries[key]) for key in order]
+
+
+def flex_prefetch_schedule(
+    regs: Sequence[int], budget: int, chunks: int
+) -> tuple[int, int]:
+    """``(loads, depth)`` of a prefetch budget: the loads are taken in order
+    while their chunk registers fit (``flex_prefetch_count``), and the
+    budget then buys ``depth`` chunks of lead over the taken set (at least
+    one, at most ``chunks - 1``); ``(0, 0)`` when nothing fits."""
+    count = flex_prefetch_count(regs, budget)
+    if count == 0:
+        return 0, 0
+    taken = [size for size in regs if size <= budget][:count]
+    total = max(1, sum(taken))
+    return count, max(1, min(budget // total, chunks - 1))
+
+
+def _prefetch_plan(
+    plan: AttentionScorePlan,
+    infos: Sequence[_RegionInfo],
+    chunk_cols: int,
+    width: int,
+    budget: int,
+    streamed: frozenset[tuple[object, ...]] = frozenset(),
+) -> tuple[frozenset[tuple[str, Node]], int]:
+    """The loads whose chunk data is issued ahead and the chunks of lead
+    (``flex_prefetch_schedule`` over the per-chunk loads in region and
+    graph order; a run shared by several loads counts once).  Runs the
+    cooperative stream carries (``streamed``: their ``_coop_key``s) are not
+    register-prefetched."""
+    if budget <= 0:
+        return frozenset(), 0
+    entries = [
+        entry
+        for entry in _chunk_load_regs(plan, infos, chunk_cols, width)
+        if not any(
+            _coop_key(info, node, info.nodes[node]) in streamed
+            for info in infos
+            for tag, node in entry[2]
+            if tag == info.tag and info.nodes[node].coop_step
+        )
+    ]
+    count, depth = flex_prefetch_schedule(
+        [regs for _key, regs, _loads in entries], budget, 128 // chunk_cols
+    )
+    chosen: set[tuple[str, Node]] = set()
+    used = 0
+    taken = 0
+    for _key, regs, loads in entries:
+        if taken == count:
+            break
+        if used + regs > budget:
+            continue
+        used += regs
+        taken += 1
+        chosen.update(loads)
+    return frozenset(chosen), depth
+
+
+def _group_width(infos: Sequence[_RegionInfo]) -> int:
+    widths = [
+        meta.vector_width
+        for info in infos
+        for meta in info.nodes.values()
+        if meta.role == "load" and meta.vector_width and meta.cls == _ELEMENT
+    ]
+    return max(widths) if widths else 0
+
+
+def flex_prefetch_regs(
+    plan: AttentionScorePlan, coord_bounds: Sequence[int | None] | None
+) -> tuple[int, ...]:
+    """Registers per thread of each prefetchable per-chunk table load (or
+    shared run) at 32-column chunks, in region and graph order: the plan
+    fact the prefetch budget knob (``cute_flash_flex_prefetch``) resolves
+    its choices against.  ``coord_bounds`` are the kernel's (the window
+    form needs the proof)."""
+    regions = [
+        (tag, r)
+        for tag, r in (("s", plan.score_region), ("m", plan.mask_region))
+        if isinstance(r, FlexRegion)
+    ]
+    if not regions:
+        return ()
+    analyzer = _Analyzer(plan, 32, coord_bounds)
+    infos = [analyzer.analyze(region, tag) for tag, region in regions]
+    _demote_item_values(infos, ITEM_LIVE_CAP)
+    width = _group_width(infos)
+    return tuple(
+        regs for _key, regs, _loads in _chunk_load_regs(plan, infos, 32, width)
+    )
+
+
+def coop_request_width(coalesce: int, chunk_cols: int, bytes_per_col: int) -> int:
+    """The cooperative request width (bytes per row) of a run whose chunk
+    span is ``chunk_cols * bytes_per_col`` bytes per row under the
+    ``coalesce`` knob: the knob capped at the largest power of two dividing
+    the span (a request covers whole pieces of the span), 0 below the
+    narrowest width (the per-lane form)."""
+    if coalesce <= 0:
+        return 0
+    row_bytes = chunk_cols * bytes_per_col
+    width = min(coalesce, row_bytes & -row_bytes)
+    return width if width >= COOP_WIDTHS[0] else 0
+
+
+def _coop_key(info: _RegionInfo, node: Node, meta: _NodeInfo) -> tuple[object, ...]:
+    """The shared-run key of a coalescible load (the loads of one table with
+    the same leading indices share the fetched block)."""
+    indices = cast("Sequence[object]", node.args[1])
+    lane_dim = next(
+        dim
+        for dim, index in enumerate(indices)
+        if isinstance(index, Node) and _T_LANE in info.nodes[index].deps
+    )
+    return (
+        info.tag,
+        meta.aux_index,
+        meta.run_stride,
+        tuple(indices[:lane_dim]),
+        meta.proven,
+    )
+
+
+def _coop_runs(
+    plan: AttentionScorePlan, infos: Sequence[_RegionInfo]
+) -> list[tuple[tuple[object, ...], int]]:
+    """The coalescible runs (``coop_step`` set) in region and graph order:
+    ``(key, bytes per column)`` per shared run."""
+    seen: set[tuple[object, ...]] = set()
+    runs: list[tuple[tuple[object, ...], int]] = []
+    for info in infos:
+        for node, meta in info.nodes.items():
+            if (
+                meta.role != "load"
+                or meta.cls != _ELEMENT
+                or not meta.vector_width
+                or not meta.coop_step
+            ):
+                continue
+            key = _coop_key(info, node, meta)
+            if key in seen:
+                continue
+            seen.add(key)
+            runs.append(
+                (key, meta.run_stride * plan.aux_buffers[meta.aux_index].dtype.itemsize)
+            )
+    return runs
+
+
+def _coop_layout(
+    runs: Sequence[tuple[tuple[object, ...], int]], coalesce: int, chunk_cols: int
+) -> tuple[dict[tuple[object, ...], tuple[int, int, int]], int]:
+    """The staging layout of one warp: per run ``(request width, row pitch,
+    region offset)`` in bytes (width 0: the run stays per-lane and has no
+    region) and the buffer's bytes.  Each coalesced run's region holds the
+    32 rows of its chunk span at the padded pitch, back to back."""
+    layout: dict[tuple[object, ...], tuple[int, int, int]] = {}
+    offset = 0
+    for key, bytes_per_col in runs:
+        width = coop_request_width(coalesce, chunk_cols, bytes_per_col)
+        if not width:
+            layout[key] = (0, 0, 0)
+            continue
+        pitch = coop_pitch(chunk_cols * bytes_per_col)
+        layout[key] = (width, pitch, offset)
+        offset += 32 * pitch
+    return layout, offset
+
+
+def flex_coalesce_steps(
+    plan: AttentionScorePlan, coord_bounds: Sequence[int | None] | None
+) -> tuple[int, ...]:
+    """Bytes per column of the hook's coalescible runs (the runs with a
+    proven affine row step of a line or more), in region and graph order:
+    the plan fact the coalescing knob (``cute_flash_flex_coalesce``)
+    resolves its choices against.  ``coord_bounds`` are the kernel's (the
+    proof needs them)."""
+    regions = [
+        (tag, r)
+        for tag, r in (("s", plan.score_region), ("m", plan.mask_region))
+        if isinstance(r, FlexRegion)
+    ]
+    if not regions:
+        return ()
+    analyzer = _Analyzer(plan, 32, coord_bounds)
+    infos = [analyzer.analyze(region, tag) for tag, region in regions]
+    _demote_item_values(infos, ITEM_LIVE_CAP)
+    return tuple(step for _key, step in _coop_runs(plan, infos))
+
+
+def flex_coalesce_widths(
+    steps: Sequence[int], coalesce: int, chunk_cols: int
+) -> tuple[int, ...]:
+    """The request width of each coalescible run (``flex_coalesce_steps``)
+    at a knob value and chunk width: the knob's effective identity."""
+    return tuple(coop_request_width(coalesce, chunk_cols, step) for step in steps)
+
+
+# The softmax warps of the fa4 pair body (two warpgroups), each with its own
+# staging buffer.
+COOP_WARPS = 8
+
+
+def flex_coalesce_smem_bytes(
+    steps: Sequence[int], coalesce: int, chunk_cols: int
+) -> int:
+    """Shared memory of the cooperative staging buffers: per softmax warp,
+    the 32 rows of every coalesced run's chunk span at the padded pitch; 0
+    when no run coalesces."""
+    _layout, warp_bytes = _coop_layout(
+        [((index,), step) for index, step in enumerate(steps)], coalesce, chunk_cols
+    )
+    return COOP_WARPS * warp_bytes
+
+
+def flex_prefetch_count(regs: Sequence[int], budget: int) -> int:
+    """How many entries of ``flex_prefetch_regs`` a budget takes (loads are
+    taken in order while the cumulative registers fit; a later smaller load
+    that still fits is taken too)."""
+    used = 0
+    count = 0
+    for size in regs:
+        if used + size <= budget:
+            used += size
+            count += 1
+    return count
+
+
+class FlexAuxSmem(NamedTuple):
+    """One aux table staged in shared memory (``flex_aux_smem_layout``)."""
+
+    aux_index: int
+    # Byte offset of the table's copy inside the staging region.
+    byte_offset: int
+    # Elements of the table; element ``numel`` of the copy is the zero
+    # sentinel out-of-range gathers read.
+    numel: int
+    # Bytes the copy occupies (the sentinel included, 16-byte rounded).
+    padded_bytes: int
+
+
+def _aux_numel(buffer: FlexAuxBuffer) -> int:
+    return math.prod(buffer.shape)
+
+
+def _aux_padded_bytes(buffer: FlexAuxBuffer) -> int:
+    return -(-((_aux_numel(buffer) + 1) * buffer.dtype.itemsize) // 16) * 16
+
+
+def _aux_is_contiguous(buffer: FlexAuxBuffer) -> bool:
+    expected = 1
+    for size, stride in zip(
+        reversed(buffer.shape), reversed(buffer.strides), strict=True
+    ):
+        if size != 1 and stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _aux_smem_eligible(plan: AttentionScorePlan) -> list[int]:
+    """Aux indices, in plan order, of the tables worth staging in shared
+    memory: contiguous tables some load of which indexes with a
+    lane-dependent value that has no affine form in the coordinates (a
+    value loaded from another table, a clamped column, ...): the
+    data-dependent gathers no vector, window or run form serves.  Only
+    real regions are analyzed (the emitter tests pass stand-in objects)."""
+    regions = [
+        r for r in (plan.score_region, plan.mask_region) if isinstance(r, FlexRegion)
+    ]
+    if not regions:
+        return []
+    analyzer = _Analyzer(plan, 32)
+    candidates = [False] * len(plan.aux_buffers)
+    for tag, region in zip("sm", regions, strict=False):
+        info = analyzer.analyze(region, tag)
+        for node, meta in info.nodes.items():
+            if meta.role != "load":
+                continue
+            indices = cast("Sequence[object]", node.args[1])
+            if any(
+                isinstance(index, Node)
+                and _T_LANE in info.nodes[index].deps
+                and info.nodes[index].affine is None
+                for index in indices
+            ):
+                candidates[meta.aux_index] = True
+    return [
+        aux_index
+        for aux_index, (buffer, candidate) in enumerate(
+            zip(plan.aux_buffers, candidates, strict=True)
+        )
+        if candidate and _aux_is_contiguous(buffer) and _aux_numel(buffer) > 0
+    ]
+
+
+def flex_aux_smem_candidates(plan: AttentionScorePlan) -> tuple[int, ...]:
+    """Padded byte sizes, in plan order, of the aux tables worth staging in
+    shared memory (``_aux_smem_eligible``).  The staged copy turns each of
+    their gathers into a 32-bit-addressed shared-memory load with a
+    sentinel for out-of-range coordinates; the autotuner's byte budget
+    (``cute_flash_flex_aux_smem``) is resolved against these sizes."""
+    return tuple(
+        _aux_padded_bytes(plan.aux_buffers[i]) for i in _aux_smem_eligible(plan)
+    )
+
+
+def flex_aux_smem_staged(candidates: Sequence[int], budget: int) -> int:
+    """How many leading candidates (``flex_aux_smem_candidates`` sizes) a
+    byte budget stages: tables are taken in order while the total fits."""
+    total = 0
+    count = 0
+    for size in candidates:
+        if total + size > budget:
+            break
+        total += size
+        count += 1
+    return count
+
+
+def flex_aux_smem_layout(plan: AttentionScorePlan, budget: int) -> list[FlexAuxSmem]:
+    """The staged tables of a byte budget with their offsets in the region."""
+    if budget <= 0:
+        return []
+    eligible = _aux_smem_eligible(plan)
+    sizes = [_aux_padded_bytes(plan.aux_buffers[i]) for i in eligible]
+    layout: list[FlexAuxSmem] = []
+    offset = 0
+    for aux_index in eligible[: flex_aux_smem_staged(sizes, budget)]:
+        buffer = plan.aux_buffers[aux_index]
+        padded = _aux_padded_bytes(buffer)
+        layout.append(FlexAuxSmem(aux_index, offset, _aux_numel(buffer), padded))
+        offset += padded
+    return layout
 
 
 def flex_hook_params(plan: AttentionScorePlan) -> list[tuple[str, str]]:

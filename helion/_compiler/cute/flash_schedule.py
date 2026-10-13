@@ -81,6 +81,10 @@ class FlashScheduleSpec:
     # KV tile width. Only the K/V staging rings scale with it; the query and
     # output tiles stay 128 rows wide.
     kv_tile_n: int = 128
+    # Shared memory the body adds outside the tiles and rings (the flex
+    # hook's warp-cooperative table staging, ``flex_coalesce_smem_bytes``):
+    # part of the base the K/V depth is fitted against.
+    aux_smem_bytes: int = 0
     # V/O head dim when it differs from the Q/K ``head_dim`` (the (192, 128)
     # MLA pair): sQ and the K tile follow ``head_dim``, the aliased ring slot
     # the wider operand, the output tile and TMEM accumulators the V width.
@@ -293,7 +297,7 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
         else 0
     )
     # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
-    return q_bytes + kv_bytes + output_bytes + 3072
+    return q_bytes + kv_bytes + output_bytes + 3072 + spec.aux_smem_bytes
 
 
 _ALT_OVERHEAD_BYTES = 3072

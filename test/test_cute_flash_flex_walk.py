@@ -32,6 +32,7 @@ import helion.language as hl
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from helion._compiler.cute.flash_score_mod import FlexHookCode
     from helion._compiler.device_function import DeviceFunction
 
 pytest.importorskip("cutlass")
@@ -401,6 +402,718 @@ def test_flex_mask_form_knob_is_searched_only_with_a_mask_region() -> None:
     assert _resolve({key: "element"}, has_list_walk=False).flex_mask_form == "bitmask"
     with pytest.raises(InvalidConfig):
         _resolve({**BODY, key: "r2p"})
+
+
+def test_flex_aux_smem_knob_is_searched_only_with_a_candidate_table() -> None:
+    """``cute_flash_flex_aux_smem`` (the shared-memory aux staging budget):
+    an appended schema axis, default 0, whose search choices resolve against
+    the plan's candidate table sizes (pinned without candidates; the budgets
+    that stage distinct table sets with them; a requested budget
+    canonicalizes to the smallest one staging the same tables); resolved to
+    0 off flex plans."""
+    key = cute_flash.FLASH_FLEX_AUX_SMEM_KEY
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    # Appended behind the axes it was introduced after (later knobs follow).
+    assert keys.count(key) == 1
+    assert keys.index(key) > keys.index(cute_flash.FLASH_FLEX_MASK_FORM_KEY)
+    assert (
+        cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_aux_smem"].default
+        == 0
+    )
+    for value in (4096, 16384):
+        assert (key, value) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+
+    def active(fragments: dict[str, object]) -> tuple[object, ...]:
+        fragment = fragments[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        search = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if search is None else tuple(search)
+
+    def fragments(candidates: tuple[int, ...]) -> dict[str, object]:
+        with patch.dict(os.environ, {}, clear=True):
+            return cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                16,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=True,
+                flex_aux_smem_candidates=candidates,
+                score_modifier_kinds=(FLEX_SCORE_KIND,),
+            )
+
+    # One small table: 4096 and 16384 stage the same set, so one of them.
+    small = fragments((1552,))
+    assert active(small) == (0, 4096)
+    assert small[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    # Two tables where only the larger budget stages both.
+    two = fragments((1552, 8192))
+    assert set(active(two)) == {0, 4096, 16384}
+    assert two[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    # A first table past 4096: staged by 16384 alone.
+    big = fragments((4112,))
+    assert set(active(big)) == {0, 16384}
+    assert big[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    none = fragments(())
+    assert active(none) == (0,)
+    with patch.dict(os.environ, {}, clear=True):
+        dense = cute_flash.flash_autotune_fragments(
+            HEAD_DIM, 16, dtype=torch.bfloat16, num_bh=NUM_BH
+        )
+    assert active(dense) == (0,)
+
+    candidates = (1552, 8192)
+    assert _resolve(BODY, flex_aux_smem_candidates=candidates).flex_aux_smem == 0
+    assert (
+        _resolve({**BODY, key: 4096}, flex_aux_smem_candidates=candidates).flex_aux_smem
+        == 4096
+    )
+    assert (
+        _resolve(
+            {**BODY, key: 16384}, flex_aux_smem_candidates=candidates
+        ).flex_aux_smem
+        == 16384
+    )
+    # Canonical: 16384 stages the single small table exactly as 4096 does.
+    assert (
+        _resolve({**BODY, key: 16384}, flex_aux_smem_candidates=(1552,)).flex_aux_smem
+        == 4096
+    )
+    assert _resolve({**BODY, key: 16384}).flex_aux_smem == 0
+    assert _resolve(BODY).flex_aux_smem == 0
+    assert (
+        _resolve(
+            {key: 4096}, has_list_walk=False, flex_aux_smem_candidates=(1552,)
+        ).flex_aux_smem
+        == 4096
+    )
+    with pytest.raises(InvalidConfig):
+        _resolve({**BODY, key: 1024}, flex_aux_smem_candidates=candidates)
+
+
+def test_flex_prefetch_knob_is_searched_only_with_per_chunk_table_loads() -> None:
+    """``cute_flash_flex_prefetch`` (the table prefetch register budget): an
+    appended schema axis, default 64 canonicalized against the plan's
+    per-chunk table loads (0 without them), search choices = the budgets that prefetch distinct
+    load sets or depths at some chunk width, a requested budget canonical
+    to the smallest one with the same loads and depth at the config's chunk
+    width; resolved to 0 off flex plans."""
+    key = cute_flash.FLASH_FLEX_PREFETCH_KEY
+    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-2] == key
+    assert (
+        cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_prefetch"].default
+        == 0
+    )
+    for value in (32, 64, 128):
+        assert (key, value) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+
+    def active(fragments: dict[str, object]) -> tuple[object, ...]:
+        fragment = fragments[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        search = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if search is None else tuple(search)
+
+    def fragments(regs: tuple[int, ...]) -> dict[str, object]:
+        with patch.dict(os.environ, {}, clear=True):
+            return cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                16,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=True,
+                flex_prefetch_regs=regs,
+                score_modifier_kinds=(FLEX_SCORE_KIND,),
+            )
+
+    # One 32-register vector: 32 / 64 / 128 take it one / two / three chunks
+    # ahead at 32 columns (two / four / seven at 16).
+    one = fragments((32,))
+    assert set(active(one)) == {0, 32, 64, 128}
+    assert one[key].default() == 64  # pyrefly: ignore[missing-attribute]
+    # The graphormer-edge pair (32 + 96): 32 takes the vector one ahead, 64
+    # two ahead, 128 both one ahead.
+    pair = fragments((32, 96))
+    assert set(active(pair)) == {0, 32, 64, 128}
+    assert pair[key].default() == 64  # pyrefly: ignore[missing-attribute]
+    # A 34-register window: nothing fits 32 at 32 columns (18 at 16: one
+    # ahead), 64 one ahead, 128 three ahead.
+    window = fragments((34,))
+    assert set(active(window)) == {0, 32, 64, 128}
+    # One 8-register byte vector (a bool table over kv, global-sw /
+    # jetspec-tree): 32 already reaches the depth cap at both chunk widths,
+    # so 64 and 128 resolve to 32 and the default follows (a default of 64
+    # would be a searched value no config can realize: the coverage design
+    # rejected the global-sw search with "uncovered values [(prefetch, 64)]").
+    byte = fragments((8,))
+    assert set(active(byte)) == {0, 32}
+    assert byte[key].default() == 32  # pyrefly: ignore[missing-attribute]
+    assert _resolve(BODY, flex_prefetch_regs=(8,)).flex_prefetch == 32
+    assert _resolve({**BODY, key: 64}, flex_prefetch_regs=(8,)).flex_prefetch == 32
+    none = fragments(())
+    assert active(none) == (0,)
+    assert none[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    with patch.dict(os.environ, {}, clear=True):
+        dense = cute_flash.flash_autotune_fragments(
+            HEAD_DIM, 16, dtype=torch.bfloat16, num_bh=NUM_BH
+        )
+    assert active(dense) == (0,)
+
+    regs = (32, 96)
+    assert _resolve(BODY, flex_prefetch_regs=regs).flex_prefetch == 64
+    assert _resolve({**BODY, key: 0}, flex_prefetch_regs=regs).flex_prefetch == 0
+    # BODY has 16-column chunks (16 + 48 registers, 8 chunks): 64 takes both
+    # one ahead, 128 both two ahead; at 32 columns 128 takes both one ahead.
+    assert _resolve({**BODY, key: 128}, flex_prefetch_regs=regs).flex_prefetch == 128
+    assert (
+        _resolve(
+            {**BODY, key: 128, cute_flash.FLASH_S_LOAD_REP_KEY: 32},
+            flex_prefetch_regs=regs,
+        ).flex_prefetch
+        == 128
+    )
+    # A single 32-register vector at 32 columns (4 chunks): 64 is two ahead,
+    # 128 three ahead (the lead is capped at chunks - 1).
+    assert (
+        _resolve(
+            {**BODY, key: 64, cute_flash.FLASH_S_LOAD_REP_KEY: 32},
+            flex_prefetch_regs=(32,),
+        ).flex_prefetch
+        == 64
+    )
+    assert _resolve({**BODY, key: 64}).flex_prefetch == 0
+    assert _resolve(BODY).flex_prefetch == 0
+    assert (
+        _resolve({key: 64}, has_list_walk=False, flex_prefetch_regs=(34,)).flex_prefetch
+        == 64
+    )
+    with pytest.raises(InvalidConfig):
+        _resolve({**BODY, key: 48}, flex_prefetch_regs=regs)
+
+
+def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
+    """``cute_flash_flex_coalesce`` (bytes per row of one warp-cooperative
+    table request): an appended schema axis, default 0 (the per-lane
+    vectors), search choices = the widths giving distinct per-run request
+    widths at some chunk width whose staging fits the surface's bodies, a
+    requested width canonical to the smallest one with the same per-run
+    widths at the config's chunk width (0 where its staging leaves no
+    two-deep ring); resolved to 0 off flex plans."""
+    key = cute_flash.FLASH_FLEX_COALESCE_KEY
+    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    assert (
+        cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_coalesce"].default
+        == 0
+    )
+    for value in (32, 64, 128):
+        assert (key, value) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+
+    def active(fragments: dict[str, object]) -> tuple[object, ...]:
+        fragment = fragments[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        search = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if search is None else tuple(search)
+
+    def fragments(steps: tuple[int, ...]) -> dict[str, object]:
+        with patch.dict(os.environ, {}, clear=True):
+            return cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                16,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=True,
+                flex_coalesce_steps=steps,
+                score_modifier_kinds=(FLEX_SCORE_KIND,),
+            )
+
+    # The graphormer-edge pair (4 and 12 bytes per column): 128-byte spans
+    # at 32 columns would realize every width, but their 136 KB staging
+    # fits no searched hd64 body, so 128 is not offered; at 16 columns the
+    # spans cap both runs at 64 (74 KB, fits).
+    pair = fragments((4, 12))
+    assert set(active(pair)) == {0, 32, 64}
+    assert pair[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    assert cute_flash.flash_flex_coalesce_choices((4, 12), 128) == (0,)
+    # A bf16 unit-stride run: 64-byte spans at 32 columns (32 at 16), so
+    # 128 is 64 everywhere.
+    half = fragments((2,))
+    assert set(active(half)) == {0, 32, 64}
+    assert half[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    # A byte run: 32-byte spans at 32 columns only.
+    byte = fragments((1,))
+    assert set(active(byte)) == {0, 32}
+    assert byte[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    # One int32 vector (graphormer-spatial): 36 KB at 32 columns fits.
+    assert cute_flash.flash_flex_coalesce_choices((4,), 64) == (0, 32, 64, 128)
+    none = fragments(())
+    assert active(none) == (0,)
+    assert none[key].default() == 0  # pyrefly: ignore[missing-attribute]
+    with patch.dict(os.environ, {}, clear=True):
+        dense = cute_flash.flash_autotune_fragments(
+            HEAD_DIM, 16, dtype=torch.bfloat16, num_bh=NUM_BH
+        )
+    assert active(dense) == (0,)
+
+    steps = (4, 12)
+    plain = _resolve(BODY, flex_coalesce_steps=steps)
+    assert (plain.flex_coalesce, plain.flex_coalesce_slots) == (0, 0)
+    # BODY has 16-column chunks: 64-byte spans, so 128 resolves to 64.  The
+    # pair's staging is 72 KB per ring slot there: one slot fits beside the
+    # two Q tiles, the two staged O tiles and a three-deep ring, two do not.
+    resolved = _resolve({**BODY, key: 128}, flex_coalesce_steps=steps)
+    assert resolved.flex_coalesce == 64
+    assert resolved.flex_coalesce_slots == 1
+    assert resolved.kv_stage == 3
+    # One int32 table (graphormer-spatial): 20 KB per slot at 16 columns
+    # (four slots, 80 KB), 36 KB at 32 (two slots).
+    assert (
+        _resolve({**BODY, key: 128}, flex_coalesce_steps=(4,)).flex_coalesce_slots == 4
+    )
+    assert (
+        _resolve(
+            {**BODY, key: 128, cute_flash.FLASH_S_LOAD_REP_KEY: 32},
+            flex_coalesce_steps=(4,),
+        ).flex_coalesce_slots
+        == 2
+    )
+    assert _resolve({**BODY, key: 128}, flex_coalesce_steps=steps).flex_coalesce == 64
+    assert _resolve({**BODY, key: 32}, flex_coalesce_steps=steps).flex_coalesce == 32
+    assert _resolve({**BODY, key: 0}, flex_coalesce_steps=steps).flex_coalesce == 0
+    # 32 columns: 136 KB of staging.  Beside the pair's two staged O tiles
+    # no two-deep ring is left, so the width resolves to 0 (the ring keeps
+    # its depth); with the output staged in the dead Q stages it fits.
+    wide = {**BODY, cute_flash.FLASH_S_LOAD_REP_KEY: 32}
+    staged = _resolve({**wide, key: 128}, flex_coalesce_steps=steps)
+    assert staged.flex_coalesce == 0
+    assert staged.kv_stage == 3
+    over_q = {**wide, cute_flash.FLASH_O_OVER_Q_KEY: True}
+    fitted = _resolve({**over_q, key: 128}, flex_coalesce_steps=steps)
+    assert (fitted.flex_coalesce, fitted.flex_coalesce_slots, fitted.kv_stage) == (
+        128,
+        1,
+        3,
+    )
+    assert _resolve({**over_q, key: 64}, flex_coalesce_steps=steps).flex_coalesce == 64
+    # A byte run at 16 columns has no request width: every choice is 0.
+    assert _resolve({**BODY, key: 128}, flex_coalesce_steps=(1,)).flex_coalesce == 0
+    assert _resolve({**wide, key: 128}, flex_coalesce_steps=(1,)).flex_coalesce == 32
+    assert _resolve({**BODY, key: 128}).flex_coalesce == 0
+    assert _resolve(BODY).flex_coalesce == 0
+    assert (
+        _resolve(
+            {**wide, key: 128}, has_list_walk=False, flex_coalesce_steps=(4,)
+        ).flex_coalesce
+        == 128
+    )
+    with pytest.raises(InvalidConfig):
+        _resolve({**BODY, key: 48}, flex_coalesce_steps=steps)
+
+
+def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
+    """The structural coverage design finds a witness for every searched
+    cooperative width of the graphormer-edge surface (64 and 32 through the
+    16-column chunk axis; the cold autotune of edge s2048 failed with
+    "uncovered values [(cute_flash_flex_coalesce, 128)]" while 128 was
+    offered) and of the one-table surface (128 at 32 columns)."""
+    from helion._compiler.backend import CuteBackend
+    from helion.autotuner.config_spec import BlockSizeSpec
+    from helion.autotuner.config_spec import ConfigSpec
+
+    for steps, expected in (((4, 12), (0, 32, 64)), ((4,), (0, 32, 64, 128))):
+        with (
+            patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
+            patch(
+                "helion.autotuner.config_spec.get_target_device_capability",
+                return_value=(10, 0),
+            ),
+        ):
+            spec = ConfigSpec(backend=CuteBackend())
+            for block_id, target in enumerate((1, 128, 128)):
+                spec.block_sizes.append(
+                    BlockSizeSpec(block_id=block_id, size_hint=target)
+                )
+            spec.enable_cute_flash_search(
+                head_dim=HEAD_DIM,
+                num_kv=16,
+                num_bh=NUM_BH,
+                dtype=torch.bfloat16,
+                block_size_targets={0: 1, 1: 128, 2: 128},
+                standard_dense_output=False,
+                standard_causal_output=False,
+                plain_row_body=False,
+                has_score_modifiers=True,
+                score_modifier_kinds=(FLEX_SCORE_KIND,),
+                has_list_walk=True,
+                flex_has_score_region=True,
+                q_seq=2048,
+                kv_seq=2048,
+                flex_aux_smem_candidates=(1552,),
+                flex_prefetch_regs=(32, 96),
+                flex_coalesce_steps=steps,
+            )
+            fragment = spec._cute_flash_autotune_fragments()[
+                cute_flash.FLASH_FLEX_COALESCE_KEY
+            ]
+            assert tuple(fragment.search_choices) == expected  # pyrefly: ignore[missing-attribute]
+            generation = spec.create_config_generation()
+            assert generation.flash_structural_coverage_uncovered_values() == []
+
+
+def test_codegen_binds_the_cooperative_staging_buffer() -> None:
+    """With a cooperative width the fa4 storage grows by the eight softmax
+    warps' staging buffers (``flex_coop_bytes``: 32 rows at the widest
+    request's padded pitch, 36864 at 128 / 20480 at 64), the setup binds
+    ``_flash_flex_coop_smem`` and the width reaches both hooks; without one
+    nothing of that exists."""
+
+    plan = _gather_plan()
+    assert cute_flash._flash_flex_coalesce_steps(plan, NUM_BH, NUM_HEADS, 16) == (4,)
+    seen: list[int] = []
+    stub = cute_flash.render_flex_hook
+
+    def recording(*args: object, **kwargs: object) -> FlexHookCode:
+        seen.append(int(kwargs.get("coalesce", -1)))  # pyrefly: ignore[bad-argument-type]
+        return stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+    wide = {**BODY, cute_flash.FLASH_S_LOAD_REP_KEY: 32}
+    with patch.object(cute_flash, "render_flex_hook", recording):
+        src = _render(
+            _resolve(
+                {**wide, cute_flash.FLASH_FLEX_COALESCE_KEY: 128},
+                flex_coalesce_steps=(4,),
+            ),
+            plan,
+        )
+        assert set(seen) == {128}
+        seen.clear()
+        narrow = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_COALESCE_KEY: 128},
+                flex_coalesce_steps=(4,),
+            ),
+            plan,
+        )
+        assert set(seen) == {64}
+        seen.clear()
+        plain = _render(
+            _resolve(
+                {**wide, cute_flash.FLASH_FLEX_COALESCE_KEY: 0},
+                flex_coalesce_steps=(4,),
+            ),
+            plan,
+        )
+        assert set(seen) == {0}
+    # Two ring slots of 36 KB at 32 columns, four of 20 KB at 16.
+    storage = next(
+        line for line in src.splitlines() if "flash_fa4_shared_storage(" in line
+    )
+    assert "flex_coop_bytes=73728" in storage
+    assert "_flash_flex_coop_smem = storage.sFlexCoop.data_ptr()" in src
+    assert src.index("storage = smem.allocate(") < src.index("_flash_flex_coop_smem = ")
+    narrow_storage = next(
+        line for line in narrow.splitlines() if "flash_fa4_shared_storage(" in line
+    )
+    assert "flex_coop_bytes=81920" in narrow_storage
+    assert "flex_coop_bytes" not in plain
+    assert "sFlexCoop" not in plain
+
+
+def test_codegen_splices_the_cooperative_stream() -> None:
+    """With a streamed run the softmax loop (a) issues chunks ``0 .. slots
+    - 1`` of the walk's first tile before the KV loop after a full wait and
+    a warp sync, (b) at the top of every PASS1 iteration runs the consume
+    block ahead of the t2r copy and then issues chunk ``(ci + slots) %
+    chunks`` of the current tile, or of the peeked tile past the chunk
+    count, into slot ``ci % slots`` (both branches), and (c) refills the
+    ring for the peeked tile on an absent step (status 0) after PASS1,
+    ahead of PASS2; the slot count reaches the hook.  Without a width none
+    of that exists."""
+    from helion._compiler.cute.flash_score_mod import FlexHookCode
+
+    plan = _gather_plan()
+    seen: list[tuple[int, int]] = []
+    stub = cute_flash.render_flex_hook
+
+    def recording(*args: object, **kwargs: object) -> FlexHookCode:
+        seen.append(
+            (int(kwargs.get("coalesce", -1)), int(kwargs.get("coop_slots", -1)))
+        )  # pyrefly: ignore[bad-argument-type]
+        code = stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+        if seen[-1][0]:
+            return FlexHookCode(
+                code.item_prelude,
+                code.tile_prologue,
+                code.chunk_body,
+                chunk_issue=" " * 16
+                + "'flex issue chunk=flash_flex_pc slot=flash_flex_ps'\n",
+                chunk_consume=" " * 16 + "'flex consume chunk=flash_ci'\n",
+                coop_slots=seen[-1][1],
+            )
+        return code
+
+    with patch.object(cute_flash, "render_flex_hook", recording):
+        src = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_COALESCE_KEY: 128},
+                flex_coalesce_steps=(4,),
+            ),
+            plan,
+        )
+        assert set(seen) == {(64, 4)}
+        seen.clear()
+        plain = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_COALESCE_KEY: 0},
+                flex_coalesce_steps=(4,),
+            ),
+            plan,
+        )
+        assert set(seen) == {(0, 1)}
+    issue = "'flex issue chunk=flash_flex_pc slot=flash_flex_ps'"
+    consume = "'flex consume chunk=flash_ci'"
+    for loop in re.finditer(
+        r"flash_ld_shape = tLDcS\[None, 0, None, None\]\.shape\n(.*?)cute\.arch\.fence_view_async_tmem_load",
+        src,
+        re.DOTALL,
+    ):
+        body = loop.group(1).partition(
+            "for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):"
+        )[2]
+        # (b): consume, the bindings, the issue, all ahead of the t2r copy.
+        at = body.index(consume)
+        assert at < body.index("flash_flex_pc = (flash_ci + 4) % flash_LD_CHUNKS")
+        assert "flash_flex_ps = flash_ci % 4" in body
+        assert (
+            "flash_flex_pkv = flash_kv if flash_ci + 4 < flash_LD_CHUNKS else flash_kv_peek"
+            in body
+        )
+        assert at < body.index(issue) < body.index("cute.copy(")
+    # One softmax loop per stage: (a) before the ``for`` (four issues after
+    # the wait and the sync), (c) under the absent-step guard after PASS1.
+    stages = src.split("flash_row_sum = cutlass.Float32(0.0)")[1:]
+    assert len(stages) == 2
+    for stage_src in stages:
+        loop_at = stage_src.index("for flash_kv_iter in cutlass.range(")
+        pre = stage_src[:loop_at]
+        assert "flash_kv_peek = cutlass.Int32(0)" in pre
+        assert pre.index("cute.arch.cp_async_wait_group(0)") < pre.index(
+            "flash_flex_pkv = flash_kv_peek"
+        )
+        assert pre.count(issue) == 4
+        assert "flash_flex_ps = 3" in pre
+        body = stage_src[loop_at:]
+        refill = body.index("if flash_flex_status == 0:")
+        assert refill < body.index("flash_p_sum = cutlass.Float32(0.0)")
+        assert body[refill:].count(issue) == 4
+        assert "cute.arch.cp_async_wait_group(0)" in body[refill:]
+    for text in (
+        "flash_flex_pc",
+        "flash_kv_peek",
+        "flash_flex_pkv",
+        "cute.arch.cp_async_wait_group",
+        "cute.arch.cp_async_commit_group",
+    ):
+        assert text not in plain, text
+
+
+def _gather_plan() -> AttentionScorePlan:
+    """A flex plan whose score region gathers ``bias[h, idx[b, q, kv]]``:
+    ``idx`` is a vector-form table, ``bias`` (16 x 7 fp32) a staging
+    candidate."""
+    import helion
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.cute.flash_score_mod import build_flex_region
+
+    def score_mod(score, b, h, q_idx, kv_idx, idx, bias):
+        return score + hl.load(bias, [h, hl.load(idx, [b, q_idx, kv_idx])])
+
+    settings = helion.Settings(backend="cute")
+    with (
+        patch(
+            "helion._compiler.compile_environment.target_device_capability",
+            return_value=(10, 0),
+        ),
+        CompileEnvironment(torch.device("cpu"), settings),
+    ):
+        region, aux, scalars = build_flex_region(
+            score_mod,
+            aux_specs=[
+                ("idx", torch.int32, (16, 2048, 2048)),
+                ("bias", torch.float32, (16, 7)),
+            ],
+        )
+    return AttentionScorePlan(
+        head_dim=HEAD_DIM,
+        qk_scale_log2=math.log2(math.e) / math.sqrt(HEAD_DIM),
+        q_seq=2048,
+        kv_seq=2048,
+        kv_walk=_walk(),
+        score_region=region,
+        aux_buffers=aux,
+        host_scalars=scalars,
+        scale_peeled=False,
+    )
+
+
+def test_codegen_stages_candidate_tables_in_shared_memory() -> None:
+    """With a budget the fa4 storage grows by the padded table (``sFlexAux``),
+    the CTA-wide setup binds the typed pointer and fills the copy (every
+    thread, one zero sentinel) before the setup sync, and the hook is
+    rendered with the budget; without one nothing of that exists."""
+    from helion._compiler.cute.flash_score_mod import flex_aux_smem_candidates
+
+    plan = _gather_plan()
+    assert flex_aux_smem_candidates(plan) == (464,)
+    seen: list[int] = []
+    stub = cute_flash.render_flex_hook
+
+    def recording(*args: object, **kwargs: object) -> cute_flash.FlexHookCode:
+        seen.append(int(kwargs.pop("aux_smem_budget", -1)))  # pyrefly: ignore[bad-argument-type]
+        return stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+    with patch.object(cute_flash, "render_flex_hook", recording):
+        staged = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_AUX_SMEM_KEY: 4096},
+                flex_aux_smem_candidates=(464,),
+            ),
+            plan,
+        )
+        assert set(seen) == {4096}
+        seen.clear()
+        plain = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_AUX_SMEM_KEY: 0},
+                flex_aux_smem_candidates=(464,),
+            ),
+            plan,
+        )
+        assert set(seen) == {0}
+    # The storage allocation follows the descriptor prefetch (an
+    # ``if warp_idx == 0`` block), so the fill is checked on the whole text.
+    assert "flex_aux_bytes=464)" in staged
+    assert "flash_flex_aux_smem = storage.sFlexAux.data_ptr()" in staged
+    assert (
+        "_flash_aux1_smem = cute.recast_ptr(flash_flex_aux_smem + 0, "
+        "dtype=cutlass.Float32)" in staged
+    )
+    fill = staged.index("for flash_fa in cutlass.range_constexpr(1):")
+    sync = staged.index("cute.arch.sync_threads()")
+    assert "flash_fa_i = tidx + flash_fa * 512" in staged[fill:sync]
+    assert (
+        "(_flash_aux1_smem + flash_fa_i).store((_flash_aux1.iterator + "
+        "flash_fa_i).load())" in staged[fill:sync]
+    )
+    assert "if flash_fa_i == 112:" in staged[fill:sync]
+    assert (
+        "(_flash_aux1_smem + flash_fa_i).store(cutlass.Float32(0))" in staged[fill:sync]
+    )
+    # Every thread fills, after the allocation and before the setup-wide
+    # sync the softmax warps pass; no warp-role guard in between.
+    allocation = staged.index("storage = smem.allocate(_flash_storage_cls)")
+    assert allocation < fill < sync
+    assert "warp_idx" not in staged[allocation:sync]
+    for text in ("sFlexAux", "flex_aux_bytes", "_flash_aux1_smem", "flash_fa_i"):
+        assert text not in plain, text
+
+
+def test_codegen_splices_the_next_chunk_prefetch_around_the_t2r_copy() -> None:
+    """With a prefetch budget the hook's prefetch block runs (a) before the
+    KV loop for the walk's first tile (a peek of the initial words, the
+    slots created: chunks ``0 .. depth - 1`` plus chunk 0 again into slot
+    ``depth``), (b) at the top of every PASS1 iteration for chunk ``(ci +
+    depth) % chunks`` of the current tile ahead of the t2r copy (both
+    branches bind ``flash_flex_pkv = flash_kv``), and (c) after PASS1 on
+    every step, outside the status guard, for the peeked next tile ahead
+    of PASS2; the budget reaches the hook.  Without one nothing of that
+    exists."""
+    from helion._compiler.cute.flash_score_mod import FlexHookCode
+
+    plan = _gather_plan()
+    assert cute_flash._flash_flex_prefetch_regs(plan, NUM_BH, NUM_HEADS, 16) == (32,)
+    seen: list[int] = []
+    stub = cute_flash.render_flex_hook
+
+    def recording(*args: object, **kwargs: object) -> FlexHookCode:
+        seen.append(int(kwargs.pop("prefetch_regs", -1)))  # pyrefly: ignore[bad-argument-type]
+        code = stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+        if seen[-1]:
+            return FlexHookCode(
+                code.item_prelude,
+                code.tile_prologue,
+                code.chunk_body,
+                " " * 16 + "'flex prefetch chunk=flash_flex_pc'\n",
+                1,
+            )
+        return code
+
+    with patch.object(cute_flash, "render_flex_hook", recording):
+        src = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_PREFETCH_KEY: 32},
+                flex_prefetch_regs=(32,),
+            ),
+            plan,
+        )
+        assert set(seen) == {32}
+        seen.clear()
+        plain = _render(
+            _resolve(
+                {**BODY, cute_flash.FLASH_FLEX_PREFETCH_KEY: 0},
+                flex_prefetch_regs=(32,),
+            ),
+            plan,
+        )
+        assert set(seen) == {0}
+    marker = "'flex prefetch chunk=flash_flex_pc'"
+    for loop in re.finditer(
+        r"flash_ld_shape = tLDcS\[None, 0, None, None\]\.shape\n(.*?)cute\.arch\.fence_view_async_tmem_load",
+        src,
+        re.DOTALL,
+    ):
+        block = loop.group(1)
+        head, _, body = block.partition(
+            "for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):"
+        )
+        # (b): the current tile bound, no fill inside PASS1's head.
+        assert "flash_flex_pkv = flash_kv" in head and marker not in head
+        step = body.index("flash_flex_pc = (flash_ci + 1) % flash_LD_CHUNKS")
+        assert "flash_flex_ps = (flash_ci + 1) % 2" in body[step:]
+        assert step < body.index(marker) < body.index("cute.copy(")
+        assert "if flash_ci" not in body
+    # One softmax loop per stage: (a) before the ``for``, (c) after PASS1
+    # ahead of PASS2's ``flash_p_sum`` reset, both for ``flash_kv_peek``.
+    stages = src.split("flash_row_sum = cutlass.Float32(0.0)")[1:]
+    assert len(stages) == 2
+    for stage_src in stages:
+        loop_at = stage_src.index("for flash_kv_iter in cutlass.range(")
+        pre = stage_src[:loop_at]
+        assert "flash_kv_peek = cutlass.Int32(0)" in pre
+        assert "flash_flex_pkv = flash_kv_peek" in pre
+        assert pre.count(marker) == 2  # chunk 0 into slots 0 and 1 (depth 1)
+        assert "flash_flex_pf_init = True" in pre and "flash_flex_ps = 1" in pre
+        body = stage_src[loop_at:]
+        # The in-loop peek follows the walk step (after the bit is cleared).
+        assert body.index(
+            "flash_flex_rem0 = flash_flex_rem0 & ~flash_flex_kvbit"
+        ) < body.index("flash_kv_peek = cutlass.Int32(0)")
+        fill = body.index("flash_flex_pkv = flash_kv_peek")
+        assert fill < body.index("flash_p_sum = cutlass.Float32(0.0)")
+        assert "flash_flex_pf_init = False" in body[fill:]
+        # Outside the status guard: one level below the ``for`` (the render
+        # is ``ast.unparse``d, so compare relative indentation).
+        for_line = next(
+            line
+            for line in stage_src.splitlines()
+            if line.lstrip().startswith("for flash_kv_iter in cutlass.range(")
+        )
+        for_indent = len(for_line) - len(for_line.lstrip())
+        fill_line = next(
+            line
+            for line in body.splitlines()
+            if line.strip() == "flash_flex_pkv = flash_kv_peek"
+        )
+        assert len(fill_line) - len(fill_line.lstrip()) == for_indent + 4
+    for text in ("flash_flex_pc", "flash_kv_peek", "flash_flex_pkv"):
+        assert text not in plain, text
 
 
 def test_fragment_surface_is_length_invariant_for_the_list_walk() -> None:

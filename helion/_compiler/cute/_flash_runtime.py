@@ -135,6 +135,8 @@ def flash_fa4_shared_storage(
     kv_cta_group_size: int = 1,
     head_dim_v: int | None = None,
     uneven_kv_ring: bool = False,
+    flex_aux_bytes: int = 0,
+    flex_coop_bytes: int = 0,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -164,10 +166,18 @@ def flash_fa4_shared_storage(
     the separate V ring / ``sO`` follow the V width. ``uneven_kv_ring`` is
     FA4's three-slot [wide, narrow, wide] aliased ring for that pair: the
     stage stride is half a K plus half a V tile and the ring ends one wide
-    tile after the last stride (see ``uneven_kv_ring_slot``).
+    tile after the last stride (see ``uneven_kv_ring_slot``). ``flex_aux_bytes``
+    (a multiple of 16) is the flex hook's shared-memory aux staging region
+    (``sFlexAux``, the staged tables back to back, each padded with a zero
+    sentinel element), filled once per CTA at the setup; it sits in the
+    alignment padding below ``sQ`` when it fits there.  ``flex_coop_bytes``
+    (a multiple of 16) is the hook's warp-cooperative table-load staging
+    (``sFlexCoop``: one 32-row buffer per softmax warp, see
+    ``flex_score_mod_runtime.coop_exchange``).
     """
     assert kv_cta_group_size in (1, 2)
     assert kv_tile_n % kv_cta_group_size == 0
+    flex_aux_words = flex_aux_bytes // 4
     if head_dim_v is None:
         head_dim_v = head_dim
     kv_slot_dim = max(head_dim, head_dim_v)
@@ -215,6 +225,16 @@ def flash_fa4_shared_storage(
             ]
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+            # The flex hook's staged aux tables: declared before the
+            # 1024-aligned tiles so a small region lives in the alignment
+            # padding below ``sQ`` instead of growing the dynamic shared
+            # memory (crossing a carveout step costs L1 capacity).
+            sFlexAux: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+            ]
+            sFlexCoop: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, flex_coop_bytes], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
@@ -257,6 +277,13 @@ def flash_fa4_shared_storage(
             clc_response: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
             ]
+            # See the separate-KV struct: in the padding below ``sQ``.
+            sFlexAux: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+            ]
+            sFlexCoop: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, flex_coop_bytes], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
@@ -296,6 +323,13 @@ def flash_fa4_shared_storage(
         clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
         clc_response: cute.struct.Align[
             cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
+        ]
+        # See the separate-KV struct: in the padding below ``sQ``.
+        sFlexAux: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+        ]
+        sFlexCoop: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int8, flex_coop_bytes], 16
         ]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024

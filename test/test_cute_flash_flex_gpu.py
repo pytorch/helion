@@ -353,6 +353,299 @@ def test_score_mod_with_a_table_gather() -> None:
 
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
+)
+def test_aux_smem_staging_is_bitwise_the_global_gather(
+    overrides: dict[str, object],
+) -> None:
+    """``cute_flash_flex_aux_smem``: a data-dependent gather
+    (``bias[h, idx[b, q, kv]]``, the graphormer-spatial shape of score_mod
+    with out-of-range indices) read from the shared-memory copy through the
+    sentinel select gives the same output and LSE as the clamped global
+    gather, at 16- and 32-column chunks; both match torch (where
+    out-of-range indices read 0, the ``hl.load`` convention)."""
+    batch, heads, seq = 2, 4, 1024
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(2)
+    idx = torch.randint(-1, 9, (batch, seq, seq), device=DEVICE, dtype=torch.int32)
+    bias = torch.randn(heads, 7, device=DEVICE)
+
+    def score_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [h, hl.load(idx, [b, q_idx, kv_idx])])
+
+    def score_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        i = idx[b, q_idx, kv_idx]
+        ok = (i >= 0) & (i < 7)
+        return score + torch.where(ok, bias[h, i.clamp(0, 6)], 0.0)
+
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, score_mod, block_mask)
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for budget in (0, 4096):
+        fn, resolved = _compile_flex(
+            args, {**overrides, cute_flash.FLASH_FLEX_AUX_SMEM_KEY: budget}
+        )
+        assert resolved.flex_aux_smem == budget
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        results[budget] = (out, lse)
+    out, lse = results[4096]
+    assert torch.equal(out, results[0][0])
+    assert torch.equal(lse, results[0][1])
+    out_ref, lse_ref = _reference(q, k, v, score_ref, block_mask)
+    _assert_close_to_reference(out, lse, out_ref, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
+)
+def test_strided_table_runs_match_torch(overrides: dict[str, object]) -> None:
+    """The strided-run form: ``types[b, q, kv, n]`` (int32, three literal
+    trailing indices sharing one run per four-lane group) feeding gathers
+    from a staged table (budget 4096), the graphormer-edge score_mod shape."""
+    batch, heads, seq = 2, 4, 1024
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(3)
+    types = torch.randint(0, 8, (batch, seq, seq, 3), device=DEVICE, dtype=torch.int32)
+    lengths = torch.randint(0, 4, (batch, seq, seq), device=DEVICE, dtype=torch.int32)
+    table = torch.randn(heads, 24, device=DEVICE)
+
+    def score_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        length = hl.load(lengths, [b, q_idx, kv_idx])
+        total = torch.zeros_like(score)
+        for n in range(3):
+            et = hl.load(types, [b, q_idx, kv_idx, n])
+            c = hl.load(table, [h, et + n * 8])
+            total = total + torch.where(length > n, c, 0.0)
+        return score + total / torch.clamp(length, min=1).to(torch.float32)
+
+    def score_ref(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        length = lengths[b, q_idx, kv_idx]
+        total = torch.zeros_like(score)
+        for n in range(3):
+            c = table[h, types[b, q_idx, kv_idx, n] + n * 8]
+            total = total + torch.where(length > n, c, 0.0)
+        return score + total / torch.clamp(length, min=1).to(torch.float32)
+
+    block_mask = create_block_mask(
+        _causal, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, score_mod, block_mask)
+    out_ref, lse_ref = _reference(q, k, v, score_ref, block_mask)
+    fn, resolved = _compile_flex(
+        args, {**overrides, cute_flash.FLASH_FLEX_AUX_SMEM_KEY: 4096}
+    )
+    assert resolved.flex_aux_smem == 4096
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    _assert_close_to_reference(out, lse, out_ref, lse_ref)
+
+
+def _edge_like_score_args(seed: int) -> tuple[Any, ...]:
+    """Flex arguments with the graphormer-edge shape of score_mod over the band
+    mask: a strided int32 row-table run (``types``, three reads per element),
+    a row-table vector (``lengths``) and a gathered bias table."""
+    batch, heads, seq = 2, 4, 1024
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(seed)
+    types = torch.randint(0, 8, (batch, seq, seq, 3), device=DEVICE, dtype=torch.int32)
+    lengths = torch.randint(0, 4, (batch, seq, seq), device=DEVICE, dtype=torch.int32)
+    table = torch.randn(heads, 24, device=DEVICE)
+
+    def score_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        length = hl.load(lengths, [b, q_idx, kv_idx])
+        total = torch.zeros_like(score)
+        for n in range(3):
+            et = hl.load(types, [b, q_idx, kv_idx, n])
+            c = hl.load(table, [h, et + n * 8])
+            total = total + torch.where(length > n, c, 0.0)
+        return score + total / torch.clamp(length, min=1).to(torch.float32)
+
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    return _flex_args(q, k, v, score_mod, block_mask)
+
+
+def _spatial_score_args(seed: int) -> tuple[Any, ...]:
+    """Flex arguments with the graphormer-spatial shape of score_mod over the
+    band mask: one int32 row-table vector feeding a gathered bias table."""
+    batch, heads, seq = 2, 4, 1024
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(seed)
+    dist = torch.randint(0, 7, (batch, seq, seq), device=DEVICE, dtype=torch.int32)
+    bias = torch.randn(heads, 7, device=DEVICE)
+
+    def spatial_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+        return score + hl.load(bias, [h, hl.load(dist, [b, q_idx, kv_idx])])
+
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    return _flex_args(q, k, v, spatial_mod, block_mask)
+
+
+# Each case below compiles two or three fa4 kernels, which runs past the
+# suite's 60 s per-test timeout under CI's eight xdist workers on one B200.
+_MULTI_COMPILE_TIMEOUT = pytest.mark.timeout(300)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
+)
+def test_next_chunk_table_prefetch_is_bitwise_the_in_chunk_loads(
+    overrides: dict[str, object],
+) -> None:
+    """``cute_flash_flex_prefetch``: the row-table vector and the shared
+    strided run issued ahead (budgets 32: the vector one chunk ahead, and
+    128: both one ahead at 32 columns, two ahead at 16) give the same
+    output and LSE as the in-chunk loads, on partial and full tiles."""
+    args = _edge_like_score_args(4)
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for budget in (0, 32, 128):
+        fn, resolved = _compile_flex(
+            args, {**overrides, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
+        )
+        assert resolved.flex_prefetch == budget
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        results[budget] = (out, lse)
+    for budget in (32, 128):
+        assert torch.equal(results[budget][0], results[0][0])
+        assert torch.equal(results[budget][1], results[0][1])
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    "overrides", [PAIR_DESC, STAGED_ASC], ids=["pair_desc", "staged_asc"]
+)
+def test_deep_table_prefetch_lead_is_bitwise_the_in_chunk_loads(
+    overrides: dict[str, object],
+) -> None:
+    """A single-vector score_mod at budget 128 runs three (32 columns) /
+    seven (16 columns) chunks ahead and gives the same output and LSE as
+    the in-chunk loads."""
+    args = _spatial_score_args(4)
+    deep: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for budget in (0, 128):
+        fn, resolved = _compile_flex(
+            args, {**overrides, cute_flash.FLASH_FLEX_PREFETCH_KEY: budget}
+        )
+        assert resolved.flex_prefetch == budget
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        deep[budget] = (out, lse)
+    assert torch.equal(deep[128][0], deep[0][0])
+    assert torch.equal(deep[128][1], deep[0][1])
+
+
+# The TMA-epilogue pair body with 32-column chunks and the output staged in
+# the dead Q stages: the only 32-column body whose shared memory holds the
+# cooperative staging of the graphormer-edge pair (136 KB).
+WIDE_OVER_Q: dict[str, object] = {
+    **PAIR_DESC,
+    cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    cute_flash.FLASH_O_OVER_Q_KEY: True,
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("overrides", "width"),
+    [
+        (PAIR_DESC, 64),
+        (PAIR_DESC, 32),
+        (WIDE_OVER_Q, 128),
+        (WIDE_OVER_Q, 64),
+        (WIDE_OVER_Q, 32),
+    ],
+    ids=[
+        "pair_desc_16-64",
+        "pair_desc_16-32",
+        "over_q_32-128",
+        "over_q_32-64",
+        "over_q_32-32",
+    ],
+)
+def test_cooperative_table_loads_are_bitwise_the_per_lane_vectors(
+    overrides: dict[str, object], width: int
+) -> None:
+    """``cute_flash_flex_coalesce``: the row-table runs fetched
+    warp-cooperatively (whole lines of 4 / 8 / 16 rows per request at 128 /
+    64 / 32 bytes per row) and staged through the warp's shared-memory
+    buffer give the same output and LSE as the per-lane vectors, with and
+    without the ring prefetch, on partial and full tiles; at 16-column
+    chunks the 64-byte spans cap the request at 64, so the pair_desc body
+    offers no 128."""
+    args = _edge_like_score_args(5)
+    fn, resolved = _compile_flex(
+        args, {**overrides, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
+    )
+    assert resolved.flex_coalesce == 0
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    for prefetch in (0, 128):
+        fn, resolved = _compile_flex(
+            args,
+            {
+                **overrides,
+                cute_flash.FLASH_FLEX_COALESCE_KEY: width,
+                cute_flash.FLASH_FLEX_PREFETCH_KEY: prefetch,
+            },
+        )
+        assert resolved.flex_coalesce == width, (width, resolved.flex_coalesce)
+        assert resolved.flex_prefetch == prefetch
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out, out_ref), (width, prefetch)
+        assert torch.equal(lse, lse_ref), (width, prefetch)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("overrides", "width"),
+    [(PAIR_DESC, 64), (WIDE_OVER_Q, 128)],
+    ids=["pair_desc_16", "over_q_32"],
+)
+def test_cooperative_loads_of_the_spatial_vector_table_are_bitwise(
+    overrides: dict[str, object], width: int
+) -> None:
+    """The spatial shape (one int32 vector table, a 36 KB staging at 32
+    columns): a 128-byte request resolves to the widest width the body
+    offers and gives the same output and LSE as the per-lane vectors."""
+    args = _spatial_score_args(5)
+    fn, resolved = _compile_flex(
+        args, {**overrides, cute_flash.FLASH_FLEX_COALESCE_KEY: 0}
+    )
+    assert resolved.flex_coalesce == 0
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args, {**overrides, cute_flash.FLASH_FLEX_COALESCE_KEY: 128}
+    )
+    assert resolved.flex_coalesce == width
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
 def test_random_table_mask_with_empty_rows_is_stable_under_repeated_launches() -> None:
     batch, heads, seq = 4, 8, 2048
     torch.manual_seed(1)
