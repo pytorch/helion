@@ -100,6 +100,18 @@ class FlashSearchSurface(NamedTuple):
     flex_has_mask_region: bool = False
     q_seq: int | None = None
     kv_seq: int | None = None
+    # Padded sizes of the flex hook's shared-memory aux staging candidates
+    # (``flash_score_mod.flex_aux_smem_candidates``, plan order): the budget
+    # knob's search choices and default resolve against them.
+    flex_aux_smem_candidates: tuple[int, ...] = ()
+    # Registers of the hook's prefetchable per-chunk table loads at 32
+    # columns (``flash_score_mod.flex_prefetch_regs``): the prefetch budget
+    # knob's choices resolve against them.
+    flex_prefetch_regs: tuple[int, ...] = ()
+    # Bytes per column of the hook's coalescible row-table runs
+    # (``flash_score_mod.flex_coalesce_steps``): the cooperative request
+    # width knob's choices resolve against them.
+    flex_coalesce_steps: tuple[int, ...] = ()
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3605,7 +3617,10 @@ def flex_search_surface(
     so a query length below 128 (which caps the generic range at its extent)
     is not a decline; a declared ceiling below 128 is.
     """
+    from .cute.cute_flash import _flash_flex_coalesce_steps
+    from .cute.cute_flash import _flash_flex_prefetch_regs
     from .cute.cute_flash import _flash_output_requires_tma
+    from .cute.flash_score_mod import flex_aux_smem_candidates
 
     plan = match.plan
     num_bh = match.num_bh
@@ -3650,6 +3665,13 @@ def flex_search_surface(
         flex_has_mask_region=plan.flex_has_mask_region,
         q_seq=match.q_seq,
         kv_seq=match.kv_seq,
+        flex_aux_smem_candidates=flex_aux_smem_candidates(plan),
+        flex_prefetch_regs=_flash_flex_prefetch_regs(
+            plan, num_bh, match.heads or num_bh, match.num_kv
+        ),
+        flex_coalesce_steps=_flash_flex_coalesce_steps(
+            plan, num_bh, match.heads or num_bh, match.num_kv
+        ),
     )
 
 

@@ -2000,7 +2000,7 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     for key, value in resident_defaults.items():
         assert _active_choices(enum_fragments[key]) == frozenset((value,))
     assert set(resident_defaults.items()) <= set(active_values)
-    # 74: the ws surface pins every dimension it cannot vary to one value,
+    # 77: the ws surface pins every dimension it cannot vary to one value,
     # including the KV tile width, the query-tile height, the one-pass
     # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
     # the (fa4-only) per-chunk P release, the affine bias lowering
@@ -2025,12 +2025,18 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # envelope's fa4 PTX pair body) and its dead-stage split
     # (``cute_flash_flex_dead_stage_split``, live only with that skip) and
     # the flex mask form (``cute_flash_flex_mask_form``, live only on flex
-    # plans with a mask region) and the split-KV walk (``cute_flash_kv_split``,
-    # live only on list-walk fa4 plans); the two-warpgroup body measures
-    # both of its O epilogues (``cute_flash_epi_stg``).
+    # plans with a mask region), the split-KV walk (``cute_flash_kv_split``,
+    # live only on list-walk fa4 plans) and the flex aux staging budget
+    # (``cute_flash_flex_aux_smem``, live only on flex plans with a
+    # data-dependent table gather) and the flex table prefetch budget
+    # (``cute_flash_flex_prefetch``, live only on flex plans with per-chunk
+    # table loads) and the flex table request width
+    # (``cute_flash_flex_coalesce``, live only on flex plans with a
+    # coalescible row-table run); the two-warpgroup body measures both of
+    # its O epilogues (``cute_flash_epi_stg``).
     # Resident-only coordinates add exactly three inactive singletons; keep
     # the upstream bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 74
+    assert len(active_values) - len(resident_defaults) <= 77
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(

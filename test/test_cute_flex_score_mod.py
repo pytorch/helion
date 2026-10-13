@@ -9,21 +9,40 @@ import textwrap
 import types
 from typing import TYPE_CHECKING
 from typing import Callable
+from typing import cast
 from unittest.mock import patch
 
+import pytest
 import torch
+
+# The renderer's DSL runtime helpers (``flex_score_mod_runtime``) import the
+# CuTe DSL at module level; every test here renders through it.
+pytest.importorskip("cutlass")
+pytest.importorskip("cutlass.cute")
 
 import helion
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute import flex_score_mod_runtime
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexAuxBuffer
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import FlexRegion
 from helion._compiler.cute.flash_score_mod import FlexHookCode
 from helion._compiler.cute.flash_score_mod import build_flex_region
+from helion._compiler.cute.flash_score_mod import flex_aux_smem_candidates
+from helion._compiler.cute.flash_score_mod import flex_aux_smem_layout
+from helion._compiler.cute.flash_score_mod import flex_aux_smem_staged
+from helion._compiler.cute.flash_score_mod import flex_coalesce_smem_bytes
+from helion._compiler.cute.flash_score_mod import flex_coalesce_steps
+from helion._compiler.cute.flash_score_mod import flex_coalesce_widths
 from helion._compiler.cute.flash_score_mod import flex_hook_params
+from helion._compiler.cute.flash_score_mod import flex_prefetch_count
+from helion._compiler.cute.flash_score_mod import flex_prefetch_regs
+from helion._compiler.cute.flash_score_mod import flex_prefetch_schedule
 from helion._compiler.cute.flash_score_mod import render_flex_hook
+from helion._compiler.cute.flex_coop_layout import coop_pitch
+from helion._compiler.cute.flex_score_mod_runtime import coop_lane_map
 from helion._compiler.helper_function import CodegenInterface
 from helion._testing import TestCase
 from helion._testing import skipUnlessCuteAvailable
@@ -144,6 +163,10 @@ def _render(
     bounds: bool = False,
     chunk_cols: int = _CHUNK_COLS,
     mask_form: str = "bitmask",
+    aux_smem_budget: int = 0,
+    prefetch_regs: int = 0,
+    coalesce: int = 0,
+    coop_slots: int = 1,
 ) -> FlexHookCode:
     return render_flex_hook(
         plan,
@@ -162,6 +185,10 @@ def _render(
         device_function=_StubDeviceFunction(),  # pyrefly: ignore [bad-argument-type]
         coord_bounds=_BOUNDS if bounds else None,
         mask_form=mask_form,
+        aux_smem_budget=aux_smem_budget,
+        prefetch_regs=prefetch_regs,
+        coalesce=coalesce,
+        coop_slots=coop_slots,
     )
 
 
@@ -241,6 +268,13 @@ def _load_vec(ptr: _Ptr, width: int, dtype: _Dtype) -> list[object]:
     return [dtype(ptr.storage[ptr.offset + j]) for j in range(width)]
 
 
+def _load_run(ptr: _Ptr, count: int, width: int, dtype: _Dtype) -> list[object]:
+    values: list[object] = []
+    for k in range(count):
+        values.extend(_load_vec(ptr + width * k, width, dtype))
+    return values
+
+
 def _load_window(
     ptr: _Ptr, last_ptr: _Ptr, count: int, width: int, dtype: _Dtype
 ) -> list[object]:
@@ -249,6 +283,53 @@ def _load_window(
         values.extend(_load_vec(ptr + width * k, width, dtype))
     values.extend(_load_vec(last_ptr, width, dtype))
     return values
+
+
+def _coop_issue(
+    row_ptr: _Ptr,
+    col: object,
+    slot: object,
+    row_step: int,
+    width: int,
+    units: int,
+    per_vector: int,
+    dtype: _Dtype,
+    stage_ptr: _Ptr,
+    lane: object,
+    pitch: int,
+    limit: int | None = None,
+) -> None:
+    """The GPU copies every lane's share of the block into the slot; the
+    single-thread emulation writes the owner row's values into the lane's
+    staged row directly (the lane's request row minus its own row is the
+    renderer's ``delta``, so its own row sits ``delta`` rows below its copy
+    base), clamping each piece as the copy does.  Synchronous: the reads
+    that follow the group's wait find the data."""
+    assert row_ptr.offset >= 0
+    assert 0 <= int(slot) < width // 16  # pyrefly: ignore [bad-argument-type]
+    row = cast("int", coop_lane_map(int(lane), width)[0])  # pyrefly: ignore [bad-argument-type]
+    owner = row_ptr + (int(lane) - row) * row_step  # pyrefly: ignore [bad-argument-type]
+    lanes_per_row = width // 16
+    unit_elems = width * per_vector // 16
+    assert units * unit_elems <= pitch
+    target = stage_ptr + int(lane) * pitch  # pyrefly: ignore [bad-argument-type]
+    for u in range(units):
+        for s in range(lanes_per_row):
+            offset = int(col) + s * per_vector + u * unit_elems  # pyrefly: ignore [bad-argument-type]
+            if limit is not None:
+                offset = min(max(offset, 0), limit)
+            values = _load_vec(owner + offset, per_vector, dtype)
+            first = u * unit_elems + s * per_vector
+            target.storage[
+                target.offset + first : target.offset + first + per_vector
+            ] = values
+
+
+def _recast_ptr(ptr: _Ptr, dtype: _Dtype) -> _Ptr:
+    """A fresh staging region per recast (one per table region per item):
+    the single-thread emulation needs no aliasing between regions."""
+    assert isinstance(ptr, _Ptr)
+    return _Ptr([0] * (32 * 4096), 0)
 
 
 def _mask_tail(frg: list[float], col_limit: int) -> None:
@@ -277,6 +358,7 @@ def _namespace() -> dict[str, object]:
         ),
         "cute": types.SimpleNamespace(
             size=len,
+            recast_ptr=_recast_ptr,
             math=types.SimpleNamespace(
                 max=lambda a, b, propagate_nan=True: max(a, b),
                 min=lambda a, b, propagate_nan=True: min(a, b),
@@ -304,6 +386,10 @@ def _namespace() -> dict[str, object]:
                 exp2=lambda x: 2.0**x,
                 fmin=lambda a, b, nan=False: min(a, b),
                 rcp_approx=lambda x: 1.0 / x,
+                # The stream's copies are synchronous in the emulation.
+                cp_async_wait_group=lambda n: None,
+                cp_async_commit_group=lambda: None,
+                sync_warp=lambda: None,
             ),
         ),
         "_cute_python_mod": operator.mod,
@@ -317,12 +403,150 @@ def _namespace() -> dict[str, object]:
         # torch.remainder on floats is Python's floor-mod.
         "_cute_flex_remainder": operator.mod,
         "_cute_flex_load_vec": _load_vec,
+        "_cute_flex_load_run": _load_run,
         "_cute_flex_load_window": _load_window,
+        "_cute_flex_coop_lane": coop_lane_map,
+        "_cute_flex_coop_issue": _coop_issue,
+        # The staging buffers: an address the stubs only carry along.
+        "_flash_flex_coop_smem": _Ptr([], 0),
         "_cute_flex_lane_below": lambda limit, width: (
             (1 << max(0, min(int(limit), width))) - 1
         ),
         "_helion_flash_rt": types.SimpleNamespace(mask_r2p_sm100_rank1=_mask_tail),
     }
+
+
+def _prefetch_fill(
+    ns: dict[str, object], prefetch: object, depth: int, tile: int, init: bool
+) -> None:
+    """The emitter's ring fill for KV tile ``tile``: chunks ``0 .. depth - 1``
+    into slots ``0 .. depth - 1``, chunk 0 again into slot ``depth``."""
+    ns["flash_flex_pkv"] = tile
+    for slot in range(depth + 1):
+        ns["flash_flex_pc"] = slot if slot < depth else 0
+        ns["flash_flex_ps"] = slot
+        ns["flash_flex_pf_init"] = init and slot == 0
+        exec(prefetch, ns)  # pyrefly: ignore[bad-argument-type]
+
+
+def _emulate_tiles(
+    code: FlexHookCode,
+    *,
+    score_tiles: Sequence[torch.Tensor],
+    bh: int,
+    m_tile: int,
+    kv_tiles: Sequence[int],
+    kv_tail_cols: int,
+    aux_tensors: Sequence[torch.Tensor],
+    scalar_values: Sequence[object],
+    scale: float | None = None,
+    rows: Sequence[int] = _ROWS,
+    stage: int = 0,
+    chunk_cols: int = _CHUNK_COLS,
+    smem_tables: Sequence[int] = (),
+    absent: Sequence[int] = (),
+) -> list[torch.Tensor]:
+    """Run the hook over a sequence of KV tiles per thread row with the
+    emitter's prefetch protocol (the ring filled for the first tile before
+    the walk, for the next tile after each tile's chunks; ``absent`` tiles
+    skip their chunks like a status-0 step but still refill) and return the
+    masked/transformed tiles.
+
+    ``smem_tables`` are the aux indices the hook reads from the shared-memory
+    copy (``_flash_aux{i}_smem``): the flattened table plus the zero sentinel
+    the emitter's fill appends.
+    """
+    prelude = compile(textwrap.dedent(code.item_prelude), "<item_prelude>", "exec")
+    prologue = compile(textwrap.dedent(code.tile_prologue), "<tile_prologue>", "exec")
+    body = compile(textwrap.dedent(code.chunk_body), "<chunk_body>", "exec")
+    prefetch = compile(textwrap.dedent(code.chunk_prefetch), "<prefetch>", "exec")
+    issue = compile(textwrap.dedent(code.chunk_issue), "<issue>", "exec")
+    consume = compile(textwrap.dedent(code.chunk_consume), "<consume>", "exec")
+    chunks = 128 // chunk_cols
+    depth = code.prefetch_depth
+    slots = code.coop_slots
+
+    def stream_fill(ns: dict[str, object], tile: int) -> None:
+        """The emitter's stream fill: chunks ``0 .. slots - 1`` of ``tile``."""
+        ns["flash_flex_pkv"] = tile
+        for slot in range(slots):
+            ns["flash_flex_pc"] = slot
+            ns["flash_flex_ps"] = slot
+            exec(issue, ns)  # pyrefly: ignore[bad-argument-type]
+
+    results = [tile.clone().double() for tile in score_tiles]
+    fake_aux = [_FakeTensor(t) for t in aux_tensors]
+    fake_smem = {
+        index: _Ptr([*aux_tensors[index].flatten().tolist(), 0], 0)
+        for index in smem_tables
+    }
+    for row in rows:
+        ns = _namespace()
+        ns.update(
+            {
+                "flash_bh": bh,
+                "_flash_heads": _HEADS,
+                "_flash_kv_tail_cols": kv_tail_cols,
+                f"flash_m_tile{stage}": m_tile,
+                "tLDcS": _Coords(row, chunk_cols),
+            }
+        )
+        for i, tensor in enumerate(fake_aux):
+            ns[f"_flash_aux{i}"] = tensor
+        for i, pointer in fake_smem.items():
+            ns[f"_flash_aux{i}_smem"] = pointer
+        for j, value in enumerate(scalar_values):
+            ns[f"_flash_hs{j}"] = value
+        if scale is not None:
+            ns["_flash_scale"] = scale
+        exec(prelude, ns)
+        if depth:
+            _prefetch_fill(ns, prefetch, depth, kv_tiles[0], True)
+        if slots:
+            stream_fill(ns, kv_tiles[0])
+        for index, kv_tile in enumerate(kv_tiles):
+            ns["flash_kv"] = kv_tile
+            # The walk's peek: the next tile, 0 past the end (dead loads).
+            next_tile = kv_tiles[index + 1] if index + 1 < len(kv_tiles) else 0
+            ns["flash_kv_peek"] = next_tile
+            exec(prologue, ns)
+            if index not in absent:
+                ns["flash_flex_pkv"] = kv_tile
+                result = results[index]
+                for ci in range(chunks):
+                    # The emitter's wrap-around: the last iterations prefetch
+                    # early chunks into the freed ring slot (dead code on the
+                    # GPU, overwritten by the fill below).
+                    if depth:
+                        ns["flash_flex_pc"] = (ci + depth) % chunks
+                        ns["flash_flex_ps"] = (ci + depth) % (depth + 1)
+                        ns["flash_flex_pf_init"] = False
+                        ns["flash_flex_pkv"] = kv_tile
+                        exec(prefetch, ns)
+                    ns["flash_ci"] = ci
+                    if slots:
+                        # The stream: the chunk's rows from its slot, then
+                        # chunk ``ci + slots`` (of the next tile past the
+                        # chunk count) into the freed slot.
+                        exec(consume, ns)
+                        ns["flash_flex_pc"] = (ci + slots) % chunks
+                        ns["flash_flex_ps"] = ci % slots
+                        ns["flash_flex_pkv"] = (
+                            kv_tile if ci + slots < chunks else next_tile
+                        )
+                        exec(issue, ns)
+                    frg = result[row, ci * chunk_cols : (ci + 1) * chunk_cols].tolist()
+                    ns["flash_disc_frg"] = frg
+                    exec(body, ns)
+                    result[row, ci * chunk_cols : (ci + 1) * chunk_cols] = torch.tensor(
+                        frg, dtype=torch.float64
+                    )
+            elif slots:
+                # An absent step issued nothing for the next tile: the fill.
+                stream_fill(ns, next_tile)
+            if depth:
+                _prefetch_fill(ns, prefetch, depth, next_tile, False)
+    return [result.float() for result in results]
 
 
 def _emulate(
@@ -339,42 +563,24 @@ def _emulate(
     rows: Sequence[int] = _ROWS,
     stage: int = 0,
     chunk_cols: int = _CHUNK_COLS,
+    smem_tables: Sequence[int] = (),
 ) -> torch.Tensor:
-    """Run the three blocks per thread row and return the masked/transformed tile."""
-    prelude = compile(textwrap.dedent(code.item_prelude), "<item_prelude>", "exec")
-    prologue = compile(textwrap.dedent(code.tile_prologue), "<tile_prologue>", "exec")
-    body = compile(textwrap.dedent(code.chunk_body), "<chunk_body>", "exec")
-    result = score_tile.clone().double()
-    fake_aux = [_FakeTensor(t) for t in aux_tensors]
-    for row in rows:
-        ns = _namespace()
-        ns.update(
-            {
-                "flash_bh": bh,
-                "_flash_heads": _HEADS,
-                "_flash_kv_tail_cols": kv_tail_cols,
-                f"flash_m_tile{stage}": m_tile,
-                "flash_kv": kv_tile,
-                "tLDcS": _Coords(row, chunk_cols),
-            }
-        )
-        for i, tensor in enumerate(fake_aux):
-            ns[f"_flash_aux{i}"] = tensor
-        for j, value in enumerate(scalar_values):
-            ns[f"_flash_hs{j}"] = value
-        if scale is not None:
-            ns["_flash_scale"] = scale
-        exec(prelude, ns)
-        exec(prologue, ns)
-        for ci in range(128 // chunk_cols):
-            frg = result[row, ci * chunk_cols : (ci + 1) * chunk_cols].tolist()
-            ns["flash_ci"] = ci
-            ns["flash_disc_frg"] = frg
-            exec(body, ns)
-            result[row, ci * chunk_cols : (ci + 1) * chunk_cols] = torch.tensor(
-                frg, dtype=torch.float64
-            )
-    return result.float()
+    """One KV tile of ``_emulate_tiles``."""
+    return _emulate_tiles(
+        code,
+        score_tiles=[score_tile],
+        bh=bh,
+        m_tile=m_tile,
+        kv_tiles=[kv_tile],
+        kv_tail_cols=kv_tail_cols,
+        aux_tensors=aux_tensors,
+        scalar_values=scalar_values,
+        scale=scale,
+        rows=rows,
+        stage=stage,
+        chunk_cols=chunk_cols,
+        smem_tables=smem_tables,
+    )[0]
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +848,25 @@ def score_graphormer_edge(
     return score + total / torch.clamp(length, min=1).to(torch.float32)
 
 
+def score_strided_runs(score, b, h, q_idx, kv_idx, narrow, wide, flags):
+    # ``narrow[B, 1024, 64, 3]`` int32: out of range past column 64 (the run's
+    # group guard); ``wide[B, 1024, 1024, 3]`` bf16 (eight-lane groups: the
+    # int32 run is loaded in six vectors of the common group); ``flags[B,
+    # 1024, 1024, 2]`` bool (a one-vector run of bytes).
+    a = hl.load(narrow, [b, q_idx, kv_idx, 1]).to(torch.float32)
+    c = hl.load(narrow, [b, q_idx, kv_idx, 2]).to(torch.float32)
+    w = hl.load(wide, [b, q_idx, kv_idx, 0]).to(torch.float32)
+    keep = hl.load(flags, [b, q_idx, kv_idx, 1])
+    return torch.where(keep, score + a * 0.5 + c, score * 0.25 + w)
+
+
+def score_two_gathers(score, b, h, q_idx, kv_idx, idx, small, big):
+    # Two data-dependent gathers: ``small`` (16 x 7) and ``big`` (16 x 1024)
+    # are staging candidates in plan order.
+    i = hl.load(idx, [b, q_idx, kv_idx])
+    return score + hl.load(small, [h, i]) + hl.load(big, [h, i * 37])
+
+
 def score_runtime_scale(score, b, h, q_idx, kv_idx, bias_scale, scale):
     return score * scale + (q_idx - kv_idx) * bias_scale
 
@@ -738,6 +963,22 @@ def _graphormer_edge_tables(gen: torch.Generator) -> list[torch.Tensor]:
         _int_table(gen, (_BATCH, 1024, 1024), 0, 4),
         _int_table(gen, (_BATCH, 1024, 1024, 3), 0, 8),
         torch.randn(_HEADS, 24, generator=gen),
+    ]
+
+
+def _strided_run_tables(gen: torch.Generator) -> list[torch.Tensor]:
+    return [
+        _int_table(gen, (_BATCH, 1024, 64, 3), -4, 4),
+        torch.randn(_BATCH, 1024, 1024, 3, generator=gen).to(torch.bfloat16),
+        torch.rand(_BATCH, 1024, 1024, 2, generator=gen) < 0.5,
+    ]
+
+
+def _two_gather_tables(gen: torch.Generator) -> list[torch.Tensor]:
+    return [
+        _int_table(gen, (_BATCH, 1024, 1024), -1, 9),
+        torch.randn(_HEADS, 7, generator=gen),
+        torch.randn(_HEADS, 1024, generator=gen),
     ]
 
 
@@ -861,6 +1102,18 @@ _CASES = [
         tables=_bf16_bias_tables,
         table_names=("bias",),
     ),
+    _Case(
+        "strided_runs",
+        score=score_strided_runs,
+        tables=_strided_run_tables,
+        table_names=("narrow", "wide", "flags"),
+    ),
+    _Case(
+        "two_gathers",
+        score=score_two_gathers,
+        tables=_two_gather_tables,
+        table_names=("idx", "small", "big"),
+    ),
     _Case("extra_ops", score=score_extra_ops),
     _Case("int_fmod", mask=mask_int_fmod),
 ]
@@ -901,6 +1154,11 @@ def _render_case(
     bounds: bool = False,
     chunk_cols: int = _CHUNK_COLS,
     mask_form: str = "bitmask",
+    aux_smem_budget: int = 0,
+    prefetch_regs: int = 0,
+    coalesce: int = 0,
+    coop_slots: int = 1,
+    stage: int = 0,
 ) -> tuple[FlexHookCode, AttentionScorePlan, list[torch.Tensor], list[object]]:
     tables, scalar_values = _case_inputs(case)
     with _environment(fast_math=case.fast_math):
@@ -910,9 +1168,14 @@ def _render_case(
             with_score=case.score is not None,
             with_mask=case.mask is not None,
             tail_mask=with_tail,
+            stage=stage,
             bounds=bounds,
             chunk_cols=chunk_cols,
             mask_form=mask_form,
+            aux_smem_budget=aux_smem_budget,
+            prefetch_regs=prefetch_regs,
+            coalesce=coalesce,
+            coop_slots=coop_slots,
         )
     return code, plan, tables, scalar_values
 
@@ -926,6 +1189,10 @@ class TestCuteFlexScoreMod(TestCase):
         bounds: bool = False,
         chunk_cols: int = _CHUNK_COLS,
         mask_form: str = "bitmask",
+        aux_smem_budget: int = 0,
+        prefetch_regs: int = 0,
+        coalesce: int = 0,
+        coop_slots: int = 1,
     ) -> None:
         gen = torch.Generator().manual_seed(1)
         codes = {
@@ -935,11 +1202,18 @@ class TestCuteFlexScoreMod(TestCase):
                 bounds=bounds,
                 chunk_cols=chunk_cols,
                 mask_form=mask_form,
+                aux_smem_budget=aux_smem_budget,
+                prefetch_regs=prefetch_regs,
+                coalesce=coalesce,
+                coop_slots=coop_slots,
             )
             for with_tail in (False, True)
         }
         for bh, m_tile, kv_tile, tail in case.geometries:
             code, plan, tables, scalar_values = codes[tail is not None]
+            staged = [
+                entry.aux_index for entry in flex_aux_smem_layout(plan, aux_smem_budget)
+            ]
             score_tile = torch.randn(128, 128, generator=gen) * 4.0
             scale_value = None
             if case.scale_arg is not None:
@@ -956,6 +1230,7 @@ class TestCuteFlexScoreMod(TestCase):
                 scalar_values=scalar_values,
                 scale=scale_value,
                 chunk_cols=chunk_cols,
+                smem_tables=staged,
             )
             expected = _reference(
                 case.score,
@@ -1002,6 +1277,962 @@ class TestCuteFlexScoreMod(TestCase):
             for mask_form in ("bitmask", "element"):
                 with self.subTest(case=case.name, mask_form=mask_form):
                     self._check_case(case, chunk_cols=16, mask_form=mask_form)
+
+    def test_emulation_matrix_with_shared_memory_staging(self) -> None:
+        """Every candidate table staged (budget 16384): the gathers read the
+        copy through the sentinel select; same values, with and without the
+        coordinate bounds and at both chunk widths."""
+        for case in _CASES:
+            if case.tables is None:
+                continue
+            for bounds, chunk_cols in ((False, 32), (True, 32), (True, 16)):
+                with self.subTest(case=case.name, bounds=bounds, chunk=chunk_cols):
+                    self._check_case(
+                        case,
+                        bounds=bounds,
+                        chunk_cols=chunk_cols,
+                        aux_smem_budget=16384,
+                    )
+
+    def test_emulation_matrix_with_next_chunk_prefetch(self) -> None:
+        """Every prefetchable load issued one chunk ahead (budget 128) and a
+        partial budget (32): the chunk bodies read the parity slots the
+        prefetch block filled; same values at both chunk widths, with and
+        without the bounds and with the staged copies."""
+        for case in _CASES:
+            if case.tables is None:
+                continue
+            for bounds, chunk_cols, budget, smem in (
+                (True, 32, 128, 0),
+                (True, 16, 128, 16384),
+                (False, 32, 32, 0),
+                (True, 32, 32, 0),
+                (True, 16, 64, 0),
+                (False, 16, 32, 4096),
+            ):
+                with self.subTest(
+                    case=case.name, bounds=bounds, chunk=chunk_cols, budget=budget
+                ):
+                    self._check_case(
+                        case,
+                        bounds=bounds,
+                        chunk_cols=chunk_cols,
+                        aux_smem_budget=smem,
+                        prefetch_regs=budget,
+                    )
+
+    def test_prefetch_ring_carries_across_kv_tiles(self) -> None:
+        """The emitter's cross-tile protocol: the ring filled for the first
+        tile before the walk and for the next tile after each tile's chunks
+        (an absent step skips its chunks but refills); every tile of a
+        sequence reads its own chunks at every depth, both chunk widths,
+        with and without the staged copies."""
+        gen = torch.Generator().manual_seed(7)
+        tiles = [2, 5, 1, 7, 0]
+        for name in (
+            "graphormer_edge",
+            "graphormer_spatial",
+            "sandwich",
+            "strided_runs",
+            "flamingo",
+            "two_gathers",
+        ):
+            case = next(c for c in _CASES if c.name == name)
+            for chunk_cols, budget, smem in (
+                (16, 128, 0),
+                (32, 128, 16384),
+                (16, 32, 0),
+                (32, 64, 0),
+            ):
+                code, plan, tables, values = _render_case(
+                    case,
+                    with_tail=False,
+                    bounds=True,
+                    chunk_cols=chunk_cols,
+                    aux_smem_budget=smem,
+                    prefetch_regs=budget,
+                )
+                staged = [e.aux_index for e in flex_aux_smem_layout(plan, smem)]
+                scores = [torch.randn(128, 128, generator=gen) * 4.0 for _ in tiles]
+                outs = _emulate_tiles(
+                    code,
+                    score_tiles=scores,
+                    bh=5,
+                    m_tile=1,
+                    kv_tiles=tiles,
+                    kv_tail_cols=128,
+                    aux_tensors=tables,
+                    scalar_values=values,
+                    chunk_cols=chunk_cols,
+                    smem_tables=staged,
+                    absent=(2,),
+                )
+                rows = list(_ROWS)
+                for index, (kv_tile, score, out) in enumerate(
+                    zip(tiles, scores, outs, strict=True)
+                ):
+                    if index == 2:
+                        continue
+                    expected = _reference(
+                        case.score,
+                        case.mask,
+                        score_tile=score,
+                        bh=5,
+                        m_tile=1,
+                        kv_tile=kv_tile,
+                        kv_tail_cols=None,
+                        aux_tensors=tables,
+                        scalar_values=values,
+                    )
+                    torch.testing.assert_close(
+                        out[rows],
+                        expected[rows],
+                        rtol=1e-5,
+                        atol=1e-5,
+                        msg=f"{name} chunk={chunk_cols} budget={budget} depth={code.prefetch_depth} tile#{index}",
+                    )
+
+    def test_emulation_matrix_with_cooperative_loads(self) -> None:
+        """The warp-cooperative block form (``coalesce`` 128 / 64 / 32): the
+        runs with a proven affine row step are fetched through the
+        cooperative stubs and exchanged into the owner row; same values at
+        both chunk widths, with the ring and the staged copies, and on the
+        unproven lane dimension (strided_runs' narrow table: the clamped
+        fetch under the group guard).  Without the coordinate bounds no
+        row step is proven and the render is byte-identical to the
+        per-lane form; so is every mask-only render."""
+        for case in _CASES:
+            if case.tables is None:
+                continue
+            for chunk_cols, coalesce, budget, smem, slots in (
+                (32, 128, 0, 0, 1),
+                (16, 128, 0, 0, 2),
+                (32, 64, 128, 4096, 2),
+                (16, 64, 64, 0, 4),
+                (32, 32, 32, 16384, 4),
+                (16, 32, 128, 4096, 1),
+            ):
+                with self.subTest(
+                    case=case.name,
+                    chunk=chunk_cols,
+                    coalesce=coalesce,
+                    budget=budget,
+                    slots=slots,
+                ):
+                    self._check_case(
+                        case,
+                        bounds=True,
+                        chunk_cols=chunk_cols,
+                        aux_smem_budget=smem,
+                        prefetch_regs=budget,
+                        coalesce=coalesce,
+                        coop_slots=slots,
+                    )
+            plain, _plan_, _tables, _values = _render_case(case, with_tail=False)
+            same, _plan_, _tables, _values = _render_case(
+                case, with_tail=False, coalesce=128
+            )
+            self.assertEqual(plain, same, case.name)
+            self.assertNotIn("coop", "".join(plain[:4]))
+        for case in _CASES:
+            if case.score is not None:
+                continue
+            plain, _plan_, _tables, _values = _render_case(
+                case, with_tail=True, bounds=True
+            )
+            same, _plan_, _tables, _values = _render_case(
+                case, with_tail=True, bounds=True, coalesce=128
+            )
+            self.assertEqual(plain, same, case.name)
+
+    def test_cooperative_stream_carries_across_kv_tiles(self) -> None:
+        """The stream's issue / consume protocol over a tile sequence with
+        an absent step (the emitter's splice: the first tile's chunks
+        before the walk, chunk ``ci + slots`` of the current or the peeked
+        tile after each consume, the refill at the absent step): every
+        tile reads its own block at every width and ring depth, with the
+        register prefetch of the other loads alongside.  Streamed runs
+        leave the register ring (no ``_pf`` slot of theirs)."""
+        gen = torch.Generator().manual_seed(11)
+        tiles = [2, 5, 1, 7, 0]
+        for name in ("graphormer_edge", "graphormer_spatial", "strided_runs"):
+            case = next(c for c in _CASES if c.name == name)
+            for chunk_cols, budget, coalesce, slots in (
+                (16, 128, 128, 2),
+                (32, 128, 64, 1),
+                (32, 64, 32, 4),
+                (16, 0, 64, 1),
+            ):
+                code, plan, tables, values = _render_case(
+                    case,
+                    with_tail=False,
+                    bounds=True,
+                    chunk_cols=chunk_cols,
+                    aux_smem_budget=4096,
+                    prefetch_regs=budget,
+                    coalesce=coalesce,
+                    coop_slots=slots,
+                )
+                self.assertEqual(code.coop_slots, slots)
+                self.assertIn("_cute_flex_coop_issue(", code.chunk_issue)
+                self.assertIn("cute.arch.cp_async_commit_group()", code.chunk_issue)
+                self.assertIn(
+                    f"cute.arch.cp_async_wait_group({slots - 1})", code.chunk_consume
+                )
+                self.assertNotIn("_cute_flex_coop_issue(", code.chunk_body)
+                self.assertNotIn("_cute_flex_coop_issue(", code.chunk_prefetch)
+                self.assertNotIn("_run_pf", code.chunk_prefetch)
+                staged = [e.aux_index for e in flex_aux_smem_layout(plan, 4096)]
+                scores = [torch.randn(128, 128, generator=gen) * 4.0 for _ in tiles]
+                outs = _emulate_tiles(
+                    code,
+                    score_tiles=scores,
+                    bh=5,
+                    m_tile=1,
+                    kv_tiles=tiles,
+                    kv_tail_cols=128,
+                    aux_tensors=tables,
+                    scalar_values=values,
+                    chunk_cols=chunk_cols,
+                    smem_tables=staged,
+                    absent=(2,),
+                )
+                rows = list(_ROWS)
+                for index, (kv_tile, score, out) in enumerate(
+                    zip(tiles, scores, outs, strict=True)
+                ):
+                    if index == 2:
+                        continue
+                    expected = _reference(
+                        case.score,
+                        case.mask,
+                        score_tile=score,
+                        bh=5,
+                        m_tile=1,
+                        kv_tile=kv_tile,
+                        kv_tail_cols=None,
+                        aux_tensors=tables,
+                        scalar_values=values,
+                    )
+                    torch.testing.assert_close(
+                        out[rows],
+                        expected[rows],
+                        rtol=1e-5,
+                        atol=1e-5,
+                        msg=f"{name} chunk={chunk_cols} coalesce={coalesce} tile#{index}",
+                    )
+
+    def test_cooperative_block_render_and_facts(self) -> None:
+        """graphormer-edge at 128 and 32 columns with a two-slot ring: the
+        lane roots once per item, the warp's ring (two chunk blocks of 544
+        bytes per row: 34816 bytes; stage 1 at ring 4), each run's slot-0
+        region (recast to the table's dtype) and the lane's staged row,
+        each run's copy row base (the owner's leading offsets plus the
+        lane's row delta times the row step: 1024 / 3072 elements per query
+        row); the issue block copies 1 / 3 pieces of 128 bytes per row of
+        chunk ``flash_flex_pc`` of tile ``flash_flex_pkv`` into slot
+        ``flash_flex_ps`` and commits; the consume block waits for the
+        chunk's group, reads the whole-chunk runs from slot ``flash_ci %
+        2`` between warp syncs; the element block indexes the chunk run;
+        no run is left in the body or the register ring.  At 16 columns
+        the 64- and 192-byte spans cap the request at 64 bytes; the knob's
+        effective identity and the staging size follow."""
+        case = next(c for c in _CASES if c.name == "graphormer_edge")
+        code, plan, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, coalesce=128, coop_slots=2, stage=1
+        )
+        self.assertEqual(code.coop_slots, 2)
+        prelude = code.item_prelude
+        self.assertIn(
+            "flash_flex1_lane = cutlass.Int32(tLDcS[0][0]) % cutlass.Int32(32)", prelude
+        )
+        self.assertIn(
+            "flash_flex1_coopr128, flash_flex1_coops128 = _cute_flex_coop_lane("
+            "flash_flex1_lane, 128)",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1_coopd128 = flash_flex1_coopr128 - flash_flex1_lane", prelude
+        )
+        self.assertIn(
+            "flash_flex1_coopbuf = _flash_flex_coop_smem + (cutlass.Int32(4) + "
+            "cutlass.Int32(tLDcS[0][0]) // cutlass.Int32(32)) * cutlass.Int32(34816)",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1s_load_sp = cute.recast_ptr(flash_flex1_coopbuf, dtype=cutlass.Int32)",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1s_load_rsp = flash_flex1s_load_sp + flash_flex1_lane * 36",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1s_load_1_sp = cute.recast_ptr(flash_flex1_coopbuf + 4608, "
+            "dtype=cutlass.Int32)",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1s_load_1_rsp = flash_flex1s_load_1_sp + flash_flex1_lane * 100",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1s_load_cb = flash_flex1s_load_i0 * cutlass.Int32(1048576) + "
+            "flash_flex1s_load_i1 * cutlass.Int32(1024) + flash_flex1_coopd128 * "
+            "cutlass.Int32(1024)",
+            prelude,
+        )
+        self.assertIn(
+            "flash_flex1s_load_1_cb = flash_flex1s_load_1_i0 * cutlass.Int32(3145728) + "
+            "flash_flex1s_load_1_i1 * cutlass.Int32(3072) + flash_flex1_coopd128 * "
+            "cutlass.Int32(3072)",
+            prelude,
+        )
+        issue = code.chunk_issue
+        self.assertIn(
+            "flash_flex1_ikvbase = cutlass.Int32(flash_flex_pkv) * cutlass.Int32(128)",
+            issue,
+        )
+        self.assertIn(
+            "flash_flex1_icbase = flash_flex1_ikvbase + cutlass.Int32(tLDcS[None, "
+            "flash_flex_pc, None, None][0][1])",
+            issue,
+        )
+        self.assertIn(
+            "_cute_flex_coop_issue(_flash_aux0.iterator + flash_flex1s_load_cb, "
+            "flash_flex1s_load_lo, flash_flex1_coops128, 1024, 128, 1, 4, cutlass.Int32, "
+            "flash_flex1s_load_sp + flash_flex_ps * 4352, flash_flex1_lane, 36)",
+            issue,
+        )
+        self.assertIn(
+            "_cute_flex_coop_issue(_flash_aux1.iterator + flash_flex1s_load_1_cb, "
+            "(flash_flex1s_load_1_lo) * cutlass.Int32(3), flash_flex1_coops128, 3072, "
+            "128, 3, 4, cutlass.Int32, flash_flex1s_load_1_sp + flash_flex_ps * 4352, "
+            "flash_flex1_lane, 100)",
+            issue,
+        )
+        self.assertTrue(issue.rstrip().endswith("cute.arch.cp_async_commit_group()"))
+        consume = code.chunk_consume.strip().splitlines()
+        self.assertEqual(consume[0].strip(), "cute.arch.cp_async_wait_group(1)")
+        self.assertEqual(consume[1].strip(), "cute.arch.sync_warp()")
+        self.assertEqual(consume[-1].strip(), "cute.arch.sync_warp()")
+        self.assertIn(
+            "flash_flex1s_load_run = _cute_flex_load_run(flash_flex1s_load_rsp + "
+            "(flash_ci % 2) * 4352, 8, 4, cutlass.Int32)",
+            code.chunk_consume,
+        )
+        self.assertIn(
+            "flash_flex1s_load_1_run = _cute_flex_load_run(flash_flex1s_load_1_rsp + "
+            "(flash_ci % 2) * 4352, 24, 4, cutlass.Int32)",
+            code.chunk_consume,
+        )
+        body = code.chunk_body
+        self.assertIn("flash_flex1s_load_1_run[flash_flex_i * 3 + 2]", body)
+        self.assertIn("flash_flex1s_load_run[flash_flex_i]", body)
+        self.assertNotIn("_cute_flex_load_run(", body)
+        self.assertNotIn("_cute_flex_load_vec(", body)
+        self.assertNotIn("_flash_aux0.iterator", body)
+        self.assertNotIn("_flash_aux1.iterator", body)
+        # Both lane dimensions proven: no run guard (the gathers keep theirs).
+        self.assertNotIn("flash_flex1s_load_ok", body)
+        self.assertNotIn("flash_flex1s_load_1_ok", body)
+        self.assertEqual(code.chunk_prefetch, "")
+        # The element block is the per-lane form's up to the run indexing.
+        plain, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, stage=1
+        )
+        self.assertNotIn("coop", plain.item_prelude + plain.chunk_body)
+        self.assertEqual(plain.coop_slots, 0)
+        # 16 columns, one slot: 64-byte spans (path_lengths) and 192-byte
+        # spans (path_types): both requests 64 bytes wide; 80 + 208 bytes
+        # per row, a 9216-byte ring.
+        narrow, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, coalesce=128, chunk_cols=16
+        )
+        self.assertEqual(narrow.coop_slots, 1)
+        self.assertIn("_cute_flex_coop_lane(flash_flex0_lane, 64)", narrow.item_prelude)
+        self.assertIn("* cutlass.Int32(9216)", narrow.item_prelude)
+        self.assertIn(
+            "flash_flex0_coopbuf + 2560, dtype=cutlass.Int32", narrow.item_prelude
+        )
+        self.assertIn(
+            "flash_flex0_coops64, 1024, 64, 1, 4, cutlass.Int32, flash_flex0s_load_sp + "
+            "flash_flex_ps * 2304, flash_flex0_lane, 20)",
+            narrow.chunk_issue,
+        )
+        self.assertIn(
+            "flash_flex0_coops64, 3072, 64, 3, 4, cutlass.Int32, flash_flex0s_load_1_sp + "
+            "flash_flex_ps * 2304, flash_flex0_lane, 52)",
+            narrow.chunk_issue,
+        )
+        self.assertIn("cute.arch.cp_async_wait_group(0)", narrow.chunk_consume)
+        self.assertIn(
+            "(flash_ci % 1) * 2304, 4, 4, cutlass.Int32)", narrow.chunk_consume
+        )
+        # The unproven lane dimension keeps the owner's per-group guard and
+        # passes the copy its clamp limit (strided_runs' 64-column table).
+        strided = next(c for c in _CASES if c.name == "strided_runs")
+        guarded, _plan_, _tables, _values = _render_case(
+            strided, with_tail=False, bounds=True, coalesce=128
+        )
+        self.assertIn(
+            "flash_flex0s_load_ok = (flash_flex0s_load_glo >= cutlass.Int32(0)) & "
+            "(flash_flex0s_load_glo < cutlass.Int32(64))",
+            guarded.chunk_body,
+        )
+        self.assertIn("flash_flex0_lane, 100, 188)", guarded.chunk_issue)
+        self.assertIn(
+            "cutlass.select_(flash_flex0s_load_ok, cutlass.Int32("
+            "flash_flex0s_load_run[flash_flex_i * 3 + 1])",
+            guarded.chunk_body,
+        )
+        # Facts: bytes per column of the coalescible runs; the per-run
+        # request widths and the staging bytes at a knob value and width.
+        self.assertEqual(flex_coalesce_steps(plan, _BOUNDS), (4, 12))
+        self.assertEqual(flex_coalesce_steps(plan, None), ())
+        expected = {
+            "graphormer_spatial": (4,),
+            "bf16_table": (2,),
+            "strided_runs": (12, 6, 2),
+            "two_gathers": (4,),
+            "flamingo": (),
+            "sandwich": (),
+            "global_sw": (),
+        }
+        for name, steps in expected.items():
+            other = next(c for c in _CASES if c.name == name)
+            _code, other_plan, _tables, _values = _render_case(
+                other, with_tail=False, bounds=True
+            )
+            self.assertEqual(flex_coalesce_steps(other_plan, _BOUNDS), steps, name)
+        self.assertEqual(flex_coalesce_widths((4, 12), 128, 32), (128, 128))
+        self.assertEqual(flex_coalesce_widths((4, 12), 128, 16), (64, 64))
+        self.assertEqual(flex_coalesce_widths((4, 12), 64, 32), (64, 64))
+        self.assertEqual(flex_coalesce_widths((4, 12), 32, 16), (32, 32))
+        self.assertEqual(flex_coalesce_widths((2,), 128, 16), (32,))
+        self.assertEqual(flex_coalesce_widths((1,), 128, 16), (0,))
+        self.assertEqual(flex_coalesce_widths((12, 6, 2), 128, 32), (128, 64, 64))
+        self.assertEqual(flex_coalesce_widths((4,), 0, 32), (0,))
+        self.assertEqual(
+            flex_coalesce_smem_bytes((4, 12), 128, 32), 8 * 32 * (144 + 400)
+        )
+        self.assertEqual(
+            flex_coalesce_smem_bytes((4, 12), 128, 16), 8 * 32 * (80 + 208)
+        )
+        self.assertEqual(flex_coalesce_smem_bytes((4,), 32, 32), 8 * 32 * 144)
+        self.assertEqual(flex_coalesce_smem_bytes((4,), 128, 16), 8 * 32 * 80)
+        self.assertEqual(flex_coalesce_smem_bytes((1,), 128, 16), 0)
+        self.assertEqual(flex_coalesce_smem_bytes((), 128, 32), 0)
+
+    def test_coop_runtime_redistributes_rows_and_is_bank_conflict_free(self) -> None:
+        """The runtime helpers on a simulated warp: 32 lanes run
+        ``coop_issue`` and the row reads in lockstep (threads, the warp sync
+        a barrier, the DSL copies / loads replaced by Python ones over a
+        fake table and a fake staging slot).  Every lane ends with its own
+        row's chunk span; each request of a piece covers whole rows (the
+        coalescing); every 8-lane phase of the copies' shared-memory writes
+        and of the row loads hits 32 distinct banks at the padded pitch,
+        for every width, with and without the clamp."""
+        import threading
+
+        class Lane:
+            def __init__(self, memory: str, offset: int) -> None:
+                self.memory = memory
+                self.offset = offset
+
+            def __add__(self, other: object) -> Lane:
+                return Lane(self.memory, self.offset + int(other))  # pyrefly: ignore [bad-argument-type]
+
+        class Value(int):
+            def ir_value(self) -> Value:
+                return self
+
+        class Dtype:
+            def __init__(self, width: int) -> None:
+                self.width = width
+                self.mlir_type = f"i{width}"
+
+            def __call__(self, value: object) -> Value:
+                return Value(value)  # pyrefly: ignore [bad-argument-type]
+
+        for width in (128, 64, 32):
+            for clamp in (False, True):
+                with self.subTest(width=width, clamp=clamp):
+                    self._simulate_coop(width, clamp, threading, Lane, Dtype)
+
+    def _simulate_coop(
+        self,
+        width: int,
+        clamp: bool,
+        threading: object,
+        lane_cls: type,
+        dtype_cls: type,
+    ) -> None:
+        itemsize = 4
+        per_vector = 16 // itemsize
+        dtype = dtype_cls(32)
+        units = 3 if width == 128 else 2
+        row_step = 2048  # elements between query rows (8 KB: lines apart)
+        rows = 48
+        q0 = 9  # the warp's first row
+        col = 96  # the chunk's first element along the lane dimension
+        unit_elems = width // itemsize
+        span = units * unit_elems  # the row's chunk span in elements
+        limit = (col + span - per_vector - 8) if clamp else None
+        table = [r * 100000 + e for r in range(rows) for e in range(row_step)]
+        pitch = coop_pitch(span * itemsize) // itemsize  # elements
+        staging: list[object] = [None] * (32 * pitch)
+        global_loads: dict[int, list[tuple[int, int]]] = {}
+        stores: dict[int, list[tuple[int, int]]] = {}
+        loads: dict[int, list[tuple[int, int]]] = {}
+        counters: dict[str, list[int]] = {
+            "load": [0] * 32,
+            "store": [0] * 32,
+            "sload": [0] * 32,
+        }
+        local = threading.local()  # pyrefly: ignore [missing-attribute]
+        barrier = threading.Barrier(32)  # pyrefly: ignore [missing-attribute]
+        lock = threading.Lock()  # pyrefly: ignore [missing-attribute]
+
+        def fake_load(ptr: object, vector_type: object) -> list[object]:
+            lane = local.lane
+            count = vector_type[0]
+            if ptr.memory == "table":  # pyrefly: ignore [missing-attribute]
+                with lock:
+                    index = counters["load"][lane]
+                    counters["load"][lane] += 1
+                    global_loads.setdefault(index, []).append((lane, ptr.offset))  # pyrefly: ignore [missing-attribute]
+                self.assertEqual(ptr.offset % per_vector, 0)  # pyrefly: ignore [missing-attribute]
+                return table[ptr.offset : ptr.offset + count]  # pyrefly: ignore [missing-attribute]
+            with lock:
+                index = counters["sload"][lane]
+                counters["sload"][lane] += 1
+                loads.setdefault(index, []).append((lane, ptr.offset))  # pyrefly: ignore [missing-attribute]
+            self.assertEqual(ptr.offset % per_vector, 0)  # pyrefly: ignore [missing-attribute]
+            return staging[ptr.offset : ptr.offset + count]  # pyrefly: ignore [missing-attribute]
+
+        def fake_copy(dst: object, src: object, size: int, modifier: str) -> None:
+            lane = local.lane
+            self.assertEqual((size, modifier), (16, "cg"))
+            self.assertEqual(src.memory, "table")  # pyrefly: ignore [missing-attribute]
+            self.assertEqual(dst.memory, "stage")  # pyrefly: ignore [missing-attribute]
+            with lock:
+                index = counters["load"][lane]
+                counters["load"][lane] += 1
+                global_loads.setdefault(index, []).append((lane, src.offset))  # pyrefly: ignore [missing-attribute]
+                stores.setdefault(index, []).append((lane, dst.offset))  # pyrefly: ignore [missing-attribute]
+            self.assertEqual(src.offset % per_vector, 0)  # pyrefly: ignore [missing-attribute]
+            self.assertEqual(dst.offset % per_vector, 0)  # pyrefly: ignore [missing-attribute]
+            staging[dst.offset : dst.offset + per_vector] = table[  # pyrefly: ignore [missing-attribute]
+                src.offset : src.offset
+                + per_vector  # pyrefly: ignore [missing-attribute]
+            ]
+
+        fake_cute = types.SimpleNamespace(
+            arch=types.SimpleNamespace(
+                load=fake_load,
+                cp_async_shared_global=fake_copy,
+                sync_warp=lambda: barrier.wait(),
+            )
+        )
+        fake_ir = types.SimpleNamespace(
+            VectorType=types.SimpleNamespace(get=lambda shape, t: (shape[0], t))
+        )
+        fake_cutlass = types.SimpleNamespace(Int32=int, min=min, max=max)
+        results: dict[int, list[object]] = {}
+        errors: list[BaseException] = []
+
+        def run(lane: int) -> None:
+            try:
+                local.lane = lane
+                row, slot = cast("tuple[int, int]", coop_lane_map(lane, width))
+                # The renderer's loader base: the owner's row shifted by the
+                # lane's request row minus its own row.
+                row_ptr = lane_cls("table", (q0 + lane + row - lane) * row_step)
+                stage = lane_cls("stage", 0)
+                flex_score_mod_runtime.coop_issue(
+                    row_ptr,
+                    col,
+                    slot,
+                    row_step,
+                    width,
+                    units,
+                    per_vector,
+                    dtype,
+                    stage,
+                    lane,
+                    pitch,
+                    limit,
+                )
+                barrier.wait()  # the group's wait and the warp sync
+                # The consume block's read of the staged row.
+                results[lane] = flex_score_mod_runtime.load_run(
+                    stage + lane * pitch, span * itemsize // 16, per_vector, dtype
+                )
+            except BaseException as error:
+                errors.append(error)
+                barrier.abort()
+
+        with (
+            patch.object(flex_score_mod_runtime, "cute", fake_cute),
+            patch.object(flex_score_mod_runtime, "ir", fake_ir),
+            patch.object(flex_score_mod_runtime, "cutlass", fake_cutlass),
+        ):
+            threads = [threading.Thread(target=run, args=(lane,)) for lane in range(32)]  # pyrefly: ignore [missing-attribute]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(errors, [])
+        lanes_per_row = width // 16
+        rows_per_request = 32 // lanes_per_row
+        # Every lane holds its own row's span (the clamp folds the pieces
+        # past the limit onto the limit, as the GPU fetch does).
+        for lane in range(32):
+            expected: list[int] = []
+            for u in range(units):
+                for s_ in range(lanes_per_row):
+                    offset = col + s_ * per_vector + u * unit_elems
+                    if limit is not None:
+                        offset = min(max(offset, 0), limit)
+                    base = (q0 + lane) * row_step + offset
+                    expected.extend(table[base : base + per_vector])
+            self.assertEqual([int(v) for v in results[lane]], expected, lane)
+        # Coalescing: request ``k`` of piece ``u`` covers rows ``row + k *
+        # rows_per_request`` whole (every slot of each row).
+        self.assertEqual(len(global_loads), units * lanes_per_row)
+        for index, entries in global_loads.items():
+            u, k = divmod(index, lanes_per_row)
+            covered = set()
+            for lane, offset in entries:
+                row, slot = cast("tuple[int, int]", coop_lane_map(lane, width))
+                piece = col + slot * per_vector + u * unit_elems
+                if limit is not None:
+                    piece = min(max(piece, 0), limit)
+                self.assertEqual(
+                    offset, (q0 + row + k * rows_per_request) * row_step + piece
+                )
+                covered.add((row + k * rows_per_request, slot))
+            self.assertEqual(
+                covered,
+                {
+                    (r, s_)
+                    for r in range(k * rows_per_request, (k + 1) * rows_per_request)
+                    for s_ in range(lanes_per_row)
+                },
+            )
+
+        # Bank conflicts: per copy / load instruction and 8-lane phase, the
+        # 16-byte shared-memory accesses (element offsets) sit on 32
+        # distinct banks.
+        def check_phases(accesses: dict[int, list[tuple[int, int]]]) -> None:
+            for index, entries in accesses.items():
+                by_lane = dict(entries)
+                self.assertEqual(len(by_lane), 32, index)
+                for phase in range(4):
+                    banks: list[int] = []
+                    for lane in range(phase * 8, phase * 8 + 8):
+                        word = by_lane[lane] * itemsize // 4
+                        banks.extend((word + w) % 32 for w in range(4))
+                    self.assertEqual(len(set(banks)), 32, (index, phase, banks))
+
+        self.assertEqual(len(stores), units * lanes_per_row)
+        self.assertEqual(len(loads), span // per_vector)
+        check_phases(stores)
+        check_phases(loads)
+
+    def test_prefetch_block_double_buffers_the_next_chunk(self) -> None:
+        """graphormer-edge at budget 128: the ``path_lengths`` vector and the
+        shared ``path_types`` run of chunk ``flash_flex_pc`` are appended
+        per group to the chunk-parity slot in the prefetch block (slots
+        initialised per KV step), the group block reads its entry, and no
+        table load is left in the chunk body; at budget 32 only the vector
+        (32 registers) is prefetched and the run (96) stays in the body."""
+        case = next(c for c in _CASES if c.name == "graphormer_edge")
+        code, plan, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, prefetch_regs=128
+        )
+        self.assertEqual(flex_prefetch_regs(plan, _BOUNDS), (32, 96))
+        prefetch = code.chunk_prefetch
+        self.assertIn(
+            "flash_flex0s_load_vec_pf = [None] * 2 if flash_flex_pf_init else "
+            "flash_flex0s_load_vec_pf",
+            prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_1_run_pf = [None] * 2 if flash_flex_pf_init else "
+            "flash_flex0s_load_1_run_pf",
+            prefetch,
+        )
+        self.assertNotIn("_pf", code.tile_prologue)
+        self.assertIn("flash_flex0s_load_vec_pf[flash_flex_ps] = []", prefetch)
+        self.assertIn("for flash_flex_g in cutlass.range_constexpr(8):", prefetch)
+        self.assertIn(
+            "flash_flex0_pkvbase = cutlass.Int32(flash_flex_pkv) * cutlass.Int32(128)",
+            prefetch,
+        )
+        self.assertIn(
+            "flash_flex0_pgbase = flash_flex0_pkvbase + cutlass.Int32(tLDcS[None, "
+            "flash_flex_pc, None, None][flash_flex_g * 4][1])",
+            prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_vec_pf[flash_flex_ps].append(_cute_flex_load_vec(",
+            prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_1_run_pf[flash_flex_ps].append(_cute_flex_load_run(",
+            prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_vec = flash_flex0s_load_vec_pf[flash_ci % 2][flash_flex_g]",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "flash_flex0s_load_1_run = flash_flex0s_load_1_run_pf[flash_ci % 2][flash_flex_g]",
+            code.chunk_body,
+        )
+        self.assertNotIn("_cute_flex_load_vec(", code.chunk_body)
+        self.assertNotIn("_cute_flex_load_run(", code.chunk_body)
+        partial, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, prefetch_regs=32
+        )
+        self.assertIn("_cute_flex_load_vec(", partial.chunk_prefetch)
+        self.assertNotIn("_cute_flex_load_run(", partial.chunk_prefetch)
+        self.assertIn(
+            "flash_flex0s_load_1_run = _cute_flex_load_run(", partial.chunk_body
+        )
+        self.assertNotIn("run_pf", partial.chunk_prefetch + partial.chunk_body)
+        none, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True
+        )
+        self.assertEqual(none.chunk_prefetch, "")
+        self.assertNotIn("_pf", none.tile_prologue + none.chunk_body)
+        # Budget rule: in order while the chunk data fits (a later smaller
+        # load still fits); the resolver scales these by the chunk width.
+        self.assertEqual(flex_prefetch_count((32, 96), 32), 1)
+        self.assertEqual(flex_prefetch_count((32, 96), 128), 2)
+        self.assertEqual(flex_prefetch_count((96, 48, 16), 64), 2)
+        self.assertEqual(flex_prefetch_count((96, 48, 16), 0), 0)
+        # ... then the budget's multiple of the taken set is the depth (at
+        # least 1, at most chunks - 1).
+        self.assertEqual(flex_prefetch_schedule((32, 96), 32, 4), (1, 1))
+        self.assertEqual(flex_prefetch_schedule((32, 96), 64, 4), (1, 2))
+        self.assertEqual(flex_prefetch_schedule((32, 96), 128, 4), (2, 1))
+        self.assertEqual(flex_prefetch_schedule((16,), 128, 8), (1, 7))
+        self.assertEqual(flex_prefetch_schedule((32,), 128, 4), (1, 3))
+        self.assertEqual(flex_prefetch_schedule((34,), 32, 4), (0, 0))
+        self.assertEqual(code.prefetch_depth, 1)
+        self.assertEqual(partial.prefetch_depth, 1)
+        self.assertEqual(none.prefetch_depth, 0)
+        # graphormer-spatial's 32-register vector at budget 128: three
+        # chunks of lead over four-slot rings.
+        case = next(c for c in _CASES if c.name == "graphormer_spatial")
+        deep, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, prefetch_regs=128
+        )
+        self.assertEqual(deep.prefetch_depth, 3)
+        self.assertIn(
+            "flash_flex0s_load_vec_pf = [None] * 4 if flash_flex_pf_init else "
+            "flash_flex0s_load_vec_pf",
+            deep.chunk_prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_vec_pf[flash_flex_ps] = []", deep.chunk_prefetch
+        )
+        self.assertIn(
+            "flash_flex0s_load_vec = flash_flex0s_load_vec_pf[flash_ci % 4][flash_flex_g]",
+            deep.chunk_body,
+        )
+
+    def test_prefetch_facts_and_window_prefetch(self) -> None:
+        """The fact lists the per-chunk loads at 32 columns in order: the
+        spatial vector (32), sandwich's fp32 window (17 two-lane vectors:
+        34), flamingo's two int32 vectors (32 each), global-sw's bool
+        vector (8), the strided case's int32 / bf16 / bool runs (96 / 48 /
+        16); unproven windows are gathers (no entry).  A prefetched window
+        computes its base, misalignment bit and vectors for the next chunk
+        into the slots."""
+        expected = {
+            "graphormer_spatial": (32,),
+            "sandwich": (34,),
+            "flamingo": (32, 32),
+            "strided_runs": (96, 48, 16),
+            "global_sw": (8,),
+            "shared_prefix": (),
+            "jetspec_tree": (),
+        }
+        for name, regs in expected.items():
+            case = next(c for c in _CASES if c.name == name)
+            _code, plan, _tables, _values = _render_case(
+                case, with_tail=False, bounds=True
+            )
+            self.assertEqual(flex_prefetch_regs(plan, _BOUNDS), regs, name)
+        case = next(c for c in _CASES if c.name == "sandwich")
+        _code, plan, _tables, _values = _render_case(case, with_tail=False)
+        self.assertEqual(flex_prefetch_regs(plan, None), ())
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, prefetch_regs=64
+        )
+        self.assertIn(
+            "flash_flex0s_load_win_pf = [None] * 2 if flash_flex_pf_init else "
+            "flash_flex0s_load_win_pf",
+            code.chunk_prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_m0_pf = [None] * 2 if flash_flex_pf_init else "
+            "flash_flex0s_load_m0_pf",
+            code.chunk_prefetch,
+        )
+        self.assertIn(
+            "flash_flex0_pcbase = flash_flex0_pkvbase + cutlass.Int32(tLDcS[None, "
+            "flash_flex_pc, None, None][0][1])",
+            code.chunk_prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_win_pf[flash_flex_ps] = _cute_flex_load_window(",
+            code.chunk_prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_m0_pf[flash_flex_ps] = (flash_flex0s_load_m & "
+            "cutlass.Int32(1)) != cutlass.Int32(0)",
+            code.chunk_prefetch,
+        )
+        self.assertIn(
+            "flash_flex0s_load_win = flash_flex0s_load_win_pf[flash_ci % 2]",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "flash_flex0s_load_m0 = flash_flex0s_load_m0_pf[flash_ci % 2]",
+            code.chunk_body,
+        )
+        self.assertNotIn("_cute_flex_load_window(", code.chunk_body)
+        # Below the window's 34 registers nothing is prefetched.
+        code, _plan_, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, prefetch_regs=32
+        )
+        self.assertEqual(code.chunk_prefetch, "")
+        self.assertIn("_cute_flex_load_window(", code.chunk_body)
+
+    def test_strided_runs_share_one_vector_run_per_group(self) -> None:
+        """graphormer-edge: the three ``path_types[b, q, kv, n]`` reads (kv at
+        stride 3, literal last index) are one 48-byte run per group of four
+        lanes, loaded once as three vectors and indexed ``j * 3 + n``; no
+        per-element ``kv``, no scalar load of that table."""
+        case = next(c for c in _CASES if c.name == "graphormer_edge")
+        code, plan, _tables, _values = _render_case(case, with_tail=False, bounds=True)
+        self.assertEqual(code.chunk_body.count("_cute_flex_load_run("), 1)
+        self.assertIn(
+            "flash_flex0s_load_1_run = _cute_flex_load_run(_flash_aux1.iterator + "
+            "flash_flex0s_load_1_i0 * cutlass.Int32(3145728) + flash_flex0s_load_1_i1 "
+            "* cutlass.Int32(3072) + (flash_flex0s_load_1_lo) * cutlass.Int32(3), 3, 4, "
+            "cutlass.Int32)",
+            code.chunk_body,
+        )
+        for n, name in (
+            (0, "flash_flex0s_load_1"),
+            (1, "flash_flex0s_load_3"),
+            (2, "flash_flex0s_load_5"),
+        ):
+            slot = "flash_flex_j * 3" if n == 0 else f"flash_flex_j * 3 + {n}"
+            self.assertIn(
+                f"{name} = cutlass.Int32(cutlass.Int32(flash_flex0s_load_1_run[{slot}]))",
+                code.chunk_body,
+            )
+        self.assertNotIn("flash_flex0_kv =", code.chunk_body)
+        self.assertNotIn(
+            "_flash_aux1.iterator +",
+            code.chunk_body.split("_run = ")[1].split("\n", 1)[1],
+        )
+        self.assertEqual(code.chunk_body.count(".load()"), 3)
+        # ``path_lengths`` keeps the plain four-lane vector of the same group.
+        self.assertIn(", 4, cutlass.Int32)", code.chunk_body)
+        self.assertEqual(
+            [a.index_class for a in plan.aux_buffers],
+            ["column_affine", "row_col", "value"],
+        )
+        # Per-dimension proof: ``edge_bias[h, et + 8n]`` keeps the guard and
+        # the clamp on the data-dependent column only.
+        self.assertIn("flash_flex0s_load_2_i0 * cutlass.Int32(24)", code.chunk_body)
+        self.assertNotIn("cutlass.max(flash_flex0s_load_2_i0", code.chunk_body)
+        self.assertIn("cutlass.max(flash_flex0s_load_2_i1", code.chunk_body)
+        self.assertIn(
+            "flash_flex0s_load_2_ok = (flash_flex0s_load_2_i1 >= cutlass.Int32(0)) & "
+            "(flash_flex0s_load_2_i1 < cutlass.Int32(24))",
+            code.chunk_body,
+        )
+        # Without the bounds the run keeps the group guard and clamp.
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn(
+            "cutlass.min(cutlass.max(flash_flex0s_load_1_lo, cutlass.Int32(0)), "
+            "cutlass.Int32(1020))) * cutlass.Int32(3)",
+            code.chunk_body,
+        )
+        self.assertIn("cutlass.select_(flash_flex0s_load_1_ok, ", code.chunk_body)
+
+    def test_mixed_run_groups_take_the_largest_lane_count(self) -> None:
+        """int32 stride 3 (four lanes), bf16 stride 3 and bool stride 2 (eight
+        lanes): the group loop is eight lanes, the int32 run six vectors."""
+        case = next(c for c in _CASES if c.name == "strided_runs")
+        code, _plan_, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn(
+            "for flash_flex_g in cutlass.range_constexpr(cute.size(flash_disc_frg) // 8):",
+            code.chunk_body,
+        )
+        self.assertIn(", 6, 4, cutlass.Int32)", code.chunk_body)
+        self.assertIn(", 3, 8, cutlass.BFloat16)", code.chunk_body)
+        self.assertIn("_cute_flex_load_vec(_flash_aux2.iterator", code.chunk_body)
+        self.assertIn(", 16, cutlass.Int8)", code.chunk_body)
+        self.assertIn("[flash_flex_j * 2 + 1]) != cutlass.Int8(0)", code.chunk_body)
+
+    def test_staged_gathers_read_shared_memory_through_the_sentinel(self) -> None:
+        case = next(c for c in _CASES if c.name == "graphormer_spatial")
+        code, plan, _tables, _values = _render_case(
+            case, with_tail=False, bounds=True, aux_smem_budget=4096
+        )
+        # 4 x 8 fp32 plus the sentinel, 16-byte rounded.
+        self.assertEqual(flex_aux_smem_candidates(plan), (144,))
+        self.assertEqual(
+            flex_aux_smem_layout(plan, 4096),
+            [(1, 0, 32, 144)],
+        )
+        self.assertEqual(flex_aux_smem_layout(plan, 0), [])
+        self.assertIn(
+            "flash_flex0s_load_1_off = cutlass.Int32(cutlass.select_(flash_flex0s_load_1_ok,"
+            " flash_flex0s_load_1_i0 * cutlass.Int32(8) + flash_flex0s_load_1_i1 * "
+            "cutlass.Int32(1), cutlass.Int32(32)))",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "flash_flex0s_load_1 = cutlass.Float32((_flash_aux1_smem + "
+            "flash_flex0s_load_1_off).load())",
+            code.chunk_body,
+        )
+        self.assertNotIn("cutlass.max(", code.chunk_body)
+        self.assertNotIn("_flash_aux1.iterator", code.chunk_body)
+        # The vector-form table is not a candidate and stays in global memory.
+        self.assertIn("_cute_flex_load_vec(_flash_aux0.iterator", code.chunk_body)
+        # Two candidates: staged in plan order while the total fits.
+        case = next(c for c in _CASES if c.name == "two_gathers")
+        code, plan, _tables, _values = _render_case(
+            case, with_tail=False, aux_smem_budget=4096
+        )
+        self.assertEqual(flex_aux_smem_candidates(plan), (128, 16400))
+        self.assertEqual(flex_aux_smem_staged((128, 16400), 4096), 1)
+        self.assertEqual(flex_aux_smem_staged((128, 16400), 16384), 1)
+        self.assertEqual(flex_aux_smem_staged((128, 16400), 32768), 2)
+        self.assertEqual(flex_aux_smem_staged((128, 16400), 0), 0)
+        self.assertEqual(flex_aux_smem_layout(plan, 32768)[1][:2], (2, 128))
+        self.assertIn("_flash_aux1_smem", code.chunk_body)
+        self.assertIn("_flash_aux2.iterator", code.chunk_body)
+        # A clamped column index is data-dependent to the proof: a candidate.
+        case = next(c for c in _CASES if c.name == "jetspec_tree")
+        _code, plan, _tables, _values = _render_case(case, with_tail=False)
+        self.assertEqual(flex_aux_smem_candidates(plan), (4112,))
+        for name in ("sandwich", "shared_prefix", "flamingo", "bf16_table"):
+            case = next(c for c in _CASES if c.name == name)
+            _code, plan, _tables, _values = _render_case(case, with_tail=False)
+            self.assertEqual(flex_aux_smem_candidates(plan), (), name)
 
     def test_proven_loads_drop_guards_and_diagonal_gathers_take_windows(self) -> None:
         case = next(c for c in _CASES if c.name == "sandwich")
@@ -1293,7 +2524,8 @@ class TestCuteFlexScoreMod(TestCase):
             <= set(masked.tile_prologue.splitlines())
         )
         for code in (masked, unmasked):
-            for block in code:
+            for block in code[:4]:
+                assert isinstance(block, str)
                 self.assertIsNone(re.search(r"\bv_\d+\b", block), block)
                 self.assertTrue(block == "" or block.endswith("\n"))
         # Lifted temporaries are named after the node they belong to.
@@ -1559,7 +2791,8 @@ class TestCuteFlexScoreMod(TestCase):
         code, _plan_, _tables, _values = _render_case(case, with_tail=False)
         self.assertNotIn("_w0", code.chunk_body + code.tile_prologue)
         element = _render_case(case, with_tail=False, mask_form="element")[0]
-        for block, other in zip(code, element, strict=True):
+        for block, other in zip(code[:4], element[:4], strict=True):
+            assert isinstance(block, str) and isinstance(other, str)
             self.assertEqual(sorted(block.splitlines()), sorted(other.splitlines()))
 
     def test_bitmask_with_score_region_and_tail(self) -> None:
