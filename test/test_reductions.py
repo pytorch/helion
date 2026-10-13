@@ -830,6 +830,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(s, x.sum(-1), rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(out, bias[:, None].expand(16, 64))
 
+    @onlyBackends(["triton"])
     @skipIfRefEager("asserts generated Triton source, which ref eager does not emit")
     def test_fused_looped_reductions_share_one_load(self):
         @helion.kernel(autotune_effort="none")
@@ -855,6 +856,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mean, x.mean(-1), rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(var, (x * x).mean(-1), rtol=1e-4, atol=1e-4)
 
+    @onlyBackends(["triton"])
     @skipIfRefEager("asserts generated Triton source, which ref eager does not emit")
     def test_reduction_fusion_preserves_store_read_dependency(self):
         @helion.kernel(autotune_effort="none")
