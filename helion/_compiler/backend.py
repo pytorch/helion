@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import collections
 import dataclasses
+import enum
 import functools
 import logging
 import math
@@ -179,6 +180,14 @@ def _validate_subscript_indices(index: list[object]) -> int:
     return narrowed
 
 
+class BackendState(enum.Enum):
+    """Maturity of a codegen backend."""
+
+    EXPERIMENTAL = "experimental"  # Warns on use
+    BETA = "beta"  # No warning, but no backwards-compat guarantee
+    STABLE = "stable"
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -195,9 +204,9 @@ class Backend(abc.ABC):
         ...
 
     @property
-    def experimental(self) -> bool:
-        """Whether this backend is experimental and should emit a warning."""
-        return True
+    def state(self) -> BackendState:
+        """Maturity of this backend; experimental backends emit a warning."""
+        return BackendState.EXPERIMENTAL
 
     @property
     def supports_debug_dtype_asserts(self) -> bool:
