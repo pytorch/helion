@@ -58,9 +58,9 @@ class EpilogueSubtilingCandidate(NamedTuple):
     split_dim: int
     block_id: int | None
     split_size: int | torch.SymInt
-    # Output subscript position that receives the per-piece offset.  For tile
-    # splits this can differ from split_dim (a boundary dim), e.g. for
-    # ``s[tile_n, :].T * acc``; static-slice splits reuse split_dim.
+    # Output subscript position that receives the per-piece offset.  This can
+    # differ from split_dim (a boundary dim) when the epilogue changes dimension
+    # order or an integer output subscript removes a value dimension.
     output_split_dim: int
 
 
@@ -145,7 +145,7 @@ def _iter_eligible_epilogue_chains(
         # Tensor descriptors require the value tile shape to match the descriptor
         # block shape.  For outputs like out[tile_m, :], split the static slice
         # dimension first instead of the tiled row dimension.
-        split_candidate = (
+        static_slice_candidate = (
             _find_static_slice_split_candidate(
                 boundary_val,
                 output_node,
@@ -154,20 +154,19 @@ def _iter_eligible_epilogue_chains(
             if output_node in descriptor_output_nodes
             else None
         )
-        split_candidate = split_candidate or _find_split_candidate(
-            boundary_val,
-            env,
-            split_factor,
-        )
-        if split_candidate is None:
-            continue
-
-        split_dim, block_id, split_size = split_candidate
-        output_split_dim = (
-            split_dim
-            if block_id is None
-            else _find_output_split_dim(env, output_node, block_id)
-        )
+        if static_slice_candidate is not None:
+            split_dim, output_split_dim, split_size = static_slice_candidate
+            block_id = None
+        else:
+            split_candidate = _find_split_candidate(
+                boundary_val,
+                env,
+                split_factor,
+            )
+            if split_candidate is None:
+                continue
+            split_dim, block_id, split_size = split_candidate
+            output_split_dim = _find_output_split_dim(env, output_node, block_id)
         if output_split_dim is None:
             continue
         yield EpilogueSubtilingCandidate(
@@ -705,8 +704,8 @@ def _find_static_slice_split_candidate(
     value: torch.Tensor,
     output_node: torch.fx.Node,
     split_factor: int,
-) -> tuple[int, None, int | torch.SymInt] | None:
-    """Find a full-slice output dim, e.g. the ``:`` in ``out[tile_m, :]``."""
+) -> tuple[int, int, int | torch.SymInt] | None:
+    """Return value dim, subscript position, and size of a full-slice split."""
     subscript_arg = output_node.args[1]
     if not isinstance(subscript_arg, (list, tuple)):
         return None
@@ -717,10 +716,10 @@ def _find_static_slice_split_candidate(
     )
     value_dim = 0
     tensor_dim = 0
-    candidate: tuple[int, None, int | torch.SymInt] | None = None
+    candidate: tuple[int, int, int | torch.SymInt] | None = None
     # Iterate in output-subscript order to keep tensor/value dims aligned, but
     # keep the last eligible slice so we still prefer the innermost split dim.
-    for subscript in subscript_arg:
+    for output_dim, subscript in enumerate(subscript_arg):
         if isinstance(subscript, int):
             tensor_dim += 1
             continue
@@ -745,7 +744,7 @@ def _find_static_slice_split_candidate(
             and value.size(value_dim) % split_factor == 0
             and split_size % split_factor == 0
         ):
-            candidate = (value_dim, None, split_size)
+            candidate = (value_dim, output_dim, split_size)
         tensor_dim += 1
         value_dim += 1
 
