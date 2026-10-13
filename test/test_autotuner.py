@@ -11496,93 +11496,116 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertNotIn(config_b, search._benchmarked_members)
         self.assertEqual(set(search._benchmarked_members), {config_a, config_c})
 
-    def test_cute_finalist_history_uses_latest_verified_perf(self) -> None:
-        settings = Settings(autotune_log_level=logging.CRITICAL)
-        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
-        search.settings = settings
-        search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(
-            backend_name="cute", cute_flash_search_enabled=True
-        )
-        search._benchmarked_members = {}
-        search._pinned_finalist_configs = set()
-        search._pinned_finalist_members = {}
+    def test_flash_and_topk_finalist_history_uses_latest_verified_perf(self) -> None:
+        for backend_name, flash_search, topk_search in (
+            (None, True, False),
+            ("cute", True, False),
+            ("cute", False, True),
+            ("cute", True, True),
+        ):
+            with self.subTest(
+                backend=backend_name, cute_flash=flash_search, cute_topk=topk_search
+            ):
+                settings = Settings(autotune_log_level=logging.CRITICAL)
+                search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+                search.settings = settings
+                search.log = AutotuningLogger(settings)
+                search.config_spec = SimpleNamespace(
+                    backend_name=backend_name,
+                    cute_flash_search_enabled=flash_search,
+                    cute_topk_search_enabled=topk_search,
+                )
+                search._benchmarked_members = {}
+                search._pinned_finalist_configs = set()
+                search._pinned_finalist_members = {}
 
-        initial_fast_final_slow = PopulationMember(
-            lambda: None,
-            [1.0, 10.0],
-            [],
-            helion.Config(num_warps=4),
-            status="ok",
-        )
-        middle = PopulationMember(
-            lambda: None,
-            [2.0, 5.0],
-            [],
-            helion.Config(num_warps=8),
-            status="ok",
-        )
-        initial_slow_final_fast = PopulationMember(
-            lambda: None,
-            [3.0, 0.5],
-            [],
-            helion.Config(num_warps=16),
-            status="ok",
-        )
+                initial_fast_final_slow = PopulationMember(
+                    lambda: None,
+                    [1.0, 10.0],
+                    [],
+                    helion.Config(num_warps=4),
+                    status="ok",
+                )
+                middle = PopulationMember(
+                    lambda: None,
+                    [2.0, 5.0],
+                    [],
+                    helion.Config(num_warps=8),
+                    status="ok",
+                )
+                initial_slow_final_fast = PopulationMember(
+                    lambda: None,
+                    [3.0, 0.5],
+                    [],
+                    helion.Config(num_warps=16),
+                    status="ok",
+                )
 
-        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
-            search._record_benchmarked_member(initial_fast_final_slow)
-            search._record_benchmarked_member(middle)
-            search._record_benchmarked_member(initial_slow_final_fast)
+                with clean_final_rebenchmark_env(
+                    HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"
+                ):
+                    search._record_benchmarked_member(initial_fast_final_slow)
+                    search._record_benchmarked_member(middle)
+                    search._record_benchmarked_member(initial_slow_final_fast)
 
-        self.assertEqual(
-            set(search._benchmarked_members),
-            {middle.config, initial_slow_final_fast.config},
-        )
+                self.assertEqual(
+                    set(search._benchmarked_members),
+                    {middle.config, initial_slow_final_fast.config},
+                )
 
-    def test_non_cute_finalist_history_keeps_low_water_perf(self) -> None:
-        settings = Settings(autotune_log_level=logging.CRITICAL)
-        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
-        search.settings = settings
-        search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(
-            backend_name="triton", cute_flash_search_enabled=False
-        )
-        search._benchmarked_members = {}
-        search._pinned_finalist_configs = set()
-        search._pinned_finalist_members = {}
+    def test_other_finalist_history_keeps_low_water_perf(self) -> None:
+        for backend_name, topk_search in (
+            ("triton", False),
+            ("triton", True),
+            ("cute", False),
+        ):
+            with self.subTest(backend=backend_name, cute_topk=topk_search):
+                settings = Settings(autotune_log_level=logging.CRITICAL)
+                search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+                search.settings = settings
+                search.log = AutotuningLogger(settings)
+                search.config_spec = SimpleNamespace(
+                    backend_name=backend_name,
+                    cute_flash_search_enabled=False,
+                    cute_topk_search_enabled=topk_search,
+                )
+                search._benchmarked_members = {}
+                search._pinned_finalist_configs = set()
+                search._pinned_finalist_members = {}
 
-        initial_fast_final_slow = PopulationMember(
-            lambda: None,
-            [1.0, 10.0],
-            [],
-            helion.Config(num_warps=4),
-            status="ok",
-        )
-        middle = PopulationMember(
-            lambda: None,
-            [2.0, 5.0],
-            [],
-            helion.Config(num_warps=8),
-            status="ok",
-        )
-        initial_slow_final_fast = PopulationMember(
-            lambda: None,
-            [3.0, 0.5],
-            [],
-            helion.Config(num_warps=16),
-            status="ok",
-        )
+                initial_fast_final_slow = PopulationMember(
+                    lambda: None,
+                    [1.0, 10.0],
+                    [],
+                    helion.Config(num_warps=4),
+                    status="ok",
+                )
+                middle = PopulationMember(
+                    lambda: None,
+                    [2.0, 5.0],
+                    [],
+                    helion.Config(num_warps=8),
+                    status="ok",
+                )
+                initial_slow_final_fast = PopulationMember(
+                    lambda: None,
+                    [3.0, 0.5],
+                    [],
+                    helion.Config(num_warps=16),
+                    status="ok",
+                )
 
-        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
-            search._record_benchmarked_member(initial_fast_final_slow)
-            search._record_benchmarked_member(middle)
-            search._record_benchmarked_member(initial_slow_final_fast)
+                with clean_final_rebenchmark_env(
+                    HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"
+                ):
+                    search._record_benchmarked_member(initial_fast_final_slow)
+                    search._record_benchmarked_member(middle)
+                    search._record_benchmarked_member(initial_slow_final_fast)
 
-        self.assertEqual(
-            set(search._benchmarked_members),
-            {initial_fast_final_slow.config, initial_slow_final_fast.config},
-        )
+                self.assertEqual(
+                    set(search._benchmarked_members),
+                    {initial_fast_final_slow.config, initial_slow_final_fast.config},
+                )
 
     def test_non_cute_rebenchmark_refreshes_retained_snapshot(self) -> None:
         settings = Settings(
@@ -11661,82 +11684,111 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             [5.0, float("inf")],
         )
 
-    def test_cute_rebenchmark_refresh_reinserts_pruned_finalist(self) -> None:
-        settings = Settings(
-            autotune_log_level=logging.CRITICAL,
-            autotune_suspicious_rebenchmark_ratio=0,
-        )
-        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
-        search.settings = settings
-        search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(
-            backend_name="cute", cute_flash_search_enabled=True
-        )
-        search._benchmarked_members = {}
-        search._pinned_finalist_configs = set()
-        search._pinned_finalist_members = {}
-        search.best_perf_so_far = 1.0
-        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+    def test_cute_rebenchmark_refresh_respects_selection_scope(self) -> None:
+        for flash_search, topk_search in (
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            with self.subTest(cute_flash=flash_search, cute_topk=topk_search):
+                settings = Settings(
+                    autotune_log_level=logging.CRITICAL,
+                    autotune_suspicious_rebenchmark_ratio=0,
+                )
+                search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+                search.settings = settings
+                search.log = AutotuningLogger(settings)
+                search.config_spec = SimpleNamespace(
+                    backend_name="cute",
+                    cute_flash_search_enabled=flash_search,
+                    cute_topk_search_enabled=topk_search,
+                )
+                search._benchmarked_members = {}
+                search._pinned_finalist_configs = set()
+                search._pinned_finalist_members = {}
+                search.best_perf_so_far = 1.0
+                search.kernel = SimpleNamespace(
+                    env=SimpleNamespace(process_group_name=None)
+                )
 
-        initial_fast_final_slow = PopulationMember(
-            lambda: None,
-            [1.0],
-            [],
-            helion.Config(num_warps=4),
-            status="ok",
-        )
-        middle = PopulationMember(
-            lambda: None,
-            [2.0],
-            [],
-            helion.Config(num_warps=8),
-            status="ok",
-        )
-        initial_slow_final_fast = PopulationMember(
-            lambda: None,
-            [3.0],
-            [],
-            helion.Config(num_warps=16),
-            status="ok",
-        )
-        members = [initial_fast_final_slow, middle, initial_slow_final_fast]
+                initial_fast_final_slow = PopulationMember(
+                    lambda: None,
+                    [1.0],
+                    [],
+                    helion.Config(num_warps=4),
+                    status="ok",
+                )
+                middle = PopulationMember(
+                    lambda: None,
+                    [2.0],
+                    [],
+                    helion.Config(num_warps=8),
+                    status="ok",
+                )
+                initial_slow_final_fast = PopulationMember(
+                    lambda: None,
+                    [3.0],
+                    [],
+                    helion.Config(num_warps=16),
+                    status="ok",
+                )
+                members = [initial_fast_final_slow, middle, initial_slow_final_fast]
 
-        def benchmark_isolated(
-            fns: list[Callable[[], object]],
-            *,
-            warmup: int,
-            rep: int,
-            desc: str,
-            fresh_process: bool = False,
-        ) -> list[float]:
-            self.assertEqual(len(fns), 3)
-            return [10.0, 5.0, 0.5]
+                def benchmark_isolated(
+                    fns: list[Callable[[], object]],
+                    *,
+                    warmup: int,
+                    rep: int,
+                    desc: str,
+                    fresh_process: bool = False,
+                ) -> list[float]:
+                    self.assertEqual(len(fns), 3)
+                    return [10.0, 5.0, 0.5]
 
-        search.benchmark_provider = SimpleNamespace(
-            benchmark_isolated=benchmark_isolated,
-            mutated_arg_indices=[],
-        )
+                search.benchmark_provider = SimpleNamespace(
+                    benchmark_isolated=benchmark_isolated,
+                    mutated_arg_indices=[],
+                )
 
-        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
-            for member in members:
-                search._record_benchmarked_member(member)
-            self.assertNotIn(
-                initial_slow_final_fast.config, search._benchmarked_members
-            )
-            initial_snapshot = search._benchmarked_members[
-                initial_fast_final_slow.config
-            ]
-            self.assertIsNot(initial_snapshot.perfs, initial_fast_final_slow.perfs)
+                with clean_final_rebenchmark_env(
+                    HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"
+                ):
+                    for member in members:
+                        search._record_benchmarked_member(member)
+                    self.assertNotIn(
+                        initial_slow_final_fast.config, search._benchmarked_members
+                    )
+                    initial_snapshot = search._benchmarked_members[
+                        initial_fast_final_slow.config
+                    ]
+                    self.assertIsNot(
+                        initial_snapshot.perfs, initial_fast_final_slow.perfs
+                    )
 
-            search.rebenchmark(members, target_ms=200.0)
+                    search.rebenchmark(members, target_ms=200.0)
 
-        self.assertEqual(
-            set(search._benchmarked_members),
-            {middle.config, initial_slow_final_fast.config},
-        )
-        refreshed = search._benchmarked_members[initial_slow_final_fast.config]
-        self.assertEqual(refreshed.perfs, [3.0, 0.5])
-        self.assertIsNot(refreshed.perfs, initial_slow_final_fast.perfs)
+                self.assertEqual(
+                    set(search._benchmarked_members),
+                    {middle.config, initial_slow_final_fast.config}
+                    if flash_search or topk_search
+                    else {initial_fast_final_slow.config, middle.config},
+                )
+                retained = (
+                    initial_slow_final_fast if flash_search or topk_search else middle
+                )
+                refreshed = search._benchmarked_members[retained.config]
+                self.assertEqual(refreshed.perfs, retained.perfs)
+                self.assertIsNot(refreshed.perfs, retained.perfs)
+
+                # Refresh must not mutate the old snapshot or share the live config.
+                self.assertEqual(initial_snapshot.perfs, [1.0])
+                saved_config = copy.deepcopy(refreshed.config)
+                saved_perfs = copy.deepcopy(refreshed.perfs)
+                retained.perfs.append(50.0)
+                retained.config.config["num_warps"] = 32
+                self.assertEqual(refreshed.perfs, saved_perfs)
+                self.assertEqual(refreshed.config, saved_config)
+                self.assertIs(search._benchmarked_members[saved_config], refreshed)
 
     def test_pinned_finalist_survives_benchmarked_member_pruning(self) -> None:
         settings = Settings(autotune_log_level=logging.CRITICAL)
@@ -11771,11 +11823,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(set(search._benchmarked_members), {fast_config, faster_config})
 
     def test_pinned_finalist_refresh_groups_equal_config_duplicates(self) -> None:
-        for backend_name, cute_flash_search_enabled in (
-            ("triton", False),
-            ("cute", True),
+        for backend_name, cute_flash_search_enabled, cute_topk_search_enabled in (
+            ("triton", False, False),
+            ("cute", True, False),
+            ("cute", False, False),
+            ("cute", False, True),
         ):
-            with self.subTest(backend=backend_name):
+            with self.subTest(
+                backend=backend_name,
+                cute_flash=cute_flash_search_enabled,
+                cute_topk=cute_topk_search_enabled,
+            ):
                 settings = Settings(autotune_log_level=logging.CRITICAL)
                 search = PopulationBasedSearch.__new__(PopulationBasedSearch)
                 search.settings = settings
@@ -11783,6 +11841,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search.config_spec = SimpleNamespace(
                     backend_name=backend_name,
                     cute_flash_search_enabled=cute_flash_search_enabled,
+                    cute_topk_search_enabled=cute_topk_search_enabled,
                 )
                 search._benchmarked_members = {}
                 search._pinned_finalist_configs = set()
@@ -11830,11 +11889,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 )
 
     def test_failed_duplicate_does_not_evict_pinned_finalist(self) -> None:
-        for backend_name, cute_flash_search_enabled in (
-            ("triton", False),
-            ("cute", True),
+        for backend_name, cute_flash_search_enabled, cute_topk_search_enabled in (
+            ("triton", False, False),
+            ("cute", True, False),
+            ("cute", False, False),
+            ("cute", False, True),
         ):
-            with self.subTest(backend=backend_name):
+            with self.subTest(
+                backend=backend_name,
+                cute_flash=cute_flash_search_enabled,
+                cute_topk=cute_topk_search_enabled,
+            ):
                 settings = Settings(autotune_log_level=logging.CRITICAL)
                 search = PopulationBasedSearch.__new__(PopulationBasedSearch)
                 search.settings = settings
@@ -11842,6 +11907,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 search.config_spec = SimpleNamespace(
                     backend_name=backend_name,
                     cute_flash_search_enabled=cute_flash_search_enabled,
+                    cute_topk_search_enabled=cute_topk_search_enabled,
                 )
                 search._benchmarked_members = {}
                 search._pinned_finalist_configs = set()
