@@ -8180,28 +8180,43 @@ def test_attention_required_full_autotune_rejects_tampered_random_fill():
 
 
 def test_attention_strict_initial_population_replay_uses_seed_without_rng_leak():
+    from helion.autotuner.search_space_logger import canonical_config_id
 
     generation = _fresh_full_autotune_config_generation()
     original_state = random.getstate()
     try:
+        required_configs = set(generation.flash_deterministic_population_configs())
+        required_configs.update(
+            config for _flat, config in generation.seed_flat_config_pairs()
+        )
+        required_ids = {canonical_config_id(config) for config in required_configs}
+        initial_population_size = max(100, len(required_ids) + 1)
+        assert (
+            generation.flash_exact_effective_search_space_configs(
+                initial_population_size
+            )
+            is None
+        )
         random.seed(987654321)
         saved_state = random.getstate()
 
         first_ids = compare_attention_backends._replay_strict_attention_initial_population_config_ids(
             generation,
             random_seed=123,
-            initial_population_size=100,
+            initial_population_size=initial_population_size,
         )
         assert random.getstate() == saved_state
         second_ids = compare_attention_backends._replay_strict_attention_initial_population_config_ids(
             generation,
             random_seed=124,
-            initial_population_size=100,
+            initial_population_size=initial_population_size,
         )
 
         assert random.getstate() == saved_state
         assert isinstance(first_ids, list)
-        assert len(first_ids) == len(second_ids) == 100
+        assert len(first_ids) == len(second_ids) == initial_population_size
+        assert required_ids <= set(first_ids)
+        assert required_ids <= set(second_ids)
         assert first_ids != second_ids
     finally:
         random.setstate(original_state)

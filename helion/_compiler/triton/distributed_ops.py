@@ -1216,6 +1216,15 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             result = expr_from_string(
                 backend.broadcast_to_expr("{value}", shape), value=result
             )
+            if indexing.broadcast_mask_expr is not None:
+                # Like a pointer load, zero the lanes past a broadcast tile.
+                result = expr_from_string(
+                    backend.where_expr(
+                        "{mask}", "{value}", backend.full_expr([], "0", dtype)
+                    ),
+                    mask=indexing.broadcast_mask_expr,
+                    value=result,
+                )
         elif indexing.block_shaped_offset or mask is not None:
             group = shape if words is None else words[2]
             pack = _poll_pack(state, output_size, 1 if words is None else lanes)

@@ -1048,6 +1048,16 @@ class PointerIndexingStrategy(IndexingStrategy):
             backend = CompileEnvironment.current().backend
             broadcast = backend.broadcast_to_expr("{load_expr}", shape_str)
             load_expr = expr_from_string(broadcast, load_expr=load_expr)
+            if indexing.broadcast_mask_expr is not None:
+                # Loads are masked to 0 (``get_masked_value(load)``), which a
+                # reduction over the tile relies on, so zero the broadcast
+                # lanes past the tile's extent too.
+                zero = backend.full_expr([], "0", fake_tensor.dtype)
+                load_expr = expr_from_string(
+                    backend.where_expr("{mask}", "{load_expr}", zero),
+                    mask=indexing.broadcast_mask_expr,
+                    load_expr=load_expr,
+                )
 
         return load_expr
 
@@ -1682,6 +1692,16 @@ class StackIndexingStrategy:
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
+        if (broadcast_mask := indexing.broadcast_mask_expr) is not None:
+            # Load broadcast dims through a broadcast pointer, masked by their
+            # tiles, so the lanes past a tile's extent are 0 like any load's.
+            if indexing.has_mask():
+                broadcast_mask = expr_from_string(
+                    "{mask} & {broadcast_mask}",
+                    mask=indexing.mask_expr,
+                    broadcast_mask=broadcast_mask,
+                )
+            indexing = indexing._replace(mask_expr=broadcast_mask)
         subscripts_shape = SubscriptIndexing.compute_shape(
             tensor_like, subscript, state
         )
@@ -1704,7 +1724,7 @@ class StackIndexingStrategy:
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
-            "offset": indexing.index_expr,
+            "offset": indexing.broadcast_offset(state, subscripts_shape),
             "mask": mask_expr,
         }
         if eviction_policy is not None:
@@ -1772,6 +1792,8 @@ class PerDimIndexing:
     # Per tensor dimension, whether that dimension's index is block shaped (a
     # tile/tensor index rather than a scalar). Parallel to dim_index_exprs.
     block_dims: tuple[bool, ...] = ()
+    # A load's masks of the tiles it broadcasts size-1 dims onto
+    broadcast_mask_expr: ast.AST | None = None
 
     def has_mask(self) -> bool:
         return not (
@@ -1799,6 +1821,8 @@ class SubscriptIndexing(NamedTuple):
     block_shaped_offset: bool = True
     # Whether each dim_index_exprs entry is block shaped rather than scalar.
     block_dims: tuple[bool, ...] = ()
+    # A load's masks of the tiles it broadcasts size-1 dims onto
+    broadcast_mask_expr: ast.AST | None = None
 
     def has_mask(self) -> bool:
         return not (
@@ -1935,12 +1959,15 @@ class SubscriptIndexing(NamedTuple):
 
         This is the strategy-agnostic first phase of indexing: it computes
         individual dimension index strings and a combined mask expression.
-        A size-1 dim indexed by a wider tile broadcasts, so a load drops the
-        tile's mask there.  A store target never needs to broadcast (a valid
-        store's dim covers the tile's extent), so ``for_store`` does not guard
-        its dynamic sizes to 1; a dim known to be 1 anyway (static, or guarded
-        by a load) keeps the tile's mask, since every masked-off lane would
-        otherwise write the same element.
+        A size-1 dim indexed by a wider tile (or tensor index) broadcasts, so
+        a load reads it without the tile's mask, which it returns as
+        ``broadcast_mask_expr`` to zero the lanes past the tile's extent
+        (masks shared by several index tensors also guard the others'
+        offsets, so they stay in ``mask_expr``).  A store target never needs
+        to broadcast (a valid store's dim covers the tile's extent), so
+        ``for_store`` does not guard its dynamic sizes to 1; a dim known to be
+        1 anyway (static, or guarded by a load) keeps the tile's mask, since
+        every masked-off lane would otherwise write the same element.
         """
         tile_strategy = state.tile_strategy
         output_idx = 0
@@ -1948,6 +1975,7 @@ class SubscriptIndexing(NamedTuple):
         # Parallel to index_values: whether that dimension's index is block shaped.
         block_dims: list[bool] = []
         mask_values: dict[str, None] = {}
+        broadcast_masks: dict[str, None] = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -2018,7 +2046,7 @@ class SubscriptIndexing(NamedTuple):
                 expand = tile_strategy.expand_dims_str(
                     output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
                 )
-                idx_val = f"({index_var}){expand}"
+                positions: list[int] = []
             elif single_output_dim:
                 assert pos is not None
                 if index_elem.ndim == 1:
@@ -2029,13 +2057,26 @@ class SubscriptIndexing(NamedTuple):
                     expand = tile_strategy.expand_dims_str(
                         output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
                     )
-                idx_val = f"({index_var}){expand}"
-                # Add mask for the single non-trivial output position
+                positions = [pos]
+            else:
+                # Multi-dim tensor with multiple non-trivial dims
+                # Still need expansion for trailing/leading slice dimensions
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                positions = non_trivial_output_positions
+            idx_val = f"({index_var}){expand}"
+            # Every index masks the tile positions it covers (a later index may
+            # cover positions an earlier one does not).  The masks also guard
+            # the other indices' offsets, so even over a size-1 target dim,
+            # which drops this index from the offset and broadcasts it over
+            # these positions, they stay in the access's own mask, to whose
+            # shape a load broadcasts its pointer.
+            for p in positions:
                 if (
-                    pos < len(output_size)
-                    and (bid := env.get_block_id(output_size[pos])) is not None
+                    p < len(output_size)
+                    and (bid := env.get_block_id(output_size[p])) is not None
                     and (mv := state.codegen.mask_var(bid))
-                    and not _is_size_one(fake_value.size(len(index_values)))
                 ):
                     if env.is_jagged_tile(bid):
                         mask_shape = env.jagged_tile_mask_shapes[bid]
@@ -2044,33 +2085,14 @@ class SubscriptIndexing(NamedTuple):
                         )
                     else:
                         new_masks.setdefault(
-                            f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                            f"({mv}){tile_strategy.expand_str(output_size, p)}"
                         )
-            else:
-                # Multi-dim tensor with multiple non-trivial dims
-                # Still need expansion for trailing/leading slice dimensions
-                expand = tile_strategy.expand_dims_str(
-                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+            if _is_size_one(fake_value.size(len(index_values))):
+                size1_broadcast_dims.extend(
+                    (p, output_size[p])
+                    for p in positions
+                    if not _is_size_one(output_size[p])
                 )
-                idx_val = f"({index_var}){expand}"
-                if tensor_idx == 0:
-                    for p in non_trivial_output_positions:
-                        if (
-                            p < len(output_size)
-                            and (bid := env.get_block_id(output_size[p])) is not None
-                            and (mv := state.codegen.mask_var(bid))
-                            and not _is_size_one(fake_value.size(len(index_values)))
-                        ):
-                            if env.is_jagged_tile(bid):
-                                mask_shape = env.jagged_tile_mask_shapes[bid]
-                                new_masks.setdefault(
-                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
-                                )
-
-                            else:
-                                new_masks.setdefault(
-                                    f"({mv}){tile_strategy.expand_str(output_size, p)}"
-                                )
             # The padding mask has the index's rank: expand it like the index.
             if (iota_mask := _padded_iota_mask(state, position)) is not None:
                 new_masks.setdefault(f"({iota_mask}{expand})")
@@ -2114,21 +2136,37 @@ class SubscriptIndexing(NamedTuple):
                         f"tl.arange(0, {block_size_expr}).to({dtype}))"
                     )
                     index_values.append(f"{index_expr}{expand}")
-                    if not _is_size_one(fake_value.size(i)) or (
-                        for_store and broadcast
+                    # An epilogue-subtile piece of the tile: mask it like the
+                    # tile, by the loop's end rather than the target's size
+                    if state.codegen.mask_var(block_id) and (
+                        not _is_size_one(fake_value.size(i)) or broadcast
                     ):
-                        dim_size = state.device_function.tensor_size(fake_value, i).name
-                        mask_values.setdefault(f"({index_expr} < {dim_size}){expand}")
+                        end = (
+                            state.codegen.active_device_loops[block_id][-1]
+                            .block_id_to_info[block_id]
+                            .end_var_name
+                        )
+                        assert end is not None
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({index_expr} < {end}){expand}")
                 else:
                     index_var = state.codegen.index_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)
                     index_values.append(f"(({index_var}) + {offset_expr}){expand}")
                     # Use the same mask as the underlying tile
                     if (mask := state.codegen.mask_var(block_id)) and (
-                        not _is_size_one(fake_value.size(i))
-                        or (for_store and broadcast)
+                        not _is_size_one(fake_value.size(i)) or broadcast
                     ):
-                        mask_values.setdefault(f"({mask}){expand}")
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({mask}){expand}")
                 if broadcast:
                     size1_broadcast_dims.append((output_idx, output_size[output_idx]))
                 output_idx += 1
@@ -2150,15 +2188,19 @@ class SubscriptIndexing(NamedTuple):
                     block_dims.append(True)
                     index_values.append(f"({index_var}){expand}")
                     if (mask := state.codegen.mask_var(block_id)) and (
-                        not _is_size_one(fake_value.size(i))
-                        or (for_store and broadcast)
+                        not _is_size_one(fake_value.size(i)) or broadcast
                     ):
                         if env.is_jagged_tile(block_id):
                             mask_shape = env.jagged_tile_mask_shapes[block_id]
                             expand = tile_strategy.jagged_tile_expand_str(
                                 mask_shape, output_size
                             )
-                        mask_values.setdefault(f"({mask}){expand}")
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({mask}){expand}")
                     if broadcast:
                         size1_broadcast_dims.append(
                             (output_idx, output_size[output_idx])
@@ -2263,12 +2305,22 @@ class SubscriptIndexing(NamedTuple):
                     if output_idx < len(output_size)
                     else None
                 )
-                if mask_block_id is not None:
-                    mask_var = state.codegen.mask_var(mask_block_id)
-                    if mask_var and not _is_size_one(
-                        fake_value.size(len(index_values) - 1)
-                    ):
-                        mask_values.setdefault(f"({mask_var}){expand}")
+                # A size-1 target dim drops this index from the offset, which
+                # then broadcasts over the index's output dims.
+                size_one = _is_size_one(fake_value.size(len(index_values) - 1))
+                if mask_block_id is not None and (
+                    mask_var := state.codegen.mask_var(mask_block_id)
+                ):
+                    masks = (
+                        broadcast_masks if size_one and not for_store else mask_values
+                    )
+                    masks.setdefault(f"({mask_var}){expand}")
+                if size_one:
+                    size1_broadcast_dims.extend(
+                        (p, output_size[p])
+                        for p in range(output_idx, output_idx + k.ndim)
+                        if not _is_size_one(output_size[p])
+                    )
                 if (iota_mask := _padded_iota_mask(state, n)) is not None:
                     mask_values.setdefault(f"({iota_mask}{expand})")
 
@@ -2289,6 +2341,7 @@ class SubscriptIndexing(NamedTuple):
             tuple(size1_broadcast_dims),
             output_size,
             tuple(block_dims),
+            expr_from_string("&".join(broadcast_masks)) if broadcast_masks else None,
         )
 
     @staticmethod
@@ -2329,6 +2382,7 @@ class SubscriptIndexing(NamedTuple):
             per_dim.dim_index_exprs,
             block_shaped,
             per_dim.block_dims,
+            per_dim.broadcast_mask_expr,
         )
 
 

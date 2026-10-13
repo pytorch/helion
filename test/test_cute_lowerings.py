@@ -15311,6 +15311,7 @@ class TestCuteLowerings(unittest.TestCase):
         fake_env = SimpleNamespace(
             backend=SimpleNamespace(name="cute"),
             block_sizes={0: SimpleNamespace(numel=sympy.Integer(1024))},
+            specialize_expr=lambda expr: expr,
             index_type=lambda: "cutlass.Int32",
         )
         current_grid = DeviceGridState(
