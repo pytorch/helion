@@ -3630,6 +3630,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         min_size: int = 1,
         max_size: int | None = None,
         bounded_by_block_id: int | None = None,
+        data_dependent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -3674,6 +3675,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # raised this block's, ``None`` where it did not
         # (``drop_occupancy_floor``).
         self.occupancy_floor: tuple[int, int] | None = None
+        self.data_dependent: bool = data_dependent
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size

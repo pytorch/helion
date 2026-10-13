@@ -93,6 +93,7 @@ def _config_not_viable_due_to_grid_size(
                 / block_size_by_id[block_id]
             )
             for block_id in root.block_ids
+            if block_id in block_size_by_id
         )
         if programs > max_programs_per_root_grid:
             return True
@@ -126,7 +127,7 @@ def _inner_loop_steps_exceed(
     """Whether any candidate device loop exceeds ``limit`` grouped steps."""
     grid_block_ids = set(config_spec.grid_block_ids)
     for spec in config_spec.block_sizes:
-        if spec.block_id in grid_block_ids:
+        if spec.block_id in grid_block_ids or spec.data_dependent:
             continue
         extent = spec.size_hint
         if spec.bounded_by_block_id is not None:
