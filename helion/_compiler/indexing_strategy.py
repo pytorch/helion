@@ -52,6 +52,10 @@ class TileWithOffsetInfo(NamedTuple):
     block_id: int
     offset: int | torch.SymInt
     block_size: int | torch.SymInt | None = None
+    # An epilogue-subtile piece's offset within its tile, which its loop-end
+    # mask compares, where ``offset`` also includes the store's own offset
+    # (``tile.index + k``); None when that is ``offset``.
+    mask_offset: int | torch.SymInt | None = None
 
     def resolved_block_size_var(self, env: CompileEnvironment) -> int | torch.SymInt:
         """Return block_size if set, otherwise fall back to the env block_size var."""
@@ -81,7 +85,9 @@ def subscript_tile_info(
         offset = metadata.get("offset", 0)
         block_size = metadata.get("block_size")
         if isinstance(block_id, int) and isinstance(offset, (int, torch.SymInt)):
-            return TileWithOffsetInfo(block_id, offset, block_size)
+            return TileWithOffsetInfo(
+                block_id, offset, block_size, metadata.get("mask_offset")
+            )
         return None
     block_id = env.resolve_block_id(subscript.meta.get("val"))
     if block_id is None:
@@ -296,6 +302,7 @@ def _get_tile_with_offset_info(
             meta["block_id"],
             meta["offset"],
             meta.get("block_size"),
+            meta.get("mask_offset"),
         )
 
     return None
@@ -2139,7 +2146,8 @@ class SubscriptIndexing(NamedTuple):
                     )
                     index_values.append(f"{index_expr}{expand}")
                     # An epilogue-subtile piece of the tile: mask it like the
-                    # tile, by the loop's end rather than the target's size
+                    # tile, by its lanes' place in the loop (not shifted by the
+                    # store's own offset) against the loop's end
                     if state.codegen.mask_var(block_id) and (
                         not _is_size_one(fake_value.size(i)) or broadcast
                     ):
@@ -2149,12 +2157,22 @@ class SubscriptIndexing(NamedTuple):
                             .end_var_name
                         )
                         assert end is not None
+                        if tile_info.mask_offset is not None:
+                            mask_start = state.device_function.literal_expr(
+                                tile_info.mask_offset
+                            )
+                            tile_expr = (
+                                f"(({base_offset}) + {mask_start} + "
+                                f"tl.arange(0, {block_size_expr}).to({dtype}))"
+                            )
+                        else:
+                            tile_expr = index_expr
                         masks = (
                             broadcast_masks
                             if broadcast and not for_store
                             else mask_values
                         )
-                        masks.setdefault(f"({index_expr} < {end}){expand}")
+                        masks.setdefault(f"({tile_expr} < {end}){expand}")
                 else:
                     index_var = state.codegen.index_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)
