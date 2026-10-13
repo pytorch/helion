@@ -17459,6 +17459,7 @@ if warp_idx == 15:
         The alpha publish guard is the loop counter: one loop, no segments.
         """
         assert flex_walk is not None
+        assert num_heads is not None
         words = _flash_flex_mask_words(num_kv)
         shared_row = flex_walk.q_block == 256
         list_stage = "0" if shared_row else stage
@@ -17473,6 +17474,15 @@ if warp_idx == 15:
             "chunk_expr": "flash_ci",
             "chunk_cols": cfg.s_load_repetition,
             "indent": 16,
+            # Coordinate bounds of every (live or dead) row and column the
+            # walk evaluates the hook on: the pair's 256 rows up to the last
+            # pair, the KV tiles up to ``num_kv``.
+            "coord_bounds": (
+                num_bh // num_heads,
+                num_heads,
+                None if score_plan.q_seq is None else -(-score_plan.q_seq // 256) * 256,
+                num_kv * 128,
+            ),
         }
         hooks: list[FlexHookCode] = []
         dense_rowmax_block = (

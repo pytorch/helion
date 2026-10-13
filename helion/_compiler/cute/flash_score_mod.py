@@ -177,6 +177,15 @@ _INT_DTYPES = frozenset(
 # Natural 16-byte vector width per element size.
 _VECTOR_WIDTH = {1: 16, 2: 8, 4: 4}
 _VECTOR_BYTES = 16
+# Lanes of one window vector (``load_window``): a lane-affine gather
+# ``table[.., a*kv_idx + rest]`` with ``a = +-1`` reads ``chunk_cols``
+# consecutive entries per thread and chunk; the thread's first entry is not
+# vector-aligned (it depends on the row), so the window is loaded from the
+# aligned-down base in ``_WINDOW_LANES``-wide vectors and each element picks
+# its lane with ``_WINDOW_LANES - 1`` selects.  Two lanes (one select per
+# element, ``chunk_cols // 2 + 1`` loads per chunk) minimise the issue count
+# for every element width.
+_WINDOW_LANES = 2
 
 
 def _unsupported(message: str) -> exc.BackendUnsupported:
@@ -253,6 +262,23 @@ class _Affine:
     def is_kv_plus_const(self) -> bool:
         return self.coeffs == (("kv", 1),)
 
+    def kv_coefficient(self) -> int:
+        return dict(self.coeffs).get("kv", 0)
+
+    def interval(self, bounds: dict[str, int]) -> tuple[int, int] | None:
+        """``[lo, hi]`` of the form over roots in ``[0, bounds[root])``;
+        ``None`` when a root has no bound."""
+        lo = hi = self.const
+        for root, coef in self.coeffs:
+            bound = bounds.get(root)
+            if bound is None or bound <= 0:
+                return None
+            if coef > 0:
+                hi += coef * (bound - 1)
+            else:
+                lo += coef * (bound - 1)
+        return lo, hi
+
 
 @dataclasses.dataclass
 class _NodeInfo:
@@ -268,6 +294,12 @@ class _NodeInfo:
     scalar_index: int = -1
     divisor: int = 0
     vector_width: int = 0
+    # Loads: every index proven inside the table from the coordinate bounds
+    # (no guard, no clamp); the window form's lane count and the sign of the
+    # last index's ``kv_idx`` coefficient.
+    in_bounds: bool = False
+    window: int = 0
+    window_sign: int = 1
 
 
 @dataclasses.dataclass
@@ -345,11 +377,24 @@ def _lowering_inputs(node: Node) -> list[Node]:
 class _Analyzer:
     """Dependence / affine analysis of one region."""
 
-    def __init__(self, plan: AttentionScorePlan, chunk_cols: int) -> None:
+    def __init__(
+        self,
+        plan: AttentionScorePlan,
+        chunk_cols: int,
+        coord_bounds: Sequence[int | None] | None = None,
+    ) -> None:
         self.plan = plan
         self.chunk_cols = chunk_cols
         self.num_aux = len(plan.aux_buffers)
         self.num_scalars = len(plan.host_scalars)
+        # Exclusive upper bounds of the coordinate roots (``b``, ``h``, ``q``,
+        # ``kv``) as the kernel evaluates the hook: the rows and columns of
+        # every tile the walk can visit, live or not.
+        self.bounds: dict[str, int] = {}
+        if coord_bounds is not None:
+            for root, bound in zip(("b", "h", "q", "kv"), coord_bounds, strict=True):
+                if bound is not None:
+                    self.bounds[root] = int(bound)
 
     def analyze(self, region: FlexRegion, tag: str) -> _RegionInfo:
         nodes: dict[Node, _NodeInfo] = {}
@@ -531,8 +576,62 @@ class _Analyzer:
                     f"{node.name}: index {index!r} must be a tensor or int literal"
                 )
         info = _NodeInfo("load", frozenset(deps), None, aux_index=aux_index)
+        info.in_bounds = self._in_bounds(indices, buffer, nodes)
         info.vector_width = self._vector_width(node, buffer, nodes)
+        if info.in_bounds and not info.vector_width:
+            info.window, info.window_sign = self._window(indices, buffer, nodes)
         return info
+
+    def _in_bounds(
+        self,
+        indices: Sequence[object],
+        buffer: FlexAuxBuffer,
+        nodes: dict[Node, _NodeInfo],
+    ) -> bool:
+        """Every index is an affine form of the coordinates whose range over
+        the kernel's coordinate bounds lies inside the table."""
+        for dim, index in enumerate(indices):
+            size = buffer.shape[dim]
+            if isinstance(index, Node):
+                affine = nodes[index].affine
+                interval = None if affine is None else affine.interval(self.bounds)
+                if interval is None:
+                    return False
+                lo, hi = interval
+            else:
+                constant = _int_constant(index)
+                assert constant is not None
+                lo = hi = constant
+            if lo < 0 or hi >= size:
+                return False
+        return True
+
+    def _window(
+        self,
+        indices: Sequence[object],
+        buffer: FlexAuxBuffer,
+        nodes: dict[Node, _NodeInfo],
+    ) -> tuple[int, int]:
+        """``(lanes, sign)`` of the window form: the unit-stride last index
+        is ``+-kv_idx + <lane-free>``, every other index is lane-free and
+        keeps the row base vector-aligned.  ``(0, 1)`` otherwise."""
+        if not indices or buffer.strides[-1] != 1:
+            return 0, 1
+        last = indices[-1]
+        if not isinstance(last, Node):
+            return 0, 1
+        affine = nodes[last].affine
+        if affine is None or affine.kv_coefficient() not in (1, -1):
+            return 0, 1
+        lanes = _WINDOW_LANES
+        if buffer.shape[-1] % lanes != 0 or self.chunk_cols % lanes != 0:
+            return 0, 1
+        for dim, index in enumerate(indices[:-1]):
+            if isinstance(index, Node) and _T_LANE in nodes[index].deps:
+                return 0, 1
+            if buffer.strides[dim] % lanes != 0:
+                return 0, 1
+        return lanes, affine.kv_coefficient()
 
     def _vector_width(
         self, node: Node, buffer: FlexAuxBuffer, nodes: dict[Node, _NodeInfo]
@@ -937,13 +1036,20 @@ class _HookEmitter:
         t = self.dtype_str(buffer.dtype)
         zero = f"{t}(False)" if buffer.dtype is torch.bool else f"{t}(0)"
         indices = cast("Sequence[object]", node.args[1])
+        proven = meta.in_bounds
         width = self.vector_width if meta.vector_width and meta.cls == _ELEMENT else 0
-        load_cls = _GROUP if width else meta.cls
+        window = meta.window if meta.cls == _ELEMENT and not width else 0
+        if width:
+            load_cls = _GROUP
+        elif window:
+            load_cls = _CHUNK
+        else:
+            load_cls = meta.cls
         last_dim = len(indices) - 1
         guards: list[str] = []
         offsets: list[str] = []
         for dim, index in enumerate(indices):
-            if width and dim == last_dim:
+            if (width or window) and dim == last_dim:
                 break
             size, stride = buffer.shape[dim], buffer.strides[dim]
             index_var = f"{name}_i{dim}"
@@ -958,57 +1064,157 @@ class _HookEmitter:
                 constant = _int_constant(index)
                 assert constant is not None
                 self.emit(_ITEM, f"{index_var} = cutlass.Int32({constant})")
-            guards.append(
-                f"({index_var} >= cutlass.Int32(0)) & ({index_var} < cutlass.Int32({size}))"
-            )
+            if not proven:
+                guards.append(
+                    f"({index_var} >= cutlass.Int32(0)) & ({index_var} < cutlass.Int32({size}))"
+                )
             if stride == 0:
+                continue
+            if proven:
+                # Every index is inside the table: no clamp.
+                offsets.append(f"{index_var} * cutlass.Int32({stride})")
                 continue
             clamped = (
                 f"cutlass.min(cutlass.max({index_var}, cutlass.Int32(0)), "
                 f"cutlass.Int32({size - 1}))"
             )
             offsets.append(f"{clamped} * cutlass.Int32({stride})")
-        if not width:
+        if not width and not window:
             pointer = f"{tensor}.iterator" + "".join(
                 f" + {offset}" for offset in offsets
             )
             load = f"{t}(({pointer}).load())"
+            if proven:
+                self.emit(load_cls, f"{name} = {load}")
+                return
             guard = " & ".join(guards)
             self.emit(load_cls, f"{name}_ok = {guard}")
             self.emit(
                 load_cls, f"{name} = {t}(cutlass.select_({name}_ok, {load}, {zero}))"
             )
             return
-        # Lane-contiguous last index ``kv_idx + c``: one vector load per group
-        # of ``width`` lanes, selected per lane.  ``gbase`` is the group's
-        # first KV index; the group never straddles the table end because
-        # ``shape[-1] % width == 0`` and the base is ``width``-aligned.
-        last = cast("Node", indices[last_dim])
-        affine = info.nodes[last].affine
-        assert affine is not None
-        size = buffer.shape[last_dim]
-        lo = f"{name}_lo"
-        offset = f" + cutlass.Int32({affine.const})" if affine.const else ""
-        self.emit(_GROUP, f"{lo} = {self.root('gbase')}{offset}")
-        guards.append(f"({lo} >= cutlass.Int32(0)) & ({lo} < cutlass.Int32({size}))")
-        clamped = f"cutlass.min(cutlass.max({lo}, cutlass.Int32(0)), cutlass.Int32({size - width}))"
-        pointer = (
-            f"{tensor}.iterator" + "".join(f" + {o}" for o in offsets) + f" + {clamped}"
-        )
-        self.emit(_GROUP, f"{name}_ok = {' & '.join(guards)}")
         if buffer.dtype is torch.bool:
             # A bool table is loaded as bytes: ``cutlass.Boolean``'s MLIR type
             # is ``i1`` and a ``vector<16xi1>`` load traps the DSL's lowering
             # (the host process dies with SIGILL); each lane is ``!= 0``.
             vec_t = "cutlass.Int8"
-            lane = f"{vec_t}({name}_vec[{_LANE_VAR}]) != {vec_t}(0)"
         else:
             vec_t = t
-            lane = f"{t}({name}_vec[{_LANE_VAR}])"
+
+        def lane_value(value: str) -> str:
+            if buffer.dtype is torch.bool:
+                return f"{vec_t}({value}) != {vec_t}(0)"
+            return f"{t}({value})"
+
+        last = cast("Node", indices[last_dim])
+        affine = info.nodes[last].affine
+        assert affine is not None
+        size = buffer.shape[last_dim]
+        pointer = f"{tensor}.iterator" + "".join(f" + {o}" for o in offsets)
+        if window:
+            self._window_load(
+                name,
+                pointer,
+                affine,
+                sign=meta.window_sign,
+                lanes=window,
+                size=size,
+                vec_t=vec_t,
+                lane_value=lane_value,
+            )
+            return
+        # Lane-contiguous last index ``kv_idx + c``: one vector load per group
+        # of ``width`` lanes, selected per lane.  ``gbase`` is the group's
+        # first KV index; the group never straddles the table end because
+        # ``shape[-1] % width == 0`` and the base is ``width``-aligned.
+        lo = f"{name}_lo"
+        offset = f" + cutlass.Int32({affine.const})" if affine.const else ""
+        self.emit(_GROUP, f"{lo} = {self.root('gbase')}{offset}")
+        lane = lane_value(f"{name}_vec[{_LANE_VAR}]")
+        if proven:
+            self.emit(
+                _GROUP,
+                f"{name}_vec = _cute_flex_load_vec({pointer} + {lo}, {width}, {vec_t})",
+            )
+            self.emit(_ELEMENT, f"{name} = {t}({lane})")
+            return
+        guards.append(f"({lo} >= cutlass.Int32(0)) & ({lo} < cutlass.Int32({size}))")
+        clamped = f"cutlass.min(cutlass.max({lo}, cutlass.Int32(0)), cutlass.Int32({size - width}))"
+        self.emit(_GROUP, f"{name}_ok = {' & '.join(guards)}")
         self.emit(
-            _GROUP, f"{name}_vec = _cute_flex_load_vec({pointer}, {width}, {vec_t})"
+            _GROUP,
+            f"{name}_vec = _cute_flex_load_vec({pointer} + {clamped}, {width}, {vec_t})",
         )
         self.emit(_ELEMENT, f"{name} = {t}(cutlass.select_({name}_ok, {lane}, {zero}))")
+
+    def _window_load(
+        self,
+        name: str,
+        pointer: str,
+        affine: _Affine,
+        *,
+        sign: int,
+        lanes: int,
+        size: int,
+        vec_t: str,
+        lane_value: Callable[[str], str],
+    ) -> None:
+        """Lane-affine last index ``+-kv_idx + rest`` proven inside the table.
+
+        The thread's ``chunk_cols`` entries of a chunk are consecutive (rising
+        with the column for ``+``, falling for ``-``) but start at a
+        row-dependent, unaligned entry.  Per chunk: load them from the
+        ``lanes``-aligned base at or below the first entry as
+        ``chunk_cols // lanes + 1`` vectors; the last vector is only read
+        when the misalignment ``m`` is nonzero, in which case it lies inside
+        the table, so its address is clamped to the table end instead of
+        guarded.  Per element: pick the lane ``m + slot`` with ``lanes - 1``
+        selects.  The same entries as the gather, bitwise the same values.
+        """
+        positive: list[str] = []
+        negative: list[str] = []
+        for root, coef in affine.coeffs:
+            if root == "kv":
+                base = self.root("cbase")
+                if sign < 0:
+                    base = f"({base} + cutlass.Int32({self.chunk_cols - 1}))"
+                (negative if coef < 0 else positive).append(base)
+            elif coef in (1, -1):
+                (negative if coef < 0 else positive).append(self.root(root))
+            else:
+                positive.append(f"{self.root(root)} * cutlass.Int32({coef})")
+        constant = f"cutlass.Int32({affine.const})"
+        terms = [*positive, constant] if positive else [constant]
+        first = " + ".join(terms) + "".join(f" - {term}" for term in negative)
+        lo = f"{name}_lo"
+        base = f"{name}_wb"
+        self.emit(_CHUNK, f"{lo} = {first}")
+        self.emit(_CHUNK, f"{base} = {lo} & cutlass.Int32({-lanes})")
+        self.emit(_CHUNK, f"{name}_m = {lo} - {base}")
+        bits = lanes.bit_length() - 1
+        for bit in range(bits):
+            self.emit(
+                _CHUNK,
+                f"{name}_m{bit} = ({name}_m & cutlass.Int32({1 << bit})) != cutlass.Int32(0)",
+            )
+        count = self.chunk_cols // lanes + 1
+        last = f"cutlass.min({base} + cutlass.Int32({self.chunk_cols}), cutlass.Int32({size - lanes}))"
+        self.emit(
+            _CHUNK,
+            f"{name}_win = _cute_flex_load_window({pointer} + {base}, "
+            f"{pointer} + {last}, {count}, {lanes}, {vec_t})",
+        )
+        slot = _ELEM if sign > 0 else f"{self.chunk_cols - 1} - {_ELEM}"
+
+        def tree(low: int, bit: int) -> str:
+            if bit < 0:
+                return f"{name}_win[{slot} + {low}]"
+            return (
+                f"cutlass.select_({name}_m{bit}, {tree(low + (1 << bit), bit - 1)}, "
+                f"{tree(low, bit - 1)})"
+            )
+
+        self.emit(_ELEMENT, f"{name} = {lane_value(tree(0, bits - 1))}")
 
     # -- assembly -----------------------------------------------------------
 
@@ -1087,6 +1293,7 @@ def render_flex_hook(
     item_indent: int | None = None,
     tile_indent: int | None = None,
     device_function: DeviceFunction | None = None,
+    coord_bounds: Sequence[int | None] | None = None,
 ) -> FlexHookCode:
     """Render the flex hook of ``stage`` for one PASS1 chunk.
 
@@ -1115,7 +1322,7 @@ def render_flex_hook(
     emit_tags = {tag for tag, flag in (("s", with_score), ("m", with_mask)) if flag}
     for _tag, region in regions:
         _ensure_lowerings(region.graph)
-    analyzer = _Analyzer(plan, chunk_cols)
+    analyzer = _Analyzer(plan, chunk_cols, coord_bounds)
     infos = [analyzer.analyze(region, tag) for tag, region in regions]
     _demote_item_values(infos, ITEM_LIVE_CAP)
     infos = [info for info in infos if info.tag in emit_tags]

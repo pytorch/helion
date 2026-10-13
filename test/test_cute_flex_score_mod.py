@@ -39,6 +39,9 @@ _HEADS = 4
 _BATCH = 2
 _CHUNK_COLS = 32
 _ROWS = (0, 1, 5, 31, 32, 63, 64, 100, 127)
+# Exclusive coordinate bounds covering every emulated geometry (``m_tile`` <= 3,
+# ``kv_tile`` <= 7): the kernel's static bounds proof of table indices.
+_BOUNDS = (_BATCH, _HEADS, 4 * 128, 8 * 128)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +141,7 @@ def _render(
     with_mask: bool,
     tail_mask: bool,
     stage: int = 0,
+    bounds: bool = False,
 ) -> FlexHookCode:
     return render_flex_hook(
         plan,
@@ -154,6 +158,7 @@ def _render(
         tail_mask=tail_mask,
         row_coord_expr="tLDcS[0][0]",
         device_function=_StubDeviceFunction(),  # pyrefly: ignore [bad-argument-type]
+        coord_bounds=_BOUNDS if bounds else None,
     )
 
 
@@ -232,6 +237,16 @@ def _load_vec(ptr: _Ptr, width: int, dtype: _Dtype) -> list[object]:
     return [dtype(ptr.storage[ptr.offset + j]) for j in range(width)]
 
 
+def _load_window(
+    ptr: _Ptr, last_ptr: _Ptr, count: int, width: int, dtype: _Dtype
+) -> list[object]:
+    values: list[object] = []
+    for k in range(count - 1):
+        values.extend(_load_vec(ptr + width * k, width, dtype))
+    values.extend(_load_vec(last_ptr, width, dtype))
+    return values
+
+
 def _mask_tail(frg: list[float], col_limit: int) -> None:
     for c in range(len(frg)):
         if c >= col_limit:
@@ -298,6 +313,7 @@ def _namespace() -> dict[str, object]:
         # torch.remainder on floats is Python's floor-mod.
         "_cute_flex_remainder": operator.mod,
         "_cute_flex_load_vec": _load_vec,
+        "_cute_flex_load_window": _load_window,
         "_helion_flash_rt": types.SimpleNamespace(mask_r2p_sm100_rank1=_mask_tail),
     }
 
@@ -871,7 +887,7 @@ def _build(case: _Case, tables: Sequence[torch.Tensor]) -> AttentionScorePlan:
 
 
 def _render_case(
-    case: _Case, *, with_tail: bool
+    case: _Case, *, with_tail: bool, bounds: bool = False
 ) -> tuple[FlexHookCode, AttentionScorePlan, list[torch.Tensor], list[object]]:
     tables, scalar_values = _case_inputs(case)
     with _environment(fast_math=case.fast_math):
@@ -881,16 +897,17 @@ def _render_case(
             with_score=case.score is not None,
             with_mask=case.mask is not None,
             tail_mask=with_tail,
+            bounds=bounds,
         )
     return code, plan, tables, scalar_values
 
 
 @skipUnlessCuteAvailable("renders CuTe DSL source through the cute backend")
 class TestCuteFlexScoreMod(TestCase):
-    def _check_case(self, case: _Case) -> None:
+    def _check_case(self, case: _Case, *, bounds: bool = False) -> None:
         gen = torch.Generator().manual_seed(1)
         codes = {
-            with_tail: _render_case(case, with_tail=with_tail)
+            with_tail: _render_case(case, with_tail=with_tail, bounds=bounds)
             for with_tail in (False, True)
         }
         for bh, m_tile, kv_tile, tail in case.geometries:
@@ -932,6 +949,68 @@ class TestCuteFlexScoreMod(TestCase):
         for case in _CASES:
             with self.subTest(case=case.name):
                 self._check_case(case)
+
+    def test_emulation_matrix_with_coordinate_bounds(self) -> None:
+        """With the coordinate bounds the proven loads drop their guards and
+        the diagonal gathers take the window form; same values."""
+        for case in _CASES:
+            with self.subTest(case=case.name):
+                self._check_case(case, bounds=True)
+
+    def test_proven_loads_drop_guards_and_diagonal_gathers_take_windows(self) -> None:
+        case = next(c for c in _CASES if c.name == "sandwich")
+        guarded, _plan, _tables, _values = _render_case(case, with_tail=False)
+        self.assertIn("flash_flex0s_load_ok = ", guarded.chunk_body)
+        self.assertIn("flash_flex0s_load_1_ok = ", guarded.item_prelude)
+        self.assertNotIn("_cute_flex_load_window", guarded.chunk_body)
+        code, plan, tables, values = _render_case(case, with_tail=False, bounds=True)
+        # ``rel_bias[q - kv + 1023]`` over q < 512, kv < 1024 lies in [0, 1535)
+        # of the 2048-entry table; ``head_scale[h]`` over h < 4.
+        self.assertNotIn(
+            "_ok", code.item_prelude + code.tile_prologue + code.chunk_body
+        )
+        self.assertNotIn("cutlass.max(", code.item_prelude + code.chunk_body)
+        self.assertNotIn(".load()", code.chunk_body)
+        # Per chunk: the first entry at the chunk's last column (falling
+        # index), the aligned base, 17 two-lane vectors with the last clamped.
+        self.assertIn(
+            "flash_flex0s_load_lo = flash_flex0_q + cutlass.Int32(1023)"
+            " - (flash_flex0_cbase + cutlass.Int32(31))",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "flash_flex0s_load_win = _cute_flex_load_window(_flash_aux0.iterator + "
+            "flash_flex0s_load_wb, _flash_aux0.iterator + cutlass.min(flash_flex0s_load_wb"
+            " + cutlass.Int32(32), cutlass.Int32(2046)), 17, 2, cutlass.Float32)",
+            code.chunk_body,
+        )
+        self.assertIn(
+            "flash_flex0s_load = cutlass.Float32(cutlass.select_(flash_flex0s_load_m0, "
+            "flash_flex0s_load_win[31 - flash_flex_i + 1], "
+            "flash_flex0s_load_win[31 - flash_flex_i + 0]))",
+            code.chunk_body,
+        )
+        # The window and its selects are the only per-chunk / per-element
+        # load statements (no per-element pointer arithmetic).
+        self.assertEqual(code.chunk_body.count("_cute_flex_load_window"), 1)
+
+    def test_bounds_proof_declines_small_tables_and_unbounded_indices(self) -> None:
+        # A 16-entry table indexed by q: out of range for q >= 16, guarded.
+        case = next(c for c in _CASES if c.name == "out_of_range_table")
+        code, _plan, _tables, _values = _render_case(case, with_tail=False, bounds=True)
+        self.assertIn(
+            "_ok = ", code.item_prelude + code.tile_prologue + code.chunk_body
+        )
+        # A dependent gather (index loaded from another table) has no affine
+        # form: guarded and clamped.
+        case = next(c for c in _CASES if c.name == "graphormer_spatial")
+        code, _plan, _tables, _values = _render_case(case, with_tail=False, bounds=True)
+        self.assertIn("flash_flex0s_load_1_ok = ", code.chunk_body)
+        self.assertIn("cutlass.max(flash_flex0s_load_1_i1", code.chunk_body)
+        # Its ``distances[b, q, kv]`` read is proven (kv < 1024) and keeps the
+        # aligned vector form without the per-lane select.
+        self.assertIn("_cute_flex_load_vec(_flash_aux0.iterator", code.chunk_body)
+        self.assertNotIn("flash_flex0s_load_ok", code.chunk_body)
 
     def test_row_only_table_loads_render_in_item_prelude(self) -> None:
         case = next(c for c in _CASES if c.name == "shared_prefix")
