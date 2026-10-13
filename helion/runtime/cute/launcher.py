@@ -81,6 +81,7 @@ from .source_dependencies import referenced_helper_sources
 from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Iterator
     from collections.abc import Sequence
@@ -2723,7 +2724,13 @@ class _CompiledCuteLauncher:
     Any failure in the cache layer falls back to a plain ``cute.compile``.
     """
 
-    __slots__ = ("_cache_key", "_compile_options", "_compiled", "_jit_func")
+    __slots__ = (
+        "_cache_key",
+        "_capi_compiled",
+        "_compile_options",
+        "_compiled",
+        "_jit_func",
+    )
 
     def __init__(
         self,
@@ -2734,7 +2741,33 @@ class _CompiledCuteLauncher:
         self._jit_func = jit_func
         self._compile_options = compile_options
         self._compiled: object = None
+        self._capi_compiled: object = None
         self._cache_key = cache_key
+
+    def capi_function(self) -> object:
+        """The compiled function in its C-API (``JitExecutor``) form.
+
+        ``cute.compile`` under ``--enable-tvm-ffi`` returns a TVM-FFI function
+        whose launches never create a ``JitExecutor``; only a disk-cache
+        reload yields the plain ``CudaDialectJitCompiledFunction``.  The fast
+        relaunch patches an executor's packed C arguments, so a fresh-compile
+        process would otherwise never build it (and every call would pay the
+        FFI marshalling).  JIT the host module once more (~50ms, in memory)
+        into the same object a cache hit produces; the TVM-FFI function keeps
+        serving the slow path.
+        """
+        compiled = self._compiled
+        if compiled is None or not _is_tvm_ffi_compiled_function(compiled):
+            return compiled
+        twin = self._capi_compiled
+        if twin is None:
+            twin = self._jit_cuda_dialect_function(
+                cast("Any", compiled).ir_module,
+                cast("Any", compiled).function_name,
+                has_gpu_module=bool(cast("Any", compiled).has_gpu_module),
+            )
+            self._capi_compiled = twin
+        return twin
 
     def __call__(self, *args: object) -> object:
         compiled = self._compiled
@@ -2822,10 +2855,6 @@ class _CompiledCuteLauncher:
         try:
             from cutlass.base_dsl.cache_helpers import load_ir
             from cutlass.base_dsl.cache_helpers import read_bytecode_and_check_crc32
-            from cutlass.cutlass_dsl.cuda_jit_executor import (
-                CudaDialectJitCompiledFunction,
-            )
-            from cutlass.cutlass_dsl.cutlass import CuTeDSL
 
             _cache_dir, mlir, meta = self._cache_file_paths()
             if not (os.path.exists(mlir) and os.path.exists(meta)):
@@ -2841,40 +2870,67 @@ class _CompiledCuteLauncher:
                 asBytecode=True,
                 bytecode_reader=read_bytecode_and_check_crc32,
             )
-            if (
-                self._compile_options
-                and _TVM_FFI_COMPILE_OPTION in self._compile_options.split()
-            ):
-                # Compilation imports this runtime through the SDK's FFI
-                # provider. A fresh-process disk hit must also load its global
-                # symbols before the cached host module is linked.
-                importlib.import_module("tvm_ffi")
-            dsl = CuTeDSL._get_dsl()
-            engine = dsl.compiler_provider.jit(
-                module, shared_libs=dsl.get_shared_libs()
-            )
-            capi_func = engine.lookup(function_name)
-            # The signature is reconstructable from the wrapper, so it does not
-            # need to be persisted.
-            wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
-            signature = inspect.signature(cast("Any", wrapped), eval_str=True)
-            # Empty kernel_info / default extra-arg state is correct only for the
-            # non-experimental ``cute.compile`` path Helion uses here; the
-            # experimental DSL would populate these from module attributes.
-            return CudaDialectJitCompiledFunction(
+            return self._jit_cuda_dialect_function(
                 module,
-                engine,
-                capi_func,
-                signature,
                 function_name,
-                {},
-                False,
-                None,
                 has_gpu_module=bool(metadata.get("has_gpu_module", True)),
             )
         except Exception:
             # Any cutlass-internal change or corrupt artifact -> recompile.
             return None
+
+    def _jit_cuda_dialect_function(
+        self,
+        module: object,
+        function_name: str,
+        *,
+        has_gpu_module: bool,
+    ) -> object:
+        """JIT the lowered host module into a plain C-API compiled function."""
+        from cutlass.cutlass_dsl.cuda_jit_executor import CudaDialectJitCompiledFunction
+        from cutlass.cutlass_dsl.cutlass import CuTeDSL
+
+        if (
+            self._compile_options
+            and _TVM_FFI_COMPILE_OPTION in self._compile_options.split()
+        ):
+            # Compilation imports this runtime through the SDK's FFI
+            # provider. A fresh-process disk hit must also load its global
+            # symbols before the cached host module is linked.
+            importlib.import_module("tvm_ffi")
+        dsl = CuTeDSL._get_dsl()
+        engine = dsl.compiler_provider.jit(module, shared_libs=dsl.get_shared_libs())
+        capi_func = engine.lookup(function_name)
+        # The signature is reconstructable from the wrapper, so it does not
+        # need to be persisted.
+        wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
+        signature = inspect.signature(cast("Any", wrapped), eval_str=True)
+        # Empty kernel_info / default extra-arg state is correct only for the
+        # non-experimental ``cute.compile`` path Helion uses here; the
+        # experimental DSL would populate these from module attributes.
+        return CudaDialectJitCompiledFunction(
+            module,
+            engine,
+            capi_func,
+            signature,
+            function_name,
+            {},
+            False,
+            None,
+            has_gpu_module=has_gpu_module,
+        )
+
+
+def _is_tvm_ffi_compiled_function(compiled: object) -> bool:
+    """Whether ``compiled`` launches through the DSL's TVM-FFI bridge.
+
+    Looked up rather than imported: a TVM-FFI function can only exist once the
+    provider module is loaded, and test doubles must not pull the DSL in.
+    """
+    provider = sys.modules.get("cutlass.cutlass_dsl.tvm_ffi_provider")
+    return provider is not None and isinstance(
+        compiled, provider.TVMFFIJitCompiledFunctionBase
+    )
 
 
 _TVM_FFI_COMPILE_OPTION = "--enable-tvm-ffi"
@@ -6615,8 +6671,11 @@ class _CuteFastRelaunch:
         "block",
         "by_ref_writers",
         "by_val_slots",
+        "capi_func",
         "compile_options",
         "constexpr_flags",
+        "cuda_error",
+        "cuda_result",
         "device_index",
         "exe_args",
         "executor",
@@ -6624,7 +6683,9 @@ class _CuteFastRelaunch:
         "keepalive",
         "last_raw",
         "lock",
+        "packed_args",
         "scalar_guards",
+        "tensor_guard",
         "tensor_guards",
         "tensor_slots",
     )
@@ -6658,10 +6719,12 @@ class _CuteFastRelaunch:
         device_index: int,
         last_raw: int,
         keepalive: tuple[object, ...],
+        packed_launch: _CutePackedLaunch | None = None,
     ) -> None:
         self.executor = executor
         self.exe_args = exe_args
         self.tensor_guards = tensor_guards
+        self.tensor_guard = _compile_cute_fastpath_tensor_guard(tensor_guards)
         self.scalar_guards = scalar_guards
         self.constexpr_flags = constexpr_flags
         self.tensor_slots = tensor_slots
@@ -6675,6 +6738,16 @@ class _CuteFastRelaunch:
         self.last_raw = last_raw
         self.keepalive = keepalive
         self.lock = threading.Lock()
+        if packed_launch is None:
+            self.packed_args = None
+            self.capi_func = None
+            self.cuda_result = None
+            self.cuda_error = None
+        else:
+            self.packed_args = packed_launch.packed_args
+            self.capi_func = packed_launch.capi_func
+            self.cuda_result = packed_launch.cuda_result
+            self.cuda_error = packed_launch.cuda_error
 
     def try_launch(
         self,
@@ -6688,48 +6761,144 @@ class _CuteFastRelaunch:
             or grid != self.grid
             or block != self.block
             or compile_options != self.compile_options
+            or not self.tensor_guard(args)
         ):
             return _CUTE_FASTPATH_MISS
-        for (
-            index,
-            device_type,
-            device_index,
-            dtype,
-            shape,
-            stride,
-            alignment,
-        ) in self.tensor_guards:
-            tensor = args[index]
-            if (
-                not isinstance(tensor, torch.Tensor)
-                or tensor.dtype is not dtype
-                or tensor.device.type != device_type
-                or tensor.device.index != device_index
-                or tensor.size() != shape
-                or tensor.stride() != stride
-                or tensor.data_ptr() % alignment != 0
-            ):
-                return _CUTE_FASTPATH_MISS
         for guard in self.scalar_guards:
             if not guard.matches(args, self.constexpr_flags):
                 return _CUTE_FASTPATH_MISS
         raw = torch._C._cuda_getCurrentRawStream(self.device_index)
         with self.lock:
-            exe_args = self.exe_args
+            # The slots are poked in the pre-packed C array of a CuTe DSL
+            # ``JitExecutor``; an executor that is not one (test doubles,
+            # profiling wrappers) has no such array and keeps packing
+            # ``exe_args`` itself through ``run_compiled_program``.
+            packed_args = self.packed_args
+            slots = cast("Any", self.exe_args if packed_args is None else packed_args)
             # tensor_slots entries: (arg_index, exe_slot_or_None, writer_or_None)
             for index, slot, writer in self.tensor_slots:
                 ptr = cast("torch.Tensor", args[index]).data_ptr()
                 if writer is not None:
                     cast("Any", writer).value = ptr
                 else:
-                    exe_args[cast("int", slot)] = ptr
+                    slots[cast("int", slot)] = ptr
             if raw != self.last_raw:
                 for stream_writer in self.by_ref_writers:
                     cast("Any", stream_writer).value = raw
                 for stream_slot in self.by_val_slots:
-                    exe_args[stream_slot] = raw
+                    slots[stream_slot] = raw
                 self.last_raw = raw
-            return (True, cast("Any", self.executor).run_compiled_program(exe_args))
+            if packed_args is None:
+                return (
+                    True,
+                    cast("Any", self.executor).run_compiled_program(self.exe_args),
+                )
+            cast("Any", self.capi_func)(packed_args)
+            cuda_result = self.cuda_result
+            if cuda_result is None:
+                return (True, None)
+            error_code = cast("Any", cuda_result).value
+            if error_code == 0:
+                return (True, 0)
+            raise cast("Any", self.cuda_error)(error_code)
+
+
+@dataclass(frozen=True)
+class _CutePackedLaunch:
+    """A private copy of the DSL executor's packed C argument array.
+
+    ``JitExecutor.run_compiled_program`` re-packs every ``exe_args`` entry into
+    a thread-local ``c_void_p`` array on each call (type dispatch plus a
+    ``ctypes.c_void_p(...)`` round trip per entry, ~3us for a flash kernel).
+    Only the tensor-pointer and stream slots change between fast relaunches,
+    so the array is packed once and those slots are poked in place before the
+    C entry point is invoked directly.  The copy is private: the executor's
+    thread-local buffer is rewritten by any slow-path launch of the same
+    kernel, which would otherwise clobber the cached scalar slots.
+    """
+
+    packed_args: object
+    capi_func: object
+    cuda_result: object | None
+    cuda_error: object
+
+
+def _cute_packed_launch(executor: object, exe_args: list[object]) -> object | None:
+    """Pre-pack ``exe_args`` for a real CuTe DSL ``JitExecutor``; else ``None``.
+
+    The DSL modules are looked up rather than imported: a real executor can
+    only exist once ``cutlass.base_dsl.jit_executor`` is loaded, and test
+    doubles must not pull the DSL in.
+    """
+    jit_executor = sys.modules.get("cutlass.base_dsl.jit_executor")
+    if jit_executor is None or not isinstance(executor, jit_executor.JitExecutor):
+        return None
+    create_cuda_runtime_error = sys.modules[
+        "cutlass.base_dsl.runtime.cuda"
+    ].create_cuda_runtime_error
+    source = executor._get_invoke_packed_args(list(exe_args))
+    total = len(exe_args) + executor._num_extra_args
+    packed_args = (ctypes.c_void_p * total)()
+    ctypes.memmove(packed_args, source, ctypes.sizeof(ctypes.c_void_p) * total)
+    return _CutePackedLaunch(
+        packed_args=packed_args,
+        capi_func=executor.capi_func,
+        cuda_result=executor.cuda_result,
+        cuda_error=create_cuda_runtime_error,
+    )
+
+
+def _compile_cute_fastpath_tensor_guard(
+    tensor_guards: tuple[
+        tuple[
+            int,
+            str,
+            int | None,
+            torch.dtype,
+            tuple[int, ...],
+            tuple[int, ...],
+            int,
+        ],
+        ...,
+    ],
+) -> Callable[[tuple[object, ...]], bool]:
+    """Fold the per-tensor metadata checks into one straight-line expression.
+
+    Same facts as the tuple form (dtype, shape, stride, device, compiled
+    pointer alignment); evaluating them as a single generated lambda avoids
+    the per-tensor loop and tuple unpacking on every relaunch.
+    """
+    namespace: dict[str, object] = {"Tensor": torch.Tensor}
+    checks: list[str] = []
+    for (
+        index,
+        device_type,
+        device_index,
+        dtype,
+        shape,
+        stride,
+        alignment,
+    ) in tensor_guards:
+        namespace[f"dtype_{index}"] = dtype
+        namespace[f"shape_{index}"] = torch.Size(shape)
+        namespace[f"stride_{index}"] = tuple(stride)
+        namespace[f"device_{index}"] = (
+            torch.device(device_type)
+            if device_index is None
+            else torch.device(device_type, device_index)
+        )
+        tensor = f"t{index}"
+        item = [
+            f"isinstance(({tensor} := args[{index}]), Tensor)",
+            f"{tensor}.dtype is dtype_{index}",
+            f"{tensor}.size() == shape_{index}",
+            f"{tensor}.stride() == stride_{index}",
+            f"{tensor}.device == device_{index}",
+        ]
+        if alignment > 1:
+            item.append(f"{tensor}.data_ptr() % {int(alignment)} == 0")
+        checks.append(f"({' and '.join(item)})")
+    return eval(f"lambda args: {' and '.join(checks) if checks else 'True'}", namespace)
 
 
 def _cute_maybe_build_fastpath(
@@ -6743,8 +6912,17 @@ def _cute_maybe_build_fastpath(
 ) -> None:
     """Build (once per kernel) the fast relaunch state after a successful
     slow-path launch.  ``False`` marks a permanent probe failure so the
-    slow path is not re-probed on every call."""
+    slow path is not re-probed on every call.
+
+    Not under CUDA-graph capture: a fresh compile's first launch there would
+    JIT the C-API twin (``capi_function``, tens of milliseconds) and load its
+    library inside the capture.  The graph keeps the marshalled launch just
+    issued and the state stays unset; the next eager launch that misses the
+    last-launch cache (same-pointer calls keep hitting it) builds it.
+    """
     if getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None) is not None:
+        return
+    if torch.cuda.is_current_stream_capturing():
         return
     state = _cute_build_fast_relaunch(
         cute_kernel, args, grid, block, compile_options, launch, compiled
@@ -6765,17 +6943,7 @@ def _cute_build_fast_relaunch(
 ) -> _CuteFastRelaunch | None:
     if not isinstance(compiled, _CompiledCuteLauncher):
         return None
-    dsl_fn = cast("Any", compiled)._compiled
-    if dsl_fn is None:
-        return None
-    execution_args = getattr(dsl_fn, "execution_args", None)
-    executor = getattr(dsl_fn, "_default_executor", None)
-    if (
-        execution_args is None
-        or not hasattr(execution_args, "generate_execution_args")
-        or executor is None
-        or not hasattr(executor, "run_compiled_program")
-    ):
+    if cast("Any", compiled)._compiled is None:
         return None
     # Kernels with grouped-scheduler plans, dynamic tensormaps, or launcher-
     # owned side tensors have per-call state beyond (pointers, stream);
@@ -6821,6 +6989,21 @@ def _cute_build_fast_relaunch(
     if device_index is None:
         device_index = torch.cuda.current_device()
     try:
+        # Resolved after the structural checks: a fresh TVM-FFI compile JITs
+        # its C-API twin here, which is wasted on kernels that cannot relaunch.
+        dsl_fn = cast("Any", compiled).capi_function()
+        if dsl_fn is None:
+            return None
+        execution_args = getattr(dsl_fn, "execution_args", None)
+        executor = getattr(dsl_fn, "_default_executor", None)
+        if execution_args is None or not hasattr(
+            execution_args, "generate_execution_args"
+        ):
+            return None
+        if executor is None:
+            executor = dsl_fn.to(None)
+        if not hasattr(executor, "run_compiled_program"):
+            return None
         cuda_driver = importlib.import_module("cuda.bindings.driver")
         gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
         make_ptr = cast("Any", make_ptr_obj)
@@ -6999,9 +7182,10 @@ def _cute_build_fast_relaunch(
                     scalar_value=_cute_scalar_cache_value(scalar_kind, scalar_value),
                 )
             )
+        exe_args = list(exe1)
         return _CuteFastRelaunch(
             executor=executor,
-            exe_args=list(exe1),
+            exe_args=exe_args,
             tensor_guards=tuple(tensor_guards),
             scalar_guards=tuple(scalar_guards),
             constexpr_flags=tuple(constexpr_flags),
@@ -7015,6 +7199,9 @@ def _cute_build_fast_relaunch(
             device_index=device_index,
             last_raw=raw0,
             keepalive=(base, stream_a, adapted1, exe1),
+            packed_launch=cast(
+                "_CutePackedLaunch | None", _cute_packed_launch(executor, exe_args)
+            ),
         )
     except Exception:
         return None
@@ -7099,7 +7286,7 @@ def default_cute_launcher(
         int(block[2]) if len(block) > 2 else 1,
     )
 
-    if any(dim <= 0 for dim in grid_xyz):
+    if grid_xyz[0] <= 0 or grid_xyz[1] <= 0 or grid_xyz[2] <= 0:
         return None
 
     args_tuple = tuple(args)

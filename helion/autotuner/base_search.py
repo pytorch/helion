@@ -16,11 +16,13 @@ import os
 from pathlib import Path
 import random
 import re
+import statistics
 import sys
 import time
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Literal
+from typing import NamedTuple
 from typing import Protocol
 from typing import cast
 from unittest.mock import patch
@@ -37,6 +39,7 @@ from ..runtime.cute_structural_config import StructuralPolicyError
 from ..runtime.cute_structural_config import bound_structural_policy
 from ..runtime.cute_structural_config import require_same_structural_policy
 from ..runtime.settings import _env_get_int
+from ..runtime.settings import _env_get_optional_int
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -54,6 +57,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
+from .effort_profile import get_effort_profile
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
 from .logger import AutotuneLogEntry
@@ -62,6 +66,7 @@ from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
+from .search_space_logger import canonical_config_id
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
@@ -69,6 +74,7 @@ from helion._dist_utils import sync_object
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
+    from typing_extensions import Self
 
     from ..runtime.config import Config
     from ..runtime.cute_structural_policy import CuteStructuralPolicy
@@ -79,6 +85,7 @@ if TYPE_CHECKING:
     from .local_cache import SavedBestConfig
     from .search_space_logger import SearchSpaceTracker
     from helion.autotuner.effort_profile import AutotuneEffortProfile
+    from helion.autotuner.effort_profile import FinalSelectionConfig
 
 
 @functools.cache
@@ -118,6 +125,22 @@ _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
 _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
+# The only env override of the harness-grade final selection (full effort):
+# the number of steady-window rounds, for A/B runs against the profile.
+# HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0 restores the single-pass final
+# verification (and its HELION_AUTOTUNE_FINAL_REBENCHMARK_* knobs).
+_FINAL_SELECTION_ROUNDS_ENV = "HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS"
+# The search phase never gives up more than this share of a wall-clock budget
+# to the final selection: the selection only re-times configs the search
+# found, so a small budget must stay mostly search; the phase is then sized
+# to whatever is left when it starts (``FinalSelectionConfig.fit_to_seconds``).
+_FINAL_SELECTION_RESERVE_FRACTION = 0.25
+# Single-pass verification knobs the final selection does not read.
+_FINAL_SELECTION_IGNORED_ENVS = (
+    _FINAL_REBENCHMARK_TARGET_MS_ENV,
+    _FINAL_REBENCHMARK_ISOLATED_ENV,
+)
+_final_selection_ignored_envs_warned = False
 _CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION = 8
 
 
@@ -692,17 +715,71 @@ class BaseSearch(BaseAutotuner):
         configs = getattr(kernel_obj, "configs", None)
         return bool(configs) and not self.settings.force_autotune
 
+    # Set once the search phase hands over to the final selection, which then
+    # spends the budget share ``_budget_reserve_seconds`` kept back for it.
+    _budget_reserve_released: bool = False
+    # Longest wall time between two generation-boundary budget checks of the
+    # search phase (``_autotune_budget_exceeded_across_ranks``: the generation
+    # loops and the flash qualification passes call it once per generation).
+    # A budget check only stops new compiles; the generation in flight still
+    # finishes its benchmark pass, which took 60-120 s past the check in
+    # flash searches, so the search phase also holds back one generation of
+    # overrun for the final selection (``_in_flight_hold_back_seconds``).
+    _longest_generation_seconds: float = 0.0
+    _last_generation_boundary: float | None = None
+
+    def _budget_reserve_seconds(self) -> float:
+        """Wall-clock seconds the search phase leaves for the final selection."""
+        return 0.0
+
+    def _minimum_final_selection_seconds(self) -> float:
+        """Estimated seconds of the final selection's smallest plan."""
+        return 0.0
+
+    def _in_flight_hold_back_seconds(self, budget: float, reserve: float) -> float:
+        """Seconds the search phase stops early on top of ``reserve`` so the
+        generation in flight can finish without spending the reserve.
+
+        The reserve and the hold-back together take at most the reserve's
+        share of the budget (``_FINAL_SELECTION_RESERVE_FRACTION``): the
+        selection sizes itself to what is left when it starts, so a long
+        generation shortens the selection rather than the search. The
+        selection's smallest plan is the exception, it stays reserved
+        whenever a quarter of the budget covers it: when the generation
+        would eat the reserve down past it, the hold-back grows by the
+        difference (never beyond one generation) and the search stops one
+        generation plus that plan before the budget ends.
+        """
+        longest = self._longest_generation_seconds
+        cap = max(reserve, _FINAL_SELECTION_RESERVE_FRACTION * budget)
+        keeps_minimum = longest + self._minimum_final_selection_seconds() - reserve
+        return min(longest, max(cap - reserve, keeps_minimum))
+
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
         if budget is None or self._autotune_budget_start is None:
             return False
         elapsed = time.perf_counter() - self._autotune_budget_start
-        if elapsed < budget:
-            return False
-        self.log(
-            f"Autotune budget {budget}s exceeded "
-            f"(elapsed {elapsed:.1f}s); returning best-so-far."
+        reserve = (
+            0.0 if self._budget_reserve_released else self._budget_reserve_seconds()
         )
+        in_flight = (
+            self._in_flight_hold_back_seconds(budget, reserve) if reserve > 0 else 0.0
+        )
+        if elapsed < budget - reserve - in_flight:
+            return False
+        if reserve > 0:
+            self.log(
+                f"Autotune budget {budget}s exceeded for the search phase "
+                f"(elapsed {elapsed:.1f}s, {reserve:.0f}s reserved for the final "
+                f"selection plus {in_flight:.0f}s for the generation in flight); "
+                "returning best-so-far."
+            )
+        else:
+            self.log(
+                f"Autotune budget {budget}s exceeded "
+                f"(elapsed {elapsed:.1f}s); returning best-so-far."
+            )
         return True
 
     def _budgeted_range(self, *args: int) -> Iterator[int]:
@@ -714,6 +791,14 @@ class BaseSearch(BaseAutotuner):
 
     def _autotune_budget_exceeded_across_ranks(self) -> bool:
         """Synchronize CuTe-flash budget exhaustion before the next round."""
+        now = time.perf_counter()
+        if not self._budget_reserve_released:
+            if self._last_generation_boundary is not None:
+                self._longest_generation_seconds = max(
+                    self._longest_generation_seconds,
+                    now - self._last_generation_boundary,
+                )
+            self._last_generation_boundary = now
         exceeded = self._autotune_budget_exceeded()
         if not getattr(
             getattr(self, "config_spec", None), "cute_flash_search_enabled", False
@@ -1361,6 +1446,162 @@ def performance(member: PopulationMember) -> float:
     return member.perf
 
 
+class _PrivateBenchmarkArgs(NamedTuple):
+    """Candidate-private kernel arguments for an in-process re-timing.
+
+    ``sacrificial`` absorbs the allocator's recycled addresses and must stay
+    alive while ``by_member`` is in use: a single recycled clone would let a
+    later candidate inherit L2 eviction priority from an earlier candidate
+    that touched the same addresses (for example an ``l2_last`` store).
+    """
+
+    sacrificial: Sequence[object]
+    by_member: list[Sequence[object]]
+
+
+class _FinalSelectionMeasurer(Protocol):
+    """Steady-window timer the final selection drives one finalist at a time.
+
+    A ``BenchmarkWorkerUnkillable`` raised by either method names the finalist
+    it was timing in ``fn_index``.
+    """
+
+    def __enter__(self) -> Self: ...
+
+    def __exit__(self, exc_type: object, *exc_info: object) -> None: ...
+
+    def warm(self, index: int, duration_ms: int) -> None:
+        """Run finalist ``index`` for ``duration_ms`` to settle the clocks."""
+        ...
+
+    def measure(
+        self, index: int, warmup_ms: int, rep_ms: int
+    ) -> IsolatedBenchmarkTiming:
+        """Median of one ``warmup_ms``+``rep_ms`` steady window of finalist
+        ``index``; ``None`` when no reading could be taken."""
+        ...
+
+
+class _WorkerFinalSelectionMeasurer:
+    """Times finalists in the killable benchmark worker (one long-lived
+    process, so a hung finalist is reaped instead of hanging the search).
+    With ``private_copies`` every finalist reads its own argument copies,
+    which are released when the phase ends."""
+
+    def __init__(
+        self,
+        provider: LocalBenchmarkProvider,
+        fns: Sequence[Callable[..., object]],
+        *,
+        private_copies: bool,
+        timeout_s: float,
+    ) -> None:
+        self.provider = provider
+        self.fns = list(fns)
+        self.private_copies = private_copies
+        self.slots: list[int | None] = [
+            index if private_copies else None for index in range(len(self.fns))
+        ]
+        self.timeout_s = timeout_s
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, *exc_info: object) -> None:
+        # The worker stays up for later phases; its private argument copies
+        # (up to half of the free device memory) must not. A worker that
+        # raised on the way out (hung, died) is not asked to release them.
+        if self.private_copies and exc_type is None:
+            self.provider.release_private_argument_copies()
+
+    def warm(self, index: int, duration_ms: int) -> None:
+        self._window(index, warmup=duration_ms, rep=1, desc="Final selection warmup")
+
+    def measure(
+        self, index: int, warmup_ms: int, rep_ms: int
+    ) -> IsolatedBenchmarkTiming:
+        return self._window(index, warmup=warmup_ms, rep=rep_ms, desc="Final selection")
+
+    def _window(
+        self, index: int, *, warmup: int, rep: int, desc: str
+    ) -> IsolatedBenchmarkTiming:
+        try:
+            results = self.provider.benchmark_isolated(
+                [self.fns[index]],
+                warmup=warmup,
+                rep=rep,
+                desc=desc,
+                args_slots=[self.slots[index]],
+                timeout=self.timeout_s,
+            )
+        except BenchmarkWorkerUnkillable as error:
+            # the batch held this one finalist
+            error.fn_index = index
+            raise
+        if results is None:
+            return None
+        return results[0]
+
+
+class _InProcessFinalSelectionMeasurer:
+    """Times finalists in the autotuning process with the backend's steady
+    bench; ``args_by_fn`` holds each finalist's (possibly private) arguments."""
+
+    def __init__(
+        self,
+        fns: Sequence[Callable[..., object]],
+        args: _PrivateBenchmarkArgs | Sequence[object],
+        steady_bench: Callable[..., float | tuple[float, ...]],
+        *,
+        process_group_name: str | None,
+        log: AutotuningLogger,
+    ) -> None:
+        self.fns = list(fns)
+        # the private clones stay alive (with their sacrificial clone) until exit
+        self.args: _PrivateBenchmarkArgs | Sequence[object] | None = args
+        self.args_by_fn: list[Sequence[object]] = (
+            list(args.by_member)
+            if isinstance(args, _PrivateBenchmarkArgs)
+            else [args] * len(self.fns)
+        )
+        self.steady_bench = steady_bench
+        self.process_group_name = process_group_name
+        self.log = log
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, *exc_info: object) -> None:
+        for fn in self.fns:
+            clear_jit_fast_path_caches(fn, self.log)
+        self.args_by_fn = []
+        self.args = None
+
+    def warm(self, index: int, duration_ms: int) -> None:
+        self._bench(index, duration_ms, 1)
+
+    def measure(
+        self, index: int, warmup_ms: int, rep_ms: int
+    ) -> IsolatedBenchmarkTiming:
+        return self._bench(index, warmup_ms, rep_ms)
+
+    def _bench(self, index: int, warmup_ms: int, rep_ms: int) -> float:
+        run = functools.partial(self.fns[index], *self.args_by_fn[index])
+        try:
+            timing = self.steady_bench(
+                run,
+                warmup=warmup_ms,
+                rep=rep_ms,
+                return_mode="median",
+                process_group_name=self.process_group_name,
+            )
+        finally:
+            clear_jit_fast_path_caches(self.fns[index], self.log)
+        if isinstance(timing, tuple):
+            timing = timing[0]
+        return float(timing)
+
+
 class PopulationBasedSearch(BaseSearch):
     """
     Base class for search algorithms that use a population of configurations.
@@ -1369,6 +1610,13 @@ class PopulationBasedSearch(BaseSearch):
         population (list[PopulationMember]): The current population of configurations.
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
+
+    # Harness-grade final selection policy, resolved from the effort profile
+    # of ``settings.autotune_effort`` (full effort only; the lower efforts
+    # keep the single-pass final verification). It is a benchmarking policy
+    # rather than a search-algorithm knob, so it is not a constructor
+    # argument and ``_final_rebenchmark_cache_policy`` carries it.
+    final_selection: FinalSelectionConfig | None = None
 
     def __init__(
         self,
@@ -1387,6 +1635,7 @@ class PopulationBasedSearch(BaseSearch):
         """
         super().__init__(kernel, args)
         self.finishing_rounds = finishing_rounds
+        self.final_selection = self._final_selection_from_settings(self.settings)
         self.population: list[PopulationMember] = []
         # Population members corresponding to compiler-seeded configs from
         # ``ConfigSpec.compiler_seed_configs``.  Tracked separately so the
@@ -1423,7 +1672,38 @@ class PopulationBasedSearch(BaseSearch):
             "isolated": self._final_rebenchmark_use_isolated(),
             "pinned_tolerance": self._final_rebenchmark_pinned_tolerance(),
             "repeat_cap": os.getenv("HELION_CAP_REBENCHMARK_REPEAT"),
+            # The harness-grade final selection replaces the pass above at
+            # full effort; like the knobs above it decides which finalist is
+            # returned, not which candidates the search visits.
+            "final_selection": (
+                None
+                if self.final_selection is None
+                else dataclasses.asdict(self.final_selection)
+            ),
         }
+
+    @staticmethod
+    def _final_selection_from_profile(
+        profile: AutotuneEffortProfile,
+    ) -> FinalSelectionConfig | None:
+        """The profile's final selection policy with the rounds override."""
+        policy = profile.final_selection
+        if policy is None:
+            return None
+        rounds = _env_get_optional_int(_FINAL_SELECTION_ROUNDS_ENV)
+        if rounds is not None:
+            policy = dataclasses.replace(policy, rounds=max(0, rounds))
+        if policy.rounds <= 0:
+            return None
+        return policy
+
+    @classmethod
+    def _final_selection_from_settings(
+        cls, settings: Settings
+    ) -> FinalSelectionConfig | None:
+        return cls._final_selection_from_profile(
+            get_effort_profile(settings.autotune_effort)
+        )
 
     @classmethod
     def get_kwargs_from_profile(
@@ -1432,8 +1712,6 @@ class PopulationBasedSearch(BaseSearch):
         """
         Retrieve extra kwargs from the effort profile for the autotuner.
         """
-        from ..runtime.settings import _env_get_optional_int
-
         finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
         if finishing_rounds is None:
             finishing_rounds = profile.finishing_rounds
@@ -1442,6 +1720,90 @@ class PopulationBasedSearch(BaseSearch):
             "finishing_rounds": finishing_rounds,
             **super().get_kwargs_from_profile(profile, settings),
         }
+
+    def _final_selection_enabled(self) -> bool:
+        """Whether the final pick runs the interleaved steady-window shootout."""
+        return (
+            self.final_selection is not None
+            and self.settings.autotune_benchmark_fn is None
+            and not isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider)
+        )
+
+    def _final_selection_shortlist_estimate(self) -> int:
+        """Longest shortlist ``final_rebenchmark_best`` can hand the selection:
+        the retained ``top_k``, the pinned seeds and the incumbent (appended
+        when a later phase re-timed it above the shortlist's numbers)."""
+        return self._final_rebenchmark_top_k() + len(self._pinned_finalist_configs) + 1
+
+    def _budget_reserve_seconds(self) -> float:
+        budget = self.settings.autotune_budget_seconds
+        if budget is None or not self._final_selection_enabled():
+            return 0.0
+        policy = self.final_selection
+        assert policy is not None
+        return min(
+            policy.estimated_seconds(self._final_selection_shortlist_estimate()),
+            _FINAL_SELECTION_RESERVE_FRACTION * budget,
+        )
+
+    def _minimum_final_selection_seconds(self) -> float:
+        if not self._final_selection_enabled():
+            return 0.0
+        policy = self.final_selection
+        assert policy is not None
+        smallest = policy.budget_ladder()[-1]
+        return smallest.estimated_seconds(self._final_selection_shortlist_estimate())
+
+    def _final_selection_plan(self, shortlist: int) -> FinalSelectionConfig | None:
+        """The policy sized to the budget left when the phase starts.
+
+        Without a budget the profile's policy runs as is. Rank 0's plan is
+        used on every rank so the ranks take the same windows together.
+        """
+        policy = self.final_selection
+        assert policy is not None
+        budget = self.settings.autotune_budget_seconds
+        if budget is not None and self._autotune_budget_start is not None:
+            remaining = budget - (time.perf_counter() - self._autotune_budget_start)
+            plan = policy.fit_to_seconds(remaining, shortlist)
+            if plan is None:
+                smallest = policy.budget_ladder()[-1].estimated_seconds(shortlist)
+                self.log(
+                    f"Final selection skipped: {remaining:.0f}s of the "
+                    f"{budget}s budget remain, less than the {smallest:.0f}s of "
+                    "its smallest plan; returning the search's best."
+                )
+            elif plan != policy:
+                self.log(
+                    f"Final selection sized to the {remaining:.0f}s left of the "
+                    f"{budget}s budget: up to {plan.finalists(shortlist)} finalists x "
+                    f"{plan.rounds} rounds"
+                    + (", no screen" if policy.screens(shortlist) else "")
+                    + (
+                        ", no thermal warmup"
+                        if plan.thermal_warmup_ms == 0 < policy.thermal_warmup_ms
+                        else ""
+                    )
+                )
+            policy = plan
+        return sync_object(
+            policy, process_group_name=self.kernel.env.process_group_name
+        )
+
+    def _warn_ignored_final_rebenchmark_envs(self) -> None:
+        """Say once that the single-pass knobs do not steer the selection."""
+        global _final_selection_ignored_envs_warned
+        if _final_selection_ignored_envs_warned:
+            return
+        ignored = [name for name in _FINAL_SELECTION_IGNORED_ENVS if name in os.environ]
+        if not ignored:
+            return
+        _final_selection_ignored_envs_warned = True
+        self.log.warning(
+            f"{', '.join(ignored)} only steer the single-pass final verification; "
+            "the full-effort final selection ignores them (set "
+            f"{_FINAL_SELECTION_ROUNDS_ENV}=0 to run that verification instead)."
+        )
 
     @property
     def best(self) -> PopulationMember:
@@ -2308,7 +2670,12 @@ class PopulationBasedSearch(BaseSearch):
         else:
             raise exc.NoConfigFound
 
-        if self._autotune_budget_exceeded_across_ranks():
+        use_final_selection = self._final_selection_enabled()
+        # The single-pass verification is skipped once a wall-clock budget is
+        # spent; the final selection instead reserved its share of the budget
+        # during the search (``_budget_reserve_seconds``) and sizes itself to
+        # what is left (``_final_selection_plan``).
+        if not use_final_selection and self._autotune_budget_exceeded_across_ranks():
             return fallback
         top_k = self._final_rebenchmark_top_k()
         if top_k <= 1:
@@ -2329,6 +2696,11 @@ class PopulationBasedSearch(BaseSearch):
             *pinned,
             *sorted(remaining, key=self._finalist_history_perf)[:top_k],
         ]
+        # The incumbent defends its title even when later phases re-timed it
+        # above the shortlist's search numbers.
+        incumbent = by_config.get(best.config)
+        if incumbent is not None and incumbent not in finalists:
+            finalists.append(incumbent)
         if len(finalists) < 2:
             live_finalists = [
                 member for member in finalists if math.isfinite(member.perf)
@@ -2336,33 +2708,43 @@ class PopulationBasedSearch(BaseSearch):
             return min(live_finalists, key=performance, default=fallback)
 
         before = min(finalists, key=performance)
-        # Finalists have already survived the normal benchmark path. Time the
-        # last shortlist with the paired event-based interleaved bench so
-        # clock/thermal drift between per-candidate timing windows cannot
-        # mis-rank near-tied finalists (unpaired sequential steady windows
-        # measured 1-3% apart on identical configs). If a user explicitly
-        # opts into isolated finalist timing, keep suspicious confirmation
-        # enabled for the in-process fallback.
-        use_isolated = self._final_rebenchmark_use_isolated()
-        self.rebenchmark(
-            finalists,
-            desc=f"Final verification top {len(finalists)} configs",
-            target_ms=self._final_rebenchmark_target_ms(),
-            use_isolated=use_isolated,
-            confirm_suspicious=use_isolated,
-            use_interleaved=not use_isolated,
-            candidate_private_args=use_isolated,
-        )
-        live_finalists = [member for member in finalists if math.isfinite(member.perf)]
-        if not live_finalists:
-            raise exc.NoConfigFound
-        after = min(live_finalists, key=performance)
-        live_pinned = [member for member in pinned if math.isfinite(member.perf)]
-        if live_pinned:
-            pinned_after = min(live_pinned, key=performance)
-            tolerance = self._final_rebenchmark_pinned_tolerance()
-            if pinned_after.perf <= after.perf * (1.0 + tolerance):
-                after = pinned_after
+        if use_final_selection:
+            self._warn_ignored_final_rebenchmark_envs()
+            plan = self._final_selection_plan(len(finalists))
+            if plan is None:
+                return fallback
+            after = self._run_final_selection(
+                finalists,
+                pinned_configs,
+                before if incumbent is None else incumbent,
+                plan,
+            )
+        else:
+            # Finalists have already survived the normal benchmark path. Time
+            # the last shortlist with the paired event-based interleaved bench
+            # so clock/thermal drift between per-candidate timing windows
+            # cannot mis-rank near-tied finalists (unpaired sequential steady
+            # windows measured 1-3% apart on identical configs). If a user
+            # explicitly opts into isolated finalist timing, keep suspicious
+            # confirmation enabled for the in-process fallback.
+            use_isolated = self._final_rebenchmark_use_isolated()
+            self.rebenchmark(
+                finalists,
+                desc=f"Final verification top {len(finalists)} configs",
+                target_ms=self._final_rebenchmark_target_ms(),
+                use_isolated=use_isolated,
+                confirm_suspicious=use_isolated,
+                use_interleaved=not use_isolated,
+                candidate_private_args=use_isolated,
+            )
+            live_finalists = [
+                member for member in finalists if math.isfinite(member.perf)
+            ]
+            if not live_finalists:
+                raise exc.NoConfigFound
+            after = self._prefer_pinned_within_tolerance(
+                min(live_finalists, key=performance), live_finalists, pinned_configs
+            )
         if after.config != before.config:
             self.log(
                 "Final verification selected a different config: "
@@ -2370,6 +2752,318 @@ class PopulationBasedSearch(BaseSearch):
                 f"{self.format_performance(after.perf)}"
             )
         return after
+
+    def _prefer_pinned_within_tolerance(
+        self,
+        after: PopulationMember,
+        live: Sequence[PopulationMember],
+        pinned_configs: set[Config],
+    ) -> PopulationMember:
+        """A pinned seed within the tolerance of the best finalist wins the tie."""
+        live_pinned = [member for member in live if member.config in pinned_configs]
+        if not live_pinned:
+            return after
+        pinned_after = min(live_pinned, key=performance)
+        tolerance = self._final_rebenchmark_pinned_tolerance()
+        if pinned_after.perf <= after.perf * (1.0 + tolerance):
+            return pinned_after
+        return after
+
+    def _steady_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        """The backend's steady-window timer, or the generic ``do_bench``."""
+        return self.config_spec.backend.get_do_bench() or do_bench
+
+    def _private_benchmark_args(self, count: int) -> _PrivateBenchmarkArgs:
+        """Private clones of the kernel arguments for ``count`` candidates.
+
+        Raises ``torch.OutOfMemoryError`` when they do not fit on the device.
+        """
+        process_group_name = self.kernel.env.process_group_name
+        clones = [
+            _clone_args(self.args, process_group_name, idx_to_clone=None)
+            for _ in range(count + 1)
+        ]
+        return _PrivateBenchmarkArgs(clones[0], clones[1:])
+
+    def _shared_benchmark_args(self) -> Sequence[object]:
+        """The kernel arguments every candidate of a re-timing shares: a clone
+        of the mutated arguments when the kernel has any, else the originals."""
+        mutated = self.benchmark_provider.mutated_arg_indices
+        if len(mutated) == 0:
+            return self.args
+        return _clone_args(
+            self.args, self.kernel.env.process_group_name, idx_to_clone=mutated
+        )
+
+    def _final_selection_measurer(
+        self, finalists: Sequence[PopulationMember], policy: FinalSelectionConfig
+    ) -> _FinalSelectionMeasurer:
+        """Steady-window timer for the finalists: the killable benchmark worker
+        when the search benchmarks in one, otherwise in-process."""
+        provider = self.benchmark_provider
+        window_s = (policy.warmup_ms + policy.rep_ms) / 1000.0
+        thermal_s = (policy.thermal_warmup_ms + policy.rep_ms) / 1000.0
+        # The timer sizes its repetitions from an estimate pass, so a kernel
+        # that runs slower in the window than in the estimate stretches the
+        # window; three times the longest window still finishes, and 15 s
+        # covers a worker spawn with its wrapper and argument loads.
+        timeout_s = max(
+            float(self.settings.autotune_benchmark_timeout),
+            3.0 * max(window_s, thermal_s) + 15.0,
+        )
+        if isinstance(provider, LocalBenchmarkProvider):
+            private_copies = provider.private_argument_copies_affordable(len(finalists))
+            if provider.steady_window_benchmark_available():
+                return _WorkerFinalSelectionMeasurer(
+                    provider,
+                    [member.fn for member in finalists],
+                    private_copies=private_copies,
+                    timeout_s=timeout_s,
+                )
+        else:
+            private_copies = False
+        args: _PrivateBenchmarkArgs | Sequence[object] | None = None
+        if private_copies and not dist.is_initialized():
+            try:
+                args = self._private_benchmark_args(len(finalists))
+            except torch.OutOfMemoryError:
+                self.log.warning(
+                    "Final selection could not allocate private argument copies; "
+                    "finalists share one argument set."
+                )
+        if args is None:
+            args = self._shared_benchmark_args()
+        return _InProcessFinalSelectionMeasurer(
+            [member.fn for member in finalists],
+            args,
+            self._steady_bench(),
+            process_group_name=self.kernel.env.process_group_name,
+            log=self.log,
+        )
+
+    def _run_final_selection(
+        self,
+        finalists: list[PopulationMember],
+        pinned_configs: set[Config],
+        incumbent: PopulationMember,
+        policy: FinalSelectionConfig,
+    ) -> PopulationMember:
+        """Pick the returned config with interleaved harness-grade windows.
+
+        The shortlist is screened once in the sustained clock regime (when it
+        is long enough to be worth it), the best ``top_k`` survivors plus the
+        best pinned seed and the ``incumbent`` then run ``rounds`` rounds of
+        steady windows whose order alternates every round, and the median
+        across rounds decides (see ``FinalSelectionConfig``). Every decision
+        that depends on a reading is taken by rank 0 and broadcast, so
+        distributed ranks time the same finalist in every window.
+        """
+        start = time.perf_counter()
+        count = len(finalists)
+        screen: list[float | None] = [None] * count
+        readings: list[list[float]] = [[] for _ in range(count)]
+        failures: list[Literal["error", "timeout"] | None] = [None] * count
+        process_group_name = self.kernel.env.process_group_name
+
+        def take(index: int, warmup_ms: int, rep_ms: int) -> float | None:
+            result = measurer.measure(index, warmup_ms, rep_ms)
+            if isinstance(result, IsolatedBenchmarkFailure):
+                failures[index] = result.status
+                return None
+            if result is None or not math.isfinite(result) or result <= 0:
+                return None
+            return float(result)
+
+        try:
+            with self._final_selection_measurer(finalists, policy) as measurer:
+                if policy.thermal_warmup_ms > 0:
+                    measurer.warm(finalists.index(incumbent), policy.thermal_warmup_ms)
+                screened = policy.screens(count)
+                if screened:
+                    for index in range(count):
+                        screen[index] = take(
+                            index, policy.screen_warmup_ms, policy.screen_rep_ms
+                        )
+
+                def rank_key(index: int) -> float:
+                    if not screened:
+                        return self._finalist_history_perf(finalists[index])
+                    reading = screen[index]
+                    return inf if reading is None else reading
+
+                alive = [index for index in range(count) if failures[index] is None]
+                ranked = sorted(alive, key=rank_key)
+                survivors = ranked[: policy.top_k]
+                pinned_alive = [
+                    index
+                    for index in ranked
+                    if finalists[index].config in pinned_configs
+                ]
+                if pinned_alive and pinned_alive[0] not in survivors:
+                    survivors.append(pinned_alive[0])
+                # The incumbent defends its title like the pinned seed: it
+                # was shortlisted even where later phases re-timed it above
+                # the shortlist's search numbers, which rank it last here
+                # whenever the shortlist is not screened.
+                incumbent_index = finalists.index(incumbent)
+                if incumbent_index in alive and incumbent_index not in survivors:
+                    survivors.append(incumbent_index)
+                # rank 0 decides who goes on so every rank runs the same windows
+                survivors = sync_object(
+                    survivors, process_group_name=process_group_name
+                )
+                for round_index in range(policy.rounds):
+                    # A finalist that failed, timed out or missed a reading in
+                    # an earlier round cannot compete (it needs a reading from
+                    # every round), so it is not timed again: a hung finalist
+                    # would otherwise cost every remaining round a timeout.
+                    disqualified = sync_object(
+                        [
+                            index
+                            for index in survivors
+                            if failures[index] is not None
+                            or len(readings[index]) < round_index
+                        ],
+                        process_group_name=process_group_name,
+                    )
+                    order = survivors if round_index % 2 == 0 else survivors[::-1]
+                    for index in order:
+                        if index in disqualified:
+                            continue
+                        reading = take(index, policy.warmup_ms, policy.rep_ms)
+                        if reading is not None:
+                            readings[index].append(reading)
+        except BenchmarkWorkerUnkillable as error:
+            self._record_unkillable(finalists, error)
+            raise
+
+        members = [finalists[index] for index in survivors]
+        # A finalist competes on the median of a reading from every round: a
+        # round it failed, timed out or produced no reading in disqualifies
+        # it (one lucky reading must not win over consistently timed rivals).
+        results: list[IsolatedBenchmarkTiming] = []
+        for index in survivors:
+            status = failures[index]
+            if status is not None:
+                results.append(IsolatedBenchmarkFailure(status))
+            elif len(readings[index]) == policy.rounds:
+                results.append(statistics.median(readings[index]))
+            else:
+                results.append(None)
+        results = sync_object(results, process_group_name=process_group_name)
+        timings, failure_statuses = self._resolve_isolated_rebenchmark_results(
+            members, results
+        )
+        self._apply_rebenchmark_timings(
+            members, timings, failure_statuses=failure_statuses
+        )
+        live = [
+            member
+            for member, result in zip(members, results, strict=True)
+            if isinstance(result, float) and math.isfinite(member.perf)
+        ]
+        if not live:
+            self.log.warning(
+                "Final selection took no complete steady-window readings; "
+                "keeping the search's best config."
+            )
+            live = [member for member in members if math.isfinite(member.perf)]
+        if not live:
+            raise exc.NoConfigFound
+        after = self._prefer_pinned_within_tolerance(
+            min(live, key=performance), live, pinned_configs
+        )
+        self._log_final_selection(
+            finalists,
+            survivors,
+            screen,
+            readings,
+            results,
+            after,
+            pinned_configs,
+            policy,
+            wall_s=time.perf_counter() - start,
+        )
+        return after
+
+    def _log_final_selection(
+        self,
+        finalists: Sequence[PopulationMember],
+        survivors: Sequence[int],
+        screen: Sequence[float | None],
+        readings: Sequence[Sequence[float]],
+        results: Sequence[IsolatedBenchmarkTiming],
+        selected: PopulationMember,
+        pinned_configs: set[Config],
+        policy: FinalSelectionConfig,
+        *,
+        wall_s: float,
+    ) -> None:
+        result_by_index = dict(zip(survivors, results, strict=True))
+
+        def verdict(index: int) -> str | None:
+            result = result_by_index[index]
+            if isinstance(result, IsolatedBenchmarkFailure):
+                return result.status
+            if result is None:
+                return "incomplete"
+            return None
+
+        def sort_key(index: int) -> float:
+            result = result_by_index[index]
+            return result if isinstance(result, float) else inf
+
+        rows: list[dict[str, object]] = []
+        lines: list[str] = []
+        for index in sorted(survivors, key=sort_key):
+            member = finalists[index]
+            samples = list(readings[index])
+            result = result_by_index[index]
+            median = result if isinstance(result, float) else None
+            config_id = canonical_config_id(member.config)
+            rows.append(
+                {
+                    "config_id": config_id,
+                    "pinned": member.config in pinned_configs,
+                    "search_ms": member.perfs[0] if member.perfs else None,
+                    "screen_ms": screen[index],
+                    "rounds_ms": samples,
+                    "median_ms": median,
+                    "disqualified": verdict(index),
+                }
+            )
+            marks = ("*" if member is selected else " ") + (
+                "P" if member.config in pinned_configs else " "
+            )
+            median_text = (
+                self.format_performance(median)
+                if median is not None
+                else verdict(index) or "n/a"
+            )
+            rounds_text = " ".join(f"{sample:.4f}" for sample in samples)
+            screen_text = "" if screen[index] is None else f"{screen[index]:.4f}"
+            search_text = (
+                self.format_performance(member.perfs[0]) if member.perfs else "n/a"
+            )
+            lines.append(
+                f"  {marks} {median_text:>10} [{rounds_text}] screen={screen_text} "
+                f"search={search_text} {config_id}"
+            )
+        self.log(
+            f"Final selection: {len(finalists)} shortlisted, {len(survivors)} "
+            f"finalists x {policy.rounds} rounds of {policy.warmup_ms}+{policy.rep_ms} ms "
+            f"windows in {wall_s:.1f}s; selected "
+            f"{self.format_performance(selected.perf)} (* selected, P pinned seed):\n"
+            + "\n".join(lines)
+        )
+        self._autotune_metrics.final_selection = {
+            "policy": dataclasses.asdict(policy),
+            "shortlisted": len(finalists),
+            "finalists": len(survivors),
+            "wall_s": wall_s,
+            "selected_config_id": canonical_config_id(selected.config),
+            "rows": rows,
+        }
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
@@ -2484,41 +3178,25 @@ class PopulationBasedSearch(BaseSearch):
                 )
             in_process_isolation = candidate_private_args and not dist.is_initialized()
 
-        if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            if in_process_isolation:
-                # A single recycled clone lets a later candidate inherit L2
-                # eviction priority from an earlier candidate that touched the
-                # same addresses (for example, an ``l2_last`` store). Keep a
-                # sacrificial clone alive to absorb the allocator's recycled
-                # addresses, then give every finalist private live tensor
-                # storage, including inputs that the kernel only reads.
-                isolated_args: list[Sequence[object]] = []
-                try:
-                    isolated_args = [
-                        _clone_args(
-                            self.args,
-                            self.kernel.env.process_group_name,
-                            idx_to_clone=None,
-                        )
-                        for _ in range(len(members) + 1)
-                    ]
-                    benchmark_args_by_member = isolated_args[1:]
-                except torch.OutOfMemoryError as error:
-                    isolated_args.clear()
-                    raise exc.AutotuneError(
-                        "Unable to allocate candidate-private mutated arguments "
-                        "for in-process finalist isolation. Reduce "
-                        f"{_FINAL_REBENCHMARK_TOP_K_ENV} and retry."
-                    ) from error
-            else:
-                benchmark_args = _clone_args(
-                    self.args,
-                    self.kernel.env.process_group_name,
-                    idx_to_clone=self.benchmark_provider.mutated_arg_indices,
-                )
-                benchmark_args_by_member = [benchmark_args] * len(members)
+        private_args: _PrivateBenchmarkArgs | None = None
+        if (
+            in_process_isolation
+            and len(self.benchmark_provider.mutated_arg_indices) > 0
+        ):
+            # Every finalist gets private live tensor storage, including
+            # inputs that the kernel only reads (see ``_PrivateBenchmarkArgs``
+            # for the sacrificial clone it keeps alive).
+            try:
+                private_args = self._private_benchmark_args(len(members))
+            except torch.OutOfMemoryError as error:
+                raise exc.AutotuneError(
+                    "Unable to allocate candidate-private mutated arguments "
+                    "for in-process finalist isolation. Reduce "
+                    f"{_FINAL_REBENCHMARK_TOP_K_ENV} and retry."
+                ) from error
+            benchmark_args_by_member = private_args.by_member
         else:
-            benchmark_args_by_member = [self.args] * len(members)
+            benchmark_args_by_member = [self._shared_benchmark_args()] * len(members)
 
         def make_rebenchmark_callable(
             member: PopulationMember,
@@ -2539,7 +3217,6 @@ class PopulationBasedSearch(BaseSearch):
 
             return wrapped
 
-        _backend = getattr(getattr(self, "config_spec", None), "backend", None)
         try:
             if use_interleaved or self.settings.autotune_benchmark_fn is not None:
                 iterator = [
@@ -2557,10 +3234,9 @@ class PopulationBasedSearch(BaseSearch):
                     benchmark_function = self.settings.autotune_benchmark_fn
                 else:
                     interleaved_benchmark = (
-                        _backend.get_interleaved_bench()
-                        if _backend is not None
-                        else None
-                    ) or interleaved_bench
+                        self.config_spec.backend.get_interleaved_bench()
+                        or interleaved_bench
+                    )
                     # ``repeat`` is sized from candidate kernel time alone; for
                     # microsecond kernels the fixed per-call overhead dominates
                     # and the capped repeat count can take minutes of wall
@@ -2593,9 +3269,7 @@ class PopulationBasedSearch(BaseSearch):
                         members, benchmark_args_by_member, strict=True
                     )
                 ]
-                steady_bench = (
-                    _backend.get_do_bench() if _backend is not None else None
-                ) or do_bench
+                steady_bench = self._steady_bench()
                 rep_ms = self._steady_rebenchmark_rep_ms(target_ms)
                 warmup_ms = min(1000, rep_ms)
                 new_timings = []
@@ -3155,16 +3829,33 @@ class PopulationBasedSearch(BaseSearch):
             self._unkillable_configs.add(members[error.fn_index].config)
 
     def _finalize(self) -> Config:
-        """Final verification, finishing phase, and final-pick re-rank.
+        """Finishing phase, terminal refinement, final selection (or the
+        single-pass final verification) and the final-pick re-rank.
 
-        Shared tail of the search ``_autotune`` methods; the final-pick re-rank
+        Shared tail of every search's ``_autotune``; the final-pick re-rank
         runs only on TPU/Pallas (see ``_final_pick_supported``).
         """
         best = self.best
         try:
-            best = self.final_rebenchmark_best(best)
-            best = self.run_finishing_phase(best, self.finishing_rounds)
-            best = self.run_terminal_refinement(best)
+            if self._final_selection_enabled():
+                # The finishing phase and the terminal refinement generate
+                # candidates and compare them with the search's short windows;
+                # their picks join the shortlist of the final selection, which
+                # runs last so the returned config is the one that won the
+                # harness-grade shootout rather than a later short-window pick.
+                # They spend the search phase's share of the budget: the
+                # reserve kept for the final selection opens only once they
+                # are done.
+                best = self.run_finishing_phase(best, self.finishing_rounds)
+                best = self.run_terminal_refinement(best)
+                self._budget_reserve_released = True
+                best = self.final_rebenchmark_best(best)
+                self._selected_member = best
+            else:
+                self._budget_reserve_released = True
+                best = self.final_rebenchmark_best(best)
+                best = self.run_finishing_phase(best, self.finishing_rounds)
+                best = self.run_terminal_refinement(best)
             if self._final_pick_supported():
                 best = self.run_final_pick_verification(best)
         except BenchmarkWorkerUnkillable as error:
