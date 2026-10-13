@@ -72,6 +72,7 @@ class MetalBackend(Backend):
             "num_threads",
             "num_warps",
             "reduction_loops",
+            "reduction_fusion",
         }
     )
 

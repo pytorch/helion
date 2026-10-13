@@ -830,6 +830,57 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(s, x.sum(-1), rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(out, bias[:, None].expand(16, 64))
 
+    @onlyBackends(["triton"])
+    @skipIfRefEager("asserts generated Triton source, which ref eager does not emit")
+    def test_fused_looped_reductions_share_one_load(self):
+        @helion.kernel(autotune_effort="none")
+        def mean_var(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            mean = torch.empty([m], dtype=torch.float32, device=x.device)
+            var = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                mean[tile_m] = row.sum(-1) / n
+                var[tile_m] = (row * row).sum(-1) / n
+            return mean, var
+
+        x = torch.randn([128, 1024], device=DEVICE)
+        base, _ = code_and_output(mean_var, (x,), block_size=32, reduction_loop=64)
+        self.assertEqual(base.count("for roffset"), 2)
+        self.assertEqual(base.count("tl.load(x"), 2)
+        code, (mean, var) = code_and_output(
+            mean_var, (x,), block_size=32, reduction_loop=64, reduction_fusion=True
+        )
+        self.assertEqual(code.count("for roffset"), 1)
+        self.assertEqual(code.count("tl.load(x"), 1)
+        torch.testing.assert_close(mean, x.mean(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(var, (x * x).mean(-1), rtol=1e-4, atol=1e-4)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("asserts generated Triton source, which ref eager does not emit")
+    def test_reduction_fusion_preserves_store_read_dependency(self):
+        @helion.kernel(autotune_effort="none")
+        def chained(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            out2 = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                out[tile_m] = row.sum(-1)
+                out2[tile_m] = out[tile_m] * 2.0 + row.amax(-1)
+            return out, out2
+
+        x = torch.randn([128, 1024], device=DEVICE)
+        code, (out, out2) = code_and_output(
+            chained, (x,), block_size=32, reduction_loop=64, reduction_fusion=True
+        )
+        self.assertEqual(code.count("for roffset"), 2)
+        expected = x.sum(-1)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            out2, expected * 2.0 + x.amax(-1), rtol=1e-4, atol=1e-4
+        )
+
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):

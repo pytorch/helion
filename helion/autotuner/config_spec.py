@@ -1063,6 +1063,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "num_sm_multiplier",
         "maxnreg",
+        "reduction_fusion",
         "indexing",
         "atomic_indexing",
         "load_eviction_policies",
@@ -1409,6 +1410,7 @@ class ConfigSpec:
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
+        self.reduction_fusion_available: bool = False
         self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
             BlockIdSequence()
         )
@@ -3345,6 +3347,8 @@ class ConfigSpec:
         )
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "reduction_fusion":
+            return self.backend_name != "cute" and self.backend.supports_config_key(key)
         if key == "host_tensor_descriptors":
             return (
                 self.device is not None
@@ -5274,6 +5278,7 @@ class ConfigSpec:
             "num_sm_multiplier",
             "maxnreg",
             "host_tensor_descriptors",
+            "reduction_fusion",
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
@@ -5289,6 +5294,17 @@ class ConfigSpec:
                     config["host_tensor_descriptors"] = False
                 else:
                     raise InvalidConfig("host_tensor_descriptors must be a bool")
+        if self.supports_config_key("reduction_fusion"):
+            if self.reduction_fusion_available:
+                config.setdefault("reduction_fusion", False)
+            if (
+                "reduction_fusion" in config
+                and type(config["reduction_fusion"]) is not bool
+            ):
+                if _fix_invalid:
+                    config["reduction_fusion"] = False
+                else:
+                    raise InvalidConfig("reduction_fusion must be a bool")
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
@@ -6857,6 +6873,10 @@ class ConfigSpec:
             self.indexing.length > 0 or self.atomic_indexing.length > 0
         ):
             fields["host_tensor_descriptors"] = BooleanFragment()
+        if self.reduction_fusion_available and self.supports_config_key(
+            "reduction_fusion"
+        ):
+            fields["reduction_fusion"] = BooleanFragment()
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
