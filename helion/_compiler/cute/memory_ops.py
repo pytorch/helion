@@ -1417,6 +1417,8 @@ def _cute_stack_tensor_offset_expr(
     tensor_like: torch.Tensor,
     subscript: list[object],
     ast_subscript: list[object] | tuple[object, ...],
+    *,
+    for_store: bool = False,
 ) -> str:
     env = CompileEnvironment.current()
     index_exprs = _cute_index_exprs(
@@ -1426,6 +1428,7 @@ def _cute_stack_tensor_offset_expr(
         tensor=tensor_like,
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
+        for_store=for_store,
     )
     if "None" in index_exprs:
         raise exc.BackendUnsupported("cute", "inactive stack tensor load dimension")
@@ -1554,6 +1557,7 @@ def _codegen_cute_store_stack_load(
             ast_subscript,
             tensor=tensor,
             inactive_singleton_slice_expr="0",
+            for_store=True,
         )
         if len(target_index_exprs) != tensor.ndim:
             return None
@@ -1616,6 +1620,7 @@ def _codegen_cute_store_stack_load(
         ast_subscript,
         tensor=tensor,
         inactive_singleton_slice_expr="0",
+        for_store=True,
     )
     ptr_pos = 0
     rewritten_index_exprs = []
@@ -2349,6 +2354,7 @@ def _codegen_cute_store_loaded_index_trailing_slices(
         prefix_ast_subscript,
         tensor=tensor,
         inactive_singleton_slice_expr="0",
+        for_store=True,
     )
     if len(target_prefix) != indexer_value.ndim:
         return None
@@ -2800,6 +2806,7 @@ def _codegen_cute_store_expand_broadcast_tile(
         ast_subscript,
         tensor=tensor,
         inactive_singleton_slice_expr="0",
+        for_store=True,
     )
     if len(index_exprs) != tensor.ndim or "None" in index_exprs:
         return None
@@ -3299,6 +3306,7 @@ def _(state: CodegenState) -> ast.AST:
             tensor_like,
             [*subscript],
             ast_subscript,
+            for_store=True,
         )
         backend = CompileEnvironment.current().backend
         target_dtype = backend.dtype_str(tensor_like.dtype)
@@ -3457,6 +3465,7 @@ def _(state: CodegenState) -> ast.AST:
         ast_subscript,
         tensor=tensor,
         inactive_singleton_slice_expr="0",
+        for_store=True,
     )
     # Regions come from the subscript as written: a re-addressed full-slice
     # dim (below) stays inside the slice's extent, so they remain an
