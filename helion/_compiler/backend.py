@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .aten_lowering import Lowering
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
+    from .cute.flex_match import FlexMatch
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import DeviceIR
@@ -90,6 +91,15 @@ class FlashSearchSurface(NamedTuple):
     head_dim_v: int | None = None
     # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain attention).
     kv_group: int = 1
+    # Flex envelope facts (``AttentionScorePlan.is_flex``): a data-dependent
+    # BlockMask list walk (variable trip count driven by tables), whether the
+    # captured score / mask regions exist, and the separate Q / KV lengths
+    # (which need not be equal nor multiples of 128).
+    has_list_walk: bool = False
+    flex_has_score_region: bool = False
+    flex_has_mask_region: bool = False
+    q_seq: int | None = None
+    kv_seq: int | None = None
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3324,9 +3334,18 @@ def _attention_softmax_pattern_head_dim(
 
 
 def _flash_block_sizes_reachable(
-    env: CompileEnvironment, targets: dict[int, int]
+    env: CompileEnvironment,
+    targets: dict[int, int],
+    *,
+    overshoot_dimension: bool = False,
 ) -> bool:
-    """True when every block id's fragment range can reach its flash target."""
+    """True when every block id's fragment range can reach its flash target.
+
+    ``overshoot_dimension``: the fused body tiles past the dimension's extent
+    (ragged query rows), so the extent's cap on the range (``update_hint``)
+    does not count against the target; only a declared ceiling
+    (``BlockSizeSpec.declared_max_size``) does.
+    """
     from ..autotuner.config_fragment import BlockSizeFragment
 
     if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
@@ -3335,7 +3354,11 @@ def _flash_block_sizes_reachable(
         block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
         fragment = block_spec._fragment(env.config_spec)
         assert isinstance(fragment, BlockSizeFragment)
-        if not fragment.low <= target <= fragment.high:
+        high = fragment.high
+        if overshoot_dimension:
+            declared = block_spec.declared_max_size
+            high = max(high, target if declared is None else declared)
+        if not fragment.low <= target <= high:
             return False
     return True
 
@@ -3355,14 +3378,17 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
 
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return None
-    # Attention binds to a 2-axis root grid (tile_b, tile_m) plus one inner
-    # tile_n device loop.
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
+    env = CompileEnvironment.current()
+    # The FlexAttention envelope binds to a 3-axis root grid (tile_b, tile_h,
+    # tile_m) with unit b/h tiles; the collapsed envelope below to a 2-axis
+    # grid (tile_b, tile_m) plus one inner tile_n device loop.
+    if len(root_grid_ids) == 3:
+        return _detect_flex_search_surface(device_ir, root_grid_ids, env)
     if len(root_grid_ids) != 2:
         return None
-    env = CompileEnvironment.current()
 
     def block_sizes_reachable(targets: dict[int, int]) -> bool:
         return _flash_block_sizes_reachable(env, targets)
@@ -3541,7 +3567,89 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             block_size_targets=generic_fallback_targets
         )
         return None
+    if flash_surface is None:
+        flash_surface = _detect_flex_search_surface(device_ir, root_grid_ids, env)
     return flash_surface
+
+
+def _detect_flex_search_surface(
+    device_ir: DeviceIR,
+    root_grid_ids: Sequence[int],
+    env: CompileEnvironment,
+) -> FlashSearchSurface | None:
+    """The flex-envelope surface: the whole-graph-set matcher on
+    ``device_ir.graphs`` (never cache its node identities; codegen re-runs
+    it on the graph copies)."""
+    from .cute.flex_match import FLEX_PLAN_ENABLED
+    from .cute.flex_match import match_flex_envelope
+
+    if not FLEX_PLAN_ENABLED:
+        return None
+    match = match_flex_envelope(device_ir.graphs, root_grid_ids, env=env)
+    if match is None:
+        return None
+    return flex_search_surface(match, env)
+
+
+def flex_search_surface(
+    match: FlexMatch, env: CompileEnvironment
+) -> FlashSearchSurface | None:
+    """Build the autotune surface of a matched flex kernel.
+
+    Only the tunable (tile_m, tile_n) ids enter ``block_size_targets`` (the
+    unit b/h axes are ``FixedBlockSizeSource(1)``, which the matcher already
+    verified; ``block_id_lookup`` has no entry for them). ``num_kv`` is the
+    upper bound ``cdiv(kv_seq, 128)`` of the list walk. The 128-row pins
+    hold for every ``q_seq >= 1``: the emitter row-guards a ragged last tile,
+    so a query length below 128 (which caps the generic range at its extent)
+    is not a decline; a declared ceiling below 128 is.
+    """
+    from .cute.cute_flash import _flash_output_requires_tma
+
+    plan = match.plan
+    num_bh = match.num_bh
+    # LSE uses a direct layout with signed Int32 element coordinates.
+    if match.lse_name is not None and num_bh * match.q_seq > 1 << 31:
+        return None
+    block_size_targets = {match.q_block_id: 128, match.kv_block_id: 128}
+    if not _flash_block_sizes_reachable(
+        env, block_size_targets, overshoot_dimension=True
+    ):
+        return None
+    return FlashSearchSurface(
+        head_dim=match.head_dim,
+        num_kv=match.num_kv,
+        num_bh=num_bh,
+        tensor_4d_heads=match.heads,
+        io_dtype=match.io_dtype,
+        block_size_targets=block_size_targets,
+        is_causal=False,
+        has_kv_tile_pruning=False,
+        requires_ws_overlap=False,
+        small_biased_candidate=False,
+        standard_dense_output=False,
+        standard_causal_output=False,
+        output_requires_tma=_flash_output_requires_tma(
+            num_bh, match.q_seq, match.head_dim_v
+        ),
+        # The flex emitter reads its 4-D operands directly; the collapsed
+        # path's reshape-view TMA proof does not apply.
+        supports_tensor_4d_tma=False,
+        has_row_epilogue=False,
+        # The hook bodies exist only in the 128-row bodies.
+        plain_row_body=False,
+        # Mask-only plans keep the dense body on full tiles: only a score
+        # region (or an unpeeled scale) makes every tile run the hook.
+        has_score_modifiers=plan.flex_has_score_region,
+        score_modifier_kinds=plan.modifier_kinds,
+        head_dim_v=plan.head_dim_v,
+        kv_group=plan.kv_group,
+        has_list_walk=plan.has_list_walk,
+        flex_has_score_region=plan.flex_has_score_region,
+        flex_has_mask_region=plan.flex_has_mask_region,
+        q_seq=match.q_seq,
+        kv_seq=match.kv_seq,
+    )
 
 
 class _SpecializedMmaPlan(NamedTuple):

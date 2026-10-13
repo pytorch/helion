@@ -1005,6 +1005,81 @@ def _detect_attention_bwd_mma_loop(
     return True
 
 
+def _attention_config_envelope_ok(config: Config) -> bool:
+    """The fused flash bodies emit their own program mapping and own the
+    whole CTA: only the flat pid with no reordering, no L2 grouping, no
+    explicit thread counts and no lane vectors is valid."""
+    if config.pid_type != "flat":
+        return False
+    if any(grouping != 1 for grouping in config.l2_groupings):
+        return False
+    if any(order != [*range(len(order))] for order in config.loop_orders):
+        return False
+    if any(thread_count != 0 for thread_count in config.num_threads):
+        return False
+    cute_vector_widths = config.config.get("cute_vector_widths", [])
+    return not (
+        isinstance(cute_vector_widths, list)
+        and any(width != 1 for width in cute_vector_widths)
+    )
+
+
+def _detect_flex_attention_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> bool:
+    """True when ``block_ids`` is one of the device loops of a matched
+    FlexAttention envelope (``flex_match.match_flex_envelope``).
+
+    The match runs once per device function on the codegen graph copies and
+    is cached on ``cute_state``; the outer list loops and the inner KV loops
+    of both walks all answer True so the SIMT planner never allocates thread
+    axes for them. The config envelope mirrors the collapsed detector plus
+    the unit b/h tiles and the 128x128 (tile_m, tile_n) pins.
+    """
+    from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
+    from .flex_match import FLEX_PLAN_ENABLED
+    from .flex_match import match_flex_envelope
+
+    if not FLEX_PLAN_ENABLED:
+        return False
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return False
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(root_grid_ids) != 3 or len(block_ids) != 1 or block_ids[0] in root_grid_ids:
+        return False
+    env = CompileEnvironment.current()
+    state = fn.cute_state
+    if not state.attention_flex_probed:
+        state.attention_flex_probed = True
+        state.attention_flex_match = match_flex_envelope(
+            fn.codegen.codegen_graphs, root_grid_ids, env=env
+        )
+    match = state.attention_flex_match
+    if match is None or block_ids[0] not in match.loop_block_ids:
+        return False
+    if not _attention_config_envelope_ok(config):
+        return False
+    bm = env.block_sizes[match.q_block_id].from_config(config)
+    bn = env.block_sizes[match.kv_block_id].from_config(config)
+    if bm != 128 or bn != 128:
+        return False
+    if any(
+        env.block_sizes[block_id].from_config(config) != 1
+        for block_id in (match.b_block_id, match.h_block_id)
+    ):
+        return False
+    if not flash_head_dims_supported(match.head_dim, match.head_dim_v):
+        return False
+    state.attention_flash_score_plan = match.plan
+    state.attention_flash_block_ids = list(match.loop_block_ids)
+    return True
+
+
 def _detect_attention_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -1025,6 +1100,9 @@ def _detect_attention_mma_loop(
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
+        # The FlexAttention envelope (3-axis grid, BlockMask list walks).
+        if _detect_flex_attention_loop(fn, block_ids, config=config):
+            return True
         # Softmax-free (gated) attention over jagged rows: same tcgen05 body
         # family, selected by the same config envelope (128-row tiles).
         from .cute_flash_gated import detect_gated_attention_loop
@@ -4131,8 +4209,11 @@ class CuteBackend(Backend):
                     # loops (mma_mode) and run a single 128-thread warpgroup
                     # like the spike. The dedicated flash codegen emits the
                     # whole device body; the FX-graph statement walk is bypassed.
+                    # The flex envelope records every loop it owns up front
+                    # (two nests); keep that list instead of the current loop.
                     mma_mode = True
-                    fn.cute_state.attention_flash_block_ids = list(block_ids)
+                    if fn.cute_state.attention_flash_block_ids is None:
+                        fn.cute_state.attention_flash_block_ids = list(block_ids)
                 elif _detect_attention_bwd_mma_loop(
                     fn,
                     block_ids,

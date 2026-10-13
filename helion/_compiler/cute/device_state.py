@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
@@ -861,6 +862,12 @@ class CuteDeviceFunctionState:
         # ``.notes/spikes/fa_tcgen05_spike.py``.
         self.attention_flash_block_ids: list[int] | None = None
         self.attention_flash_score_plan: AttentionScorePlan | None = None
+        # Set by the flex-envelope matcher (``flex_match.py``): the
+        # whole-graph-set match, probed once per device function. Every
+        # device loop of the two BlockMask list walks answers ``mma_mode``
+        # from it, and the flash codegen reads its operands from it.
+        self.attention_flex_match: FlexMatch | None = None
+        self.attention_flex_probed: bool = False
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128

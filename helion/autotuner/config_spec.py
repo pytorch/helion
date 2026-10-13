@@ -1694,6 +1694,16 @@ class ConfigSpec:
         self._cute_flash_plain_row_body: bool = True
         self._cute_flash_has_score_modifiers: bool = False
         self._cute_flash_score_modifier_kinds: tuple[str, ...] = ()
+        # Flex-envelope facts (``score_modifier_kinds == ("flex",)``): the
+        # data-dependent BlockMask list walk (a third variable-trip-count
+        # category next to causal / pruned-interval plans), the captured
+        # region kinds and the separate Q / KV lengths. Recorded here for the
+        # resolver / seed sites that key on them; no searchable field.
+        self._cute_flash_has_list_walk: bool = False
+        self._cute_flash_flex_has_score_region: bool = False
+        self._cute_flash_flex_has_mask_region: bool = False
+        self._cute_flash_q_seq: int | None = None
+        self._cute_flash_kv_seq: int | None = None
         # The kernel's ``fast_math`` setting: the polynomial exp2 packets are
         # approximations and reach the flash surface only under it. Recorded
         # by ``enable_cute_flash_search`` and passed to every flash surface
@@ -2573,6 +2583,11 @@ class ConfigSpec:
         head_dim_v: int | None = None,
         kv_group: int = 1,
         fast_math: bool = False,
+        has_list_walk: bool = False,
+        flex_has_score_region: bool = False,
+        flex_has_mask_region: bool = False,
+        q_seq: int | None = None,
+        kv_seq: int | None = None,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
@@ -2608,6 +2623,11 @@ class ConfigSpec:
         self._cute_flash_has_score_modifiers = has_score_modifiers
         self._cute_flash_score_modifier_kinds = tuple(score_modifier_kinds)
         self._cute_flash_fast_math = fast_math
+        self._cute_flash_has_list_walk = has_list_walk
+        self._cute_flash_flex_has_score_region = flex_has_score_region
+        self._cute_flash_flex_has_mask_region = flex_has_mask_region
+        self._cute_flash_q_seq = q_seq
+        self._cute_flash_kv_seq = kv_seq
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -7428,6 +7448,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # A search surface may pin the default (non-autotuned) block size while
         # widening the autotuner's range (see ``_fragment``).
         self.default_size: int | None = None
+        # The ceiling the kernel declared (``hl.register_block_size`` bounds,
+        # ``update_max`` from an MMA shape analysis), independent of the
+        # dimension's extent; ``None`` when only the extent caps the search
+        # (``update_hint``). Fused surfaces whose tiles overshoot the
+        # dimension (ragged flash rows) check their pins against this.
+        self.declared_max_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -7462,6 +7488,11 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     def update_max(self, value: int) -> None:
         clamped = max(value, 1)
         self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
+        self.declared_max_size = (
+            clamped
+            if self.declared_max_size is None
+            else min(self.declared_max_size, clamped)
+        )
 
     def allow_overshoot(self, ceiling: int) -> None:
         """Raise the autotuner search ceiling above the dimension size.
@@ -7477,8 +7508,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size = max(self.max_size, next_power_of_2(max(ceiling, 1)))
 
     def update_hint(self, value: int) -> None:
+        """Resolve the dimension's extent: it caps ``max_size`` but is not a
+        declared ceiling (see ``declared_max_size``)."""
         self.size_hint = value
-        self.update_max(next_power_of_2(max(value, 1)))
+        self.max_size = min(self.max_size, next_power_of_2(max(value, 1)))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)
