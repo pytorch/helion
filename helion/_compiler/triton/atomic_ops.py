@@ -175,13 +175,38 @@ def _(state: CodegenState) -> ast.AST:
     device_fn.atomic_op_index += 1
     _sync_before_release(state)
 
-    indices = SubscriptIndexing.create(state, target, index)
+    indices = SubscriptIndexing.create(state, target, index, for_store=True)
     name = state.device_function.tensor_arg(target).name
+    output_size = SubscriptIndexing.compute_shape(target, index, state)
+    if indices.has_mask():
+        # Triton's CAS takes no mask: a masked-off lane instead swaps an
+        # element for its own expected value, a no-op.  Each index past its
+        # dim wraps around (clamped in case it is past twice), which keeps
+        # such lanes in bounds without piling them onto a few addresses.
+        fn = state.device_function
+        terms = []
+        for i, index in enumerate(indices.dim_index_exprs):
+            if CompileEnvironment.current().known_equal(target.size(i), 1):
+                continue
+            size = fn.tensor_size(target, i).name
+            stride = fn.tensor_stride(target, i).name
+            terms.append(
+                f"tl.minimum(tl.where({index} < {size}, {index}, {index} - {size}),"
+                f" {size} - 1) * {stride}"
+            )
+        if terms:
+            indices = indices._replace(index_expr=expr_from_string(" + ".join(terms)))
+    offset = indices.broadcast_offset(state, output_size)
 
     exp_ast, val_ast = _to_ast_values([exp_expr, val_expr])
+    if indices.has_mask():
+        mask = state.codegen.lift(indices.mask_expr, dce=True, prefix="cas_mask").id
+        exp = state.codegen.lift(exp_ast, dce=True, prefix="cas_exp").id
+        exp_ast = expr_from_string(exp)
+        val_ast = expr_from_string(f"tl.where({mask}, {{val}}, {exp})", val=val_ast)
     atomic = expr_from_string(
         f"tl.atomic_cas({name} + {{offset}}, {{exp}}, {{val}}, sem={{sem}})",
-        offset=indices.index_expr,
+        offset=offset,
         exp=exp_ast,
         val=val_ast,
         sem=sem,
