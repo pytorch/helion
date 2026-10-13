@@ -2157,11 +2157,23 @@ class SubscriptIndexing(NamedTuple):
                         f"tl.arange(0, {block_size_expr}).to({dtype}))"
                     )
                     index_values.append(f"{index_expr}{expand}")
-                    if not _is_size_one(fake_value.size(i)) or (
-                        for_store and broadcast
+                    # An epilogue-subtile piece of the tile: mask it like the
+                    # tile, by the loop's end rather than the target's size
+                    if state.codegen.mask_var(block_id) and (
+                        not _is_size_one(fake_value.size(i)) or broadcast
                     ):
-                        dim_size = state.device_function.tensor_size(fake_value, i).name
-                        mask_values.setdefault(f"({index_expr} < {dim_size}){expand}")
+                        end = (
+                            state.codegen.active_device_loops[block_id][-1]
+                            .block_id_to_info[block_id]
+                            .end_var_name
+                        )
+                        assert end is not None
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({index_expr} < {end}){expand}")
                 else:
                     index_var = state.codegen.index_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)

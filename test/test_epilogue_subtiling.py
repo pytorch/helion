@@ -216,6 +216,61 @@ class TestEpilogueSubtiling(TestCase):
         )
         _assert_split_codegen(self, code, 2)
 
+    def test_pieces_masked_by_loop_extent(self):
+        """Each piece is masked by the tile's loop extent, not by the target's
+        size: an ``out`` wider than the loop had its tail written."""
+        for static_shapes in (True, False):
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 64], epilogue_subtile=2),
+            )
+            def add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    out[tile_m, tile_n] = a[tile_m, tile_n] + 1.0
+                return out
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 64], epilogue_subtile=2),
+            )
+            def add_one_inner_loop(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m in hl.tile(a.size(0)):
+                    for tile_n in hl.tile(a.size(1)):
+                        out[tile_m, tile_n] = a[tile_m, tile_n] + 1.0
+                return out
+
+            for kernel in (add_one, add_one_inner_loop):
+                with self.subTest(static_shapes=static_shapes, kernel=kernel.name):
+                    a = torch.randn(64, 100, device=DEVICE)
+                    out = torch.zeros(64, 128, device=DEVICE)
+                    expected = out.clone()
+                    expected[:, :100] = a + 1.0
+                    torch.testing.assert_close(kernel(a, out), expected)
+
+    @skipIfCute("CuTe does not subtile a grid whose end is a tensor")
+    def test_pieces_masked_by_tensor_loop_end(self):
+        """A root grid whose end is a tensor names its loaded end, which
+        bounds the pieces."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[16, 64], epilogue_subtile=2),
+        )
+        def add_one(
+            a: torch.Tensor, n: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile([a.size(0), n]):
+                out[tile_m, tile_n] = a[tile_m, tile_n] + 1.0
+            return out
+
+        a = torch.randn(64, 100, device=DEVICE)
+        n = torch.tensor([90], device=DEVICE, dtype=torch.int32)
+        out = torch.zeros(64, 128, device=DEVICE)
+        expected = out.clone()
+        expected[:, :90] = a[:, :90] + 1.0
+        torch.testing.assert_close(add_one(a, n, out), expected)
+
     @skipIfRefEager("test checks generated backend code")
     def test_codegen_s4(self):
         """S=4 produces multiple backend split steps and 4 stores."""
