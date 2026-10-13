@@ -5633,6 +5633,8 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
             "plain_row_body": spec._cute_flash_plain_row_body,
             "score_modifier_kinds": spec._cute_flash_score_modifier_kinds,
             "device_sm_count": spec._cute_flash_device_sm_count,
+            "kv_group": spec._cute_flash_kv_group,
+            "fast_math": spec._cute_flash_fast_math,
         }
         seeds = spec._legalize_cute_flash_compiler_seeds(
             flash_attention_seed_configs(

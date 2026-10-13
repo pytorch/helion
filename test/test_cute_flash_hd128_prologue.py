@@ -1,6 +1,7 @@
-"""hd128 dense FA4 levers: the exp2 packet surface with an LSE output (the
-plain batched packets; the degree-2 polynomial packet stays with the standard
-dense output), the QK0-before-Q1 MMA prologue and the staged first-load order.
+"""hd128 dense FA4 levers: the exp2 packet surface (the plain batched packets;
+the degree-2 polynomial packet is an approximation and is reachable only under
+the ``fast_math`` setting, and then only with the standard dense output), the
+QK0-before-Q1 MMA prologue and the staged first-load order.
 
 The kernel here mirrors ``examples.attention.attention`` (row-plain body with a
 base-2 LSE store), i.e. the surface the attention example autotunes on.
@@ -175,22 +176,32 @@ def test_dense_hd128_lse_surface_offers_the_plain_packets_only() -> None:
     )
 
 
-def test_dense_hd128_standard_output_surface_keeps_the_degree2_packet() -> None:
-    """The standard dense output (no LSE store) keeps its measured packet."""
-    packet = cast(
-        "object",
-        cute_flash.flash_autotune_fragments(
-            128,
-            16,
-            num_bh=32,
-            dtype=torch.bfloat16,
-            is_causal=False,
-            standard_dense_output=True,
-            standard_causal_output=False,
-            plain_row_body=True,
-        )[cute_flash.FLASH_EXP2_PACKET_KEY],
-    )
-    assert _DEG2_PACKET in tuple(packet.choices)  # pyrefly: ignore[missing-attribute]
+def _standard_output_packet_fragment(*, fast_math: bool) -> object:
+    return cute_flash.flash_autotune_fragments(
+        128,
+        16,
+        num_bh=32,
+        dtype=torch.bfloat16,
+        is_causal=False,
+        standard_dense_output=True,
+        standard_causal_output=False,
+        plain_row_body=True,
+        fast_math=fast_math,
+    )[cute_flash.FLASH_EXP2_PACKET_KEY]
+
+
+def test_dense_hd128_standard_output_surface_offers_degree2_under_fast_math_only() -> (
+    None
+):
+    """The degree-2 polynomial pass is an approximation (its bf16 P and fp32
+    row statistics are not bitwise those of the exact pass), so even the
+    standard dense output it was measured on offers it only when the kernel
+    opted into ``fast_math``."""
+    default = _standard_output_packet_fragment(fast_math=False)
+    assert set(default.choices) == set(_PLAIN_PACKETS)  # pyrefly: ignore[missing-attribute]
+    fast = _standard_output_packet_fragment(fast_math=True)
+    assert _DEG2_PACKET in tuple(fast.choices)  # pyrefly: ignore[missing-attribute]
+    assert _DEG2_PACKET in tuple(fast.search_choices or fast.choices)  # pyrefly: ignore[missing-attribute]
 
 
 def test_causal_hd128_surface_keeps_the_neutral_packet_only() -> None:
@@ -230,20 +241,27 @@ def test_dense_hd128_resolver_canonicalizes_the_degree2_packet_away_on_the_lse_b
     assert cfg.exp2_packet == "1x1"  # pyrefly: ignore[missing-attribute]
     assert cfg.e2e_schedule == "8/2"  # pyrefly: ignore[missing-attribute]
     with patch.dict(os.environ, {}, clear=True):
-        standard = cute_flash.resolve_flash_config(
-            128,
-            16,
-            {**_WINNER, cute_flash.FLASH_EXP2_PACKET_KEY: _DEG2_PACKET},
-            dtype=torch.bfloat16,
-            num_bh=32,
-            is_causal=False,
-            standard_dense_output=True,
-            standard_causal_output=False,
-            plain_row_body=True,
-        )
-    # The standard dense output keeps the packet and its measured cadence.
-    assert standard.exp2_packet == _DEG2_PACKET
-    assert standard.e2e_schedule == "16/6"
+        standard = {
+            fast_math: cute_flash.resolve_flash_config(
+                128,
+                16,
+                {**_WINNER, cute_flash.FLASH_EXP2_PACKET_KEY: _DEG2_PACKET},
+                dtype=torch.bfloat16,
+                num_bh=32,
+                is_causal=False,
+                standard_dense_output=True,
+                standard_causal_output=False,
+                plain_row_body=True,
+                fast_math=fast_math,
+            )
+            for fast_math in (False, True)
+        }
+    # The standard dense output keeps the packet and its measured cadence under
+    # fast_math only; otherwise the request resolves to the exact default.
+    assert standard[True].exp2_packet == _DEG2_PACKET
+    assert standard[True].e2e_schedule == "16/6"
+    assert standard[False].exp2_packet == "1x1"
+    assert standard[False].e2e_schedule == "8/2"
 
 
 @pytest.mark.parametrize("packet", (*_PLAIN_PACKETS[1:], _DEG2_PACKET))
@@ -489,30 +507,34 @@ def test_causal_plan_is_untouched_by_the_dense_packet_surface() -> None:
     assert causal_score_plan(128) is not None
 
 
-def test_compound_degree2_overrides_require_the_standard_dense_output() -> None:
+def test_compound_degree2_overrides_require_standard_output_and_fast_math() -> None:
     """The structural-qualification path asks the compound-packet overrides
     whether the packet is effective; they agree with the resolver and the
-    fragment surface: the standard dense output only, never the LSE body."""
+    fragment surface: the standard dense output under fast_math only, never
+    the LSE body."""
     common = {"dtype": torch.bfloat16, "is_causal": False}
     requirements = cute_flash._flash_compound_exp2_packet_overrides(
         128,
         16,
         {cute_flash.FLASH_EXP2_PACKET_KEY: _DEG2_PACKET},
         standard_dense_output=True,
+        fast_math=True,
         **common,
     )
     assert requirements[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta"
     assert requirements[cute_flash.FLASH_E2E_SCHEDULE_KEY] == "16/6"
-    assert (
-        cute_flash._flash_compound_exp2_packet_overrides(
-            128,
-            16,
-            {cute_flash.FLASH_EXP2_PACKET_KEY: _DEG2_PACKET},
-            standard_dense_output=False,
-            **common,
+    for standard_dense_output, fast_math in ((False, True), (True, False)):
+        assert (
+            cute_flash._flash_compound_exp2_packet_overrides(
+                128,
+                16,
+                {cute_flash.FLASH_EXP2_PACKET_KEY: _DEG2_PACKET},
+                standard_dense_output=standard_dense_output,
+                fast_math=fast_math,
+                **common,
+            )
+            == {}
         )
-        == {}
-    )
 
 
 @skipIfNotCUDA()

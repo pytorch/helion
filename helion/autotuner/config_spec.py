@@ -1673,6 +1673,8 @@ class ConfigSpec:
         self._cute_flash_head_dim_v: int | None = None
         self._cute_flash_num_kv: int | None = None
         self._cute_flash_num_bh: int | None = None
+        # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain rows).
+        self._cute_flash_kv_group: int = 1
         # SM count of the bound device (0 when unknown); small grids seed the
         # 64-row flash tile from it.
         self._cute_flash_device_sm_count: int = 0
@@ -1692,6 +1694,11 @@ class ConfigSpec:
         self._cute_flash_plain_row_body: bool = True
         self._cute_flash_has_score_modifiers: bool = False
         self._cute_flash_score_modifier_kinds: tuple[str, ...] = ()
+        # The kernel's ``fast_math`` setting: the polynomial exp2 packets are
+        # approximations and reach the flash surface only under it. Recorded
+        # by ``enable_cute_flash_search`` and passed to every flash surface
+        # call this spec makes (fragments, resolver, seeds, packet overrides).
+        self._cute_flash_fast_math: bool = False
         self._cute_flash_block_size_targets: dict[int, int] = {}
         # Memo for ``flash_autotune_fragments``: every other input is fixed
         # ConfigSpec state, so (topology_override, pipeline_family_override) is
@@ -2014,6 +2021,8 @@ class ConfigSpec:
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
                 head_dim_v=self._cute_flash_head_dim_v,
+                kv_group=self._cute_flash_kv_group,
+                fast_math=self._cute_flash_fast_math,
             )
             self._cute_flash_fragments_cache[key] = cached
         return dict(cached)
@@ -2051,6 +2060,8 @@ class ConfigSpec:
             has_row_epilogue=self._cute_flash_has_row_epilogue,
             has_score_modifiers=self._cute_flash_has_score_modifiers,
             score_modifier_kinds=self._cute_flash_score_modifier_kinds,
+            kv_group=self._cute_flash_kv_group,
+            fast_math=self._cute_flash_fast_math,
         )
 
     def _cute_flash_config_topology(self, config: Mapping[str, object]) -> str:
@@ -2207,6 +2218,7 @@ class ConfigSpec:
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
                 head_dim_v=self._cute_flash_head_dim_v,
+                fast_math=self._cute_flash_fast_math,
             )
         )
         if self._cute_flash_requires_ws_overlap:
@@ -2559,6 +2571,8 @@ class ConfigSpec:
         score_modifier_kinds: Sequence[str] = (),
         device_sm_count: int = 0,
         head_dim_v: int | None = None,
+        kv_group: int = 1,
+        fast_math: bool = False,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
@@ -2572,6 +2586,7 @@ class ConfigSpec:
         )
         self._cute_flash_num_kv = num_kv
         self._cute_flash_num_bh = num_bh
+        self._cute_flash_kv_group = kv_group
         self._cute_flash_tensor_4d_heads = tensor_4d_heads
         self._cute_flash_dtype = dtype
         self._cute_flash_is_causal = is_causal
@@ -2592,6 +2607,7 @@ class ConfigSpec:
         self._cute_flash_plain_row_body = plain_row_body
         self._cute_flash_has_score_modifiers = has_score_modifiers
         self._cute_flash_score_modifier_kinds = tuple(score_modifier_kinds)
+        self._cute_flash_fast_math = fast_math
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -3287,6 +3303,7 @@ class ConfigSpec:
                     score_modifier_kinds=self._cute_flash_score_modifier_kinds,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                     device_sm_count=self._cute_flash_device_sm_count,
+                    fast_math=self._cute_flash_fast_math,
                 )
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)
@@ -6132,6 +6149,7 @@ class ConfigSpec:
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     head_dim_v=self._cute_flash_head_dim_v,
+                    fast_math=self._cute_flash_fast_math,
                 )
                 if not packet_requirements:
                     raise InvalidConfig(
@@ -6289,6 +6307,7 @@ class ConfigSpec:
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     head_dim_v=self._cute_flash_head_dim_v,
+                    fast_math=self._cute_flash_fast_math,
                 )
                 requested_packet = overrides[FLASH_EXP2_PACKET_KEY]
                 for key, required_value in packet_requirements.items():

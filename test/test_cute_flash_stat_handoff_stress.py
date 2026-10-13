@@ -46,6 +46,7 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
+from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 from helion._testing import skipIfFn
@@ -121,8 +122,15 @@ def _stress(
     q, k, v = (
         torch.randn(*_SHAPE, dtype=torch.bfloat16, device=DEVICE) for _ in range(3)
     )
+    # The polynomial exp2 packets (the XSA route's ``deg2_16x6``) are
+    # approximations and reach the surface only under the fast_math setting.
     kernel = helion.kernel(
-        example.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        example.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        fast_math=config.get("cute_flash_exp2_packet")
+        in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS,
     )
     bound = kernel.bind((q, k, v))
     normalized = bound._normalized_config_copy(helion.Config(**config))

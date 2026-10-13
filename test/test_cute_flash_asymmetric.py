@@ -106,6 +106,7 @@ def _resolve(
     head_dim_v: int | None = HEAD_DIM_V,
     num_kv: int = 32,
     is_causal: bool = True,
+    fast_math: bool = False,
 ) -> cute_flash.FlashAttentionConfig:
     with patch.dict(os.environ, {}, clear=True):
         return cute_flash.resolve_flash_config(
@@ -118,6 +119,7 @@ def _resolve(
             is_causal=is_causal,
             standard_dense_output=not is_causal,
             standard_causal_output=is_causal,
+            fast_math=fast_math,
         )
 
 
@@ -127,7 +129,10 @@ def _fragments(
     head_dim_v: int | None = HEAD_DIM_V,
     num_kv: int = 32,
     is_causal: bool = True,
+    fast_math: bool = False,
 ) -> dict[str, ConfigSpecFragment]:
+    # ``fast_math`` admits the polynomial resident cadences (an approximation);
+    # the default surface keeps the hardware-only resident sibling.
     with patch.dict(os.environ, {}, clear=True):
         return cute_flash.flash_autotune_fragments(
             head_dim,
@@ -138,6 +143,7 @@ def _fragments(
             is_causal=is_causal,
             standard_dense_output=not is_causal,
             standard_causal_output=is_causal,
+            fast_math=fast_math,
         )
 
 
@@ -247,7 +253,7 @@ def test_symmetric_resolution_is_unchanged() -> None:
 
 
 def test_surface_searches_only_the_fa4_family() -> None:
-    fragments = _fragments()
+    fragments = _fragments(fast_math=True)
     assert _active(fragments[FAMILY_KEY]) == ("fa4",)
     # The causal resident packets (every cadence sibling) are keyed on the
     # 128-wide value tiles (their body never touches the Q/K width); the
@@ -258,6 +264,14 @@ def test_surface_searches_only_the_fa4_family() -> None:
     )
     assert _active(fragments[cute_flash.FLASH_Q_TILE_M_KEY]) == (128,)
     assert fragments[FAMILY_KEY].default() == "fa4"
+    # Without the fast_math setting the three polynomial cadences are
+    # withheld; the hardware-only resident sibling stays searched.
+    default = _fragments()
+    assert _active(default[FAMILY_KEY]) == ("fa4",)
+    assert _active(default[cute_flash.FLASH_EXP2_PACKET_KEY]) == (
+        "1x1",
+        cute_flash._FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_XU_EARLY_ACQUIRE_EXP2_PACKET,
+    )
 
 
 def test_seeds_resolve_to_the_fa4_family() -> None:
@@ -271,10 +285,11 @@ def test_seeds_resolve_to_the_fa4_family() -> None:
             is_causal=True,
             standard_causal_output=True,
             target_device_capability=(10, 0),
+            fast_math=True,
         )
     assert seeds
     assert len(seeds) == len({seed.to_json() for seed in seeds})
-    resolved_seeds = [_resolve(seed.config) for seed in seeds]
+    resolved_seeds = [_resolve(seed.config, fast_math=True) for seed in seeds]
     for resolved in resolved_seeds:
         assert resolved.pipeline_family == "fa4"
         # Either the direct-store two-slot ring or FA4's structure for the
@@ -348,6 +363,64 @@ def test_seeds_resolve_to_the_fa4_family() -> None:
         and resolved.causal_loop_split
     )
     assert direct_schedules == ["16/2", "16/4", "16/6", "8/2", "xu", "xu"]
+
+
+def test_default_seeds_keep_the_staged_structures_on_the_hardware_sibling() -> None:
+    # Without the fast_math setting the polynomial resident cadences leave
+    # the surface; the staged pair structures are seeded on the hardware-only
+    # resident sibling instead (their dead phase offsets dropped) and the
+    # duplicates this creates fold, so no seed carries a polynomial packet.
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = cute_flash.flash_attention_seed_configs(
+            HEAD_DIM,
+            32,
+            head_dim_v=HEAD_DIM_V,
+            dtype=torch.bfloat16,
+            num_bh=64,
+            is_causal=True,
+            standard_causal_output=True,
+            target_device_capability=(10, 0),
+        )
+    assert len(seeds) == len({seed.to_json() for seed in seeds})
+    resolved_seeds = [_resolve(seed.config) for seed in seeds]
+    hardware = "causal_hd128_resident3_013_prefetch2_xu_early_acquire"
+    for resolved in resolved_seeds:
+        assert resolved.pipeline_family == "fa4"
+        assert resolved.exp2_packet not in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS
+    staged = [resolved for resolved in resolved_seeds if resolved.uneven_kv_ring]
+    assert sorted(
+        (
+            resolved.exp2_packet,
+            resolved.e2e_schedule,
+            resolved.softmax_regs,
+            resolved.rescale_threshold,
+            resolved.wait_hint,
+        )
+        for resolved in staged
+    ) == sorted(
+        [
+            ("1x1", "xu", 200, 8.0, 10_000_000),
+            (hardware, "xu", 160, 32.0, 0),
+            (hardware, "xu", 160, 8.0, 0),
+            (hardware, "xu", 192, 8.0, 0),
+            (hardware, "xu", 200, 8.0, 10_000_000),
+        ]
+    )
+    for resolved in staged:
+        if resolved.exp2_packet == hardware:
+            assert (resolved.e2e_freq, resolved.e2e_res) == (16, 0)
+            assert (resolved.e2e_offset, resolved.e2e_offset0) == (0, 0)
+    # The direct-store fallbacks: the descending loop-split schedule with the
+    # default and the XU cadence, plus the generic seed of the hardware-only
+    # resident packet (the polynomial cadences' generic seeds fold into it).
+    direct_schedules = sorted(
+        resolved.e2e_schedule
+        for resolved in resolved_seeds
+        if not resolved.uneven_kv_ring
+        and resolved.causal_kv_order == "descending"
+        and resolved.causal_loop_split
+    )
+    assert direct_schedules == ["8/2", "xu", "xu"]
 
 
 # --------------------------------------------------------------------------
@@ -680,8 +753,17 @@ def test_o_over_q_opens_the_staged_epilogue_search_for_the_pair() -> None:
     assert _active(fragments[cute_flash.FLASH_O_OVER_Q_KEY]) == (False, True)
     assert set(_active(fragments[cute_flash.FLASH_EPI_TMA_KEY])) == {False, True}
     assert set(_active(fragments[cute_flash.FLASH_EPI_STG_KEY])) == {False, True}
-    symmetric = _fragments(head_dim=128, head_dim_v=None)
-    assert _active(symmetric[cute_flash.FLASH_O_OVER_Q_KEY]) == (False,)
+    # Symmetric surfaces search it only where another knob needs the ring
+    # depth it buys: the plain causal hd128 body, whose staggered walk
+    # (``cute_flash_causal_stagger``) needs four slots that the separate
+    # staged-output buffer cannot reach; the dense hd128 and the hd64
+    # surfaces keep it pinned.
+    causal_hd128 = _fragments(head_dim=128, head_dim_v=None)
+    assert _active(causal_hd128[cute_flash.FLASH_O_OVER_Q_KEY]) == (False, True)
+    dense_hd128 = _fragments(head_dim=128, head_dim_v=None, is_causal=False)
+    assert _active(dense_hd128[cute_flash.FLASH_O_OVER_Q_KEY]) == (False,)
+    causal_hd64 = _fragments(head_dim=64, head_dim_v=None)
+    assert _active(causal_hd64[cute_flash.FLASH_O_OVER_Q_KEY]) == (False,)
 
 
 def test_o_over_q_schedule_aliases_the_output_tiles_on_the_q_stages() -> None:
@@ -777,7 +859,9 @@ RESIDENT_PACKET = "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
 
 
 def test_resident_packet_resolves_for_the_pair() -> None:
-    resolved = _resolve({cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET})
+    resolved = _resolve(
+        {cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET}, fast_math=True
+    )
     assert resolved.exp2_packet == RESIDENT_PACKET
     # The packet pins its measured structure (the hd128 compound overrides).
     assert resolved.e2e_schedule == "16/6"
@@ -792,15 +876,24 @@ def test_resident_packet_resolves_for_the_pair() -> None:
             cute_flash.FLASH_UNEVEN_KV_RING_KEY: True,
             cute_flash.FLASH_O_OVER_Q_KEY: True,
             cute_flash.FLASH_EPI_TMA_KEY: True,
-        }
+        },
+        fast_math=True,
     )
     assert resolved.exp2_packet == RESIDENT_PACKET
     assert resolved.uneven_kv_ring and resolved.o_over_q and resolved.epi_tma
+    # Without the fast_math setting the polynomial cadence resolves to the
+    # exact default packet.
+    assert (
+        _resolve({cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET}).exp2_packet
+        == "1x1"
+    )
     # The plain cadence packets stay off the pair; the dense pair has none.
     assert _resolve({cute_flash.FLASH_EXP2_PACKET_KEY: "8x1"}).exp2_packet == "1x1"
     assert (
         _resolve(
-            {cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET}, is_causal=False
+            {cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET},
+            is_causal=False,
+            fast_math=True,
         ).exp2_packet
         == "1x1"
     )
@@ -818,21 +911,25 @@ def test_resident_packet_overrides_key_on_the_value_head_dim() -> None:
         is_causal=True,
         standard_causal_output=True,
         head_dim_v=HEAD_DIM_V,
+        fast_math=True,
     )
     assert overrides[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
     assert overrides[cute_flash.FLASH_E2E_SCHEDULE_KEY] == "16/6"
-    # Without the value width the 192-wide request is not a resident shape.
-    assert (
-        cute_flash._flash_compound_exp2_packet_overrides(
-            HEAD_DIM,
-            32,
-            {cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET},
-            dtype=torch.bfloat16,
-            is_causal=True,
-            standard_causal_output=True,
+    # Without the value width the 192-wide request is not a resident shape;
+    # without the fast_math setting the polynomial cadence is not effective.
+    for ineligible in ({"fast_math": True}, {"head_dim_v": HEAD_DIM_V}):
+        assert (
+            cute_flash._flash_compound_exp2_packet_overrides(
+                HEAD_DIM,
+                32,
+                {cute_flash.FLASH_EXP2_PACKET_KEY: RESIDENT_PACKET},
+                dtype=torch.bfloat16,
+                is_causal=True,
+                standard_causal_output=True,
+                **ineligible,
+            )
+            == {}
         )
-        == {}
-    )
 
 
 def test_resident_packet_gate_follows_the_hd128_causal_one() -> None:
@@ -844,6 +941,7 @@ def test_resident_packet_gate_follows_the_hd128_causal_one() -> None:
     key = cute_flash.FLASH_EXP2_PACKET_KEY
     variants: tuple[dict[str, object], ...] = (
         {},
+        {"fast_math": False},
         {"has_kv_tile_pruning": True},
         {"small_biased_candidate": True},
         {"dtype": torch.float16},
@@ -856,6 +954,7 @@ def test_resident_packet_gate_follows_the_hd128_causal_one() -> None:
             "num_bh": 64,
             "is_causal": True,
             "standard_causal_output": True,
+            "fast_math": True,
             **extra,
         }
         with patch.dict(os.environ, {}, clear=True):

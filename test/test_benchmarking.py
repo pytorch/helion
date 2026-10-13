@@ -3762,6 +3762,9 @@ def _full_autotune_config_spec():
         dtype=torch.float16,
         block_size_targets={0: 1, 1: 128, 2: 128},
         standard_dense_output=True,
+        # The compound-transfer fixtures project onto the degree-2 packet,
+        # which the surface offers under fast_math only.
+        fast_math=True,
     )
     seeds = spec.autotune_seed_configs()
     assert seeds
@@ -4370,10 +4373,27 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     # surface also seeds upstream's distinct flat ws_overlap grid, the dense
     # hd64 surface the two measured wide fa4_local_tma packets and the causal
     # hd64 surface the three measured causal bodies (the paired 16-column
-    # score-load body at s2048 and s8192 and the hybrid s4096 body).
-    assert policy["raw_config_count"] == (13 if causal else 33)
-    assert len(policy["effective_config_ids"]) == (13 if causal else 32)
-    assert len(generation_zero_ids) == 100
+    # score-load body at s2048 and s8192 and the hybrid s4096 body) and the
+    # staggered descending split walk at ring 4 (``cute_flash_causal_stagger``,
+    # one seed from the fragment defaults; the target seed's parent dedupes).
+    # The examples run without the fast_math setting, so no seed carries a
+    # polynomial exp2 packet: each such seed keeps its structure on the exact
+    # default packet instead (the same raw and effective counts).
+    assert policy["raw_config_count"] == (14 if causal else 33)
+    assert len(policy["effective_config_ids"]) == (14 if causal else 32)
+    # Generation zero retains every seed and every structural coverage row;
+    # their union may exceed the nominal 100 rows (the dense hd64 surface's
+    # resident lowerings widen the design and it seeds the two fa4_local_tma
+    # packets on top, 101 rows).
+    from helion.autotuner.search_space_logger import canonical_config_id
+
+    coverage_ids = {
+        canonical_config_id(config)
+        for config in generation.flash_deterministic_population_configs()
+    }
+    assert len(generation_zero_ids) == max(
+        100, len(coverage_ids | set(policy["effective_config_ids"]))
+    )
     assert set(policy["effective_config_ids"]) <= set(generation_zero_ids)
 
 
@@ -4383,17 +4403,24 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
         # Include legal stateful schedules/mappings and upstream's flat grid,
         # D128 batched exp2 packets and alternating-warpgroup family; the
         # dense hd64 surface also seeds the two wide fa4_local_tma packets and
-        # the causal hd64 surface the two measured causal bodies.
+        # the causal hd64 surface the three measured causal bodies.
         ("attention_output", (2, 32, 262144, 128), 18, 18),
-        # The causal hd128 surface seeds the four resident cadence packets.
-        ("causal_attention_output", (2, 32, 524288, 128), 10, 10),
+        # The causal hd128 surface seeds the hardware-only resident cadence
+        # packet (the three polynomial cadences are fast_math-only and fold
+        # onto it without the setting) and the staggered descending split
+        # walk at ring 5 with the output in the Q stages (one seed: the
+        # target seed's and the fragment defaults' parents produce the same
+        # structure).
+        ("causal_attention_output", (2, 32, 524288, 128), 8, 8),
         ("attention_output", (1, 32, 524288, 64), 23, 22),
-        ("causal_attention_output", (1, 32, 1048576, 64), 16, 16),
+        # Every plain causal hd64 surface seeds the staggered walk at ring 4
+        # once on top of its measured bodies.
+        ("causal_attention_output", (1, 32, 1048576, 64), 17, 17),
         ("attention_output", (8, 32, 524288, 64), 1, 1),
-        ("causal_attention_output", (8, 32, 786432, 64), 14, 14),
+        ("causal_attention_output", (8, 32, 786432, 64), 15, 15),
         ("attention_relu_output", (2, 32, 524288, 64), 23, 22),
-        ("causal_attention_relu_output", (2, 32, 1048576, 64), 14, 14),
-        ("causal_attention_output", (2, 32, 65536, 64), 18, 18),
+        ("causal_attention_relu_output", (2, 32, 1048576, 64), 15, 15),
+        ("causal_attention_output", (2, 32, 65536, 64), 19, 19),
     ),
 )
 @skipUnlessCuteAvailable("binding a cute-backend kernel requires the CuTe DSL")
@@ -4700,6 +4727,9 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
             is_causal=is_causal,
             standard_dense_output=not is_causal,
             standard_causal_output=is_causal,
+            # The compound structural leaves the provenance pins exist on
+            # the fast_math surface only.
+            fast_math=True,
         )
         seeds = spec.autotune_seed_configs()
         assert seeds
@@ -5053,6 +5083,8 @@ def test_attention_compound_projection_uses_shape_config_generation(
         is_causal=causal,
         standard_dense_output=not causal,
         standard_causal_output=causal,
+        # The projected polynomial packets are offered under fast_math only.
+        fast_math=True,
     )
     generation = ConfigGeneration(spec)
     source_family = "fa4" if causal else "fa4_2cta"
@@ -8206,6 +8238,8 @@ def test_attention_strict_initial_population_replay_uses_seed_without_rng_leak()
         random.seed(987654321)
         saved_state = random.getstate()
 
+        # The seeds and the coverage design of this surface fill 100 rows by
+        # themselves; ask for more so the seed-dependent random fill exists.
         first_ids = compare_attention_backends._replay_strict_attention_initial_population_config_ids(
             generation,
             random_seed=123,
