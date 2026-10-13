@@ -32,6 +32,7 @@ from torch.fx import map_arg
 from ..autotuner.config_fragment import integer_power_of_two
 from ..language.view_ops import split as hl_split
 from .compile_environment import CompileEnvironment
+from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 
 if TYPE_CHECKING:
@@ -57,6 +58,10 @@ class EpilogueSubtilingCandidate(NamedTuple):
     split_dim: int
     block_id: int | None
     split_size: int | torch.SymInt
+    # Output subscript position that receives the per-piece offset.  For tile
+    # splits this can differ from split_dim (a boundary dim), e.g. for
+    # ``s[tile_n, :].T * acc``; static-slice splits reuse split_dim.
+    output_split_dim: int
 
 
 def apply_epilogue_subtiling(
@@ -158,6 +163,13 @@ def _iter_eligible_epilogue_chains(
             continue
 
         split_dim, block_id, split_size = split_candidate
+        output_split_dim = (
+            split_dim
+            if block_id is None
+            else _find_output_split_dim(env, output_node, block_id)
+        )
+        if output_split_dim is None:
+            continue
         yield EpilogueSubtilingCandidate(
             output_node=output_node,
             pointwise_nodes=pointwise_nodes,
@@ -165,7 +177,38 @@ def _iter_eligible_epilogue_chains(
             split_dim=split_dim,
             block_id=block_id,
             split_size=split_size,
+            output_split_dim=output_split_dim,
         )
+
+
+def _find_output_split_dim(
+    env: CompileEnvironment,
+    output_node: torch.fx.Node,
+    block_id: int,
+) -> int | None:
+    """Find the single output subscript position indexed by ``block_id``.
+
+    Returns None if the tile is not indexed directly at exactly one position, or
+    if it also feeds a tensor indexer (e.g. ``idx[tile_m]``), which would not be
+    split along with the stored value.
+    """
+    subscript_arg = output_node.args[1]
+    if not isinstance(subscript_arg, (list, tuple)):
+        return None
+    positions = []
+    for i, subscript in enumerate(subscript_arg):
+        if not isinstance(subscript, torch.fx.Node):
+            continue
+        if (info := subscript_tile_info(env, subscript)) is not None:
+            if info.block_id == block_id:
+                positions.append(i)
+            continue
+        val = subscript.meta.get("val")
+        if isinstance(val, torch.Tensor) and any(
+            env.get_block_id(size) == block_id for size in val.shape
+        ):
+            return None
+    return positions[0] if len(positions) == 1 else None
 
 
 def _rewrite_chain(
@@ -233,7 +276,7 @@ def _rewrite_chain(
         graph,
         candidate.output_node,
         pw_results,
-        split_dim,
+        candidate.output_split_dim,
         piece_shape_size,
         piece_block_size,
         block_id,
@@ -309,7 +352,7 @@ def _rewrite_output_node(
     graph: torch.fx.Graph,
     output_node: torch.fx.Node,
     pieces: list[torch.fx.Node],
-    split_dim: int,
+    output_dim: int,
     piece_shape_size: int | torch.SymInt,
     piece_block_size: int | torch.SymInt,
     block_id: int | None,
@@ -325,11 +368,11 @@ def _rewrite_output_node(
             if block_id is None:
                 # Static-slice split: rewrite ":" into concrete slice ranges.
                 offset = piece_idx * piece_shape_size
-                new_subscript[split_dim] = slice(offset, offset + piece_shape_size)
+                new_subscript[output_dim] = slice(offset, offset + piece_shape_size)
             else:
-                base_index_node = subscript[split_dim]
+                base_index_node = subscript[output_dim]
                 assert isinstance(base_index_node, torch.fx.Node)
-                new_subscript[split_dim] = _new_subtile_index_node(
+                new_subscript[output_dim] = _new_subtile_index_node(
                     graph,
                     base_index_node,
                     piece_idx,
@@ -370,13 +413,16 @@ def _new_subtile_index_node(
     block_id: int,
 ) -> torch.fx.Node:
     offset = piece_idx * piece_shape_size
+    # Keep any offset already on the subscript, e.g. out[tile_n.index + 8].
+    base_tile = base_index_node.meta.get("tile_with_offset")
+    base_offset = base_tile.get("offset", 0) if isinstance(base_tile, dict) else 0
     node = graph.call_function(operator.add, (base_index_node, 0))
     node.meta = {
         **base_index_node.meta,
         "val": base_index_node.meta["val"] + offset,
         "tile_with_offset": {
             "block_id": block_id,
-            "offset": offset,
+            "offset": base_offset + offset,
             "block_size": piece_block_size,
         },
     }
