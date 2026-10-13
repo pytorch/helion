@@ -29,6 +29,7 @@ from helion._testing import code_and_output
 from helion._testing import get_test_dot_precision
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
@@ -220,6 +221,119 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 @onlyBackends(["triton", "cute"])
 class TestDot(RefEagerTestBase, TestCase):
+    def test_hl_dot_masks_computed_operands_along_k(self):
+        """``hl.dot`` sums over K, so the products past the K tile must be 0:
+        two computed operands (``x + 1``, a broadcast add) both held real
+        values there, and K=40 with 16-wide tiles summed them."""
+        config = helion.Config(block_sizes=[16, 16, 16])
+
+        @helion.kernel(static_shapes=True, config=config)
+        def dot_plus_one(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = y.size(1)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        x[tile_m, tile_k] + 1.0, y[tile_k, tile_n] + 1.0, acc=acc
+                    )
+                out[tile_m, tile_n] = acc
+            return out
+
+        @helion.kernel(static_shapes=True, config=config)
+        def dot_with_biases(
+            x: torch.Tensor, c: torch.Tensor, y: torch.Tensor, d: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n = y.size(1)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    a = x[tile_m, tile_k] + c[tile_m][:, None]
+                    b = y[tile_k, tile_n] + d[tile_n][None, :]
+                    acc = hl.dot(a, b, acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 40, device=DEVICE)
+        y = torch.randn(40, 32, device=DEVICE)
+        c = torch.randn(32, device=DEVICE)
+        d = torch.randn(32, device=DEVICE)
+        tolerance = {"rtol": 1e-2, "atol": 1e-1}
+        torch.testing.assert_close(
+            dot_plus_one(x, y), (x + 1.0) @ (y + 1.0), **tolerance
+        )
+        torch.testing.assert_close(
+            dot_with_biases(x, c, y, d),
+            (x + c[:, None]) @ (y + d[None, :]),
+            **tolerance,
+        )
+
+    def test_hl_dot_operand_also_summed(self):
+        """A sum of a dot operand ahead of the dot masks it too: it must not
+        reuse the dot's mask, which comes after it, nor keep the dot's operand
+        masked when the loaded partner's zeros already cancel its padding."""
+
+        @helion.kernel(
+            static_shapes=True, config=helion.Config(block_sizes=[16, 16, 16])
+        )
+        def sum_and_dot(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            n = y.size(1)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            sums = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                total = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    p = torch.exp(x[tile_m, tile_k])
+                    total = total + torch.sum(p, -1)
+                    acc = hl.dot(p, y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc
+                sums[tile_m, tile_n] = total[:, None].expand_as(acc)
+            return out, sums
+
+        x = torch.randn(32, 40, device=DEVICE)
+        y = torch.randn(40, 32, device=DEVICE)
+        out, sums = sum_and_dot(x, y)
+        torch.testing.assert_close(out, torch.exp(x) @ y, rtol=1e-2, atol=1e-1)
+        torch.testing.assert_close(
+            sums, torch.exp(x).sum(-1)[:, None].expand(32, 32), rtol=1e-4, atol=1e-4
+        )
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_hl_dot_masks_computed_float8_operands_along_k(self):
+        """Float8 conversions of computed operands hold real values past the K
+        tile too (K=48 in 32-wide tiles: float8 matmuls need K divisible by
+        16)."""
+
+        @helion.kernel(
+            static_shapes=True, config=helion.Config(block_sizes=[16, 16, 32])
+        )
+        def dot_float8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = y.size(1)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    a = (x[tile_m, tile_k] + 1.0).to(torch.float8_e4m3fn)
+                    b = (y[tile_k, tile_n] + 1.0).to(torch.float8_e4m3fn)
+                    acc = hl.dot(a, b, acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 48, device=DEVICE)
+        y = torch.randn(48, 32, device=DEVICE)
+        expected = (x + 1.0).to(torch.float8_e4m3fn).float() @ (y + 1.0).to(
+            torch.float8_e4m3fn
+        ).float()
+        torch.testing.assert_close(dot_float8(x, y), expected, rtol=1e-2, atol=1e-1)
+
     @skipIfNotTriton(
         "asserts the tl.dot/tl.cast codegen; test_input_* cover the numerics"
     )
