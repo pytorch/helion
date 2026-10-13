@@ -1088,6 +1088,59 @@ class TestPallasJaggedCarryRejects(TestCase):
                 helion.Config(block_sizes=[16, 128, 128], pallas_loop_type=loop_type)
             )
 
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_skipping_nonempty_group_rejected(self, loop_type: str) -> None:
+        # At an unaligned group boundary, each group adds the shared boundary
+        # rows saved in the carry buffer by the last group that stored, so a
+        # conditional skipping a non-empty group (around the row loop or its
+        # store) makes its successor add a stale boundary;
+        # test_carry_scalar_branch_store covers an `if` storing the same tile in
+        # both branches.
+        @helion.kernel(backend="pallas")
+        def conditional_store(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            min_rows: hl.constexpr,
+            kind: hl.constexpr,
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s, e = seq_offsets[g], seq_offsets[g + 1]
+                col_end = e - s if kind == "dyn_col" else D
+                if e - s > min_rows if kind == "outer" else True:
+                    for st in hl.tile(s, e):
+                        for dt in hl.tile(0, col_end):
+                            if e - s > min_rows if kind == "inner" else True:
+                                hl.store(
+                                    out,
+                                    [st, dt],
+                                    jagged[st, dt] * 2,
+                                    extra_mask=(
+                                        st.index[:, None] < e
+                                        if kind == "mask"
+                                        else None
+                                    ),
+                                )
+            return out
+
+        seq_offsets, jagged, _ = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
+        config = helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+        # `e - s > 0` around the row loop only skips empty groups.
+        conditional_store.bind((seq_offsets, jagged, 0, "outer")).to_code(config)
+        for kind, min_rows, msg in (
+            ("outer", 8, "may skip the row loop or its store"),
+            ("inner", 8, "may skip the row loop or its store"),
+            ("dyn_col", 0, "may skip the row loop or its store"),
+            ("mask", 0, "extra_mask on a carried store is not supported"),
+        ):
+            conditional_store.reset()
+            with self.assertRaisesRegex(exc.BackendUnsupported, msg):
+                conditional_store.bind((seq_offsets, jagged, min_rows, kind)).to_code(
+                    config
+                )
+
     def test_non_jagged_emit_pipeline_unaffected(self) -> None:
         # Static (compile-time) tile bounds never trip the gate: a plain
         # emit_pipeline matmul still lowers and runs correctly.
