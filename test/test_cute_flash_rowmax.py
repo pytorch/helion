@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 import dataclasses
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
@@ -216,7 +217,9 @@ def test_causal_hardware_maximum_only_updates_unmasked_rows(
     assert config.rowmax == "tmem"
     # The unacknowledged whole-row causal protocol remains canonically unavailable.
     assert config.softmax_disc
-    assert "fa4_disc_rowmax_causal_balanced" in source
+    # The masked tiles keep the software causal reduce (with the store-back
+    # of ``cute_flash_causal_mask_storeback`` on the plain body).
+    assert re.search(r"fa4_disc_rowmax_causal(_store)?_balanced", source)
     assert "disc_rowmax_ldred" in source
 
 
@@ -238,7 +241,7 @@ def test_partial_resident_causal_scores_retain_hardware_maxima() -> None:
             "for flash_kv_unmask_iter"
         )
     ]
-    assert "fa4_disc_rowmax_causal_balanced" in masked
+    assert re.search(r"fa4_disc_rowmax_causal(_store)?_balanced", masked)
     assert "flash_res_red" not in masked
 
 

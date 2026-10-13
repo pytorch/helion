@@ -468,6 +468,43 @@ def gemm_ptx_precomputed_qk(
 
 
 @cute.jit
+def shift_ptx_smem_desc(
+    tCrB_layout: cute.Layout,
+    smem_var_name_prefix: str,
+    smem_offset: int,
+) -> None:
+    """Apply ``gemm_ptx_precomputed_qk``'s descriptor shift without issuing MMAs.
+
+    The precomputed A descriptors are shared PTX registers that every
+    ``gemm_ptx_precomputed_qk`` call moves by its ``smem_offset`` (the two Q
+    stages alternate -/+ one stage stride), so a skipped QK must still move
+    them to keep the next call's slot right.
+    """
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    llvm.inline_asm(
+        None,
+        [],
+        "{\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_a_hi;\n\t"
+        + "".join(
+            (
+                f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, "
+                f"{smem_var_name_prefix}_{k};\n\t"
+                f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                f"mov.b64 {smem_var_name_prefix}_{k}, "
+                "{smem_desc_a_lo, smem_desc_a_hi};\n\t"
+            )
+            for k in range(num_k_tile)
+        )
+        + "}\n",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def declare_ptx_smem_desc_base(
     smem_desc_start_a: Int32,
     smem_desc_base_a: int,

@@ -55,6 +55,15 @@ _DEG1_SHORT_PACKET = "deg1_8x2_corr10"
 _CAUSAL_HD128_RESIDENT_PACKET = (
     "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
 )
+_CAUSAL_HD128_RESIDENT_16X4_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_deg2_16x4_early_acquire"
+)
+_CAUSAL_HD128_RESIDENT_16X2_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_deg2_16x2_early_acquire"
+)
+_CAUSAL_HD128_RESIDENT_XU_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_xu_early_acquire"
+)
 
 
 @helion.kernel(backend="cute", static_shapes=True)
@@ -638,6 +647,8 @@ def _emit_causal_resident_native_source(
         manual_overrides = dict(seed.config)
         if config_overrides is not None:
             manual_overrides.update(config_overrides)
+        # The resolver sees the render's target (as the bind path's does):
+        # the dead-tile skip is pinned off on the resident-native route.
         config = cute_flash.resolve_flash_config(
             64,
             num_kv,
@@ -810,7 +821,9 @@ def test_online_softmax_codegen_preserves_target_alpha_schedules() -> None:
         "flash_s_full_phase ^= 1",
         "flash_scale_t[flash_s_corr_prod_index, 0, flash_local_tidx] = flash_alpha",
         "flash_minus_max_scale =",
-        "fa4_disc_exp_convert_store_pipe_causal",
+        # The masked segment stores the masked scores back in PASS1 and runs
+        # the plain PASS2 helper (``cute_flash_causal_mask_storeback``).
+        "fa4_disc_exp_convert_store_pipe(",
         "flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum",
     )
     _assert_source_markers_in_order(b200_masked, b200_markers)
@@ -952,6 +965,22 @@ def test_degree2_packet_codegen_route_is_exact_and_manual_only() -> None:
         False,
         True,
     )
+    # The resident cadence siblings: the degree-2 route follows the residue
+    # pairs, so the hardware-only cadence (residue zero) reports no route.
+    for packet, e2e_res, emu_batch, degree2 in (
+        (_CAUSAL_HD128_RESIDENT_PACKET, 6, 3, True),
+        (_CAUSAL_HD128_RESIDENT_16X4_PACKET, 4, 2, True),
+        (_CAUSAL_HD128_RESIDENT_16X2_PACKET, 2, 1, True),
+        (_CAUSAL_HD128_RESIDENT_XU_PACKET, 0, 1, False),
+    ):
+        assert cute_flash._flash_disc_exp2_codegen_params(packet, 8, 2) == (
+            16,
+            e2e_res,
+            8,
+            emu_batch,
+            degree2,
+            False,
+        )
     current_packets = {
         "1x1": (1, 1),
         "4x1": (4, 1),
@@ -968,6 +997,66 @@ def test_degree2_packet_codegen_route_is_exact_and_manual_only() -> None:
             False,
             False,
         )
+
+
+def test_hardware_resident_cadence_routes_every_pair_to_the_xu_pipe() -> None:
+    """At residue zero ``_disc_chunk_exp`` never reaches a polynomial route, so
+    the dropped ``degree2`` flag of the hardware-only sibling changes nothing."""
+    packet_route = cute_flash._flash_disc_exp2_codegen_params(
+        _CAUSAL_HD128_RESIDENT_XU_PACKET, 8, 2
+    )
+    assert (packet_route.e2e_freq, packet_route.e2e_res) == (16, 0)
+    assert not packet_route.degree2
+
+    def fma(values, scales, offsets):
+        return (
+            values[0] * scales[0] + offsets[0],
+            values[1] * scales[1] + offsets[1],
+        )
+
+    def polynomial(*_args):
+        raise AssertionError("a polynomial exp2 route executed at residue zero")
+
+    exp2_inputs: list[float] = []
+
+    def hardware_exp2(value):
+        exp2_inputs.append(value)
+        return value
+
+    for degree2 in (False, True):
+        for e2e_offset in range(16):
+            fragment = [float(index) for index in range(32)]
+            exp2_inputs.clear()
+            with (
+                patch.object(_flash_runtime.cute, "size", side_effect=len),
+                patch.object(
+                    _flash_runtime.cute.arch, "fma_packed_f32x2", side_effect=fma
+                ),
+                patch.object(
+                    _flash_runtime.cute.arch, "exp2", side_effect=hardware_exp2
+                ),
+                patch.object(_flash_runtime, "ex2_emulation_2", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg1_2", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg2_2", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_batch", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg1_batch", polynomial),
+                patch.object(_flash_runtime, "ex2_emulation_deg2_batch", polynomial),
+                patch.object(_flash_runtime, "exp2_approx_f16x2_to_f32", polynomial),
+            ):
+                _flash_runtime._disc_chunk_exp(
+                    fragment,
+                    1.0,
+                    0.0,
+                    packet_route.e2e_freq,
+                    packet_route.e2e_res,
+                    e2e_offset,
+                    False,
+                    pair_batch=packet_route.pair_batch,
+                    emu_batch=packet_route.emu_batch,
+                    degree2=degree2,
+                )
+            assert exp2_inputs == [float(index) for index in range(32)]
+            assert fragment == exp2_inputs
 
 
 def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
@@ -1092,6 +1181,7 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
         ),
     ),
 )
+@pytest.mark.parametrize("storeback", (False, True))
 def test_disc_degree_calls_match_runtime_signatures(
     packet: str,
     head_dim: int,
@@ -1099,7 +1189,13 @@ def test_disc_degree_calls_match_runtime_signatures(
     is_causal: bool,
     depth: int,
     required_helper: str,
+    storeback: bool,
 ) -> None:
+    # With ``cute_flash_causal_mask_storeback`` PASS1 stores the masked scores
+    # back and the masked PASS2 runs the plain helper; the knob is inert off
+    # the plain causal fa4 disc body.
+    if storeback and required_helper == "fa4_disc_exp_convert_store_pipe_causal":
+        required_helper = "fa4_disc_exp_convert_store_pipe"
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
             head_dim,
@@ -1112,6 +1208,7 @@ def test_disc_degree_calls_match_runtime_signatures(
                     else "fa4_2cta",
                     cute_flash.FLASH_DISC_PIPE_KEY: depth,
                     cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "standard",
+                    cute_flash.FLASH_CAUSAL_MASK_STOREBACK_KEY: storeback,
                 },
             ),
             dtype=dtype,
@@ -2135,8 +2232,13 @@ def test_causal_hd128_resident_packet_has_structural_search_envelope() -> None:
         )
         packet = fragments[cute_flash.FLASH_EXP2_PACKET_KEY]
         assert isinstance(packet, EnumFragment)
-        assert packet.choices == ("1x1", _CAUSAL_HD128_RESIDENT_PACKET)
-        assert packet.search_choices == ("1x1", _CAUSAL_HD128_RESIDENT_PACKET)
+        resident_packets = (
+            "1x1",
+            *cute_flash._FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKET_CHOICES,
+        )
+        assert packet.choices == resident_packets
+        assert packet.search_choices == resident_packets
+        assert resident_packets[1] == _CAUSAL_HD128_RESIDENT_PACKET
 
     for num_kv in (1, 513, 2049):
         fragments = cute_flash.flash_autotune_fragments(
@@ -2361,16 +2463,87 @@ def test_causal_hd128_resident_seed_matches_sdpa() -> None:
     assert normalized_rmse.item() < 0.003
 
 
-def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
+_HYBRID_PASS2_HELPERS = frozenset(
+    {
+        "fa4_disc_exp_convert_store_pipe",
+        "fa4_disc_exp_convert_store_pipe_causal",
+    }
+)
+_CAUSAL_SPLIT_SEGMENT_LOOP_VARS = {
+    "flash_kv_mask_iter": "masked",
+    "flash_kv_unmask_iter": "unmasked",
+}
+
+
+def _disc_pass2_calls_by_segment(
+    module: ast.Module, helpers: frozenset[str]
+) -> dict[str, list[ast.Call]]:
+    """PASS2 helper calls of the split causal body keyed by their segment.
+
+    The masked diagonal prefix (``for flash_kv_mask_iter``) and the unmasked
+    suffix (``for flash_kv_unmask_iter``) are told apart by the enclosing
+    loop, not by the helper's name: with ``cute_flash_causal_mask_storeback``
+    PASS1 stores the masked scores back and the masked segment runs the plain
+    helper too, at its own (masked) cadence.
+    """
+    calls: dict[str, list[ast.Call]] = {"masked": [], "unmasked": []}
+    for loop in ast.walk(module):
+        if not isinstance(loop, ast.For) or not isinstance(loop.target, ast.Name):
+            continue
+        segment = _CAUSAL_SPLIT_SEGMENT_LOOP_VARS.get(loop.target.id)
+        if segment is None:
+            continue
+        calls[segment].extend(
+            node
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in helpers
+        )
+    return calls
+
+
+def _assert_hybrid_pass2_routes(module: ast.Module) -> None:
+    """Masked segment: degree-2 emulation; unmasked segment: degree 1.
+
+    Holds for both values of ``cute_flash_causal_mask_storeback`` (the knob
+    changes which helper the masked segment calls, not its polynomial).
+    """
+    segments = _disc_pass2_calls_by_segment(module, _HYBRID_PASS2_HELPERS)
+    assert {segment: len(calls) for segment, calls in segments.items()} == {
+        "masked": 2,
+        "unmasked": 2,
+    }
+    for segment, calls in segments.items():
+        polynomial = {"degree2": True} if segment == "masked" else {"degree1": True}
+        for call in calls:
+            assert ast.literal_eval(call.args[8]) == 16
+            assert ast.literal_eval(call.args[9]) == 8
+            keywords = {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in call.keywords
+            }
+            assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}, (
+                segment,
+                call.func.attr,  # pyrefly: ignore[missing-attribute]
+            )
+
+
+@pytest.mark.parametrize("storeback", (False, True))
+def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2(storeback: bool) -> None:
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
             64,
             512,
-            _manual_config(_HYBRID_PACKET),
+            _manual_config(
+                _HYBRID_PACKET,
+                **{cute_flash.FLASH_CAUSAL_MASK_STOREBACK_KEY: storeback},
+            ),
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
         )
+    assert config.causal_mask_storeback is storeback
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
         head_dim=64,
@@ -2383,35 +2556,14 @@ def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
         io_dtype="cutlass.Float16",
         score_plan=causal_score_plan(64),
     )
-    module = ast.Module(body=body, type_ignores=[])
-    pass2_calls = [
-        node
-        for node in ast.walk(module)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "fa4_disc_exp_convert_store_pipe",
-            "fa4_disc_exp_convert_store_pipe_causal",
-        }
-    ]
-    assert len(pass2_calls) == 4
-    for call in pass2_calls:
-        assert ast.literal_eval(call.args[8]) == 16
-        assert ast.literal_eval(call.args[9]) == 8
-        keywords = {
-            keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords
-        }
-        polynomial = (
-            {"degree2": True}
-            if call.func.attr.endswith("_causal")
-            else {"degree1": True}
-        )
-        assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}
+    _assert_hybrid_pass2_routes(ast.Module(body=body, type_ignores=[]))
 
 
+@pytest.mark.parametrize("storeback", (False, True))
 @pytest.mark.parametrize("num_kv", (1024, 4096, 5120, 6144, 7168, 8192))
-def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
+def test_bfloat16_hybrid_packet_uses_audited_causal_routes(
+    num_kv: int, storeback: bool
+) -> None:
     config = next(
         seed.config
         for seed in cute_flash.flash_attention_seed_configs(
@@ -2427,11 +2579,12 @@ def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
         resolved = cute_flash.resolve_flash_config(
             64,
             num_kv,
-            config,
+            {**config, cute_flash.FLASH_CAUSAL_MASK_STOREBACK_KEY: storeback},
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
         )
+    assert resolved.causal_mask_storeback is storeback
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
         head_dim=64,
@@ -2444,29 +2597,7 @@ def test_bfloat16_hybrid_packet_uses_audited_causal_routes(num_kv: int) -> None:
         io_dtype="cutlass.BFloat16",
         score_plan=causal_score_plan(64),
     )
-    module = ast.Module(body=body, type_ignores=[])
-    pass2_calls = [
-        node
-        for node in ast.walk(module)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "fa4_disc_exp_convert_store_pipe",
-            "fa4_disc_exp_convert_store_pipe_causal",
-        }
-    ]
-    assert len(pass2_calls) == 4
-    for call in pass2_calls:
-        keywords = {
-            keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords
-        }
-        polynomial = (
-            {"degree2": True}
-            if call.func.attr.endswith("_causal")
-            else {"degree1": True}
-        )
-        assert keywords == {"pair_batch": 8, "emu_batch": 4, **polynomial}
+    _assert_hybrid_pass2_routes(ast.Module(body=body, type_ignores=[]))
 
 
 @pytest.mark.parametrize(

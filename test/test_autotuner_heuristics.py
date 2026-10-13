@@ -72,7 +72,9 @@ from helion._compiler.cute import cute_flash
 from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_L2_SHIFT_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_SKIP_DEAD_TILE_KEY
 from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
 from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
 from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
@@ -7636,34 +7638,70 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
     def test_cute_flash_causal_hd64_seeds_carry_measured_bodies(self) -> None:
         """The causal hd64 shapes are won by the paired 16-column score-load
-        body (s2048) and the hybrid degree-1 body with 80 correction registers
-        (s4096/s8192); both are seeded so a cold search starts next to them."""
+        body with the 4x1 packet (s2048) and with the 8x2 packet at the 16/6
+        cadence on a seven-stage K/V ring (s8192), and by the hybrid degree-1
+        body with the two-deep chunked PASS2 (s4096); all three are seeded as
+        measured so a cold search starts on them."""
         pair_body = {
             FLASH_PIPELINE_FAMILY_KEY: "fa4",
-            FLASH_EXP2_PACKET_KEY: "8x1",
+            FLASH_EXP2_PACKET_KEY: "4x1",
             FLASH_E2E_SCHEDULE_KEY: "8/2",
             FLASH_MASKED_E2E_SCHEDULE_KEY: "xu",
+            FLASH_E2E_OFFSET_KEY: 4,
+            FLASH_E2E_OFFSET0_KEY: 4,
             FLASH_S_LOAD_REP_KEY: 16,
             FLASH_DISC_PIPE_KEY: 1,
             FLASH_SOFTMAX_REGS_KEY: 168,
             FLASH_CORR_REGS_KEY: 104,
             FLASH_OTHER_REGS_KEY: 56,
-            FLASH_RESCALE_THRESHOLD_KEY: 16.0,
-            FLASH_RESCALE_CHUNK_COLS_KEY: 64,
+            FLASH_RESCALE_THRESHOLD_KEY: 32.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 32,
+            FLASH_FIRST_LOAD_ORDER_KEY: 2,
+            FLASH_WAIT_HINT_KEY: 10000000,
             FLASH_EPI_TMA_KEY: True,
             FLASH_CAUSAL_KV_ORDER_KEY: "descending",
             FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
+            FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
+        }
+        long_body = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_EXP2_PACKET_KEY: "8x2",
+            FLASH_E2E_SCHEDULE_KEY: "16/6",
+            FLASH_MASKED_E2E_SCHEDULE_KEY: "xu",
+            FLASH_E2E_OFFSET_KEY: 14,
+            FLASH_E2E_OFFSET0_KEY: 2,
+            FLASH_KV_STAGE_KEY: 7,
+            FLASH_S_LOAD_REP_KEY: 16,
+            FLASH_DISC_PIPE_KEY: 2,
+            FLASH_SOFTMAX_REGS_KEY: 168,
+            FLASH_CORR_REGS_KEY: 104,
+            FLASH_OTHER_REGS_KEY: 56,
+            FLASH_RESCALE_THRESHOLD_KEY: 16.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_FIRST_LOAD_ORDER_KEY: 4,
+            FLASH_WAIT_HINT_KEY: 0,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
         }
         hybrid_body = {
             FLASH_EXP2_PACKET_KEY: "hybrid_deg1_16x8",
             FLASH_PIPELINE_FAMILY_KEY: "fa4",
-            FLASH_SOFTMAX_REGS_KEY: 192,
-            FLASH_CORR_REGS_KEY: 80,
-            FLASH_RESCALE_THRESHOLD_KEY: 32.0,
-            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_E2E_OFFSET_KEY: 0,
+            FLASH_E2E_OFFSET0_KEY: 4,
+            FLASH_SOFTMAX_REGS_KEY: 200,
+            FLASH_CORR_REGS_KEY: 64,
+            FLASH_OTHER_REGS_KEY: 48,
+            FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 8,
+            FLASH_FIRST_LOAD_ORDER_KEY: 2,
+            FLASH_PRECOMPUTE_QK_DESC_KEY: True,
             FLASH_EPI_TMA_KEY: True,
             FLASH_CAUSAL_KV_ORDER_KEY: "descending",
             FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
         }
         for num_kv in (16, 32, 64):
             with self.subTest(num_kv=num_kv):
@@ -7675,7 +7713,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     is_causal=True,
                     standard_causal_output=True,
                 )
-                for body in (pair_body, hybrid_body):
+                for body in (pair_body, long_body, hybrid_body):
                     matches = [
                         seed.config
                         for seed in seeds
@@ -7699,6 +7737,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                     self.assertEqual(resolved.corr_regs, body[FLASH_CORR_REGS_KEY])
                     self.assertTrue(resolved.causal_loop_split)
+                    self.assertFalse(resolved.causal_skip_dead_tile)
 
     def test_cute_flash_dense_hd64_seeds_carry_local_tma_packets(self) -> None:
         """The fa4_local_tma family wins the dense hd64 shapes with a wide exp2
@@ -7924,11 +7963,16 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 for seed in seeds
                 if seed.config[FLASH_EXP2_PACKET_KEY] == "hybrid_deg1_16x8"
             ]
-            # The packet-loop seed and the measured long-sequence body (80
-            # correction registers, 16-column rescale chunks).
+            # The packet-loop seed and the measured s4096 body (8-column
+            # rescale chunks at threshold 8, TMA epilogue, K-then-V-then-Q
+            # load order); both carry the 200/64/48 register split.
             self.assertEqual(len(hybrid), 2)
             self.assertEqual(
-                sorted(seed.config[FLASH_CORR_REGS_KEY] for seed in hybrid), [64, 80]
+                sorted(seed.config[FLASH_RESCALE_CHUNK_COLS_KEY] for seed in hybrid),
+                [8, 32],
+            )
+            self.assertEqual(
+                [seed.config[FLASH_CORR_REGS_KEY] for seed in hybrid], [64, 64]
             )
             for seed in hybrid:
                 resolved = resolve_flash_config(
