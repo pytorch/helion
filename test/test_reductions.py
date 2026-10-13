@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
@@ -302,6 +303,94 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertIn("fragment_reduce_index", code)
         torch.testing.assert_close(low, (x + 1).amin(-1), equal_nan=True)
         torch.testing.assert_close(high, (x + 1).amax(-1), equal_nan=True)
+
+    @skipIfCute("CuTe does not lower a reduction over a stack")
+    @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")
+    @skipIfPallas("Pallas has no aten.stack lowering")
+    def test_sum_over_stack_of_differently_masked_values(self):
+        """A stack's lanes come from every input, so its masked value is
+        only theirs when they agree: stacking ``xt`` with ``xt + 1`` (padded
+        lanes 0 and 1) and summing over the padded N=3 dim added the 1s."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_of_stack(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0), 2])
+            for tile_m in hl.tile(x.size(0)):
+                xt = x[tile_m, :]
+                out[tile_m, :] = torch.stack([xt, xt + 1], -1).sum(1)
+            return out
+
+        x = torch.randn(32, 3, device=DEVICE)
+        torch.testing.assert_close(
+            row_sums_of_stack(x), torch.stack([x, x + 1], -1).sum(1)
+        )
+
+    def test_sum_with_operand_broadcast_along_reduced_dim(self):
+        """An operand broadcast along the reduced dim holds its real values
+        in that dim's padded lanes (N=3 pads to 4), so adding it to a masked
+        load must not let the sum drop its mask."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_plus(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = (x[tile_m, :] + b[tile_m][:, None]).sum(-1)
+            return out
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_plus_column(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = (x[tile_m, :] + b[tile_m, :]).sum(-1)
+            return out
+
+        x = torch.randn(32, 3, device=DEVICE)
+        b = torch.randn(32, device=DEVICE)
+        expected = (x + b[:, None]).sum(-1)
+        torch.testing.assert_close(row_sums_plus(x, b), expected)
+        torch.testing.assert_close(
+            row_sums_plus_column(x, b[:, None].contiguous()), expected
+        )
+
+    @skipIfMetal("Metal has no aten.expand lowering")
+    def test_sum_with_operand_expanded_along_reduced_dim(self):
+        """Like an implicit broadcast, an ``expand`` along the reduced dim
+        puts the operand's real values in the padded lanes."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_plus_expanded(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile_m in hl.tile(x.size(0)):
+                xt = x[tile_m, :]
+                out[tile_m] = (xt + b[tile_m][:, None].expand_as(xt)).sum(-1)
+            return out
+
+        x = torch.randn(32, 3, device=DEVICE)
+        b = torch.randn(32, device=DEVICE)
+        torch.testing.assert_close(
+            row_sums_plus_expanded(x, b), (x + b[:, None]).sum(-1)
+        )
+
+    @skipIfMetal("Metal has no aten.gather lowering")
+    @skipIfPallas("Pallas does not support int64 tensors")
+    @skipIfTileIR("TileIR does not lower tl.gather")
+    def test_sum_of_gather_along_reduced_dim(self):
+        """A gather's masked-off lanes read the source at index 0, real
+        data, so summing a gather over the padded N=3 dim must keep its
+        mask."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_of_gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = torch.gather(x[tile_m, :], 1, idx[tile_m, :]).sum(-1)
+            return out
+
+        x = torch.randn(32, 3, device=DEVICE)
+        idx = torch.randint(0, 3, (32, 3), device=DEVICE)
+        torch.testing.assert_close(
+            row_sums_of_gather(x, idx), torch.gather(x, 1, idx).sum(-1)
+        )
 
     @onlyBackends(["cute"])
     def test_tile_reduction_after_full_slice_reduction(self):
