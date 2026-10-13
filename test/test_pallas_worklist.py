@@ -1637,6 +1637,86 @@ class TestWorklistConfig(unittest.TestCase):
             )
 
 
+@skipUnlessPallas("fill_owner_tiles writes SMEM refs inside a Pallas kernel")
+class TestFillOwnerTiles(unittest.TestCase):
+    """The in-kernel worklist splits each owner at sublane-aligned rows."""
+
+    @staticmethod
+    def _reference(lengths, block, sublane):
+        tiles = []
+        base = 0
+        for owner, length in enumerate(lengths):
+            end = base + length
+            if length:
+                for tile in range(base - base % sublane, end, block):
+                    start = max(tile, base)
+                    tiles.append((owner, start, min(tile + block, end) - start))
+            base = end
+        return tiles
+
+    @staticmethod
+    def _fill(lengths, block, sublane):
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from helion.runtime.pallas.compact_worklist import aligned_upper_bound
+        from helion.runtime.pallas.compact_worklist import fill_owner_tiles
+
+        owners = len(lengths)
+        upper = aligned_upper_bound(sum(lengths), owners, block, sublane)
+
+        def kernel(offsets_ref, num_work_ref, owner_ref, start_ref, extent_ref):
+            def owner_tiles(owner, num_work):
+                base = offsets_ref[owner]
+                length = offsets_ref[owner + 1] - base
+                return fill_owner_tiles(
+                    num_work,
+                    owner,
+                    base,
+                    length,
+                    block,
+                    sublane,
+                    owner_ref,
+                    start_ref,
+                    extent_ref,
+                )
+
+            num_work_ref[0] = jax.lax.fori_loop(0, owners, owner_tiles, jnp.int32(0))
+
+        smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+        table = jax.ShapeDtypeStruct((upper,), jnp.int32)
+        num_work, owner, start, extent = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((1,), jnp.int32), table, table, table),
+            in_specs=[smem],
+            out_specs=(smem, smem, smem, smem),
+            interpret=is_pallas_interpret(),
+        )(jnp.asarray(_offsets(lengths).numpy()))
+        tiles = [
+            (int(owner[i]), int(start[i]), int(extent[i]))
+            for i in range(int(num_work[0]))
+        ]
+        return tiles, upper
+
+    def test_matches_reference(self):
+        mixed = [0, 5, 0, 40, 3, 0, 100]
+        for lengths, block, sublane in (
+            (mixed, 16, 16),
+            (mixed, 32, 16),
+            ([7, 13, 9], 8, 8),
+            ([0, 0, 0], 32, 16),
+        ):
+            with self.subTest(lengths=lengths, block=block, sublane=sublane):
+                tiles, upper = self._fill(lengths, block, sublane)
+                self.assertEqual(tiles, self._reference(lengths, block, sublane))
+                self.assertLessEqual(len(tiles), upper)
+                for _owner, start, extent in tiles:
+                    # Each tile fits the aligned window the kernel reads.
+                    end = start + extent
+                    window = -(-end // sublane) * sublane - (start - start % sublane)
+                    self.assertLessEqual(window, block)
+
+
 @onlyBackends(["pallas"])
 class TestWorklistLoopDispatch(unittest.TestCase):
     @staticmethod
