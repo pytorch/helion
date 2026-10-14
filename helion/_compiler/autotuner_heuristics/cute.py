@@ -1886,7 +1886,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return bool(cls.get_seed_configs(env, device_ir))
+        return bool(env.config_spec.matmul_facts)
 
     @classmethod
     def get_seed_config(
@@ -2180,6 +2180,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         # native-MMA seeds instead of measuring the requested collective.
         if spec.cute_tcgen05_search_enabled or spec.cute_flash_search_enabled:
             return []
+        placements = cute_matmul_root_placements(env, device_ir)
         axes = cls._axes(env, device_ir)
         if not axes:
             return []
@@ -2187,13 +2188,12 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
         }
         axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
-        singleton_axes = set(blocks) - axis_ids
+        non_matmul_axes = blocks.keys() - axis_ids
+        root_axes = {block_id for _, root in placements for block_id in root}
+        singleton_axes = root_axes & non_matmul_axes
         if any(blocks[block_id].max_size != 1 for block_id in singleton_axes):
             return []
-        fp32_inputs = any(
-            fact.lhs_dtype == torch.float32
-            for fact, _root in cute_matmul_root_placements(env, device_ir)
-        )
+        fp32_inputs = any(fact.lhs_dtype == torch.float32 for fact, _root in placements)
         fixed_k = axis_ids - set(blocks)
         if any(
             block_id not in {k for _, _, k, _ in axes}
@@ -2235,6 +2235,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                 for m, n, k, _ in axes
                 for block_id, value in zip((m, n, k), (128 // bn, bn, 1), strict=True)
             }
+            for block_id in non_matmul_axes:
+                values[block_id] = fragments[block_id].default()
+                threads[block_id] = 0
             values.update(dict.fromkeys(singleton_axes, 1))
             threads.update(dict.fromkeys(singleton_axes, 0))
             if not all(
