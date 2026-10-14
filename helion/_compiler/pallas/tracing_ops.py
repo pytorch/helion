@@ -2023,31 +2023,6 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
-def _pipeline_begin_alignment(
-    begin_expr: str,
-    state: CodegenState,
-) -> int | None:
-    """Return a proven divisor of ``begin_expr``, or ``None``.
-
-    A nested-tile inner loop's begin is its outer loop's ``offset_var``, which is
-    a multiple of the outer block size when that outer loop begins at 0 — so it
-    needs no extra pad. Returns that block size in that case.
-    """
-    for block_id, loops in state.codegen.active_device_loops.items():
-        if not loops:
-            continue
-        if state.codegen.offset_var(block_id) != begin_expr:
-            continue
-        info = loops[-1].block_id_to_info.get(block_id)
-        # Only sound when the outer loop begins at 0, so the offset is a clean
-        # multiple of the outer block size.
-        if info is None or info.begin_expr not in (0, sympy.Integer(0)):
-            return None
-        outer_bs = state.device_function.resolved_block_size(block_id)
-        return outer_bs if isinstance(outer_bs, int) else None
-    return None
-
-
 def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
     """Return a direct ``end = begin + constant`` loop extent, if present.
 
@@ -2117,6 +2092,8 @@ def _compute_pipeline_or_dma_extra_pad(
     begin that is provably a multiple of ``block_size`` (e.g. an outer tile's
     aligned offset) needs no extra padding at all.
     """
+    from . import codegen as pallas_codegen
+
     if begin_expr == "0":
         return 0
     bs_val = state.device_function.resolved_block_size(bid)
@@ -2126,7 +2103,7 @@ def _compute_pipeline_or_dma_extra_pad(
         extent = _fixed_loop_extent(state, loop_dim_index)
         if extent is not None and extent % bs_val == 0:
             return 0
-    alignment = _pipeline_begin_alignment(begin_expr, state)
+    alignment = pallas_codegen.loop_begin_alignment(begin_expr, state)
     if alignment is not None and alignment % bs_val == 0:
         return 0
     return bs_val - 1
@@ -3241,14 +3218,11 @@ def _record_aligned_tiles(
     from .backend import _slice_addressing
     from .plan_tiling import NonePattern
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import aligned_window_sublane
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
 
-    sublanes = [
-        env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
-        for t in HostFunction.current().tensor_to_origin
-        if isinstance(t, torch.Tensor) and t.is_floating_point()
-    ]
-    if not sublanes:
+    sublane = aligned_window_sublane(env)
+    if sublane is None:
         return
 
     # Strictest addressing each row needs over the tensors it slices.
@@ -3284,7 +3258,6 @@ def _record_aligned_tiles(
             else:
                 addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
-    sublane = max(sublanes)
     for i, bid in enumerate(block_ids):
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
@@ -3674,6 +3647,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
+                    _record_loop_pad(state, fake, dim_idx, bid)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
