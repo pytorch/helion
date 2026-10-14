@@ -5,12 +5,16 @@ from __future__ import annotations
 import ast
 from itertools import pairwise
 import math
+from typing import TYPE_CHECKING
 from typing import cast
 
 from . import cluster_online_pair as pair
 from .hoist_warp_reduce import _static_trip_count
 from .rolled_cluster_online_pair import _prove
 from .rolled_cluster_online_pair import _wrap_sites
+
+if TYPE_CHECKING:
+    from .register_row_tensor_copy import TensorCopyContext
 
 
 def _trip_count(loop: ast.For, constants: dict[str, int] | None) -> int | None:
@@ -29,7 +33,10 @@ def _trip_count(loop: ast.For, constants: dict[str, int] | None) -> int | None:
 
 
 def lower_register_row_reduction(
-    body: list[ast.stmt], constants: dict[str, int] | None
+    body: list[ast.stmt],
+    constants: dict[str, int] | None,
+    *,
+    tensor_copy_context: TensorCopyContext | None = None,
 ) -> list[ast.stmt]:
     from .fuse_two_pass_loads import _range_bounds
 
@@ -180,11 +187,40 @@ def lower_register_row_reduction(
                     result.append(statement)
             return result
 
-        load_body = [
-            pair._stmt(f"{row} = cute.make_rmem_tensor({elements}, cutlass.Float32)"),
-            *load_statements(site_a.for_node.body[: site_a.stmt_idx]),
-            pair._stmt(f"{values} = {row}.load()"),
-        ]
+        copy_plan = None
+        if tensor_copy_context is not None:
+            from .register_row_tensor_copy import prove_tensor_copy
+
+            copy_plan = prove_tensor_copy(
+                working,
+                site_a,
+                site_b,
+                fold,
+                caches,
+                chain,
+                _values,
+                valid_trips,
+                constants or {},
+                tensor_copy_context,
+            )
+        load_body = (
+            [
+                copy_plan.assignment(values),
+                *(
+                    statement
+                    for statement in site_a.for_node.body[: site_a.stmt_idx]
+                    if pair._is_name_assign(statement) and statement is not fold
+                ),
+            ]
+            if copy_plan is not None
+            else [
+                pair._stmt(
+                    f"{row} = cute.make_rmem_tensor({elements}, cutlass.Float32)"
+                ),
+                *load_statements(site_a.for_node.body[: site_a.stmt_idx]),
+                pair._stmt(f"{values} = {row}.load()"),
+            ]
+        )
         site_a.for_node.body = [
             *load_body,
             pair._stmt(

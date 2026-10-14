@@ -267,6 +267,14 @@ def lower_scalar_epilogue(
     guard = pair._stmt(f"if {condition}:\n    pass")
     assert isinstance(guard, ast.If)
     guard.body = [*moved, *suffix]
+    # The whole-CTA, single-row proof above moves every final-result consumer
+    # into lane0/rank0. The helper may now keep its communication unconditional
+    # while folding its local receive mirror only in that owner's warp.
+    if (
+        fn.config.get("cute_scalar_epilogue_owner_fold", False)
+        and ast.unparse(call.func) == "_cute_grouped_reduce_cluster_warp_online_pair"
+    ):
+        call.keywords.append(ast.keyword(arg="owner_only", value=ast.Constant(True)))
     return [statement for statement in prefix if id(statement) not in moved_ids] + [
         guard
     ]

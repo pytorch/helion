@@ -1931,9 +1931,24 @@ class DeviceFunction:
             if self.config.get("cute_register_row", False):
                 from .cute.register_row_reduction import lower_register_row_reduction
 
-                kernel_body = lower_register_row_reduction(
-                    kernel_body, constexpr_values
-                )
+                if self.config.get("cute_register_row_tensor_copy", False):
+                    from .cute.register_row_tensor_copy import (
+                        context_from_device_function,
+                    )
+
+                    kernel_body = lower_register_row_reduction(
+                        kernel_body,
+                        constexpr_values,
+                        tensor_copy_context=context_from_device_function(
+                            self,
+                            exact_thread_block_dims or (0, 0, 0),
+                            tensor_dtypes,
+                        ),
+                    )
+                else:
+                    kernel_body = lower_register_row_reduction(
+                        kernel_body, constexpr_values
+                    )
             elif self.config.get("cute_cluster_warp_online", False):
                 from .cute.rolled_cluster_online_pair import (
                     fuse_rolled_cluster_online_pair,
