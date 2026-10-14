@@ -304,6 +304,32 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(low, (x + 1).amin(-1), equal_nan=True)
         torch.testing.assert_close(high, (x + 1).amax(-1), equal_nan=True)
 
+    def test_sum_of_product_with_infinite_padded_lanes(self):
+        """Zero times inf is NaN, not 0: ``x * (1.0 / z)`` with ``z`` loaded as
+        0 in the padded lane (N=3 pads to 4) has NaN there, which the sum must
+        mask, as it must an infinite broadcast factor's 0 * inf."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_times_reciprocal(x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = (x[tile_m, :] * (1.0 / z[tile_m, :])).sum(-1)
+            return out
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def row_sums_times_scale(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = (x[tile_m, :] * b[tile_m][:, None]).sum(-1)
+            return out
+
+        x = torch.rand(32, 3, device=DEVICE) + 0.5
+        z = torch.rand(32, 3, device=DEVICE) + 0.5
+        torch.testing.assert_close(row_sums_times_reciprocal(x, z), (x / z).sum(-1))
+        b = torch.rand(32, device=DEVICE)
+        b[5] = float("inf")
+        torch.testing.assert_close(row_sums_times_scale(x, b), (x * b[:, None]).sum(-1))
+
     @skipIfCute("CuTe does not lower a reduction over a stack")
     @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")
     @skipIfPallas("Pallas has no aten.stack lowering")

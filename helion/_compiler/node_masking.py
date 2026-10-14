@@ -494,9 +494,27 @@ def getitem_masked_value(
 
 
 class MaskedValueAnalysisInductor(ValueRangeAnalysis):
-    def __init__(self, input_name_lookup: dict[str, ValueRangesAny]) -> None:
+    def __init__(
+        self, input_name_lookup: dict[str, ValueRangesAny], *, strict_float: bool
+    ) -> None:
         super().__init__()
         self.input_name_lookup = input_name_lookup
+        self.strict_float = strict_float
+
+    def mul(
+        self, a: ValueRangesAny | float, b: ValueRangesAny | float
+    ) -> ValueRangesAny:
+        a_range: ValueRangesAny = ValueRanges.wrap(a)
+        b_range: ValueRangesAny = ValueRanges.wrap(b)
+        # Inductor takes 0 * anything to be 0, but a float 0 times inf or NaN
+        # is NaN (fast math assumes those away), so a factor that may not be
+        # finite leaves the product unknown.
+        if self.strict_float and not all(
+            bound.is_finite
+            for bound in (a_range.lower, a_range.upper, b_range.lower, b_range.upper)
+        ):
+            return ValueRanges.unknown()
+        return super().mul(a_range, b_range)
 
     def load(self, name: str, index: sympy.Expr) -> ValueRangesAny:
         return self.input_name_lookup[name]
@@ -527,9 +545,16 @@ def inductor_masked_value(
 
     input_ranges: list[ValueRangesAny] = []
     map_arg((node.args, node.kwargs), visit)
+    val = node.meta.get("val")
+    strict_float = (
+        isinstance(val, torch.Tensor)
+        and val.dtype.is_floating_point
+        and not CompileEnvironment.current().settings.fast_math
+    )
     with V.set_ops_handler(
         MaskedValueAnalysisInductor(
             dict(zip(lowering.input_names, input_ranges, strict=True)),
+            strict_float=strict_float,
         )
     ):
         result = call_inner_fn(lowering.buffer.data)
