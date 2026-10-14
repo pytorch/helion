@@ -423,6 +423,38 @@ class TestPallasWorklistBufferCountConfig(TestCase):
         self.assertEqual(config.pallas_worklist_buffer_count, [8, 5])
 
 
+class TestPallasWorklistBucketRowsConfig(TestCase):
+    def test_kept_only_with_grouping_one(self) -> None:
+        spec = ConfigSpec(backend=PallasBackend())
+        config = helion.Config(
+            pallas_worklist_grouping=1, pallas_worklist_bucket_rows=32
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_worklist_bucket_rows, 32)
+        for config in (
+            helion.Config(pallas_worklist_bucket_rows=32),
+            helion.Config(pallas_worklist_grouping=0, pallas_worklist_bucket_rows=32),
+            helion.Config(pallas_worklist_grouping=2, pallas_worklist_bucket_rows=32),
+        ):
+            with self.subTest(config=config):
+                # Without grouping 1 the bucket does not apply: normalize drops it.
+                spec.normalize(config)
+                self.assertNotIn("pallas_worklist_bucket_rows", config)
+
+    def test_rejects_invalid_values(self) -> None:
+        spec = ConfigSpec(backend=PallasBackend())
+        for value in (-16, True, 16.0, "16"):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pallas_worklist_grouping": 1,
+                            "pallas_worklist_bucket_rows": value,
+                        }
+                    )
+                )
+
+
 def _count_columns_then_sum_rows(
     x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor, z: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

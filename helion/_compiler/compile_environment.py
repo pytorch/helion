@@ -1023,6 +1023,10 @@ class CompileEnvironment:
         self.compact_worklist_ordered_block: int = 1
         # Sublane tiling of the in-kernel worklist.
         self.compact_worklist_sublane: int = 1
+        # Row bucket of plans with static inner loops (pallas_worklist_bucket_rows
+        # below the compact block), else 0: each work item runs the compact body
+        # on its live rows rounded up to a multiple of it.
+        self.compact_worklist_bucket_rows: int = 0
         # Offsets-tensor parameter names the generated _build_worklist takes, in
         # order (set when the builder is emitted); used by the launcher to map
         # them to host-call arg positions.

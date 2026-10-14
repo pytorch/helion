@@ -253,6 +253,8 @@ def _(state: CodegenState) -> object:
             assert plan is not None
             if plan.grouping == 2:
                 return _codegen_grouped_compact_tile(state)
+            if CompileEnvironment.current().compact_worklist_bucket_rows:
+                return _codegen_bucketed_compact_tile(state)
         elif _is_compact_static_inner_loop(state):
             # pyrefly: ignore[bad-return]
             return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -291,6 +293,9 @@ def _(state: CodegenState) -> None:
             assert plan is not None
             if plan.grouping == 2:
                 _codegen_grouped_compact_tile(state)
+                return None
+            if CompileEnvironment.current().compact_worklist_bucket_rows:
+                _codegen_bucketed_compact_tile(state)
                 return None
         elif _is_compact_static_inner_loop(state):
             # pyrefly: ignore[bad-return]
@@ -1330,24 +1335,20 @@ def _is_compact_static_inner_loop(state: CodegenState) -> bool:
 
 
 @contextlib.contextmanager
-def _compact_block_variant(state: CodegenState, factor: int) -> Iterator[None]:
-    """Temporarily codegen the compact loop with ``factor * base_block``."""
-    if factor == 1:
-        yield
-        return
-
+def _compact_block_size(state: CodegenState, size: int) -> Iterator[None]:
+    """Temporarily codegen the compact loop with a ``size``-row block."""
     from ...runtime.config import Config
     from ..tile_dispatch import TileStrategyDispatch
 
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
-    assert plan is not None and factor == 2
+    assert plan is not None
     block_id = plan.compact_axis.block_id
     fn = state.device_function
 
     block_sizes = [*fn.config.block_sizes]
     block_index = env.config_spec.block_sizes.block_id_to_index(block_id)
-    block_sizes[block_index] *= factor
+    block_sizes[block_index] = size
     variant_config = Config.from_dict({**fn.config.config, "block_sizes": block_sizes})
 
     original_config = fn.config
@@ -1640,6 +1641,23 @@ def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
     return statements
 
 
+def _codegen_compact_variant(
+    state: CodegenState, counters: Mapping[str, int], size: int | None
+) -> tuple[list[ast.AST], dict[str, int]]:
+    """Codegen the compact loop body at ``size`` rows (``None`` keeps base block)."""
+    fn = state.device_function
+    for name, value in counters.items():
+        setattr(fn, name, value)
+    body: list[ast.AST] = []
+    block_ctx = (
+        contextlib.nullcontext() if size is None else _compact_block_size(state, size)
+    )
+    with state.codegen.set_statements(body), block_ctx:
+        result = _codegen_fori_loop(state)
+    assert result is None
+    return body, {name: getattr(fn, name) for name in _CODEGEN_VARIANT_COUNTERS}
+
+
 def _codegen_grouped_compact_tile(state: CodegenState) -> None:
     """Emit static base-block and double-block compact-body variants."""
     from .compact_worklist import compact_ref_names
@@ -1666,21 +1684,11 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
     codegen.grouped_compact_common_statements = common_statements
     try:
         for factor in (1, 2):
-            for name, value in initial_counters.items():
-                setattr(state.device_function, name, value)
-            branch_body: list[ast.AST] = []
-            with (
-                codegen.set_statements(branch_body),
-                _compact_block_variant(state, factor),
-            ):
-                result = _codegen_fori_loop(state)
-            assert result is None
+            size = None if factor == 1 else env.compact_worklist_block * factor
+            branch_body, after = _codegen_compact_variant(state, initial_counters, size)
             if factor == 1:
                 branch_body[:0] = _compact_output_initializers(state)
-                final_counters = {
-                    name: getattr(state.device_function, name)
-                    for name in _CODEGEN_VARIANT_COUNTERS
-                }
+                final_counters = after
 
             fn_name = state.device_function.new_var(f"_compact_group_{factor}")
             comparison = "<=" if factor == 1 else ">"
@@ -1705,6 +1713,66 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
         state.add_statement(statement)
     for fn_def in branch_defs:
         state.add_statement(fn_def)
+
+
+def _codegen_bucketed_compact_tile(state: CodegenState) -> None:
+    """Emit one compact body per row bucket and switch on the live rows.
+
+    A work item's rows ``[start, start + extent)`` lie in the first
+    ``start % sublane + extent`` rows of its window. Variant ``k`` is the
+    compact body codegen'd with a ``k * bucket``-row compact block, so it
+    loads, multiplies and stores only the window's first ``k * bucket`` rows.
+    ``lax.switch`` runs the smallest variant that covers the live rows: a
+    small group pays for a matmul of its own size instead of the whole block.
+    The rows a variant leaves stale are never written back, because the
+    output window ends at the live rows' last sublane tile.
+    """
+    from .compact_worklist import compact_ref_names
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and plan.static_inner_loops and plan.grouping == 1
+    assert _is_compact_tile_loop(state)
+    bucket = env.compact_worklist_bucket_rows
+    block = env.compact_worklist_block
+    assert 0 < bucket < block and block % bucket == 0, (bucket, block)
+
+    fn = state.device_function
+    initial = {name: getattr(fn, name) for name in _CODEGEN_VARIANT_COUNTERS}
+    final: dict[str, int] | None = None
+    branch_defs: list[ast.FunctionDef] = []
+    for rows in range(bucket, block + 1, bucket):
+        body, after = _codegen_compact_variant(state, initial, rows)
+        if final is None:
+            final = after
+        elif after != final:
+            # The same graph at another row extent must take the same per-op
+            # config slots (load and store indices) as the first variant.
+            raise AssertionError(
+                "row bucket variants consumed different codegen slots: "
+                f"{after} != {final}"
+            )
+        fn_def = statement_from_string(
+            f"def {fn.new_var(f'_rows_{rows}')}():\n    pass"
+        )
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = cast("list[ast.stmt]", body) or [ast.Pass()]
+        branch_defs.append(fn_def)
+    assert final is not None
+    for name, value in final.items():
+        setattr(fn, name, value)
+
+    begin_ref, extent_ref = (f"{name}_ref" for name in compact_ref_names(plan))
+    live = f"{begin_ref}[_wid] % {env.compact_worklist_sublane} + {extent_ref}[_wid]"
+    for fn_def in branch_defs:
+        state.add_statement(fn_def)
+    branches = ", ".join(fn_def.name for fn_def in branch_defs)
+    state.add_statement(
+        statement_from_string(
+            f"lax.switch(jnp.minimum(({live} - 1) // {bucket}, "
+            f"{len(branch_defs) - 1}), [{branches}])"
+        )
+    )
 
 
 def _compact_worklist_bounds(

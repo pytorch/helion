@@ -155,6 +155,7 @@ class Config(Mapping[str, object]):
         static_ranges: list[bool] | None = None,
         pallas_load_buffer_count: list[int] | None = None,
         pallas_worklist_buffer_count: list[int] | None = None,
+        pallas_worklist_bucket_rows: int | None = None,
         load_eviction_policies: (
             EvictionPolicyLiteral | list[EvictionPolicyLiteral] | None
         ) = None,
@@ -235,6 +236,13 @@ class Config(Mapping[str, object]):
                 8) for each input tensor of a compact-worklist kernel
                 (``pallas_worklist_grouping`` 1 or 2). Inputs the worklist
                 pipeline does not prefetch (e.g. SMEM offsets) ignore it.
+            pallas_worklist_bucket_rows: Pallas-only row bucket of a
+                compact-worklist kernel whose compact tile holds only static
+                inner loops (``pallas_worklist_grouping`` 1). A positive value
+                smaller than the compact block runs each work item's body on
+                its live rows rounded up to a multiple of it instead of the
+                whole block.
+                0 (the default) runs the whole block.
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
                 Valid values are "", "first", and "last". CuTe also supports
@@ -610,6 +618,7 @@ class Config(Mapping[str, object]):
             "static_ranges": static_ranges,
             "pallas_load_buffer_count": pallas_load_buffer_count,
             "pallas_worklist_buffer_count": pallas_worklist_buffer_count,
+            "pallas_worklist_bucket_rows": pallas_worklist_bucket_rows,
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
@@ -912,6 +921,10 @@ class Config(Mapping[str, object]):
     @property
     def pallas_worklist_buffer_count(self) -> list[int]:
         return cast("list[int]", self.config.get("pallas_worklist_buffer_count", []))
+
+    @property
+    def pallas_worklist_bucket_rows(self) -> int:
+        return cast("int", self.config.get("pallas_worklist_bucket_rows", 0))
 
     @property
     def load_eviction_policies(
