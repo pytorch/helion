@@ -34,6 +34,8 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
     Combined policy/replication profiles require PDL. A default-geometry
     replication carrier keeps search structure independent of profitable
     geometry, dtype, and layout; the lowering can safely leave it unchanged.
+    Append at most one independent-accumulation carrier with the same reference
+    geometry, retaining all prior seeds and defaults (at most nine seeds total).
     """
 
     name = "cute_full_chunk_row"
@@ -63,27 +65,28 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
         if not cls.is_eligible(env, device_ir):
             return []
         seeds = cls._packet_seeds(env, device_ir)
-        replicated = env.config_spec._flat_fields().get("cute_replicated_reduction")
-        if (
-            isinstance(replicated, EnumFragment)
-            and True in replicated.choices
-            and not any(seed.get("cute_replicated_reduction", False) for seed in seeds)
-        ):
+        for key in ("cute_replicated_reduction", "cute_independent_reduction"):
+            field = env.config_spec._flat_fields().get(key)
+            if (
+                not isinstance(field, EnumFragment)
+                or True not in field.choices
+                or any(seed.get(key, False) for seed in seeds)
+            ):
+                continue
             # Enum search subsets participate in structural_fingerprint. A
-            # geometry-dependent replication witness would otherwise reject
+            # geometry-dependent mode witness would otherwise reject
             # autotune_multi for the same row kernel at neighboring extents.
             # No packet/cache/launch overrides belong on this carrier.
             carrier = Config.from_dict(
-                env.config_spec.autotune_reference_config().config
-                | {"cute_replicated_reduction": True}
+                env.config_spec.autotune_reference_config().config | {key: True}
             )
             try:
                 generation = ConfigGeneration(env.config_spec)
                 flat, effective = generation.strict_config_pair(carrier)
                 if generation.strict_unflatten(flat) != effective:
-                    return seeds
+                    continue
             except InvalidConfig:
-                return seeds
+                continue
             seeds.append(carrier)
         return seeds
 
