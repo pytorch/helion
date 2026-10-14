@@ -83,6 +83,7 @@ class TestRootDispatchCodegen(TestCase):
                         exec(code, scope)
                         self.assertEqual(scope["selected"], selected)
 
+    @skipIfRefEager("checks generated root dispatch")
     def test_five_root_codegen(self):
         for static_shapes in (False, True):
             with self.subTest(static_shapes=static_shapes):
