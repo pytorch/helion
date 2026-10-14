@@ -53,7 +53,7 @@ def test_all_added_profiles_preserve_full_prefix_and_generate(
         previous = bind(rows, size, dtype)
     bound = bind(rows, size, dtype)
     additions = low_seeds(bound)
-    threads = [128, 256] if size == 4096 else [256]
+    threads = [128, 256] if size == 4096 else [256, 128]
     assert len(additions) == 4 * len(threads)
     assert bound.config_spec.compiler_seed_configs == [
         *previous.config_spec.compiler_seed_configs,
@@ -164,7 +164,8 @@ def test_unprofitable_shapes_keep_both_carriers_and_structural_identity(
 
 
 @pytest.mark.parametrize(
-    ("matrix_count", "threads"), [(1, [256]), (2, [256]), (3, []), (8, [])]
+    ("matrix_count", "threads"),
+    [(1, [128, 256]), (2, [256]), (3, [256]), (8, [])],
 )
 def test_shared_128_slot_budget_counts_all_original_loads(
     matrix_count: int, threads: list[int]

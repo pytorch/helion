@@ -410,7 +410,7 @@ def test_block_id_mapping_and_policy_indices_are_not_positions() -> None:
     for seq in sequences.values():
         seq.reverse()
     reordered = seeds_for(bound)
-    assert len(reordered) == len(original) == 13
+    assert len(reordered) == len(original) == 17
     for index, (before, after) in enumerate(zip(original, reordered, strict=True)):
         if index == 8:  # The unchanged reference carrier has default geometry.
             continue

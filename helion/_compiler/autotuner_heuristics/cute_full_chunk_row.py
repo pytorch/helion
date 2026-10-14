@@ -10,7 +10,10 @@ import torch
 from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_generation import ConfigGeneration
 from ...exc import InvalidConfig
+from ...language import _tracing_ops
 from ...language.memory_ops import load as language_load
+from ...language.memory_ops import store as language_store
+from ...language.view_ops import subscript
 from ...runtime.config import Config
 from .common import is_canonical_row_reduction
 from .cute import _seq_config_list
@@ -28,6 +31,8 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
     The 512/1024-thread choices and 128-slot retained-cache estimate are seed
     policy, not occupancy guarantees. Count every original load site, including
     loads not cached, and reserve another full fragment for consumer prefetch.
+    Low-thread profiles omit that reserve only when a closed two-pass graph
+    proves that the consumer load already has its own original-load charge.
     Charge each value one 32-bit register slot even for FP16/BF16 inputs.
     Requested packet widths are not alignment proofs: existing vector lowering
     retains its scalar fallback for offset or otherwise unaligned inputs.
@@ -100,7 +105,112 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
     def _low_thread_seeds(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config]:
-        return cls._packet_seeds(env, device_ir, independent=True)
+        seeds = cls._packet_seeds(env, device_ir, independent=True)
+        if cls._consumer_prefetch_is_counted(device_ir):
+            # Preserve the complete old prefix. A consumer load already in
+            # the original load count must not also cost a reserve fragment.
+            seeds.extend(
+                seed
+                for seed in cls._packet_seeds(
+                    env, device_ir, independent=True, prefetch_already_counted=True
+                )
+                if seed not in seeds
+            )
+        return seeds
+
+    @staticmethod
+    def _consumer_prefetch_is_counted(device_ir: DeviceIR) -> bool:
+        """Prove the reserve duplicates a charged load in a closed two-pass row.
+
+        Keep the old estimate for additional graphs, statistics, stores, or
+        opaque operations. This concerns retained raw load fragments only;
+        scalar temporaries and independent accumulators are not full-row
+        caches. The emitted prefetch pass still checks every actual private
+        allocation against its unchanged 128-slot cap.
+        """
+        # Lowering imports the runtime that registers these heuristics.
+        from ..device_ir import ReductionLoopGraphInfo
+        from ..inductor_lowering import PointwiseLowering
+        from ..inductor_lowering import ReductionLowering
+
+        loops = [
+            info
+            for info in device_ir.graphs
+            if isinstance(info, ReductionLoopGraphInfo)
+        ]
+        if (
+            len(loops) != 2
+            or len(device_ir.graphs) != 3
+            or len(device_ir.rolled_reductions) != 1
+        ):
+            return False
+        rolled = device_ir.rolled_reductions[0]
+        producer, consumer = loops
+        if (
+            len(rolled.rolled_block_ids) != 1
+            or producer.block_ids != rolled.rolled_block_ids
+            or consumer.block_ids != rolled.rolled_block_ids
+        ):
+            return False
+        original = device_ir.graphs[rolled.original_graph_id].graph
+        reductions = [
+            node
+            for node in original.nodes
+            if isinstance(node.meta.get("lowering"), ReductionLowering)
+        ]
+        if len(reductions) != 1:
+            return False
+        reduction_name = reductions[0].name
+        if (
+            sum(node.name == reduction_name for node in producer.graph.nodes) != 1
+            or any(node.name == reduction_name for node in consumer.graph.nodes)
+            or sum(node.target is language_store for node in original.nodes) != 1
+        ):
+            return False
+        allowed = {
+            _tracing_ops._host_tensor,
+            _tracing_ops._get_symnode,
+            language_load,
+            language_store,
+            subscript,
+        }
+        if any(
+            node.op != "output"
+            and node.target not in allowed
+            and not isinstance(
+                node.meta.get("lowering"), (PointwiseLowering, ReductionLowering)
+            )
+            for node in original.nodes
+        ):
+            return False
+        charged = {
+            node.name: node for node in original.nodes if node.target is language_load
+        }
+        names: list[set[str]] = []
+        for loop in loops:
+            present: set[str] = set()
+            for node in loop.graph.nodes:
+                if node.target is not language_load:
+                    continue
+                old = charged.get(node.name)
+                if (
+                    old is None
+                    or not node.args
+                    or not old.args
+                    or not isinstance(node.args[0], torch.fx.Node)
+                    or not isinstance(old.args[0], torch.fx.Node)
+                    or node.args[0].meta.get("val") is None
+                    or node.args[0].meta.get("val") is not old.args[0].meta.get("val")
+                    or torch.fx.map_arg((node.args, node.kwargs), lambda n: n.name)
+                    != torch.fx.map_arg((old.args, old.kwargs), lambda n: n.name)
+                ):
+                    return False
+                present.add(node.name)
+            names.append(present)
+        # Retain the charge for every original load, including loads that
+        # cannot be cached. Only the additional reserve is redundant when
+        # an already-charged load exists exclusively in the consumer pass.
+        return set.union(*names) == set(charged) and bool(names[1] - names[0])
 
     @classmethod
     def _packet_seeds(
@@ -109,6 +219,7 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
         device_ir: DeviceIR,
         *,
         independent: bool = False,
+        prefetch_already_counted: bool = False,
     ) -> list[Config]:
         spec = env.config_spec
         reduction = cast("ReductionLoopSpec", spec.reduction_loops[0])
@@ -221,7 +332,8 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
             if (
                 threads > (spec.max_reduction_threads or 1024)
                 or chunk % threads
-                or (load_sites + 1) * (chunk // threads) > 128
+                or (load_sites + (not prefetch_already_counted)) * (chunk // threads)
+                > 128
             ):
                 continue
             vector_domain = (
