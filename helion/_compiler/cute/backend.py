@@ -1902,6 +1902,8 @@ class CuteBackend(Backend):
             # does not support scalar dereference for its 4-bit type yet, so
             # SIMT scalar loads treat the tensor as raw byte storage.
             return "cutlass.Uint8"
+        if dtype is torch.float8_e8m0fnu:
+            return "cutlass.Float8E8M0FNU"
         if dtype is torch.uint32:
             return "cutlass.Uint32"
         if dtype is torch.uint64:
