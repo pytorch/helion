@@ -3743,6 +3743,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_list_walk=flash_shape.has_list_walk,
                     flex_has_score_region=flash_shape.flex_has_score_region,
                     flex_has_mask_region=flash_shape.flex_has_mask_region,
+                    flex_trivial_walk=flash_shape.flex_trivial_walk,
                     q_seq=flash_shape.q_seq,
                     kv_seq=flash_shape.kv_seq,
                     flex_aux_smem_candidates=flash_shape.flex_aux_smem_candidates,

@@ -137,8 +137,9 @@ def _compile_flex(
     )
     resolved = spec._resolve_cute_flash_config(normalized.config)
     assert resolved.pipeline_family == "fa4"
+    # (The list walk is persistent by default; an override pins either way.)
     assert resolved.persistent == bool(
-        (overrides or {}).get(cute_flash.FLASH_PERSISTENT_KEY, False)
+        {**base, **(overrides or {})}[cute_flash.FLASH_PERSISTENT_KEY]
     )
     code = bound.to_code(normalized)
     assert "flash_flex_status" in code

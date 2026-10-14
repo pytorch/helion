@@ -1787,6 +1787,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk: bool = False
         self._cute_flash_flex_has_score_region: bool = False
         self._cute_flash_flex_has_mask_region: bool = False
+        self._cute_flash_flex_trivial_walk: bool = False
         self._cute_flash_q_seq: int | None = None
         self._cute_flash_kv_seq: int | None = None
         self._cute_flash_flex_aux_smem_candidates: tuple[int, ...] = ()
@@ -2106,6 +2107,7 @@ class ConfigSpec:
                 has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                 has_list_walk=self._cute_flash_has_list_walk,
+                flex_trivial_walk=self._cute_flash_flex_trivial_walk,
                 flex_has_mask_region=self._cute_flash_flex_has_mask_region,
                 device_sm_count=self._cute_flash_device_sm_count,
                 q_seq=self._cute_flash_q_seq,
@@ -2153,6 +2155,7 @@ class ConfigSpec:
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
             has_list_walk=self._cute_flash_has_list_walk,
+            flex_trivial_walk=self._cute_flash_flex_trivial_walk,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
@@ -2696,6 +2699,7 @@ class ConfigSpec:
         has_list_walk: bool = False,
         flex_has_score_region: bool = False,
         flex_has_mask_region: bool = False,
+        flex_trivial_walk: bool = False,
         q_seq: int | None = None,
         kv_seq: int | None = None,
         flex_aux_smem_candidates: Sequence[int] = (),
@@ -2741,6 +2745,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk = has_list_walk
         self._cute_flash_flex_has_score_region = flex_has_score_region
         self._cute_flash_flex_has_mask_region = flex_has_mask_region
+        self._cute_flash_flex_trivial_walk = flex_trivial_walk
         self._cute_flash_q_seq = q_seq
         self._cute_flash_kv_seq = kv_seq
         self._cute_flash_flex_aux_smem_candidates = tuple(flex_aux_smem_candidates)
@@ -3430,6 +3435,7 @@ class ConfigSpec:
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                     has_list_walk=self._cute_flash_has_list_walk,
+                    flex_trivial_walk=self._cute_flash_flex_trivial_walk,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
