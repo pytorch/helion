@@ -123,7 +123,10 @@ def _flex_args(
 
 
 def _compile_flex(
-    args: tuple[Any, ...], overrides: dict[str, object] | None
+    args: tuple[Any, ...],
+    overrides: dict[str, object] | None,
+    *,
+    expect_in_code: str | None = None,
 ) -> tuple[Any, cute_flash.FlashAttentionConfig]:
     """Compile the flex kernel at the default config plus ``overrides``,
     asserting the surface is the flex plan category and the body the walk."""
@@ -143,6 +146,8 @@ def _compile_flex(
     )
     code = bound.to_code(normalized)
     assert "flash_flex_status" in code
+    if expect_in_code is not None:
+        assert expect_in_code in code
     return bound.compile_config(normalized), resolved
 
 
@@ -689,6 +694,181 @@ def test_rolled_chunk_loop_is_bitwise_the_unrolled_kernel(
         torch.cuda.synchronize()
         assert torch.equal(out, out_ref), coalesce
         assert torch.equal(lse, lse_ref), coalesce
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+def test_item_words_are_bitwise_the_device_list_walk() -> None:
+    """The host-built per-item bitmask words (``cute_flash_flex_item_words``,
+    the default) give the same output and LSE as the device walk over the
+    index lists, on the persistent loop and the plain grid."""
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    for persistent in (False, True):
+        base = {**PAIR_DESC, cute_flash.FLASH_PERSISTENT_KEY: persistent}
+        fn, resolved = _compile_flex(
+            args,
+            {**base, cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: False},
+            expect_in_code="for flash_flex_i in cutlass.range(flash_flex_cp0, unroll=1):",
+        )
+        assert not resolved.flex_item_words
+        out_ref, lse_ref = fn(*args)
+        torch.cuda.synchronize()
+        fn, resolved = _compile_flex(
+            args,
+            {**base, cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: True},
+            expect_in_code="_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)]",
+        )
+        assert resolved.flex_item_words
+        out, lse = fn(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out, out_ref), persistent
+        assert torch.equal(lse, lse_ref), persistent
+
+
+RESIDENT_REP32: dict[str, object] = {
+    **PAIR_DESC,
+    cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    cute_flash.FLASH_P_STORE_REP_KEY: 32,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+    cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+    cute_flash.FLASH_CORR_REGS_KEY: 64,
+    cute_flash.FLASH_OTHER_REGS_KEY: 48,
+}
+
+
+RESIDENT_REP16_SPLIT: dict[str, object] = {
+    **RESIDENT_REP32,
+    cute_flash.FLASH_P_STORE_REP_KEY: 16,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+}
+RESIDENT_REP32_SPLIT: dict[str, object] = {
+    **RESIDENT_REP32,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+}
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize(
+    ("persistent", "store"),
+    [
+        (False, "rep32"),
+        (True, "rep32"),
+        (False, "rep16_split"),
+        (True, "rep16_split"),
+        (False, "rep32_split"),
+        (True, "rep32_split"),
+    ],
+    ids=[
+        "grid_rep32",
+        "persistent_rep32",
+        "grid_rep16_split",
+        "persistent_rep16_split",
+        "grid_rep32_split",
+        "persistent_rep32_split",
+    ],
+)
+def test_resident_pass2_is_bitwise_the_reload_pass2(
+    persistent: bool, store: str
+) -> None:
+    """``cute_flash_s_resident``: PASS2 over the chunks PASS1 left in registers
+    gives the same output and LSE as the TMEM-reload PASS2 (the per-chunk
+    numerics are shared), on a mask-only walk with partial and full tiles,
+    with Rep32 P stores and with Rep16 stores keeping the split P arrival."""
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    body = {
+        "rep32": RESIDENT_REP32,
+        "rep16_split": RESIDENT_REP16_SPLIT,
+        "rep32_split": RESIDENT_REP32_SPLIT,
+    }[store]
+    base = {**body, cute_flash.FLASH_PERSISTENT_KEY: persistent}
+    fn, resolved = _compile_flex(
+        args,
+        base,
+        expect_in_code={
+            "rep32": "fa4_disc_exp_convert_store_rep32_pipe(",
+            "rep16_split": "fa4_disc_exp_convert_store_pipe(",
+            "rep32_split": "fa4_disc_exp_convert_store_rep32_split(",
+        }[store],
+    )
+    assert not resolved.s_resident
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_S_RESIDENT_KEY: True},
+        expect_in_code={
+            "rep32": "fa4_disc_exp_convert_store_resident_rep32((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
+            "rep16_split": "fa4_disc_exp_convert_store_resident_rep16((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
+            "rep32_split": "fa4_disc_exp_convert_store_resident_rep32_split((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), ",
+        }[store],
+    )
+    assert resolved.s_resident
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+@_MULTI_COMPILE_TIMEOUT
+@pytest.mark.parametrize("resident", [False, True], ids=["reload", "resident"])
+def test_tmem_rowmax_is_bitwise_the_software_rowmax_on_the_list_walk(
+    resident: bool,
+) -> None:
+    """``cute_flash_rowmax="tmem"`` on the list walk's full tiles (the hardware
+    per-load maxima) gives the same output and LSE as the software FMNMX tree
+    (the maximum is exact in any order), with the reload and the resident PASS2."""
+    batch, heads, seq = 2, 4, 2048
+    q, k, v = _qkv(batch, heads, seq, seq)
+    block_mask = create_block_mask(
+        _band, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, _identity, block_mask)
+    base = {**RESIDENT_REP32, cute_flash.FLASH_S_RESIDENT_KEY: resident}
+    fn, resolved = _compile_flex(args, base)
+    assert resolved.rowmax == "software" and resolved.s_resident is resident
+    bound = _flex_kernel().bind(args)
+    probe = bound.config_spec._resolve_cute_flash_config(
+        bound._normalized_config_copy(
+            helion.Config(
+                **{
+                    **bound.config_spec.default_config().config,
+                    **base,
+                    cute_flash.FLASH_ROWMAX_KEY: "tmem",
+                }
+            )
+        ).config
+    )
+    if probe.rowmax != "tmem":
+        pytest.skip("this device's policy has no TMEM row reduction (GB300 only)")
+    out_ref, lse_ref = fn(*args)
+    torch.cuda.synchronize()
+    fn, resolved = _compile_flex(
+        args,
+        {**base, cute_flash.FLASH_ROWMAX_KEY: "tmem"},
+        expect_in_code=(
+            "(flash_res_frg3, flash_res_red3))" if resident else "disc_rowmax_ldred("
+        ),
+    )
+    assert resolved.rowmax == "tmem"
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
 
 
 @skipIfNotCUDA()
