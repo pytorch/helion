@@ -930,6 +930,44 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 _BACKEND_DIAGNOSTIC_CONFIG_KEYS = CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 
 
+# A proved complete MXFP8 root is replaced by one native scaled contraction.
+# These coordinates describe the displaced SIMT/collective lowering and cannot
+# change that contraction. Keep the native geometry and every user tunable.
+_CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
+    {
+        "block_sizes",
+        "num_threads",
+        "loop_orders",
+        "l2_groupings",
+        "flatten_loops",
+        "indexing",
+        "load_eviction_policies",
+        "load_cache_modifiers",
+        "store_cache_modifiers",
+        "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_collective_stages",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
+        "cute_register_chain",
+        "cute_pdl",
+        "cute_min_blocks_per_mp",
+        "epilogue_subtile",
+    }
+)
+
+
 def _get_backend_tunable_keys() -> frozenset[str]:
     """Get all backend tunable keys, including FB-private ones if available."""
     try:
@@ -4736,6 +4774,35 @@ class ConfigSpec:
                 "or 16, or an N tile of at least 16"
             )
 
+    def _normalize_cute_mxfp8_root_lowering(self, config: dict[str, object]) -> None:
+        """Collapse source-only choices for the proved complete native root.
+
+        This proof covers every operation in the root. The native planner
+        either replaces it completely or rejects compilation; it never falls
+        back to the displaced lowering when cute_scaled_mma is selected.
+        Scalar configurations retain their entire independent search space.
+        """
+        if (
+            self.backend_name != "cute"
+            or not self.cute_mxfp8_mma_available
+            or config.get("cute_scaled_mma") is not True
+            or self.target_device_capability is None
+            or self.target_device_capability[0] != 10
+            or config.get("pid_type", self.allowed_pid_types[0]) != "flat"
+        ):
+            return
+        fields = self._flat_fields()
+        for key in _CUTE_MXFP8_ROOT_LOWERING_KEYS.intersection(config):
+            if key in self.user_defined_tunables:
+                continue
+            field = fields.get(key)
+            if field is None:
+                config.pop(key)
+            else:
+                config[key] = field._flat_config(
+                    self, lambda fragment: fragment.default()
+                )
+
     def normalize(
         self,
         config: helion.Config | dict[str, object],
@@ -4763,6 +4830,8 @@ class ConfigSpec:
                 _cute_register_tiles=_cute_register_tiles,
             )
             return
+
+        self._normalize_cute_mxfp8_root_lowering(config)
 
         if (
             self.backend_name == "cute"
