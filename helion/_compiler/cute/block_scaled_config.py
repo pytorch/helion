@@ -15,6 +15,14 @@ BLOCK_SCALED_CHOICES: dict[str, tuple[object, ...]] = {
 BLOCK_SCALED_CONFIG_KEYS = frozenset(BLOCK_SCALED_CHOICES)
 
 
+def block_scaled_choices(*, mxfp8: bool = False) -> dict[str, tuple[object, ...]]:
+    """Return format-specific geometry without extending NVFP4's vocabulary."""
+    choices = dict(BLOCK_SCALED_CHOICES)
+    if mxfp8:
+        choices["cute_scaled_tile_n"] = (256, 128, 64)
+    return choices
+
+
 def block_scaled_workspace_shape(
     m: int, n: int, k: int, bn: int, bk: int
 ) -> tuple[int, int, int]:
@@ -38,6 +46,7 @@ def normalize_block_scaled_config(
     available: bool,
     capability: tuple[int, int] | None,
     fix_invalid: bool,
+    mxfp8: bool = False,
 ) -> None:
     selected = BLOCK_SCALED_CONFIG_KEYS.intersection(config)
     if not available:
@@ -48,7 +57,7 @@ def normalize_block_scaled_config(
         for key in selected:
             config.pop(key)
         return
-    for key, choices in BLOCK_SCALED_CHOICES.items():
+    for key, choices in block_scaled_choices(mxfp8=mxfp8).items():
         value = config.setdefault(key, choices[0])
         if not any(
             type(value) is type(choice) and value == choice for choice in choices
@@ -64,3 +73,8 @@ def normalize_block_scaled_config(
             config["cute_scaled_mma"] = False
         else:
             raise InvalidConfig("native block scaling requires SM100-family hardware")
+    if mxfp8 and config["cute_scaled_tile_k"] == 64:
+        if fix_invalid:
+            config["cute_scaled_tile_k"] = 128
+        else:
+            raise InvalidConfig("MXFP8 block scaling requires K tiles of 128 or 256")

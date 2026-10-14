@@ -28,8 +28,8 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
-from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
+from .._compiler.cute.block_scaled_config import block_scaled_choices
 from .._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from .._compiler.cute.cute_flash import _FLASH_EXP2_PACKET_PARAMS
 from .._compiler.cute.cute_flash import _FLASH_MANUAL_EXP2_PACKET_PARAMS
@@ -932,6 +932,44 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
 _BACKEND_DIAGNOSTIC_CONFIG_KEYS = CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 
 
+# A proved complete MXFP8 root is replaced by one native scaled contraction.
+# These coordinates describe the displaced SIMT/collective lowering and cannot
+# change that contraction. Keep the native geometry and every user tunable.
+_CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
+    {
+        "block_sizes",
+        "num_threads",
+        "loop_orders",
+        "l2_groupings",
+        "flatten_loops",
+        "indexing",
+        "load_eviction_policies",
+        "load_cache_modifiers",
+        "store_cache_modifiers",
+        "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_collective_stages",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
+        "cute_register_chain",
+        "cute_pdl",
+        "cute_min_blocks_per_mp",
+        "epilogue_subtile",
+    }
+)
+
+
 def _get_backend_tunable_keys() -> frozenset[str]:
     """Get all backend tunable keys, including FB-private ones if available."""
     try:
@@ -1458,6 +1496,7 @@ class ConfigSpec:
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
         self.cute_scaled_mma_available = False
+        self.cute_mxfp8_mma_available = False
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_packet_prefetch_enabled = False
@@ -4737,6 +4776,35 @@ class ConfigSpec:
                 "or 16, or an N tile of at least 16"
             )
 
+    def _normalize_cute_mxfp8_root_lowering(self, config: dict[str, object]) -> None:
+        """Collapse source-only choices for the proved complete native root.
+
+        This proof covers every operation in the root. The native planner
+        either replaces it completely or rejects compilation; it never falls
+        back to the displaced lowering when cute_scaled_mma is selected.
+        Scalar configurations retain their entire independent search space.
+        """
+        if (
+            self.backend_name != "cute"
+            or not self.cute_mxfp8_mma_available
+            or config.get("cute_scaled_mma") is not True
+            or self.target_device_capability is None
+            or self.target_device_capability[0] != 10
+            or config.get("pid_type", self.allowed_pid_types[0]) != "flat"
+        ):
+            return
+        fields = self._flat_fields()
+        for key in _CUTE_MXFP8_ROOT_LOWERING_KEYS.intersection(config):
+            if key in self.user_defined_tunables:
+                continue
+            field = fields.get(key)
+            if field is None:
+                config.pop(key)
+            else:
+                config[key] = field._flat_config(
+                    self, lambda fragment: fragment.default()
+                )
+
     def normalize(
         self,
         config: helion.Config | dict[str, object],
@@ -4764,6 +4832,8 @@ class ConfigSpec:
                 _cute_register_tiles=_cute_register_tiles,
             )
             return
+
+        self._normalize_cute_mxfp8_root_lowering(config)
 
         if (
             self.backend_name == "cute"
@@ -5567,6 +5637,7 @@ class ConfigSpec:
                 available=self.cute_scaled_mma_available,
                 capability=self.target_device_capability,
                 fix_invalid=_fix_invalid,
+                mxfp8=self.cute_mxfp8_mma_available,
             )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
@@ -7048,8 +7119,18 @@ class ConfigSpec:
                 and self.target_device_capability[0] == 10
             ):
                 fields.update(
-                    (key, EnumFragment(choices=choices))
-                    for key, choices in BLOCK_SCALED_CHOICES.items()
+                    (
+                        key,
+                        EnumFragment(
+                            choices=tuple(value for value in choices if value != 64)
+                            if self.cute_mxfp8_mma_available
+                            and key == "cute_scaled_tile_k"
+                            else choices
+                        ),
+                    )
+                    for key, choices in block_scaled_choices(
+                        mxfp8=self.cute_mxfp8_mma_available
+                    ).items()
                 )
             if self.cute_matmul_min_blocks_search_enabled:
                 fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))

@@ -78,6 +78,8 @@ class BlockScaledMmaPlan:
     cluster_m: int
     persistent: bool
     num_sm: int
+    format: str = "nvfp4"
+    rhs_transposed: bool = False
 
     @property
     def workspace_bytes(self) -> int:
@@ -85,6 +87,8 @@ class BlockScaledMmaPlan:
             self.m, self.n, self.k, self.bn, self.bk
         )
         padded_rows = padded_m + padded_n
+        if self.format == "mxfp8":
+            return padded_rows * padded_k // 32
         return padded_rows * padded_k // 2 + padded_rows * padded_k // 16
 
 
@@ -601,7 +605,9 @@ def plan_block_scaled(graphs: Sequence[GraphInfo]) -> None:
     df = DeviceFunction.current()
     if df.config.get("cute_scaled_mma", False) is not True:
         return
-    plan = _plan_block_scaled(graphs)
+    from .mxfp8_mma import plan_mxfp8
+
+    plan = plan_mxfp8(graphs) or _plan_block_scaled(graphs)
     if plan is None:
         raise exc.BackendUnsupported(
             "cute", "native block-scaled contraction proof declined"
@@ -672,6 +678,9 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
         "lhs_row_fast": plan.lhs.row_fast,
         "rhs_row_fast": plan.rhs.row_fast,
     }
+    if plan.format == "mxfp8":
+        wrapper_plan["format"] = plan.format
+        wrapper_plan["rhs_transposed"] = plan.rhs_transposed
     if alpha.isidentifier():
         wrapper_plan["scale_name"] = alpha
     else:

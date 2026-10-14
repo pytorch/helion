@@ -7,6 +7,7 @@ from typing import cast
 import torch
 
 from ... import exc
+from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -33,11 +34,13 @@ if TYPE_CHECKING:
 
 
 # fx ops that preserve the underlying byte storage of a tensor (no dtype
-# change, no arithmetic).  Used to trace a matmul operand back to its raw
+# change, no arithmetic; a dot operand's ``_mask_to`` zeroes lanes of its
+# input in kind).  Used to trace a matmul operand back to its raw
 # ``memory_ops.load`` so we can tell a raw fp8 *byte* load apart from a
 # *computed* fp8 register value (e.g. ``p = exp2(...).to(fp8)``).
 _FP8_LOAD_PASSTHROUGH_TARGETS = frozenset(
     {
+        _mask_to,
         torch.ops.aten.clone.default,
         torch.ops.aten.detach.default,
         torch.ops.aten.permute.default,
@@ -817,6 +820,36 @@ def _emit_cute_matmul_n_collapse(
     return result
 
 
+def _cute_product_ignores_lane(
+    cg: CodegenInterface, product: ast.AST, loop_state: object, lane_var: str
+) -> bool:
+    """Whether a matmul product reads nothing that varies along ``lane_var``
+    (or, when vectorized, its V-loop's coordinates), through the lane setup
+    and the statements emitted so far.  A tile mask (zeroing the lanes past
+    K) guards lanes rather than varying along them, as the lane loop
+    placement sees it."""
+    from ..ast_read_writes import ReadWrites
+    from ..tile_strategy import _cute_lane_coordinates
+    from ..tile_strategy import _lane_varying_names
+
+    masks = getattr(loop_state, "tile_masks", frozenset())
+    statements = [
+        statement
+        for statement in (
+            *getattr(loop_state, "lane_setup_statements", ()),
+            *getattr(cg, "statements_stack", [[]])[-1],
+        )
+        if not set(ReadWrites.from_ast(statement).writes) & masks
+    ]
+    coordinates = _cute_lane_coordinates(
+        lane_var, getattr(loop_state, "vec_lane_wrappers", {}).get(lane_var)
+    )
+    varying = coordinates.union(
+        *(_lane_varying_names(statements, name) for name in coordinates)
+    )
+    return not (set(ReadWrites.from_ast(product).reads) & varying)
+
+
 def _cute_k_lane_loop_is_innermost(cg: GenerateAST, loop_state: object) -> bool:
     """Whether the K block's loop body is the innermost open statement scope.
 
@@ -1191,6 +1224,25 @@ def _emit_cute_matmul(
                 product_lane = lane_var
                 lane_var = None
         if lane_var is not None:
+            if _cute_product_ignores_lane(cg, product, loop_state, lane_var):
+                # Operands uniform along K (expanded size-1 dims) still make
+                # one product per lane of the K tile.  Weighting the product
+                # by the lane's K validity counts them, and keeps the running
+                # sum in the lane loop, which a lane-invariant update would
+                # leave to run once per tile.
+                assert k_block_id is not None
+                end = loop_state.block_id_to_info[k_block_id].end_var_name
+                assert end is not None
+                weight_dtype = reduction_dtype or lhs_dtype or torch.float32
+                weight = (
+                    f"{CompileEnvironment.current().backend.dtype_str(weight_dtype)}"
+                    f"({cg.index_var(k_block_id)} < {end})"
+                )
+                product = expr_from_string(
+                    "{product} * {weight}",
+                    product=product,
+                    weight=expr_from_string(weight),
+                )
             product_name = cg.lift(product, dce=True, prefix="dot_product").id
             dot_acc = cg.device_function.new_var("dot_acc")
             dot_acc_base = None

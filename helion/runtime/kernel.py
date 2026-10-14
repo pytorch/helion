@@ -3577,6 +3577,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if expr != symbol
         ]
         relations.extend(
+            (symbol, expr, True) for symbol, expr in self.env.keyed_size_equalities
+        )
+        relations.extend(
             (lhs, rhs, False)
             # Binding records ``!= 1`` for any size it saw >= 2 without code
             # depending on it; code generation's (block pointers keep a

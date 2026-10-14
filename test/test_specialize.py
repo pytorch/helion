@@ -1043,7 +1043,16 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                     if not self._in_ref_eager_mode:
                         for kernel in (store_add_one, atomic_add_one):
                             bound = kernel.bind((a, out))
-                            self.assertEqual(bound._guarded_input_facts(), [])
+                            # A block store keys ``out`` matching the loop's
+                            # extent, but nothing compares a size with 1.
+                            self.assertEqual(
+                                [
+                                    fact
+                                    for fact in bound._guarded_input_facts()
+                                    if fact.extractor.rhs == 1
+                                ],
+                                [],
+                            )
 
     def test_size_one_broadcast_store_keeps_tile_mask(self):
         """Loading ``out`` first guards its size-1 dim to 1, so the following

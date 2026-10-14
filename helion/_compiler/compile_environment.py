@@ -541,6 +541,10 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
+        # Input sizes code generation relied on being equal (a block store
+        # bounded by its tensor covering the tile's loop) only at this
+        # binding's values; like a guard, each keys the bound kernel.
+        self.keyed_size_equalities: set[tuple[sympy.Symbol, sympy.Expr]] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
         self.tunable_symbols: set[sympy.Symbol] = set()
