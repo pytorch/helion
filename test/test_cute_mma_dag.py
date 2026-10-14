@@ -563,10 +563,11 @@ def test_admitted_kernels_expose_the_knobs_and_the_seeds() -> None:
     assert {c.config["cute_mma_dag_stages"] for c in seeds} == set(
         dag.MMA_DAG_SEED_STAGES
     )
-    # The sm100 fake target promotes the first seed to the autotune-off default.
+    # The sm100 fake target promotes the first seed to the autotune-off
+    # default: the tensor-memory mode where the kernel admits it.
     assert spec.compiler_default_config is not None
-    assert spec.compiler_default_config.config["cute_mma_dag"] == "warp"
-    assert bound.config_spec.default_config().config["cute_mma_dag"] == "warp"
+    assert spec.compiler_default_config.config["cute_mma_dag"] == "tcgen05"
+    assert bound.config_spec.default_config().config["cute_mma_dag"] == "tcgen05"
     # Admission leaves the block-size fragments alone (normalize and the
     # seeds keep the mode on legal tiles).
     assert _block_bounds(spec) == _block_bounds(_bind_fwd(dag=False).config_spec)
@@ -588,7 +589,7 @@ def test_k_loop_kernels_are_admitted_with_their_axes() -> None:
     spec = bound.config_spec
     assert _block_bounds(spec) == _block_bounds(_bind_fwd_o(dag=False).config_spec)
     default = spec.default_config().config
-    assert default["cute_mma_dag"] == "warp" and default["block_sizes"][0] == 1
+    assert default["cute_mma_dag"] == "tcgen05" and default["block_sizes"][0] == 1
     for bind in (
         lambda: _bind_fwd_o(gated=True),
         _bind_dqk,

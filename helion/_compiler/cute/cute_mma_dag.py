@@ -64,13 +64,17 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..device_ir import GraphInfo
+    from .cute_mma_dag_tcgen05 import Tcgen05Facts
+    from .cute_mma_dag_tcgen05 import Tcgen05Plan
 
     Layouts = dict[tuple[int, int], tuple[int, int]]
 
 MMA_DAG_KEY = "cute_mma_dag"
 MMA_DAG_OFF = "off"
 MMA_DAG_WARP = "warp"
-# ``tcgen05`` is reserved for a TMEM-resident mode of the same owner.
+# The TMEM-resident mode of the same owner (cute_mma_dag_tcgen05.py); it
+# joins the knob's choices only where its facts admit it.
+MMA_DAG_TCGEN05 = "tcgen05"
 MMA_DAG_MODES: tuple[str, ...] = (MMA_DAG_OFF, MMA_DAG_WARP)
 MMA_DAG_WARPS_KEY = "cute_mma_dag_warps"
 MMA_DAG_WARP_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
@@ -694,6 +698,8 @@ class CuteMmaDagFacts:
     k_axes: tuple[int, ...]
     smem_capacity: int
     grid_blocks: int = 1
+    # The tcgen05 mode's admission facts (None: not admitted).
+    tcgen05: Tcgen05Facts | None = None
     # Slot indices live together at some program point (the register budget
     # is the largest group); empty: every slot is live throughout.
     live: tuple[tuple[int, ...], ...] = ()
@@ -770,6 +776,9 @@ class MmaDagPlan:
     # into a ring slot, read per lane from shared memory) or ``global``
     # (per-lane global pair loads at the fragment coordinates).
     derived_routes: dict[Node, str] = dataclasses.field(default_factory=dict)
+    # ``warp`` (mma.sync, this module's emitter) or ``tcgen05``.
+    compute: str = MMA_DAG_WARP
+    tcgen05: Tcgen05Plan | None = None
 
     @property
     def threads(self) -> int:
@@ -1054,12 +1063,20 @@ def mma_dag_config_reason(
     sizes: Mapping[int, object],
     warps: object,
     stages: object,
+    mode: str = MMA_DAG_WARP,
 ) -> str | None:
-    """Why the block sizes / warps / stages cannot run the program (None: they can).
+    """Why the block sizes / warps / stages cannot run the program in
+    ``mode`` (None: they can).
 
     ``sizes`` maps block ids to the config's block sizes.
     """
-    if type(warps) is not int or warps not in MMA_DAG_WARP_CHOICES:
+    if mode == MMA_DAG_TCGEN05:
+        from .cute_mma_dag_tcgen05 import tcgen05_warps_reason
+
+        warps_reason = tcgen05_warps_reason(warps)
+        if warps_reason is not None:
+            return warps_reason
+    elif type(warps) is not int or warps not in MMA_DAG_WARP_CHOICES:
         return f"{MMA_DAG_WARPS_KEY} {warps!r} must be one of {MMA_DAG_WARP_CHOICES}"
     if type(stages) is not int or stages not in MMA_DAG_STAGE_CHOICES:
         return f"{MMA_DAG_STAGES_KEY} {stages!r} must be one of {MMA_DAG_STAGE_CHOICES}"
@@ -1078,6 +1095,11 @@ def mma_dag_config_reason(
     for index in facts.k_axes:
         if resolved[index] % MMA_DAG_K_STEP:
             return f"the dot K extent {resolved[index]} must be a multiple of {MMA_DAG_K_STEP}"
+    assert type(warps) is int
+    if mode == MMA_DAG_TCGEN05:
+        from .cute_mma_dag_tcgen05 import tcgen05_config_reason
+
+        return tcgen05_config_reason(facts, resolved, warps, stages)
     frag_words: list[int] = []
     for rows, cols in facts.frags:
         bm, bn = resolved[rows], resolved[cols]
@@ -1114,11 +1136,19 @@ def mma_dag_config_reason(
 
 
 def mma_dag_repair(
-    facts: CuteMmaDagFacts, sizes: Mapping[int, object], warps: object, stages: object
+    facts: CuteMmaDagFacts,
+    sizes: Mapping[int, object],
+    warps: object,
+    stages: object,
+    mode: str = MMA_DAG_WARP,
 ) -> tuple[dict[int, int], int, int] | None:
     """A legal ``(sizes, warps, stages)`` near the request: fewer stages
     first, then fewer warps, then the larger tunable tile halved (None: no
     legal config)."""
+    if mode == MMA_DAG_TCGEN05:
+        from .cute_mma_dag_tcgen05 import tcgen05_repair
+
+        return tcgen05_repair(facts, sizes, warps, stages)
     tunable = [
         axis.block_id for axis in facts.axes if axis.kind in (AXIS_ROOT, AXIS_LOOP)
     ]
@@ -2713,6 +2743,8 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         for store in program.stores
         if store.region == "loop" and store.source == "carry_in"
     )
+    from .cute_mma_dag_tcgen05 import tcgen05_facts
+
     return CuteMmaDagFacts(
         axes=tuple(AxisFacts(a.block_id, a.kind, a.extent) for a in program.axes),
         frags=tuple((rows.index, cols.index) for rows, cols in program.slots),
@@ -2721,6 +2753,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         k_axes=tuple(sorted({dot.k.index for dot in program.dots})),
         smem_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device),
         grid_blocks=grid_blocks,
+        tcgen05=tcgen05_facts(program),
         live=mma_dag_live_slots(program),
         edges=mma_dag_frag_edges(program),
         sm_count=_device_sm_count(env.device),
@@ -2994,7 +3027,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     mode = get(MMA_DAG_KEY, MMA_DAG_OFF)
     if mode == MMA_DAG_OFF or mode is None:
         return None
-    if mode != MMA_DAG_WARP:
+    if mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
         raise _decline(f"unknown mode {mode!r}")
     program = match_mma_dag(graphs)
     if program is None:
@@ -3013,7 +3046,9 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     store_mode = get(MMA_DAG_STORE_KEY, MMA_DAG_STORE_STAGED)
     exchange_mode = get(MMA_DAG_EXCHANGE_KEY, MMA_DAG_EXCHANGE_AUTO)
     facts = mma_dag_facts(program)
-    reason = mma_dag_config_reason(facts, sizes_by_block, warps, stages)
+    reason = mma_dag_config_reason(
+        facts, sizes_by_block, warps, stages, cast("str", mode)
+    )
     if reason is not None:
         raise _decline(reason)
     if store_mode not in MMA_DAG_STORE_CHOICES:
@@ -3067,6 +3102,23 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         )
         is None
     )
+    if mode == MMA_DAG_TCGEN05:
+        from .cute_mma_dag_tcgen05 import plan_tcgen05
+
+        tc = plan_tcgen05(
+            program, facts, sizes, routes, warps, stages, cast("str", store_mode)
+        )
+        return MmaDagPlan(
+            program=program,
+            sizes=sizes,
+            warps=warps,
+            stages=stages,
+            routes=routes,
+            staged_stores=tc.staged_stores,
+            exchange_mode=cast("str", exchange_mode),
+            compute=MMA_DAG_TCGEN05,
+            tcgen05=tc,
+        )
     plan = MmaDagPlan(
         program=program,
         sizes=sizes,
@@ -3107,6 +3159,7 @@ __all__ = [
     "MMA_DAG_STORE_DIRECT",
     "MMA_DAG_STORE_KEY",
     "MMA_DAG_STORE_STAGED",
+    "MMA_DAG_TCGEN05",
     "MMA_DAG_WARP",
     "MMA_DAG_WARPS_KEY",
     "MMA_DAG_WARP_CHOICES",
