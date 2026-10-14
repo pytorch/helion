@@ -124,7 +124,11 @@ class ReductionRoller:
                 "hl.associative_scan operations are not compatible with reduction rolling"
             )
 
-        if node.target in (torch.ops.aten.topk.default, torch.ops.aten.sort.default):
+        if node.target in (
+            torch.ops.aten.topk.default,
+            torch.ops.aten.sort.default,
+            torch.ops.aten.sort.stable,
+        ):
             # Ordering needs every value of its selected axis. Top-k shrinks
             # that axis, so output-shape placement would leave it outside the
             # rolled producer loop, observing only its last chunk. Sorting each

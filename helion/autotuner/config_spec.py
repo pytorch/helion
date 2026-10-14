@@ -4023,7 +4023,7 @@ class ConfigSpec:
             config,
             "cute_fragment_packet_loads",
             self.cute_fragment_packet_load_root_ids,
-            "a complete fragment root with readonly Float32 host loads",
+            "a complete fragment root with readonly Float32, Float16 or BFloat16 host loads",
             fix_invalid=fix_invalid,
         )
 

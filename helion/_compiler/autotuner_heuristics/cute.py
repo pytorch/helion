@@ -5270,6 +5270,29 @@ class CuteTopKHeuristic(AutotunerHeuristic):
         integer_key = "int64" if full_precision else "int32"
         padded_k = 1 << (plan.k - 1).bit_length()
         seeds = []
+        small_row_seed = None
+        per_warp_lane = (plan.n + 31) // 32
+        if (
+            env.block_sizes[plan.row_block_id].size_hint() <= 8
+            and plan.n >= 32
+            and per_warp_lane <= 32
+        ):
+            # A warp per row exposes parallelism when only a few rows exist.
+            # Bound the per-lane register footprint and append this hint after
+            # every existing family; ordinary defaults and their order stay put.
+            small_row_seed = env.config_spec.default_config()
+            small_row_seed.config.update(
+                cute_topk_lanes_per_row=32,
+                cute_topk_rows_per_block=1,
+                cute_topk_vector_width=min(4, 1 << (per_warp_lane.bit_length() - 1)),
+                cute_topk_output_vector_width=1,
+                cute_topk_value_mode="decode",
+                cute_topk_key_dtype=integer_key,
+                cute_topk_rank_mode="ordinal",
+                cute_topk_selection_layout="distributed",
+                cute_topk_sort_network="compact_pruned",
+                cute_topk_merge_schedule="balanced",
+            )
         # Retain the original register-pressure and occupancy candidates. All
         # seeds are search hints, not promoted defaults.
         for target, threads, value_mode, rank_mode, layout in (
@@ -5360,6 +5383,8 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                         cute_topk_key_recovery="packed",
                     )
                     seeds.append(config)
+            if small_row_seed is not None:
+                seeds.append(small_row_seed)
             return dedupe_configs(seeds)
         # Replicated ordinal decoding can avoid irregular value gathers. Add
         # all encoder implementations at two bounded register-fragment sizes;
@@ -5516,6 +5541,8 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                     cute_topk_merge_schedule="balanced",
                 )
                 seeds.append(config)
+        if small_row_seed is not None:
+            seeds.append(small_row_seed)
         return dedupe_configs(seeds)
 
     @classmethod
