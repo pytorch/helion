@@ -1976,6 +1976,7 @@ class CuteBackend(Backend):
             or key == "cute_mma_dag_store"
             or key == "cute_mma_dag_exchange"
             or key == "cute_mma_dag_pass_warps"
+            or key == "cute_mma_dag_loads"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )

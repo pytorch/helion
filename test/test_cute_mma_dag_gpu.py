@@ -1176,16 +1176,20 @@ def test_wy_dl_at_the_s1_pipeline_shape_matches_the_triton_backend(gated: bool) 
     # SIMT reference (not a dag fault -- the dag matches Triton bit for bit,
     # the two fp32 accumulation orders differ by a few bf16 ulps of dL where
     # the bf16-rounded intermediate of dA amplifies them).  The promoted
-    # default at the real shape and dtypes (bf16 beta and dvni) runs and
-    # equals Triton.
+    # default at the real shape and dtypes (bf16 beta and dvni) -- a
+    # tensor-memory seed, wy_dL being a flat streaming region program --
+    # runs and equals Triton.
     t = _inputs_m4(bhn=2048, d=128, dv=128, dtype=torch.bfloat16, seed=1)
     args = _wy_dl_args(t, gated)
     fn = _kernel_fn("wy_dL")
     bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
     with bound.env:
-        default = bound.config_spec.default_config()
-    assert default.config["cute_mma_dag"] == "warp"
-    _source, out = _run_cute(fn, args, default)
+        default = bound.config_spec.normalized_config(
+            bound.config_spec.default_config()
+        )
+    assert default.config["cute_mma_dag"] == "tcgen05"
+    out = _tensors(bound.compile_config(default)(*args))
+    torch.cuda.synchronize()
     ref = _run_triton(fn, args, default.config["block_sizes"])
     inexact = _M4_INEXACT[("wy_dL", gated)]
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
