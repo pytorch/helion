@@ -57,7 +57,8 @@ def jagged_dense_bmm(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
     L, D = jagged.shape
-    B, D, K = dense.shape
+    B, D2, K = dense.shape
+    assert D == D2
     out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
     for g in hl.grid(B):
         s = seq_offsets[g]
@@ -76,7 +77,8 @@ def jagged_dense_bmm_2d_loop(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
     L, D = jagged.shape
-    B, D, K = dense.shape
+    B, D2, K = dense.shape
+    assert D == D2
     out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
     for g in hl.grid(B):
         s = seq_offsets[g]
@@ -499,6 +501,49 @@ class TestPallasJaggedCarryBmm(TestCase):
         self.assertIn("(B,)", code)
         torch.testing.assert_close(out, jagged * 2)
 
+    @parametrize(
+        "case",
+        [
+            subtest((8, 128, torch.float32), name="load_only_d8_f32"),
+            subtest((64, 64, torch.bfloat16), name="load_and_store_64_bf16"),
+            subtest((64, 64, torch.float32), name="load_and_store_64_f32"),
+            subtest((8, 8, torch.float32), name="load_and_store_8_f32"),
+        ],
+    )
+    @parametrize(
+        "offsets",
+        [
+            subtest([0, 13, 61, 192], name="unaligned_groups"),
+        ],
+    )
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_unaligned_full_dim_dynamic_shapes(
+        self,
+        case: tuple[int, int, torch.dtype],
+        offsets: list[int],
+        kernel,
+        loop_type: str,
+    ) -> None:
+        # With static_shapes=False, minor dims narrower than 128 lanes lower
+        # through the ordered carry when the block covers the full tensor dim
+        # (block_d == D, block_k == K).
+        d, k, dtype = case
+        seq_offsets, jagged, dense = _inputs(offsets, d, k, dtype)
+        dynamic_kernel = helion.kernel(kernel.fn, backend="pallas", static_shapes=False)
+        code, out = _run(
+            seq_offsets,
+            jagged,
+            dense,
+            [16, k, d],
+            loop_type,
+            kernel=dynamic_kernel,
+        )
+        self.assertIn("carry", code)
+        self.assertNotIn("one_hot", code)
+        ref = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        torch.testing.assert_close(out[offsets[0] :], ref[offsets[0] :])
+
 
 def _ref_jagged_row_sum(seq_offsets: torch.Tensor, jagged: torch.Tensor):
     ref = torch.zeros(
@@ -769,6 +814,37 @@ class TestPallasJaggedCarryRejects(TestCase):
             exc.InvalidConfig, "block_row .* must be a multiple"
         ):
             _run(seq_offsets, jagged, dense, [8, 128, 128], loop_type, kernel=kernel)
+
+    @parametrize(
+        "K,block_k,dtype",
+        [
+            (12, 16, torch.float32),
+            (24, 32, torch.float32),
+            (48, 64, torch.bfloat16),
+        ],
+    )
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_unaligned_store_block_rejected(
+        self,
+        K: int,
+        block_k: int,
+        dtype: torch.dtype,
+        kernel,
+        loop_type: str,
+    ) -> None:
+        # Padded store blocks narrower than 128 lanes (K < block_k < 128) are
+        # not TPU DMA aligned since block_k != K and block_k % 128 != 0.
+        seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, K, dtype)
+        with self.assertRaisesRegex(exc.InvalidConfig, "not TPU DMA aligned"):
+            _run(
+                seq_offsets,
+                jagged,
+                dense,
+                [16, block_k, 128],
+                loop_type,
+                kernel=kernel,
+            )
 
     @parametrize("loop_type", _LOOP_TYPES)
     @parametrize("out_dtype", [torch.bfloat16, torch.float32])
