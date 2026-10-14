@@ -981,7 +981,7 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
     # IntelGPUError covers JIT and AOT build failures
     if isinstance(err, IntelGPUError) or err.__class__.__name__ == "IntelGPUError":
         return "warn"
-    
+
     msg = str(err)
     if "PassManager::run failed" in msg:
         return "warn"
