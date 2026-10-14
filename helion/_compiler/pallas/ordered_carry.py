@@ -198,7 +198,6 @@ def _carry_store_plan(
             f"Pallas ordered carry: block_row ({block_row}) must be a multiple of the "
             f"sublane tiling S ({S})."
         )
-    # TODO(tcombes): block_row > L (tensor shorter than a block) crashes downstream.
     return CarryStorePlan(
         row_block_id=row_block_id,
         col_block_id=col_block_id,
@@ -212,7 +211,6 @@ def _carry_store_plan(
 def emit_carry_store(
     state: CodegenState,
     tensor: torch.Tensor,
-    subscript: list[object] | tuple[object, ...],
     name: str,
     idx_str: str,
     value: object,

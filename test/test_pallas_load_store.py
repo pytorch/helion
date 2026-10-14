@@ -370,6 +370,30 @@ class TestPallasJaggedCarryBmm(TestCase):
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @parametrize("dtype", [torch.float32, torch.bfloat16])
+    @parametrize(
+        "case",
+        [
+            # Total L=25 < block_row=32: the only row tile is partial.
+            subtest(([0, 13, 25], 128, 32), name="short_rows"),
+            # Total K=64 < block_col=128: the only column tile is partial.
+            subtest(([0, 13, 25, 40], 64, 16), name="short_columns"),
+        ],
+    )
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_partial_last_tile(
+        self, dtype: torch.dtype, case, kernel, loop_type: str
+    ) -> None:
+        # The carry store writes the full (block_row, block_col) block even when
+        # the output's last tile along rows or columns is partial.
+        offsets, K, block_row = case
+        seq_offsets, jagged, dense = _inputs(offsets, 128, K, dtype)
+        _code, out = _run(
+            seq_offsets, jagged, dense, [block_row, 128, 128], loop_type, kernel=kernel
+        )
+        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
+
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("kernel", _BMM_KERNELS)
     @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
     def test_bmm_multi_k_tile(self, dtype: torch.dtype, kernel, loop_type: str) -> None:
