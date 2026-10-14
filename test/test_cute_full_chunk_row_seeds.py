@@ -151,8 +151,11 @@ def test_full_chunk_seeds_keep_legacy_prefix_default_and_packets(
     prior = old.config_spec.compiler_seed_configs
     current = bound.config_spec.compiler_seed_configs
     extras = seeds_for(bound)
-    assert len(extras) == 9
-    assert extras[-1].get("cute_independent_reduction") is True
+    with patch.object(CuteFullChunkRowHeuristic, "_low_thread_seeds", return_value=[]):
+        legacy_extras = seeds_for(bound)
+    assert len(legacy_extras) == 9 and 9 < len(extras) <= 17
+    assert extras[:9] == legacy_extras
+    assert extras[8].get("cute_independent_reduction") is True
     assert current == prior + extras
     assert current == bound.config_spec.compiler_seed_configs
     assert seeds_for(bound) == extras
@@ -174,7 +177,7 @@ def test_full_chunk_seeds_keep_legacy_prefix_default_and_packets(
     assert default == old_default
     assert bound.to_code(default) == old.to_code(old_default)
     chunk = 1 << (size - 1).bit_length()
-    for seed in extras[:-1]:
+    for seed in legacy_extras[:-1]:
         with bound.env:
             flat, effective = generation.strict_config_pair(seed)
             assert generation.strict_unflatten(flat) == effective
@@ -360,7 +363,7 @@ def test_unclassified_load_column_and_caps_decline() -> None:
 def test_offset_layout_never_gains_vector_alignment() -> None:
     bound = bind(1, 4096, torch.bfloat16, layout="offset")
     seeds = seeds_for(bound)
-    assert len(seeds) == 9
+    assert len(seeds) == 17
     for seed in seeds:
         code = bound.to_code(seed)
         assert "_consume_prefetch_" not in code
@@ -407,8 +410,10 @@ def test_block_id_mapping_and_policy_indices_are_not_positions() -> None:
     for seq in sequences.values():
         seq.reverse()
     reordered = seeds_for(bound)
-    assert len(reordered) == len(original) == 9
-    for before, after in zip(original[:-1], reordered[:-1], strict=True):
+    assert len(reordered) == len(original) == 13
+    for index, (before, after) in enumerate(zip(original, reordered, strict=True)):
+        if index == 8:  # The unchanged reference carrier has default geometry.
+            continue
         for name in sequences:
             assert after[name] == list(reversed(before[name]))
         with bound.env:
@@ -429,7 +434,7 @@ def test_pdl_profiles_follow_target_search_domain(
     bound = bind(1, 4096, torch.bfloat16)
     with patch.object(bound.config_spec, "target_device_capability", target):
         seeds = seeds_for(bound)
-    assert len(seeds) == (9 if target is not None and target >= (9, 0) else 6)
+    assert len(seeds) == (17 if target is not None and target >= (9, 0) else 14)
     assert any(seed.get("cute_replicated_reduction", False) for seed in seeds)
 
 
@@ -469,7 +474,7 @@ def test_replication_carrier_keeps_shape_structure_and_reference_geometry(
         old = bind(3, size, dtype, static=static, layout=layout)
     bound = bind(3, size, dtype, static=static, layout=layout)
     seeds = seeds_for(bound)
-    assert 2 <= len(seeds) <= 9
+    assert 2 <= len(seeds) <= 17
     packet_seeds = seeds_for(bound, packets_only=True)
     assert (
         bound.config_spec.compiler_seed_configs
