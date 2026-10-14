@@ -8000,7 +8000,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
-_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = (
+    "auto",
+    "register",
+    "gmem",
+    "register_prefetch",
+)
 # Manual unroll of the row lane loop of a sunk vector nest (``cute_vloop_sink``).
 _CUTE_LANE_UNROLL_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 
@@ -8023,7 +8028,9 @@ class CuteReductionReloadSpec(_BlockIdItem):
     per-thread slice is small; spills to local memory when it is not).
     ``"gmem"`` re-loads from global memory on later sweeps (the row is usually
     still resident in L2, and no registers are burned).  ``"auto"`` (default)
-    keeps the legacy size heuristic in ``fuse_two_pass_loads``.
+    keeps the legacy size heuristic in ``fuse_two_pass_loads``. The optional
+    ``"register_prefetch"`` mode retains register reloads and also prefetches
+    one proven read-only consumer packet across a one-trip reduction.
     """
 
     def __init__(self, *, block_id: int) -> None:

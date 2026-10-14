@@ -1401,6 +1401,8 @@ class _CuteFuseTwoPassLoads:
                 # (re-load later sweeps from gmem/L2).
                 if _fuser_mode == "gmem":
                     _fuser_mode = "disabled"
+            if _fuser_mode == "register_prefetch":
+                _fuser_mode = "register"
             if _fuser_mode == "disabled":
                 continue
             if _fuser_mode == "register":
