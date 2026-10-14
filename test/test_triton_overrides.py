@@ -10,6 +10,8 @@ from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
+# Covers HelionTritonOverrides, the Triton backend's floordiv/mod printer;
+# CuTe prints index arithmetic through its own op overrides.
 @onlyBackends(["triton"])
 class TestTritonDivisionSimplification(TestCase):
     @skipIfRefEager("to_triton_code() requires compilation")

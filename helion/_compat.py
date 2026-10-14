@@ -521,23 +521,30 @@ def num_compute_units() -> int:
     return 128
 
 
-@functools.cache
 def supports_amd_cdna_tunables() -> bool:
-    if not is_hip():
-        return False
+    # Keep is_hip() outside the cache: tests patch is_hip/_is_hip to model
+    # other targets, and a result cached under such a patch would leak into
+    # every later test in the process.
+    return is_hip() and _is_amd_cdna()
+
+
+@functools.cache
+def _is_amd_cdna() -> bool:
+    # CDNA architectures are gfx908 and above but less than gfx1000
+    # Reference: https://llvm.org/docs/AMDGPUUsage.html
+    match = re.match(r"gfx([0-9a-f]{3})", _amd_base_arch() or "")
+    return match is not None and int(match.group(1), 16) >= 0x908
+
+
+@functools.cache
+def _amd_base_arch() -> str | None:
+    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         arch = getattr(props, "gcnArchName", None)
-        if arch is None:
-            return False
-        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
-        # CDNA architectures are gfx908 and above but less than gfx1000
-        # Reference: https://llvm.org/docs/AMDGPUUsage.html
-        base_arch = arch.split(":")[0]
-        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
-        return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
-        return False
+        return None
+    return None if arch is None else arch.split(":")[0]
 
 
 def device_num_sm(device: torch.device | int | None = None) -> int:
@@ -599,7 +606,6 @@ def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
         return {}
 
 
-@functools.cache
 def supports_tf32_precision_on_amd() -> bool:
     """Check if the AMD GPU supports TF32 (XF32) precision.
 
@@ -608,19 +614,8 @@ def supports_tf32_precision_on_amd() -> bool:
     only support 'ieee' precision for dot operations.
     Reference: triton/backends/amd/compiler.py only enables tf32 for gfx942.
     """
-    if not is_hip():
-        return False
-    try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        arch = getattr(props, "gcnArchName", None)
-        if arch is None:
-            return False
-        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
-        base_arch = arch.split(":")[0]
-        # Only gfx942 (CDNA3 / MI300) supports TF32 in Triton's HIP backend
-        return base_arch == "gfx942"
-    except Exception:
-        return False
+    # is_hip() stays uncached for the same reason as in supports_amd_cdna_tunables.
+    return is_hip() and _amd_base_arch() == "gfx942"
 
 
 def shape_env_size_hint(
@@ -754,8 +749,13 @@ def torch_uses_template_producer_fusion() -> bool:
 
 
 @functools.cache
-def supports_torch_compile_fusion() -> bool:
-    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+def supports_torch_compile_template_lowering() -> bool:
+    """Check whether Inductor can lower Helion's kernel HOP as a template.
+
+    This is the unfused subset of :func:`supports_torch_compile_fusion`: the
+    external template kernel and the template buffer fusion flags, without the
+    scheduler's prologue/producer fusion hook.
+    """
     if torch.xpu.is_available():
         return False
     if not requires_torch_version("2.11"):
@@ -769,15 +769,24 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
-        fusion_hook = (
-            "has_aliasing_or_mutation_for_producer_fusion"
-            if torch_uses_template_producer_fusion()
-            else "has_aliasing_or_mutation_for_prologue_fusion"
-        )
-        assert hasattr(TemplateBuffer, fusion_hook)
     except (ImportError, AttributeError, AssertionError):
         return False
     return True
+
+
+@functools.cache
+def supports_torch_compile_fusion() -> bool:
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+    if not supports_torch_compile_template_lowering():
+        return False
+    from torch._inductor.ir import TemplateBuffer
+
+    fusion_hook = (
+        "has_aliasing_or_mutation_for_producer_fusion"
+        if torch_uses_template_producer_fusion()
+        else "has_aliasing_or_mutation_for_prologue_fusion"
+    )
+    return hasattr(TemplateBuffer, fusion_hook)
 
 
 def extract_device(args: Sequence[object]) -> torch.device | None:

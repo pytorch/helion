@@ -53,6 +53,29 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         _, result = code_and_output(jagged_row_sum, (x, offsets))
         torch.testing.assert_close(result, ref(x, offsets))
 
+    def test_jagged_tile_singleton_parent(self):
+        @helion.kernel(autotune_effort="none")
+        def jagged_row_sum(values: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                offsets.numel() - 1, device=values.device, dtype=values.dtype
+            )
+            for row in hl.tile(out.numel(), block_size=1):
+                starts = offsets[row]
+                lengths = offsets[row.index + 1] - starts
+                acc = hl.zeros([row], dtype=values.dtype)
+                for column in hl.jagged_tile(lengths):
+                    indices = starts[:, None] + column.index[None, :]
+                    acc += values[indices].sum(dim=1)
+                out[row] = acc
+            return out
+
+        values = torch.arange(1, 13, dtype=torch.float32, device=DEVICE)
+        offsets = torch.tensor([0, 3, 3, 11, 12], device=DEVICE)
+        _, result = code_and_output(jagged_row_sum, (values, offsets), block_sizes=[4])
+        torch.testing.assert_close(
+            result, torch.tensor([6.0, 0.0, 60.0, 12.0], device=DEVICE)
+        )
+
     def test_jagged_tile_mean_over_the_jagged_dim_is_rejected(self):
         """Each row of the parent tile holds its own number of elements, so a mean over the jagged dim has no one divisor; it used to divide by the block."""
 

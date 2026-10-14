@@ -24,6 +24,7 @@ import inspect
 import json
 import linecache
 import logging
+import math
 import os
 import sys
 import threading
@@ -77,9 +78,11 @@ from ..._compiler.cute.tcgen05_constants import (
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
+from .source_dependencies import referenced_helper_sources
 from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Iterator
     from collections.abc import Sequence
@@ -755,9 +758,24 @@ def _append_cute_wrapper_plan(
         bias_idx = plan_optional_int("bias_idx")
         alibi_idx = plan_optional_int("alibi_idx")
         document_idx = plan_optional_int("document_idx")
+        row_kv_begin_idx = plan_optional_int("row_kv_begin_idx")
+        row_kv_begin_work_idx = plan_optional_int("row_kv_begin_work_idx")
         seq = plan_int("seq")
+        # The flex envelope's K/V length (the Q/O/LSE length is ``seq``).
+        kv_seq = plan_int("kv_seq", default=seq)
+        # The flex envelope's runtime softmax scale.
+        scale_idx = plan_optional_int("scale_idx")
+        scale_peeled = bool(plan.get("scale_peeled", True))
         head_dim = plan_int("head_dim")
+        # V/O head dim: equals ``head_dim`` except for the asymmetric MLA pair
+        # (192-wide Q/K against 128-wide V/O).
+        head_dim_v = plan_int("head_dim_v", default=head_dim)
+        uneven_kv_ring = bool(plan.get("uneven_kv_ring"))
         batch = plan_int("batch")
+        # Grouped-query attention: K/V hold ``batch // kv_group`` batch heads
+        # (the device body reads them at ``bh // kv_group``); Q/O keep ``batch``.
+        kv_group = plan_int("kv_group", default=1)
+        kv_batch = batch // kv_group
         scale_log2 = plan["scale_log2"]
         assert isinstance(scale_log2, float)
         score_bias_scale = plan.get("score_bias_scale", 0.0)
@@ -765,6 +783,10 @@ def _append_cute_wrapper_plan(
         alibi_count = plan_int("alibi_count", default=batch)
         document_batch = plan_int("document_batch", default=batch)
         document_heads_per_batch = plan_int("document_heads_per_batch", default=1)
+        row_kv_begin_batch = plan_int("row_kv_begin_batch", default=batch)
+        row_kv_begin_heads_per_batch = plan_int(
+            "row_kv_begin_heads_per_batch", default=1
+        )
         kv_stage = plan_int("kv_stage")
         q_stage = plan_int("q_stage", default=1)
         use_2cta_instrs = bool(plan.get("use_2cta_instrs"))
@@ -775,15 +797,19 @@ def _append_cute_wrapper_plan(
         # amortizes the per-tile softmax correction over more columns, which is
         # where FA4's tuned plans get their edge on sm_103.
         kv_n = plan_int("kv_tile_n", default=128)
-        num_kv = (seq + kv_n - 1) // kv_n
+        num_kv = (kv_seq + kv_n - 1) // kv_n
         # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
         # flat tile-id space the device-body strided while loop walks). When
         # persistent, the host clamps grid_x down to min(total_tiles, num_SMs)
         # so each SM gets one CTA that strides over many work tiles.
         persistent = bool(plan.get("persistent"))
         total_tiles = plan_int("total_tiles", default=batch * (seq // 128))
+        # The split-KV list walk (``cute_flash_kv_split``): that many CTAs
+        # per pair item (the device body decodes the split id).
+        kv_split = plan_int("kv_split", default=1)
         pass_dynamic_tile_counts = plan.get("topology") != "fa4"
         hd = head_dim
+        hd_v = head_dim_v
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
         tensor_4d_batch = plan_int("tensor_4d_batch", default=0)
@@ -802,8 +828,12 @@ def _append_cute_wrapper_plan(
         q_tile_m = plan_int("q_tile_m", default=128)
         mma_m = 256 if use_2cta_instrs else q_tile_m
         qkd = f"({mma_m}, {kv_n}, {hd})"
-        pvd = f"({mma_m}, {hd}, {kv_n})"
+        pvd = f"({mma_m}, {hd_v}, {kv_n})"
         if use_tensor_4d_tma:
+            # The 4D descriptors describe Q/K/V/O with one head dim and one
+            # sequence length.
+            assert hd_v == hd
+            assert kv_seq == seq
             bh_stride = seq * hd
             batch_stride = tensor_4d_heads * bh_stride
             sdb = (
@@ -816,14 +846,34 @@ def _append_cute_wrapper_plan(
                 f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
                 f"{batch_stride}))"
             )
+            sdb_o = sdb
         else:
+            # Q (and K) are ``hd`` wide; O (and the row-epilogue aux rows that
+            # share its view) and the MN-major V are ``hd_v`` wide.
             sdb = (
                 f"cute.make_layout(({seq}, {hd}, {batch}), "
                 f"stride=({hd}, 1, {seq * hd}))"
             )
+            sdb_o = (
+                f"cute.make_layout(({seq}, {hd_v}, {batch}), "
+                f"stride=({hd_v}, 1, {seq * hd_v}))"
+            )
             dsb = (
-                f"cute.make_layout(({hd}, {seq}, {batch}), "
-                f"stride=(1, {hd}, {seq * hd}))"
+                f"cute.make_layout(({hd_v}, {seq}, {batch}), "
+                f"stride=(1, {hd_v}, {seq * hd_v}))"
+            )
+        # K/V layouts span their own (grouped) batch-head count and length.
+        if kv_group == 1 and kv_seq == seq:
+            sdb_kv = sdb
+            dsb_kv = dsb
+        else:
+            sdb_kv = (
+                f"cute.make_layout(({kv_seq}, {hd}, {kv_batch}), "
+                f"stride=({hd}, 1, {kv_seq * hd}))"
+            )
+            dsb_kv = (
+                f"cute.make_layout(({hd_v}, {kv_seq}, {kv_batch}), "
+                f"stride=(1, {hd_v}, {kv_seq * hd_v}))"
             )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
@@ -835,18 +885,50 @@ def _append_cute_wrapper_plan(
         sel = "cute.select"
         flash_lines = [
             f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
-            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb_kv})",
             # V is MN-major: (D, S, B).
-            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
-            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb_kv})",
+            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb_o})",
             f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
-            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd_v}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
             # the device-body kv_stage + the SharedStorage MemRange depths.
             f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
             f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
+        ]
+        if hd_v != hd:
+            # The aliased K/V ring alternates K and V through one physical
+            # ring whose slots are K's (wider) tile, so V's stage stride has
+            # to be K's: recompose V's swizzled layout over the shared stage
+            # stride (FA4's ``same_hdim_kv_padded`` layout fix-up). One V stage
+            # still covers only its own ``kv_n x hd_v`` box. FA4's uneven
+            # [wide, narrow, wide] ring strides both operands by half a K
+            # plus half a V tile instead (the device body shifts the odd slot).
+            if uneven_kv_ring:
+                stage_stride = (
+                    "(max(_flash_ksl.outer.stride[-1], 0) "
+                    "+ max(_flash_vsl.outer.stride[-1], 0)) // 2"
+                )
+            else:
+                stage_stride = (
+                    "max(max(_flash_ksl.outer.stride[-1], 0), "
+                    "max(_flash_vsl.outer.stride[-1], 0))"
+                )
+            flash_lines.append(f"_flash_kv_stage_stride = {stage_stride}")
+            if uneven_kv_ring:
+                flash_lines.append(
+                    "_flash_ksl = cute.make_composed_layout(_flash_ksl.inner, 0, "
+                    f"cute.make_layout((*_flash_ksl.outer.shape[:-1], {kv_stage}), "
+                    "stride=(*_flash_ksl.outer.stride[:-1], _flash_kv_stage_stride)))"
+                )
+            flash_lines.append(
+                "_flash_vsl = cute.make_composed_layout(_flash_vsl.inner, 0, "
+                f"cute.make_layout((*_flash_vsl.outer.shape[:-1], {kv_stage}), "
+                "stride=(*_flash_vsl.outer.stride[:-1], _flash_kv_stage_stride)))"
+            )
+        flash_lines += [
             f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
             f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg})",
             f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
@@ -855,6 +937,20 @@ def _append_cute_wrapper_plan(
             f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
             f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
         ]
+        if scale_idx is not None:
+            # The flex envelope's runtime scale: the hooks read it as
+            # ``_flash_scale``; a mask-only plan (raw QK units, the scale
+            # peeled into the PASS2 multiplier) derives the log2 scale from
+            # it and needs it positive (a non-positive scale would flip the
+            # row max), while a score region owns the multiply itself.
+            flash_lines.append(f"_flash_scale = cutlass.Float32(arg{scale_idx})")
+            if scale_peeled:
+                # A non-positive scale would flip the row max; the example's
+                # host wrapper asserts ``scale > 0`` (a staged value cannot be
+                # asserted inside the DSL wrapper).
+                flash_lines.append(
+                    f"_flash_scale_log2 = _flash_scale * cutlass.Float32({math.log2(math.e)!r})"
+                )
         if bias_idx is not None:
             flash_lines.extend(
                 [
@@ -874,6 +970,15 @@ def _append_cute_wrapper_plan(
             )
         if document_idx is not None:
             sdoc = f"cute.make_layout(({seq}, {document_batch}), stride=(1, {seq}))"
+            # Host-built ``(2, doc_batch, num_tiles)`` int32 [min, max] id table,
+            # viewed as ``(num_tiles, doc_batch, 2)`` so the device indexes it
+            # ``[tile, doc_bh, 0 | 1]``.
+            document_range_idx = plan_int("document_range_idx")
+            document_tiles = plan_int("document_tiles")
+            srange = (
+                f"cute.make_layout(({document_tiles}, {document_batch}, 2), "
+                f"stride=(1, {document_tiles}, {document_tiles * document_batch}))"
+            )
             flash_lines.extend(
                 [
                     f"_flash_mDoc = cute.make_tensor(arg{document_idx}.iterator, {sdoc})",
@@ -881,15 +986,44 @@ def _append_cute_wrapper_plan(
                         "_flash_doc_heads_per_batch = "
                         f"cutlass.Int32({document_heads_per_batch})"
                     ),
+                    (
+                        "_flash_mDocRange = cute.make_tensor("
+                        f"arg{document_range_idx}.iterator, {srange})"
+                    ),
                 ]
             )
+        if row_kv_begin_idx is not None:
+            # Per-row KV lower-bound table, viewed like the document table.
+            srkb = f"cute.make_layout(({seq}, {row_kv_begin_batch}), stride=(1, {seq}))"
+            flash_lines.extend(
+                [
+                    (
+                        "_flash_mRowKvBegin = cute.make_tensor("
+                        f"arg{row_kv_begin_idx}.iterator, {srkb})"
+                    ),
+                    (
+                        "_flash_rkb_heads_per_batch = "
+                        f"cutlass.Int32({row_kv_begin_heads_per_batch})"
+                    ),
+                ]
+            )
+            if row_kv_begin_work_idx is not None:
+                # Host-built ``(rows, 4)`` int32 work table of the segment
+                # tiling: row 0 holds the item count, the rest the
+                # (batch row, segment start, segment length, pair code) items.
+                work_rows = plan_int("row_kv_begin_work_rows")
+                flash_lines.append(
+                    "_flash_mRkbWork = cute.make_tensor("
+                    f"arg{row_kv_begin_work_idx}.iterator, "
+                    f"cute.make_layout(({work_rows}, 4), stride=(4, 1)))"
+                )
         # Fused row-epilogue inputs share O's (S, D, B) view so the device body
         # can partition them exactly like the O store.
         epi_aux_count = plan_int("epi_aux_count", default=0)
         for index in range(epi_aux_count):
             aux_idx = plan_int(f"epi_aux{index}_idx")
             flash_lines.append(
-                f"_flash_mEpiAux{index} = cute.make_tensor(arg{aux_idx}.iterator, {sdb})"
+                f"_flash_mEpiAux{index} = cute.make_tensor(arg{aux_idx}.iterator, {sdb_o})"
             )
         if pass_dynamic_tile_counts:
             flash_lines.extend(
@@ -912,7 +1046,7 @@ def _append_cute_wrapper_plan(
             # Q tiles of a work item, ws_overlap stages its single tile.
             # Per-CTA output tile: 128 rows for fa4 (also under CtaGroup.TWO,
             # where each CTA stores its own half) or the ws_overlap tile height.
-            otile = f"({q_tile_m}, {hd})"
+            otile = f"({q_tile_m}, {hd_v})"
             flash_lines.extend(
                 [
                     (
@@ -982,14 +1116,16 @@ def _append_cute_wrapper_plan(
             assert num_sm is not None and num_sm > 0
             ctas_per_sm = max(1, plan_int("persistent_ctas_per_sm", 1))
             max_ctas = ((num_sm * ctas_per_sm) // cluster_m) * cluster_m
-            grid_cap = min(total_tiles * cluster_m, max_ctas)
+            grid_cap = min(total_tiles * kv_split * cluster_m, max_ctas)
             body.append(f"    grid_x = cutlass.Int32({grid_cap})")
         elif plan.get("topology") == "fa4":
             # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
-            # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs.
-            # The default root grid would launch batch * seq // 128; override it
-            # to the halved fa4 tile count.
-            body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
+            # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs
+            # (times the split-KV factor). The default root grid would launch
+            # batch * seq // 128; override it to the halved fa4 tile count.
+            body.append(
+                f"    grid_x = cutlass.Int32({total_tiles * kv_split * cluster_m})"
+            )
         elif q_tile_m != 128:
             # 64-row ws_overlap tiles: one CTA per (bh, 64-row tile), twice the
             # default 128-row root grid.
@@ -1022,9 +1158,24 @@ def _append_cute_wrapper_plan(
         if alibi_idx is not None:
             call_args.extend(["_flash_mAlibi", "_flash_num_alibi"])
         if document_idx is not None:
-            call_args.extend(["_flash_mDoc", "_flash_doc_heads_per_batch"])
+            call_args.extend(
+                ["_flash_mDoc", "_flash_doc_heads_per_batch", "_flash_mDocRange"]
+            )
+        if row_kv_begin_idx is not None:
+            call_args.extend(["_flash_mRowKvBegin", "_flash_rkb_heads_per_batch"])
+            if row_kv_begin_work_idx is not None:
+                call_args.append("_flash_mRkbWork")
+                if epi_tma:
+                    # The ragged tiles' vector store needs the plain O view.
+                    call_args.append("_flash_mO")
+        if scale_idx is not None:
+            call_args.append("_flash_scale")
         if epi_tma:
             call_args.extend(["_flash_tma_o", "_flash_osl"])
+            if plan.get("epi_tma_ragged"):
+                # A ragged query length's partial tiles take the vector
+                # store over the plain O view.
+                call_args.append("_flash_mO")
         elif epi_stg:
             call_args.append("_flash_osl")
         call_args.extend(f"_flash_mEpiAux{index}" for index in range(epi_aux_count))
@@ -2622,7 +2773,13 @@ class _CompiledCuteLauncher:
     Any failure in the cache layer falls back to a plain ``cute.compile``.
     """
 
-    __slots__ = ("_cache_key", "_compile_options", "_compiled", "_jit_func")
+    __slots__ = (
+        "_cache_key",
+        "_capi_compiled",
+        "_compile_options",
+        "_compiled",
+        "_jit_func",
+    )
 
     def __init__(
         self,
@@ -2633,7 +2790,33 @@ class _CompiledCuteLauncher:
         self._jit_func = jit_func
         self._compile_options = compile_options
         self._compiled: object = None
+        self._capi_compiled: object = None
         self._cache_key = cache_key
+
+    def capi_function(self) -> object:
+        """The compiled function in its C-API (``JitExecutor``) form.
+
+        ``cute.compile`` under ``--enable-tvm-ffi`` returns a TVM-FFI function
+        whose launches never create a ``JitExecutor``; only a disk-cache
+        reload yields the plain ``CudaDialectJitCompiledFunction``.  The fast
+        relaunch patches an executor's packed C arguments, so a fresh-compile
+        process would otherwise never build it (and every call would pay the
+        FFI marshalling).  JIT the host module once more (~50ms, in memory)
+        into the same object a cache hit produces; the TVM-FFI function keeps
+        serving the slow path.
+        """
+        compiled = self._compiled
+        if compiled is None or not _is_tvm_ffi_compiled_function(compiled):
+            return compiled
+        twin = self._capi_compiled
+        if twin is None:
+            twin = self._jit_cuda_dialect_function(
+                cast("Any", compiled).ir_module,
+                cast("Any", compiled).function_name,
+                has_gpu_module=bool(cast("Any", compiled).has_gpu_module),
+            )
+            self._capi_compiled = twin
+        return twin
 
     def __call__(self, *args: object) -> object:
         compiled = self._compiled
@@ -2721,10 +2904,6 @@ class _CompiledCuteLauncher:
         try:
             from cutlass.base_dsl.cache_helpers import load_ir
             from cutlass.base_dsl.cache_helpers import read_bytecode_and_check_crc32
-            from cutlass.cutlass_dsl.cuda_jit_executor import (
-                CudaDialectJitCompiledFunction,
-            )
-            from cutlass.cutlass_dsl.cutlass import CuTeDSL
 
             _cache_dir, mlir, meta = self._cache_file_paths()
             if not (os.path.exists(mlir) and os.path.exists(meta)):
@@ -2740,40 +2919,67 @@ class _CompiledCuteLauncher:
                 asBytecode=True,
                 bytecode_reader=read_bytecode_and_check_crc32,
             )
-            if (
-                self._compile_options
-                and _TVM_FFI_COMPILE_OPTION in self._compile_options.split()
-            ):
-                # Compilation imports this runtime through the SDK's FFI
-                # provider. A fresh-process disk hit must also load its global
-                # symbols before the cached host module is linked.
-                importlib.import_module("tvm_ffi")
-            dsl = CuTeDSL._get_dsl()
-            engine = dsl.compiler_provider.jit(
-                module, shared_libs=dsl.get_shared_libs()
-            )
-            capi_func = engine.lookup(function_name)
-            # The signature is reconstructable from the wrapper, so it does not
-            # need to be persisted.
-            wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
-            signature = inspect.signature(cast("Any", wrapped), eval_str=True)
-            # Empty kernel_info / default extra-arg state is correct only for the
-            # non-experimental ``cute.compile`` path Helion uses here; the
-            # experimental DSL would populate these from module attributes.
-            return CudaDialectJitCompiledFunction(
+            return self._jit_cuda_dialect_function(
                 module,
-                engine,
-                capi_func,
-                signature,
                 function_name,
-                {},
-                False,
-                None,
                 has_gpu_module=bool(metadata.get("has_gpu_module", True)),
             )
         except Exception:
             # Any cutlass-internal change or corrupt artifact -> recompile.
             return None
+
+    def _jit_cuda_dialect_function(
+        self,
+        module: object,
+        function_name: str,
+        *,
+        has_gpu_module: bool,
+    ) -> object:
+        """JIT the lowered host module into a plain C-API compiled function."""
+        from cutlass.cutlass_dsl.cuda_jit_executor import CudaDialectJitCompiledFunction
+        from cutlass.cutlass_dsl.cutlass import CuTeDSL
+
+        if (
+            self._compile_options
+            and _TVM_FFI_COMPILE_OPTION in self._compile_options.split()
+        ):
+            # Compilation imports this runtime through the SDK's FFI
+            # provider. A fresh-process disk hit must also load its global
+            # symbols before the cached host module is linked.
+            importlib.import_module("tvm_ffi")
+        dsl = CuTeDSL._get_dsl()
+        engine = dsl.compiler_provider.jit(module, shared_libs=dsl.get_shared_libs())
+        capi_func = engine.lookup(function_name)
+        # The signature is reconstructable from the wrapper, so it does not
+        # need to be persisted.
+        wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
+        signature = inspect.signature(cast("Any", wrapped), eval_str=True)
+        # Empty kernel_info / default extra-arg state is correct only for the
+        # non-experimental ``cute.compile`` path Helion uses here; the
+        # experimental DSL would populate these from module attributes.
+        return CudaDialectJitCompiledFunction(
+            module,
+            engine,
+            capi_func,
+            signature,
+            function_name,
+            {},
+            False,
+            None,
+            has_gpu_module=has_gpu_module,
+        )
+
+
+def _is_tvm_ffi_compiled_function(compiled: object) -> bool:
+    """Whether ``compiled`` launches through the DSL's TVM-FFI bridge.
+
+    Looked up rather than imported: a TVM-FFI function can only exist once the
+    provider module is loaded, and test doubles must not pull the DSL in.
+    """
+    provider = sys.modules.get("cutlass.cutlass_dsl.tvm_ffi_provider")
+    return provider is not None and isinstance(
+        compiled, provider.TVMFFIJitCompiledFunctionBase
+    )
 
 
 _TVM_FFI_COMPILE_OPTION = "--enable-tvm-ffi"
@@ -2925,7 +3131,9 @@ def _cute_disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, external compiled-helper sources, full input
+    generated device-kernel source, external compiled-helper sources, the
+    sources of the Helion helper modules the kernel's globals reference
+    (``referenced_helper_sources``), full input
     specialization (dtypes, ranks,
     pointer alignments, baked shapes/strides, constexpr values), launch shape
     (block/cluster), preferred shared-memory carveout, CuTe compile options,
@@ -2955,6 +3163,12 @@ def _cute_disk_cache_key(
     helper_sources = wrapper_source_dependencies(helper_kinds)
     if helper_sources is None:
         return None
+    kernel_globals = getattr(
+        getattr(cute_kernel, "__wrapped__", cute_kernel), "__globals__", {}
+    )
+    called_helper_sources = referenced_helper_sources(kernel_globals)
+    if called_helper_sources is None:
+        return None
     try:
         import cutlass
 
@@ -2963,9 +3177,10 @@ def _cute_disk_cache_key(
         cutlass_version = ""
     payload = repr(
         (
-            "helion-cute-cache-v2",
+            "helion-cute-cache-v3",
             source_hash,
             helper_sources,
+            called_helper_sources,
             schema_key,
             block,
             wrapper_plans,
@@ -6505,8 +6720,11 @@ class _CuteFastRelaunch:
         "block",
         "by_ref_writers",
         "by_val_slots",
+        "capi_func",
         "compile_options",
         "constexpr_flags",
+        "cuda_error",
+        "cuda_result",
         "device_index",
         "exe_args",
         "executor",
@@ -6514,7 +6732,9 @@ class _CuteFastRelaunch:
         "keepalive",
         "last_raw",
         "lock",
+        "packed_args",
         "scalar_guards",
+        "tensor_guard",
         "tensor_guards",
         "tensor_slots",
     )
@@ -6548,10 +6768,12 @@ class _CuteFastRelaunch:
         device_index: int,
         last_raw: int,
         keepalive: tuple[object, ...],
+        packed_launch: _CutePackedLaunch | None = None,
     ) -> None:
         self.executor = executor
         self.exe_args = exe_args
         self.tensor_guards = tensor_guards
+        self.tensor_guard = _compile_cute_fastpath_tensor_guard(tensor_guards)
         self.scalar_guards = scalar_guards
         self.constexpr_flags = constexpr_flags
         self.tensor_slots = tensor_slots
@@ -6565,6 +6787,16 @@ class _CuteFastRelaunch:
         self.last_raw = last_raw
         self.keepalive = keepalive
         self.lock = threading.Lock()
+        if packed_launch is None:
+            self.packed_args = None
+            self.capi_func = None
+            self.cuda_result = None
+            self.cuda_error = None
+        else:
+            self.packed_args = packed_launch.packed_args
+            self.capi_func = packed_launch.capi_func
+            self.cuda_result = packed_launch.cuda_result
+            self.cuda_error = packed_launch.cuda_error
 
     def try_launch(
         self,
@@ -6578,48 +6810,144 @@ class _CuteFastRelaunch:
             or grid != self.grid
             or block != self.block
             or compile_options != self.compile_options
+            or not self.tensor_guard(args)
         ):
             return _CUTE_FASTPATH_MISS
-        for (
-            index,
-            device_type,
-            device_index,
-            dtype,
-            shape,
-            stride,
-            alignment,
-        ) in self.tensor_guards:
-            tensor = args[index]
-            if (
-                not isinstance(tensor, torch.Tensor)
-                or tensor.dtype is not dtype
-                or tensor.device.type != device_type
-                or tensor.device.index != device_index
-                or tensor.size() != shape
-                or tensor.stride() != stride
-                or tensor.data_ptr() % alignment != 0
-            ):
-                return _CUTE_FASTPATH_MISS
         for guard in self.scalar_guards:
             if not guard.matches(args, self.constexpr_flags):
                 return _CUTE_FASTPATH_MISS
         raw = torch._C._cuda_getCurrentRawStream(self.device_index)
         with self.lock:
-            exe_args = self.exe_args
+            # The slots are poked in the pre-packed C array of a CuTe DSL
+            # ``JitExecutor``; an executor that is not one (test doubles,
+            # profiling wrappers) has no such array and keeps packing
+            # ``exe_args`` itself through ``run_compiled_program``.
+            packed_args = self.packed_args
+            slots = cast("Any", self.exe_args if packed_args is None else packed_args)
             # tensor_slots entries: (arg_index, exe_slot_or_None, writer_or_None)
             for index, slot, writer in self.tensor_slots:
                 ptr = cast("torch.Tensor", args[index]).data_ptr()
                 if writer is not None:
                     cast("Any", writer).value = ptr
                 else:
-                    exe_args[cast("int", slot)] = ptr
+                    slots[cast("int", slot)] = ptr
             if raw != self.last_raw:
                 for stream_writer in self.by_ref_writers:
                     cast("Any", stream_writer).value = raw
                 for stream_slot in self.by_val_slots:
-                    exe_args[stream_slot] = raw
+                    slots[stream_slot] = raw
                 self.last_raw = raw
-            return (True, cast("Any", self.executor).run_compiled_program(exe_args))
+            if packed_args is None:
+                return (
+                    True,
+                    cast("Any", self.executor).run_compiled_program(self.exe_args),
+                )
+            cast("Any", self.capi_func)(packed_args)
+            cuda_result = self.cuda_result
+            if cuda_result is None:
+                return (True, None)
+            error_code = cast("Any", cuda_result).value
+            if error_code == 0:
+                return (True, 0)
+            raise cast("Any", self.cuda_error)(error_code)
+
+
+@dataclass(frozen=True)
+class _CutePackedLaunch:
+    """A private copy of the DSL executor's packed C argument array.
+
+    ``JitExecutor.run_compiled_program`` re-packs every ``exe_args`` entry into
+    a thread-local ``c_void_p`` array on each call (type dispatch plus a
+    ``ctypes.c_void_p(...)`` round trip per entry, ~3us for a flash kernel).
+    Only the tensor-pointer and stream slots change between fast relaunches,
+    so the array is packed once and those slots are poked in place before the
+    C entry point is invoked directly.  The copy is private: the executor's
+    thread-local buffer is rewritten by any slow-path launch of the same
+    kernel, which would otherwise clobber the cached scalar slots.
+    """
+
+    packed_args: object
+    capi_func: object
+    cuda_result: object | None
+    cuda_error: object
+
+
+def _cute_packed_launch(executor: object, exe_args: list[object]) -> object | None:
+    """Pre-pack ``exe_args`` for a real CuTe DSL ``JitExecutor``; else ``None``.
+
+    The DSL modules are looked up rather than imported: a real executor can
+    only exist once ``cutlass.base_dsl.jit_executor`` is loaded, and test
+    doubles must not pull the DSL in.
+    """
+    jit_executor = sys.modules.get("cutlass.base_dsl.jit_executor")
+    if jit_executor is None or not isinstance(executor, jit_executor.JitExecutor):
+        return None
+    create_cuda_runtime_error = sys.modules[
+        "cutlass.base_dsl.runtime.cuda"
+    ].create_cuda_runtime_error
+    source = executor._get_invoke_packed_args(list(exe_args))
+    total = len(exe_args) + executor._num_extra_args
+    packed_args = (ctypes.c_void_p * total)()
+    ctypes.memmove(packed_args, source, ctypes.sizeof(ctypes.c_void_p) * total)
+    return _CutePackedLaunch(
+        packed_args=packed_args,
+        capi_func=executor.capi_func,
+        cuda_result=executor.cuda_result,
+        cuda_error=create_cuda_runtime_error,
+    )
+
+
+def _compile_cute_fastpath_tensor_guard(
+    tensor_guards: tuple[
+        tuple[
+            int,
+            str,
+            int | None,
+            torch.dtype,
+            tuple[int, ...],
+            tuple[int, ...],
+            int,
+        ],
+        ...,
+    ],
+) -> Callable[[tuple[object, ...]], bool]:
+    """Fold the per-tensor metadata checks into one straight-line expression.
+
+    Same facts as the tuple form (dtype, shape, stride, device, compiled
+    pointer alignment); evaluating them as a single generated lambda avoids
+    the per-tensor loop and tuple unpacking on every relaunch.
+    """
+    namespace: dict[str, object] = {"Tensor": torch.Tensor}
+    checks: list[str] = []
+    for (
+        index,
+        device_type,
+        device_index,
+        dtype,
+        shape,
+        stride,
+        alignment,
+    ) in tensor_guards:
+        namespace[f"dtype_{index}"] = dtype
+        namespace[f"shape_{index}"] = torch.Size(shape)
+        namespace[f"stride_{index}"] = tuple(stride)
+        namespace[f"device_{index}"] = (
+            torch.device(device_type)
+            if device_index is None
+            else torch.device(device_type, device_index)
+        )
+        tensor = f"t{index}"
+        item = [
+            f"isinstance(({tensor} := args[{index}]), Tensor)",
+            f"{tensor}.dtype is dtype_{index}",
+            f"{tensor}.size() == shape_{index}",
+            f"{tensor}.stride() == stride_{index}",
+            f"{tensor}.device == device_{index}",
+        ]
+        if alignment > 1:
+            item.append(f"{tensor}.data_ptr() % {int(alignment)} == 0")
+        checks.append(f"({' and '.join(item)})")
+    return eval(f"lambda args: {' and '.join(checks) if checks else 'True'}", namespace)
 
 
 def _cute_maybe_build_fastpath(
@@ -6633,8 +6961,17 @@ def _cute_maybe_build_fastpath(
 ) -> None:
     """Build (once per kernel) the fast relaunch state after a successful
     slow-path launch.  ``False`` marks a permanent probe failure so the
-    slow path is not re-probed on every call."""
+    slow path is not re-probed on every call.
+
+    Not under CUDA-graph capture: a fresh compile's first launch there would
+    JIT the C-API twin (``capi_function``, tens of milliseconds) and load its
+    library inside the capture.  The graph keeps the marshalled launch just
+    issued and the state stays unset; the next eager launch that misses the
+    last-launch cache (same-pointer calls keep hitting it) builds it.
+    """
     if getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None) is not None:
+        return
+    if torch.cuda.is_current_stream_capturing():
         return
     state = _cute_build_fast_relaunch(
         cute_kernel, args, grid, block, compile_options, launch, compiled
@@ -6655,17 +6992,7 @@ def _cute_build_fast_relaunch(
 ) -> _CuteFastRelaunch | None:
     if not isinstance(compiled, _CompiledCuteLauncher):
         return None
-    dsl_fn = cast("Any", compiled)._compiled
-    if dsl_fn is None:
-        return None
-    execution_args = getattr(dsl_fn, "execution_args", None)
-    executor = getattr(dsl_fn, "_default_executor", None)
-    if (
-        execution_args is None
-        or not hasattr(execution_args, "generate_execution_args")
-        or executor is None
-        or not hasattr(executor, "run_compiled_program")
-    ):
+    if cast("Any", compiled)._compiled is None:
         return None
     # Kernels with grouped-scheduler plans, dynamic tensormaps, or launcher-
     # owned side tensors have per-call state beyond (pointers, stream);
@@ -6711,6 +7038,21 @@ def _cute_build_fast_relaunch(
     if device_index is None:
         device_index = torch.cuda.current_device()
     try:
+        # Resolved after the structural checks: a fresh TVM-FFI compile JITs
+        # its C-API twin here, which is wasted on kernels that cannot relaunch.
+        dsl_fn = cast("Any", compiled).capi_function()
+        if dsl_fn is None:
+            return None
+        execution_args = getattr(dsl_fn, "execution_args", None)
+        executor = getattr(dsl_fn, "_default_executor", None)
+        if execution_args is None or not hasattr(
+            execution_args, "generate_execution_args"
+        ):
+            return None
+        if executor is None:
+            executor = dsl_fn.to(None)
+        if not hasattr(executor, "run_compiled_program"):
+            return None
         cuda_driver = importlib.import_module("cuda.bindings.driver")
         gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
         make_ptr = cast("Any", make_ptr_obj)
@@ -6889,9 +7231,10 @@ def _cute_build_fast_relaunch(
                     scalar_value=_cute_scalar_cache_value(scalar_kind, scalar_value),
                 )
             )
+        exe_args = list(exe1)
         return _CuteFastRelaunch(
             executor=executor,
-            exe_args=list(exe1),
+            exe_args=exe_args,
             tensor_guards=tuple(tensor_guards),
             scalar_guards=tuple(scalar_guards),
             constexpr_flags=tuple(constexpr_flags),
@@ -6905,6 +7248,9 @@ def _cute_build_fast_relaunch(
             device_index=device_index,
             last_raw=raw0,
             keepalive=(base, stream_a, adapted1, exe1),
+            packed_launch=cast(
+                "_CutePackedLaunch | None", _cute_packed_launch(executor, exe_args)
+            ),
         )
     except Exception:
         return None
@@ -6989,7 +7335,7 @@ def default_cute_launcher(
         int(block[2]) if len(block) > 2 else 1,
     )
 
-    if any(dim <= 0 for dim in grid_xyz):
+    if grid_xyz[0] <= 0 or grid_xyz[1] <= 0 or grid_xyz[2] <= 0:
         return None
 
     args_tuple = tuple(args)

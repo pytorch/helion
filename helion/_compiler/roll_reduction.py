@@ -30,6 +30,7 @@ from ..language.view_ops import join as hl_join
 from ..language.view_ops import split as hl_split
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
+from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
 
@@ -58,6 +59,12 @@ _ATOMIC_OPS: tuple[object, ...] = (
 )
 
 
+# Marks a reduction of values computed outside the loop from a free
+# ``hl.arange``: on CuTe it rolls for the computed-fragment lowering, and
+# ``LoopedReductionStrategy`` refuses it otherwise.
+FREE_IOTA_REDUCTION_META = "helion_free_iota_reduction"
+
+
 class ReductionRoller:
     """This does the opposite of unrolling, it takes persistent reductions and turns them into looped reductions."""
 
@@ -66,10 +73,12 @@ class ReductionRoller:
         device_ir: DeviceIR,
         rdim: BlockSizeInfo,
         graph_id_to_info: dict[int, RolledReductionInfo],
+        enable_fusion: bool = False,
     ) -> None:
         self.device_ir = device_ir
         self.rdim = rdim
         self.graph_id_to_info = graph_id_to_info
+        self.enable_fusion = enable_fusion
         # inner graph contains ops on the reduction dimension
         self.inner_args: list[torch.fx.Node] = []
         self.inner_graph: torch.fx.Graph = torch.fx.Graph()
@@ -114,6 +123,31 @@ class ReductionRoller:
             raise NotImplementedError(
                 "hl.associative_scan operations are not compatible with reduction rolling"
             )
+
+        if node.target in (torch.ops.aten.topk.default, torch.ops.aten.sort.default):
+            # Ordering needs every value of its selected axis. Top-k shrinks
+            # that axis, so output-shape placement would leave it outside the
+            # rolled producer loop, observing only its last chunk. Sorting each
+            # chunk independently likewise lacks a cross-chunk merge. Other
+            # axes remain independent and may still be rolled normally.
+            source = node.args[0]
+            assert isinstance(source, torch.fx.Node)
+            value = source.meta["val"]
+            assert isinstance(value, torch.Tensor)
+            position = 2 if node.target is torch.ops.aten.topk.default else 1
+            dim = (
+                node.args[position]
+                if len(node.args) > position
+                else node.kwargs.get("dim", -1)
+            )
+            assert isinstance(dim, int)
+            if (
+                CompileEnvironment.current().get_block_id(value.shape[dim])
+                == self.rdim.block_id
+            ):
+                raise NotImplementedError(
+                    "selection axes require complete input or a cross-chunk merge"
+                )
 
         if is_for_loop_target(node.target) or node.target is _if:
             if is_for_loop_target(node.target):
@@ -180,6 +214,14 @@ class ReductionRoller:
                         num_rdims = self._count_rdim_axes_in_subscript(
                             target, index_arg
                         )
+                elif num_rdims != self._count_rdim_axes_in_subscript(target, index_arg):
+                    # The value's rdim axis lands on positions another index
+                    # names (``loss[tile] = rows_over_rdim``): a chunk of the
+                    # rdim per iteration cannot fill them.
+                    raise NotImplementedError(
+                        "a value over the reduction dim is stored at positions "
+                        "another index names"
+                    )
             else:
                 # When the stored value is a Python scalar (broadcast across
                 # the indexed slice), it carries no shape, so the LHS
@@ -240,12 +282,10 @@ class ReductionRoller:
             return 0
         from .indexing_strategy import SubscriptIndexing
 
-        # FX records traced SymInt/Tensor index args as torch.fx.Node references;
-        # compute_shape wants the underlying values, the same form it receives at
-        # register_fake time (memory_ops.load).
-        normalized = [
-            k.meta["val"] if isinstance(k, torch.fx.Node) else k for k in index
-        ]
+        # FX records traced SymInt/Tensor index args (and symbolic slice bounds)
+        # as torch.fx.Node references; compute_shape wants the underlying values,
+        # the same form it receives at register_fake time (memory_ops.load).
+        normalized = [*torch.fx.node.map_arg(index, lambda node: node.meta["val"])]
         shape = SubscriptIndexing.compute_shape(target_val, normalized)
         env = CompileEnvironment.current()
         rdim_block_id = self.rdim.block_id
@@ -418,24 +458,64 @@ class ReductionRoller:
 
         return any(is_matmul_with_rdim(node) for node in graph.nodes)
 
+    def has_gather_along_rdim(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph gathers along the rdim.
+
+        ``torch.gather(row, dim, index)`` reads ``row`` at any position of
+        ``dim``, which one chunk of the rdim per loop iteration does not hold
+        (Triton's ``tl.gather`` would pick positions within the chunk).
+        """
+        env = CompileEnvironment.current()
+        for node in graph.nodes:
+            if node.target is not torch.ops.aten.gather.default:
+                continue
+            input_node, dim = node.args[0], node.args[1]
+            assert isinstance(input_node, torch.fx.Node)
+            assert isinstance(dim, int)
+            val = input_node.meta["val"]
+            assert isinstance(val, torch.Tensor)
+            if env.get_block_id(val.size(dim)) == self.rdim.block_id:
+                return True
+        return False
+
+    def has_pinned_rdim(self) -> bool:
+        """Check if a guard pinned the rdim's symbol to a constant.
+
+        A reshape to a literal size (``x[t, :].reshape(t, 1, 64)``) or
+        hl.specialize does: the rdim's dims then carry a plain int that
+        ``get_block_id`` cannot tell from other dims of that size, so the
+        roller would move only the nodes whose dims still name the symbol (a
+        store) into the loop and leave the loads they read outside it.
+        """
+        return not self.rdim.var._sympy_().free_symbols
+
     def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph reduces over the rdim along a non-tile axis.
 
         A reduction can only be rolled into a loop when the dimension being
         reduced is indexed by a re-bindable block index var (e.g. a ``hl.tile``
         axis or a ``[..., :]`` slice), so the producing load can be re-indexed
-        in ``_REDUCTION_BLOCK``-sized chunks inside the loop. A dimension
-        indexed by ``hl.arange(n)`` instead carries a fixed full-extent
-        ``iota`` index that cannot be re-bound per loop iteration, so rolling
-        would leave the full-extent load outside the loop and emit a shape
-        mismatch (issue #2643). Such reductions must stay persistent.
+        in ``_REDUCTION_BLOCK``-sized chunks inside the loop.  An
+        ``hl.arange(n)`` over the rdim rolls when its value names the rdim's
+        symbol, so it moves into the loop and takes the chunk's positions,
+        and it does not index a load directly.  Otherwise it is a fixed
+        full-extent ``iota`` outside the loop, and any value inside the loop
+        computed from it is wrong: a shape mismatch on Triton (issue #2643),
+        an unrelated coordinate on CuTe.  Such reductions stay persistent.
 
-        Detected by walking back from each reduction over ``self.rdim`` to the
-        loads feeding it and checking whether any is indexed by an ``iota``
-        node sized to the rdim. The output-shape of the load is not a reliable
-        signal: when the arange size coincides with another reduction of the
-        same size, ``allocate_reduction_dimension`` unifies them and the load
-        axis surfaces as the rdim symbol rather than a concrete int.
+        On CuTe a free ``iota`` that only reductions read, through values
+        computed outside the loop, still rolls when the computed-fragment
+        lowering takes the reduction (``free_iota_reductions``): it re-reads
+        the iota per chunk, and any other lowering refuses a rolled reduction
+        of a value from outside its loop
+        (``LoopedReductionStrategy.codegen_reduction``).
+
+        Detected by walking back from each reduction over ``self.rdim`` and
+        checking each input ``iota`` node sized to the rdim. The output-shape
+        of a load is not a reliable signal: when the arange size coincides
+        with another reduction of the same size,
+        ``allocate_reduction_dimension`` unifies them and the load axis
+        surfaces as the rdim symbol rather than a concrete int.
         """
         env = CompileEnvironment.current()
         rdim_block_id = self.rdim.block_id
@@ -452,18 +532,48 @@ class ReductionRoller:
                 env.resolve_block_id(size) == rdim_block_id for size in val.size()
             )
 
-        def is_iota_indexed_load(node: torch.fx.Node) -> bool:
-            if node.target is not load:
-                return False
+        def indexes_load(node: torch.fx.Node) -> bool:
             # load(tensor, index_list, ...): an iota in the index list cannot
             # be re-indexed in chunks inside the reduction loop.
-            for arg in node.args:
-                entries = arg if isinstance(arg, (list, tuple)) else (arg,)
-                if any(is_rdim_iota(entry) for entry in entries):
+            return any(
+                user.target is load
+                and any(
+                    node in (arg if isinstance(arg, (list, tuple)) else (arg,))
+                    for arg in user.args
+                )
+                for user in node.users
+            )
+
+        def inside_loop(node: torch.fx.Node) -> bool:
+            if is_for_loop_target(node.target) or node.target is _if:
+                return True
+            try:
+                return self.should_go_in_inner_graph(node)
+            except NotImplementedError:
+                return True
+
+        def read_inside_loop(iota: torch.fx.Node) -> bool:
+            # Whether a value inside the loop is computed from ``iota``; a
+            # reduction of a value from outside the loop ends the walk.
+            seen: set[torch.fx.Node] = set()
+            stack = list(iota.users)
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if self.is_reduction(node):
+                    source = node.args[0]
+                    if isinstance(source, torch.fx.Node) and inside_loop(source):
+                        return True
+                    continue
+                if inside_loop(node):
                     return True
+                stack.extend(node.users)
             return False
 
-        def depends_on_iota_indexed_load(reduction: torch.fx.Node) -> bool:
+        def unrollable(reduction: torch.fx.Node) -> bool:
+            free_iota = False
             seen: set[torch.fx.Node] = set()
             stack = list(reduction.all_input_nodes)
             while stack:
@@ -471,15 +581,29 @@ class ReductionRoller:
                 if node in seen:
                     continue
                 seen.add(node)
-                if node.op == "call_function" and is_iota_indexed_load(node):
-                    return True
                 stack.extend(node.all_input_nodes)
+                if not is_rdim_iota(node) or (
+                    inside_loop(node) and not indexes_load(node)
+                ):
+                    continue
+                if (
+                    indexes_load(node)
+                    or env.backend_name != "cute"
+                    or read_inside_loop(node)
+                ):
+                    return True
+                free_iota = True
+            if free_iota:
+                # Only the reductions the computed-fragment lowering takes
+                # over roll; every other lowering would refuse them.
+                from .cute.free_iota_reduction import free_iota_reductions
+
+                if reduction not in free_iota_reductions(env, self.device_ir.graphs):
+                    return True
+                reduction.meta[FREE_IOTA_REDUCTION_META] = True
             return False
 
-        return any(
-            self.is_reduction(node) and depends_on_iota_indexed_load(node)
-            for node in graph.nodes
-        )
+        return any(self.is_reduction(node) and unrollable(node) for node in graph.nodes)
 
     def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains stack tensors with rdim inputs."""
@@ -510,8 +634,69 @@ class ReductionRoller:
 
         return any(is_stack_with_rdim(node) for node in graph.nodes)
 
-    def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
+    def _reorder_for_fusion(self, graph: torch.fx.Graph) -> list[torch.fx.Node]:
+        """Defer each reduction's outer tail (its store plus the scalar ops
+        feeding it) past sibling reductions so the roller folds independent
+        reductions over ``self.rdim`` into one loop sharing a single load.
+        Nodes move only where data, memory, and side-effect ordering allow."""
+
+        def is_deferrable(node: torch.fx.Node) -> bool:
+            if node.op != "call_function" or self.should_go_in_inner_graph(node):
+                return False
+            if node.target is store or node.target in _ATOMIC_OPS:
+                target = node.args[0]
+                if not isinstance(target, torch.fx.Node):
+                    return False
+                val = target.meta.get("val")
+                if not isinstance(val, torch.Tensor):
+                    return False
+                origin = HostFunction.current().tensor_to_origin.get(val)
+                return origin is not None and not origin.is_argument()
+            return not (node.is_impure() or node.target is load)
+
+        order: list[torch.fx.Node] = []
+        deferred: list[torch.fx.Node] = []
+        deferred_set: set[torch.fx.Node] = set()
+
+        def flush_through(cutoff: int) -> None:
+            # Preserve ordering among deferred nodes when releasing a dependency.
+            order.extend(deferred[: cutoff + 1])
+            del deferred[: cutoff + 1]
+            deferred_set.intersection_update(deferred)
+
         for node in graph.nodes:
+            if is_deferrable(node) and any(
+                inp in deferred_set or self.is_reduction(inp)
+                for inp in node.all_input_nodes
+            ):
+                deferred.append(node)
+                deferred_set.add(node)
+                continue
+            if deferred:
+                if node.op != "call_function" or node.is_impure():
+                    flush_through(len(deferred) - 1)
+                else:
+                    is_load = node.target is load
+                    inputs = set(node.all_input_nodes)
+                    cutoff = -1
+                    for i, deferred_node in enumerate(deferred):
+                        if deferred_node in inputs or (
+                            is_load
+                            and (
+                                deferred_node.target is store
+                                or deferred_node.target in _ATOMIC_OPS
+                            )
+                        ):
+                            cutoff = i
+                    if cutoff >= 0:
+                        flush_through(cutoff)
+            order.append(node)
+        order.extend(deferred)
+        return order
+
+    def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
+        nodes = self._reorder_for_fusion(graph) if self.enable_fusion else graph.nodes
+        for node in nodes:
             if self.should_go_in_inner_graph(node):
                 if not all(
                     (n in self.available or n in self.inner_available)

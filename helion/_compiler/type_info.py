@@ -48,6 +48,8 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 from .variable_origin import TensorStrideOrigin
+from .variable_origin import TileBeginOrigin
+from .variable_origin import TileEndOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -65,6 +67,30 @@ regexp_allowed_host_ops: re.Pattern[str] = re.compile(
     r"like|new|broadcast|promote|view|reshape|expand|permute|strided|"
     r"transpose|contiguous|unsqueeze|squeeze|zero|rand|full|fill"
 )
+
+
+def tile_spanned_by_slice(lower: object, upper: object) -> torch.SymInt | None:
+    """The tile ``lower:upper`` spans when they are its ``begin`` and ``end``.
+
+    Such a slice indexes what the tile does, with the tile's size; as a range
+    its length would be a value only the device knows.
+    """
+    if not isinstance(lower, torch.SymInt) or not isinstance(upper, torch.SymInt):
+        return None
+    origins = HostFunction.current().expr_to_origin
+    begin = origins.get(lower._sympy_())
+    end = origins.get(upper._sympy_())
+    if (
+        begin is None
+        or end is None
+        or not isinstance(begin.origin, TileBeginOrigin)
+        or not isinstance(end.origin, TileEndOrigin)
+        or begin.origin.block_id != end.origin.block_id
+    ):
+        return None
+    block_size = CompileEnvironment.current().block_sizes[begin.origin.block_id].var
+    assert isinstance(block_size, torch.SymInt)
+    return block_size
 
 
 class TypeInfo:
@@ -361,6 +387,11 @@ class TensorType(TypeInfo):
         if origin.is_host():
             warning(exc.TensorOperationInWrapper)
         if isinstance(op, ast.Not):
+            # Host code runs as Python, where PyTorch raises this itself.
+            if origin.is_device() and tensor_may_have_many_elements(self.fake_value):
+                raise exc.TypeInferenceError(
+                    f"Boolean value of {self!s} with more than one value is ambiguous"
+                )
             return SymBoolType.new_unbacked(origin)
         try:
             return TypeInfo.from_example(_eval_unary(op, self.fake_value), origin)
@@ -400,6 +431,11 @@ class TensorType(TypeInfo):
                 slice_obj = k.proxy()
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
+
+                tile = tile_spanned_by_slice(slice_obj.start, slice_obj.stop)
+                if tile is not None and slice_obj.step in (None, 1):
+                    output_sizes.append(tile)
+                    continue
 
                 # For slices with steps, we need to calculate the output size differently
                 output_size = compute_slice_size(slice_obj, size)
@@ -552,10 +588,19 @@ class TensorType(TypeInfo):
                     details=f"rank {self.fake_value.dim()} != {other.fake_value.dim()}",
                 )
             if self.fake_value.size() != other.fake_value.size():
-                raise exc.ControlFlowTensorMismatch(
-                    var=var_name,
-                    details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
-                )
+                # A static size and the reduction dimension allocated for it
+                # later (e.g. by a ``:`` slice) name the same dim; compare the
+                # shapes in their block-variable form.
+                env = CompileEnvironment.current()
+                shape = env._normalize_shape_to_block_vars([*self.fake_value.size()])
+                if shape != env._normalize_shape_to_block_vars(
+                    [*other.fake_value.size()]
+                ):
+                    raise exc.ControlFlowTensorMismatch(
+                        var=var_name,
+                        details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
+                    )
+                return TensorType(other.origin, self.fake_value.new_empty(shape))
             # TODO(jansel): handle symbolic shapes
             # TODO(jansel): stride check?
             return TensorType(other.origin, torch.empty_like(self.fake_value))
@@ -1930,8 +1975,20 @@ class SliceType(CollectionType):
         )
 
 
+def tensor_may_have_many_elements(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` is not known to hold exactly one element (a tile's
+    extent is a block size, which may exceed 1)."""
+    env = CompileEnvironment.current()
+    return not all(env.known_equal(size, 1) for size in tensor.shape)
+
+
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
+        # ``not`` would call bool() and guard a symbolic value on its hint.
+        if isinstance(value, torch.SymBool):
+            return torch.sym_not(value)
+        if isinstance(value, (torch.SymInt, torch.SymFloat)):
+            return value == 0
         return not value
     if isinstance(op, ast.UAdd):
         # pyrefly: ignore [unsupported-operation]

@@ -4,6 +4,8 @@ from collections import defaultdict
 import dataclasses
 import enum
 
+from .attention_plan import flash_head_dims_supported
+
 
 class FlashScheduleError(ValueError):
     """A structural flash schedule is unsafe or exceeds device resources."""
@@ -79,6 +81,14 @@ class FlashScheduleSpec:
     # KV tile width. Only the K/V staging rings scale with it; the query and
     # output tiles stay 128 rows wide.
     kv_tile_n: int = 128
+    # Shared memory the body adds outside the tiles and rings (the flex
+    # hook's warp-cooperative table staging, ``flex_coalesce_smem_bytes``):
+    # part of the base the K/V depth is fitted against.
+    aux_smem_bytes: int = 0
+    # V/O head dim when it differs from the Q/K ``head_dim`` (the (192, 128)
+    # MLA pair): sQ and the K tile follow ``head_dim``, the aliased ring slot
+    # the wider operand, the output tile and TMEM accumulators the V width.
+    head_dim_v: int | None = None
     # Alternating-warpgroup family: one query tile per work item, the two
     # softmax warpgroups own alternating KV steps on their own score and
     # probability buffers, separate K and V rings (``kv_depth`` is the K ring,
@@ -86,6 +96,20 @@ class FlashScheduleSpec:
     # item's dead Q stage. ``query_slots_per_cta`` is one.
     alternating_warpgroups: bool = False
     v_depth: int | None = None
+    # FA4's uneven aliased ring for the asymmetric pair: three slots laid out
+    # [K-wide, V-wide, K-wide] with a stage stride of half a K plus half a V
+    # tile, so a third stage fits where three K-wide slots would not. The odd
+    # slot is shifted by half the width difference toward whichever operand
+    # it holds (K and V alternate through the ring, so every slot sees both),
+    # and a K load into slot 0 also waits for slot 1 to drain (its wider
+    # tile reaches into the previous round's K bytes there).
+    uneven_kv_ring: bool = False
+    # Stage the output tiles in the Q stages instead of a separate ``sO``
+    # (FA4's overlap_sO_sQ): the output stage is written after the work
+    # item's last PV, whose completion barrier also covers every QK that read
+    # Q, and a non-persistent CTA loads no further Q tile, so both Q stages
+    # are dead by then. Needs ``stage_output``; no bytes for the staged tiles.
+    output_over_query: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,6 +184,10 @@ class FlashSchedule:
     tmem_columns: int
 
 
+# The uneven aliased ring is FA4's fixed three-slot layout.
+UNEVEN_KV_RING_DEPTH = 3
+
+
 @dataclasses.dataclass(frozen=True)
 class FlashScheduleLimits:
     shared_memory_bytes: int = 232448
@@ -185,31 +213,91 @@ def _kv_node_name(kind: str, cta_rank: int, multicast: bool) -> str:
     return f"{kind}_r{cta_rank}"
 
 
-def _kv_tile_bytes(spec: FlashScheduleSpec) -> int:
+def _value_head_dim(spec: FlashScheduleSpec) -> int:
+    """V/O head dim: ``head_dim`` unless the spec names the asymmetric pair."""
+    return spec.head_dim if spec.head_dim_v is None else spec.head_dim_v
+
+
+def _kv_cta_group_size(spec: FlashScheduleSpec) -> int:
     # CtaGroup.TWO partitions the MMA B operand across CTAs. Merely clustering
     # two local-MMAs does not reduce their independently resident K/V tiles.
-    cta_group_size = 2 if spec.cooperative_mma else 1
-    return spec.kv_tile_n * spec.head_dim * spec.dtype_bytes // cta_group_size
+    return 2 if spec.cooperative_mma else 1
+
+
+def _k_tile_bytes(spec: FlashScheduleSpec) -> int:
+    """Per-CTA bytes of one K tile."""
+    return spec.kv_tile_n * spec.head_dim * spec.dtype_bytes // _kv_cta_group_size(spec)
+
+
+def _v_tile_bytes(spec: FlashScheduleSpec) -> int:
+    """Per-CTA bytes of one V tile (the V width of the asymmetric pair)."""
+    return (
+        spec.kv_tile_n
+        * _value_head_dim(spec)
+        * spec.dtype_bytes
+        // _kv_cta_group_size(spec)
+    )
+
+
+def _kv_slot_bytes(spec: FlashScheduleSpec) -> int:
+    """Per-CTA bytes of one aliased K/V ring slot (the wider of the two tiles)."""
+    slot_dim = max(spec.head_dim, _value_head_dim(spec))
+    return spec.kv_tile_n * slot_dim * spec.dtype_bytes // _kv_cta_group_size(spec)
+
+
+def uneven_kv_ring_stage_stride_bytes(spec: FlashScheduleSpec) -> int:
+    """Stage stride of the uneven ring: half a K tile plus half a V tile."""
+    k_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
+    v_tile_bytes = spec.kv_tile_n * _value_head_dim(spec) * spec.dtype_bytes
+    return (k_tile_bytes + v_tile_bytes) // 2
+
+
+def uneven_kv_ring_shift_bytes(spec: FlashScheduleSpec) -> int:
+    """Shift of the odd uneven-ring slot: half the K/V tile width difference."""
+    k_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
+    v_tile_bytes = spec.kv_tile_n * _value_head_dim(spec) * spec.dtype_bytes
+    return abs(k_tile_bytes - v_tile_bytes) // 2
+
+
+def _aliased_kv_ring_bytes(spec: FlashScheduleSpec) -> int:
+    """Bytes of the aliased K/V ring: ``kv_depth`` wide slots, or FA4's uneven
+    [wide, narrow, wide] layout whose last slot starts at two stage strides."""
+    if spec.uneven_kv_ring:
+        return (spec.kv_depth - 1) * uneven_kv_ring_stage_stride_bytes(
+            spec
+        ) + _kv_slot_bytes(spec)
+    return spec.kv_depth * _kv_slot_bytes(spec)
 
 
 def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
-    kv_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
+    k_tile_bytes = _k_tile_bytes(spec)
+    v_tile_bytes = _v_tile_bytes(spec)
     if spec.alternating_warpgroups:
         # Two Q stages (the next item's tile is prefetched), the K ring, the V
         # ring, and the stat/barrier overhead; the output tile aliases a Q stage.
         assert spec.v_depth is not None
         return (
             2 * tile_bytes
-            + (spec.kv_depth + spec.v_depth) * kv_tile_bytes
+            + spec.kv_depth * k_tile_bytes
+            + spec.v_depth * v_tile_bytes
             + _ALT_OVERHEAD_BYTES
         )
     q_bytes = spec.query_slots_per_cta * tile_bytes
-    kv_rings = 2 if spec.separate_kv else 1
-    kv_bytes = kv_rings * spec.kv_depth * _kv_tile_bytes(spec)
-    output_bytes = spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
+    if spec.separate_kv:
+        kv_bytes = spec.kv_depth * (k_tile_bytes + v_tile_bytes)
+    else:
+        # K and V alternate through one ring, so every slot is the wider tile
+        # (or the uneven ring's two wide slots around one narrow slot).
+        kv_bytes = _aliased_kv_ring_bytes(spec)
+    output_tile_bytes = 128 * _value_head_dim(spec) * spec.dtype_bytes
+    output_bytes = (
+        spec.query_slots_per_cta * output_tile_bytes
+        if spec.stage_output and not spec.output_over_query
+        else 0
+    )
     # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
-    return q_bytes + kv_bytes + output_bytes + 3072
+    return q_bytes + kv_bytes + output_bytes + 3072 + spec.aux_smem_bytes
 
 
 _ALT_OVERHEAD_BYTES = 3072
@@ -671,14 +759,37 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     )
 
 
+def fa4_schedule_fits(
+    spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
+) -> bool:
+    """Whether the schedule's SMEM layout fits at ``spec.kv_depth``."""
+    if limits is None:
+        limits = FlashScheduleLimits()
+    return _shared_memory_bytes(spec) <= limits.shared_memory_bytes
+
+
 def max_fa4_kv_depth(
     spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
 ) -> int:
     """Return the largest K/V depth allowed by the schedule's SMEM layout."""
     if limits is None:
         limits = FlashScheduleLimits()
+    if spec.uneven_kv_ring:
+        # The uneven layout is FA4's three-slot ring; it is either the depth
+        # that fits or the ordinary aliased ring's depth.
+        if fa4_schedule_fits(
+            dataclasses.replace(spec, kv_depth=UNEVEN_KV_RING_DEPTH), limits
+        ):
+            return UNEVEN_KV_RING_DEPTH
+        return max_fa4_kv_depth(dataclasses.replace(spec, uneven_kv_ring=False), limits)
     base_bytes = _shared_memory_bytes(dataclasses.replace(spec, kv_depth=0))
-    bytes_per_stage = (2 if spec.separate_kv else 1) * _kv_tile_bytes(spec)
+    # A staging slot holds one KV tile, which is ``kv_tile_n`` wide; separate
+    # rings pay for a K and a V tile per stage, the aliased ring for the wider
+    # (each the per-CTA extent of a cooperative two-CTA MMA).
+    if spec.separate_kv:
+        bytes_per_stage = _k_tile_bytes(spec) + _v_tile_bytes(spec)
+    else:
+        bytes_per_stage = _kv_slot_bytes(spec)
     return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
 
 
@@ -718,8 +829,40 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     Score storage is always two local query slots. With two CTAs this becomes
     four aggregate CTA-local slices; it is not a temporal four-stage score ring.
     """
-    if spec.head_dim not in (64, 128):
-        raise FlashScheduleError("FA4 schedule requires head_dim 64 or 128")
+    if not flash_head_dims_supported(spec.head_dim, _value_head_dim(spec)):
+        raise FlashScheduleError(
+            "FA4 schedule requires head_dim 64 or 128, or the 192/128 pair"
+        )
+    if spec.head_dim_v is not None and spec.head_dim_v != spec.head_dim:
+        if spec.separate_kv or spec.cta_count != 1 or spec.alternating_warpgroups:
+            raise FlashScheduleError(
+                "asymmetric head dims need the one-CTA aliased K/V ring"
+            )
+    if spec.uneven_kv_ring:
+        if spec.head_dim_v is None or spec.head_dim_v == spec.head_dim:
+            raise FlashScheduleError("the uneven K/V ring needs asymmetric head dims")
+        if spec.kv_depth != UNEVEN_KV_RING_DEPTH:
+            raise FlashScheduleError("the uneven K/V ring has exactly three slots")
+        if uneven_kv_ring_shift_bytes(spec) % 1024 != 0:
+            raise FlashScheduleError(
+                "the uneven K/V ring shift must keep the 1024-byte swizzle period"
+            )
+    if spec.output_over_query:
+        if not spec.stage_output:
+            raise FlashScheduleError("output over the Q stages needs a staged output")
+        if spec.persistent:
+            raise FlashScheduleError(
+                "output over the Q stages needs a non-persistent schedule: a "
+                "persistent CTA loads the next item's Q tile while the output drains"
+            )
+        if spec.separate_kv or spec.cta_count != 1 or spec.alternating_warpgroups:
+            raise FlashScheduleError(
+                "output over the Q stages needs the one-CTA aliased K/V ring"
+            )
+        if _value_head_dim(spec) > spec.head_dim:
+            raise FlashScheduleError(
+                "output over the Q stages needs output tiles no wider than Q"
+            )
     if spec.kv_depth < 2:
         raise FlashScheduleError("FA4 schedule requires at least two K/V stages")
     if spec.cta_count not in (1, 2):
@@ -784,14 +927,21 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
         1 if spec.cooperative_mma else spec.cta_count if spec.multicast_kv else 1
     )
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    output_tile_bytes = 128 * _value_head_dim(spec) * spec.dtype_bytes
     q_bytes = spec.query_slots_per_cta * tile_bytes
-    kv_ring_bytes = spec.kv_depth * _kv_tile_bytes(spec)
+    kv_ring_bytes = _aliased_kv_ring_bytes(spec)
     k_offset = q_bytes
     v_offset = k_offset + (kv_ring_bytes if spec.separate_kv else 0)
     output_offset = q_bytes + (2 if spec.separate_kv else 1) * kv_ring_bytes
     overhead_offset = output_offset + (
-        spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
+        spec.query_slots_per_cta * output_tile_bytes
+        if spec.stage_output and not spec.output_over_query
+        else 0
     )
+    if spec.output_over_query:
+        # The staged output tiles alias the (dead) Q stages from offset 0.
+        output_offset = 0
+    q_alias_group = "q_stages_r{rank}" if spec.output_over_query else None
     stat_bytes_per_query = spec.stat_depth * 128 * 4
 
     load_nodes: set[str] = set()
@@ -1144,6 +1294,11 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashVisibility.CTA_PRIVATE,
                     q_load,
                     (qk,),
+                    alias_group=(
+                        None
+                        if q_alias_group is None
+                        else q_alias_group.format(rank=rank)
+                    ),
                     cta_rank=rank,
                 )
             )
@@ -1178,8 +1333,8 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashMemoryRegion(
                         f"O_r{rank}_q{slot}",
                         FlashMemorySpace.TMEM,
-                        256 + slot * spec.head_dim,
-                        spec.head_dim,
+                        256 + slot * _value_head_dim(spec),
+                        _value_head_dim(spec),
                         1,
                         FlashVisibility.CTA_PRIVATE,
                         pv,
@@ -1233,12 +1388,17 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashMemoryRegion(
                         f"O_stage_r{rank}_q{slot}",
                         FlashMemorySpace.SMEM,
-                        output_offset + slot * tile_bytes,
-                        tile_bytes,
+                        output_offset + slot * output_tile_bytes,
+                        output_tile_bytes,
                         1024,
                         FlashVisibility.CTA_PRIVATE,
                         output_stage,
                         (output_store,),
+                        alias_group=(
+                            None
+                            if q_alias_group is None
+                            else q_alias_group.format(rank=rank)
+                        ),
                         cta_rank=rank,
                     )
                 )
@@ -1373,7 +1533,7 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                 )
             )
         phase_cycles = tuple(cycles)
-    tmem_columns = 256 + spec.query_slots_per_cta * spec.head_dim
+    tmem_columns = 256 + spec.query_slots_per_cta * _value_head_dim(spec)
     return FlashSchedule(
         spec=spec,
         nodes=tuple(nodes),
@@ -1867,7 +2027,7 @@ def verify_flash_schedule(
     expected_tmem_columns = (
         _alt_tmem_columns(schedule.spec)
         if schedule.spec.alternating_warpgroups
-        else 256 + schedule.spec.query_slots_per_cta * schedule.spec.head_dim
+        else 256 + schedule.spec.query_slots_per_cta * _value_head_dim(schedule.spec)
     )
     if schedule.tmem_columns != expected_tmem_columns:
         raise FlashScheduleError("TMEM accounting does not match the schedule")

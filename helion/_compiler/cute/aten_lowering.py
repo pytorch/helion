@@ -22,6 +22,7 @@ from torch.fx.node import map_arg
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..aten_lowering import Lowering
 from ..aten_lowering import LoweringContext
 from ..aten_lowering import _argreduce_schema
 from ..aten_lowering import _env_arg
@@ -37,6 +38,7 @@ from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
+from ..aten_lowering import rolled_reduction_iota_index
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import stack_lowering
@@ -57,6 +59,7 @@ from .indexing import CuteSortableLoad
 from .indexing import is_cute_shape_chain_target
 from .indexing import match_cute_affine_range_iota
 from .iota_utils import cute_free_arange_indexed_dim_key
+from .iota_utils import cute_free_arange_lanes
 from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
@@ -74,6 +77,7 @@ from .matmul_utils import cute_static_k_invariant_extent
 from .matmul_utils import cute_static_mn_collapse_n_block_id
 from .matmul_utils import cute_static_serial_matmul_k_extent
 from .matmul_utils import cute_synthetic_lane_k_extent
+from .matmul_utils import emit_cute_serial_mm_from_load_views
 from .matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .matmul_utils import emit_cute_synthetic_lane_fold_mm
 from .strategies import is_pure_matmul_role_lifecycle_config
@@ -83,8 +87,8 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
 _SYNTHETIC_LANE_FOLD_UNSUPPORTED = (
-    "CuTe synthetic-lane K matmul fold only supports direct-load "
-    "operands whose contraction axis is the load's trailing dim"
+    "CuTe synthetic-lane K matmul fold only supports scaled or permuted "
+    "direct-load operands"
 )
 
 
@@ -106,6 +110,45 @@ def _reject_tcgen05_flat_role_coordinates_fallback() -> None:
         f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
         "active-K-loop tcgen05 MMA lowering",
     )
+
+
+def _serial_mm_from_load_views(
+    ctx: LoweringContext,
+    node: Node,
+    out_dtype: torch.dtype | None,
+    *,
+    acc: ast.AST | None = None,
+) -> ast.AST | None:
+    """Serial-K matmul over load views; an addmm/baddbmm passes its ``acc``."""
+    acc_dtype = None
+    if acc is None:
+        lhs_node, rhs_node = node.args[:2]
+    else:
+        acc_node, lhs_node, rhs_node = node.args[:3]
+        assert isinstance(acc_node, Node)
+        acc_dtype = acc_node.meta["val"].dtype
+    assert isinstance(lhs_node, Node)
+    assert isinstance(rhs_node, Node)
+    result = emit_cute_serial_mm_from_load_views(
+        ctx.cg,
+        ctx.env,
+        node,
+        lhs_node,
+        rhs_node,
+        acc=acc,
+        acc_dtype=acc_dtype,
+        out_dtype=out_dtype,
+    )
+    if result is not None:
+        if _requested_tcgen05_flat_role_coordinates(ctx):
+            _reject_tcgen05_flat_role_coordinates_fallback()
+        if _requested_pure_matmul_role_lifecycle(ctx):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
+                "active-K-loop tcgen05 matmul lowering, not serial scalar fallback",
+            )
+    return result
 
 
 @where_lowering.register_codegen("cute")
@@ -405,16 +448,6 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         hinted(lhs_node.meta["val"].shape[-1]) == 1
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
-    if (
-        static_k_extent is None
-        and serial_k_extent is None
-        and k_block_id is None
-        and not k_is_one
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
     outer_acc_dtype = cute_outer_accumulator_dtype(node, is_acc_none=True)
     effective_out_dtype = (
@@ -422,6 +455,19 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if out_dtype is not None
         else None
     )
+    if (
+        static_k_extent is None
+        and serial_k_extent is None
+        and k_block_id is None
+        and not k_is_one
+    ):
+        view_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
+        if view_result is not None:
+            return view_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
+        )
     if node.target in (torch.ops.aten.bmm.default, torch.ops.aten.bmm.dtype):
         mma_result = codegen_cute_mma(ctx, node, with_acc=False)
         if mma_result is not None:
@@ -464,6 +510,9 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             )
         return serial_result
     if serial_k_extent is not None:
+        view_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
+        if view_result is not None:
+            return view_result
         raise exc.BackendUnsupported(
             "cute",
             "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
@@ -491,6 +540,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             lhs_dtype=lhs_node.meta["val"].dtype,
             rhs_dtype=rhs_node.meta["val"].dtype,
         )
+        if fold_result is None:
+            # Operands the fold cannot re-read (a scalar-indexed load view)
+            # still fold their full K through the serial load-view lowering.
+            fold_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
         if fold_result is not None:
             return fold_result
         raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
@@ -579,6 +632,11 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
     if static_k_extent is None and k_block_id is None and not k_is_one:
+        view_result = _serial_mm_from_load_views(
+            ctx, node, node.meta["val"].dtype, acc=acc
+        )
+        if view_result is not None:
+            return view_result
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
@@ -598,6 +656,10 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             lhs_dtype=lhs_node.meta["val"].dtype,
             rhs_dtype=rhs_node.meta["val"].dtype,
         )
+        if fold_result is None:
+            fold_result = _serial_mm_from_load_views(
+                ctx, node, node.meta["val"].dtype, acc=acc
+            )
         if fold_result is not None:
             return fold_result
         raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
@@ -838,6 +900,11 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         and hinted(rhs_node.meta["val"].shape[-2]) == 1
     )
     if static_k_extent is None and k_block_id is None and not k_is_one:
+        view_result = _serial_mm_from_load_views(
+            ctx, node, node.meta["val"].dtype, acc=acc
+        )
+        if view_result is not None:
+            return view_result
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
@@ -870,6 +937,10 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             lhs_dtype=lhs_node.meta["val"].dtype,
             rhs_dtype=rhs_node.meta["val"].dtype,
         )
+        if fold_result is None:
+            fold_result = _serial_mm_from_load_views(
+                ctx, node, node.meta["val"].dtype, acc=acc
+            )
         if fold_result is not None:
             return fold_result
         raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
@@ -942,25 +1013,33 @@ def _cute_free_arange_axis_expr(
         return None
     if not cute_iota_is_free_memory_index(source_node, cg):
         return None
-    # The synthetic axis is keyed by the size of the tensor dimension this
-    # arange indexes. Two arange dims that address the same logical dimension (the
-    # load and store ``hl.arange(k)`` over a K-sized axis) share one axis so a
-    # value loaded on a lane is stored back on that lane, while a cartesian
-    # ``row``/``col`` pair addressing differently-sized dims gets distinct axes.
-    # ``length``/``start``/``step`` round out the key so two distinct arange dims
-    # that happen to index equal-sized dims still separate.
-    dim_key = cute_free_arange_indexed_dim_key(source_node, cg)
-    if dim_key is None:
-        return None
-    key = (
-        dim_key,
-        length_hint,
-        _arange_endpoint_key(start),
-        _arange_endpoint_key(step),
-    )
-    # The key is taken from the arange's *first* memory-op user, so two
-    # distinct hl.arange() dims can still land on one axis (``rows``/``cols`` both
-    # loaded from equal-sized dims).  Within a single load/store that would
+    # The synthetic axis is keyed by the arange dim's positional lane class
+    # (``FreeArangeLanes``): the dims that meet in the kernel's values share
+    # one axis whatever their start and step, so a value loaded on a lane is
+    # stored back at the same position (``out[t, hl.arange(2, 7)] =
+    # x[t, hl.arange(1, 6)]``), while the dims of one value stay distinct.
+    root = cute_free_arange_lanes(cg).root(source_node)
+    if root is not None:
+        key: tuple[object, ...] = (root, length_hint)
+    else:
+        # Outside the modeled ops, the key is the size of the tensor dimension
+        # this arange indexes: the load and store ``hl.arange(k)`` over a
+        # K-sized axis share one axis, while a cartesian ``row``/``col`` pair
+        # addressing differently-sized dims gets distinct axes.
+        # ``length``/``start``/``step`` round out the key so two distinct arange
+        # dims that happen to index equal-sized dims still separate.
+        dim_key = cute_free_arange_indexed_dim_key(source_node, cg)
+        if dim_key is None:
+            return None
+        key = (
+            dim_key,
+            length_hint,
+            _arange_endpoint_key(start),
+            _arange_endpoint_key(step),
+        )
+    # Two distinct hl.arange() dims can still land on one axis: the dim-size
+    # key is taken from the arange's *first* memory-op user (``rows``/``cols``
+    # both loaded from equal-sized dims).  Within a single load/store that would
     # address only the diagonal: refuse it rather than silently drop lanes.
     # One arange reaching two index dims of a single access is the same
     # collapse: Helion indexes two tensor entries as a cartesian tile, so
@@ -1017,6 +1096,41 @@ def _wrap_iota_coord_expr(
     )
 
 
+def _cute_inactive_loop_block_coord(cg: GenerateAST, block_id: int) -> str | None:
+    """The lane coordinate of ``block_id`` where its device loop is not running.
+
+    A value with a dim of that block keeps it on the loop's thread axis, as
+    the accumulator ``acc = hl.zeros([tile_m, bn])`` of ``for tile_n in
+    hl.tile(n, block_size=bn)`` does after the loop, so ``out[tile_m, 0:bn] =
+    acc`` must index the range by that axis rather than by a synthetic one.
+    ``None`` when no strategy of the running grid owns a thread axis for the
+    block.
+    """
+    tile_strategy = cg.device_function.tile_strategy
+    grid_state = cg.current_grid_state
+    axis = tile_strategy.thread_axis_for_block_id(block_id)
+    if axis is None or grid_state is None:
+        return None
+    owners = [s for s in tile_strategy.strategies if block_id in s.block_ids]
+    if not owners or not tile_strategy.strategies_can_coexecute(
+        grid_state.strategy, owners[0]
+    ):
+        return None
+    if len(owners[0].block_ids) != 1 or tile_strategy.thread_extent_for_block_id(
+        block_id
+    ) != cg.device_function.resolved_block_size(block_id):
+        # Outside its loop, a value of the block has one register per
+        # thread: a lane loop or a multi-block layout has no coordinate for
+        # each of its elements there.
+        raise exc.BackendUnsupported(
+            "cute",
+            f"a slice or hl.arange() over block_id={block_id} read outside its "
+            "device loop, where each thread holds several elements of the block "
+            "in one value (a lane loop or a multi-block tile)",
+        )
+    return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+
+
 def _cute_iota_expr(
     ctx: LoweringContext,
     *,
@@ -1028,6 +1142,7 @@ def _cute_iota_expr(
 ) -> object:
     from ..device_ir import ForLoopGraphInfo
     from ..generate_ast import GenerateAST
+    from .cute_reshape import _get_block_local_coord
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _grid_local_coord_expr
     from .cute_reshape import _resolve_tile_extent
@@ -1040,7 +1155,21 @@ def _cute_iota_expr(
         else CompileEnvironment.current().index_dtype
     )
 
+    if (rolled := rolled_reduction_iota_index(ctx, source_node)) is not None:
+        # The thread's position in the whole reduction dim; its block-local
+        # coordinate would restart the range at every chunk.
+        return _wrap_iota_coord_expr(ctx, rolled, start, step, dtype)
+
     env = CompileEnvironment.current()
+    if isinstance(length_arg, int) and length_arg == 1:
+        # A one-element range (``hl.arange(1)``, the literal broadcast
+        # coordinate of a unit tile such as the flex example's batch / head
+        # vectors) has no element coordinate in the SIMT lowering: a size-1
+        # dim is a scalar, so the range is its ``start``.
+        expr = "{start}"
+        if dtype != torch.int32:
+            expr = f"{env.backend.dtype_str(dtype)}({expr})"
+        return expr_from_string(expr, start=ctx.to_ast(start))
     length_hint: int | None = None
     if isinstance(length_arg, (int, torch.SymInt)):
         length_hint = _resolve_tile_extent(length_arg, env, cg.device_function.config)
@@ -1121,15 +1250,11 @@ def _cute_iota_expr(
 
         matched: list[tuple[int, str]] = []
         for candidate in active_block_ids:
-            loops = cg.active_device_loops.get(candidate)
-            if loops:
-                expr = loops[-1].strategy.index_var(candidate)
-            elif (
-                cg.current_grid_state is not None
-                and candidate in cg.current_grid_state.block_ids
-            ):
-                expr = cg.current_grid_state.strategy.index_var(candidate)
-            else:
+            # The range counts from 0 along an axis matched by its block size,
+            # so it is the axis' block-local coordinate: the axis index would
+            # add the offset of this program's (or loop iteration's) block.
+            expr = _get_block_local_coord(cg, candidate)
+            if expr is None:
                 continue
 
             candidate_size = cg.device_function.resolved_block_size(candidate)
@@ -1194,6 +1319,27 @@ def _cute_iota_expr(
             length_hint = _resolve_tile_extent(
                 fake_val.shape[0], env, cg.device_function.config
             )
+            if length_hint == 1:
+                # A one-element range holds only ``start``.  Matching an active
+                # axis of extent one would read that axis' global index.
+                return _wrap_iota_coord_expr(
+                    ctx, "cutlass.Int32(0)", start, step, dtype
+                )
+            if (
+                block_id is None
+                and cute_free_arange_lanes(cg).root(source_node) is not None
+                and (
+                    synthetic := _cute_free_arange_axis_expr(
+                        cg, source_node, length_hint, start, step
+                    )
+                )
+                is not None
+            ):
+                # The range's dims meet no tile axis in the kernel's values
+                # (FreeArangeLanes): an active axis whose block size matches or
+                # is a multiple of its length is another dim of those values
+                # (``x[tile_m, hl.arange(4)]``), so it takes its own lane.
+                return _wrap_iota_coord_expr(ctx, synthetic, start, step, dtype)
             local_coord = _get_dim_local_coord(cg, fake_val, 0)
             if local_coord != "cutlass.Int32(0)":
                 expr = local_coord
@@ -1272,15 +1418,21 @@ def _cute_iota_expr(
         loops = cg.active_device_loops.get(candidate_block_id)
         if loops:
             expr = loops[-1].strategy.index_var(candidate_block_id)
-            active_block_id = candidate_block_id
-            break
-        if (
+        elif (
             cg.current_grid_state is not None
             and candidate_block_id in cg.current_grid_state.block_ids
         ):
             expr = cg.current_grid_state.strategy.index_var(candidate_block_id)
-            active_block_id = candidate_block_id
-            break
+        else:
+            continue
+        if not env.block_sizes[candidate_block_id].reduction:
+            # A reduction axis allocated for the range's extent walks all of
+            # it (a rolled loop included), so its index is the range.  A tile
+            # axis holds one block of a larger space: the range counts from
+            # the block's first element, its block-local coordinate.
+            expr = _get_block_local_coord(cg, candidate_block_id)
+        active_block_id = candidate_block_id
+        break
     block_id = resolved_block_id if active_block_id is None else active_block_id
 
     if expr is None:
@@ -1298,6 +1450,8 @@ def _cute_iota_expr(
                     break
         if thread_axis is not None:
             expr = _grid_local_coord_expr(cg, block_id, thread_axis)
+        elif (coord := _cute_inactive_loop_block_coord(cg, block_id)) is not None:
+            expr = coord
         elif (active_expr := active_iota_expr()) is not None:
             return active_expr
         elif (
@@ -1378,68 +1532,41 @@ def _sort_args(node: Node) -> tuple[int, bool]:
 
 def _emit_cute_rank_sort(
     ctx: LoweringContext,
+    node: Node,
     load: CuteSortableLoad,
     input_tensor: torch.Tensor,
     *,
     descending: bool,
     k: int | None = None,
 ) -> tuple[ast.AST, ast.AST]:
+    from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
+    from .scan_ops import cute_rank_sort_lines
+    from .scan_ops import cute_serial_axis
+
+    if not isinstance(ctx.cg, GenerateAST):
+        raise exc.NotAllowedInHelperFunction
     env = CompileEnvironment.current()
-    fn = ctx.cg.device_function
-    n = input_tensor.shape[-1]
-    n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
-    if not isinstance(n_hint, int):
-        raise exc.BackendUnsupported("cute", "dynamic sort extent")
-    dtype_str = env.backend.dtype_str(load.dtype)
+    state = CodegenState(ctx.cg, fx_node=node, env=ctx.env)
+    axis = cute_serial_axis(state, input_tensor, input_tensor.ndim - 1, "sort")
+    # The lane's position along the sorted dim: the rank it selects, and for
+    # topk the output column it writes (``cute_topk_lane_expr``).
+    node.meta["cute_sort_axis"] = axis
+    out_pos = ctx.cg.device_function.new_var("sort_out_pos")
     index_dtype = env.backend.dtype_str(env.index_dtype)
-    out_pos = fn.new_var("sort_out_pos")
-    sorted_vals = fn.new_var("sorted_vals")
-    sorted_indices = fn.new_var("sorted_indices")
-    candidate = fn.new_var("sort_k")
-    probe = fn.new_var("sort_j")
-    candidate_rank = fn.new_var("sort_rank")
-    candidate_value = fn.new_var("sort_candidate")
-    probe_value = fn.new_var("sort_probe")
-    before = fn.new_var("sort_before")
-    selected = fn.new_var("sort_selected")
-
     ctx.cg.add_statement(
-        statement_from_string(
-            f"{out_pos} = {index_dtype}({load.index_exprs[load.sort_index_pos]})"
-        )
+        statement_from_string(f"{out_pos} = {index_dtype}({axis.position})")
     )
-    ctx.cg.add_statement(statement_from_string(f"{sorted_vals} = {dtype_str}(0)"))
-    ctx.cg.add_statement(statement_from_string(f"{sorted_indices} = {index_dtype}(0)"))
-
-    cmp_op = ">" if descending else "<"
-
-    def indexed_load(index: str) -> str:
-        index_exprs = list(load.index_exprs)
-        index_exprs[load.sort_index_pos] = index
-        expr = f"{load.tensor_name}[{', '.join(index_exprs)}]"
-        if load.mask_expr is not None:
-            return f"({expr} if {load.mask_expr} else {dtype_str}(0))"
-        return expr
-
-    mask_suffix = f" and {out_pos} < {k}" if k is not None else ""
-    ctx.cg.add_statement(
-        statement_from_string(
-            "\n".join(
-                [
-                    f"for {candidate} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
-                    f"    {candidate_value} = {indexed_load(candidate)}",
-                    f"    {candidate_rank} = {index_dtype}(0)",
-                    f"    for {probe} in range(cutlass.Int32(0), cutlass.Int32({n_hint}), cutlass.Int32(1)):",
-                    f"        {probe_value} = {indexed_load(probe)}",
-                    f"        {before} = ({probe_value} {cmp_op} {candidate_value}) or (({probe_value} == {candidate_value}) and ({probe} < {candidate}))",
-                    f"        {candidate_rank} = {candidate_rank} + ({index_dtype}(1) if {before} else {index_dtype}(0))",
-                    f"    {selected} = ({candidate_rank} == {out_pos}{mask_suffix})",
-                    f"    {sorted_vals} = {candidate_value} if {selected} else {sorted_vals}",
-                    f"    {sorted_indices} = {index_dtype}({candidate}) if {selected} else {sorted_indices}",
-                ]
-            )
-        )
+    statements, sorted_vals, sorted_indices = cute_rank_sort_lines(
+        state,
+        load,
+        axis,
+        descending,
+        out_pos,
+        select_if=None if k is None else f"{out_pos} < {k}",
     )
+    for statement in statements:
+        ctx.cg.add_statement(statement_from_string(statement))
     return expr_from_string(sorted_vals), expr_from_string(sorted_indices)
 
 
@@ -1456,7 +1583,7 @@ def codegen_sort_cute(ctx: LoweringContext, node: Node) -> object:
         raise exc.BackendUnsupported("cute", "torch.sort input")
     node.meta["cute_sort_load"] = load
     node.meta["cute_sort_descending"] = descending
-    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=descending)
+    return _emit_cute_rank_sort(ctx, node, load, input_tensor, descending=descending)
 
 
 @gather_lowering.register_codegen("cute")
@@ -1554,6 +1681,9 @@ def _topk_args(node: Node) -> tuple[int, int, bool]:
 
 @topk_lowering.register_codegen("cute")
 def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
+    from ...language import memory_ops
+    from .memory_ops import _cute_topk_cast_input
+
     k, _, largest = _topk_args(node)
     input_node = node.args[0]
     assert isinstance(input_node, Node)
@@ -1563,6 +1693,72 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
         load = input_node.meta.get("cute_sortable_load")
     if not isinstance(load, CuteSortableLoad):
         raise exc.BackendUnsupported("cute", "torch.topk input")
-    node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
+    # Output ``j`` is held on the lane at position ``j`` of the sorted input
+    # dim, which only a store addresses (``_cute_topk_store_index_exprs``);
+    # dtype conversions retain that lane. Other consumers would read it on
+    # the output dim's own lanes.
+    pending = list(node.users)
+    visited: set[Node] = set()
+    while pending:
+        output = pending.pop()
+        if output in visited:
+            continue
+        visited.add(output)
+        for user in output.users:
+            if user.target is memory_ops.store and user.args[2] is output:
+                continue
+            if _cute_topk_cast_input(user) is output:
+                pending.append(user)
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                "torch.topk output that feeds anything but a store: its "
+                "elements are held on the lanes of the sorted input dim",
+            )
+    if k == 1 and CompileEnvironment.current().known_equal(input_tensor.shape[-1], 1):
+        # A singleton keeps its original masked load and has index zero. Its
+        # size-one axis has no block owner or sorting coordinates to publish.
+        return load.expr, expr_from_string("cutlass.Int64(0)")
+    result = _emit_cute_rank_sort(
+        ctx, node, load, input_tensor, descending=largest, k=k
+    )
+    node.meta["cute_topk_lane_expr"] = node.meta["cute_sort_axis"].position
     node.meta["cute_topk_k"] = k
-    return _emit_cute_rank_sort(ctx, load, input_tensor, descending=largest, k=k)
+    return result
+
+
+class NumericExtremumLowering(Lowering):
+    """Lower numeric extrema that choose the non-NaN operand when available."""
+
+    def codegen(self, ctx: LoweringContext, node: Node) -> ast.AST:
+        backend = CompileEnvironment.current().backend
+        dtype = node.meta["val"].dtype
+        operands = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert all(isinstance(arg, ast.AST) for arg in operands)
+        left, right = (
+            backend.cast_ast(cast("ast.AST", arg), dtype) for arg in operands
+        )
+        operation = "min" if node.target is torch.ops.aten.fmin.default else "max"
+        if dtype == torch.float32:
+            cg = cast("GenerateAST", ctx.cg)
+            module = "helion.runtime.cute.register_tensor"
+            name = "_cute_numeric_extremum"
+            if not any(
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == module
+                and any(alias.name == name for alias in statement.names)
+                for statement in cg.module_statements
+            ):
+                cg.module_statements.append(
+                    ast.ImportFrom(module=module, names=[ast.alias(name=name)], level=0)
+                )
+            return expr_from_string(
+                f"{name}({{left}}, {{right}}, minimum={operation == 'min'})",
+                left=left,
+                right=right,
+            )
+        return expr_from_string(
+            f"cute.math.{operation}({{left}}, {{right}}, propagate_nan=False)",
+            left=left,
+            right=right,
+        )

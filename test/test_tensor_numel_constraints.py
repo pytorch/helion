@@ -315,19 +315,19 @@ class TestNumelConstraintExtraction(unittest.TestCase):
                 symbol=lambda: r0,
                 block_id=2,
                 size=4,
-                block_size_source=ReductionLoopBlockSizeSource(0),
+                block_size_source=ReductionLoopBlockSizeSource(),
             ),
             SimpleNamespace(
                 symbol=lambda: r1,
                 block_id=3,
                 size=32,
-                block_size_source=ReductionLoopBlockSizeSource(1),
+                block_size_source=ReductionLoopBlockSizeSource(),
             ),
             SimpleNamespace(
                 symbol=lambda: r2,
                 block_id=4,
                 size=128,
-                block_size_source=ReductionLoopBlockSizeSource(2),
+                block_size_source=ReductionLoopBlockSizeSource(),
             ),
         ]
         env.kernel_tensor_sizes = [(b0, r0, r1, b1, r2)]
@@ -357,7 +357,7 @@ class TestNumelConstraintExtraction(unittest.TestCase):
                 symbol=lambda: reduction,
                 block_id=1,
                 size=5,
-                block_size_source=ReductionLoopBlockSizeSource(0),
+                block_size_source=ReductionLoopBlockSizeSource(),
             ),
         ]
         env.kernel_tensor_sizes = [(block, reduction)]
@@ -386,7 +386,7 @@ class TestNumelConstraintExtraction(unittest.TestCase):
                 symbol=lambda: r0,
                 block_id=2,
                 size=16384,
-                block_size_source=ReductionLoopBlockSizeSource(0),
+                block_size_source=ReductionLoopBlockSizeSource(),
             ),
         ]
         env.kernel_tensor_sizes = [(b0, b1, r0)]
@@ -406,7 +406,7 @@ class TestNumelConstraintExtraction(unittest.TestCase):
                 symbol=lambda: block,
                 block_id=1,
                 size=16384,
-                block_size_source=ReductionLoopBlockSizeSource(0),
+                block_size_source=ReductionLoopBlockSizeSource(),
             ),
         ]
         env.kernel_tensor_sizes = [(block, sympy.Integer(16384))]

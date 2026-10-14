@@ -2941,6 +2941,10 @@ class TestMetalCodegen(unittest.TestCase):
     """Renders that need no Metal device."""
 
     @skipIfRefEager("renders a pinned config; ref mode runs the kernel eagerly")
+    @unittest.skipIf(
+        row_sum.settings.debug_dtype_asserts,
+        "Metal refuses debug_dtype_asserts (it emits Triton checks)",
+    )
     def test_rolled_reduction_has_no_cuda_barrier(self) -> None:
         # The lane-loop wrapper Metal's rolled reductions share with the CuTe
         # backend runs CuTe's cross-thread barrier pass only for CuTe: a

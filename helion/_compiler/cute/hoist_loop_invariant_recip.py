@@ -75,9 +75,13 @@ neighbours (at most 1 ulp away from the IEEE division result).  The bound
 assumes ``1 / d`` is a normal fp32 value (roughly ``2**-128 < |d| <=
 2**126``); outside that range the reciprocal can overflow or lose bits
 where the division would not, exactly as for the loop-invariant hoist.
-Both rewrites use only IEEE-rounded ``/`` and ``*`` -- no approximate or
-fast-math instructions are introduced -- and neither is an autotuner knob:
-the only gate is the ``HELION_DISABLE_HOIST_RECIP`` escape hatch.
+Both rewrites use only IEEE-rounded ``/`` and ``*``, but they still change
+results, and only where they fire: inside a loop for the hoist, and where
+a block repeats a divisor for the sharing.  Which loops and blocks exist
+depends on the config (a lane loop when ``num_threads`` is below the block
+size, a rolled reduction loop, an unrolled lane), so the rewrites run only
+under the ``fast_math`` setting; configs must never change numerics.
+``HELION_DISABLE_HOIST_RECIP`` turns off the whole pass.
 
 The alias-DCE pass inlines chains like ``mi_copy_1 = mi`` /
 ``mi_copy_1_0 = mi_copy_1`` so the deepest inner-loop use can read
@@ -1260,10 +1264,13 @@ def _dce_pure_assigns(body: list[ast.stmt]) -> list[ast.stmt]:
 def hoist_loop_invariant_recips(
     body: list[ast.stmt],
     rename_groups: dict[str, str] | None = None,
+    *,
+    fast_math: bool,
 ) -> list[ast.stmt]:
     """Apply the hoist passes to a list of kernel-body statements.
 
-    Runs four sub-passes:
+    Runs four sub-passes (2, 3 and 4 only when ``fast_math``, the setting,
+    allows rounding to depend on the config):
 
       1. Inline pure SSA alias chains (``mi_copy_1 = mi`` →
          direct use of ``mi``) so subsequent passes see clean root names.
@@ -1279,7 +1286,10 @@ def hoist_loop_invariant_recips(
       4. Hoist ``(A - INV) * CONST`` patterns where INV is
          loop-invariant — emits ``INV_scaled = INV * CONST`` outside
          and rewrites the inner expression to ``A * CONST - INV_scaled``
-         (an FMA-friendly form).
+         (an FMA-friendly form).  Distributing the product rounds
+         differently, and loses precision when ``A`` is close to a large
+         ``INV`` (softmax's ``x - max``); like the reciprocals it fires
+         only in the loops a config creates.
 
     ``rename_groups`` (if provided) maps pre-rename name -> canonical
     post-rename name.  This lets the invariance analysis treat aliases
@@ -1324,14 +1334,15 @@ def hoist_loop_invariant_recips(
         #    ``di`` is not classified as invariant when ``v_8`` (renamed
         #    to ``di``) is reassigned inside the loop.
         _USE_CANONICAL_INVARIANCE[0] = True
-        body = _hoist_in_body(body)
-        # 3. Share reciprocals between the divisions sub-pass 2 could not
-        #    hoist (divisor recomputed per iteration) — same
-        #    canonical-aware mode so a rebind through a to-be-renamed
-        #    alias ends the sharing group.
-        body = _share_repeated_recips_in_body(body)
-        # 4. Hoist scaled-sub patterns — same canonical-aware mode.
-        body = _hoist_scaled_subs_in_body(body)
+        if fast_math:
+            body = _hoist_in_body(body)
+            # 3. Share reciprocals between the divisions sub-pass 2 could
+            #    not hoist (divisor recomputed per iteration) — same
+            #    canonical-aware mode so a rebind through a to-be-renamed
+            #    alias ends the sharing group.
+            body = _share_repeated_recips_in_body(body)
+            # 4. Hoist scaled-sub patterns — same canonical-aware mode.
+            body = _hoist_scaled_subs_in_body(body)
         # 5. DCE dead pure assigns left behind by the rewrites
         #    (e.g. ``v_10 = v_9 - mi`` now unused because the Mult was
         #    rewritten to read ``v_9`` directly).

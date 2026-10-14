@@ -8,6 +8,8 @@ base class for the Cute and Pallas printers
 
 from __future__ import annotations
 
+from typing import cast
+
 import sympy
 from torch._inductor.codegen.triton import TritonPrinter
 
@@ -27,6 +29,12 @@ class HelionTritonPrinter(TritonPrinter):
       denominator is a positive integer, so that we keep helper calls for cases
       that rely on floor semantics with mixed signs.
     """
+
+    def _print_IntegerPowerOfTwo(self, expr: sympy.Expr) -> str:
+        # The shared scalar lowering proved that this positive integer fits
+        # signed Int64. Keep the result integer for indexing and bitwise ops.
+        shift = self.doprint(cast("sympy.Expr", expr.args[0]))
+        return f"(tl.full((), 1, tl.int64) << ({shift}))"
 
     def _print_Float(self, expr: sympy.Expr) -> str:
         return str(expr)

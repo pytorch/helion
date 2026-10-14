@@ -10,7 +10,8 @@ accesses of its tensor is rejected instead.  Whether an access repeats is
 decided by the values it reads, not by the loops the structure places it in: a
 partial tile's masks tie every access to every loop, and a device loop's lane
 loops are built around its body before the body exists (that nest is checked
-the same way, never redistributed).  A placement is checked like the nest it
+the same way, and redistributed like a root body when it is inexact).  A
+placement is checked like the nest it
 replaces: an inner loop nested inside an outer one (by its hoisted packets, or
 because a statement needs both and each loop is materialized once) runs its
 statements inside the outer loop whether or not their values change with it.
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import gc
 import itertools
 import re
 import textwrap
@@ -43,8 +45,11 @@ import helion
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from helion._compiler.cute import lane_loop_distribution
+from helion._compiler.cute.block_uniform import block_uniform
+from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+from helion.language import _tracing_ops
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -934,18 +939,24 @@ _INNER_LANES_CONFIG = {
 }
 
 
-def test_tile_uniform_store_in_an_inner_loops_lane_nest_is_checked() -> None:
+def test_tile_uniform_store_in_an_inner_loops_lane_nest_is_placed() -> None:
     # A device loop's lane loops are built around its body before the body
-    # exists and are never redistributed, so the nest must be the tile
-    # program.  The zeroing store ignores the column lane: before the copy it
-    # would be re-applied after the first lane's copy of the same element ...
+    # exists.  The zeroing store ignores the column lane: before the copy it
+    # would be re-applied after the first lane's copy of the same element, so
+    # the inexact nest is redistributed: the store runs once, before the lane
+    # loop, and a barrier orders it before the other threads' copies ...
     args = (torch.empty((8, 512)), torch.empty((8, 512)))
-    with pytest.raises(
-        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
-    ):
-        _generate(
-            _zero_first_column_then_copy_in_inner_tile, args, **_INNER_LANES_CONFIG
-        )
+    code = _generate(
+        _zero_first_column_then_copy_in_inner_tile, args, **_INNER_LANES_CONFIG
+    )
+    function = _kernel_function(code)
+    (lane_loop,) = _loops(function, "lane_1")
+    (tile_loop,) = _loops(function, "tile_offset_1")
+    position = tile_loop.body.index(lane_loop)
+    before = ast.unparse(tile_loop.body[:position])
+    assert _accesses(tile_loop.body[0], "out"), code
+    assert "cute.arch.sync_threads()" in before, code
+    assert _accesses(lane_loop, "out") and _accesses(lane_loop, "x"), code
     # ... and after every lane's copy it is exact, inside the inner loop's
     # lane loop.
     code = _generate(
@@ -1108,6 +1119,41 @@ def _first_column_then_update_all(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_column_then_overwrite_beside_row_sums(
+    x: torch.Tensor, out: torch.Tensor, sums: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        first = out[tile0, tile1.begin]
+        sums[tile0] = x[tile0, tile1].sum(-1)
+        out[tile0, tile1] = x[tile0, tile1] + first[:, None]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sum_then_normalized_overwrite(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        v = x[tile0, tile1]
+        s = v.sum(-1)
+        out[tile0, tile1.begin] = s
+        out[tile0, tile1] = v / s[:, None]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sum_stored_twice(
+    x: torch.Tensor, out: torch.Tensor, sums: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        v = x[tile0, tile1]
+        out[tile0, tile1] = v * 2.0
+        sums[tile0] = v.sum(-1)
+        sums[tile0] = v.sum(-1) * 2.0
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _first_column_then_update_all_3d(x: torch.Tensor) -> torch.Tensor:
     for tile0, tile1, tile2 in hl.tile(x.shape):
         first = x[tile0, tile1, tile2.begin]
@@ -1267,6 +1313,56 @@ def test_uniform_read_before_per_lane_stores_on_a_shared_axis_gets_a_barrier(
     assert load < barrier < row_loop.body.index(column_loop), code
 
 
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_racing_accesses_beside_a_lane_reduction_reject_the_config(
+    config: dict[str, object],
+) -> None:
+    # As in ``_first_column_then_update_all``, every thread of the column axis
+    # reads the first column that thread 0 overwrites in the column loop.  The
+    # row sum's ``_helion_lane_reduce`` leaves the body to the reduction split,
+    # which would carry no barrier between the read and the stores: the race
+    # is refused instead of left open.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)), torch.empty(8))
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match=r"race on a tensor in a body a later pass rewrites "
+        r"\(_helion_lane_reduce\)",
+    ):
+        _generate(_first_column_then_overwrite_beside_row_sums, args, **config)
+
+
+def test_lane_reduction_without_a_shared_thread_axis_keeps_the_config() -> None:
+    # One thread per row: no other thread reads the first column, nothing to
+    # order.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)), torch.empty(8))
+    code = _generate(
+        _first_column_then_overwrite_beside_row_sums, args, **_ONE_THREAD_CONFIG
+    )
+    assert not _barriers(_kernel_function(code)), code
+
+
+def test_reduced_stores_beside_a_lane_reduction_need_no_barrier() -> None:
+    # Every thread of the column axis stores the row sum, which the split
+    # combines over those threads before either store: each thread writes the
+    # same two values in program order, so the last one stands whatever the
+    # threads' order.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)), torch.empty(8))
+    code = _generate(_row_sum_stored_twice, args, **_NESTED_SCALAR_CONFIG)
+    assert not _barriers(_kernel_function(code)), code
+
+
+def test_reduced_store_then_per_element_overwrite_rejects_the_config() -> None:
+    # The first column's per-element value must replace the row sum every
+    # thread of the column axis stores there first; a thread still storing
+    # the sum after thread 0's overwrite leaves the wrong value, and the
+    # barrier between the stores cannot sit in the body the split rewrites.
+    args = (torch.empty((8, 256)), torch.empty((8, 256)))
+    with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
+        _generate(_row_sum_then_normalized_overwrite, args, **_NESTED_SCALAR_CONFIG)
+
+
 def test_no_barrier_when_every_axis_has_one_thread() -> None:
     code = _generate(
         _first_column_then_update_all, (torch.empty((8, 256)),), **_ONE_THREAD_CONFIG
@@ -1403,10 +1499,17 @@ def test_device_loop_body_gets_a_barrier_for_its_own_thread_axis() -> None:
     _one_barrier_between(device_loop.body, "tile_offset_1) *", ".store(")
 
 
+def _flags_aliasing(x: torch.Tensor) -> torch.Tensor:
+    """Flags that are a view of ``x``, which the kernels write in place."""
+    return x.view(-1)[: x.size(0)]
+
+
 def test_racing_accesses_inside_a_branch_reject_the_config() -> None:
-    # A branch condition may vary per thread, and a block-wide barrier inside
-    # a branch some threads skip would deadlock: fail closed.
-    args = (torch.empty((8, 256)), torch.empty(8))
+    # A branch condition may vary per thread (here a flag the kernel itself
+    # overwrites, passed aliased to ``x``), and a block-wide barrier inside a
+    # branch some threads skip would deadlock: fail closed.
+    x = torch.empty((8, 256))
+    args = (x, _flags_aliasing(x))
     with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
         _generate(
             _flagged_inner_first_column_then_update_all,
@@ -1568,12 +1671,15 @@ def test_racing_accesses_in_a_grid_body_branch_reject_the_config(
     kernel: object,
 ) -> None:
     # A ``hl.if`` body is emitted inside the lane nest without passing
-    # through it; the pass reads its statements as a block of their own where
-    # no barrier can go, and threads taking different branches cannot be
-    # ordered at all.
-    args = (torch.empty((8, 256)), torch.empty(8))
-    with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
-        _generate(kernel, args, **_NESTED_CONFIG)
+    # through it, so each lane's pass re-reads the first column the column
+    # loop's lane 0 stored: the exactness check rejects the nest before the
+    # barrier pass would find the branch divergent (the flag aliases ``x``,
+    # which the kernel writes) and the threads' race unorderable.
+    x = torch.empty((8, 256))
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant load of x .* inside a branch"
+    ):
+        _generate(kernel, (x, _flags_aliasing(x)), **_NESTED_CONFIG)
 
 
 def test_racing_access_before_a_branch_gets_a_barrier_before_the_branch() -> None:
@@ -1588,6 +1694,454 @@ def test_racing_access_before_a_branch_gets_a_barrier_before_the_branch() -> Non
     load = _index_of(row_loop.body, "tile_offset_1")
     barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
     assert load < barrier < row_loop.body.index(column_loop), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_first_column_then_update_all(x: torch.Tensor, rows: int) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if tile0.begin < rows:
+            first = x[tile0, tile1.begin]
+            x[tile0, tile1] = x[tile0, tile1] + first[:, None] + 1.0
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_update_all_or_first_column(x: torch.Tensor, rows: int) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if tile0.begin < rows:
+            x[tile0, tile1] = x[tile0, tile1] + 1.0
+        else:
+            first = x[tile0, tile1.begin]
+            x[tile0, tile1] = x[tile0, tile1] + first[:, None]
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_inner_first_column_then_update_all(
+    x: torch.Tensor, rows: int
+) -> torch.Tensor:
+    for tile0 in hl.tile(x.size(0)):
+        if tile0.begin < rows:
+            for tile1 in hl.tile(x.size(1)):
+                first = x[tile0, tile1.begin]
+                x[tile0, tile1] = x[tile0, tile1] + first[:, None] + 1.0
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_then_flagged_first_column_then_update_all(
+    x: torch.Tensor, flags: torch.Tensor, rows: int
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if tile0.begin < rows:
+            if flags[tile0.begin] > 0:
+                first = x[tile0, tile1.begin]
+                x[tile0, tile1] = x[tile0, tile1] + first[:, None] + 1.0
+    return x
+
+
+# One thread per element: the grid body has no lane loop.
+_ELEMENTWISE_THREADS_CONFIG = {
+    "block_sizes": [4, 64],
+    "num_threads": [4, 64],
+    "cute_vector_widths": [1, 1],
+}
+
+
+def _branches(node: ast.AST) -> list[ast.If]:
+    return [child for child in ast.walk(node) if isinstance(child, ast.If)]
+
+
+def test_racing_accesses_inside_a_uniform_branch_get_a_barrier_inside_it() -> None:
+    # ``tile0.begin < rows`` is one value per CTA (a grid tile's begin and a
+    # kernel argument), so every thread takes the branch or none does and the
+    # barrier between the first column's load and the update goes inside it.
+    code = _generate(
+        _bounded_first_column_then_update_all,
+        (torch.empty((8, 256)), 4),
+        **_ELEMENTWISE_THREADS_CONFIG,
+    )
+    function = _kernel_function(code)
+    (branch,) = _branches(function)
+    assert len(_barriers(function)) == len(_barriers(branch)) == 1, code
+    _one_barrier_between(branch.body, "tile_offset_1) *", ".store(")
+
+
+def test_two_sides_of_a_uniform_branch_are_not_ordered_against_each_other() -> None:
+    # The CTA runs one side of the branch, so only the ``else`` side's own
+    # race needs a barrier; the plain update on the other side races with
+    # nothing.
+    code = _generate(
+        _bounded_update_all_or_first_column,
+        (torch.empty((8, 256)), 4),
+        **_ELEMENTWISE_THREADS_CONFIG,
+    )
+    function = _kernel_function(code)
+    (branch,) = _branches(function)
+    assert len(_barriers(function)) == 1 and not _barriers(branch.body[0]), code
+    _one_barrier_between(branch.orelse, "tile_offset_1) *", ".store(")
+
+
+def test_device_loop_inside_a_uniform_branch_gets_its_barrier() -> None:
+    # The device loop's own race is ordered inside its body, which every
+    # thread runs the same number of times under a uniform branch.
+    code = _generate(
+        _bounded_inner_first_column_then_update_all,
+        (torch.empty((8, 256)), 4),
+        **_INNER_THREADED_COLUMNS_CONFIG,
+    )
+    function = _kernel_function(code)
+    (device_loop,) = _loops(function, "tile_offset_1")
+    assert len(_barriers(function)) == 1, code
+    _one_barrier_between(device_loop.body, "tile_offset_1) *", ".store(")
+
+
+# Four rows per thread around one column per thread: the row axis is a lane
+# loop, the column axis is shared by the threads.
+_ROWS_PER_THREAD_THREADED_COLUMNS_CONFIG = {
+    "block_sizes": [4, 64],
+    "num_threads": [1, 64],
+    "cute_vector_widths": [1, 1],
+}
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flagged_first_column_update_of_a_fresh_output(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0, tile1] = x[tile0, tile1]
+        if flags[tile0.begin] > 0:
+            first = out[tile0, tile1.begin]
+            out[tile0, tile1] = out[tile0, tile1] + first[:, None] + 1.0
+    return out
+
+
+def test_racing_accesses_in_an_unwritten_flag_branch_get_a_barrier_inside_it() -> None:
+    # Every thread loads ``flags`` at the tile's begin and nothing in the
+    # kernel can write it (only the fresh ``out`` is written), so the flag is
+    # one value per CTA and the first column's race gets its barrier in the
+    # branch.
+    code = _generate(
+        _flagged_first_column_update_of_a_fresh_output,
+        (torch.empty((8, 256)), torch.empty(8)),
+        **_ELEMENTWISE_THREADS_CONFIG,
+    )
+    function = _kernel_function(code)
+    (branch,) = _branches(function)
+    assert len(_barriers(branch)) == 1, code
+    _one_barrier_between(branch.body, "tile_offset_1) *", ".store(")
+
+
+def test_argument_flag_proof_survives_the_bind_tensors_being_freed() -> None:
+    # ``flags`` and the in-place ``x`` are both arguments: only the bound
+    # kernel's cache-keyed storage-disjointness fact proves the flag
+    # unwritten.  The bound kernel holds the bind's tensors weakly; a second
+    # config compiled after they are freed must reach the decision the first
+    # did, from the recorded fact.
+    x = torch.empty((8, 256))
+    flags = torch.empty(8)
+    configs = (
+        _ELEMENTWISE_THREADS_CONFIG,
+        {**_ELEMENTWISE_THREADS_CONFIG, "block_sizes": [2, 64], "num_threads": [2, 64]},
+    )
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(_flagged_first_column_then_update_all, (x, flags))
+        first = bound.to_code(helion.Config.from_dict(configs[0]))
+        del x, flags
+        gc.collect()
+        assert all(ref() is None for ref in bound._runtime_tensor_refs_by_name.values())
+        second = bound.to_code(helion.Config.from_dict(configs[1]))
+    for code in (first, second):
+        (branch,) = _branches(_kernel_function(code))
+        assert _barriers(branch), code
+
+
+def test_uniform_branch_inside_a_lane_loop_gets_its_barrier() -> None:
+    # Each row lane's pass runs the branch whole; the first column's load
+    # reads the row lane, so it repeats nothing, and the column threads'
+    # race in each pass is ordered by a barrier inside the branch.
+    code = _generate(
+        _bounded_first_column_then_update_all,
+        (torch.empty((8, 256)), 4),
+        **_ROWS_PER_THREAD_THREADED_COLUMNS_CONFIG,
+    )
+    function = _kernel_function(code)
+    (row_loop,) = _loops(function, "lane_0")
+    (branch,) = _branches(row_loop)
+    assert len(_barriers(function)) == len(_barriers(branch)) == 1, code
+    _one_barrier_between(branch.body, "tile_offset_1) *", ".store(")
+
+
+def test_loaded_branch_inside_a_uniform_one_still_rejects_its_race() -> None:
+    # A flag the kernel may overwrite (it aliases ``x``) is a per-thread value,
+    # so its branch stays divergent inside a uniform one.
+    x = torch.empty((8, 256))
+    with pytest.raises(exc.BackendUnsupported, match="race on x inside a branch"):
+        _generate(
+            _bounded_then_flagged_first_column_then_update_all,
+            (x, _flags_aliasing(x), 4),
+            **_ELEMENTWISE_THREADS_CONFIG,
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _flagged_update_all(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if flags[tile0.begin] > 0:
+            x[tile0, tile1] = x[tile0, tile1] * 2.0 + 1.0
+    return x
+
+
+# Each thread walks the 16 columns of its row in a lane loop.
+_ROW_PER_THREAD_CONFIG = {
+    "block_sizes": [4, 16],
+    "num_threads": [4, 1],
+    "cute_vector_widths": [1, 1],
+}
+
+
+def test_first_column_load_leaves_the_lane_loop_of_its_row() -> None:
+    # The first column's load reads no lane: the placement runs it once,
+    # before the loop and so before every lane's store.
+    code = _generate(
+        _first_column_then_update_all,
+        (torch.empty((8, 64)),),
+        **_ROW_PER_THREAD_CONFIG,
+    )
+    function = _kernel_function(code)
+    (lane_loop,) = _loops(function, "lane_1")
+    first = _index_of(function.body, "Int32(tile_offset_1) *")
+    assert first < function.body.index(lane_loop), code
+    assert "Int32(tile_offset_1) *" not in ast.unparse(lane_loop), code
+
+
+@pytest.mark.parametrize(
+    ("kernel", "args"),
+    [
+        pytest.param(
+            _flagged_first_column_then_update_all,
+            (torch.empty((8, 64)), torch.empty(8)),
+            id="loaded_condition",
+        ),
+        pytest.param(
+            _bounded_first_column_then_update_all,
+            (torch.empty((8, 64)), 4),
+            id="uniform_condition",
+        ),
+    ],
+)
+def test_first_column_load_in_a_branch_inside_a_lane_loop_rejects_the_config(
+    kernel: object, args: tuple[object, ...]
+) -> None:
+    # A branch is emitted whole inside the lane loop, so each lane would
+    # re-read the first column after lane 0 stored to it: no nest of the
+    # branch is the tile program.
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match="lane-invariant load of x would repeat .* inside a branch",
+    ):
+        _generate(kernel, args, **_ROW_PER_THREAD_CONFIG)  # pyrefly: ignore [bad-argument-type]
+
+
+def test_per_lane_branch_inside_a_lane_loop_keeps_the_config() -> None:
+    # Every statement of the branch reads the lane: repeating the branch per
+    # lane runs each lane's own update once.
+    code = _generate(
+        _flagged_update_all,
+        (torch.empty((8, 64)), torch.empty(8)),
+        **_ROW_PER_THREAD_CONFIG,
+    )
+    (lane_loop,) = _loops(_kernel_function(code), "lane_1")
+    assert any(isinstance(node, ast.If) for node in ast.walk(lane_loop)), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_column_update_in_a_while_loop(x: torch.Tensor, iters: int) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        steps = torch.zeros([], device=x.device, dtype=torch.int32)
+        while steps < iters:
+            first = x[tile0, tile1.begin]
+            x[tile0, tile1] = x[tile0, tile1] + first[:, None] + 1.0
+            steps = steps + 1
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_column_reads_in_a_device_loop(
+    x: torch.Tensor, y: torch.Tensor, reps: int
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        for rep in hl.grid(reps):
+            first = x[tile0, tile1.begin]
+            y[tile0, tile1] = first[:, None] + rep
+    return y
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_column_reads_in_a_device_loop_then_update_all(
+    x: torch.Tensor, y: torch.Tensor, reps: int
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        for rep in hl.grid(reps):
+            first = x[tile0, tile1.begin]
+            y[tile0, tile1] = first[:, None] + rep
+        x[tile0, tile1] = x[tile0, tile1] + 1.0
+    return y
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bounded_first_column_reads_in_a_device_loop_then_update_all(
+    x: torch.Tensor, y: torch.Tensor, rows: int, reps: int
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if tile0.begin < rows:
+            for rep in hl.grid(reps):
+                first = x[tile0, tile1.begin]
+                y[tile0, tile1] = first[:, None] + rep
+            x[tile0, tile1] = x[tile0, tile1] + 1.0
+    return y
+
+
+@pytest.mark.parametrize(
+    ("kernel", "args", "reason"),
+    [
+        pytest.param(
+            _first_column_update_in_a_while_loop,
+            (torch.empty((8, 64)), 1),
+            "lane-invariant load of x in a loop repeated whole once per lane_1 "
+            "meets a per-lane store to it",
+            id="while_loop",
+        ),
+        pytest.param(
+            _first_column_reads_in_a_device_loop_then_update_all,
+            (torch.empty((8, 64)), torch.empty((8, 64)), 2),
+            "lane-invariant load of x would repeat .* from a loop repeated whole",
+            id="device_loop_then_store",
+        ),
+        pytest.param(
+            _bounded_first_column_reads_in_a_device_loop_then_update_all,
+            (torch.empty((8, 64)), torch.empty((8, 64)), 4, 2),
+            "lane-invariant load of x would repeat .* from a loop repeated whole",
+            id="device_loop_then_store_in_a_branch",
+        ),
+    ],
+)
+def test_first_column_load_in_a_loop_inside_a_lane_loop_rejects_the_config(
+    kernel: object, args: tuple[object, ...], reason: str
+) -> None:
+    # The loop runs whole once per lane of the row, so each lane's pass
+    # would re-read the first column: after the store in the loop (a
+    # ``while`` loop is a loop too) or after the update following the loop,
+    # which lane 0 has already applied.
+    with pytest.raises(exc.BackendUnsupported, match=reason):
+        _generate(kernel, args, **_ROW_PER_THREAD_CONFIG)  # pyrefly: ignore [bad-argument-type]
+
+
+def test_first_column_load_in_a_device_loop_alone_keeps_the_config() -> None:
+    # Nothing stores to x: each lane's pass of the device loop re-reads the
+    # same first column.
+    code = _generate(
+        _first_column_reads_in_a_device_loop,
+        (torch.empty((8, 64)), torch.empty((8, 64)), 2),
+        **_ROW_PER_THREAD_CONFIG,
+    )
+    (lane_loop,) = _loops(_kernel_function(code), "lane_1")
+    (device_loop,) = _loops(lane_loop, "tile_offset_2")
+    assert "Int32(tile_offset_1) *" in ast.unparse(device_loop), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _if_tile_id_and_end(x: torch.Tensor, skip: int) -> torch.Tensor:
+    for tile0 in hl.tile(x.size(0)):
+        if tile0.id != skip and tile0.end <= x.size(0):
+            x[tile0, :] = x[tile0, :] + 1.0
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _if_loaded_flag(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    for tile0 in hl.tile(x.size(0)):
+        if flags[tile0.begin] > 0:
+            x[tile0, :] = x[tile0, :] + 1.0
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _if_device_loop_tile(x: torch.Tensor) -> torch.Tensor:
+    for tile0 in hl.tile(x.size(0)):
+        for tile1 in hl.tile(x.size(1)):
+            if tile1.begin == 0:
+                x[tile0, tile1] = x[tile0, tile1] + 1.0
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _if_loaded_flag_into_fresh_output(
+    x: torch.Tensor, flags: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0 in hl.tile(x.size(0)):
+        if flags[tile0.begin] > 0:
+            out[tile0, :] = x[tile0, :] + 1.0
+    return out
+
+
+@pytest.mark.parametrize(
+    ("kernel", "args", "uniform"),
+    [
+        pytest.param(
+            _if_tile_id_and_end, (torch.empty(8, 256), 1), True, id="grid_tile"
+        ),
+        pytest.param(
+            _if_loaded_flag_into_fresh_output,
+            (torch.empty(8, 256), torch.empty(8)),
+            True,
+            id="unwritten_loaded_value",
+        ),
+        pytest.param(
+            _if_loaded_flag,
+            (torch.empty(8, 256), torch.empty(8)),
+            True,
+            id="argument_flag_proven_apart_at_runtime",
+        ),
+        pytest.param(
+            _if_loaded_flag,
+            (_aliased := torch.empty(8, 256), _flags_aliasing(_aliased)),
+            False,
+            id="flag_aliasing_a_written_argument",
+        ),
+        pytest.param(
+            _if_device_loop_tile, (torch.empty(8, 256),), False, id="device_loop_tile"
+        ),
+    ],
+)
+def test_block_uniform_proves_only_cta_uniform_conditions(
+    kernel: object, args: tuple[object, ...], uniform: bool
+) -> None:
+    # A grid tile's id and end against a kernel argument and a tensor size
+    # are one value per CTA, and so is a load of ``flags`` at the tile's
+    # begin while the kernel writes only a fresh allocation, or writes the
+    # argument ``x`` that this launch's storages (the bound kernel's
+    # cache-keyed disjointness fact) keep apart from ``flags``.  Passed as a
+    # view of ``x`` the flag may change under the threads; a device loop's
+    # tile is outside the proof (it fails closed).
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(kernel, args)
+    host_function = bound.host_function
+    assert host_function is not None
+    (condition,) = {
+        node.args[0]
+        for graph in host_function.device_ir.graphs
+        # The rolled-reduction copy of a branch takes its condition as a
+        # placeholder, which the proof never accepts.
+        if not isinstance(graph, ReductionLoopGraphInfo)
+        for node in graph.graph.nodes
+        if node.target is _tracing_ops._if
+    }
+    with bound.env, host_function:
+        assert block_uniform(condition) is uniform
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -1711,6 +2265,41 @@ def test_staging_repeated_by_the_row_loop_is_exact_only_as_a_plain_store(
     # once per row lane.  A plain store re-applies the same value ahead of
     # the loads reading it; an augmented one accumulates once per row.
     body: list[ast.AST] = list(ast.parse(_STAGING.format(op=op)).body)
+    scopes = _threaded_column_scopes()
+    if accepted:
+        lane_loop_distribution.check_full_nest(body, scopes, rename_groups={})
+        return
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match="depends on its own result and would repeat once per lane_0",
+    ):
+        lane_loop_distribution.check_full_nest(body, scopes, rename_groups={})
+
+
+@pytest.mark.parametrize(
+    ("branch", "accepted"),
+    [
+        pytest.param(
+            f"    loaded = {_pointer('scale', 'indices_1')}.load()\n"
+            "    column_scale = loaded * 2.0\n",
+            True,
+            id="branch_temporary",
+        ),
+        pytest.param("    column_scale = column_scale * 2.0\n", False, id="carried"),
+    ],
+)
+def test_repeated_if_depends_only_on_values_from_before_it(
+    branch: str, accepted: bool
+) -> None:
+    # The full nest repeats the column-only if once per row lane.  A name a
+    # branch assigns before reading it is a temporary of that run; reading
+    # the value an earlier run assigned compounds once per row.
+    body: list[ast.AST] = list(
+        ast.parse(
+            f"if flag:\n{branch}"
+            f"{_pointer('out', 'indices_0', 'indices_1')}.store(column_scale)\n"
+        ).body
+    )
     scopes = _threaded_column_scopes()
     if accepted:
         lane_loop_distribution.check_full_nest(body, scopes, rename_groups={})

@@ -88,6 +88,7 @@ class Config(Mapping[str, object]):
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
         xcd_remap: bool | None = None,
+        reduction_fusion: bool | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -173,10 +174,10 @@ class Config(Mapping[str, object]):
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             cross_loop_pipeline: Execution strategy for kernels with
                 compiler-inferred cross-loop dependencies. ``"barrier"`` uses
-                grid synchronization. ``"static"`` and ``"dynamic"`` execute
-                the same compiler-derived dependency schedule with fixed worker
-                ownership or one-shot packet dispatch, respectively.
-                Unsupported kernels reject this field.
+                grid synchronization. ``"static"`` and ``"dynamic"`` (Triton
+                only) execute the same compiler-derived dependency schedule
+                with fixed worker ownership or one-shot packet dispatch,
+                respectively. Unsupported kernels reject this field.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configurations may use intermediate values.
@@ -208,6 +209,11 @@ class Config(Mapping[str, object]):
                 improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
                 "flat", "persistent_blocked", and "persistent_interleaved"; composes with
                 ``l2_groupings``.
+            reduction_fusion: When multiple independent reductions in a looped
+                (rolled) reduction read the same operand, fold them into one loop
+                with a single shared load instead of re-reading the operand per
+                reduction. Trades global-memory bandwidth for register pressure,
+                so it is autotuned. Defaults to False.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -259,6 +265,7 @@ class Config(Mapping[str, object]):
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
+            "reduction_fusion": reduction_fusion,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -429,6 +436,10 @@ class Config(Mapping[str, object]):
     @property
     def host_tensor_descriptors(self) -> bool:
         return cast("bool", self.config.get("host_tensor_descriptors", False))
+
+    @property
+    def reduction_fusion(self) -> bool:
+        return cast("bool", self.config.get("reduction_fusion", False))
 
     @property
     def range_unroll_factors(self) -> list[int]:

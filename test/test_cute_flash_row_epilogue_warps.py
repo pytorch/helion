@@ -4,9 +4,10 @@ At (2, 16, 2048, 128) bf16 the XSA kernel (``examples/xsa.py``) ran 2.2x slower
 on the persistent FA4 families than on the flat one.  Three general changes
 cover it:
 
-- the loop-invariant reciprocal hoist now descends into ``while`` bodies, so a
-  persistent role loop no longer keeps one IEEE divide (a slow-path CALL) per
-  element (covered in ``test_cute_hoist_loop_invariant_recip.py``);
+- under the ``fast_math`` setting, the loop-invariant reciprocal hoist now
+  descends into ``while`` bodies, so a persistent role loop no longer keeps
+  one IEEE divide (a slow-path CALL) per element (covered in
+  ``test_cute_hoist_loop_invariant_recip.py``);
 - ``cute_flash_row_epilogue_warps`` moves the row program from the correction
   warpgroup (64 registers, both Q tiles in sequence, the next tile's rescales
   queued behind it) to the softmax warpgroups (200 registers, both Q tiles in
@@ -68,11 +69,15 @@ _WS = {
 _CORRECTION = {"cute_flash_row_epilogue_warps": "correction"}
 
 
-def _xsa_kernel() -> helion.Kernel:
+def _xsa_kernel(*, fast_math: bool = False) -> helion.Kernel:
     from examples.xsa import xsa_kernel
 
     return helion.kernel(
-        xsa_kernel.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        xsa_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        fast_math=fast_math,
     )
 
 
@@ -504,7 +509,7 @@ def test_row_epilogue_warps_is_searched_only_with_a_row_program() -> None:
 @onlyBackends(["cute"])
 def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
-    code = _code(_xsa_kernel(), (q, k, v), **_FA4_2CTA)
+    code = _code(_xsa_kernel(fast_math=True), (q, k, v), **_FA4_2CTA)
     softmax0 = _role(code, "warp_idx < 4")
     softmax1 = _role(code, "(warp_idx >= 4) & (warp_idx < 8)")
     correction = _role(code, "(warp_idx >= 8) & (warp_idx < 12)")
@@ -574,8 +579,8 @@ def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> 
     )
     assert "cute.arch.mbarrier_init(flash_aux_full_ptr + flash_st, 1)" in code
     assert "_flash_tma_aux0, _flash_mEpiAux0t" in code
-    # The reciprocal hoist reaches into the persistent while loop and the chunk
-    # loop walks element pairs with packed FMA-pipe ops.
+    # Under fast_math the reciprocal hoist reaches into the persistent while
+    # loop, and the chunk loop walks element pairs with packed FMA-pipe ops.
     assert "_helion_inv_div_0 = 1.0 / _ep0_v7" in softmax0
     divides = [line for line in softmax0.splitlines() if "/ _ep0_v7" in line]
     assert divides and all(
@@ -592,7 +597,7 @@ def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> 
 @onlyBackends(["cute"])
 def test_correction_route_keeps_the_program_in_the_correction_warps() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
-    code = _code(_xsa_kernel(), (q, k, v), **_FA4_2CTA, **_CORRECTION)
+    code = _code(_xsa_kernel(fast_math=True), (q, k, v), **_FA4_2CTA, **_CORRECTION)
     correction = _role(code, "(warp_idx >= 8) & (warp_idx < 12)")
     softmax0 = _role(code, "warp_idx < 4")
     assert "_ep0_t2r, _ep0_r2s" in correction and "_ep1_t2r, _ep1_r2s" in correction
@@ -602,7 +607,7 @@ def test_correction_route_keeps_the_program_in_the_correction_warps() -> None:
         "_flash_tma_aux0" not in code and "flash_aux_full_ptr + 0, flash_sm" not in code
     )
     assert "_ep_gaux00 = cute.flat_divide(_flash_mEpiAux0" in correction
-    # The hoist still applies inside the persistent loop.
+    # The fast_math hoist still applies inside the persistent loop.
     assert "_helion_inv_div_0 = 1.0 / _ep0_v7" in correction
 
 

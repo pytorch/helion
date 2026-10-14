@@ -7,6 +7,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
+from helion import exc
 from helion._compiler.cute.canonicalize_reductions import _independent_combines
 from helion._compiler.cute.canonicalize_reductions import canonicalize_reductions
 from helion._compiler.device_ir import DeviceIR
@@ -17,6 +18,8 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfFn
+from helion._testing import skipIfRefEager
 import helion.language as hl
 from helion.language._tracing_ops import _mask_to
 from helion.language.reduce_ops import _reduce
@@ -40,6 +43,27 @@ def mul_combine_fn(x, y):
 def min_combine_fn(x, y):
     """Minimum combine function for min reduction."""
     return torch.minimum(x, y)
+
+
+def max_min_combine_fn(left_max, left_min, right_max, right_min):
+    """Elementwise max of the first operands and min of the second ones."""
+    return torch.maximum(left_max, right_max), torch.minimum(left_min, right_min)
+
+
+def scaled_max_combine_fn(x, y):
+    """Ends in ``torch.maximum`` but scales its right operand first."""
+    return torch.maximum(x, y * 2)
+
+
+def keep_left_max_combine_fn(x, y):
+    """``torch.maximum`` of the left operand with itself: keeps the first
+    element."""
+    return torch.maximum(x, x)
+
+
+def tuple_add_alpha_combine_fn(left_x, left_y, right_x, right_y):
+    """Adds the right operand twice to the first tuple element."""
+    return torch.add(left_x, right_x, alpha=2), left_y + right_y
 
 
 def tuple_add_combine_fn(left_tuple, right_tuple):
@@ -81,6 +105,179 @@ def argmax_combine_unpacked_fn(left_value, left_index, right_value, right_index)
     max_index = torch.where(take_right, right_index, left_index)
 
     return max_value, max_index
+
+
+def argmax_tie_right_fn(left_value, left_index, right_value, right_index):
+    """argmax whose ties keep the right operand (the last tied element)."""
+    take_left = left_value > right_value
+    return (
+        torch.where(take_left, left_value, right_value),
+        torch.where(take_left, left_index, right_index),
+    )
+
+
+def argmax_ge_fn(left_value, left_index, right_value, right_index):
+    """argmax written with ``>=``; ties keep the left operand."""
+    take_left = left_value >= right_value
+    return (
+        torch.where(take_left, left_value, right_value),
+        torch.where(take_left, left_index, right_index),
+    )
+
+
+def argmin_le_fn(left_value, left_index, right_value, right_index):
+    """argmin written with ``<=``; ties keep the right operand."""
+    take_right = right_value <= left_value
+    return (
+        torch.where(take_right, right_value, left_value),
+        torch.where(take_right, right_index, left_index),
+    )
+
+
+def argmax_le_fn(left_value, left_index, right_value, right_index):
+    """argmax written with ``<=``; ties keep the right operand."""
+    take_right = left_value <= right_value
+    return (
+        torch.where(take_right, right_value, left_value),
+        torch.where(take_right, right_index, left_index),
+    )
+
+
+def argmin_lt_fn(left_value, left_index, right_value, right_index):
+    """argmin written with ``<``; ties keep the left operand."""
+    take_right = right_value < left_value
+    return (
+        torch.where(take_right, right_value, left_value),
+        torch.where(take_right, right_index, left_index),
+    )
+
+
+def argmin_keep_left_le_fn(left_value, left_index, right_value, right_index):
+    """argmin choosing the left operand when its test holds; ties keep it."""
+    take_left = left_value <= right_value
+    return (
+        torch.where(take_left, left_value, right_value),
+        torch.where(take_left, left_index, right_index),
+    )
+
+
+def argmin_keep_left_gt_fn(left_value, left_index, right_value, right_index):
+    """argmin choosing the left operand when the right one is greater; ties
+    keep the right operand."""
+    take_left = right_value > left_value
+    return (
+        torch.where(take_left, left_value, right_value),
+        torch.where(take_left, left_index, right_index),
+    )
+
+
+# Every argmax/argmin form ``torch.where`` combines take: either operand kept
+# on a tie, and either operand kept when the test is false (as it is for a
+# NaN).
+ARG_REDUCE_COMBINES = (
+    argmax_combine_unpacked_fn,
+    argmax_le_fn,
+    argmax_ge_fn,
+    argmax_tie_right_fn,
+    argmin_lt_fn,
+    argmin_le_fn,
+    argmin_keep_left_le_fn,
+    argmin_keep_left_gt_fn,
+)
+
+
+@helion.kernel(autotune_effort="none")
+def arg_reduce_combines(
+    x: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Column ``k`` of each result reduces ``(x, indices)`` with
+    ``ARG_REDUCE_COMBINES[k]``."""
+    values = torch.empty([x.size(0), 8], dtype=x.dtype, device=x.device)
+    chosen = torch.empty([x.size(0), 8], dtype=indices.dtype, device=x.device)
+    for i in hl.tile(x.size(0)):
+        pair = (x[i, :], indices[i, :])
+        values[i, 0], chosen[i, 0] = hl.reduce(argmax_combine_unpacked_fn, pair, dim=1)
+        values[i, 1], chosen[i, 1] = hl.reduce(argmax_le_fn, pair, dim=1)
+        values[i, 2], chosen[i, 2] = hl.reduce(argmax_ge_fn, pair, dim=1)
+        values[i, 3], chosen[i, 3] = hl.reduce(argmax_tie_right_fn, pair, dim=1)
+        values[i, 4], chosen[i, 4] = hl.reduce(argmin_lt_fn, pair, dim=1)
+        values[i, 5], chosen[i, 5] = hl.reduce(argmin_le_fn, pair, dim=1)
+        values[i, 6], chosen[i, 6] = hl.reduce(argmin_keep_left_le_fn, pair, dim=1)
+        values[i, 7], chosen[i, 7] = hl.reduce(argmin_keep_left_gt_fn, pair, dim=1)
+    return values, chosen
+
+
+@helion.kernel(autotune_effort="none")
+def arg_reduce_tile_dim(
+    x: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``arg_reduce_combines`` with two of the combines, over a tile of each
+    row rather than a reduction dim (the tile holds the whole row)."""
+    values = torch.empty([x.size(0), 2], dtype=x.dtype, device=x.device)
+    chosen = torch.empty([x.size(0), 2], dtype=indices.dtype, device=x.device)
+    for i, j in hl.tile([x.size(0), x.size(1)], block_size=[4, 256]):
+        pair = (x[i, j], indices[i, j])
+        values[i, 0], chosen[i, 0] = hl.reduce(argmax_combine_unpacked_fn, pair, dim=1)
+        values[i, 1], chosen[i, 1] = hl.reduce(argmin_keep_left_gt_fn, pair, dim=1)
+    return values, chosen
+
+
+def _rows_with_nans(n: int, dtype: torch.dtype) -> torch.Tensor:
+    """Rows of small integers (many ties) with a NaN at the start, inside, at
+    the end, two inside, at both ends, everywhere, or nowhere."""
+    x = torch.randint(0, 4, (16, n), device=DEVICE).to(dtype)
+    nan = float("nan")
+    x[0, 0] = nan
+    x[1, 3] = nan
+    x[2, -1] = nan
+    x[3, 1] = x[3, 5] = nan
+    x[4, 0] = x[4, -1] = nan
+    x[5, :] = nan
+    return x
+
+
+def _left_fold_choice(
+    x: torch.Tensor, indices: torch.Tensor, extreme: torch.Tensor, *, last: bool
+) -> torch.Tensor:
+    """The index operand of the first (or last) element of each row of ``x``
+    equal to ``extreme``."""
+    n = x.size(1)
+    positions = torch.arange(n, device=x.device).expand_as(x)
+    tied = x == extreme[:, None]
+    if last:
+        chosen = torch.where(tied, positions, -1).amax(1)
+    else:
+        chosen = torch.where(tied, positions, n).amin(1)
+    return indices.gather(1, chosen[:, None])[:, 0]
+
+
+@helion.kernel(autotune_effort="none")
+def arg_reductions_with_ties(
+    x: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    first_max = torch.empty([x.size(0)], dtype=torch.int64, device=x.device)
+    last_max = torch.empty_like(first_max)
+    ge_max = torch.empty_like(first_max)
+    last_min = torch.empty_like(first_max)
+    for i in hl.tile(x.size(0)):
+        row = x[i, :]
+        row_indices = indices[i, :]
+        _, first_max[i] = hl.reduce(
+            argmax_combine_unpacked_fn,
+            (row, row_indices),
+            dim=1,
+            other=(float("-inf"), 0),
+        )
+        _, last_max[i] = hl.reduce(
+            argmax_tie_right_fn, (row, row_indices), dim=1, other=(float("-inf"), 0)
+        )
+        _, ge_max[i] = hl.reduce(
+            argmax_ge_fn, (row, row_indices), dim=1, other=(float("-inf"), 0)
+        )
+        _, last_min[i] = hl.reduce(
+            argmin_le_fn, (row, row_indices), dim=1, other=(float("inf"), 0)
+        )
+    return first_max, last_max, ge_max, last_min
 
 
 @helion.kernel
@@ -177,10 +374,202 @@ class TestReduce(RefEagerTestBase, TestCase):
             self.assertIn("keep_dims=True", code)
 
     def test_reduce_all_dims(self):
-        """Test reduce with dim=None (reduce all dimensions) - SKIP for now."""
-        # Skip this test for now - dim=None has complex implementation issues
-        # with symbolic shapes that require more work to fix properly
-        self.skipTest("dim=None reduction requires more complex implementation")
+        """Test reduce with dim=None (reduce all dimensions)."""
+
+        @helion.kernel(autotune_effort="none")
+        def reduce_all_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.grid(x.size(0)):
+                result[i] = hl.reduce(add_combine_fn, x[i, :])
+            return result
+
+        x = torch.randn(3, 200, device=DEVICE)
+        _, result = code_and_output(reduce_all_kernel, (x,))
+        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
+
+        @helion.kernel(autotune_effort="none")
+        def reduce_all_2d_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.grid(x.size(0)):
+                result[i] = hl.reduce(add_combine_fn, x[i, :, :])
+            return result
+
+        x = torch.randn(3, 4, 8, device=DEVICE)
+        _, result = code_and_output(reduce_all_2d_kernel, (x,))
+        torch.testing.assert_close(result, x.sum((1, 2)), rtol=1e-4, atol=1e-4)
+
+    def test_reduce_rows_wider_than_a_warp(self):
+        """Built-in combines over rows of 200 elements, wider than one warp."""
+
+        @helion.kernel(autotune_effort="none")
+        def wide_rows_kernel(
+            x: torch.Tensor, indices: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            row_sum = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            row_max = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            row_argmax = torch.empty([x.size(0)], dtype=torch.int64, device=x.device)
+            for i in hl.tile(x.size(0)):
+                row = x[i, :]
+                row_sum[i] = hl.reduce(add_combine_fn, row, dim=1)
+                row_max[i] = hl.reduce(max_combine_fn, row, dim=1, other=float("-inf"))
+                _, row_argmax[i] = hl.reduce(
+                    argmax_combine_unpacked_fn,
+                    (row, indices[i, :]),
+                    dim=1,
+                    other=(float("-inf"), 0),
+                )
+            return row_sum, row_max, row_argmax
+
+        x = torch.randn(32, 200, device=DEVICE)
+        indices = torch.arange(200, device=DEVICE).expand(32, 200).contiguous()
+        _, (row_sum, row_max, row_argmax) = code_and_output(
+            wide_rows_kernel, (x, indices), block_size=4
+        )
+        torch.testing.assert_close(row_sum, x.sum(1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(row_max, x.amax(1))
+        torch.testing.assert_close(row_argmax, x.argmax(1))
+
+    @skipIfFn(
+        lambda: _get_backend() != "cute",
+        "Triton's tree reduction does not keep hl.reduce's left-fold order "
+        "among tied elements",
+    )
+    def test_reduce_arg_reduction_tie_rules(self):
+        """A tied extreme ends the left fold on the first element, or the last
+        when the combine keeps the right operand of a tie; the index operand
+        of that element is returned even when it does not increase."""
+        torch.manual_seed(0)
+        for n in (8, 200):
+            x = torch.randint(0, 3, (16, n), device=DEVICE).float()
+            positions = torch.arange(n, device=DEVICE).expand(16, n)
+            for indices in (positions.contiguous(), (n - 1 - positions).contiguous()):
+                _, results = code_and_output(
+                    arg_reductions_with_ties, (x, indices), block_size=4
+                )
+                maxes, mins = x.amax(1), x.amin(1)
+                first_max, last_max, ge_max, last_min = results
+                for result, extreme, last in (
+                    (first_max, maxes, False),
+                    (last_max, maxes, True),
+                    (ge_max, maxes, False),
+                    (last_min, mins, True),
+                ):
+                    torch.testing.assert_close(
+                        result, _left_fold_choice(x, indices, extreme, last=last)
+                    )
+
+    @skipIfFn(
+        lambda: _get_backend() != "cute",
+        "Triton's tree reduction does not keep hl.reduce's left-fold order, "
+        "which decides where a NaN ends up",
+    )
+    def test_reduce_arg_reduction_nan_rows_match_left_fold(self):
+        """A comparison with a NaN is false, so each ``torch.where`` form
+        keeps or drops NaNs as the left fold in ref eager mode does: a value
+        and an index operand of the row, never a sentinel."""
+        torch.manual_seed(0)
+        for kernel, combines, config in (
+            (arg_reduce_combines, ARG_REDUCE_COMBINES, {"block_size": 4}),
+            (
+                arg_reduce_tile_dim,
+                (argmax_combine_unpacked_fn, argmin_keep_left_gt_fn),
+                {},
+            ),
+        ):
+            reference = helion.kernel(kernel.fn, ref_mode=helion.RefMode.EAGER)
+            for n, dtype in ((8, torch.float32), (200, torch.float16)):
+                x = _rows_with_nans(n, dtype)
+                indices = torch.arange(n, 0, -1, device=DEVICE).expand(16, n)
+                indices = indices.contiguous()
+                _, (values, chosen) = code_and_output(kernel, (x, indices), **config)
+                expected_values, expected_chosen = reference(x.cpu(), indices.cpu())
+                for k, combine_fn in enumerate(combines):
+                    with self.subTest(
+                        kernel=kernel.fn.__name__, combine_fn=combine_fn.__name__, n=n
+                    ):
+                        torch.testing.assert_close(
+                            values[:, k].cpu(),
+                            expected_values[:, k],
+                            rtol=0,
+                            atol=0,
+                            equal_nan=True,
+                        )
+                        torch.testing.assert_close(
+                            chosen[:, k].cpu(), expected_chosen[:, k]
+                        )
+
+    def test_reduce_builtin_combines_propagate_nan(self):
+        """``torch.maximum``/``torch.minimum``, ``+`` and ``*`` combines turn
+        a row with a NaN into NaN, as the left fold in ref eager mode does."""
+
+        @helion.kernel(autotune_effort="none")
+        def builtin_combines_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0), 6], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                row = x[i, :]
+                out[i, 0] = hl.reduce(max_combine_fn, row, dim=1, other=float("-inf"))
+                out[i, 1] = hl.reduce(min_combine_fn, row, dim=1, other=float("inf"))
+                out[i, 2], out[i, 3] = hl.reduce(
+                    max_min_combine_fn,
+                    (row, row),
+                    dim=1,
+                    other=(float("-inf"), float("inf")),
+                )
+                out[i, 4] = hl.reduce(add_combine_fn, row, dim=1)
+                out[i, 5] = hl.reduce(mul_combine_fn, row, dim=1, other=1.0)
+            return out
+
+        reference = helion.kernel(
+            builtin_combines_kernel.fn, ref_mode=helion.RefMode.EAGER
+        )
+        torch.manual_seed(0)
+        for n in (8, 200):
+            x = _rows_with_nans(n, torch.float32)
+            _, out = code_and_output(builtin_combines_kernel, (x,), block_size=4)
+            torch.testing.assert_close(
+                out.cpu(), reference(x.cpu()), rtol=1e-5, atol=0, equal_nan=True
+            )
+
+    @skipIfRefEager("ref eager mode runs the combine function itself")
+    @skipIfFn(
+        lambda: _get_backend() != "cute",
+        "Triton lowers the combine function itself",
+    )
+    def test_reduce_refuses_combines_ending_in_a_builtin(self):
+        """A combine whose last op is a built-in reduction's, applied to
+        anything but the two operands (or with an extra argument), is not that
+        reduction: it must be refused rather than lowered as one."""
+
+        @helion.kernel(autotune_effort="none")
+        def scaled_max_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                out[i] = hl.reduce(scaled_max_combine_fn, x[i, :], dim=1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def keep_left_max_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                out[i] = hl.reduce(keep_left_max_combine_fn, x[i, :], dim=1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def tuple_add_alpha_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for i in hl.tile(x.size(0)):
+                out[i], _ = hl.reduce(
+                    tuple_add_alpha_combine_fn, (x[i, :], x[i, :]), dim=1
+                )
+            return out
+
+        x = torch.randn(8, 16, device=DEVICE)
+        for kernel in (scaled_max_kernel, keep_left_max_kernel, tuple_add_alpha_kernel):
+            with (
+                self.subTest(kernel=kernel.fn.__name__),
+                self.assertRaisesRegex(exc.BackendUnsupported, "custom combine"),
+            ):
+                code_and_output(kernel, (x,), block_size=4)
 
     def test_reduce_min(self):
         """Test reduce with minimum operation."""

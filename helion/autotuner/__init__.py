@@ -17,6 +17,7 @@ from .differential_evolution import (
 )
 from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
+from .effort_profile import FinalSelectionConfig as FinalSelectionConfig
 from .effort_profile import LLMSearchConfig as LLMSearchConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig

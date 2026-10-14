@@ -13,7 +13,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -1217,7 +1216,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         "promoted-seed reduction_loops is only materialized in compiled mode"
     )
     @skipIfTileIR("TileIR reduction tiling differs")
-    @skipIfCute("reduction seed is Triton-only; CuTe uses its own reduction tiling")
     def test_scan_in_reduction_default_config_not_looped(self) -> None:
         """Regression: a scan (cumsum) inside a reduction over an axis co-resident with
         a wide feature must not be emitted as a LOOPED reduction. The looped path
@@ -1351,7 +1349,9 @@ def _serial_scan_fallback(monkeypatch):
 
     # Complete the upstream lazy reload before patching its actual emitter.
     repair_backend_codegen("cute")
-    monkeypatch.setattr(scan_ops, "_cute_try_parallel_scan", lambda *args: None)
+    monkeypatch.setattr(
+        scan_ops, "_cute_try_parallel_scan", lambda *args: "the test declines it"
+    )
 
 
 @pytest.mark.parametrize("kind", ["sum", "prod", "min", "max"])
@@ -1595,7 +1595,7 @@ def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
 
     original = scan_ops._cute_codegen_serial_scan
 
-    def without_bound(state, helper, inputs, dim, reverse):
+    def without_bound(state, helper, inputs, dim, reverse, **kwargs):
         val = inputs[0].meta["val"]
         block = _resolve_dim_block_id(state.codegen, val, dim % val.ndim)
         assert block is not None
@@ -1607,7 +1607,7 @@ def test_ordinary_grid_scan_requires_logical_owner(monkeypatch, missing):
             owner.block_id_to_info.pop(active)
         else:
             owner.block_id_to_info[active].grid_end_expr = None
-        return original(state, helper, inputs, dim, reverse)
+        return original(state, helper, inputs, dim, reverse, **kwargs)
 
     x = torch.ones(3, 25)
     with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
@@ -1637,7 +1637,7 @@ def test_ordinary_default_scan_keeps_parallel_dispatch(monkeypatch):
 
     def observe(*args):
         result = original(*args)
-        results.append(result is not None)
+        results.append(not isinstance(result, str))
         return result
 
     monkeypatch.setattr(scan_ops, "_cute_try_parallel_scan", observe)

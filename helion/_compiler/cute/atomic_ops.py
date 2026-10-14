@@ -18,6 +18,7 @@ from torch.utils import _pytree as pytree
 from ... import exc
 from ...language import _decorators
 from ...language import _tracing_ops
+from ...language.atomic_ops import ATOMIC_OPS
 from ...language.atomic_ops import _to_ast_values
 from ...language.atomic_ops import atomic_add
 from ...language.atomic_ops import atomic_and
@@ -30,13 +31,16 @@ from ...language.atomic_ops import atomic_xor
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
+from ..ast_read_writes import HELION_FENCE_BARRIER_ATTR
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..variable_origin import GridOrigin
 from ..variable_origin import NameOrigin
+from .cute_reshape import cute_lane_loops_active
 from .cute_reshape import describe_rebound_block_dims
 from .cute_reshape import subscript_rebound_block_dims
+from .thread_budget import MAX_THREADS_PER_BLOCK
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -48,19 +52,6 @@ if TYPE_CHECKING:
 _CUTE_VECTOR_ATOMIC_WIDTHS = (2, 4)
 # ``red.global.add.v{2,4}.f32`` is an sm_90+ PTX form.
 _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY = (9, 0)
-
-
-def _cute_pointer_expr(
-    state: CodegenState,
-    target: torch.Tensor,
-    index: list[object],
-    ast_index: list[object] | tuple[object, ...] | None = None,
-) -> str:
-    from ...language.memory_ops import _cute_index_exprs
-
-    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
-    name = state.device_function.tensor_arg(target).name
-    return _cute_coord_pointer_expr(name, index_exprs)
 
 
 def _cute_coord_pointer_expr(name: str, index_exprs: list[str]) -> str:
@@ -110,6 +101,8 @@ def _resolve_cute_atomic_kwargs(cute_func: str, requested: list[str]) -> list[st
     return resolved
 
 
+_CUTE_BLOCK_BARRIER = "cute.arch.sync_threads()"
+
 _CUTE_FLOAT_ATOMIC_HELPERS: dict[str, str] = {
     "atomic_max": "_cute_atomic_max_float32",
     "atomic_min": "_cute_atomic_min_float32",
@@ -144,6 +137,102 @@ def _codegen_common_cute(
     value_exprs: list[ast.AST],
     keyword_names: list[str],
 ) -> ast.AST:
+    # A thread's release / acquire orders only that thread's accesses, while
+    # Helion's memory orders act for the whole program, as the Triton backend
+    # implements them: a bar.sync before every release (``tl.debug_barrier``
+    # in ``_sync_before_release``) and after every acquire whose result is not
+    # broadcast behind one already (``_sync_after_acquire``), per-element
+    # atomics included.  So a CTA barrier puts every thread's earlier
+    # accesses before the release, whether each thread issues the RMW for its
+    # own elements or one leader thread issues it for the elements a tile axis
+    # shares, and every thread's later accesses after the acquire.  Every
+    # thread reaches it: the atomics' guards wrap single accesses, never the
+    # statement structure, and lane loops run the same trip counts on every
+    # thread (the lane-loop placement moves the barrier with the atomic,
+    # ``HELION_FENCE_BARRIER_ATTR``).  A branch or while loop may not: its
+    # condition can differ between SIMT threads.  Warp-specialized tcgen05
+    # bodies, whose roles no CTA barrier may separate, refuse such atomics
+    # (``reject_atomics_beside_warp_roles``).
+    from .memory_ops import reject_reads_of_collective_placeholders
+
+    sem = state.proxy_arg(len(state.ast_args) - 1)
+    reject_reads_of_collective_placeholders(state, "an atomic")
+    statements = state.codegen.statements_stack[-1]
+    start = len(statements)
+    result = _codegen_cute_atomic_rmw(
+        cute_func, state, value_exprs=value_exprs, keyword_names=keyword_names
+    )
+    if sem == "relaxed":
+        return result
+    if state.codegen.divergent_control_flow_depth > 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"a {sem} {cute_func} inside a branch or while loop: the "
+            "block-wide barrier ordering the other threads' accesses around "
+            "it cannot be placed where a thread may skip it",
+        )
+    if sem in ("release", "acq_rel"):
+        # Recorded like any statement of the atomic's, then moved before it.
+        barrier = _cute_fence_barrier("release")
+        state.add_statement(barrier)
+        statements.insert(start, statements.pop())
+    if sem in ("acquire", "acq_rel"):
+        if not (isinstance(result, ast.Constant) and result.value is None):
+            result = state.codegen.lift(result, prefix="atomic_old")
+        # A broadcast of the leader's result already ends in a barrier.
+        if ast.unparse(statements[-1]) != _CUTE_BLOCK_BARRIER:
+            state.add_statement(_cute_fence_barrier("acquire"))
+    return result
+
+
+def reject_atomics_beside_warp_roles(*, ctas_per_tile: str | None) -> None:
+    """Refuse the kernel's atomics a warp-specialized tcgen05 matmul would misplace.
+
+    Its warp roles (TMA producer, MMA issuer, epilogue) each walk the tiles in
+    their own loop, and the body's other statements stay outside those loops,
+    run once per CTA.  A release / acquire atomic there needs a block-wide
+    barrier (``_codegen_common_cute``), which would separate roles that wait
+    on each other through their pipelines: a deadlock.  A relaxed atomic adds
+    once per CTA, which is once per tile only when every tile has exactly one
+    CTA; ``ctas_per_tile`` says why it has not (CTAs walking several tiles, or
+    a two-CTA pair sharing one), None when it has.
+    """
+    from ..host_function import HostFunction
+
+    for graph in HostFunction.current().device_ir.graphs:
+        for node in graph.graph.nodes:
+            if node.op != "call_function" or node.target not in ATOMIC_OPS:
+                continue
+            name = node.target.__name__
+            sem = node.args[-1]
+            if sem != "relaxed":
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"a {sem} hl.{name} in a warp-specialized tcgen05 matmul: the "
+                    "block-wide barrier ordering it would separate the warp roles",
+                )
+            if ctas_per_tile is not None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"hl.{name} in a tcgen05 matmul whose {ctas_per_tile}: it "
+                    "would run once per CTA, not once per tile",
+                )
+
+
+def _cute_fence_barrier(role: str) -> ast.stmt:
+    """A release (before the atomic) or acquire (after it) block barrier."""
+    barrier = statement_from_string(_CUTE_BLOCK_BARRIER)
+    setattr(barrier, HELION_FENCE_BARRIER_ATTR, role)
+    return barrier
+
+
+def _codegen_cute_atomic_rmw(
+    cute_func: str,
+    state: CodegenState,
+    *,
+    value_exprs: list[ast.AST],
+    keyword_names: list[str],
+) -> ast.AST:
     from ..compile_environment import CompileEnvironment
 
     target = state.proxy_arg(0)
@@ -168,7 +257,9 @@ def _codegen_common_cute(
         operand = state.proxy_arg(position)
         if not isinstance(operand, torch.Tensor) or operand.ndim == 0:
             continue
-        rebound = subscript_rebound_block_dims(state, target, index, operand)
+        rebound = subscript_rebound_block_dims(
+            state, target, index, operand, value_index=position, what=cute_func
+        )
         if rebound:
             raise exc.BackendUnsupported(
                 "cute",
@@ -227,7 +318,9 @@ def _codegen_common_cute(
 
     ast_index = state.ast_args[1]
     assert isinstance(ast_index, (list, tuple))
-    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
+    index_exprs = _cute_index_exprs(
+        state, index, ast_index, tensor=target, for_store=True
+    )
     tensor_name = state.device_function.tensor_arg(target).name
     pointer = _cute_coord_pointer_expr(tensor_name, index_exprs)
     resolved_kwargs = _resolve_cute_atomic_kwargs(cute_func, keyword_names)
@@ -546,7 +639,8 @@ def _cute_vector_atomic_site(
         return False
     # Fail closed to the scalar atomic when the target capability is unknown
     # or below sm_90.
-    capability = CompileEnvironment.current().config_spec.target_device_capability
+    env = CompileEnvironment.current()
+    capability = env.config_spec.target_device_capability
     if capability is None or capability < _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY:
         return False
     # An atomic that is uniform along a live lane loop must stay a scalar
@@ -564,7 +658,8 @@ def _cute_vector_atomic_site(
         for pos, idx in enumerate(index)
         if isinstance(idx, torch.SymInt)
         and (block_id := _cute_tile_axis_block_id(idx)) is not None
-        and target.stride(pos) == 1
+        # A dynamic stride (another dim's size) must not be guarded to 1
+        and env.known_equal(target.stride(pos), 1)
     ]
     if len(lane_axes) != 1:
         return False
@@ -703,19 +798,23 @@ def _guard_cute_atomic_expr(
     )
     if not predicates:
         return atomic_expr
-    if (
-        (leader_axes or extra_predicates)
-        and state.fx_node is not None
-        and len(state.fx_node.users) > 0
-    ):
+    has_users = state.fx_node is not None and len(state.fx_node.users) > 0
+    broadcast = bool(leader_axes) and has_users
+    if has_users and (broadcast or extra_predicates):
         # Only the leader thread of a collapsed axis performs the atomic, so
-        # only it holds the previous value; the other threads' elements would
-        # consume the zero placeholder below.
-        raise exc.BackendUnsupported(
-            "cute",
-            "the result of an atomic issued by one leader thread is not shared "
-            "with the other threads of its tile axis",
+        # only it holds the previous value; it shares the value through shared
+        # memory behind block-wide barriers, which every thread must reach.
+        hazard = (
+            "under an extra predicate"
+            if extra_predicates
+            else _cute_leader_broadcast_hazard(state)
         )
+        if hazard is not None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "the result of an atomic issued by one leader thread is not "
+                f"shared with the other threads of its tile axis {hazard}",
+            )
     predicate_expr = expr_from_string(" and ".join(predicates))
     assert isinstance(predicate_expr, ast.expr)
     assert isinstance(atomic_expr, ast.expr)
@@ -756,7 +855,59 @@ def _guard_cute_atomic_expr(
             )
         )
     )
+    if broadcast:
+        _cute_broadcast_leader_value(state, result_var, target_dtype, leader_axes)
     return expr_from_string(result_var)
+
+
+def _cute_leader_broadcast_hazard(state: CodegenState) -> str | None:
+    """Why the leader's atomic result cannot be broadcast here, or None.
+
+    The broadcast (``_cute_broadcast_leader_value``) needs block-wide
+    barriers next to the atomic.  A branch or while loop may skip them on
+    some threads (its condition can differ between SIMT threads), and the
+    lane-loop placement (``cute/lane_loop_distribution.py``) pins a barrier
+    inside every lane loop while it moves a lane-invariant atomic out of
+    them, which would split the broadcast from its atomic.
+    """
+    if state.codegen.divergent_control_flow_depth > 0:
+        return "inside a branch or while loop"
+    if cute_lane_loops_active(state.codegen):
+        return "inside a lane loop"
+    return None
+
+
+def _cute_broadcast_leader_value(
+    state: CodegenState, value_var: str, dtype: str, leader_axes: set[int]
+) -> None:
+    """Give every thread the ``value_var`` of its leader along ``leader_axes``.
+
+    The leader writes the value into a shared-memory slot indexed by its
+    linear thread id (its own coordinates, zero along the leader axes), a
+    barrier publishes it, and every thread reads its leader's slot.  The
+    buffer holds one slot per possible thread, so the slot is in range for
+    any launch shape.  A second barrier keeps a later write (the next
+    iteration of a loop around the atomic) after every thread's read.
+    """
+    terms: list[str] = []
+    stride = ""
+    for axis in range(3):
+        if axis not in leader_axes:
+            coord = f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+            terms.append(f"{coord}{stride}")
+        stride += f" * cutlass.Int32(cute.arch.block_dim()[{axis}])"
+    slot = " + ".join(terms) or "cutlass.Int32(0)"
+    buffer = state.device_function.new_var("_atomic_prev_smem")
+    leader = _cute_leader_predicate(leader_axes)
+    size = MAX_THREADS_PER_BLOCK
+    for statement in (
+        f"{buffer} = cute.make_tensor(cute.arch.alloc_smem({dtype}, {size}), ({size},))",
+        f"if {leader}:\n    {buffer}[{slot}] = {value_var}",
+        _CUTE_BLOCK_BARRIER,
+        f"{value_var} = {buffer}[{slot}]",
+        _CUTE_BLOCK_BARRIER,
+    ):
+        state.codegen.add_statement(statement_from_string(statement))
 
 
 def _cute_tensor_index_leader_predicate(
@@ -1419,6 +1570,37 @@ def _index_derives_from_iota(state: CodegenState, node: torch.fx.Node) -> bool:
     return False
 
 
+def _active_reduction_axis_of_iota(
+    state: CodegenState, node: torch.fx.Node
+) -> int | None:
+    """The active reduction axis a bare ``hl.arange`` index spans, if any.
+
+    Such a range is allocated its own reduction axis, and every thread holds
+    its coordinate along that axis: the index addresses one element per
+    thread, as the slice it spans does (``hl.arange(0, k)`` is ``[:k]``), and
+    the atomic varies along that axis rather than repeating across it.
+    """
+    from ...language.memory_ops import _cute_active_index_var
+    from ..compile_environment import CompileEnvironment
+
+    iota_node = _resolve_tensor_index_iota_node(state, node)
+    if iota_node is None or state.fx_node is None:
+        return None
+    iota_val = iota_node.meta.get("val")
+    if not isinstance(iota_val, torch.Tensor) or iota_val.ndim != 1:
+        return None
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(iota_val.shape[0])
+    if block_id is None or not env.block_sizes[block_id].reduction:
+        return None
+    block_id = env.resolve_codegen_block_id(
+        block_id, state.codegen, state.fx_node.graph
+    )
+    if _cute_active_index_var(state, block_id) is None:
+        return None
+    return block_id
+
+
 def _codegen_tensor_index_common_cute(
     cute_func: str,
     state: CodegenState,
@@ -1443,12 +1625,18 @@ def _codegen_tensor_index_common_cute(
     if len(index) != 1 or len(fx_index) != 1:
         # A second component beside an arange keeps the generic per-thread
         # form from here, whose iota is the matcher's per-thread fold: not a
-        # lowering of the tile-uniform index.
+        # lowering of the tile-uniform index, unless each arange spans its
+        # own active reduction axis (``_active_reduction_axis_of_iota``).
+        axis_blocks: list[int] = []
         for component in fx_index:
-            if isinstance(component, torch.fx.Node) and _index_derives_from_iota(
+            if not isinstance(component, torch.fx.Node) or not _index_derives_from_iota(
                 state, component
             ):
+                continue
+            block_id = _active_reduction_axis_of_iota(state, component)
+            if block_id is None or block_id in axis_blocks:
                 raise exc.BackendUnsupported("cute", _DERIVED_ARANGE_INDEX)
+            axis_blocks.append(block_id)
         return None
     tensor_index = index[0] if isinstance(index[0], torch.Tensor) else None
     index_node = fx_index[0]

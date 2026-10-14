@@ -27,7 +27,7 @@ This document explains how to work effectively in this repository.
 - Helion import pattern: `import helion; import helion.language as hl` (do not `import helion as hl`).
 - Modules/files: snake_case; tests `test_*.py`; examples `*.py` with `main()`.
 - Run `./lint.sh fix` before pushing; CI uses Ruff and Pyrefly.
-- Don't call `del ...` / `_ = ...` on unused function args.  There is not unused arg linter.
+- Don't call `del ...` / `_ = ...` on unused function args.  There is no unused-arg linter.
 
 ## Testing Guidelines
 
@@ -47,11 +47,30 @@ This document explains how to work effectively in this repository.
 - Show skip reasons with `pytest -ra`; narrow with `-k <pattern>` for fast cycles.
 - When running many tests, prefer `pytest-xdist` with `-n4`
 
+## GPU Usage
+
+- You are often running on a shared machine with multiple GPUs, assign tasks to specific GPUs with `CUDA_VISIBLE_DEVICES=...`
+- Play nice with others: check for other GPU users with `nvidia-smi` and avoid assigning tasks to a busy GPU
+- `pytest-xdist` with `-n4` will saturate a GPU, so only run one of those at a time per GPU
+- Autotuning and performance measurement is sensitive to GPU load, so make sure to assign those to idle GPUs
+- Performance can vary between GPUs, even though they are the same model, so don't compare absolute measurements taken on one GPU to those taken on another
+- Performance can vary with GPU thermals, so watch out for that.  You may need to interleave measurements or wait for the GPU to cool down.
+
+## stack-pr
+
+Many pull requests on github are managed with the `stack-pr` tool.  This tool creates a stack of linked PRs that depend on each other.  When dealing with these:
+
+- One commit per github pull request in the git history
+- Each commit has `stack-info: ...` metadata as the last line: keep this intact don't clobber it
+- `stack-pr submit` pushes to github and rewrites the git history to add the stack-info metadata, only run this if asked to
+- Check out an existing stack via the top commit in the stack
+- Modify by amending the git history with an interactive rebase
+- `stack-pr --help` for more info
+
 ## Agent-Specific Instructions
 
-- Do NOT run `pip install`, networked installs, or system package managers.
-- Do NOT run `git commit` unless asked to directly.
-- Do NOT run `git push`; users handle updating PRs.
+- Do NOT run `git commit` unless asked to.
+- Do NOT run `git push` unless asked to.
 - Do NOT `print()` inside kernels; use logging or host-side code.
 - Tile indexing preserves dimensions; `i = hl.tile(...); x[i]` keeps ranks.
 - Do NOT add unnecessary error checks via `hasattr`, `getattr`, `except`, etc.

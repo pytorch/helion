@@ -32,6 +32,12 @@ pattern:
   * sweep C's ``exp2`` recompute is replaced by the cached value times the
     (CTA-uniform) rescale factor.
 
+The cached and rescaled exponentials round each output differently, so
+that form needs the ``fast_math`` setting.  Without it the rewrite keeps
+every exponential exact: only sweep B moves into the frame of the CTA's own
+maximum (``_try_rewrite_pair_exact``), and sweep C recomputes its ``exp2``
+from the global maximum.
+
 Every rewrite condition fails closed: if any structural check does not
 match, the kernel keeps the two-exchange form.
 """
@@ -517,13 +523,671 @@ def fuse_cluster_online_pair(
             or site_a.top_idx >= site_b.top_idx
         ):
             continue
-        if _try_rewrite_pair(
-            body, site_a, site_b, caches, constexpr_values, canon, pair_idx, fast_math
+        if (
+            fast_math
+            and _try_rewrite_pair(
+                body, site_a, site_b, caches, constexpr_values, canon, pair_idx
+            )
+        ) or _try_rewrite_pair_exact(
+            body,
+            site_a,
+            site_b,
+            set(caches),
+            constexpr_values,
+            canon,
+            pair_idx,
+            fast_math,
         ):
             # Sites list is stale after a rewrite; one online pair per
             # kernel is the supported shape (softmax/logsumexp).
             break
     return body
+
+
+def _loop_chain(
+    node: ast.AST, parents: dict[int, ast.AST], root: ast.For
+) -> list[tuple[ast.For, ast.stmt]] | None:
+    """The ``for`` loops from ``root`` down to ``node`` (outermost first),
+    each with the statement of its body that holds ``node``; None if
+    ``node`` sits under other control flow or in a loop's ``else``."""
+    chain: list[tuple[ast.For, ast.stmt]] = []
+    child: ast.AST = node
+    while child is not root:
+        parent = parents.get(id(child))
+        if parent is None:
+            return None
+        if isinstance(child, ast.stmt):
+            if not (
+                isinstance(parent, ast.For) and any(s is child for s in parent.body)
+            ):
+                return None
+            chain.append((parent, child))
+        child = parent
+    chain.reverse()
+    return chain
+
+
+def _strip_fp32_casts(node: ast.expr) -> ast.expr:
+    """Drop ``cutlass.Float32(v)`` around a value that already is Float32."""
+
+    class Strip(ast.NodeTransformer):
+        def visit_Call(self, call: ast.Call) -> ast.AST:
+            self.generic_visit(call)
+            if not (
+                ast.unparse(call.func) == "cutlass.Float32"
+                and len(call.args) == 1
+                and not call.keywords
+                and isinstance(inner := call.args[0], ast.Call)
+            ):
+                return call
+            if ast.unparse(inner.func) == "cutlass.Float32" or (
+                isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "bitcast"
+                and [ast.unparse(arg) for arg in inner.args] == ["cutlass.Float32"]
+            ):
+                return inner
+            return call
+
+    result = Strip().visit(node)
+    assert isinstance(result, ast.expr)
+    return result
+
+
+class _ElementValues:
+    """Canonical per-element values of expressions inside ``for`` nests
+    whose innermost loop is ``range_constexpr(N)``: local definitions are
+    inlined, the innermost index becomes each constant ``0..N-1``, the
+    other loop indices become positional placeholders, and register-cache
+    reads become the values written into them."""
+
+    def __init__(self) -> None:
+        # (cache name, canonical index) -> canonical stored value
+        self.cache_values: dict[tuple[str, str], ast.expr] = {}
+
+    @staticmethod
+    def _definitions(
+        chain: list[tuple[ast.For, ast.stmt]],
+    ) -> dict[str, ast.expr] | None:
+        definitions: dict[str, ast.expr] = {}
+        for loop, holder in chain:
+            seen: set[str] = set()
+            for statement in loop.body:
+                if statement is holder:
+                    break
+                for node in ast.walk(statement):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                        if node.id in seen:
+                            return None  # rebound: inlining could skip a write
+                        seen.add(node.id)
+                if _is_name_assign(statement):
+                    name = statement.targets[0].id  # type: ignore[attr-defined]
+                    if name not in _loads(statement.value):  # type: ignore[attr-defined]
+                        definitions[name] = statement.value  # type: ignore[attr-defined]
+        return definitions
+
+    @staticmethod
+    def _rename(node: ast.expr, names: dict[str, ast.expr]) -> ast.expr:
+        class Rename(ast.NodeTransformer):
+            def visit_Name(self, name: ast.Name) -> ast.AST:
+                replacement = names.get(name.id)
+                if replacement is None or not isinstance(name.ctx, ast.Load):
+                    return name
+                return _reparse_expr(replacement)
+
+        result = Rename().visit(_reparse_expr(node))
+        assert isinstance(result, ast.expr)
+        return result
+
+    def _canonical(
+        self,
+        node: ast.expr,
+        chain: list[tuple[ast.For, ast.stmt]],
+        constant: dict[str, int],
+    ) -> ast.expr | None:
+        definitions = self._definitions(chain)
+        if definitions is None:
+            return None
+        expr = _Inliner(definitions).visit(_reparse_expr(node))
+        names: dict[str, ast.expr] = {
+            loop.target.id: ast.Name(id=f"_loop{level}_", ctx=ast.Load())  # type: ignore[attr-defined]
+            for level, (loop, _) in enumerate(chain)
+            if isinstance(loop.target, ast.Name)
+        }
+        names.update(
+            {name: ast.Constant(value=value) for name, value in constant.items()}
+        )
+        return _strip_fp32_casts(self._rename(expr, names))
+
+    def record_cache_store(
+        self, store: ast.Assign, chain: list[tuple[ast.For, ast.stmt]]
+    ) -> bool:
+        target = store.targets[0]
+        assert isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+        index = self._canonical(target.slice, chain, {})
+        value = self._canonical(store.value, chain, {})
+        if index is None or value is None:
+            return False
+        key = (target.value.id, ast.unparse(index))
+        if key in self.cache_values:
+            return False
+        self.cache_values[key] = value
+        return True
+
+    def values(
+        self,
+        node: ast.expr,
+        chain: list[tuple[ast.For, ast.stmt]],
+        caches: set[str],
+    ) -> list[str] | None:
+        """``node``'s canonical value at each innermost-loop position."""
+        if not chain:
+            return None
+        inner = chain[-1][0]
+        iterator = inner.iter
+        if not (
+            isinstance(inner.target, ast.Name)
+            and isinstance(iterator, ast.Call)
+            and isinstance(iterator.func, ast.Attribute)
+            and iterator.func.attr == "range_constexpr"
+            and len(iterator.args) == 1
+            and isinstance(iterator.args[0], ast.Constant)
+            and isinstance(iterator.args[0].value, int)
+        ):
+            return None
+        owner = self
+        results: list[str] = []
+        for position in range(iterator.args[0].value):
+            expr = self._canonical(node, chain, {inner.target.id: position})
+            if expr is None:
+                return None
+            missing = False
+
+            class ReadCache(ast.NodeTransformer):
+                def visit_Subscript(self, read: ast.Subscript) -> ast.AST:
+                    nonlocal missing
+                    self.generic_visit(read)
+                    if not (
+                        isinstance(read.value, ast.Name) and read.value.id in caches
+                    ):
+                        return read
+                    stored = owner.cache_values.get(
+                        (read.value.id, ast.unparse(read.slice))
+                    )
+                    if stored is None:
+                        missing = True
+                        return read
+                    return _reparse_expr(stored)
+
+            expr = ReadCache().visit(expr)
+            if missing:
+                return None
+            results.append(ast.unparse(_strip_fp32_casts(expr)))
+        return results
+
+
+def _same_loop_ranges(
+    first: list[tuple[ast.For, ast.stmt]], second: list[tuple[ast.For, ast.stmt]]
+) -> bool:
+    return len(first) == len(second) and all(
+        ast.unparse(a.iter) == ast.unparse(b.iter)
+        for (a, _), (b, _) in zip(first, second, strict=True)
+    )
+
+
+def _reduced_values(
+    body: list[ast.stmt],
+    site_a: _Site,
+    canon: Callable[[str], str],
+    caches: set[str],
+) -> tuple[_ElementValues, list[tuple[ast.For, ast.stmt]], list[str]] | None:
+    """The values site A max-reduces, per position of its fold's
+    ``range_constexpr`` loop, with the register caches written alongside."""
+    acc = site_a.call.args[0]
+    if not isinstance(acc, ast.Name):
+        return None
+    acc_name = canon(acc.id)
+    root = site_a.for_node
+    parents = {
+        id(child): node
+        for node in ast.walk(root)
+        for child in ast.iter_child_nodes(node)
+    }
+    folds: list[tuple[ast.Assign, ast.expr]] = []
+    for statement in root.body[: site_a.stmt_idx]:
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                return None
+            if not (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and canon(t.id) == acc_name
+                    for t in node.targets
+                )
+            ):
+                continue
+            value = node.value
+            if not _is_name_assign(node):
+                return None
+            if ast.unparse(value) == "cutlass.Float32(float('-inf'))":
+                continue
+            if not (isinstance(value, ast.Call) and len(value.args) == 2):
+                return None
+            # NaN-propagating maxima only, as the packed exchange folds.
+            call = (
+                ast.unparse(value.func),
+                tuple((kw.arg, ast.unparse(kw.value)) for kw in value.keywords),
+            )
+            if call not in {
+                ("cute.arch.fmax", (("nan", "True"),)),
+                ("cute.math.max", (("propagate_nan", "True"),)),
+                ("_cute_nan_max", ()),
+            }:
+                return None
+            first, second = value.args
+            if isinstance(first, ast.Name) and canon(first.id) == acc_name:
+                element = second
+            elif isinstance(second, ast.Name) and canon(second.id) == acc_name:
+                element = first
+            else:
+                return None
+            if acc_name in {canon(name) for name in _loads(element)}:
+                return None
+            folds.append((node, element))
+    if len(folds) != 1:
+        return None
+    fold, element = folds[0]
+    chain = _loop_chain(fold, parents, root)
+    if chain is None:
+        return None
+    elements = _ElementValues()
+    # Register caches written beside the fold (same loops), and nowhere else.
+    for statement in body:
+        for node in ast.walk(statement):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Subscript)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id in caches
+            ):
+                continue
+            store_chain = _loop_chain(node, parents, root)
+            if (
+                store_chain is None
+                or len(store_chain) >= len(chain)
+                or any(
+                    a is not b
+                    for (a, _), (b, _) in zip(
+                        store_chain, chain[: len(store_chain)], strict=True
+                    )
+                )
+                or not elements.record_cache_store(node, store_chain)
+            ):
+                return None
+    values = elements.values(element, chain, caches)
+    if values is None:
+        return None
+    return elements, chain, values
+
+
+def _try_rewrite_pair_exact(
+    body: list[ast.stmt],
+    site_a: _Site,
+    site_b: _Site,
+    caches: set[str],
+    constexpr_values: dict[str, int] | None,
+    canon: Callable[[str], str],
+    k: int,
+    fast_math: bool,
+) -> bool:
+    """Pair the exchanges while every exponential stays as written.
+
+    ``_try_rewrite_pair`` caches sweep B's exponentials and rescales them in
+    sweep C, which rounds each output differently; it needs fast_math.  This one
+    only moves sweep B's ``exp2((x - mi) * C)`` into the frame of the CTA's
+    own maximum: the packed exchange folds the CTA sums with ``sum +=
+    s_r * exp2((m_r - m) * C)``, the reassociation the kernel's online
+    recurrence already applies between tiles, and sweep C still computes
+    ``exp2((x - mi) * C)`` from the global maximum.
+
+    Every read of ``mi`` (or a copy of it) between the sweeps must be the
+    subtrahend of such an exponent, and site B must reduce exactly their
+    sum.  Each exponent's minuend must be the very element site A
+    max-reduced (``x - max(x)``): only then is it at most the CTA maximum,
+    so the CTA frame cannot overflow, and an all--inf slice contributes
+    nothing.
+    """
+    mi_name = _max_variable(body, site_a, site_b, constexpr_values, canon)
+    if mi_name is None:
+        return False
+    acc = site_b.call.args[0]
+    if not isinstance(acc, ast.Name):
+        return False
+    acc_name = canon(acc.id)
+    region = [
+        *body[site_a.top_idx + 1 : site_b.top_idx],
+        *site_b.for_node.body[: site_b.stmt_idx],
+    ]
+    if any(
+        isinstance(node, (ast.AugAssign, ast.AnnAssign))
+        for statement in region
+        for node in ast.walk(statement)
+    ):
+        return False
+    assigns = [
+        node
+        for statement in region
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Assign)
+    ]
+    if any(not _is_name_assign(node) for node in assigns):
+        return False
+
+    def target(node: ast.Assign) -> str:
+        return canon(node.targets[0].id)  # type: ignore[attr-defined]
+
+    # Names holding ``mi``'s value: ``mi`` and its copies.
+    frames = {mi_name}
+    changed = True
+    while changed:
+        changed = False
+        for node in assigns:
+            value = node.value
+            if (
+                isinstance(value, ast.Name)
+                and canon(value.id) in frames
+                and target(node) not in frames
+            ):
+                frames.add(target(node))
+                changed = True
+    for node in assigns:
+        value = node.value
+        if target(node) in frames and not (
+            isinstance(value, ast.Name) and canon(value.id) in frames
+        ):
+            return False
+
+    def frame_subtraction(node: ast.AST) -> ast.BinOp | None:
+        """``a - frame`` with no frame value in ``a``."""
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Sub)
+            and isinstance(node.right, ast.Name)
+            and canon(node.right.id) in frames
+            and not any(canon(name) in frames for name in _loads(node.left))
+        ):
+            return node
+        return None
+
+    shifted = {
+        target(node): node.value for node in assigns if frame_subtraction(node.value)
+    }
+    if any(
+        sum(target(node) == name for node in assigns) != 1 or name == acc_name
+        for name in shifted
+    ):
+        return False
+
+    # ``exp2(Float32(shift) * C)`` with ``shift`` a frame subtraction.
+    exponents: dict[int, float] = {}
+    allowed: set[int] = set()
+    subtractions: list[ast.BinOp] = [
+        value for value in shifted.values() if isinstance(value, ast.BinOp)
+    ]
+    for statement in region:
+        for node in ast.walk(statement):
+            if not (_is_exp2(node) and not node.keywords):  # type: ignore[union-attr]
+                continue
+            argument = node.args[0]  # type: ignore[union-attr]
+            if not (
+                isinstance(argument, ast.BinOp)
+                and isinstance(argument.op, ast.Mult)
+                and isinstance(argument.right, ast.Constant)
+                and type(argument.right.value) is float
+                and math.isfinite(argument.right.value)
+                and argument.right.value > 0
+            ):
+                continue
+            shift = argument.left
+            if (
+                isinstance(shift, ast.Call)
+                and ast.unparse(shift.func) == "cutlass.Float32"
+                and len(shift.args) == 1
+                and not shift.keywords
+            ):
+                shift = shift.args[0]
+            if isinstance(shift, ast.Name) and canon(shift.id) in shifted:
+                allowed.add(id(shift))
+            elif (subtraction := frame_subtraction(shift)) is not None:
+                allowed.add(id(subtraction.right))
+                subtractions.append(subtraction)
+            else:
+                continue
+            exponents[id(node)] = argument.right.value
+    scales = set(exponents.values())
+    if len(scales) != 1:
+        return False
+    (scale,) = scales
+    subtrahends = [
+        value.right
+        for value in shifted.values()
+        if isinstance(value, ast.BinOp) and isinstance(value.right, ast.Name)
+    ]
+    allowed.update(id(node) for node in subtrahends)
+    for node in assigns:
+        if isinstance(node.value, ast.Name) and target(node) in frames:
+            allowed.add(id(node.value))
+
+    # Each exponential is named only to be accumulated (or not at all).
+    named = {
+        target(node)
+        for node in assigns
+        if id(node.value) in exponents and target(node) != acc_name
+    }
+    consumed = {
+        id(node.value)
+        for node in assigns
+        if id(node.value) in exponents and target(node) in named
+    }
+
+    def accumulated(value: ast.expr) -> bool:
+        """``acc + term`` with ``term`` an exponential or its name."""
+        if not (
+            isinstance(value, ast.BinOp)
+            and isinstance(value.op, ast.Add)
+            and isinstance(value.left, ast.Name)
+            and canon(value.left.id) == acc_name
+        ):
+            return False
+        term = value.right
+        if (
+            isinstance(term, ast.Call)
+            and ast.unparse(term.func) == "cutlass.Float32"
+            and len(term.args) == 1
+            and not term.keywords
+        ):
+            term = term.args[0]
+        if id(term) in exponents:
+            consumed.add(id(term))
+            return True
+        if isinstance(term, ast.Name) and canon(term.id) in named:
+            allowed.add(id(term))
+            return True
+        return False
+
+    updates = 0
+    for node in assigns:
+        if target(node) != acc_name:
+            continue
+        value = node.value
+        if accumulated(value):
+            updates += 1
+            allowed.add(id(value.left))  # type: ignore[union-attr]
+        elif ast.unparse(value) not in {"cutlass.Float32(0)", "cutlass.Float32(0.0)"}:
+            return False
+    if updates == 0 or set(exponents) - consumed:
+        return False
+    # Every read of a frame value, shift, exponential name or the
+    # accumulator is one of the uses above.
+    tracked = frames | set(shifted) | named | {acc_name}
+    for statement in region:
+        for node in ast.walk(statement):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and canon(node.id) in tracked
+                and id(node) not in allowed
+            ):
+                return False
+
+    # Each minuend is the element site A max-reduced, at the same loop
+    # positions.
+    reduced = _reduced_values(body, site_a, canon, caches)
+    if reduced is None:
+        return False
+    elements, reduced_chain, reduced_values = reduced
+    parents = {
+        id(child): node
+        for node in ast.walk(site_b.for_node)
+        for child in ast.iter_child_nodes(node)
+    }
+    for subtraction in subtractions:
+        chain = _loop_chain(subtraction, parents, site_b.for_node)
+        if (
+            chain is None
+            or not _same_loop_ranges(chain, reduced_chain)
+            or elements.values(subtraction.left, chain, caches) != reduced_values
+        ):
+            return False
+
+    # The region's frame-dependent values stay in it: after site B only the
+    # global ``mi`` (and site B's own reduce input) is read.
+    local_values = (frames - {mi_name}) | set(shifted) | named
+    for statement in [
+        *site_b.for_node.body[site_b.stmt_idx :],
+        *body[site_b.top_idx + 1 :],
+    ]:
+        for node in ast.walk(statement):
+            if not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)):
+                continue
+            name = canon(node.id)
+            if name in local_values or (name == acc_name and node is not acc):
+                return False
+
+    # --- everything matched; apply the rewrite. -------------------------
+    negative_inf = _unique_name(body, canon, f"_pair_negative_inf_{k}")
+    frame = _unique_name(body, canon, f"_pair_frame_{k}")
+    _localize_site_a(site_a)
+    # An all--inf CTA slice has the zero frame, so exp2((-inf - -inf) * C)
+    # does not poison its sum; the packed exchange keeps the true local
+    # maximum, so a globally all--inf row still produces NaN.
+    after_a = body.index(site_a.for_node) + 1
+    body[after_a:after_a] = [
+        _stmt(f"{negative_inf} = {mi_name} == cutlass.Float32(float('-inf'))"),
+        _stmt(f"{frame} = cutlass.Float32(0) if {negative_inf} else {mi_name}"),
+    ]
+    for statement in region:
+        for node in ast.walk(statement):
+            if (
+                isinstance(node, ast.BinOp)
+                and isinstance(node.right, ast.Name)
+                and id(node.right) in allowed
+                and frame_subtraction(node) is not None
+            ):
+                node.right = ast.Name(id=frame, ctx=ast.Load())
+    _pair_site_b(site_b, mi_name, scale, fast_math, k)
+    _rebuffer_pair(body, site_a, site_b)
+    for statement in body:
+        ast.fix_missing_locations(statement)
+    return True
+
+
+def _max_variable(
+    body: list[ast.stmt],
+    site_a: _Site,
+    site_b: _Site,
+    constexpr_values: dict[str, int] | None,
+    canon: Callable[[str], str],
+) -> str | None:
+    """The (canonical) max variable ``mi`` that site A's result feeds, when
+    both sites run once and site A's result reaches only ``mi``."""
+    from .hoist_warp_reduce import _static_trip_count
+
+    if _static_trip_count(site_a.for_node, constexpr_values) != 1:
+        return None
+    if _static_trip_count(site_b.for_node, constexpr_values) != 1:
+        return None
+
+    # --- max carrier chain: everything after site A in sweep A must be a
+    # linear cast/accumulate chain ending at the max variable ``mi``.
+    tail = site_a.for_node.body[site_a.stmt_idx + 1 :]
+    if not tail or not all(_is_name_assign(s) for s in tail):
+        return None
+    chain_targets = [s.targets[0].id for s in tail]  # type: ignore[attr-defined]
+    mi_name = canon(chain_targets[-1])
+    allowed = {canon(a) for a in {site_a.target, mi_name} | set(chain_targets)}
+    for stmt in tail:
+        if any(canon(n) not in allowed for n in _local_loads(stmt.value)):
+            return None
+    intermediates = {site_a.target} | {t for t in chain_targets if canon(t) != mi_name}
+
+    # ``mi`` must start at -inf (single trip => mi ends as a cast of the
+    # site-A result).
+    init_found = False
+    for top in body[: site_a.top_idx]:
+        if _is_name_assign(top) and canon(top.targets[0].id) == mi_name:  # type: ignore[attr-defined]
+            init_found = "-inf" in ast.unparse(top.value)
+    if not init_found:
+        return None
+
+    # No escape of the local-valued intermediates past sweep A.
+    for top in body[site_a.top_idx + 1 :]:
+        for name in _loads(top):
+            if canon(name) in {canon(x) for x in intermediates}:
+                return None
+    return mi_name
+
+
+def _unique_name(body: list[ast.stmt], canon: Callable[[str], str], name: str) -> str:
+    used_names = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+    }
+    used_names.update(canon(used) for used in tuple(used_names))
+    while name in used_names:
+        name += "_"
+    return name
+
+
+def _localize_site_a(site_a: _Site) -> None:
+    """Site A becomes a CTA-local block reduce (drop the buf/mbar args)."""
+    block_args = ", ".join(ast.unparse(a) for a in site_a.call.args[:4])
+    site_a.assign.value = _stmt(
+        f"_x = {_BLOCK_REDUCE}({block_args}, group_span={site_a.group_span})"
+    ).value
+    ast.fix_missing_locations(site_a.assign)
+
+
+def _pair_site_b(
+    site_b: _Site, mi_name: str, scale: float, fast_math: bool, k: int
+) -> None:
+    """Site B exchanges the ``(local_max, local_sum)`` pair once and every
+    later read of ``mi`` sees the global maximum."""
+    gmax = f"_pair_gmax_{k}"
+    pair_call_src = (
+        f"{gmax}, {site_b.target} = {_PAIR_REDUCE}("
+        f"{ast.unparse(site_b.call.args[0])}, {mi_name}, "
+        f"{ast.unparse(site_b.call.args[3])}, {site_b.buf_name}, "
+        f"{site_b.mbar_name}, group_span={site_b.group_span}, "
+        f"cluster_n={site_b.cluster_n}, scale={scale!r}, "
+        f"fastmath={fast_math})"
+    )
+    site_b.for_node.body[site_b.stmt_idx : site_b.stmt_idx + 1] = [
+        _stmt(pair_call_src),
+        _stmt(f"{mi_name} = {gmax}"),
+    ]
 
 
 def _try_rewrite_pair(
@@ -534,42 +1198,10 @@ def _try_rewrite_pair(
     constexpr_values: dict[str, int] | None,
     canon: Callable[[str], str],
     k: int,
-    fast_math: bool,
 ) -> bool:
-    from .hoist_warp_reduce import _static_trip_count
-
-    if _static_trip_count(site_a.for_node, constexpr_values) != 1:
+    mi_name = _max_variable(body, site_a, site_b, constexpr_values, canon)
+    if mi_name is None:
         return False
-    if _static_trip_count(site_b.for_node, constexpr_values) != 1:
-        return False
-
-    # --- max carrier chain: everything after site A in sweep A must be a
-    # linear cast/accumulate chain ending at the max variable ``mi``.
-    tail = site_a.for_node.body[site_a.stmt_idx + 1 :]
-    if not tail or not all(_is_name_assign(s) for s in tail):
-        return False
-    chain_targets = [s.targets[0].id for s in tail]  # type: ignore[attr-defined]
-    mi_name = canon(chain_targets[-1])
-    allowed = {canon(a) for a in {site_a.target, mi_name} | set(chain_targets)}
-    for stmt in tail:
-        if any(canon(n) not in allowed for n in _local_loads(stmt.value)):
-            return False
-    intermediates = {site_a.target} | {t for t in chain_targets if canon(t) != mi_name}
-
-    # ``mi`` must start at -inf (single trip => mi ends as a cast of the
-    # site-A result).
-    init_found = False
-    for top in body[: site_a.top_idx]:
-        if _is_name_assign(top) and canon(top.targets[0].id) == mi_name:  # type: ignore[attr-defined]
-            init_found = "-inf" in ast.unparse(top.value)
-    if not init_found:
-        return False
-
-    # No escape of the local-valued intermediates past sweep A.
-    for top in body[site_a.top_idx + 1 :]:
-        for name in _loads(top):
-            if canon(name) in {canon(x) for x in intermediates}:
-                return False
 
     # --- reads of ``mi`` between the sweeps: only ``scaled = mi * C``
     # assigns (or dead assigns).  Collect the scaled candidates.
@@ -732,17 +1364,7 @@ def _try_rewrite_pair(
 
     exp_cache = f"_pair_exp_cache_{k}"
     rescale = f"_pair_rescale_{k}"
-    gmax = f"_pair_gmax_{k}"
-    negative_inf = f"_pair_negative_inf_{k}"
-    used_names = {
-        node.id
-        for statement in body
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Name)
-    }
-    used_names.update(canon(name) for name in tuple(used_names))
-    while negative_inf in used_names:
-        negative_inf += "_"
+    negative_inf = _unique_name(body, canon, f"_pair_negative_inf_{k}")
     scale_assignments = [
         node
         for statement, _in_sweep_b in region
@@ -753,11 +1375,7 @@ def _try_rewrite_pair(
         return False
 
     # 1) site A -> CTA-local block reduce (drop buf/mbar args).
-    block_args = ", ".join(ast.unparse(a) for a in site_a.call.args[:4])
-    site_a.assign.value = _stmt(
-        f"_x = {_BLOCK_REDUCE}({block_args}, group_span={site_a.group_span})"
-    ).value
-    ast.fix_missing_locations(site_a.assign)
+    _localize_site_a(site_a)
 
     # An all--inf CTA slice contributes zero when another CTA has a finite
     # maximum. Normalize that slice in the zero frame so exp(-inf - -inf)
@@ -802,18 +1420,7 @@ def _try_rewrite_pair(
     ast.fix_missing_locations(acc_stmt)
 
     # 3) site B -> single packed pair exchange + global-max reassignment.
-    pair_call_src = (
-        f"{gmax}, {site_b.target} = {_PAIR_REDUCE}("
-        f"{ast.unparse(site_b.call.args[0])}, {mi_name}, "
-        f"{ast.unparse(site_b.call.args[3])}, {site_b.buf_name}, "
-        f"{site_b.mbar_name}, group_span={site_b.group_span}, "
-        f"cluster_n={site_b.cluster_n}, scale={scale_const!r}, "
-        f"fastmath={fast_math})"
-    )
-    site_b.for_node.body[site_b.stmt_idx : site_b.stmt_idx + 1] = [
-        _stmt(pair_call_src),
-        _stmt(f"{mi_name} = {gmax}"),
-    ]
+    _pair_site_b(site_b, mi_name, scale_const, fast_math=True, k=k)
 
     # 4) sweep C: the cached exp replaces the recompute.  When the exp
     # feeds exactly one multiply by a scalar that is only read inside this
@@ -887,8 +1494,13 @@ def _try_rewrite_pair(
         _stmt(f"{negative_inf} = {mi_name} == cutlass.Float32(float('-inf'))"),
     )
 
-    # 6) preamble: site B's receive buffer becomes ``cluster_n`` Int64 pair
-    # slots; site A's buffer/mbarrier (now unused) are removed.
+    _rebuffer_pair(body, site_a, site_b)
+    return True
+
+
+def _rebuffer_pair(body: list[ast.stmt], site_a: _Site, site_b: _Site) -> None:
+    """Site B's receive buffer becomes ``cluster_n`` Int64 pair slots, and
+    site A's buffer/mbarrier (now unused) are removed."""
     for top in body:
         if _is_name_assign(top) and top.targets[0].id == site_b.buf_name:  # type: ignore[attr-defined]
             top.value = _stmt(
@@ -918,4 +1530,3 @@ def _try_rewrite_pair(
     if not leftover_reads:
         for i in reversed(removable):
             del body[i]
-    return True

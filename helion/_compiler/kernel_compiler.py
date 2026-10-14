@@ -69,12 +69,19 @@ class KernelCompiler:
         fn: types.FunctionType,
         fake_args: list[object],
         constexpr_args: dict[str, object],
+        *,
+        rewrite_ast: bool = True,
     ) -> HostFunction:
-        """Run the full compilation pipeline and return the compiled HostFunction."""
+        """Run the full compilation pipeline and return the compiled HostFunction.
+
+        ``rewrite_ast=False`` skips the backend AST customizations and traces
+        the kernel as written.
+        """
         hf = self.parse(fn, fake_args, constexpr_args)
         with hf, self._compilation_context():
             self.unroll(hf)
-            self.customize_ast(hf)
+            if rewrite_ast:
+                hf.backend_rewrote_ast = self.customize_ast(hf)
             self.propagate_types(hf)
             self.finalize_config()
             self.lower(hf)
@@ -124,15 +131,15 @@ class KernelCompiler:
         with measure("HostFunction.unroll_static_loops"):
             unroll_static_loops(hf)
 
-    def customize_ast(self, hf: HostFunction) -> None:
+    def customize_ast(self, hf: HostFunction) -> bool:
         """Backend-specific AST customizations.
 
         Rewrites high-level patterns in the user's kernel AST into
         equivalent forms that compile to better code on the active
-        backend.
+        backend.  Returns whether any rewrite fired.
         """
         with measure("HostFunction.customize_ast"):
-            self.backend.customize_ast(hf)
+            return self.backend.customize_ast(hf)
 
     def propagate_types(self, hf: HostFunction) -> None:
         from .type_propagation import propagate_types

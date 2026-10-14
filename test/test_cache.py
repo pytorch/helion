@@ -822,7 +822,7 @@ class FailingBackend(RemoteCacheBackend):
         raise ConnectionError("simulated failure")
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestRemoteCache(RefEagerTestDisabled, TestCase):
     def setUp(self) -> None:
         super().setUp()

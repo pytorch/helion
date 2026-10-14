@@ -36,8 +36,8 @@ def lower_integer_powers(
 
     PowByNatural is integer shape arithmetic, not floating exponentiation.
     A constant power-of-two base admits an exact shift when its effective
-    exponent lies in [0, 62]. Reject wider or unproved powers instead of
-    inheriting Triton's floating conversion or silently wrapping an Int64.
+    exponent lies in [0, 62]. CuTe requires this proof for scalar integer
+    powers; other backends keep their existing printer for unproved powers.
     """
     replacements: dict[sympy.Basic, sympy.Basic] = {}
     for power in sympy.postorder_traversal(expression):
@@ -52,13 +52,18 @@ def lower_integer_powers(
             or base <= 0
             or int(base).bit_count() != 1
         ):
-            raise exc.BackendUnsupported(backend, "unproved scalar integer power")
+            if backend == "cute":
+                raise exc.BackendUnsupported(backend, "unproved scalar integer power")
+            continue
         shift = sympy.Mul(sympy.Integer(int(base).bit_length() - 1), exponent)
         bounds = bound_sympy(shift, ranges)
         if not (bounds.lower >= 0 and bounds.upper <= 62):
-            raise exc.BackendUnsupported(
-                backend, "scalar integer power requires a proved exponent in [0, 62]"
-            )
+            if backend == "cute":
+                raise exc.BackendUnsupported(
+                    backend,
+                    "scalar integer power requires a proved exponent in [0, 62]",
+                )
+            continue
         replacements[power] = cast(
             "sympy.Expr", IntegerPowerOfTwo(shift.xreplace(replacements))
         )

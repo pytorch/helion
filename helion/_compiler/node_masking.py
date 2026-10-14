@@ -21,6 +21,8 @@ from ..language._tracing_ops import _if
 from ..language._tracing_ops import _mask_to
 from ..language._tracing_ops import _phi
 from ..language._tracing_ops import is_for_loop_target
+from ..language.creation_ops import full
+from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from .inductor_lowering import InductorLowering
@@ -267,7 +269,6 @@ def defer_pallas_load_masks(graph: torch.fx.Graph) -> None:
     """
     from ..language.memory_ops import load as load_op
     from .aten_lowering import passthrough_masked_value
-    from .compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
 
@@ -461,9 +462,11 @@ def inductor_masked_value(
     If the masked value of X is 0, then `X + 1` will be masked to 1.
     """
 
+    pointwise = not isinstance(lowering.buffer.data, Reduction)
+
     def visit(n: torch.fx.Node) -> torch.fx.Node:
         val = cached_masked_value(n)
-        if val is None:
+        if val is None or (pointwise and broadcasts_onto_masked_lanes(n, node)):
             input_ranges.append(ValueRanges.unknown())
         else:
             input_ranges.append(ValueRanges(val, val))
@@ -484,6 +487,30 @@ def inductor_masked_value(
             if isinstance(val, (float, sympy.Float)):
                 return float(val)
         return None
+
+
+def broadcasts_onto_masked_lanes(
+    input_node: torch.fx.Node, node: torch.fx.Node
+) -> bool:
+    """Whether ``node`` broadcasts ``input_node`` along a dim that is not 1,
+    and so may be masked.  The lanes past that dim's extent then hold the
+    input's real values rather than its masked value, unless it is a
+    constant fill."""
+    if input_node.target is full:
+        return False
+    input_val = input_node.meta.get("val")
+    output_val = node.meta.get("val")
+    if not isinstance(input_val, torch.Tensor) or not isinstance(
+        output_val, torch.Tensor
+    ):
+        return False
+    env = CompileEnvironment.current()
+    pad = output_val.ndim - input_val.ndim
+    return any(
+        not env.known_equal(size, 1)
+        and (dim < pad or env.known_equal(input_val.size(dim - pad), 1))
+        for dim, size in enumerate(output_val.size())
+    )
 
 
 def call_inner_fn(loops: Loops) -> ValueRangesAny:

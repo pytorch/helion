@@ -170,31 +170,94 @@ def exact_tile_block_ids(
     return tuple(block_ids)
 
 
-def _get_padded_iota_original_length(
-    state: CodegenState, index_position: int
-) -> int | None:
-    """Get the original length of a padded iota node at the given index position.
+def _padded_iota_dims(node: object) -> tuple[int | None, ...] | None:
+    """Per-dim lengths of the padded iotas ``node`` is computed lane-wise from.
+
+    A static non-power-of-2 ``hl.arange`` is emitted as a power-of-2 range, and
+    ``[:, None]`` subscripts and pointwise ops (``rows[:, None] * 9 + cols``)
+    keep its padding lanes in place.  Entry ``d`` is the iota length behind
+    dim ``d``, or None where no padded iota feeds that dim.
+    """
+    from ..language import view_ops
+
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if node.target == torch.ops.prims.iota.default:
+        length = node.args[0]
+        padded = isinstance(length, int) and length != next_power_of_2(length)
+        return (length if padded else None,)
+    if node.target is view_ops.subscript:
+        base = _padded_iota_dims(node.args[0])
+        index = node.args[1]
+        if base is None or not isinstance(index, (list, tuple)):
+            return None
+        consumed = 0
+        dims: list[int | None] = []
+        for item in index:
+            if item is None:
+                dims.append(None)
+            elif item == slice(None) and consumed < len(base):
+                dims.append(base[consumed])
+                consumed += 1
+            else:
+                return None
+        return (*dims, *base[consumed:])
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or torch.Tag.pointwise not in getattr(
+        node.target, "tags", ()
+    ):
+        return None
+    dims = [None] * val.ndim
+    for arg in node.all_input_nodes:
+        # Inputs that no iota feeds carry no padding lanes of their own here.
+        if (arg_dims := _padded_iota_dims(arg)) is None:
+            continue
+        offset = val.ndim - len(arg_dims)
+        if offset < 0:
+            return None
+        for dim, length in enumerate(arg_dims):
+            if length is None:
+                continue
+            if dims[offset + dim] not in (None, length):
+                return None
+            dims[offset + dim] = length
+    return tuple(dims)
+
+
+def _padded_iota_mask(state: CodegenState, index_position: int) -> str | None:
+    """Mask the padding lanes of a padded-iota index at the given position.
+
+    ``hl.arange(start, end, step)`` with a static non-power-of-2 length is
+    emitted as ``start + step * tl.arange(0, next_power_of_2(length))``, so the
+    valid lanes of the index (and of anything computed lane-wise from it) are
+    the first ``length`` arange positions whatever ``start`` and ``step`` are.
+    The mask compares those positions, not the index values, and has the
+    index's own rank.
 
     Args:
         state: The codegen state containing fx_node information
         index_position: The position in the index list to check
 
     Returns:
-        The original (unpadded) length if the index is a padded iota, None otherwise
+        The mask expression if the index is a padded iota, None otherwise
     """
     try:
         index_node = state.fx_node.args[1][index_position]  # type: ignore[union-attr, index]
-        if (
-            isinstance(index_node, torch.fx.Node)
-            and index_node.target == torch.ops.prims.iota.default
-            and isinstance(length_arg := index_node.args[0], int)
-            and length_arg != next_power_of_2(length_arg)
-        ):
-            return length_arg
     except (AttributeError, IndexError, TypeError):
-        pass
-
-    return None
+        return None
+    if (dims := _padded_iota_dims(index_node)) is None:
+        return None
+    terms = []
+    for dim, length in enumerate(dims):
+        if length is None:
+            continue
+        expand = (
+            "[" + ", ".join(":" if d == dim else "None" for d in range(len(dims))) + "]"
+            if len(dims) > 1
+            else ""
+        )
+        terms.append(f"(tl.arange(0, {next_power_of_2(length)}) < {length}){expand}")
+    return f"({' & '.join(terms)})" if terms else None
 
 
 def _get_tile_with_offset_info(
@@ -516,6 +579,16 @@ def _inactive_slice_index_expr(
     index_expr = env.backend.arange_index_expr(block_size_expr, dtype)
     size_expr = state.device_function.literal_expr(size)
     return index_expr, f"({index_expr} < {size_expr})"
+
+
+def _size_one_slice_index(start_expr: str, expand: str, dtype: str) -> str:
+    """The index of a one-element slice: its start, as a one-element index
+    vector when ``expand`` places it among the other output dims (a literal
+    start cannot be subscripted)."""
+    if not expand:
+        return start_expr
+    env = CompileEnvironment.current()
+    return f"({start_expr} + {env.backend.arange_index_expr('1', dtype)}){expand}"
 
 
 class IndexingStrategy:
@@ -975,6 +1048,16 @@ class PointerIndexingStrategy(IndexingStrategy):
             backend = CompileEnvironment.current().backend
             broadcast = backend.broadcast_to_expr("{load_expr}", shape_str)
             load_expr = expr_from_string(broadcast, load_expr=load_expr)
+            if indexing.broadcast_mask_expr is not None:
+                # Loads are masked to 0 (``get_masked_value(load)``), which a
+                # reduction over the tile relies on, so zero the broadcast
+                # lanes past the tile's extent too.
+                zero = backend.full_expr([], "0", fake_tensor.dtype)
+                load_expr = expr_from_string(
+                    backend.where_expr("{mask}", "{load_expr}", zero),
+                    mask=indexing.broadcast_mask_expr,
+                    load_expr=load_expr,
+                )
 
         return load_expr
 
@@ -987,7 +1070,9 @@ class PointerIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
-        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+        indexing = SubscriptIndexing.create(
+            state, fake_tensor, subscript, extra_mask, for_store=True
+        )
         name = state.device_function.tensor_arg(fake_tensor).name
         output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
 
@@ -1005,24 +1090,19 @@ class PointerIndexingStrategy(IndexingStrategy):
             if isinstance(value_node, torch.fx.Node):
                 val_meta = value_node.meta.get("val")
                 needs_squeeze = isinstance(val_meta, torch.Tensor) and val_meta.ndim > 0
+        # A pointer broadcast to a wider tile keeps the value's shape instead.
         if (
             not indexing.block_shaped_offset
+            and not indexing.needs_broadcast()
             and not isinstance(value, ast.Constant)
             and needs_squeeze
         ):
             value = expr_from_string(backend.reshape_expr("{value}", "[]"), value=value)
 
-        offset_expr = indexing.index_expr
-        # If dimensions need broadcasting for store, broadcast the pointer
-        if indexing.needs_broadcast():
-            shape_str = state.tile_strategy.shape_str(output_size)
-            broadcast = backend.broadcast_to_expr("{offset}", shape_str)
-            offset_expr = expr_from_string(broadcast, offset=offset_expr)
-
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
         store_placeholders: dict[str, ast.AST] = {
             "value": value,
-            "offset": offset_expr,
+            "offset": indexing.broadcast_offset(state, output_size),
             "mask": indexing.mask_expr,
         }
         if cache_modifier is not None:
@@ -1041,11 +1121,14 @@ class PointerIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         sem: ast.AST,
     ) -> ast.AST:
-        indexing = SubscriptIndexing.create(state, fake_tensor, subscript)
+        indexing = SubscriptIndexing.create(
+            state, fake_tensor, subscript, for_store=True
+        )
         name = state.device_function.tensor_arg(fake_tensor).name
+        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
         return expr_from_string(
             f"tl.{op}({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
-            offset=indexing.index_expr,
+            offset=indexing.broadcast_offset(state, output_size),
             value=value,
             mask=indexing.mask_expr,
             sem=sem,
@@ -1094,6 +1177,15 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
                 cache_modifier,
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        if indexing.needs_pointer():
+            return PointerIndexingStrategy().codegen_load(
+                state,
+                fake_tensor,
+                subscript,
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
+            )
         extra = ""
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
@@ -1136,7 +1228,13 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
-        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        indexing = BlockedSubscriptIndexing.create(
+            state, fake_tensor, subscript, for_store=True
+        )
+        if indexing.needs_pointer():
+            return PointerIndexingStrategy().codegen_store(
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
+            )
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
@@ -1423,7 +1521,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
-        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        indexing = BlockedSubscriptIndexing.create(
+            state, fake_tensor, subscript, for_store=True
+        )
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
@@ -1479,7 +1579,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return fallback(op, state, fake_tensor, subscript, value, sem)
         if not self.is_supported(state, fake_tensor, subscript):
             return fallback(op, state, fake_tensor, subscript, value, sem)
-        indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        indexing = BlockedSubscriptIndexing.create(
+            state, fake_tensor, subscript, for_store=True
+        )
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
@@ -1590,6 +1692,16 @@ class StackIndexingStrategy:
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
+        if (broadcast_mask := indexing.broadcast_mask_expr) is not None:
+            # Load broadcast dims through a broadcast pointer, masked by their
+            # tiles, so the lanes past a tile's extent are 0 like any load's.
+            if indexing.has_mask():
+                broadcast_mask = expr_from_string(
+                    "{mask} & {broadcast_mask}",
+                    mask=indexing.mask_expr,
+                    broadcast_mask=broadcast_mask,
+                )
+            indexing = indexing._replace(mask_expr=broadcast_mask)
         subscripts_shape = SubscriptIndexing.compute_shape(
             tensor_like, subscript, state
         )
@@ -1612,7 +1724,7 @@ class StackIndexingStrategy:
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
-            "offset": indexing.index_expr,
+            "offset": indexing.broadcast_offset(state, subscripts_shape),
             "mask": mask_expr,
         }
         if eviction_policy is not None:
@@ -1635,7 +1747,9 @@ class StackIndexingStrategy:
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
-        indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
+        indexing = SubscriptIndexing.create(
+            state, tensor_like, subscript, extra_mask, for_store=True
+        )
         subscripts_shape = SubscriptIndexing.compute_shape(
             tensor_like, subscript, state
         )
@@ -1656,7 +1770,7 @@ class StackIndexingStrategy:
         placeholders: dict[str, ast.AST] = {
             "base": dev_ptrs_ast,
             "value": value,
-            "offset": indexing.index_expr,
+            "offset": indexing.broadcast_offset(state, subscripts_shape),
             "mask": mask_expr,
         }
         if cache_modifier is not None:
@@ -1678,6 +1792,8 @@ class PerDimIndexing:
     # Per tensor dimension, whether that dimension's index is block shaped (a
     # tile/tensor index rather than a scalar). Parallel to dim_index_exprs.
     block_dims: tuple[bool, ...] = ()
+    # A load's masks of the tiles it broadcasts size-1 dims onto
+    broadcast_mask_expr: ast.AST | None = None
 
     def has_mask(self) -> bool:
         return not (
@@ -1705,6 +1821,8 @@ class SubscriptIndexing(NamedTuple):
     block_shaped_offset: bool = True
     # Whether each dim_index_exprs entry is block shaped rather than scalar.
     block_dims: tuple[bool, ...] = ()
+    # A load's masks of the tiles it broadcasts size-1 dims onto
+    broadcast_mask_expr: ast.AST | None = None
 
     def has_mask(self) -> bool:
         return not (
@@ -1714,6 +1832,26 @@ class SubscriptIndexing(NamedTuple):
     def needs_broadcast(self) -> bool:
         """Check if the loaded result needs broadcasting to match expected shape."""
         return len(self.broadcast_dims) > 0
+
+    def broadcast_offset(
+        self, state: CodegenState, output_size: list[int | torch.SymInt]
+    ) -> ast.AST:
+        """The offset, expanded over the size-1 dims a wider tile broadcasts
+        onto, for a store: Triton broadcasts the stored value to the
+        pointer's shape, not the reverse.  A scalar offset can be a
+        constexpr, which ``tl.broadcast_to`` rejects, so it gets a block
+        shaped zero added instead, like a load's."""
+        if not self.needs_broadcast():
+            return self.index_expr
+        env = CompileEnvironment.current()
+        shape_str = state.tile_strategy.shape_str(output_size)
+        if self.block_shaped_offset:
+            expand = env.backend.broadcast_to_expr("{offset}", shape_str)
+        else:
+            expand = (
+                f"{{offset}} + {env.backend.zeros_expr(shape_str, env.index_type())}"
+            )
+        return expr_from_string(expand, offset=self.index_expr)
 
     @staticmethod
     def compute_shape(
@@ -1814,11 +1952,22 @@ class SubscriptIndexing(NamedTuple):
         fake_value: torch.Tensor,
         index: list[object],
         extra_mask: ast.AST | None = None,
+        *,
+        for_store: bool = False,
     ) -> PerDimIndexing:
         """Walk a subscript and return per-dimension index expressions and mask.
 
         This is the strategy-agnostic first phase of indexing: it computes
         individual dimension index strings and a combined mask expression.
+        A size-1 dim indexed by a wider tile (or tensor index) broadcasts, so
+        a load reads it without the tile's mask, which it returns as
+        ``broadcast_mask_expr`` to zero the lanes past the tile's extent
+        (masks shared by several index tensors also guard the others'
+        offsets, so they stay in ``mask_expr``).  A store target never needs
+        to broadcast (a valid store's dim covers the tile's extent), so
+        ``for_store`` does not guard its dynamic sizes to 1; a dim known to be
+        1 anyway (static, or guarded by a load) keeps the tile's mask, since
+        every masked-off lane would otherwise write the same element.
         """
         tile_strategy = state.tile_strategy
         output_idx = 0
@@ -1826,6 +1975,7 @@ class SubscriptIndexing(NamedTuple):
         # Parallel to index_values: whether that dimension's index is block shaped.
         block_dims: list[bool] = []
         mask_values: dict[str, None] = {}
+        broadcast_masks: dict[str, None] = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -1896,7 +2046,7 @@ class SubscriptIndexing(NamedTuple):
                 expand = tile_strategy.expand_dims_str(
                     output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
                 )
-                idx_val = f"({index_var}){expand}"
+                positions: list[int] = []
             elif single_output_dim:
                 assert pos is not None
                 if index_elem.ndim == 1:
@@ -1907,13 +2057,26 @@ class SubscriptIndexing(NamedTuple):
                     expand = tile_strategy.expand_dims_str(
                         output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
                     )
-                idx_val = f"({index_var}){expand}"
-                # Add mask for the single non-trivial output position
+                positions = [pos]
+            else:
+                # Multi-dim tensor with multiple non-trivial dims
+                # Still need expansion for trailing/leading slice dimensions
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                positions = non_trivial_output_positions
+            idx_val = f"({index_var}){expand}"
+            # Every index masks the tile positions it covers (a later index may
+            # cover positions an earlier one does not).  The masks also guard
+            # the other indices' offsets, so even over a size-1 target dim,
+            # which drops this index from the offset and broadcasts it over
+            # these positions, they stay in the access's own mask, to whose
+            # shape a load broadcasts its pointer.
+            for p in positions:
                 if (
-                    pos < len(output_size)
-                    and (bid := env.get_block_id(output_size[pos])) is not None
+                    p < len(output_size)
+                    and (bid := env.get_block_id(output_size[p])) is not None
                     and (mv := state.codegen.mask_var(bid))
-                    and not _is_size_one(fake_value.size(len(index_values)))
                 ):
                     if env.is_jagged_tile(bid):
                         mask_shape = env.jagged_tile_mask_shapes[bid]
@@ -1922,40 +2085,17 @@ class SubscriptIndexing(NamedTuple):
                         )
                     else:
                         new_masks.setdefault(
-                            f"({mv}){tile_strategy.expand_str(output_size, pos)}"
+                            f"({mv}){tile_strategy.expand_str(output_size, p)}"
                         )
-            else:
-                # Multi-dim tensor with multiple non-trivial dims
-                # Still need expansion for trailing/leading slice dimensions
-                expand = tile_strategy.expand_dims_str(
-                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+            if _is_size_one(fake_value.size(len(index_values))):
+                size1_broadcast_dims.extend(
+                    (p, output_size[p])
+                    for p in positions
+                    if not _is_size_one(output_size[p])
                 )
-                idx_val = f"({index_var}){expand}"
-                if tensor_idx == 0:
-                    for p in non_trivial_output_positions:
-                        if (
-                            p < len(output_size)
-                            and (bid := env.get_block_id(output_size[p])) is not None
-                            and (mv := state.codegen.mask_var(bid))
-                            and not _is_size_one(fake_value.size(len(index_values)))
-                        ):
-                            if env.is_jagged_tile(bid):
-                                mask_shape = env.jagged_tile_mask_shapes[bid]
-                                new_masks.setdefault(
-                                    f"({mv}){tile_strategy.jagged_tile_expand_str(mask_shape, output_size)}"
-                                )
-
-                            else:
-                                new_masks.setdefault(
-                                    f"({mv}){tile_strategy.expand_str(output_size, p)}"
-                                )
-            # Padded iota mask
-            if (
-                orig_len := _get_padded_iota_original_length(state, position)
-            ) is not None:
-                new_masks.setdefault(
-                    f"(({index_var} < {orig_len}){tile_strategy.expand_str(output_size, first_tensor_out_idx + tensor_idx)})"
-                )
+            # The padding mask has the index's rank: expand it like the index.
+            if (iota_mask := _padded_iota_mask(state, position)) is not None:
+                new_masks.setdefault(f"({iota_mask}{expand})")
             return idx_val, new_masks
 
         for n, k in enumerate(index):
@@ -1974,6 +2114,14 @@ class SubscriptIndexing(NamedTuple):
                 full_block_size = env.block_sizes[env.canonical_block_id(block_id)].var
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 i = len(index_values)
+                if not for_store:
+                    env.resolve_broadcast_dim(
+                        fake_value.size(i), block_id, tile_info.offset
+                    )
+                # Tensor size is 1 but the output has the tile's block size
+                broadcast = _is_size_one(fake_value.size(i)) and not _is_size_one(
+                    output_size[output_idx]
+                )
                 block_dims.append(True)
                 if tile_info.block_size is not None and not env.known_equal(
                     tile_info.block_size, full_block_size
@@ -1988,22 +2136,38 @@ class SubscriptIndexing(NamedTuple):
                         f"tl.arange(0, {block_size_expr}).to({dtype}))"
                     )
                     index_values.append(f"{index_expr}{expand}")
-                    if not _is_size_one(fake_value.size(i)):
-                        dim_size = state.device_function.tensor_size(fake_value, i).name
-                        mask_values.setdefault(f"({index_expr} < {dim_size}){expand}")
+                    # An epilogue-subtile piece of the tile: mask it like the
+                    # tile, by the loop's end rather than the target's size
+                    if state.codegen.mask_var(block_id) and (
+                        not _is_size_one(fake_value.size(i)) or broadcast
+                    ):
+                        end = (
+                            state.codegen.active_device_loops[block_id][-1]
+                            .block_id_to_info[block_id]
+                            .end_var_name
+                        )
+                        assert end is not None
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({index_expr} < {end}){expand}")
                 else:
                     index_var = state.codegen.index_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)
                     index_values.append(f"(({index_var}) + {offset_expr}){expand}")
                     # Use the same mask as the underlying tile
-                    if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
-                        fake_value.size(i)
+                    if (mask := state.codegen.mask_var(block_id)) and (
+                        not _is_size_one(fake_value.size(i)) or broadcast
                     ):
-                        mask_values.setdefault(f"({mask}){expand}")
-                # Track if this dimension needs broadcasting (tensor size is 1 but output has block_size)
-                if _is_size_one(fake_value.size(i)) and not _is_size_one(
-                    output_size[output_idx]
-                ):
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({mask}){expand}")
+                if broadcast:
                     size1_broadcast_dims.append((output_idx, output_size[output_idx]))
                 output_idx += 1
             elif isinstance(k, torch.SymInt):
@@ -2016,21 +2180,28 @@ class SubscriptIndexing(NamedTuple):
                     index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
+                    if not for_store:
+                        env.resolve_broadcast_dim(fake_value.size(i), block_id)
+                    broadcast = _is_size_one(fake_value.size(i)) and not _is_size_one(
+                        output_size[output_idx]
+                    )
                     block_dims.append(True)
                     index_values.append(f"({index_var}){expand}")
-                    if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
-                        fake_value.size(i)
+                    if (mask := state.codegen.mask_var(block_id)) and (
+                        not _is_size_one(fake_value.size(i)) or broadcast
                     ):
                         if env.is_jagged_tile(block_id):
                             mask_shape = env.jagged_tile_mask_shapes[block_id]
                             expand = tile_strategy.jagged_tile_expand_str(
                                 mask_shape, output_size
                             )
-                        mask_values.setdefault(f"({mask}){expand}")
-                    # Track if this dimension needs broadcasting
-                    if _is_size_one(fake_value.size(i)) and not _is_size_one(
-                        output_size[output_idx]
-                    ):
+                        masks = (
+                            broadcast_masks
+                            if broadcast and not for_store
+                            else mask_values
+                        )
+                        masks.setdefault(f"({mask}){expand}")
+                    if broadcast:
                         size1_broadcast_dims.append(
                             (output_idx, output_size[output_idx])
                         )
@@ -2068,15 +2239,19 @@ class SubscriptIndexing(NamedTuple):
                                 state, block_idx, slice_size, dtype
                             )
                         # Generate strided index: start + index * step
+                        start_expr = state.device_function.literal_expr(start)
                         block_dims.append(True)
                         index_values.append(
-                            f"({start} + ({base_index_expr}) * {step}){expand}"
+                            f"({start_expr} + ({base_index_expr}) * {step}){expand}"
                         )
                         if mask_expr is not None:
                             mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
+                        start_expr = state.device_function.literal_expr(start)
                         block_dims.append(False)
-                        index_values.append(f"{start}{expand}")
+                        index_values.append(
+                            _size_one_slice_index(start_expr, expand, dtype)
+                        )
                 else:
                     slice_size = compute_slice_size(k, size)
                     if not _is_size_one(slice_size):
@@ -2097,7 +2272,9 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         start_expr = state.device_function.literal_expr(start)
                         block_dims.append(False)
-                        index_values.append(f"{start_expr}{expand}")
+                        index_values.append(
+                            _size_one_slice_index(start_expr, expand, dtype)
+                        )
                 output_idx += 1
             elif isinstance(k, torch.Tensor):
                 ast_index = state.ast_args[1]
@@ -2128,12 +2305,24 @@ class SubscriptIndexing(NamedTuple):
                     if output_idx < len(output_size)
                     else None
                 )
-                if mask_block_id is not None:
-                    mask_var = state.codegen.mask_var(mask_block_id)
-                    if mask_var and not _is_size_one(
-                        fake_value.size(len(index_values) - 1)
-                    ):
-                        mask_values.setdefault(f"({mask_var}){expand}")
+                # A size-1 target dim drops this index from the offset, which
+                # then broadcasts over the index's output dims.
+                size_one = _is_size_one(fake_value.size(len(index_values) - 1))
+                if mask_block_id is not None and (
+                    mask_var := state.codegen.mask_var(mask_block_id)
+                ):
+                    masks = (
+                        broadcast_masks if size_one and not for_store else mask_values
+                    )
+                    masks.setdefault(f"({mask_var}){expand}")
+                if size_one:
+                    size1_broadcast_dims.extend(
+                        (p, output_size[p])
+                        for p in range(output_idx, output_idx + k.ndim)
+                        if not _is_size_one(output_size[p])
+                    )
+                if (iota_mask := _padded_iota_mask(state, n)) is not None:
+                    mask_values.setdefault(f"({iota_mask}{expand})")
 
                 output_idx += k.ndim
             else:
@@ -2152,6 +2341,7 @@ class SubscriptIndexing(NamedTuple):
             tuple(size1_broadcast_dims),
             output_size,
             tuple(block_dims),
+            expr_from_string("&".join(broadcast_masks)) if broadcast_masks else None,
         )
 
     @staticmethod
@@ -2160,9 +2350,11 @@ class SubscriptIndexing(NamedTuple):
         fake_value: torch.Tensor,
         index: list[object],
         extra_mask: ast.AST | None = None,
+        *,
+        for_store: bool = False,
     ) -> SubscriptIndexing:
         per_dim = SubscriptIndexing.compute_per_dim_indexing(
-            state, fake_value, index, extra_mask
+            state, fake_value, index, extra_mask, for_store=for_store
         )
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -2190,6 +2382,7 @@ class SubscriptIndexing(NamedTuple):
             per_dim.dim_index_exprs,
             block_shaped,
             per_dim.block_dims,
+            per_dim.broadcast_mask_expr,
         )
 
 
@@ -2203,6 +2396,19 @@ class BlockedSubscriptIndexing:
     offsets: list[str] = dataclasses.field(default_factory=list)
     block_shape: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
     reshaped_size: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
+    # A tile wider than 1 landed on a size-1 dim, which the block holds as 1
+    broadcasts_tile: bool = False
+
+    def needs_pointer(self) -> bool:
+        """Whether pointer indexing must stand in: the block holds a broadcast
+        tile dim as 1, so it cannot be reshaped into the tile (a scalar index
+        may also have dropped a dim) and a store needs the tile's mask, or the
+        block is a single element, which Triton's block pointer rewrite
+        crashes on."""
+        env = CompileEnvironment.current()
+        return self.broadcasts_tile or all(
+            env.known_equal(size, 1) for size in self.block_shape
+        )
 
     def make_block_ptr(self, state: CodegenState) -> ast.AST:
         name = state.device_function.tensor_arg(self.base).name
@@ -2279,26 +2485,10 @@ class BlockedSubscriptIndexing:
                 return True
         return False
 
-    def _needs_broadcast(self) -> bool:
-        """Check if reshaping requires broadcasting (size-1 dims expanding)."""
-        if len(self.reshaped_size) != len(self.block_shape):
-            return False
-        env = CompileEnvironment.current()
-        for block_dim, target_dim in zip(
-            self.block_shape, self.reshaped_size, strict=True
-        ):
-            # If block_shape has 1 but target has a larger value, need broadcast
-            if env.known_equal(block_dim, 1) and not env.known_equal(target_dim, 1):
-                return True
-        return False
-
     def reshape_load(self, state: CodegenState, node: ast.AST) -> ast.AST:
         if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.reshaped_size)
-        if self._needs_broadcast():
-            # Use broadcast_to when expanding size-1 dimensions
-            return expr_from_string(f"tl.broadcast_to({{node}}, {shape})", node=node)
         return expr_from_string(f"tl.reshape({{node}}, {shape})", node=node)
 
     def reshape_store(self, state: CodegenState, node: ast.AST) -> ast.AST:
@@ -2415,13 +2605,37 @@ class BlockedSubscriptIndexing:
 
     @staticmethod
     def create(
-        state: CodegenState, fake_value: torch.Tensor, index: list[object]
+        state: CodegenState,
+        fake_value: torch.Tensor,
+        index: list[object],
+        *,
+        for_store: bool = False,
     ) -> BlockedSubscriptIndexing:
         res = BlockedSubscriptIndexing(
             fake_value,
             reshaped_size=SubscriptIndexing.compute_shape(fake_value, index, state),
         )
         env = CompileEnvironment.current()
+
+        def is_wide(block_size: int | torch.SymInt, block_id: int) -> bool:
+            if env.known_equal(block_size, 1):
+                return False
+            config_size = env.block_sizes[env.canonical_block_id(block_id)].from_config(
+                state.device_function.config
+            )
+            return not (isinstance(config_size, int) and config_size == 1)
+
+        def is_size_one(
+            size: int | torch.SymInt, block_id: int, offset: int | torch.SymInt = 0
+        ) -> bool:
+            # Like ``SubscriptIndexing.compute_per_dim_indexing``: a load
+            # settles whether a dim a tile indexes broadcasts, and a store
+            # target's dynamic dims, which the block's boundary check bounds,
+            # are not compared with 1.
+            if not for_store:
+                env.resolve_broadcast_dim(size, block_id, offset)
+            return env.known_equal(size, 1)
+
         for n, k in enumerate(index):
             if k is None:
                 pass  # handled by reshaped_size
@@ -2434,8 +2648,10 @@ class BlockedSubscriptIndexing:
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
             ) is not None:
                 # Tensor marked as tile.index + offset
-                if fake_value.size(len(res.offsets)) != 1:
-                    block_id = _resolve_codegen_block_id(state, tile_info.block_id)
+                block_id = _resolve_codegen_block_id(state, tile_info.block_id)
+                if not is_size_one(
+                    fake_value.size(len(res.offsets)), block_id, tile_info.offset
+                ):
                     offset_var = state.codegen.offset_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)
                     res.offsets.append(f"({offset_var} + {offset_expr})")
@@ -2443,20 +2659,22 @@ class BlockedSubscriptIndexing:
                 else:
                     res.offsets.append("0")
                     res.block_shape.append(1)
+                    res.broadcasts_tile |= is_wide(
+                        tile_info.resolved_block_size_var(env), block_id
+                    )
             elif isinstance(k, torch.SymInt):
                 symbol = _symint_expr(k)
                 # pyrefly: ignore[no-matching-overload, bad-argument-type]
                 origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    if fake_value.size(len(res.offsets)) != 1:
-                        block_id = _resolve_codegen_block_id(
-                            state, origin.origin.block_id
-                        )
+                    block_id = _resolve_codegen_block_id(state, origin.origin.block_id)
+                    if not is_size_one(fake_value.size(len(res.offsets)), block_id):
                         res.offsets.append(state.codegen.offset_var(block_id))
                         res.block_shape.append(k)
                     else:
                         res.offsets.append("0")
                         res.block_shape.append(1)
+                        res.broadcasts_tile |= is_wide(k, block_id)
                 else:
                     if (index_ast := _subscript_index_ast(state, n)) is not None:
                         res.offsets.append(

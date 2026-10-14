@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -23,6 +24,10 @@ from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+# Triton lowers these through tensor-descriptor (TMA) reductions and their
+# pointer fallbacks; CuTe has no tensor-descriptor indexing.
+_TENSOR_DESCRIPTOR_ATOMICS = "checks Triton tensor-descriptor atomic codegen"
 
 
 @helion.kernel()
@@ -473,6 +478,88 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, y)
         torch.testing.assert_close(prev, torch.zeros_like(x))
 
+    def test_atomic_add_returns_prev_with_tensor_index_beside_tile(self):
+        """A tensor index after a tile returns each lane's previous value in
+        the ``[tile_m, tile_n]`` layout, and lanes adding into one element
+        each see a distinct previous value."""
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8]))
+        def scatter_columns(
+            x: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            prev = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_n] = hl.atomic_add(
+                    out, [tile_m, cols[tile_n]], x[tile_m, tile_n]
+                )
+            return out, prev
+
+        x = torch.ones(4, 8, device=DEVICE)
+        out = torch.zeros(4, 2, device=DEVICE)
+        cols = torch.tensor([0, 1, 1, 1, 1, 1, 1, 1], device=DEVICE)
+        out, prev = scatter_columns(x, cols, out)
+        torch.testing.assert_close(out, torch.tensor([[1.0, 7.0]] * 4, device=DEVICE))
+        torch.testing.assert_close(prev[:, 0], torch.zeros(4, device=DEVICE))
+        torch.testing.assert_close(
+            prev[:, 1:].sort(dim=1).values,
+            torch.arange(7, device=DEVICE, dtype=torch.float32).expand(4, 7),
+        )
+
+    def test_atomic_add_tensor_index_layouts(self):
+        """Tensor indices separated by a tile return each lane's previous
+        value in the compiled ``[m, k, n]`` layout (eager indexing would put
+        the indexed dims first), and a one-element index keeps its dim."""
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8, 4]))
+        def scatter_around_tile(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_m, tile_k, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_k, tile_n] = hl.atomic_add(
+                    out, [rows[tile_m], tile_k, cols[tile_n]], x[tile_m, tile_k, tile_n]
+                )
+            return prev
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8]))
+        def scatter_pairs(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_n] = hl.atomic_add(
+                    out, [rows[tile_m], cols[tile_n]], x[tile_m, tile_n]
+                )
+            return prev
+
+        out = torch.arange(3 * 8 * 5, device=DEVICE, dtype=torch.float32).view(3, 8, 5)
+        rows = torch.tensor([2, 0], device=DEVICE)
+        cols = torch.tensor([4, 1, 3, 0], device=DEVICE)
+        x = torch.ones(2, 8, 4, device=DEVICE)
+        expected_prev = out[rows][:, :, cols]
+        prev = scatter_around_tile(x, rows, cols, out.clone())
+        torch.testing.assert_close(prev, expected_prev)
+
+        out = torch.arange(3 * 5, device=DEVICE, dtype=torch.float32).view(3, 5)
+        rows = torch.tensor([1], device=DEVICE)
+        cols = torch.tensor([4, 0, 2, 3, 1, 2, 0, 4], device=DEVICE)
+        x = torch.ones(1, 8, device=DEVICE)
+        prev = scatter_pairs(x, rows, cols, out.clone())
+        self.assertEqual(prev.shape, (1, 8))
+        # A column added to k times returns its value plus 0..k-1.
+        expected = [
+            out[1, c].item() + j
+            for c in cols.unique().tolist()
+            for j in range(int((cols == c).sum()))
+        ]
+        torch.testing.assert_close(
+            prev[0].sort().values, torch.tensor(sorted(expected), device=DEVICE)
+        )
+
     @xfailIfPallas("gather indexing with different-sized tensors unsupported on Pallas")
     def test_overlapping_atomic_add(self):
         # Test with overlapping indices
@@ -505,7 +592,8 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(3, 4, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute", "triton"])
+    @skipIfTileIR("TileIR's atomic_rmw addf takes only f16, f32 and f64")
     def test_atomic_add_f32_into_bf16(self):
         """atomic_add of a float32 value into a bfloat16 output tensor."""
         x = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -971,7 +1059,93 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_cas", code)
 
-    @onlyBackends("triton")
+    @onlyBackends(["triton", "cute"])
+    @skipIfTileIR("TileIR does not compile a float16 atomic_cas")
+    def test_atomic_cas_operands_made_into_blocks(self):
+        """Triton's CAS neither broadcasts nor converts its compare and swap
+        values to the pointer's block and type: scalars and int literals over
+        a tile, lower-rank or size-1-dim tensors, values computed in float32
+        for a float16 target, and an int literal into a float scalar target
+        all failed to compile."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def claim(x: torch.Tensor) -> torch.Tensor:
+            old = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                old[tile_m, tile_n] = hl.atomic_cas(x, [tile_m, tile_n], 0, 1)
+            return old
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def swap_rows(
+            x: torch.Tensor, expected: torch.Tensor, value: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_cas(x, [tile_m, tile_n], expected[tile_n], value[tile_m, :])
+            return x
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def increment(x: torch.Tensor) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_cas(
+                    x, [tile_m, tile_n], x[tile_m, tile_n], x[tile_m, tile_n] + 1
+                )
+            return x
+
+        @helion.kernel(config=helion.Config(block_sizes=[16]))
+        def claim_first(x: torch.Tensor) -> torch.Tensor:
+            for _ in hl.tile(x.size(0)):
+                hl.atomic_cas(x, [0], 0, 1)
+            return x
+
+        for m in (4, 16):
+            with self.subTest(m=m):
+                x = torch.zeros(m, 64, device=DEVICE)
+                x[0, 0] = 5.0
+                expected = torch.ones_like(x)
+                expected[0, 0] = 5.0
+                old = claim(x)
+                torch.testing.assert_close(x, expected)
+                torch.testing.assert_close(old, torch.where(expected == 5.0, 5.0, 0.0))
+
+                x = torch.zeros(m, 64, device=DEVICE)
+                value = torch.arange(m, device=DEVICE, dtype=torch.float32)[:, None]
+                torch.testing.assert_close(
+                    swap_rows(x, torch.zeros(64, device=DEVICE), value),
+                    value.expand(m, 64),
+                )
+
+                x = torch.randn(m, 64, device=DEVICE, dtype=torch.float16)
+                torch.testing.assert_close(increment(x.clone()), x + 1)
+
+        torch.testing.assert_close(
+            claim_first(torch.zeros(4, device=DEVICE)),
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE),
+        )
+
+    def test_atomic_cas_masks_tile_lanes(self):
+        """Triton's CAS takes no mask, so the lanes of a tile past the
+        tensor's extent wrote past its end (768 elements of the buffer here)."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def cas(x: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+            old = torch.empty_like(expected)
+            for tile_m, tile_n in hl.tile(expected.size()):
+                old[tile_m, tile_n] = hl.atomic_cas(
+                    x,
+                    [tile_m, tile_n],
+                    expected[tile_m, tile_n],
+                    expected[tile_m, tile_n] + 1.0,
+                )
+            return old
+
+        buffer = torch.zeros(64, 64, device=DEVICE)
+        x = buffer[:4]
+        expected = torch.zeros(4, 64, device=DEVICE)
+        torch.testing.assert_close(cas(x, expected), torch.zeros_like(expected))
+        torch.testing.assert_close(x, expected + 1.0)
+        torch.testing.assert_close(buffer[4:], torch.zeros_like(buffer[4:]))
+
+    @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipIfRefEager("program-level atomic synchronization is codegen-only")
@@ -1027,14 +1201,25 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 hl.atomic_add(count, [0], 1, sem="relaxed")
             return out
 
+        cute = _get_backend() == "cute"
+        if cute:
+            ns, store, barrier_call = (
+                "cute.arch.",
+                ".store(",
+                "cute.arch.sync_threads()",
+            )
+        else:
+            ns, store, barrier_call = "tl.", "tl.store(", "tl.debug_barrier()"
         # kernel: (atomic call, barrier before it, barrier after it, final done)
         cases = {
-            release_unused: ("tl.atomic_add(", True, False, 0),
-            acq_rel_unused: ("tl.atomic_add(", True, True, 0),
-            # Triton itself broadcasts a used scalar result behind a bar.sync.
-            acq_rel_used: ("tl.atomic_add(", True, False, 1),
-            cas_acquire_unused: ("tl.atomic_cas(", False, True, 1),
-            relaxed: ("tl.atomic_add(", False, False, 0),
+            release_unused: (f"{ns}atomic_add(", True, False, 0),
+            acq_rel_unused: (f"{ns}atomic_add(", True, True, 0),
+            # A used scalar result is broadcast from the issuing thread: Triton
+            # does it behind a bar.sync of its own, CuTe's broadcast emits
+            # the barriers itself.
+            acq_rel_used: (f"{ns}atomic_add(", True, cute, 1),
+            cas_acquire_unused: (f"{ns}atomic_cas(", False, True, 1),
+            relaxed: (f"{ns}atomic_add(", False, False, 0),
         }
         x = torch.randn(512, device=DEVICE)
         for kernel, (call, before, after, final_done) in cases.items():
@@ -1046,14 +1231,249 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertEqual(int(count.item()), 4)
             self.assertEqual(int(done.item()), final_done)
             atomic = code.index(call)
-            barrier = code.rfind("tl.debug_barrier()", 0, atomic)
+            barrier = code.rfind(barrier_call, 0, atomic)
             if before:
-                self.assertGreater(barrier, code.rfind("tl.store(", 0, atomic))
+                self.assertGreater(barrier, code.rfind(store, 0, atomic))
             else:
                 self.assertEqual(barrier, -1)
-            self.assertEqual(code.find("tl.debug_barrier()", atomic) != -1, after)
+            self.assertEqual(code.find(barrier_call, atomic) != -1, after)
 
-    @onlyBackends("triton")
+    @onlyBackends(["triton", "cute"])
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_row_release_acquire_atomics_with_several_rows_per_thread(self):
+        """A per-row release / acquire atomic orders the accesses of its row."""
+
+        @helion.kernel(static_shapes=True)
+        def release_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                hl.atomic_add(flags, [tile_m], 1, sem="release")
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acquire_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_add(flags, [tile_m], 1, sem="acquire")
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acquire_release_rows(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_add(flags, [tile_m], 1, sem="acquire")
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                hl.atomic_add(flags, [tile_m], 1, sem="release")
+            return out
+
+        cute = _get_backend() == "cute"
+        # On CuTe, 16 x 32 threads give every thread four rows and four
+        # columns of the 64 x 128 tile: a column lane loop in a row lane loop.
+        config = {
+            "block_sizes": [64, 128],
+            **({"num_threads": [16, 32]} if cute else {}),
+        }
+        x = torch.randn(128, 256, device=DEVICE)
+        # kernel: (atomics per row and column tile, semantics in program order)
+        cases = {
+            release_rows: (1, ["release"]),
+            acquire_rows: (1, ["acquire"]),
+            acquire_release_rows: (2, ["acquire", "release"]),
+        }
+        for kernel, (per_tile, semantics) in cases.items():
+            flags = torch.zeros(128, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(kernel, (x, flags), **config)
+            torch.testing.assert_close(result, x * 2.0, rtol=0, atol=0)
+            self.assertEqual(flags.tolist(), [2 * per_tile] * 128)
+            if not cute:
+                continue
+            # One barrier per atomic and row, on the atomic's side of the
+            # row's per-lane stores (release) or loads (acquire).
+            barrier = "cute.arch.sync_threads()"
+            self.assertEqual(code.count(barrier), len(semantics))
+            for sem in semantics:
+                atomic = code.index(f"sem='{sem}'")
+                if sem == "release":
+                    fence = code.rfind(barrier, 0, atomic)
+                    self.assertNotEqual(fence, -1)
+                    self.assertGreater(fence, code.rfind(".store(", 0, atomic))
+                else:
+                    fence = code.find(barrier, atomic)
+                    self.assertNotEqual(fence, -1)
+                    self.assertLess(fence, code.index(".load()", atomic))
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_per_element_release_acquire_atomics_sync_program(self):
+        """A per-element release / acquire orders every thread's accesses too."""
+
+        @helion.kernel(static_shapes=True)
+        def release_elements(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                hl.atomic_add(flags, [tile_m, tile_n], 1, sem="release")
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acquire_elements(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_add(flags, [tile_m, tile_n], 1, sem="acquire")
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def acq_rel_elements_used(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                y = x[tile_m, tile_n] * 2.0
+                old = hl.atomic_xchg(flags, [tile_m, tile_n], 1, sem="acq_rel")
+                out[tile_m, tile_n] = y + old.to(torch.float32)
+            return out
+
+        cute = _get_backend() == "cute"
+        # On CuTe, 16 x 32 threads give every thread four rows and four
+        # columns of the 64 x 128 tile: the atomic in a column lane loop.
+        config = {
+            "block_sizes": [64, 128],
+            **({"num_threads": [16, 32]} if cute else {}),
+        }
+        if cute:
+            barrier, store, load = "cute.arch.sync_threads()", ".store(", ".load()"
+        else:
+            barrier, store, load = "tl.debug_barrier()", "tl.store(", "tl.load("
+        x = torch.randn(128, 256, device=DEVICE)
+        # kernel: (flag value before, flag value after, sem)
+        cases = {
+            release_elements: (0, 1, "release"),
+            acquire_elements: (0, 1, "acquire"),
+            acq_rel_elements_used: (3, 1, "acq_rel"),
+        }
+        for kernel, (before, after, sem) in cases.items():
+            flags = torch.full((128, 256), before, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(kernel, (x, flags), **config)
+            expected = x * 2.0 + (before if kernel is acq_rel_elements_used else 0)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+            self.assertTrue(bool((flags == after).all()))
+            atomic = code.index(f"sem='{sem}'")
+            if sem in ("release", "acq_rel"):
+                fence = code.rfind(barrier, 0, atomic)
+                self.assertNotEqual(fence, -1)
+                self.assertGreater(fence, code.rfind(store, 0, atomic))
+            if sem in ("acquire", "acq_rel"):
+                fence = code.find(barrier, atomic)
+                self.assertNotEqual(fence, -1)
+                later = [code.find(access, atomic) for access in (store, load)]
+                self.assertLess(fence, min(i for i in later if i != -1))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_of_a_reduced_update_over_full_slices(self):
+        """An atomic covering only the full slices adds once per program."""
+
+        @helion.kernel(static_shapes=True)
+        def nested_aranges(
+            x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            b, m, n = x.shape
+            n = hl.specialize(n)
+            k = hl.specialize(w.size(0))
+            for tile_b in hl.tile(b):
+                for tile_m in hl.tile(m):
+                    update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+                    hl.atomic_add(out, [hl.arange(0, k), hl.arange(0, n)], update)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def nested_slices(
+            x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            b, m, n = x.shape
+            n = hl.specialize(n)
+            k = hl.specialize(w.size(0))
+            for tile_b in hl.tile(b):
+                for tile_m in hl.tile(m):
+                    update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+                    hl.atomic_add(out, [slice(0, k), slice(0, n)], update)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def grid_aranges(
+            x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            b, m, n = x.shape
+            n = hl.specialize(n)
+            k = hl.specialize(w.size(0))
+            for tile_b, tile_m in hl.tile([b, m]):
+                update = w[:, :] * x[tile_b, tile_m, :].sum(0).sum(0)[None, :]
+                hl.atomic_add(out, [hl.arange(0, k), hl.arange(0, n)], update)
+            return out
+
+        x = torch.randn(4, 40, 6, device=DEVICE)
+        w = torch.randn(3, 6, device=DEVICE)
+        expected = w * x.sum((0, 1))[None, :]
+        # On CuTe the rows of m a tile holds are one thread's lane loop, which
+        # the reduction re-runs around the atomic.
+        for kernel in (nested_aranges, nested_slices, grid_aranges):
+            for block_sizes in ([2, 16], [4, 8], [1, 8]):
+                out = torch.zeros(3, 6, device=DEVICE)
+                _, result = code_and_output(
+                    kernel, (x, w, out), block_sizes=block_sizes
+                )
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfNotCUDA()
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
+    def test_release_atomic_in_branch(self):
+        """A release atomic inside a branch needs a barrier there."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[128]), static_shapes=True)
+        def release_in_branch(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, flag: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                if flag[0] > 0:
+                    hl.atomic_add(count, [0], 1, sem="release")
+            return out
+
+        x = torch.randn(512, device=DEVICE)
+        count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        flag = torch.ones(1, device=DEVICE, dtype=torch.int32)
+        args = (torch.empty_like(x), x, count, flag)
+        if _get_backend() == "cute":
+            # A CuTe branch condition may differ between threads, and a
+            # block-wide barrier some threads skip deadlocks: a flag the
+            # kernel's atomic may change (it aliases ``count``) is refused.
+            aliased = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported, "inside a branch or while loop"
+            ):
+                code_and_output(
+                    release_in_branch,
+                    (torch.empty_like(x), x, aliased, aliased.view(-1)),
+                )
+        code, result = code_and_output(release_in_branch, args)
+        torch.testing.assert_close(result, x * 2.0)
+        self.assertEqual(int(count.item()), 4)
+        # Nothing writes ``flag`` here, so CuTe proves the branch uniform and
+        # places its barrier inside it too.
+        barrier, atomic = (
+            ("cute.arch.sync_threads()", "cute.arch.atomic_add(")
+            if _get_backend() == "cute"
+            else ("tl.debug_barrier()", "tl.atomic_add(")
+        )
+        self.assertGreater(code.rfind(barrier, 0, code.index(atomic)), -1)
+
+    @skipIfNotTriton("checks the drain of a Triton TMA store before a release")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1084,7 +1504,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotEqual(drain, -1)
         self.assertLess(drain, code.index("tl.atomic_add("))
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_td_fallbacks(self):
@@ -1144,7 +1564,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotIn("desc.atomic_add(", code2)
         self.assertNotIn("cp.async.bulk.wait_group", code2)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1183,7 +1603,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotIn("out1_desc", code)
         self.assertNotIn("tl.atomic_add(out2", code)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1260,7 +1680,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_xchg", code)
             self.assertNotIn("desc.atomic_xchg", code)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1287,7 +1707,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertIn("x_desc.atomic_add(", code)
         self.assertNotIn("tl.atomic_add(", code)
 
-    @onlyBackends("triton")
+    @skipIfNotTriton(_TENSOR_DESCRIPTOR_ATOMICS)
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -1854,6 +2274,12 @@ def _simulate_local_atomic_program(source, x, shape):
                     block_idx=lambda row=row: (row, 0, 0),
                     sync_threads=lambda: None,
                     atomic_add=atomic_add,
+                    fmin=lambda a, b, *, nan=False: (
+                        np.minimum(a, b) if nan else np.fmin(a, b)
+                    ),
+                    fmax=lambda a, b, *, nan=False: (
+                        np.maximum(a, b) if nan else np.fmax(a, b)
+                    ),
                 ),
             ),
         }
@@ -2343,6 +2769,12 @@ def _simulate_register_load_program(
                 atomic_add=atomic_add,
                 lanemask_lt=lambda: np.uint32((1 << (state["lane"] % 32)) - 1),
                 fence_acq_rel_gpu=fence,
+                fmin=lambda a, b, *, nan=False: (
+                    np.minimum(a, b) if nan else np.fmin(a, b)
+                ),
+                fmax=lambda a, b, *, nan=False: (
+                    np.maximum(a, b) if nan else np.fmax(a, b)
+                ),
             ),
         ),
     }

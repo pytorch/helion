@@ -155,6 +155,38 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, torch.stack(tensor_list).reshape(4, 4, -1))
 
+    def test_stack_load_dynamic_strides(self):
+        """A stack tensor reads its members through the example's stride
+        arguments, so dynamic shapes, non-contiguous examples, and a reused
+        kernel whose example's specialized inner dim keeps its size but not
+        its stride all load correctly (the stride was baked in or failed to
+        lower)."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def gather_stack(dev_ptrs: torch.Tensor, example: torch.Tensor) -> torch.Tensor:
+            m = hl.specialize(dev_ptrs.size(0))
+            n1 = example.size(0)
+            n2 = hl.specialize(example.size(1))
+            out = torch.empty([m, n1, n2], dtype=example.dtype, device=dev_ptrs.device)
+            for tile_1, tile_2 in hl.tile([n1, n2]):
+                tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                out[:, tile_1, tile_2] = tensors[tile_1, tile_2]
+            return out
+
+        for name, make in (
+            ("contiguous", lambda: torch.randn(7, 8, device=DEVICE)),
+            ("padded", lambda: torch.randn(7, 16, device=DEVICE)[:, :8]),
+            ("transposed", lambda: torch.randn(8, 7, device=DEVICE).T),
+        ):
+            with self.subTest(example=name):
+                members = [make() for _ in range(4)]
+                dev_ptrs = torch.as_tensor(
+                    [t.data_ptr() for t in members], device=DEVICE, dtype=torch.uint64
+                )
+                torch.testing.assert_close(
+                    gather_stack(dev_ptrs, members[0]), torch.stack(members)
+                )
+
     def test_stack_mask(self):
         @helion.kernel
         def stack_load_w_mask(

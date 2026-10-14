@@ -11,8 +11,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from helion._compiler import tile_strategy
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.cute import affine_vector_io
+from helion._compiler.cute import factor_affine_reductions
+from helion._compiler.cute import hoist_lane_invariant_reductions
+from helion._compiler.cute import pipeline_state_loads
+from helion._compiler.cute.scalar_recipe import PURE_HELPERS
 from helion._compiler.cute.scalar_recipe import build_recipe
 
 if TYPE_CHECKING:
@@ -455,3 +461,28 @@ def test_compiler_extended_ast_is_preserved_without_mutation() -> None:
     replay, value = recipe.emit({"index": _expr("new_index")}, _fresh())
     assert _evaluate(replay, value, {"new_index": 2**32 + 7}) == 8
     assert before == (ast.dump(statement), ast.dump(expression))
+
+
+@pytest.mark.parametrize("helper", sorted(PURE_HELPERS))
+def test_pure_helpers_are_pure_in_every_effect_proof(helper: str) -> None:
+    # Each pass that proves a region free of effects accepts the registered
+    # pure helpers; an unknown call would make it decline.
+    call = _expr(f"{helper}(a, b)")
+    assert isinstance(call, ast.Call)
+    assert build_recipe(call, [], {"a", "b"}) is not None
+    assert tile_strategy._is_proven_relocatable_call(call, allow_load=False)
+    assert affine_vector_io._accesses(_body(f"c = {helper}(a, b)")) == []
+    assert pipeline_state_loads._prefetch_overlap_call_is_safe(
+        call,
+        state_tensor="state",
+        tensor_names=frozenset(),
+        proven_disjoint_tensor_pairs=set(),
+    )
+    assert factor_affine_reductions._safe_invariant_expression(
+        call,
+        outer_lane="lane",
+        outer_writes=set(),
+        outer_mutations=set(),
+        rmem_names=set(),
+    )
+    assert hoist_lane_invariant_reductions._is_allowed_pure_call(call)
