@@ -4104,8 +4104,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         k_axes=tuple(sorted({dot.k.index for dot in program.dots})),
         smem_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device),
         grid_blocks=grid_blocks,
-        # The tensor-memory mode lowers the single-loop shape only.
-        tcgen05=tcgen05_facts(program) if program.simple else None,
+        tcgen05=tcgen05_facts(program),
         live=mma_dag_live_slots(program),
         edges=mma_dag_frag_edges(program),
         sm_count=_device_sm_count(env.device),
@@ -4514,8 +4513,6 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import plan_tcgen05
 
-        if not program.simple:
-            raise _decline("the tensor-memory mode lowers single-loop programs only")
         tc = plan_tcgen05(
             program, facts, sizes, routes, warps, stages, cast("str", store_mode)
         )

@@ -113,15 +113,29 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             else MMA_DAG_STORE_STAGED
         )
         # Tensor-memory seeds lead where the kernel admits them (the promoted
-        # default is the first seed), then the warp-mode ladder.
-        ranked = [
+        # default is the first seed), then the warp-mode ladder.  Their
+        # snapshots always go through the staging tile: the direct fp32
+        # pair stores from the TMEM rows measured 397 us against 176 on
+        # bwd_dh at s2.  The region programs (many small CTAs, a few
+        # iterations each) keep the warp mode first: their
+        # tensor-memory chain of commit waits runs behind it (dk at s2: 295
+        # vs 156 us, dqkw 675 vs 525, wy_dL 598 vs 400).
+        tensor_memory = [
             (MMA_DAG_TCGEN05, seed)
             for seed in tcgen05_seed_configs(facts)[: cls.SEED_TCGEN05]
         ]
-        ranked.extend(
+        warp = [
             (MMA_DAG_WARP, seed)
             for seed in mma_dag_seed_configs(facts)[: cls.SEED_TILES]
+        ]
+        # Except wy's tf32 chain: its tcgen05 lowering runs 512 vs 677 us at
+        # s2 (two CTAs per SM, the chain's exchanges through smem).
+        regions = (
+            facts.tcgen05 is not None
+            and facts.tcgen05.regions
+            and not facts.tcgen05.tf32
         )
+        ranked = warp + tensor_memory if regions else tensor_memory + warp
         for mode, (sizes, warps, stages) in ranked:
             block_sizes = list(default_sizes)
             for block_id, size in sizes.items():
@@ -134,7 +148,9 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         MMA_DAG_KEY: mode,
                         MMA_DAG_WARPS_KEY: warps,
                         MMA_DAG_STAGES_KEY: stages,
-                        MMA_DAG_STORE_KEY: store,
+                        MMA_DAG_STORE_KEY: (
+                            MMA_DAG_STORE_STAGED if mode == MMA_DAG_TCGEN05 else store
+                        ),
                     }
                 )
             )

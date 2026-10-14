@@ -652,10 +652,10 @@ def test_the_promoted_defaults_run_on_tensor_cores() -> None:
         ("fwd_o", "tcgen05", _fwd_o_args(t3, "vanilla")),
         ("dqk", "tcgen05", _dqk_args(t3, "vanilla")),
         ("dv", "tcgen05", _dv_args(t3, "vanilla")),
-        ("fwd_h_delta", "warp", _fwd_h_delta_args(t4, False)),
-        ("fwd_h_delta", "warp", _fwd_h_delta_args(t4, True)),
-        ("dstate", "warp", _dstate_args(t4, False)),
-        ("dstate", "warp", _dstate_args(t4, True)),
+        ("fwd_h_delta", "tcgen05", _fwd_h_delta_args(t4, False)),
+        ("fwd_h_delta", "tcgen05", _fwd_h_delta_args(t4, True)),
+        ("dstate", "tcgen05", _dstate_args(t4, False)),
+        ("dstate", "tcgen05", _dstate_args(t4, True)),
     ):
         fn = _kernel_fn(kernel)
         bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
