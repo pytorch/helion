@@ -4226,6 +4226,53 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected[:, :5] = 1.0
         torch.testing.assert_close(transpose_add_rows(rows, v, out), expected)
 
+    def test_block_access_stays_within_loop_extent(self):
+        """A block_ptr or tensor descriptor block is only bounded by the
+        tensor, so over a tensor wider than the loop a store wrote past the
+        loop and a load feeding a reduction read real data there instead of
+        0; such accesses use pointer indexing, and a dynamic size that only
+        matches the loop at binding is guarded."""
+        indexings = [None]
+        if _get_backend() == "triton":
+            indexings.append("tensor_descriptor")
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+        for static_shapes in (True, False):
+            for indexing in indexings:
+                extra = {} if indexing is None else {"indexing": indexing}
+                config = helion.Config(block_sizes=[16, 64], **extra)
+
+                @helion.kernel(static_shapes=static_shapes, config=config)
+                def add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                    for tile_m, tile_n in hl.tile(a.size()):
+                        out[tile_m, tile_n] = a[tile_m, tile_n] + 1.0
+                    return out
+
+                @helion.kernel(static_shapes=static_shapes, config=config)
+                def row_sums_of_prefix(
+                    x: torch.Tensor, prefix: torch.Tensor
+                ) -> torch.Tensor:
+                    out = x.new_zeros([x.size(0)])
+                    for tile_m, tile_n in hl.tile([x.size(0), prefix.size(0)]):
+                        hl.atomic_add(out, [tile_m], x[tile_m, tile_n].sum(1))
+                    return out
+
+                with self.subTest(static_shapes=static_shapes, indexing=indexing):
+                    for out_cols in (100, 128):
+                        a = torch.randn(64, 100, device=DEVICE)
+                        out = torch.zeros(64, out_cols, device=DEVICE)
+                        expected = out.clone()
+                        expected[:, :100] = a + 1.0
+                        torch.testing.assert_close(add_one(a, out), expected)
+                    x = torch.randn(32, 128, device=DEVICE)
+                    prefix = torch.empty(100, device=DEVICE)
+                    torch.testing.assert_close(
+                        row_sums_of_prefix(x, prefix),
+                        x[:, :100].sum(1),
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
+
     def test_broadcast_tile_store_of_a_shifted_or_gathered_load(self):
         """The broadcast store writes element ``j`` at its own index tensor's
         ``j``-th entry, not at the coordinate the value was loaded from."""
