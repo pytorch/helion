@@ -667,10 +667,25 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         return codegen_computed_fragment_root(self)
 
+    def _try_codegen_mma_dag_root(self) -> bool:
+        cute_state = self.device_function.cute_state
+        if cute_state.mma_dag_plan is None:
+            return False
+        from .cute.cute_mma_dag_codegen import codegen_mma_dag
+
+        if codegen_mma_dag(self):
+            return True
+        cute_state.mma_dag_plan = None
+        raise exc.BackendUnsupported("cute", "cute_mma_dag failed late validation")
+
     def _prefer_computed_fragment_root(self, root_graph_id: int) -> bool:
         """Try fragment ownership before other schedules when this root needs it."""
         env = CompileEnvironment.current()
         if env.backend_name != "cute":
+            return False
+        if self.device_function.cute_state.mma_dag_plan is not None:
+            # The warp-MMA recurrence owner replaces the root (its captured
+            # reductions are the dot's K extent).
             return False
         from .cute.captured_reduction import captured_reduction_coordinates
         from .cute.free_iota_reduction import free_iota_reductions
@@ -1912,6 +1927,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_gdn_recurrence_root()
+                        and not self._try_codegen_mma_dag_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
