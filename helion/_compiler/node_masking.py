@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -88,7 +89,8 @@ def apply_masking(
     """Analyze the node and apply masking."""
     for user in node.users:
         if user.op == "call_function" and user.target == _mask_to:
-            if user.args[1] == other:
+            # A mask made for a later consumer is not defined at this one.
+            if user.args[1] == other and user < base_node:
                 assert user.args[0] is node
                 return user  # reuse existing mask_to node
     from .inductor_lowering import APIFuncLowering
@@ -168,10 +170,61 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
                 input_node
             ):
                 continue
-            node.replace_all_uses_with(  # pyrefly: ignore [missing-attribute]
-                input_node
-            )
-            graph.erase_node(node)
+        else:
+            for user in _dots_zeroed_by_partner(node, masked_value1):
+                user.replace_input_with(node, input_node)
+            if node.users:
+                continue
+        node.replace_all_uses_with(  # pyrefly: ignore [missing-attribute]
+            input_node
+        )
+        graph.erase_node(node)
+
+
+def _dots_zeroed_by_partner(
+    mask: torch.fx.Node, masked_value: float | bool | None
+) -> list[torch.fx.Node]:
+    """The ``hl.dot`` users taking ``mask`` as a matrix whose partner is
+    already 0 past the K tile, so their padded lanes' products are 0 without it.
+
+    That fails only for a lane holding inf or NaN.  A known one (a constant
+    fill) keeps the mask; an unknown value (such as attention's probabilities,
+    multiplied by loaded values) is taken to be finite, as every ``hl.dot``
+    operand was before they were masked, which keeps such matmuls' graphs
+    unchanged.
+    """
+    from ..language.matmul_ops import dot_operand_indices
+
+    if mask.args[1] != 0 or (
+        isinstance(masked_value, float) and not math.isfinite(masked_value)
+    ):
+        return []
+    # A Pallas load whose mask was deferred to this one has stale lanes.
+    source = mask.args[0]
+    while isinstance(source, torch.fx.Node) and source.target in _RELAYOUT_TARGETS:
+        source = source.args[0]
+    if (
+        not isinstance(source, torch.fx.Node)
+        or "pallas_deferred_mask_block_ids" in source.meta
+    ):
+        return []
+    dots = []
+    for user in mask.users:
+        indices = dot_operand_indices(user)
+        if indices is None:
+            continue
+        lhs, rhs = (user.args[i] for i in indices)
+        if mask is lhs:
+            partner = rhs
+        elif mask is rhs:
+            partner = lhs
+        else:
+            continue
+        if isinstance(partner, torch.fx.Node) and partner.target is _mask_to:
+            partner = partner.args[0]
+        if isinstance(partner, torch.fx.Node) and cached_masked_value(partner) == 0:
+            dots.append(user)
+    return dots
 
 
 def cached_masked_value(

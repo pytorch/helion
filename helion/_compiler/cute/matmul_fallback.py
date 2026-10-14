@@ -7,6 +7,7 @@ from typing import cast
 import torch
 
 from ... import exc
+from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -33,11 +34,13 @@ if TYPE_CHECKING:
 
 
 # fx ops that preserve the underlying byte storage of a tensor (no dtype
-# change, no arithmetic).  Used to trace a matmul operand back to its raw
+# change, no arithmetic; a dot operand's ``_mask_to`` zeroes lanes of its
+# input in kind).  Used to trace a matmul operand back to its raw
 # ``memory_ops.load`` so we can tell a raw fp8 *byte* load apart from a
 # *computed* fp8 register value (e.g. ``p = exp2(...).to(fp8)``).
 _FP8_LOAD_PASSTHROUGH_TARGETS = frozenset(
     {
+        _mask_to,
         torch.ops.aten.clone.default,
         torch.ops.aten.detach.default,
         torch.ops.aten.permute.default,
