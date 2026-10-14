@@ -3901,7 +3901,6 @@ class CuteBackend(Backend):
                     block_ids in device_ir.grid_block_ids
                     and config.get("cute_collective_compute", "warp") == "warp"
                 ):
-                    # shortcut: fit either M/N axis; map axes for wider auto counts.
                     cap = min(
                         (
                             spec.num_threads.config_get(config.num_threads, bid, 0) or 1
