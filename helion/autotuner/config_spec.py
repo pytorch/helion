@@ -7217,6 +7217,20 @@ class ConfigSpec:
         result: list[tuple[str | int, ...]] = [
             (key, *field.fingerprint()) for key, field in self._flat_fields().items()
         ]
+        full_extent_slots = tuple(
+            int(item.allow_full_extent) for item in self.reduction_loops
+        )
+        if any(full_extent_slots):
+            # Old flat full-size tokens represented persistent reductions. Do
+            # not reinterpret a cached legacy token as an explicit full loop.
+            # Version the capability, not the bound extent: autotune_multi must
+            # accept the same kernel at power-of-two and neighboring shapes.
+            result.append(
+                (
+                    "reduction_loop_full_extent_encoding_v2",
+                    *full_extent_slots,
+                )
+            )
         acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
         if acf_fragment is not None:
             result.append(
@@ -7661,10 +7675,20 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         block_id: int,
         size_hint: int,
         allow_non_power_of_two: bool = False,
+        allow_full_extent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
+        self.allow_full_extent = allow_full_extent
+
+    def _full_extent_chunk(self) -> int | None:
+        # A padded single iteration can preserve vector packets where an exact
+        # non-power-of-two chunk leaves too few elements per thread. Keep it
+        # distinct from persistent None, just like an exact full-width chunk.
+        if self.allow_full_extent and self.size_hint >= 8:
+            return next_power_of_2(self.size_hint)
+        return None
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -7679,6 +7703,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
+        if high == self._full_extent_chunk():
+            # The full padded chunk now denotes an explicit rolled loop.
+            # Reserve the next power of two for None, retaining the old default
+            # whenever that default selected a persistent reduction.
+            old_high = high
+            high *= 2
+            if default == old_high:
+                default = high
         return BlockSizeFragment(low, high, default)
 
     def _flat_config(
@@ -7694,18 +7726,21 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
         if value >= self.size_hint and not (
-            self.allow_non_power_of_two
-            and value == self.size_hint
-            and value & (value - 1) != 0
+            value == self._full_extent_chunk()
+            or (
+                self.allow_non_power_of_two
+                and value == self.size_hint
+                and value & (value - 1) != 0
+            )
         ):
             return None  # max size becomes persistent reduction
         return value
 
     def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
         # Encode None ("persistent reduction") so the inverse ``_flat_config``
-        # decodes it back to None. ``_flat_config`` returns None for any value
-        # >= size_hint, so the encoding must also be >= size_hint: use the
-        # fragment's ``high`` (always >= size_hint). The fragment *default* is
+        # decodes it back to None. The fragment's ``high`` is >= size_hint,
+        # and strictly greater when the full extent is an explicit loop.
+        # The fragment *default* is
         # capped at max_reduction_loop and can fall below size_hint, which would
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
@@ -7748,11 +7783,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # multi-pass kernel like layer_norm reuses the loaded inputs across
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
-        # sync regardless of how the value was generated.
+        # sync regardless of how the value was generated. CuTe can opt into
+        # a distinct explicit full-loop encoding; None remains persistent.
+        # This distinction does not waive multi-pass cache correctness checks.
         if (
             isinstance(normalized, int)
             and normalized >= self.size_hint
             and normalized & (normalized - 1) == 0
+            and normalized != self._full_extent_chunk()
         ):
             return None
         return normalized
