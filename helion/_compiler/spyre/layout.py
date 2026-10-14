@@ -21,6 +21,11 @@ if TYPE_CHECKING:
     import torch
 
 
+#: A stick is a 128-byte aligned chunk, so a pool buffer starting mid-stick
+#: would split one. Used to align ``hbm_pool`` byte offsets.
+STICK_BYTES = 128
+
+
 def device_dtype(dtype: torch.dtype) -> object:
     """The ``DataFormats`` member torch-spyre uses for a torch dtype.
 

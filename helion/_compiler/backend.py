@@ -512,6 +512,16 @@ class Backend(abc.ABC):
         """Return the tensor metadata used while tracing a kernel input."""
         return tensor
 
+    def backend_tunables(self) -> dict[str, object]:
+        """Extra autotuner knobs this backend contributes, by config key.
+
+        Maps a config key to a ``ConfigSpecFragment`` describing its search
+        space. Registered into ``ConfigSpec.user_defined_tunables`` so the
+        autotuner searches them like any other knob, rather than the backend
+        hard-coding a decision the user can neither see nor override.
+        """
+        return {}
+
     def record_input_layout(
         self, real: torch.Tensor, fake: torch.Tensor
     ) -> None:

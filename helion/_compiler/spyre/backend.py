@@ -35,6 +35,13 @@ if TYPE_CHECKING:
 #: trailing block size so no config can split a stick.
 _MAX_ELEMS_PER_STICK = 64
 
+#: Hard ceiling on concurrent LX intermediates. A **count**, not a byte budget:
+#: 3 concurrent LX buffers fail at launch at both 8 KB each (64x64 fp16) and
+#: 64 KB each (128x256 fp16) -- an 8x footprint difference with the same wall.
+#: The nominal budget (_LX_TRACKER_CAPACITY_BYTES * dxp_lx_frac_avail, ~406 KB,
+#: scratchpad/allocator.py:169,:1524) would allow ~6 and is not a safe guide.
+_MAX_LX_BUFFERS = 2
+
 #: A Spyre launch costs milliseconds and the device is a shared, serialized
 #: resource, so keep the sample count low: autotuning sweeps dozens of configs.
 _BENCH_WARMUP = 1
@@ -59,6 +66,7 @@ class SpyreBackend(Backend):
         {
             "block_sizes",
             "range_unroll_factors",
+            "spyre_lx_buffers",
         }
     )
 
@@ -67,6 +75,8 @@ class SpyreBackend(Backend):
         self.emitter = SpyreEmitter()
         #: id(fake tensor) -> stick axis of the real input it stands for.
         self._input_stick_dims: dict[int, int] = {}
+        #: id(fake tensor) -> host rank, so output_stick_dim can match by rank.
+        self._input_ranks: dict[int, int] = {}
 
     @property
     def name(self) -> str:
@@ -102,6 +112,33 @@ class SpyreBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         return key in self._SUPPORTED_CONFIG_KEYS
+
+    def backend_tunables(self) -> dict[str, object]:
+        """Expose LX residency to the autotuner instead of hard-coding it.
+
+        How many intermediates live in LX before the rest spill to ``hbm_pool``
+        is a real performance decision, and the right value is kernel-dependent
+        -- so it must be searched, not baked in. Nothing in the stack diagnoses
+        asking for too much: the specs validate, the bundle builds, the backend
+        compiler succeeds, and the kernel then fails *at launch* with
+        ``RAS::RUNTIMESCHEDULER::ComputeHardwareError``, which also poisons the
+        device stream for the rest of the process.
+
+        The ceiling is a **count, not a byte budget**: measured on this device,
+        3 concurrent LX intermediates fail at both 8 KB each (64x64 fp16) and
+        64 KB each (128x256 fp16), an 8x difference in footprint with the same
+        wall. So the search space is capped at ``_MAX_LX_BUFFERS`` and
+        ``autotune_config_is_viable`` rejects anything above it, rather than
+        letting the autotuner discover the limit as a hardware fault.
+        """
+        from ...autotuner.config_spec import IntegerFragment
+
+        return {
+            # low=0 (everything in hbm_pool) .. high=_MAX_LX_BUFFERS, default 2.
+            "spyre_lx_buffers": IntegerFragment(
+                0, _MAX_LX_BUFFERS, _MAX_LX_BUFFERS
+            ),
+        }
 
     def supports_precompile(self) -> bool:
         return False
@@ -254,6 +291,11 @@ class SpyreBackend(Backend):
           ``SubprocException`` from the backend compiler, which an autotune
           sweep hits constantly as it shrinks block sizes.
         """
+        lx_buffers = config.config.get("spyre_lx_buffers")
+        if lx_buffers is not None and not (0 <= int(lx_buffers) <= _MAX_LX_BUFFERS):
+            # Above the measured ceiling the kernel fails at launch, not here.
+            return False
+
         block_sizes = config.block_sizes
         if not block_sizes:
             return True
@@ -319,6 +361,7 @@ class SpyreBackend(Backend):
 
         try:
             self._input_stick_dims[id(fake)] = stick_dim_of(real)
+            self._input_ranks[id(fake)] = real.dim()
         except Exception:
             # A dtype or layout the backend cannot describe fails later, at the
             # point where it is actually used and can be named.
@@ -326,6 +369,23 @@ class SpyreBackend(Backend):
 
     def input_stick_dim(self, fake: torch.Tensor) -> int | None:
         return self._input_stick_dims.get(id(fake))
+
+    def output_stick_dim(self, rank: int) -> int | None:
+        """Stick axis every rank-``rank`` kernel tensor agrees on, if any.
+
+        A kernel's output tensor is recorded by ``record_input_layout`` like any
+        other argument (``torch.empty_like(x)`` in the kernel body is still a
+        host tensor passed to the launcher), but which recorded entry *is* the
+        output is not known here. When every rank-matching tensor shares one
+        stick axis, that axis is unambiguous and is the right target; a mixture
+        means a genuine conflict, which the relayout path resolves per operand.
+        """
+        axes = {
+            dim
+            for key, dim in self._input_stick_dims.items()
+            if self._input_ranks.get(key) == rank
+        }
+        return axes.pop() if len(axes) == 1 else None
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Install a Spyre lowering for every compute node.

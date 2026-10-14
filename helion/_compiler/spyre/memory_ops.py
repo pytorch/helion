@@ -134,6 +134,30 @@ def _(state: CodegenState) -> None:
         raise exc.BackendUnsupported(
             "spyre", f"store of a non-buffer value: {type(value).__name__}"
         )
+
+    import os as _os
+    if _os.environ.get("SPYRE_DBG_STORE"):
+        print(f"[dbg] store: value.stick={value.stick_dim} dest.stick={dest.stick_dim}"
+              f" dest={dest.name} dest_alloc={dest.allocation}", flush=True)
+    if value.stick_dim != dest.stick_dim:
+        # Closing relayout, the mirror of M3's opening one. The compute follows
+        # the *inputs'* stick axis, but the destination buffer need not share it
+        # -- notably ``torch.empty_like`` of a transposed Spyre tensor returns a
+        # default trailing-dim buffer, so a fully transposed kernel computes on
+        # dim 0 and must store to a dim-1 buffer. Writing the computed layout
+        # into that buffer is silently wrong (~99% error, nothing raises).
+        import sympy
+
+        symbols = [sympy.Symbol(f"c{i}") for i in range(len(dest.sizes))]
+        # ReStickifyOpHBM reads and writes HBM. The value usually lands in lx,
+        # so redirect its producer into a pool buffer first and relayout from
+        # there; an lx source is rejected by the backend scheduler with
+        # "Expect valid lower and upper bound parameters".
+        staged = emitter.restage_to_pool(value)
+        emitter.emit_restickify_into(staged, dest, symbols)
+        _mark_device_body(state)
+        return
+
     emitter.redirect_output(value, dest)
 
 

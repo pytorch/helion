@@ -485,6 +485,9 @@ class CompileEnvironment:
             device=device,
             num_sm=_num_sm,
             log_restrictions_verbose=settings.autotune_log_search_space_verbose,
+            # A backend may contribute its own knobs so that decisions it would
+            # otherwise hard-code become part of the search space.
+            user_defined_tunables=self.backend.backend_tunables() or None,
         )
         # Correctness facts registered by compiler heuristics can depend on
         # dynamic runtime inputs even when seed generation is disabled or later

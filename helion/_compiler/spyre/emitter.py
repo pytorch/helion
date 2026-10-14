@@ -25,12 +25,6 @@ if TYPE_CHECKING:
     import torch
 
 
-#: Concurrent LX intermediates to request before spilling to the HBM pool.
-#: Empirical, not nominal: 3 concurrent 128x256 fp16 LX buffers fail at launch
-#: with a Compute CB hardware error, 2 work.
-_MAX_LX_BUFFERS = 2
-
-
 @dataclasses.dataclass
 class Operand:
     """One Spyre buffer, as Helion knows it before an OpSpec needs it.
@@ -181,6 +175,27 @@ class SpyreEmitter:
     def __init__(self) -> None:
         self.reset()
 
+    @staticmethod
+    def _lx_budget() -> int:
+        """Concurrent LX intermediates allowed, from the active config.
+
+        ``spyre_lx_buffers`` is a real autotuner knob (see
+        ``SpyreBackend.backend_tunables``), so residency is searched rather than
+        hard-coded. Falls back to the measured ceiling when no config is active
+        -- e.g. a direct emit outside a bound kernel.
+        """
+        from .backend import _MAX_LX_BUFFERS
+
+        try:
+            from ..device_function import DeviceFunction
+
+            value = DeviceFunction.current().config.config.get("spyre_lx_buffers")
+        except Exception:
+            return _MAX_LX_BUFFERS
+        if value is None:
+            return _MAX_LX_BUFFERS
+        return max(0, min(int(value), _MAX_LX_BUFFERS))
+
     def reset(self) -> None:
         #: The spec tree. ``_stack[-1]`` is the list currently being appended
         #: to, so opening a LoopSpec just pushes its body.
@@ -282,18 +297,26 @@ class SpyreEmitter:
         here and anything beyond it spills to ``hbm_pool``, which is the
         residency plan 4.4 proposed in the first place.
         """
-        if residency == "lx" and self._n_lx >= _MAX_LX_BUFFERS:
+        if residency == "lx" and self._n_lx >= self._lx_budget():
             residency = "hbm_pool"
         if residency == "lx":
             allocation: dict[str, Any] = {"lx": self._n_lx}
             self._n_lx += 1
         elif residency == "hbm_pool":
-            allocation = {"hbm_pool": self._n_pool}
-            self._n_pool += 1
+            # The pool value is a **byte offset**, not a slot index: SDSC codegen
+            # reads it straight into ``start_addr``
+            # (codegen/superdsc.py:1620-1626). Handing out 0,1,2,3 overlaps every
+            # buffer at nearly the same address -- which validates, compiles and
+            # runs, and silently returns ~95% wrong results. Allocate a real
+            # offset instead, stick-aligned so no buffer starts mid-stick.
             n = 1
             for s in sizes:
                 n *= s
-            self.pool_size += n * dtype.itemsize
+            span = n * dtype.itemsize
+            allocation = {"hbm_pool": self.pool_size}
+            self._n_pool += 1
+            stride = layout.STICK_BYTES
+            self.pool_size += -(-span // stride) * stride
         else:
             raise exc.BackendUnsupported("spyre", f"residency: {residency}")
 
@@ -507,6 +530,90 @@ class SpyreEmitter:
                 ],
             )
         )
+
+    def restage_to_pool(self, value: Operand) -> Operand:
+        """Move ``value`` out of ``lx`` into the HBM pool, in place.
+
+        ``ReStickifyOpHBM`` operates on HBM, so a value produced into ``lx``
+        cannot be relayouted directly. Rather than emit a copy, rebind the
+        producing OpSpec's output onto a pool buffer of the same layout --
+        the same rewrite ``redirect_output`` performs for a store.
+        """
+        if "lx" not in value.allocation:
+            return value
+        staged = self.add_intermediate(
+            f"{value.name or 'buf'}_staged",
+            list(value.sizes),
+            value.dtype,
+            value.stick_dim,
+            residency="hbm_pool",
+        )
+        self.redirect_output(value, staged)
+        return staged
+
+    def emit_restickify_into(
+        self, source: Operand, dest: Operand, symbols: list[sympy.Expr]
+    ) -> None:
+        """Relayout ``source`` directly into an existing buffer ``dest``.
+
+        The closing counterpart to :meth:`emit_restickify`, which allocates a
+        fresh intermediate. Here the destination already exists (it is the
+        kernel's output), so the relayout writes it in place.
+
+        ``dest`` must be HBM-resident: an otherwise identical relayout writing
+        an ``lx`` destination passes validation, compiles, launches and returns
+        wrong data (measured max|d| ~1.0 on a [0,1) input versus fp16 rounding
+        error for HBM), so a non-HBM destination fails loudly here.
+        """
+        from torch_spyre._inductor.constants import RESTICKIFY_OP
+
+        if source.stick_dim == dest.stick_dim:
+            raise exc.BackendUnsupported(
+                "spyre", "closing restickify between identical stick axes"
+            )
+        if "lx" in dest.allocation:
+            raise exc.BackendUnsupported(
+                "spyre", "ReStickifyOpHBM cannot write an lx destination"
+            )
+        # A relayout needs a real work division: with every dim unsplit the
+        # backend scheduler rejects the program with "Expect valid lower and
+        # upper bound parameters". The captured reference splits its leading
+        # non-stick dim (golden/ref_restickify.py: c0 over 2 cores), so split
+        # the leading dim that is not the destination's stick axis.
+        splits = [1] * len(dest.sizes)
+        for dim in range(len(dest.sizes)):
+            if dim == dest.stick_dim:
+                continue
+            splits[dim] = self._relayout_split(dest.sizes[dim])
+            break
+
+        import sympy
+
+        iteration_space = {
+            sym: (sympy.Integer(size), split)
+            for sym, size, split in zip(symbols, dest.sizes, splits, strict=True)
+        }
+        self.emit(
+            self.op_spec(
+                RESTICKIFY_OP,
+                is_reduction=False,
+                iteration_space=iteration_space,
+                args=[
+                    source.tensor_arg(symbols, is_input=True),
+                    dest.tensor_arg(symbols, is_input=False),
+                ],
+            )
+        )
+
+    @staticmethod
+    def _relayout_split(extent: int) -> int:
+        """Cores for a relayout's split dim: the reference uses a small split."""
+        from .backend import _sencores
+
+        for candidate in (2, 4, 1):
+            if candidate <= _sencores() and extent % candidate == 0:
+                return candidate
+        return 1
 
     def emit_zero_fill(self, operand: Operand) -> None:
         """Zero an accumulator with an ``identity`` from a scalar constant.

@@ -155,9 +155,13 @@ def _emit_pointwise(
     # validates, then fails in the backend scheduler with
     # "There must be at least one valid candidate".
     #
-    # The output's axis is the trailing dim, torch-spyre's default tiled layout
-    # and what every graph input carries unless its real layout says otherwise.
-    stick_dim = len(sizes) - 1
+    # The target axis is the one the *kernel's own output* will be stored on, so
+    # the final store needs no relayout. Assuming the trailing dim instead is
+    # wrong whenever the caller's output tensor is laid out otherwise: with all
+    # operands transposed (dim_order=[1,0]) the chain still computed on dim 1
+    # and wrote a dim-1-sticked result into a dim-0-sticked buffer, returning
+    # ~99% wrong values with no error anywhere.
+    stick_dim = _output_stick_dim(len(sizes))
     if any(o.stick_dim != stick_dim for o in inputs):
         inputs = [
             o
@@ -170,7 +174,9 @@ def _emit_pointwise(
         node.name, sizes, val.dtype, stick_dim, residency="lx"
     )
 
-    iteration_space = _iteration_space(symbols, sizes, splits)
+    iteration_space = _iteration_space(
+        symbols, sizes, splits, stick_dim, val.dtype
+    )
     args = [o.tensor_arg(symbols, is_input=True) for o in inputs]
     args.append(out.tensor_arg(symbols, is_input=False))
 
@@ -633,13 +639,47 @@ def _matmul_arg(
     )
 
 
+def _output_stick_dim(rank: int) -> int:
+    """Stick axis of the kernel's output tensor, read from its real layout.
+
+    Falls back to the trailing dim -- torch-spyre's default tiled layout -- when
+    no output layout was recorded, which is the common case.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    backend = CompileEnvironment.current().backend
+    recorded = backend.output_stick_dim(rank)
+    return rank - 1 if recorded is None else recorded
+
+
 def _iteration_space(
-    symbols: list[sympy.Symbol], sizes: list[int], splits: list[int]
+    symbols: list[sympy.Symbol],
+    sizes: list[int],
+    splits: list[int],
+    stick_dim: int | None = None,
+    dtype: torch.dtype | None = None,
 ) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
-    """``{sym: (extent, cores)}`` -- the OpSpec field that *is* work division."""
+    """``{sym: (extent, cores)}`` -- the OpSpec field that *is* work division.
+
+    The **stick axis** may be divided only down to whole sticks. The rule at
+    opspec_utils.py:515-516 ("a stick is the unit of transfer, so splitting it
+    across cores would split a stick") is usually read as a statement about the
+    trailing axis, but it binds whichever axis actually carries the sticks: a
+    dim-0-sticked op over 128 elements (2 sticks at fp16) accepts splits 1 and 2
+    and is rejected by the backend scheduler at 3, 4 and 8 with
+    "Expect valid lower and upper bound parameters". Clamp rather than fail --
+    the split is a performance choice, and a lower one is always correct.
+    """
     import sympy
+
+    clamped = list(splits)
+    if stick_dim is not None and dtype is not None and stick_dim < len(sizes):
+        from . import layout as _layout
+
+        sticks = max(1, -(-sizes[stick_dim] // _layout.elems_per_stick(dtype)))
+        clamped[stick_dim] = min(clamped[stick_dim], sticks)
 
     return {
         sym: (sympy.Integer(size), split)
-        for sym, size, split in zip(symbols, sizes, splits, strict=True)
+        for sym, size, split in zip(symbols, sizes, clamped, strict=True)
     }
