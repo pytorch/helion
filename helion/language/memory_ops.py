@@ -1878,8 +1878,19 @@ def _cute_combined_mask(
                 )
             ):
                 # An epilogue-subtile piece of the tile: mask it like the
-                # tile, by the loop's end, which the target may exceed
-                tile_terms.append(f"({global_coord}) < {end}")
+                # tile, by its lanes' place in the loop (not shifted by the
+                # store's own offset) against the loop's end, which the
+                # target may exceed
+                loop_coord = global_coord
+                if tile_info.mask_offset is not None:
+                    mask_offset = state.device_function.literal_expr(
+                        tile_info.mask_offset
+                    )
+                    loop_coord = (
+                        f"({begin_var}) + cutlass.Int32({mask_offset}) + "
+                        f"({local_coord})"
+                    )
+                tile_terms.append(f"({loop_coord}) < {end}")
         if tensor is not None and tensor_dim < tensor.ndim:
             dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
             tile_terms.append(f"({global_coord}) < {dim_size}")

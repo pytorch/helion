@@ -32,6 +32,7 @@ from torch.fx import map_arg
 from ..autotuner.config_fragment import integer_power_of_two
 from ..language.view_ops import split as hl_split
 from .compile_environment import CompileEnvironment
+from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 
 if TYPE_CHECKING:
@@ -369,15 +370,19 @@ def _new_subtile_index_node(
     piece_block_size: int | torch.SymInt,
     block_id: int,
 ) -> torch.fx.Node:
-    offset = piece_idx * piece_shape_size
+    piece_offset = piece_idx * piece_shape_size
+    # The piece starts at its offset within the tile, past any offset the
+    # store adds to the tile's index (``tile.index + k``).
+    base = subscript_tile_info(CompileEnvironment.current(), base_index_node)
     node = graph.call_function(operator.add, (base_index_node, 0))
     node.meta = {
         **base_index_node.meta,
-        "val": base_index_node.meta["val"] + offset,
+        "val": base_index_node.meta["val"] + piece_offset,
         "tile_with_offset": {
             "block_id": block_id,
-            "offset": offset,
+            "offset": (0 if base is None else base.offset) + piece_offset,
             "block_size": piece_block_size,
+            "mask_offset": piece_offset,
         },
     }
     return node

@@ -248,6 +248,29 @@ class TestEpilogueSubtiling(TestCase):
                     expected[:, :100] = a + 1.0
                     torch.testing.assert_close(kernel(a, out), expected)
 
+    @skipIfCute("CuTe does not subtile a store at an offset tile index")
+    def test_pieces_keep_store_offset(self):
+        """A store at ``tile.index + k`` keeps ``k`` in each piece's address
+        (it was dropped), while the pieces are masked by their lanes' place
+        in the loop, not by the shifted index."""
+        for n in (128, 100):
+
+            @helion.kernel(
+                static_shapes=True,
+                config=helion.Config(block_sizes=[16, 64], epilogue_subtile=2),
+            )
+            def shifted_add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    out[tile_m, tile_n.index + 10] = a[tile_m, tile_n] + 1.0
+                return out
+
+            with self.subTest(n=n):
+                a = torch.randn(64, n, device=DEVICE)
+                out = torch.zeros(64, n + 10, device=DEVICE)
+                expected = out.clone()
+                expected[:, 10:] = a + 1.0
+                torch.testing.assert_close(shifted_add_one(a, out), expected)
+
     @skipIfCute("CuTe does not subtile a grid whose end is a tensor")
     def test_pieces_masked_by_tensor_loop_end(self):
         """A root grid whose end is a tensor names its loaded end, which
