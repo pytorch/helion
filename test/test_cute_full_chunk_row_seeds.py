@@ -151,7 +151,8 @@ def test_full_chunk_seeds_keep_legacy_prefix_default_and_packets(
     prior = old.config_spec.compiler_seed_configs
     current = bound.config_spec.compiler_seed_configs
     extras = seeds_for(bound)
-    assert len(extras) == 8
+    assert len(extras) == 9
+    assert extras[-1].get("cute_independent_reduction") is True
     assert current == prior + extras
     assert current == bound.config_spec.compiler_seed_configs
     assert seeds_for(bound) == extras
@@ -173,7 +174,7 @@ def test_full_chunk_seeds_keep_legacy_prefix_default_and_packets(
     assert default == old_default
     assert bound.to_code(default) == old.to_code(old_default)
     chunk = 1 << (size - 1).bit_length()
-    for seed in extras:
+    for seed in extras[:-1]:
         with bound.env:
             flat, effective = generation.strict_config_pair(seed)
             assert generation.strict_unflatten(flat) == effective
@@ -359,7 +360,7 @@ def test_unclassified_load_column_and_caps_decline() -> None:
 def test_offset_layout_never_gains_vector_alignment() -> None:
     bound = bind(1, 4096, torch.bfloat16, layout="offset")
     seeds = seeds_for(bound)
-    assert len(seeds) == 8
+    assert len(seeds) == 9
     for seed in seeds:
         code = bound.to_code(seed)
         assert "_consume_prefetch_" not in code
@@ -406,8 +407,8 @@ def test_block_id_mapping_and_policy_indices_are_not_positions() -> None:
     for seq in sequences.values():
         seq.reverse()
     reordered = seeds_for(bound)
-    assert len(reordered) == len(original) == 8
-    for before, after in zip(original, reordered, strict=True):
+    assert len(reordered) == len(original) == 9
+    for before, after in zip(original[:-1], reordered[:-1], strict=True):
         for name in sequences:
             assert after[name] == list(reversed(before[name]))
         with bound.env:
@@ -428,7 +429,7 @@ def test_pdl_profiles_follow_target_search_domain(
     bound = bind(1, 4096, torch.bfloat16)
     with patch.object(bound.config_spec, "target_device_capability", target):
         seeds = seeds_for(bound)
-    assert len(seeds) == (8 if target is not None and target >= (9, 0) else 5)
+    assert len(seeds) == (9 if target is not None and target >= (9, 0) else 6)
     assert any(seed.get("cute_replicated_reduction", False) for seed in seeds)
 
 
@@ -468,7 +469,7 @@ def test_replication_carrier_keeps_shape_structure_and_reference_geometry(
         old = bind(3, size, dtype, static=static, layout=layout)
     bound = bind(3, size, dtype, static=static, layout=layout)
     seeds = seeds_for(bound)
-    assert 1 <= len(seeds) <= 8
+    assert 2 <= len(seeds) <= 9
     packet_seeds = seeds_for(bound, packets_only=True)
     assert (
         bound.config_spec.compiler_seed_configs
@@ -485,11 +486,10 @@ def test_replication_carrier_keeps_shape_structure_and_reference_geometry(
             flat, effective = g.strict_config_pair(seed)
             assert g.strict_unflatten(flat) == effective
         if not packet_seeds:
-            assert len(seeds) == 1
-            expected = helion.Config.from_dict(
-                reference.config | {"cute_replicated_reduction": True}
-            )
-            assert seeds == [expected]
+            assert seeds == [
+                helion.Config.from_dict(reference.config | {key: True})
+                for key in ("cute_replicated_reduction", "cute_independent_reduction")
+            ]
     with old.env:
         assert reference == old.config_spec.autotune_reference_config()
         assert default == old.config_spec.default_config()
@@ -511,7 +511,7 @@ def test_carrier_respects_restricted_reload_and_thread_defaults() -> None:
         patch.object(reload, "_fragment", return_value=EnumFragment(("gmem",))),
     ):
         seeds = seeds_for(bound)
-        assert len(seeds) == 1
+        assert len(seeds) == 2
         with bound.env:
             g = ConfigGeneration(spec)
             flat, effective = g.strict_config_pair(seeds[0])
