@@ -57,11 +57,20 @@ def test_one_reference_carrier_preserves_all_prior_seeds_and_default(
     original = CuteFullChunkRowHeuristic.get_seed_configs
 
     def prior(env: CompileEnvironment, device_ir: DeviceIR) -> list[helion.Config]:
-        return [seed for seed in original(env, device_ir) if not seed.get(KEY, False)]
+        with patch.object(
+            CuteFullChunkRowHeuristic, "_low_thread_seeds", return_value=[]
+        ):
+            return [
+                seed for seed in original(env, device_ir) if not seed.get(KEY, False)
+            ]
 
     with patch.object(CuteFullChunkRowHeuristic, "get_seed_configs", side_effect=prior):
         old = bind(3, size, dtype, static=static, layout=layout)
     bound = bind(3, size, dtype, static=static, layout=layout)
+    with bound.env:
+        additions = CuteFullChunkRowHeuristic._low_thread_seeds(
+            bound.env, bound.host_function.device_ir
+        )
     with old.env:
         old_reference = old.config_spec.autotune_reference_config()
         old_default = old.config_spec.default_config()
@@ -73,6 +82,7 @@ def test_one_reference_carrier_preserves_all_prior_seeds_and_default(
         assert spec.compiler_seed_configs == [
             *old.config_spec.compiler_seed_configs,
             carrier,
+            *additions,
         ]
         assert spec.compiler_default_config == old.config_spec.compiler_default_config
         assert reference == old_reference
@@ -91,8 +101,8 @@ def test_one_reference_carrier_preserves_all_prior_seeds_and_default(
             )
             assert generation.strict_unflatten(flat) == effective
     assert bound.to_code(old_default) == old.to_code(old_default)
-    assert sum(seed.get(KEY, False) for seed in seeds_for(bound)) == 1
-    assert len(seeds_for(bound)) <= 9
+    assert sum(seed.get(KEY, False) for seed in seeds_for(bound)) == 1 + len(additions)
+    assert len(seeds_for(bound)) <= 17
 
 
 @pytest.mark.parametrize("domain", [None, (False,), (False, True)])
@@ -109,8 +119,10 @@ def test_carrier_uses_live_legal_domain_not_current_search_subset(
         fields[KEY] = EnumFragment(domain, search_choices=(False,))
     with patch.object(spec, "_flat_fields", return_value=fields):
         seeds = seeds_for(bound)
-    assert sum(seed.get(KEY, False) for seed in seeds) == int(domain == (False, True))
-    assert len(seeds) == (9 if domain == (False, True) else 8)
+    assert sum(seed.get(KEY, False) for seed in seeds) == (
+        9 if domain == (False, True) else 0
+    )
+    assert len(seeds) == (17 if domain == (False, True) else 8)
 
 
 def test_narrowed_defaults_remain_reference_geometry() -> None:

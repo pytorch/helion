@@ -35,7 +35,10 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
     replication carrier keeps search structure independent of profitable
     geometry, dtype, and layout; the lowering can safely leave it unchanged.
     Append at most one independent-accumulation carrier with the same reference
-    geometry, retaining all prior seeds and defaults (at most nine seeds total).
+    geometry. After that unchanged prefix, append at most eight 128/256-thread
+    independent packet profiles under the same retained-cache budget. These
+    thread counts and the preference for PDL are seed policy, not occupancy or
+    storage-alignment guarantees (at most seventeen seeds total).
     """
 
     name = "cute_full_chunk_row"
@@ -88,11 +91,24 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
             except InvalidConfig:
                 continue
             seeds.append(carrier)
+        seeds.extend(
+            seed for seed in cls._low_thread_seeds(env, device_ir) if seed not in seeds
+        )
         return seeds
 
     @classmethod
-    def _packet_seeds(
+    def _low_thread_seeds(
         cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        return cls._packet_seeds(env, device_ir, independent=True)
+
+    @classmethod
+    def _packet_seeds(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        *,
+        independent: bool = False,
     ) -> list[Config]:
         spec = env.config_spec
         reduction = cast("ReductionLoopSpec", spec.reduction_loops[0])
@@ -175,6 +191,15 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
         fields = spec._flat_fields()
         replicated = fields.get("cute_replicated_reduction")
         pdl = fields.get("cute_pdl")
+        independent_domain = fields.get("cute_independent_reduction")
+        if independent and (
+            not isinstance(independent_domain, EnumFragment)
+            or True not in independent_domain.choices
+            or not isinstance(replicated, EnumFragment)
+            or not isinstance(pdl, EnumFragment)
+            or not pdl.search_values()
+        ):
+            return []
         # Replication is deliberately seed-activated: test legal choices here,
         # then the completed compiler seed list enables its search choices.
         modifiers = (
@@ -192,7 +217,7 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
             and fact.dtype in dtypes
         }
         seeds = []
-        for threads in (512, 1024):
+        for threads in (128, 256) if independent else (512, 1024):
             if (
                 threads > (spec.max_reduction_threads or 1024)
                 or chunk % threads
@@ -218,17 +243,26 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
             )
             if vector is None:
                 continue
-            profiles: list[tuple[str, str | None]] = [
-                ("register", None),
-                ("register_prefetch", None),
+            profiles: list[tuple[str, str | None, bool]] = [
+                ("register", None, False),
+                ("register_prefetch", None, False),
             ]
             if modifiers and policy_indices:
                 profiles.extend(
-                    ("register_prefetch", policy)
+                    ("register_prefetch", policy, True)
                     for policy in ("l2_last", "l1_l2_last")
                     if policy in policy_domain
                 )
-            for reload, policy in profiles:
+            if independent:
+                assert isinstance(replicated, EnumFragment)
+                profiles = [
+                    ("register_prefetch", policy, replicate)
+                    for replicate in (False, True)
+                    if replicate in replicated.choices
+                    for policy in ("l2_last", "l1_l2_last")
+                    if policy in policy_domain and policy_indices
+                ]
+            for reload, policy, replicate in profiles:
                 values: dict[str, Any] = {
                     "block_sizes": [1],
                     "reduction_loops": [chunk],
@@ -258,11 +292,30 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
                     for index in policy_indices:
                         policies[index] = policy
                     values.update(
-                        cute_replicated_reduction=True,
+                        cute_replicated_reduction=replicate,
                         cute_pdl=True,
                         load_eviction_policies=policies,
                     )
+                if independent:
+                    assert isinstance(pdl, EnumFragment)
+                    values.update(
+                        cute_independent_reduction=True,
+                        cute_pdl=True in (pdl.search_values() or ()),
+                    )
                 seed = Config.from_dict(values)
+                if independent:
+                    # Use current legal domains, including any caller-imposed
+                    # narrowing, and never seed a silently repaired geometry.
+                    try:
+                        generation = ConfigGeneration(spec)
+                        flat, effective = generation.strict_config_pair(seed)
+                        if generation.strict_unflatten(flat) != effective or any(
+                            effective.config[key] != value
+                            for key, value in values.items()
+                        ):
+                            continue
+                    except InvalidConfig:
+                        continue
                 if seed not in seeds:
                     seeds.append(seed)
         return seeds
