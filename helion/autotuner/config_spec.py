@@ -1037,6 +1037,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1165,6 +1166,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1296,6 +1298,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1458,6 +1461,7 @@ class ConfigSpec:
         self.cute_scaled_mma_available = False
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
+        self.cute_warp_aggregated_atomics_enabled = False
         self.cute_packet_prefetch_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -4393,6 +4397,24 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
 
+    def _normalize_cute_warp_aggregated_atomics(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_warp_aggregated_atomics"
+        if not self.cute_warp_aggregated_atomics_enabled:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_warp_aggregated_atomics requires relaxed Int32 tickets"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, False)
+        if type(value) is not bool:
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
+
     def _normalize_cute_pdl(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -5055,6 +5077,9 @@ class ConfigSpec:
             self._normalize_cute_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_warp_aggregated_atomics(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
@@ -6886,6 +6911,8 @@ class ConfigSpec:
                     )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
+                if self.cute_warp_aggregated_atomics_enabled:
+                    fields["cute_warp_aggregated_atomics"] = BooleanFragment()
                 if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
                     for key in (
                         "cute_independent_reduction",

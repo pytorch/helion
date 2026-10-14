@@ -393,7 +393,13 @@ _PERSISTENT_VEC_STORE = "_helion_persistent_branch_vec_store"
 _PERSISTENT_VEC_STORE_ADDRESS = 3
 _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 # Float max / min emulated with integer atomics (``cute/atomic_helpers.py``).
-_ATOMIC_HELPERS = frozenset({"_cute_atomic_max_float32", "_cute_atomic_min_float32"})
+_ATOMIC_HELPERS = frozenset(
+    {
+        "_cute_atomic_max_float32",
+        "_cute_atomic_min_float32",
+        "_cute_warp_fetch_add_int32",
+    }
+)
 # The relaxed ``red.global.add.v{2,4}.f32`` flush of a vectorized atomic site
 # (``cute/atomic_ops.py``): one packet of consecutive elements.
 _VECTOR_ATOMIC_HELPERS = frozenset({"_cute_red_add_f32_vec"})

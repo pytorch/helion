@@ -129,6 +129,7 @@ class _BindingFacts:
         self.tensor = tensor
         self.input_sources = [tensor]
         self.source = LocalSource("argument")
+        self.config_spec = SimpleNamespace(target_device_capability=None)
         self.runtime_input_specializations: dict[str, Any] = {}
         self.bound_runtime_input_specialization_results: dict[str, Any] = {}
 

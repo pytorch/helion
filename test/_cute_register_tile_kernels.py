@@ -63,8 +63,7 @@ def col_stats(x: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def col_sum_f32_out(x: torch.Tensor) -> torch.Tensor:
-    """A bf16 tile summed into an fp32 output: the store cannot flush as one
-    16-byte packet of the input dtype, so it stays a per-element store."""
+    """A bf16 tile summed into fp32 to exercise widening output packets."""
     m, n = x.size()
     out = torch.empty(n, dtype=torch.float32, device=x.device)
     for tile_n in hl.tile(n):
