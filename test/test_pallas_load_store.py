@@ -766,7 +766,7 @@ class TestPallasJaggedCarryRejects(TestCase):
         # loudly instead of clobbering the boundary with a plain store.
         seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
         with self.assertRaisesRegex(
-            exc.InductorLoweringError, "block_row .* must be a multiple"
+            exc.InvalidConfig, "block_row .* must be a multiple"
         ):
             _run(seq_offsets, jagged, dense, [8, 128, 128], loop_type, kernel=kernel)
 
@@ -977,7 +977,7 @@ class TestPallasJaggedCarryRejects(TestCase):
             return out
 
         seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
-        with self.assertRaisesRegex(exc.InductorLoweringError, "only grid dimension"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, "only grid dimension"):
             code_and_output(
                 two_grid_bmm,
                 (seq_offsets, jagged, dense),
