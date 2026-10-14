@@ -2241,7 +2241,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, x + x.sum(dim=1, keepdim=True))
-        self.assertNotIn("tl.debug_barrier()", code)
+        self.assertNotIn(_thread_barrier(), code)
 
     @skipIfFn(
         lambda: _get_backend() not in ("triton", "cute"),
