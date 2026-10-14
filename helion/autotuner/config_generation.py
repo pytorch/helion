@@ -323,21 +323,10 @@ class ConfigGeneration:
     def _filter_flash_resident_search_choices(self) -> None:
         if not self.config_spec.cute_flash_search_enabled:
             return
-        from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
         from .._compiler.cute.cute_flash import FLASH_ROW_SUM_SCHEDULE_KEY
         from .._compiler.cute.cute_flash import FLASH_SOFTMAX_LOWERING_KEY
-        from .._compiler.cute.cute_flash import _flash_inactive_lpt_domain
         from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 
-        topology_controls = dict(self._override_values)
-        if self._flash_pipeline_family_override is not None:
-            topology_controls["cute_flash_pipeline_family"] = (
-                self._flash_pipeline_family_override
-            )
-        topology = self.config_spec._cute_flash_config_topology(topology_controls)
-        inactive_lpt = _flash_inactive_lpt_domain(
-            is_causal=self.config_spec._cute_flash_is_causal, topology=topology
-        )
         # Explicit contradictory requests are rejected by override normalization.
         # Only sampled modes need a narrower domain shared by random draws and
         # deterministic coverage, so neither can request an impossible lowering.
@@ -355,15 +344,8 @@ class ConfigGeneration:
                 if all(
                     key not in self._override_values
                     or self._override_values[key] == required
-                    or (
-                        key == FLASH_CAUSAL_LPT_SWIZZLE_KEY
-                        and type(self._override_values[key]) is int
-                        and self._override_values[key] in inactive_lpt
-                    )
                     for key, required in _flash_resident_softmax_overrides(
-                        choice,
-                        is_causal=self.config_spec._cute_flash_is_causal,
-                        topology=topology,
+                        choice
                     ).items()
                 )
             )
@@ -399,28 +381,6 @@ class ConfigGeneration:
                         if row_sum.coverage_choices is None
                         else tuple(
                             c for c in row_sum.coverage_choices if c == "post_acquire"
-                        )
-                    ),
-                ),
-            }
-        lpt = fields.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
-        if "resident_stateful" not in choices and isinstance(lpt, EnumFragment):
-            self._field_view = {
-                **self._flat_fields(),
-                FLASH_CAUSAL_LPT_SWIZZLE_KEY: dataclasses.replace(
-                    lpt,
-                    search_choices=tuple(
-                        c
-                        for c in lpt._active_choices()
-                        if type(c) is int and c in inactive_lpt
-                    ),
-                    coverage_choices=(
-                        None
-                        if lpt.coverage_choices is None
-                        else tuple(
-                            c
-                            for c in lpt.coverage_choices
-                            if type(c) is int and c in inactive_lpt
                         )
                     ),
                 ),
@@ -930,9 +890,7 @@ class ConfigGeneration:
         from .._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 
         owned = _flash_resident_softmax_overrides(
-            config.config.get(FLASH_SOFTMAX_LOWERING_KEY),
-            is_causal=self.config_spec._cute_flash_is_causal,
-            topology=self.config_spec._cute_flash_config_topology(config.config),
+            config.config.get(FLASH_SOFTMAX_LOWERING_KEY)
         )
         return [
             index

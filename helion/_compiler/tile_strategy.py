@@ -8360,9 +8360,11 @@ class TileStrategy:
                     end_expr = _to_sympy(end)
                     end_var_name = state.sympy_expr(end_expr)
                 else:
-                    # Tensor (data-dependent) - end_expr is None, but we still need end_var
+                    # Tensor (data-dependent): no sympy end, so name its load
                     end_expr = None
-                    end_var_name = None
+                    end_var_name = state.codegen.lift(
+                        begin_to_ast(end), dce=True, prefix="end"
+                    ).id
                 block_id_to_info[block_id] = LoopDimInfo(
                     begin_var_name=begin_var_name,
                     begin_expr=begin_expr,

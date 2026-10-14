@@ -54,19 +54,6 @@ _CUTE_VECTOR_ATOMIC_WIDTHS = (2, 4)
 _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY = (9, 0)
 
 
-def _cute_pointer_expr(
-    state: CodegenState,
-    target: torch.Tensor,
-    index: list[object],
-    ast_index: list[object] | tuple[object, ...] | None = None,
-) -> str:
-    from ...language.memory_ops import _cute_index_exprs
-
-    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
-    name = state.device_function.tensor_arg(target).name
-    return _cute_coord_pointer_expr(name, index_exprs)
-
-
 def _cute_coord_pointer_expr(name: str, index_exprs: list[str]) -> str:
     coord = (
         f"({index_exprs[0]},)"
@@ -331,7 +318,9 @@ def _codegen_cute_atomic_rmw(
 
     ast_index = state.ast_args[1]
     assert isinstance(ast_index, (list, tuple))
-    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
+    index_exprs = _cute_index_exprs(
+        state, index, ast_index, tensor=target, for_store=True
+    )
     tensor_name = state.device_function.tensor_arg(target).name
     pointer = _cute_coord_pointer_expr(tensor_name, index_exprs)
     resolved_kwargs = _resolve_cute_atomic_kwargs(cute_func, keyword_names)
@@ -650,7 +639,8 @@ def _cute_vector_atomic_site(
         return False
     # Fail closed to the scalar atomic when the target capability is unknown
     # or below sm_90.
-    capability = CompileEnvironment.current().config_spec.target_device_capability
+    env = CompileEnvironment.current()
+    capability = env.config_spec.target_device_capability
     if capability is None or capability < _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY:
         return False
     # An atomic that is uniform along a live lane loop must stay a scalar
@@ -668,7 +658,8 @@ def _cute_vector_atomic_site(
         for pos, idx in enumerate(index)
         if isinstance(idx, torch.SymInt)
         and (block_id := _cute_tile_axis_block_id(idx)) is not None
-        and target.stride(pos) == 1
+        # A dynamic stride (another dim's size) must not be guarded to 1
+        and env.known_equal(target.stride(pos), 1)
     ]
     if len(lane_axes) != 1:
         return False

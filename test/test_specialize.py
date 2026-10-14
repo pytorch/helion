@@ -9,6 +9,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import supports_block_ptr
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import AssertExpectedJournal
@@ -1002,6 +1003,293 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(
                         masked_copy(x, mask), torch.where(mask, x, 0.0)
                     )
+
+    def test_store_target_dims_record_no_broadcast_guard(self):
+        """A store target never needs to broadcast: ``out.size(0)`` is its
+        own symbol, which a tile over ``M = a.size(0)`` cannot prove covers,
+        yet comparing it with 1 at ``M == 1`` broadcast the 16-row tile onto
+        one row, and the guard split the kernel at M == 1."""
+        configs = [helion.Config(block_sizes=[16, 32])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[16, 32], indexing=indexing)
+                for indexing in indexings
+            ]
+        for config in configs:
+
+            @helion.kernel(static_shapes=False, config=config)
+            def store_add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    out[tile_m, tile_n] = a[tile_m, tile_n] + 1.0
+                return out
+
+            @helion.kernel(static_shapes=False, config=config)
+            def atomic_add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    hl.atomic_add(out, [tile_m, tile_n], a[tile_m, tile_n] + 1.0)
+                return out
+
+            for m in (1, 4, 5):
+                with self.subTest(config=config, m=m):
+                    a = torch.randn(m, 64, device=DEVICE)
+                    out = torch.randn(m, 64, device=DEVICE)
+                    torch.testing.assert_close(store_add_one(a, out.clone()), a + 1.0)
+                    torch.testing.assert_close(
+                        atomic_add_one(a, out.clone()), out + a + 1.0
+                    )
+                    if not self._in_ref_eager_mode:
+                        for kernel in (store_add_one, atomic_add_one):
+                            bound = kernel.bind((a, out))
+                            self.assertEqual(bound._guarded_input_facts(), [])
+
+    def test_size_one_broadcast_store_keeps_tile_mask(self):
+        """Loading ``out`` first guards its size-1 dim to 1, so the following
+        store or atomic broadcasts a wider tile onto it; it must still mask
+        the tile's out-of-range lanes, which would otherwise race (store) or
+        accumulate (atomic) onto the one element.  Epilogue subtiling stores
+        each piece through a sub-tile of the tile."""
+        configs = [helion.Config(block_sizes=[16, 32])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[16, 32], epilogue_subtile=2),
+                *(
+                    helion.Config(block_sizes=[16, 32], indexing=indexing)
+                    for indexing in indexings
+                ),
+            ]
+        for config in configs:
+
+            @helion.kernel(static_shapes=False, config=config)
+            def accumulate(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    out[tile_m, tile_n] = out[tile_m, tile_n] + a[tile_m, tile_n]
+                return out
+
+            @helion.kernel(static_shapes=False, config=config)
+            def atomic_accumulate(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    hl.atomic_add(
+                        out, [tile_m, tile_n], out[tile_m, tile_n] + a[tile_m, tile_n]
+                    )
+                return out
+
+            for shape in ((1, 64), (64, 1), (4, 64)):
+                with self.subTest(config=config, shape=shape):
+                    a = torch.randn(shape, device=DEVICE)
+                    out = torch.randn(shape, device=DEVICE)
+                    torch.testing.assert_close(accumulate(a, out.clone()), out + a)
+                    torch.testing.assert_close(
+                        atomic_accumulate(a, out.clone()), 2 * out + a
+                    )
+
+    def test_size_one_store_with_scalar_index(self):
+        """``out[tile_m, 0]`` with ``out.size(0)`` guarded to 1 (by a load of
+        ``out``) has a scalar store offset, a constexpr at stride 1: it must
+        be expanded to the tile, not have the tile's value squeezed into
+        it."""
+        config = helion.Config(block_sizes=[16])
+
+        @helion.kernel(static_shapes=False, config=config)
+        def store_column(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(a.size(0)):
+                out[tile_m, 0] = a[tile_m, 0] + 1.0
+            return out
+
+        @helion.kernel(static_shapes=False, config=config)
+        def accumulate_column(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(a.size(0)):
+                out[tile_m, 0] = out[tile_m, 0] + a[tile_m, 0]
+            return out
+
+        @helion.kernel(static_shapes=False, config=config)
+        def atomic_column(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(a.size(0)):
+                hl.atomic_add(out, [tile_m, 0], out[tile_m, 0] + a[tile_m, 0])
+            return out
+
+        for m in (1, 4):
+            with self.subTest(m=m):
+                a = torch.randn(m, 3, device=DEVICE)
+                out = torch.randn(m, 3, device=DEVICE)
+                expected = out.clone()
+                expected[:, 0] = a[:, 0] + 1.0
+                torch.testing.assert_close(store_column(a, out.clone()), expected)
+                expected[:, 0] = out[:, 0] + a[:, 0]
+                torch.testing.assert_close(accumulate_column(a, out.clone()), expected)
+                expected[:, 0] += out[:, 0]
+                torch.testing.assert_close(atomic_column(a, out.clone()), expected)
+
+    @skipIfRefEager("stack tensors are not supported in ref eager mode")
+    @skipUnlessBackends(["triton", "cute"])
+    def test_size_one_stack_tensor_store(self):
+        """A stack tensor store at ``M == 1``: the target dim must not be
+        guarded to 1 by the store, and once a load guards it, the store
+        broadcasts its offset to the tile and keeps the tile's mask."""
+
+        @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[16, 32]))
+        def stack_store(
+            x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+        ) -> None:
+            hl.specialize(dev_ptrs.size(0))
+            for tile_m, tile_n in hl.tile(x.size()):
+                tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                tensors[tile_m, tile_n] = (x[tile_m, tile_n] + 1.0)[None, :, :]
+
+        @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[16, 32]))
+        def stack_accumulate(
+            x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+        ) -> None:
+            hl.specialize(dev_ptrs.size(0))
+            for tile_m, tile_n in hl.tile(x.size()):
+                tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                tensors[tile_m, tile_n] = (
+                    tensors[tile_m, tile_n] + x[tile_m, tile_n][None, :, :]
+                )
+
+        for m in (1, 4):
+            with self.subTest(m=m):
+                x = torch.randn(m, 64, device=DEVICE)
+                targets = [torch.randn(m, 64, device=DEVICE) for _ in range(3)]
+                originals = [t.clone() for t in targets]
+                ptrs = torch.as_tensor(
+                    [t.data_ptr() for t in targets], device=DEVICE, dtype=torch.uint64
+                )
+                stack_accumulate(x, ptrs, targets[0])
+                for target, original in zip(targets, originals, strict=True):
+                    torch.testing.assert_close(target, original + x)
+                stack_store(x, ptrs, targets[0])
+                for target in targets:
+                    torch.testing.assert_close(target, x + 1.0)
+                self.assertEqual(
+                    stack_store.bind((x, ptrs, targets[0]))._guarded_input_facts(), []
+                )
+
+    @skipIfNotTriton("block_ptr indexing is Triton-only")
+    @skipUnlessBlockPtr("block_ptr indexing is required")
+    def test_block_ptr_scalar_index_on_size_one_dim(self):
+        """A block_ptr block holds a broadcast dim as 1, and a scalar index
+        drops a dim from the result, so the block cannot be reshaped into the
+        tile; such loads and stores use pointer indexing."""
+        config = helion.Config(block_sizes=[16], indexing="block_ptr")
+
+        @helion.kernel(static_shapes=False, config=config)
+        def load_column(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(out.size(0)):
+                out[tile_m] = x[tile_m, 3] + 1.0
+            return out
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[16], indexing=["pointer", "block_ptr"]),
+        )
+        def store_column(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, 3] = x[tile_m] + 1.0
+            return out
+
+        # At M == 1 the tile's own dim was guarded to 1, leaving a one-element
+        # block that Triton's block pointer rewrite crashed on.
+        @helion.kernel(static_shapes=False, config=config)
+        def add_one(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m] + 1.0
+            return out
+
+        for m in (1, 4):
+            with self.subTest(m=m):
+                x = torch.randn(m, 8, device=DEVICE)
+                out = torch.empty(m, device=DEVICE)
+                torch.testing.assert_close(load_column(x, out), x[:, 3] + 1.0)
+                x = torch.randn(m, device=DEVICE)
+                out = torch.zeros(m, 8, device=DEVICE)
+                expected = out.clone()
+                expected[:, 3] = x + 1.0
+                torch.testing.assert_close(store_column(x, out), expected)
+                torch.testing.assert_close(add_one(x, torch.empty_like(x)), x + 1.0)
+
+    def test_size_one_broadcast_load_feeds_reduction(self):
+        """``bias[tile_m, tile_n]`` with ``bias.size(0) == 1`` broadcasts row
+        0 over the tile.  A load is masked to 0 past the tile's extent, which
+        lets the column sum skip its own mask, so the broadcast rows past
+        ``M`` must be zeroed too (they counted ``bias`` once per row of the
+        block)."""
+        configs = [helion.Config(block_sizes=[32, 16])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[32, 16], indexing=indexing)
+                for indexing in indexings
+            ]
+        for static_shapes in (True, False):
+            for config in configs:
+
+                @helion.kernel(static_shapes=static_shapes, config=config)
+                def column_sums(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+                    m, n = x.size()
+                    out = torch.empty([n], dtype=torch.float32, device=x.device)
+                    for tile_n in hl.tile(n):
+                        acc = hl.zeros([tile_n], dtype=torch.float32)
+                        for tile_m in hl.tile(m):
+                            acc += (x[tile_m, tile_n] + bias[tile_m, tile_n]).sum(0)
+                        out[tile_n] = acc
+                    return out
+
+                for m in (1, 4, 20):
+                    with self.subTest(static_shapes=static_shapes, config=config, m=m):
+                        x = torch.randn(m, 64, device=DEVICE)
+                        bias = torch.randn(1, 64, device=DEVICE)
+                        torch.testing.assert_close(
+                            column_sums(x, bias),
+                            (x + bias).sum(0),
+                            rtol=1e-4,
+                            atol=1e-4,
+                        )
+
+    @skipIfRefEager("stack tensors are not supported in ref eager mode")
+    @skipUnlessBackends(["triton", "cute"])
+    def test_size_one_broadcast_stack_load_feeds_reduction(self):
+        """A stack tensor load that broadcasts a size-1 dim onto a wider tile
+        must also be 0 past the tile's extent before a reduction over it."""
+        for static_shapes in (True, False):
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 32]),
+            )
+            def stack_column_sums(
+                x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+            ) -> torch.Tensor:
+                m, n = x.size()
+                s = hl.specialize(dev_ptrs.size(0))
+                out = torch.empty([s, n], dtype=torch.float32, device=x.device)
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([s, tile_n], dtype=torch.float32)
+                    for tile_m in hl.tile(m):
+                        tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                        acc += tensors[tile_m, tile_n].sum(1)
+                    out[:, tile_n] = acc
+                return out
+
+            with self.subTest(static_shapes=static_shapes):
+                x = torch.randn(20, 64, device=DEVICE)
+                rows = [torch.randn(1, 64, device=DEVICE) for _ in range(4)]
+                ptrs = torch.as_tensor(
+                    [r.data_ptr() for r in rows], device=DEVICE, dtype=torch.uint64
+                )
+                torch.testing.assert_close(
+                    stack_column_sums(x, ptrs, rows[0]),
+                    torch.stack([r[0] * 20 for r in rows]),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
 
     def test_own_extent_dims_record_no_broadcast_guard(self):
         """A dim indexed by a tile over its own size cannot broadcast, so code

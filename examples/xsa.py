@@ -50,9 +50,15 @@ import helion.language as hl
 # fast_math: the epilogue's divisions by the row's softmax sum and V norm
 # become a hoisted reciprocal and multiplies, and exp2 is approximate.
 @helion.kernel(
-    fast_math=True,
     # Static shapes provides a speedup for attention.
     static_shapes=True,
+    # fast_math: the CuTe flash backend runs this online softmax (and its row
+    # epilogue) on the fused flash path and offers its polynomial (degree-2)
+    # exp2 packets, an approximation of ex2.approx, only under this setting;
+    # the Triton backend takes the approximate divide (fast_dividef,
+    # div.approx.ftz.f32) for the plain divisions (output normalization, the
+    # epilogue's V normalization); exp2 keeps libdevice.
+    fast_math=True,
     # Use the manual matmul+softmax reference as autotune's correctness anchor.
     # Otherwise `_compute_baseline` compiles Helion's default config, which OOMs
     # VMEM on TPU at large shapes (V is left as a VMEM ref because of the

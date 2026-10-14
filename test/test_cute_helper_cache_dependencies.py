@@ -149,6 +149,28 @@ def test_wrapper_generator_edit_invalidates_all_kinds(source_tree: Path) -> None
     assert all(old != _key(kernel) for old, kernel in zip(before, kernels, strict=True))
 
 
+@pytest.mark.parametrize(
+    "edited",
+    ("_compiler/cute/reduce_helpers.py", "_compiler/cute/cluster_helpers.py"),
+)
+def test_reduction_helper_edits_invalidate_ordinary_and_wrapper_keys(
+    source_tree: Path, edited: str
+) -> None:
+    # The generated source and plans stay identical while the compiled helper
+    # changes. The pre-trace key must invalidate both ordinary and wrapper IR.
+    path = source_tree / edited
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("def helper():\n    return 1\n")
+    kernels = [_kernel(None), *map(_kernel, source_dependencies._WRAPPER_DEPENDENCIES)]
+    before = list(map(_key, kernels))
+    assert all(key is not None for key in before)
+    path.write_text("def helper():\n    return 2\n")
+    after = list(map(_key, kernels))
+    assert all(old != new for old, new in zip(before, after, strict=True))
+    path.unlink()
+    assert all(_key(kernel) is None for kernel in kernels)
+
+
 @pytest.mark.parametrize("schedule", ["scalar", "resident", "pipelined"])
 @skipUnlessBackends(["cute"])
 def test_ordinary_resident_codegen_tracks_helper_edits_and_missing_source(

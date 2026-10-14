@@ -181,12 +181,15 @@ def _baseline_unless_tpu(fn: Callable[..., Any]) -> Callable[..., Any] | None:
     return None if DEVICE.type == "tpu" else fn
 
 
-# fast_math: approximate exp2 in the online softmax and division in the
-# final normalization.
+# fast_math: the CuTe flash backend offers its polynomial (degree-2) exp2
+# packets, an approximation of ex2.approx, only under this setting; the Triton
+# backend takes the approximate divide (fast_dividef, div.approx.ftz.f32) for
+# the output normalization and Inductor's use_fast_math (torch.exp lowers to
+# the flush-to-zero tl.math.exp; exp2 keeps libdevice).
 @helion.kernel(
-    fast_math=True,
     # Static shapes provides a speedup for attention
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_baseline_unless_tpu(_attention_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -259,9 +262,11 @@ def attention(
     return out.view(q_in.size()), lse.reshape(q_in.size()[:-1])
 
 
+# fast_math: see the note at ``attention``.
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -321,8 +326,10 @@ def causal_attention(
     return out.view(q_in.size()), lse.view(q_in.size()[:-1])
 
 
+# fast_math: see the note at ``attention``.
 @helion.kernel(
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_baseline_unless_tpu(_attention_output_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -371,11 +378,10 @@ def attention_output(
     return out.view(q_in.size())
 
 
-# fast_math: approximate exp2 in the online softmax and division in the
-# final normalization.
+# fast_math: see the note at ``attention``.
 @helion.kernel(
-    fast_math=True,
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_output_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -432,8 +438,10 @@ def causal_attention_output(
     return out.view(q_in.size())
 
 
+# fast_math: see the note at ``attention``.
 @helion.kernel(
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_baseline_unless_tpu(_attention_relu_output_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -479,8 +487,10 @@ def attention_relu_output(
     return out.view(q_in.size())
 
 
+# fast_math: see the note at ``attention``.
 @helion.kernel(
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_relu_output_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -534,8 +544,10 @@ def causal_attention_relu_output(
     return out.view(q_in.size())
 
 
+# fast_math: see the note at ``attention``.
 @helion.kernel(
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_biased_attention_baseline,
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -591,10 +603,10 @@ def biased_attention(
     return out.view(q_in.size()), lse.view(q_in.size()[:-1])
 
 
-# fast_math: approximate exp and division.
+# fast_math: see the note at ``attention``.
 @helion.kernel(
-    fast_math=True,
     static_shapes=True,
+    fast_math=True,
     autotune_baseline_fn=_biased_attention_output_baseline,
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
@@ -659,6 +671,8 @@ attention_dynamic: object = helion.kernel(
     attention.fn,
     configs=attention.configs,
     static_shapes=False,
+    # fast_math: see the note at ``attention``.
+    fast_math=True,
 )
 """
 Dynamic shape version of the attention kernel.

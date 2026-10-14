@@ -78,6 +78,7 @@ from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from .._compiler.cute.tile_ops import cute_masked_block_end
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
@@ -548,6 +549,7 @@ def _cute_index_exprs(
     *,
     inactive_slice_expr: str | None = None,
     inactive_singleton_slice_expr: str | None = None,
+    for_store: bool = False,
 ) -> list[str]:
     env = CompileEnvironment.current()
 
@@ -716,7 +718,9 @@ def _cute_index_exprs(
         tile_info = _get_tile_with_offset_info(
             idx, getattr(state, "fx_node", None), pos
         )
-        if tensor is not None and tensor_dim < tensor.ndim:
+        # A store target never needs to broadcast (a valid store's dim covers
+        # the tile's extent), so its dynamic sizes are not compared with 1.
+        if tensor is not None and tensor_dim < tensor.ndim and not for_store:
             if tile_info is not None:
                 env.resolve_broadcast_dim(
                     tensor.shape[tensor_dim], tile_info.block_id, tile_info.offset
@@ -1860,17 +1864,25 @@ def _cute_combined_mask(
                 )
             local_coord = f"({idx_var}) - ({begin_var})"
 
+        offset_expr = state.device_function.literal_expr(tile_info.offset)
+        global_coord = f"({begin_var}) + cutlass.Int32({offset_expr}) + ({local_coord})"
         tile_terms = []
         if tile_info.block_size is not None:
             block_size_expr = state.device_function.literal_expr(tile_info.block_size)
             tile_terms.append(f"({local_coord}) < cutlass.Int32({block_size_expr})")
+            if mask_var_for_block_id(block_id) is not None and (
+                end := cute_masked_block_end(
+                    state.codegen,
+                    _cute_remap_block_id(state, block_id),
+                    "an epilogue-subtile store",
+                )
+            ):
+                # An epilogue-subtile piece of the tile: mask it like the
+                # tile, by the loop's end, which the target may exceed
+                tile_terms.append(f"({global_coord}) < {end}")
         if tensor is not None and tensor_dim < tensor.ndim:
-            offset_expr = state.device_function.literal_expr(tile_info.offset)
             dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
-            tile_terms.append(
-                f"(({begin_var}) + cutlass.Int32({offset_expr}) + "
-                f"({local_coord})) < {dim_size}"
-            )
+            tile_terms.append(f"({global_coord}) < {dim_size}")
         return tile_terms
 
     def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:

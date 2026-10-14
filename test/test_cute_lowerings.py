@@ -14725,6 +14725,27 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("indices_0", code)
         self.assertIn("out = 1", code)
 
+    def test_dead_lane_loop_elimination_keeps_a_carried_accumulator(self) -> None:
+        # The split's per-lane accumulation of a reduction whose input ignores
+        # the lane (``hl.full(...).sum()``) reads no lane coordinate, but each
+        # iteration adds one lane's element: splicing it counted one lane.
+        body: list[ast.AST] = [
+            _create_lane_loop(
+                "synthetic_lane_0",
+                4,
+                [
+                    statement_from_string("full = cutlass.Float32(1.0)"),
+                    statement_from_string("acc = acc + full"),
+                ],
+            )
+        ]
+
+        self.assertFalse(dead_lane_loop_elimination(body))
+        self.assertIn(
+            "for synthetic_lane_0 in range(4)",
+            ast.unparse(ast.Module(body=body, type_ignores=[])),
+        )
+
     def test_wrap_body_skips_unreferenced_lane_loop(self) -> None:
         grid = DeviceGridState(
             strategy=_FakeLoopStrategy([0]),
@@ -15290,6 +15311,7 @@ class TestCuteLowerings(unittest.TestCase):
         fake_env = SimpleNamespace(
             backend=SimpleNamespace(name="cute"),
             block_sizes={0: SimpleNamespace(numel=sympy.Integer(1024))},
+            specialize_expr=lambda expr: expr,
             index_type=lambda: "cutlass.Int32",
         )
         current_grid = DeviceGridState(
@@ -25110,8 +25132,9 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
             backend.lane_index_expr("offset", 1, axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.thread_index_expr(axis=3)
+        arange = backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
-            backend.arange_expr("offsets", "lid", "bs", "cutlass.Int32", axis=3)
+            validate_thread_axis_accesses(ast.parse(arange).body)
         # Root ownership may discard a speculative grid coordinate. Validate
         # the surviving expression, and allow an elided singleton coordinate.
         index = backend.grid_index_expr("offset", "bs", "cutlass.Int32", axis=3)
@@ -25120,8 +25143,9 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         singleton = backend.grid_index_expr("offset", "1", "cutlass.Int32", axis=3)
         self.assertEqual(singleton, "offset")
         validate_thread_axis_accesses(ast.parse(f"index = {singleton}").body)
+        mask = backend.thread_in_tile_mask_expr("bs", axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
-            backend.thread_in_tile_mask_expr("bs", axis=3)
+            validate_thread_axis_accesses(ast.parse(f"mask = {mask}").body)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):
             backend.reduction_index_expr("bs", "cutlass.Int32", 0, axis=3)
         with self.assertRaisesRegex(exc.BackendUnsupported, "thread axis 3"):

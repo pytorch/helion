@@ -66,7 +66,6 @@ from .._compiler.cute.cute_flash import _flash_compound_exp2_packet_overrides
 from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
 from .._compiler.cute.cute_flash import _flash_env_get
-from .._compiler.cute.cute_flash import _flash_inactive_lpt_domain
 from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
@@ -877,6 +876,21 @@ VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc5",
 )
 CUTE_AFFINE_SCAN_SCHEDULE_KEY = "cute_affine_scan_schedule"
+CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
+    "cute_topk_lanes_per_row": (16, 1, 2, 4, 8, 32),
+    "cute_topk_rows_per_block": (8, 1, 2, 4, 16, 32, 64, 128),
+    "cute_topk_vector_width": (8, 1, 2, 4),
+    "cute_topk_output_vector_width": (1, 2, 4, 8),
+    "cute_topk_value_mode": ("gather", "decode"),
+    "cute_topk_key_dtype": ("int32", "float32", "float32_bits", "float32_native"),
+    "cute_topk_rank_mode": ("signed", "ordinal"),
+    "cute_topk_selection_layout": ("replicated", "distributed"),
+    "cute_topk_sort_network": ("batcher", "compact", "compact_pruned"),
+    "cute_topk_key_encoder": ("dsl", "asm", "paired"),
+    "cute_topk_defer_value_gathers": (False, True),
+    "cute_topk_merge_schedule": ("sequential", "balanced"),
+}
+CUTE_TOPK_CONFIG_KEYS: frozenset[str] = frozenset(CUTE_TOPK_CHOICES)
 
 
 def _cute_chunk_recurrence_config_is_safe(
@@ -953,6 +967,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        *CUTE_TOPK_CONFIG_KEYS,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -973,8 +988,11 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
@@ -1058,11 +1076,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        *CUTE_TOPK_CONFIG_KEYS,
         "num_warps",
         "num_stages",
         "pid_type",
         "num_sm_multiplier",
         "maxnreg",
+        "reduction_fusion",
         "indexing",
         "atomic_indexing",
         "load_eviction_policies",
@@ -1096,8 +1116,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
@@ -1224,8 +1247,11 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_loads",
         "cute_fragment_producer_cache",
         "cute_fragment_warp_scan",
+        "cute_fragment_topk_network",
         "cute_fragment_atomic_aggregation",
         "cute_fragment_integer_atomic_epochs",
+        "cute_topk_coarse_keys",
+        "cute_topk_key_recovery",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
@@ -1409,6 +1435,7 @@ class ConfigSpec:
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
+        self.reduction_fusion_available: bool = False
         self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
             BlockIdSequence()
         )
@@ -1535,6 +1562,13 @@ class ConfigSpec:
         # Enabled only after a generic matcher proves a compatible affine scan.
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
+        # Enabled only when the whole root is a supported top-k load/store
+        # dataflow. Its emitter owns the row geometry and vector layout.
+        self.cute_topk_search_enabled = False
+        self.cute_topk_coarse_keys_available = False
+        self.cute_topk_coarse_keys_search_enabled = False
+        self.cute_topk_key_recovery_search_enabled = False
+        self.cute_topk_choices = dict(CUTE_TOPK_CHOICES)
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
         # A separately launched, proved pointwise producer can share one
@@ -1564,6 +1598,8 @@ class ConfigSpec:
             FragmentRootRequirement, ...
         ] = ()
         self.cute_fragment_warp_scan_search_enabled = False
+        self.cute_fragment_topk_network_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_topk_network_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_search_enabled = False
@@ -1633,8 +1669,12 @@ class ConfigSpec:
             tuple[int, int], tuple[int, ...]
         ] = {}
         self._cute_flash_head_dim: int | None = None
+        # V/O head dim when it differs from the Q/K head dim (MLA prefill).
+        self._cute_flash_head_dim_v: int | None = None
         self._cute_flash_num_kv: int | None = None
         self._cute_flash_num_bh: int | None = None
+        # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain rows).
+        self._cute_flash_kv_group: int = 1
         # SM count of the bound device (0 when unknown); small grids seed the
         # 64-row flash tile from it.
         self._cute_flash_device_sm_count: int = 0
@@ -1643,6 +1683,7 @@ class ConfigSpec:
         self._cute_flash_is_causal: bool = False
         self._cute_flash_has_kv_tile_pruning: bool = False
         self._cute_flash_requires_ws_overlap: bool = False
+        self._cute_flash_has_list_walk: bool = False
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
         self._cute_flash_standard_causal_output: bool = False
@@ -1653,6 +1694,26 @@ class ConfigSpec:
         self._cute_flash_has_row_epilogue: bool = False
         self._cute_flash_plain_row_body: bool = True
         self._cute_flash_has_score_modifiers: bool = False
+        self._cute_flash_score_modifier_kinds: tuple[str, ...] = ()
+        # Flex-envelope facts (``score_modifier_kinds == ("flex",)``): the
+        # data-dependent BlockMask list walk (a third variable-trip-count
+        # category next to causal / pruned-interval plans), the captured
+        # region kinds and the separate Q / KV lengths. Recorded here for the
+        # resolver / seed sites that key on them; no searchable field.
+        self._cute_flash_has_list_walk: bool = False
+        self._cute_flash_flex_has_score_region: bool = False
+        self._cute_flash_flex_has_mask_region: bool = False
+        self._cute_flash_q_seq: int | None = None
+        self._cute_flash_kv_seq: int | None = None
+        self._cute_flash_flex_aux_smem_candidates: tuple[int, ...] = ()
+        self._cute_flash_flex_prefetch_regs: tuple[int, ...] = ()
+        self._cute_flash_flex_coalesce_steps: tuple[int, ...] = ()
+        self._cute_flash_flex_hook_ops: int = 0
+        # The kernel's ``fast_math`` setting: the polynomial exp2 packets are
+        # approximations and reach the flash surface only under it. Recorded
+        # by ``enable_cute_flash_search`` and passed to every flash surface
+        # call this spec makes (fragments, resolver, seeds, packet overrides).
+        self._cute_flash_fast_math: bool = False
         self._cute_flash_block_size_targets: dict[int, int] = {}
         # Memo for ``flash_autotune_fragments``: every other input is fixed
         # ConfigSpec state, so (topology_override, pipeline_family_override) is
@@ -1960,6 +2021,14 @@ class ConfigSpec:
                 is_causal=self._cute_flash_is_causal,
                 has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                has_list_walk=self._cute_flash_has_list_walk,
+                flex_has_mask_region=self._cute_flash_flex_has_mask_region,
+                device_sm_count=self._cute_flash_device_sm_count,
+                q_seq=self._cute_flash_q_seq,
+                flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
+                flex_prefetch_regs=self._cute_flash_flex_prefetch_regs,
+                flex_coalesce_steps=self._cute_flash_flex_coalesce_steps,
+                flex_hook_ops=self._cute_flash_flex_hook_ops,
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
@@ -1971,8 +2040,12 @@ class ConfigSpec:
                 has_row_epilogue=self._cute_flash_has_row_epilogue,
                 plain_row_body=self._cute_flash_plain_row_body,
                 has_score_modifiers=self._cute_flash_has_score_modifiers,
+                score_modifier_kinds=self._cute_flash_score_modifier_kinds,
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
+                head_dim_v=self._cute_flash_head_dim_v,
+                kv_group=self._cute_flash_kv_group,
+                fast_math=self._cute_flash_fast_math,
             )
             self._cute_flash_fragments_cache[key] = cached
         return dict(cached)
@@ -1989,11 +2062,13 @@ class ConfigSpec:
             self._cute_flash_head_dim,
             self._cute_flash_num_kv,
             flash_config,
+            head_dim_v=self._cute_flash_head_dim_v,
             dtype=self._cute_flash_dtype,
             num_bh=self._cute_flash_num_bh,
             is_causal=self._cute_flash_is_causal,
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+            has_list_walk=self._cute_flash_has_list_walk,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
@@ -2008,6 +2083,13 @@ class ConfigSpec:
             plain_row_body=self._cute_flash_plain_row_body,
             has_row_epilogue=self._cute_flash_has_row_epilogue,
             has_score_modifiers=self._cute_flash_has_score_modifiers,
+            score_modifier_kinds=self._cute_flash_score_modifier_kinds,
+            kv_group=self._cute_flash_kv_group,
+            fast_math=self._cute_flash_fast_math,
+            flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
+            flex_prefetch_regs=self._cute_flash_flex_prefetch_regs,
+            flex_coalesce_steps=self._cute_flash_flex_coalesce_steps,
+            flex_hook_ops=self._cute_flash_flex_hook_ops,
         )
 
     def _cute_flash_config_topology(self, config: Mapping[str, object]) -> str:
@@ -2089,22 +2171,24 @@ class ConfigSpec:
         # active Boolean fragment validates it.
         if FLASH_MMA_INTERLEAVE_KEY in config:
             config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
-        topology = self._cute_flash_config_topology(config)
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
         if (
-            self._cute_flash_is_causal
-            and type(causal_lpt) is int
-            and config.get(FLASH_SOFTMAX_LOWERING_KEY) != "resident_stateful"
-        ):
-            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = _flash_inactive_lpt_domain(
-                is_causal=self._cute_flash_is_causal, topology=topology
-            )[0]
-        config.update(
-            _flash_resident_softmax_overrides(
-                config.get(FLASH_SOFTMAX_LOWERING_KEY),
-                is_causal=self._cute_flash_is_causal,
-                topology=topology,
+            (
+                self._cute_flash_is_causal
+                or self._cute_flash_has_kv_tile_pruning
+                or self._cute_flash_has_list_walk
             )
+            and type(causal_lpt) is int
+            and self._cute_flash_num_bh is not None
+        ):
+            # A causal launch group wider than the grid (a config carried over
+            # from a larger grid) names the whole-grid order; the resolver
+            # projects the explicit stateful lowering's width below.
+            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = min(
+                causal_lpt, max(self._cute_flash_num_bh, 1)
+            )
+        config.update(
+            _flash_resident_softmax_overrides(config.get(FLASH_SOFTMAX_LOWERING_KEY))
         )
         block_size_targets = self._cute_flash_block_size_target_list()
         if fix_invalid:
@@ -2165,6 +2249,8 @@ class ConfigSpec:
                 small_biased_candidate=self._cute_flash_small_biased_candidate,
                 standard_dense_output=self._cute_flash_standard_dense_output,
                 standard_causal_output=self._cute_flash_standard_causal_output,
+                head_dim_v=self._cute_flash_head_dim_v,
+                fast_math=self._cute_flash_fast_math,
             )
         )
         if self._cute_flash_requires_ws_overlap:
@@ -2347,7 +2433,11 @@ class ConfigSpec:
                 e2e_res,
             )
         )
-        if not self._cute_flash_is_causal:
+        if not (
+            self._cute_flash_is_causal
+            or self._cute_flash_has_kv_tile_pruning
+            or self._cute_flash_has_list_walk
+        ):
             masked_e2e_freq = e2e_freq
             masked_e2e_res = e2e_res
         e2e_offset_period = _flash_e2e_offset_period(
@@ -2514,7 +2604,20 @@ class ConfigSpec:
         has_row_epilogue: bool = False,
         plain_row_body: bool = True,
         has_score_modifiers: bool = False,
+        score_modifier_kinds: Sequence[str] = (),
         device_sm_count: int = 0,
+        head_dim_v: int | None = None,
+        kv_group: int = 1,
+        fast_math: bool = False,
+        has_list_walk: bool = False,
+        flex_has_score_region: bool = False,
+        flex_has_mask_region: bool = False,
+        q_seq: int | None = None,
+        kv_seq: int | None = None,
+        flex_aux_smem_candidates: Sequence[int] = (),
+        flex_prefetch_regs: Sequence[int] = (),
+        flex_coalesce_steps: Sequence[int] = (),
+        flex_hook_ops: int = 0,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
@@ -2523,13 +2626,18 @@ class ConfigSpec:
         self._cute_flash_fragments_cache.clear()
         self._cute_flash_fragments_env_fingerprint = None
         self._cute_flash_head_dim = head_dim
+        self._cute_flash_head_dim_v = (
+            None if head_dim_v is None or head_dim_v == head_dim else head_dim_v
+        )
         self._cute_flash_num_kv = num_kv
         self._cute_flash_num_bh = num_bh
+        self._cute_flash_kv_group = kv_group
         self._cute_flash_tensor_4d_heads = tensor_4d_heads
         self._cute_flash_dtype = dtype
         self._cute_flash_is_causal = is_causal
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
+        self._cute_flash_has_list_walk = has_list_walk
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
         self._cute_flash_standard_causal_output = standard_causal_output
@@ -2544,6 +2652,17 @@ class ConfigSpec:
         self._cute_flash_has_row_epilogue = has_row_epilogue
         self._cute_flash_plain_row_body = plain_row_body
         self._cute_flash_has_score_modifiers = has_score_modifiers
+        self._cute_flash_score_modifier_kinds = tuple(score_modifier_kinds)
+        self._cute_flash_fast_math = fast_math
+        self._cute_flash_has_list_walk = has_list_walk
+        self._cute_flash_flex_has_score_region = flex_has_score_region
+        self._cute_flash_flex_has_mask_region = flex_has_mask_region
+        self._cute_flash_q_seq = q_seq
+        self._cute_flash_kv_seq = kv_seq
+        self._cute_flash_flex_aux_smem_candidates = tuple(flex_aux_smem_candidates)
+        self._cute_flash_flex_prefetch_regs = tuple(flex_prefetch_regs)
+        self._cute_flash_flex_coalesce_steps = tuple(flex_coalesce_steps)
+        self._cute_flash_flex_hook_ops = flex_hook_ops
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -2973,6 +3092,28 @@ class ConfigSpec:
             choices=direct_affine_schedule_choices(step_count)
         )
 
+    def enable_cute_topk_search(
+        self, selection_dtype: torch.dtype | None = None
+    ) -> None:
+        """Expose the independent row, lane, and vector geometry of top-k."""
+        self.cute_topk_search_enabled = True
+        if selection_dtype == torch.float32:
+            # A full FP32 value plus an index cannot fit any 32-bit key.
+            # The 16-bit packed encoders are not legal for this representation.
+            self.cute_topk_choices = {
+                **CUTE_TOPK_CHOICES,
+                "cute_topk_key_dtype": ("int64",),
+                "cute_topk_key_encoder": ("dsl",),
+                "cute_topk_defer_value_gathers": (False,),
+            }
+        # The root emitter supplies its own tiling. Ordinary block sizes do
+        # not change its code; retain valid defaults for shared compiler
+        # bookkeeping without searching duplicate generated kernels.
+        for spec in self.block_sizes:
+            target = spec._fragment(self).default_val
+            spec.autotuner_min = target
+            spec.max_size = target
+
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if "block_sizes" not in config:
             return
@@ -3196,6 +3337,7 @@ class ConfigSpec:
                 flash_attention_seed_configs(
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
+                    head_dim_v=self._cute_flash_head_dim_v,
                     num_bh=self._cute_flash_num_bh,
                     num_sm=self.num_sm,
                     tensor_4d_heads=self._cute_flash_tensor_4d_heads,
@@ -3203,6 +3345,7 @@ class ConfigSpec:
                     is_causal=self._cute_flash_is_causal,
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                    has_list_walk=self._cute_flash_has_list_walk,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
@@ -3213,8 +3356,15 @@ class ConfigSpec:
                     has_row_epilogue=self._cute_flash_has_row_epilogue,
                     plain_row_body=self._cute_flash_plain_row_body,
                     has_score_modifiers=self._cute_flash_has_score_modifiers,
+                    score_modifier_kinds=self._cute_flash_score_modifier_kinds,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                     device_sm_count=self._cute_flash_device_sm_count,
+                    fast_math=self._cute_flash_fast_math,
+                    q_seq=self._cute_flash_q_seq,
+                    flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
+                    flex_prefetch_regs=self._cute_flash_flex_prefetch_regs,
+                    flex_coalesce_steps=self._cute_flash_flex_coalesce_steps,
+                    flex_hook_ops=self._cute_flash_flex_hook_ops,
                 )
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)
@@ -3345,6 +3495,8 @@ class ConfigSpec:
         )
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "reduction_fusion":
+            return self.backend_name != "cute" and self.backend.supports_config_key(key)
         if key == "host_tensor_descriptors":
             return (
                 self.device is not None
@@ -3588,6 +3740,17 @@ class ConfigSpec:
             return
         raise InvalidConfig(
             f"{key}={value!r} requires a supported bounded warp-prefix scan"
+        )
+
+    def _normalize_cute_fragment_topk_network(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        self._normalize_cute_fragment_option(
+            config,
+            "cute_fragment_topk_network",
+            self.cute_fragment_topk_network_root_ids,
+            "a supported complete fragment top-k",
+            fix_invalid=fix_invalid,
         )
 
     def _normalize_cute_fragment_atomic_aggregation(
@@ -4390,6 +4553,65 @@ class ConfigSpec:
                 )
             config.pop(key, None)
 
+    def _normalize_cute_topk(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        for key, choices in self.cute_topk_choices.items():
+            if not self.cute_topk_search_enabled:
+                if key in config and not fix_invalid:
+                    raise InvalidConfig(f"{key} requires a compatible top-k root")
+                config.pop(key, None)
+                continue
+            value = config.setdefault(key, choices[0])
+            if type(value) is not type(choices[0]) or value not in choices:
+                if fix_invalid:
+                    config[key] = choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be one of {choices!r}, got {value!r}"
+                    )
+        if self.cute_topk_search_enabled:
+            lanes = cast("int", config["cute_topk_lanes_per_row"])
+            rows = cast("int", config["cute_topk_rows_per_block"])
+            if lanes * rows > 1024:
+                if fix_invalid:
+                    config["cute_topk_rows_per_block"] = 1024 // lanes
+                else:
+                    raise InvalidConfig(
+                        "cute_topk_lanes_per_row * cute_topk_rows_per_block "
+                        "must not exceed 1024 threads"
+                    )
+
+        key = "cute_topk_coarse_keys"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+        elif not (
+            value is True
+            and self.cute_topk_search_enabled
+            and self.cute_topk_coarse_keys_available
+            and config.get("cute_topk_selection_layout") == "distributed"
+            and config.get("cute_topk_key_dtype") == "int64"
+        ):
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires a complete FP32 distributed Int64-key selection"
+                )
+
+        key = "cute_topk_key_recovery"
+        value = config.get(key, "direct")
+        if value == "direct":
+            config.pop(key, None)
+        elif value != "packed" or config.get("cute_topk_coarse_keys") is not True:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires an enabled coarse-key selection and direct/packed mode"
+                )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -4774,6 +4996,7 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_topk_network(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_atomic_aggregation(
                 config, fix_invalid=_fix_invalid
             )
@@ -4829,6 +5052,7 @@ class ConfigSpec:
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
@@ -5274,6 +5498,7 @@ class ConfigSpec:
             "num_sm_multiplier",
             "maxnreg",
             "host_tensor_descriptors",
+            "reduction_fusion",
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
@@ -5289,6 +5514,17 @@ class ConfigSpec:
                     config["host_tensor_descriptors"] = False
                 else:
                     raise InvalidConfig("host_tensor_descriptors must be a bool")
+        if self.supports_config_key("reduction_fusion"):
+            if self.reduction_fusion_available:
+                config.setdefault("reduction_fusion", False)
+            if (
+                "reduction_fusion" in config
+                and type(config["reduction_fusion"]) is not bool
+            ):
+                if _fix_invalid:
+                    config["reduction_fusion"] = False
+                else:
+                    raise InvalidConfig("reduction_fusion must be a bool")
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
@@ -5973,6 +6209,8 @@ class ConfigSpec:
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
+                    head_dim_v=self._cute_flash_head_dim_v,
+                    fast_math=self._cute_flash_fast_math,
                 )
                 if not packet_requirements:
                     raise InvalidConfig(
@@ -6037,8 +6275,10 @@ class ConfigSpec:
             if key in (
                 "cute_fragment_register_loads",
                 "cute_fragment_warp_scan",
+                "cute_fragment_topk_network",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
+                "cute_topk_coarse_keys",
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
                 "cute_fragment_register_producers",
@@ -6053,6 +6293,8 @@ class ConfigSpec:
                 "cute_fragment_packet_loads",
             ):
                 return True, False
+            if key == "cute_topk_key_recovery":
+                return True, "direct"
             if key == "cute_fragment_threads":
                 return True, 128
             if key in ("cute_fragment_scan", "cute_fragment_reduction"):
@@ -6077,25 +6319,9 @@ class ConfigSpec:
                 requested_lowering = overrides.get(
                     FLASH_SOFTMAX_LOWERING_KEY, config.get(FLASH_SOFTMAX_LOWERING_KEY)
                 )
-                topology = self._cute_flash_config_topology({**config, **overrides})
-                inactive_lpt = _flash_inactive_lpt_domain(
-                    is_causal=self._cute_flash_is_causal, topology=topology
-                )
-                requirements = _flash_resident_softmax_overrides(
-                    requested_lowering,
-                    is_causal=self._cute_flash_is_causal,
-                    topology=topology,
-                )
+                requirements = _flash_resident_softmax_overrides(requested_lowering)
                 for key, required_value in requirements.items():
-                    if (
-                        key in overrides
-                        and overrides[key] != required_value
-                        and not (
-                            key == FLASH_CAUSAL_LPT_SWIZZLE_KEY
-                            and type(overrides[key]) is int
-                            and overrides[key] in inactive_lpt
-                        )
-                    ):
+                    if key in overrides and overrides[key] != required_value:
                         raise InvalidConfig(
                             f"{FLASH_SOFTMAX_LOWERING_KEY}={requested_lowering!r} "
                             f"requires {key}={required_value!r}, got {overrides[key]!r}"
@@ -6141,6 +6367,8 @@ class ConfigSpec:
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
+                    head_dim_v=self._cute_flash_head_dim_v,
+                    fast_math=self._cute_flash_fast_math,
                 )
                 requested_packet = overrides[FLASH_EXP2_PACKET_KEY]
                 for key, required_value in packet_requirements.items():
@@ -6325,6 +6553,12 @@ class ConfigSpec:
                 fields["cute_fragment_producer_cache"] = BooleanFragment()
             if self.cute_fragment_warp_results_search_enabled:
                 fields["cute_fragment_warp_results"] = BooleanFragment()
+            if self.cute_topk_coarse_keys_search_enabled:
+                fields["cute_topk_coarse_keys"] = BooleanFragment()
+            if self.cute_topk_key_recovery_search_enabled:
+                fields["cute_topk_key_recovery"] = EnumFragment(
+                    choices=("direct", "packed")
+                )
             if self.cute_fragment_atomic_aggregation_search_enabled:
                 fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
             if self.cute_fragment_integer_atomic_epochs_search_enabled:
@@ -6333,6 +6567,8 @@ class ConfigSpec:
                 fields["cute_fragment_packet_loads"] = BooleanFragment()
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
+            if self.cute_fragment_topk_network_search_enabled:
+                fields["cute_fragment_topk_network"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:
                 fields["cute_fragment_local_atomic_registers"] = BooleanFragment()
             if self.cute_integer_loop_reduction_search_enabled:
@@ -6375,7 +6611,12 @@ class ConfigSpec:
                 fields["cute_pointwise_pid_type"] = EnumFragment(
                     choices=("inherit", "flat")
                 )
-            if self.cute_tcgen05_search_enabled:
+            if self.cute_topk_search_enabled:
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in self.cute_topk_choices.items()
+                )
+            elif self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
                 if self.cute_pointwise_region_block_ids:
                     fields["num_threads"] = self.num_threads
@@ -6857,6 +7098,10 @@ class ConfigSpec:
             self.indexing.length > 0 or self.atomic_indexing.length > 0
         ):
             fields["host_tensor_descriptors"] = BooleanFragment()
+        if self.reduction_fusion_available and self.supports_config_key(
+            "reduction_fusion"
+        ):
+            fields["reduction_fusion"] = BooleanFragment()
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
@@ -7244,6 +7489,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # A search surface may pin the default (non-autotuned) block size while
         # widening the autotuner's range (see ``_fragment``).
         self.default_size: int | None = None
+        # The ceiling the kernel declared (``hl.register_block_size`` bounds,
+        # ``update_max`` from an MMA shape analysis), independent of the
+        # dimension's extent; ``None`` when only the extent caps the search
+        # (``update_hint``). Fused surfaces whose tiles overshoot the
+        # dimension (ragged flash rows) check their pins against this.
+        self.declared_max_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -7278,6 +7529,11 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     def update_max(self, value: int) -> None:
         clamped = max(value, 1)
         self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
+        self.declared_max_size = (
+            clamped
+            if self.declared_max_size is None
+            else min(self.declared_max_size, clamped)
+        )
 
     def allow_overshoot(self, ceiling: int) -> None:
         """Raise the autotuner search ceiling above the dimension size.
@@ -7293,8 +7549,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size = max(self.max_size, next_power_of_2(max(ceiling, 1)))
 
     def update_hint(self, value: int) -> None:
+        """Resolve the dimension's extent: it caps ``max_size`` but is not a
+        declared ceiling (see ``declared_max_size``)."""
         self.size_hint = value
-        self.update_max(next_power_of_2(max(value, 1)))
+        self.max_size = min(self.max_size, next_power_of_2(max(value, 1)))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)
@@ -7349,6 +7607,11 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
         # 0 is a valid sentinel meaning "use block_size as thread count"
         if value == 0:
             return 0
+        # CuTe SIMT reductions can use any whole number of warps. Keep these
+        # values available to explicit seeds even though the random search
+        # fragment remains power-of-two for a compact search space.
+        if type(value) is int and 32 <= value <= 1024 and value % 32 == 0:
+            return value
         return super()._normalize(name, value)
 
     def _fragment(self, base: ConfigSpec) -> NumThreadsFragment | EnumFragment:
@@ -7385,9 +7648,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         *,
         block_id: int,
         size_hint: int,
+        allow_non_power_of_two: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+        self.allow_non_power_of_two = allow_non_power_of_two
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -7416,7 +7681,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             raise InvalidConfig(
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
-        if value >= self.size_hint:
+        if value >= self.size_hint and not (
+            self.allow_non_power_of_two
+            and value == self.size_hint
+            and value & (value - 1) != 0
+        ):
             return None  # max size becomes persistent reduction
         return value
 
@@ -7435,7 +7704,20 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         if value is None:
             return None
-        normalized = super()._normalize(name, value)
+        if (
+            self.allow_non_power_of_two
+            and type(value) is int
+            and value >= 8
+            and value <= self.size_hint
+            and self.size_hint % value == 0
+            and value & (value - 1) != 0
+        ):
+            # Exact non-power-of-two divisors avoid padding model widths such
+            # as 3584 and 7168. They are seeded explicitly; the continuous
+            # search fragment remains power-of-two for a compact search space.
+            normalized = value
+        else:
+            normalized = super()._normalize(name, value)
         # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
         # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
         # block size <= 1.  The autotuner search never proposes < 8 (its fragment
@@ -7455,7 +7737,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
         # sync regardless of how the value was generated.
-        if isinstance(normalized, int) and normalized >= self.size_hint:
+        if (
+            isinstance(normalized, int)
+            and normalized >= self.size_hint
+            and normalized & (normalized - 1) == 0
+        ):
             return None
         return normalized
 
@@ -7463,7 +7749,7 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         return None
 
 
-_CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+_CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
 _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
 # Manual unroll of the row lane loop of a sunk vector nest (``cute_vloop_sink``).
@@ -7553,9 +7839,9 @@ class CuteLaneLayoutSpec(_BlockIdItem):
 class CuteVectorWidthSpec(_BlockIdItem):
     """Per-reduction-block vector load width for the CuTe backend.
 
-    V=1 disables vectorization (scalar loads). V=2/4/8 emits
+    V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
-    for the inner reduction load, lowering to LDG.64/LDG.128.
+    for the inner reduction load. SM100+ also admits 32-byte vectors.
     """
 
     def __init__(

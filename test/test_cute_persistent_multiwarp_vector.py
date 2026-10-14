@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
@@ -272,6 +273,54 @@ def _assert_one_warp_vector_row(
     assert "threads_in_group=32" in code
     assert TWO_STAGE not in code
     assert "in range(" not in _kernel_body(code)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "width,threads,vec",
+    [
+        (256, 96, 2),
+        (512, 224, 2),
+        (1024, 224, 4),
+        (512, 160, 4),
+        (1024, 288, 4),
+    ],
+)
+def test_whole_warp_thread_request_covers_the_full_row(
+    width: int, threads: int, vec: int
+) -> None:
+    # Legal whole-warp requests can leave columns uncovered or extend packets
+    # past the row when the thread count does not divide the padded extent.
+    bound, _arguments = _bind_rms_norm(8, width, torch.bfloat16)
+    config = _row_config(bound, reduction_threads=threads, vec=vec)
+    reduction = _reduction_block_id(bound)
+    assert config.reduction_loops == [None]
+    assert (
+        bound.config_spec.num_threads.config_get(config.num_threads, reduction, 0)
+        == threads
+    )
+    with _forbid_native_compile():
+        source = ast.parse(bound.to_code(config))
+    lane_extents = {
+        ast.literal_eval(node.iter.args[0])
+        for node in ast.walk(source)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id.startswith("synthetic_lane_")
+        and isinstance(node.iter, ast.Call)
+    }
+    block = next(
+        ast.literal_eval(keyword.value)
+        for node in ast.walk(source)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_launcher"
+        for keyword in node.keywords
+        if keyword.arg == "block"
+    )
+    assert len(lane_extents) == 1
+    assert block[1:] == (1, 1)
+    assert block[0] * next(iter(lane_extents)) == width
 
 
 @skipUnlessBackends(["cute"])

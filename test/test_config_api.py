@@ -1213,6 +1213,27 @@ class TestSettingsEnv(TestCase):
 
         self.assertEqual(config["block_sizes"][:2], [64, 64])
 
+    def test_block_size_declared_ceiling_outlives_the_dimension_hint(self) -> None:
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        # Only the dimension's extent caps this spec: nothing was declared.
+        extent_only = BlockSizeSpec(block_id=0, size_hint=4096)
+        extent_only.update_hint(64)
+        self.assertEqual(extent_only.max_size, 64)
+        self.assertIsNone(extent_only.declared_max_size)
+
+        # A declared ceiling (``update_max``) is kept apart from the extent
+        # cap (``update_hint``): the search range takes the smaller of the
+        # two, the declared value stays readable for surfaces that tile
+        # past the extent.
+        spec = BlockSizeSpec(block_id=0, size_hint=4096)
+        spec.update_max(128)
+        spec.update_hint(64)
+        self.assertEqual((spec.max_size, spec.declared_max_size), (64, 128))
+        spec.update_max(32)
+        self.assertEqual((spec.max_size, spec.declared_max_size), (32, 32))
+        self.assertEqual(spec._fragment(ConfigSpec(backend=TritonBackend())).high, 32)
+
     def test_bounded_inner_block_size_keeps_valid_inner_value(self) -> None:
         from helion._compiler.backend import TritonBackend
         from helion.autotuner.config_spec import BlockSizeSpec

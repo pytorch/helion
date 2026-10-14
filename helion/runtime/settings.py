@@ -702,7 +702,8 @@ class Settings(_Settings):
             "Override with HELION_CUTE_RNG_STREAM."
         ),
         "fast_math": (
-            "If True, enable fast math approximations (Helion-level and Inductor-level). "
+            "If True, enable fast math approximations (Helion-level, including the CuTe "
+            "flash-attention polynomial exp2 packets, and Inductor-level). "
             "May reduce numerical precision and change NaN/Inf behavior. "
             "Set HELION_FAST_MATH=1 to enable."
         ),
