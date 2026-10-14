@@ -73,6 +73,7 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
+        cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -155,6 +156,9 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
+                reservations for equal addresses within each active warp. Each
+                lane retains its own valid fetch-add return value. Off by default.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -250,6 +254,7 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
+            "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,

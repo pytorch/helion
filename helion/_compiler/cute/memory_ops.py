@@ -4936,7 +4936,9 @@ def _cute_tile_packet_is_aligned(
     a packed integer carrier of at most eight bytes.
     """
     vector_bytes = vec_width * tensor.dtype.itemsize
-    if vec_width < 2 or _CUTE_VECTOR_MAX_BYTES % vector_bytes:
+    capability = env.config_spec.target_device_capability
+    max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+    if vec_width < 2 or max_bytes % vector_bytes:
         return False
     if tensor.dtype.itemsize == 1 and vec_width not in (2, 4, 8):
         return False

@@ -41,6 +41,7 @@ from .cute_reshape import cute_lane_loops_active
 from .cute_reshape import describe_rebound_block_dims
 from .cute_reshape import subscript_rebound_block_dims
 from .thread_budget import MAX_THREADS_PER_BLOCK
+from .warp_atomic import warp_atomic_candidate
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -271,6 +272,10 @@ def _codegen_cute_atomic_rmw(
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(target.dtype)
     callee = _cute_atomic_callee(cute_func, target.dtype)
+    if state.config.get(
+        "cute_warp_aggregated_atomics", False
+    ) and warp_atomic_candidate(state.fx_node):
+        callee = "_cute_warp_fetch_add_int32"
     cast_value_exprs = [
         expr_from_string(
             backend.ast_to_dtype_expr("{value}", target_dtype),

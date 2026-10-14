@@ -1850,6 +1850,7 @@ class CuteBackend(Backend):
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
             in (
@@ -2252,6 +2253,7 @@ class CuteBackend(Backend):
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
+            "_cute_warp_fetch_add_int32": "from helion._compiler.cute.warp_atomic_runtime import warp_fetch_add_int32 as _cute_warp_fetch_add_int32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

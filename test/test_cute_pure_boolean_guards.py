@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import itertools
 import math
+import operator
 import struct
 from types import SimpleNamespace
 
@@ -46,6 +47,8 @@ def _namespace(**values: object) -> dict[str, object]:
         "not x",
         "not cutlass.Float32(x)",
         "cutlass.Boolean(x)",
+        "operator.lt(x, limit)",
+        "cutlass.Boolean(operator.eq(x, limit))",
         "x != 0 and 8 // x > 0",
         "x == 0 or 8 // x > 0",
         "cutlass.Int32(row) * cutlass.Int32(x.layout.stride[0]) % 8 == 0",
@@ -69,6 +72,9 @@ def test_supported_guards_are_pure_boolean_scalars(source: str) -> None:
         "x < limit and 2",
         "x < limit or -0.0",
         "effect() > 0",
+        "operator.lt(x.iterator.load(), limit)",
+        "operator.lt(x, limit, extra)",
+        "operator.lt(x, limit=limit)",
         "x.value > 0",
         "x[0] > 0",
         "x.iterator.load() > 0",
@@ -211,3 +217,12 @@ def test_empty_single_and_duplicate_guards_keep_existing_behavior() -> None:
     deduplicated = _conjunction([value, _expression("x > 0"), _expression("y > 0")])
     assert deduplicated is not None
     assert ast.unparse(deduplicated) == "x > 0 and y > 0"
+
+
+@pytest.mark.parametrize("x", [float("nan"), -0.0, 0.0, -2.0, 2.0])
+def test_operator_comparison_guards_preserve_short_circuit_arithmetic(x: float) -> None:
+    before, after = _pair(
+        ["operator.eq(x, x)", "operator.ne(x, 0)", "8 // cutlass.Int32(x) > 0"]
+    )
+    namespace = _namespace(x=x, operator=operator)
+    assert eval(_compile(after), namespace) is eval(_compile(before), namespace)
