@@ -4294,6 +4294,7 @@ def _tcgen05_grouped_output_ring_seeds(
     group_count: int,
     dtype_bytes: int,
     capacity_bytes: int,
+    output_dtype_bytes: int | None = None,
 ) -> list[Config]:
     """Cover the alternate output ring for device-metadata mailbox schedules.
 
@@ -4333,6 +4334,7 @@ def _tcgen05_grouped_output_ring_seeds(
                 bn=profile.mma_n,
                 bk=block_k,
                 dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
                 ab_stages=ab_stages,
                 acc_stages=cast("int", seed.config["tcgen05_acc_stages"]),
                 c_stages=4,
@@ -4471,6 +4473,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             spec.register_cute_tcgen05_grouped_worklist_smem_facts(
                 group_count=seed_facts.groups_hint,
                 device_split_sizes=seed_facts.device_split_sizes,
+                output_dtype_bytes=(analysis.output_dtype or fact.lhs_dtype).itemsize,
             )
         # A coordinate without any carrier would perturb the old random domain
         # even when additive coverage has no declaration. Share the complete
@@ -4642,6 +4645,9 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                         ],
                         group_count=seed_facts.groups_hint,
                         dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
                         capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
                             env.device
                         ),

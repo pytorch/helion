@@ -3451,11 +3451,16 @@ class ConfigSpec:
         )
 
     def register_cute_tcgen05_grouped_worklist_smem_facts(
-        self, *, group_count: int, device_split_sizes: bool
+        self,
+        *,
+        group_count: int,
+        device_split_sizes: bool,
+        output_dtype_bytes: int = 2,
     ) -> None:
         self._cute_tcgen05_config.register_grouped_worklist_smem_facts(
             group_count=group_count,
             device_split_sizes=device_split_sizes,
+            output_dtype_bytes=output_dtype_bytes,
         )
 
     @staticmethod
