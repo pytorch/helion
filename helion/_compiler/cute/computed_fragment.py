@@ -4870,6 +4870,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         for plan in (
             state.block_scaled_plan,
             state.topk_plan,
+            state.radix_selection_plan,
             state.chunk_prepare_plan,
             state.chunk_recurrence_plan,
             state.single_token_rank1_plan,

@@ -1668,6 +1668,7 @@ class CuteBackend(Backend):
         from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .literal_dims import annotate_literal_dims
+        from .radix_selection import plan_radix_selection_root
         from .register_region import plan_register_region
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
@@ -1677,6 +1678,11 @@ class CuteBackend(Backend):
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
+        device_function.cute_state.radix_selection_plan = plan_radix_selection_root(
+            graphs, tile_strategy
+        )
+        if device_function.cute_state.radix_selection_plan is not None:
+            return
         device_function.cute_state.topk_plan = plan_topk_root(graphs, tile_strategy)
         if device_function.cute_state.topk_plan is not None:
             return
@@ -1788,6 +1794,18 @@ class CuteBackend(Backend):
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_selection_algorithm",
+                "cute_radix_threads",
+                "cute_radix_candidate_key_cache",
+                "cute_radix_scalar_candidates",
+                "cute_radix_valid_domain",
+                "cute_radix_ticket_stores",
+                "cute_radix_cached_payload_inverse",
+                "cute_radix_packet_bits",
+                "cute_radix_scan_unroll",
+                "cute_radix_cluster_ctas",
+                "cute_radix_candidate_capacity",
+                "cute_radix_histogram_mode",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",

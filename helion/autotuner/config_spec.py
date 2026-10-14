@@ -78,6 +78,21 @@ from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
+from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
+from .._compiler.cute.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
+from .._compiler.cute.radix_selection_config import CONFIG_KEYS as RADIX_CONFIG_KEYS
+from .._compiler.cute.radix_selection_config import (
+    GEOMETRY_CHOICES as RADIX_GEOMETRY_CHOICES,
+)
+from .._compiler.cute.radix_selection_config import HISTOGRAM_KEY as RADIX_HISTOGRAM_KEY
+from .._compiler.cute.radix_selection_config import (
+    HISTOGRAM_MODES as RADIX_HISTOGRAM_MODES,
+)
+from .._compiler.cute.radix_selection_config import (
+    PIPELINE_CHOICES as RADIX_PIPELINE_CHOICES,
+)
+from .._compiler.cute.radix_selection_config import normalize_radix_selection
 from .._compiler.cute.split_k_cluster import validate_cluster_config
 from .._compiler.cute.split_k_cluster_config import (
     FINALIZER_KEY as SPLIT_K_FINALIZER_KEY,
@@ -166,6 +181,7 @@ if TYPE_CHECKING:
     )
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
+    from .._compiler.cute.radix_selection import RadixSelectionGraph
     from .._compiler.cute.split_k_cluster import ClusterKFacts
     from .._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxFacts
     from ..runtime.config import IndexingLiteral
@@ -1006,6 +1022,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
+        *RADIX_CONFIG_KEYS,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -1115,6 +1132,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
+        *RADIX_CONFIG_KEYS,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1252,6 +1270,7 @@ MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
+        *RADIX_CONFIG_KEYS,
         "loop_orders",
         "flatten_loops",
         "l2_groupings",
@@ -1608,6 +1627,7 @@ class ConfigSpec:
         self.cute_topk_coarse_keys_search_enabled = False
         self.cute_topk_key_recovery_search_enabled = False
         self.cute_topk_choices = dict(CUTE_TOPK_CHOICES)
+        self.cute_radix_selection_graph: RadixSelectionGraph | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
         # A separately launched, proved pointwise producer can share one
@@ -5123,6 +5143,7 @@ class ConfigSpec:
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_topk(config, fix_invalid=_fix_invalid)
+            normalize_radix_selection(self, config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
@@ -6333,6 +6354,12 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == RADIX_ALGORITHM_KEY:
+                return True, "legacy"
+            if key == RADIX_HISTOGRAM_KEY:
+                return True, RADIX_HISTOGRAM_MODES[0]
+            if key in RADIX_GEOMETRY_CHOICES:
+                return True, RADIX_GEOMETRY_CHOICES[key][0]
             if key == "cute_materialized_schedule":
                 return True, "off"
             if key == "cute_materialized_operand_schedule":
@@ -6481,6 +6508,11 @@ class ConfigSpec:
         config = self.flat_config(lambda x: x.default())
         # The additive finalizer choice must not change existing seed configs.
         config.config.pop(SPLIT_K_FINALIZER_KEY, None)
+        if config.get(RADIX_ALGORITHM_KEY, "legacy") == "legacy":
+            # Optional radix coverage represents these defaults in flat space.
+            # Keep the ordinary public default and seed payloads unchanged.
+            for key in RADIX_CONFIG_KEYS:
+                config.config.pop(key, None)
         if self.cute_matmul_min_blocks_search_enabled:
             # This optional matmul coordinate has no old default Config key.
             # Keep the public default exact; flat search still represents zero.
@@ -7134,6 +7166,25 @@ class ConfigSpec:
             if self.cross_loop_pipeline is not None:
                 fields["cross_loop_pipeline"] = self.cross_loop_pipeline
             fields.update(self.user_defined_tunables)
+            if self.cute_radix_selection_graph is not None:
+                fields[RADIX_ALGORITHM_KEY] = EnumFragment(choices=RADIX_ALGORITHMS)
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in RADIX_GEOMETRY_CHOICES.items()
+                )
+                fields[RADIX_HISTOGRAM_KEY] = EnumFragment(
+                    choices=RADIX_HISTOGRAM_MODES
+                )
+                fields.update(
+                    (key, BooleanFragment())
+                    for key in RADIX_BOOLEAN_KEYS
+                    if key != "cute_radix_valid_domain"
+                    or self.cute_radix_selection_graph.largest
+                )
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in RADIX_PIPELINE_CHOICES.items()
+                )
             return fields
 
         # Only add sequence keys that the backend supports

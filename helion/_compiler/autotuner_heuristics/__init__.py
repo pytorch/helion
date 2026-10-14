@@ -152,6 +152,8 @@ from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
 from .cute_materialized_pdl import register_materialized_pdl_coverage
 from .cute_packed_operand import register_packed_operand_coverage
+from .cute_radix_selection import CuteRadixSelectionHeuristic
+from .cute_radix_selection import register_radix_selection_coverage
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_row_resident import register_row_resident_coverage
@@ -258,6 +260,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentWarpProducerRegionsHeuristic,
         CuteFragmentBoundedGatherHeuristic,
         CuteFragmentPureProducerRegionsHeuristic,
+        CuteRadixSelectionHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -752,3 +755,4 @@ def register_compiler_coverage_groups(
     )
     register_fragment_scan_exports_coverage(env, device_ir)
     register_fragment_warp_producer_regions_coverage(env, device_ir)
+    register_radix_selection_coverage(env, device_ir)
