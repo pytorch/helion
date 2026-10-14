@@ -142,6 +142,7 @@ from .cute_fragment_warp_results import register_fragment_warp_results_coverage
 from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
 from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
 from .cute_fragment_warp_scan import register_gather_warp_scan_coverage
+from .cute_full_chunk_row import CuteFullChunkRowHeuristic
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -492,6 +493,13 @@ def compiler_seed_configs(
             configs.append(
                 Config.from_dict(paired.config | {STARTUP_PREFILL_KEY: True})
             )
+    if env.backend_name == "cute":
+        # Add these last, after every legacy postprocessor and carrier. Existing
+        # seed prefixes and promoted defaults must remain unchanged.
+        full_chunks = CuteFullChunkRowHeuristic.get_seed_configs(env, device_ir)
+        if full_chunks:
+            configs.extend(full_chunks)
+            env.config_spec.autotuner_heuristics.append(CuteFullChunkRowHeuristic.name)
     return dedupe_configs(configs)
 
 
