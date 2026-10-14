@@ -985,6 +985,33 @@ class TestPallasJaggedCarryRejects(TestCase):
                 pallas_loop_type=loop_type,
             )
 
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_in_place_store_rejected(self, loop_type: str) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def in_place_jagged_bmm(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            dense: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            B, D, K = dense.shape
+            for g in hl.grid(B):
+                s, e = seq_offsets[g], seq_offsets[g + 1]
+                for st, kt in hl.tile((s, 0), (e, K)):
+                    acc = hl.zeros([st, kt], dtype=torch.float32)
+                    for dt in hl.tile(0, D):
+                        acc = acc + torch.matmul(jagged[st, dt], dense[g, dt, kt])
+                    out[st, kt] = acc.to(out.dtype)
+            return out
+
+        seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "store target aliases a loaded tensor"
+        ):
+            in_place_jagged_bmm.bind((seq_offsets, jagged, dense, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128, 128], pallas_loop_type=loop_type)
+            )
+
     def test_non_jagged_emit_pipeline_unaffected(self) -> None:
         # Static (compile-time) tile bounds never trip the gate: a plain
         # emit_pipeline matmul still lowers and runs correctly.

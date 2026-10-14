@@ -50,6 +50,29 @@ class AccessLayout(NamedTuple):
     block_ids: tuple[int | None, ...]
 
 
+def store_aliases_a_load(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` may share its host allocation with any loaded tensor.
+
+    The carry stores each aligned row window in full, so storing in place
+    overwrites rows of the next group before it loads them.
+    """
+    import torch
+
+    from helion._compiler.host_function import HostFunction
+    from helion._compiler.pallas.memory_access import tensors_share_origin_or_storage
+    from helion.language import memory_ops
+
+    return any(
+        node.op == "call_function"
+        and node.target is memory_ops.load
+        and isinstance(node.args[0], torch.fx.Node)
+        and isinstance((val := node.args[0].meta.get("val")), torch.Tensor)
+        and tensors_share_origin_or_storage(val, tensor)
+        for info in HostFunction.current().device_ir.graphs
+        for node in info.graph.nodes
+    )
+
+
 def check_carry_lowering(
     env: CompileEnvironment,
     config: Config,
@@ -58,7 +81,7 @@ def check_carry_lowering(
 ) -> None:
     """Raise unless the carry can lower ``store`` on jagged ``row_block_id``.
 
-    Kernel-shape reasons no config can fix (grid, store rank) raise
+    Kernel-shape reasons no config can fix (grid, store rank, aliasing) raise
     ``BackendUnsupported``.  Reasons another config may fix (block sizes)
     raise ``InvalidConfig`` so the autotuner keeps searching instead of
     reporting a backend failure.
@@ -89,6 +112,8 @@ def _unsupported_reason(row_block_id: int, store: AccessLayout) -> str | None:
         return f"supports only leading-row 2D store (got {store.block_ids})"
     if store.block_ids[1] is None:
         return "the column dim of a jagged store must be tiled"
+    if store_aliases_a_load(store.tensor):
+        return "store target aliases a loaded tensor"
     return None
 
 
