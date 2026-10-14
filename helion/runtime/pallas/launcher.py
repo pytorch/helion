@@ -2860,6 +2860,23 @@ def _compact_window_block_spec(
     return pl.BlockSpec(block_shape, index_map, pipeline_mode=mode)  # type: ignore[union-attr]
 
 
+def _transfers_sublane_tiles(t: object, sublane: int) -> bool:
+    """Whether a compact window is copied as whole sublane tiles.
+
+    Then the tensor is viewed as ``(rows // sublane, sublane, cols)`` and sliced
+    on the untiled leading dim, which copies faster than slicing a dynamic row
+    count on the tiled row dim of ``(rows, cols)``.
+    """
+    return int(t.ndim) == 2 and int(t.shape[0]) % sublane == 0  # type: ignore[attr-defined]
+
+
+def _sublane_tile_view(ref: object, sublane: int) -> object:
+    """``ref`` of shape ``(rows, *rest)`` viewed as ``(rows // sublane, sublane,
+    *rest)`` (see ``_transfers_sublane_tiles``)."""
+    rows, *rest = ref.shape  # type: ignore[attr-defined]
+    return ref.reshape(rows // sublane, sublane, *rest)  # type: ignore[attr-defined]
+
+
 def _compact_aligned_window_block_spec(
     t: object,
     window: int,
@@ -2878,26 +2895,42 @@ def _compact_aligned_window_block_spec(
     An output window (``num_work_ref`` given) ends at ``end - end % sublane``
     instead (except on the last work item) because ``ordered_carry`` holds each
     owner's partial last sublane tile for the next work item to fold and write.
+
+    With ``_transfers_sublane_tiles`` the spec is over the
+    ``_sublane_tile_view`` of ``t``.
     """
     from jax.experimental import pallas as pl
     import jax.numpy as jnp
 
     rows = int(t.shape[0])  # type: ignore[attr-defined]
     ndim = int(t.ndim)  # type: ignore[attr-defined]
+    assert window % sublane == 0, (sublane, window)
+    in_tiles = _transfers_sublane_tiles(t, sublane)
 
     def index_map(wid: object) -> tuple[object, ...]:
         start = start_ref[wid]  # type: ignore[index]
         end = start + extent_ref[wid]  # type: ignore[index]
-        lo = start - start % sublane
-        hi = (end + sublane - 1) // sublane * sublane
+        # In sublane tiles: [lo, hi) holds rows [start, end).
+        lo = start // sublane
+        hi = (end + sublane - 1) // sublane
         if num_work_ref is not None:
             last = wid == num_work_ref[0] - 1  # type: ignore[index]
-            hi = jnp.where(last, hi, end - end % sublane)
-        hi = jnp.minimum(hi, rows)
-        lo = pl.multiple_of(lo, sublane)
-        return (pl.ds(lo, hi - lo), *(jnp.int32(0) for _ in range(ndim - 1)))
+            hi = jnp.where(last, hi, end // sublane)
+        if not in_tiles:
+            lo = pl.multiple_of(lo * sublane, sublane)
+            hi *= sublane
+        hi = jnp.minimum(hi, rows // sublane if in_tiles else rows)
+        return (
+            pl.ds(lo, hi - lo),
+            *(jnp.int32(0) for _ in range(ndim if in_tiles else ndim - 1)),
+        )
 
-    block_shape = (pl.BoundedSlice(window), *t.shape[1:])  # type: ignore[attr-defined]
+    leading = (
+        (pl.BoundedSlice(window // sublane), sublane)
+        if in_tiles
+        else (pl.BoundedSlice(window),)
+    )
+    block_shape = (*leading, *t.shape[1:])  # type: ignore[attr-defined]
     mode = None if buffer_count == 2 else pl.Buffered(buffer_count)
     return pl.BlockSpec(block_shape, index_map, pipeline_mode=mode)
 
@@ -3191,13 +3224,29 @@ def _pallas_compile_compact_jit_fn(
         all_specs = list(in_specs) + out_specs_seq
         pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
         pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
-        pipe_any = [io_any[p] for p in pipe_positions]
+        # Tensors sliced in whole sublane tiles (_transfers_sublane_tiles): the
+        # pipeline moves (tiles, sublane, cols) blocks of their sublane-tile
+        # view, and the kernel sees each block as the (compact_block, cols)
+        # window it was generated for.
+        tiled = {
+            p
+            for p, idx in enumerate([*tensor_arg_indices, *_output_indices])
+            if sublane
+            and idx in aligned_set
+            and _transfers_sublane_tiles(args[idx], sublane)
+        }
+        pipe_any = [
+            _sublane_tile_view(io_any[p], sublane) if p in tiled else io_any[p]
+            for p in pipe_positions
+        ]
 
         def pipeline_body(*block_refs: object) -> None:
             merged = list(io_any)
             for p, ref in smem_inputs.items():
                 merged[p] = ref
             for p, block in zip(pipe_positions, block_refs, strict=True):
+                if p in tiled:
+                    block = block.reshape(compact_block, *block.shape[2:])  # type: ignore[attr-defined]
                 merged[p] = block
             reordered_kernel(*metadata_smem, *merged, *kernel_scratch)  # type: ignore[operator]
 
