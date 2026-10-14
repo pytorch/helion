@@ -64,6 +64,7 @@ from typing import cast
 import sympy
 import torch
 
+from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
 from .cute_mma_dag import AXIS_LEAD
 from .cute_mma_dag import AXIS_LOOP
@@ -91,6 +92,7 @@ from .cute_mma_dag import Store
 from .cute_mma_dag import VecOp
 from .cute_mma_dag import VecStore
 from .cute_mma_dag import _decline
+from .cute_mma_dag import _is_call
 from .cute_mma_dag import _is_pointwise
 from .cute_mma_dag import _node_inputs
 from .cute_mma_dag import _storage
@@ -107,6 +109,7 @@ if TYPE_CHECKING:
 
     from ..device_function import DeviceFunction
     from ..generate_ast import GenerateAST
+    from .cute_mma_dag import MmaDagProgram
 
 _RUNTIME = "_helion_mma_dag"
 # A name in a coordinate expression (not an attribute).
@@ -114,6 +117,9 @@ _IDENTIFIER = r"(?<![\w.])[A-Za-z_]\w*"
 # Module roots an address expression may name (``cutlass.Int64(...)``).
 _MODULES = frozenset({"cutlass", "cute"})
 _PREAMBLE = f"import helion._compiler.cute._mma_dag_runtime as {_RUNTIME}\n"
+# The launcher's wrapper plan that names the program's tensor arguments so
+# a launch can refuse arguments that alias (see ``mma_dag_alias_plan``).
+ALIAS_KIND = "helion_mma_dag_alias"
 Coords = tuple[str, ...]
 
 
@@ -142,8 +148,35 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
     source = _Emitter(cg, plan).render()
     for statement in ast.parse(textwrap.dedent(source)).body:
         cg.add_statement(statement)
+    cg.cute_wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
     df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
     return True
+
+
+def mma_dag_alias_plan(df: DeviceFunction, program: MmaDagProgram) -> dict[str, object]:
+    """The launcher's alias guard: the program's tensor arguments (kernel
+    argument names, resolved to launch positions by the host codegen) and
+    which of them it stores to.
+
+    The planner admits a program whose loads and stores touch distinct
+    storages, and the emitter hoists side loads and stages tiles ahead of
+    the stores on that proof.  It is a proof over the fake tensors the
+    kernel is compiled against, which have one storage per argument: a
+    caller passing one tensor (or two views of one buffer) under two names
+    is only visible at launch, where the guard refuses it.
+    """
+    names: list[str] = []
+    stored: list[bool] = []
+    for access in program.accesses:
+        name = df.tensor_arg(access.fake, prefer_name=access.name).name
+        is_store = _is_call(access.node, memory_ops.store)
+        if name in names:
+            index = names.index(name)
+            stored[index] = stored[index] or is_store
+            continue
+        names.append(name)
+        stored.append(is_store)
+    return {"kind": ALIAS_KIND, "tensor_names": names, "stored": stored}
 
 
 class _Layout:
