@@ -51,6 +51,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from ... import exc
 from ..compile_environment import CompileEnvironment
@@ -869,6 +870,61 @@ class MmaDagProgram:
             for access in derived.loads
         )
 
+    def staged_ahead_of_loops(self, key: tuple[object, ...]) -> bool:
+        """Whether the once-per-CTA staged tile with sharing key ``key`` is
+        first read -- so its per-element pass runs -- ahead of the first
+        loop's ring prologue: by a root dot before the first loop or by a
+        dot inside that loop (the emitter settles a segment's tiles before
+        running it).  The raw source tile of such a converted operand is
+        dead once the loops start and may overlay their frames."""
+        first_loop = next(
+            (step.index for step in self.body if isinstance(step, Loop)), None
+        )
+        for step in self.body:
+            if isinstance(step, Dot):
+                if any(operand.chain_key == key for operand in (step.a, step.b)):
+                    return True
+            elif isinstance(step, Loop):
+                return any(
+                    operand.chain_key == key
+                    for dot in self.dots
+                    if dot.loop >= 0 and first_loop in self.enclosing_loops(dot.loop)
+                    for operand in (dot.a, dot.b)
+                )
+        return False
+
+    def read_within_one_root_segment(self, key: tuple[object, ...]) -> bool:
+        """Whether every dot reading the operand tile with sharing key ``key``
+        is a root dot, all in one run of root steps between two loops: a
+        tile written for them is dead once the next loop starts and may
+        overlay the loops' frames."""
+        readers = [
+            dot
+            for dot in self.dots
+            if any(operand.chain_key == key for operand in (dot.a, dot.b))
+        ]
+        if not readers or any(dot.loop >= 0 for dot in readers):
+            return False
+        positions = [
+            index
+            for index, step in enumerate(self.body)
+            if isinstance(step, Dot) and any(step.node is dot.node for dot in readers)
+        ]
+        if len(positions) != len(readers):
+            return False
+        return not any(
+            isinstance(step, Loop)
+            for step in self.body[min(positions) : max(positions)]
+        )
+
+    def enclosing_loops(self, loop: int) -> list[int]:
+        """Loop ``loop`` and the loops it is nested in, innermost first."""
+        result = []
+        while loop >= 0:
+            result.append(loop)
+            loop = self.loops[loop].parent
+        return result
+
     def operand_frame(self, dot: Dot, operand: Operand) -> int:
         """The shared-memory frame of the operand's tile: a ring tile's loop,
         a staged load's level, an exchange tile's writing region (the dot's
@@ -949,6 +1005,13 @@ class TileFacts:
     # The loop whose shared-memory frame holds the tile (-1: the root
     # frame, live for the whole kernel); sibling loops' frames overlap.
     frame: int = -1
+    # The raw source tile of a root-frame converted operand consumed ahead
+    # of the first loop overlays the loops' frames (dead once they start).
+    source_overlays: bool = False
+    # A root-frame exchange tile read within one root segment overlays the
+    # loops' frames as well (written after the loops before it, dead before
+    # the loop after it starts).
+    overlays: bool = False
 
     @property
     def bytes_per_element(self) -> int:
@@ -1078,6 +1141,16 @@ class SmemTileSpec:
     raw_elem_bytes: int = 0
     # The raw source tile of a transposed operand tile is ``cols x rows``.
     raw_swapped: bool = False
+    # Ring slots of the raw source tile: the pass consumes it ahead of the
+    # iteration barrier the refill follows, so one fewer than the operand
+    # ring's (one at two stages).
+    raw_slots: int = 1
+    # The raw tile overlays the nested loops' frames (see
+    # ``MmaDagProgram.staged_ahead_of_loops``).
+    raw_overlays: bool = False
+    # The tile itself does (a root exchange tile read within one root
+    # segment, see ``MmaDagProgram.read_within_one_root_segment``).
+    overlays: bool = False
 
     @property
     def bytes(self) -> int:
@@ -1245,6 +1318,101 @@ class MmaDagPlan:
             routes,
         )
 
+    def early_prologues(self) -> dict[int, int]:
+        """Loop -> the nested loop whose ring prologue the loop issues ahead
+        of each iteration: during iteration ``i``'s epilogue (the steps after
+        the nested loop) the ring tiles of iteration ``i + 1``'s first
+        ``stages - 1`` nested iterations go out, overlapping the epilogue
+        instead of being waited on right after they are issued.  A loop
+        qualifies when it has exactly one nested loop, an innermost one
+        with a ring at more than one stage, followed by at least one step,
+        whose bounds name no loop's index (the prologue evaluates them
+        ahead of the iteration), and no shared tile its own steps read
+        (operands, derived tiles, exchange tiles, staging) overlaps the
+        nested loop's frame: the prologue rewrites that frame while the
+        epilogue runs."""
+        program = self.program
+        if self.stages < 2:
+            return {}
+        operand_specs, derived_specs, staging_specs, _total, _scratch = (
+            self.smem_layout()
+        )
+        loop_symbols = {
+            loop.symbol for loop in program.loops if loop.symbol is not None
+        }
+        result: dict[int, int] = {}
+        for loop in program.loops:
+            nested = [step for step in loop.steps if isinstance(step, Loop)]
+            if len(nested) != 1 or not nested[0].innermost:
+                continue
+            inner = nested[0]
+            if not program.loop_has_ring(inner.index):
+                continue
+            if any(
+                _bound_symbols(bound) & loop_symbols
+                for bound in (inner.begin, inner.end)
+            ):
+                continue
+            position = loop.steps.index(inner)
+            if not any(
+                not isinstance(step, Loop) for step in loop.steps[position + 1 :]
+            ):
+                continue
+            # The nested frame's extent: every tile of the nested loop.
+            inner_ranges = [
+                (spec.offset, spec.offset + spec.bytes * spec.slots)
+                for dot in program.dots
+                if dot.loop == inner.index
+                for operand in (dot.a, dot.b)
+                if self.route(dot, operand) not in REGISTER_ROUTES
+                for spec in [operand_specs[operand.chain_key]]
+            ]
+            inner_ranges += [
+                (spec.offset, spec.offset + spec.bytes * spec.slots)
+                for derived, access in self.ring_derived(inner.index)
+                for spec in [derived_specs[access.node]]
+            ]
+            inner_ranges += [
+                (spec.raw_offset, spec.raw_offset + spec.raw_bytes * spec.raw_slots)
+                for dot in program.dots
+                if dot.loop == inner.index
+                for operand in (dot.a, dot.b)
+                if self.route(dot, operand) not in REGISTER_ROUTES
+                for spec in [operand_specs[operand.chain_key]]
+                if spec.raw_elem_bytes
+            ]
+            # The tiles the loop's own steps read.
+            own_ranges = [
+                (spec.offset, spec.offset + spec.bytes * spec.slots)
+                for dot in program.dots
+                if dot.loop == loop.index
+                for operand in (dot.a, dot.b)
+                if self.route(dot, operand) not in REGISTER_ROUTES
+                for spec in [operand_specs[operand.chain_key]]
+            ]
+            own_ranges += [
+                (spec.offset, spec.offset + spec.bytes * spec.slots)
+                for derived in program.derived
+                if derived.loop == loop.index
+                for access in derived.loads
+                if access.node in derived_specs
+                for spec in [derived_specs[access.node]]
+            ]
+            own_ranges += [
+                (spec.offset, spec.offset + spec.bytes * spec.slots)
+                for store in self.staged_stores
+                if store.loop == loop.index
+                for spec in [staging_specs[store.access.node]]
+            ]
+            if any(
+                a_lo < b_hi and b_lo < a_hi
+                for a_lo, a_hi in inner_ranges
+                for b_lo, b_hi in own_ranges
+            ):
+                continue
+            result[loop.index] = inner.index
+        return result
+
     def smem_layout(
         self,
     ) -> tuple[
@@ -1284,6 +1452,7 @@ class MmaDagPlan:
                     slots = self.stages
                 else:
                     slots = 1
+                frame = program.operand_frame(dot, operand)
                 spec = SmemTileSpec(
                     f"{'md_x' if exchange else 'md_t'}{count}",
                     0,
@@ -1291,6 +1460,9 @@ class MmaDagPlan:
                     self.size(operand.cols),
                     operand.dtype.itemsize,
                     slots,
+                    overlays=exchange
+                    and frame == -1
+                    and program.read_within_one_root_segment(operand.chain_key),
                 )
                 count += 1
                 if route == ROUTE_CONVERT:
@@ -1301,15 +1473,11 @@ class MmaDagPlan:
                         raw_offset=0,
                         raw_elem_bytes=load.dtype.itemsize,
                         raw_swapped=operand.transposed_tile,
+                        raw_slots=mma_dag_raw_slots(slots),
+                        raw_overlays=frame == -1
+                        and program.staged_ahead_of_loops(operand.chain_key),
                     )
-                items.append(
-                    (
-                        program.operand_frame(dot, operand),
-                        "operand",
-                        operand.chain_key,
-                        spec,
-                    )
-                )
+                items.append((frame, "operand", operand.chain_key, spec))
         # Derived values' tiles: one ring slot per stage, read per lane.
         for index, (owner, access) in enumerate(self.ring_derived()):
             rows, cols = access.tile_dims
@@ -1348,18 +1516,35 @@ class MmaDagPlan:
         placed: dict[int, list[tuple[str, object, SmemTileSpec]]] = {}
 
         def layout(frame: int, base: int) -> int:
-            offset = base
             nested = [layout(child, base) for child in children.get(frame, ())]
-            offset = max(nested, default=base)
+            frame_items = [item for item in items if item[0] == frame]
+            # Raw source tiles dead once the nested loops start overlay
+            # their frames, from the frame's base.
+            overlay = base
+            overlays: dict[object, int] = {}
+            for _frame, _kind, key, spec in frame_items:
+                if spec.raw_elem_bytes and spec.raw_overlays:
+                    overlays[key] = overlay
+                    overlay += spec.raw_bytes * spec.raw_slots
+            for _frame, _kind, key, spec in frame_items:
+                if spec.overlays:
+                    overlays[key] = overlay
+                    overlay += spec.bytes * spec.slots
+            offset = max(max(nested, default=base), overlay)
             own: list[tuple[str, object, SmemTileSpec]] = []
-            for item_frame, kind, key, spec in items:
-                if item_frame != frame:
+            for _frame, kind, key, spec in frame_items:
+                if spec.overlays:
+                    own.append(
+                        (kind, key, dataclasses.replace(spec, offset=overlays[key]))
+                    )
                     continue
                 spec = dataclasses.replace(spec, offset=offset)
                 offset += spec.bytes * spec.slots
-                if spec.raw_elem_bytes:
+                if spec.raw_elem_bytes and key in overlays:
+                    spec = dataclasses.replace(spec, raw_offset=overlays[key])
+                elif spec.raw_elem_bytes:
                     spec = dataclasses.replace(spec, raw_offset=offset)
-                    offset += spec.raw_bytes * spec.slots
+                    offset += spec.raw_bytes * spec.raw_slots
                 own.append((kind, key, spec))
             placed[frame] = own
             return offset
@@ -1455,6 +1640,7 @@ def mma_dag_smem_estimate(
             if route == ROUTE_EXCHANGE
         }
     items: list[tuple[int, int]] = []
+    overlays: list[tuple[int, int]] = []
     if warps is not None and facts.vecs:
         items.append((-1, mma_dag_vec_scratch(facts, resolved, layouts, warps)))
     for tile in facts.tiles:
@@ -1465,38 +1651,54 @@ def mma_dag_smem_estimate(
         ):
             continue
         slots = stages if tile.ring else tile.copies
-        items.append(
-            (
-                tile.frame,
-                slots
-                * resolved[tile.rows]
-                * resolved[tile.cols]
-                * tile.bytes_per_element,
-            )
-        )
+        elements = resolved[tile.rows] * resolved[tile.cols]
+        source = elements * mma_dag_raw_slots(slots) * tile.source_bytes
+        if tile.source_overlays:
+            overlays.append((tile.frame, source))
+            source = 0
+        if tile.overlays:
+            overlays.append((tile.frame, elements * slots * tile.elem_bytes))
+            continue
+        items.append((tile.frame, elements * slots * tile.elem_bytes + source))
     for index, (rows, cols, elem_bytes) in enumerate(facts.staging):
         frame = facts.staging_frames[index] if facts.staging_frames else 0
         items.append((frame, 2 * resolved[rows] * resolved[cols] * elem_bytes))
-    return mma_dag_frame_bytes(facts.loops, items)
+    return mma_dag_frame_bytes(facts.loops, items, overlays)
+
+
+def mma_dag_raw_slots(slots: int) -> int:
+    """Ring slots of a converted operand's raw source tile beside an operand
+    ring of ``slots``: iteration ``i``'s pass consumes its raw tile before
+    the iteration barrier, and the refill past that barrier (for iteration
+    ``i + slots - 1``) may take the slot over, so ``slots - 1`` raw tiles are
+    ever live (one at two stages); a single-slot tile keeps one."""
+    return max(1, slots - 1)
 
 
 def mma_dag_frame_bytes(
-    loops: Sequence[LoopFacts], items: Sequence[tuple[int, int]]
+    loops: Sequence[LoopFacts],
+    items: Sequence[tuple[int, int]],
+    overlays: Sequence[tuple[int, int]] = (),
 ) -> int:
     """Shared memory of ``items`` (``(frame, bytes)``) laid out by frame: a
     loop's frame holds its own tiles and, past them, the frames of its
     nested loops; sibling loops never run together, so their frames share
-    one extent (the largest).  The root frame (-1) is live throughout."""
+    one extent (the largest).  The root frame (-1) is live throughout.
+    ``overlays`` (``(frame, bytes)``) are dead once the frame's nested loops
+    start and share their extent."""
     own: dict[int, int] = {}
     for frame, nbytes in items:
         own[frame] = own.get(frame, 0) + nbytes
+    overlaid: dict[int, int] = {}
+    for frame, nbytes in overlays:
+        overlaid[frame] = overlaid.get(frame, 0) + nbytes
     children: dict[int, list[int]] = {}
     for index, loop in enumerate(loops):
         children.setdefault(loop.parent, []).append(index)
 
     def size(frame: int) -> int:
         nested = [size(child) for child in children.get(frame, ())]
-        return own.get(frame, 0) + max(nested, default=0)
+        return own.get(frame, 0) + max(max(nested, default=0), overlaid.get(frame, 0))
 
     return size(-1)
 
@@ -1964,6 +2166,26 @@ def _is_call(node: object, target: object) -> bool:
     )
 
 
+def _tile_signature(access: Access) -> tuple[object, ...] | None:
+    """What makes two loads of a region the same tile: the tensor, its
+    dtype and strides, and whole-tile subscripts of the same axes (loads
+    with scalar subscripts are not deduplicated)."""
+    if any(subscript.kind != "axis" for subscript in access.subscripts):
+        return None
+    return (
+        access.name,
+        access.dtype,
+        access.strides,
+        tuple(cast("Axis", subscript.axis).block_id for subscript in access.subscripts),
+    )
+
+
+def _storage(access: Access) -> StorageWeakRef:
+    """The storage an access reads or writes: views of one tensor (a host
+    slice passed as another argument) share it, their names do not."""
+    return StorageWeakRef(access.fake.untyped_storage())
+
+
 def _resolve(node: Node, aliases: Mapping[Node, Node]) -> Node:
     """``node`` through ``_new_var`` copies, ``_mask_to`` (an identity on
     whole tiles: every tile here divides its extent) and the placeholder
@@ -2017,6 +2239,49 @@ def _uniform_input(node: Node) -> bool:
     )
 
 
+_LOSSLESS_WIDTH = {
+    torch.float16: 1,
+    torch.bfloat16: 1,
+    torch.float32: 2,
+    torch.float64: 3,
+}
+
+
+def _exact_round_trip(chain: tuple[object, ...], dtype: torch.dtype) -> bool:
+    """Whether a pointwise chain over a load of ``dtype`` (a chain key, listed
+    from the value down to the source) only widens the elements losslessly
+    (16-bit -> fp32 / fp64, fp32 -> fp64) and narrows them back to ``dtype``:
+    the identity on the bits.  Anything else (another op, a narrowing on
+    the way, a different 16-bit type) is a real pass."""
+    if dtype not in _LOSSLESS_WIDTH or not chain:
+        return False
+    targets: list[torch.dtype] = []
+    for entry in chain:
+        if not isinstance(entry, tuple) or len(entry) < 4:
+            return False
+        target, args, kwargs, inputs = entry[0], entry[1], entry[2], entry[3]
+        if (
+            target is not torch.ops.prims.convert_element_type.default
+            or kwargs
+            or inputs
+            or not isinstance(args, tuple)
+            or len(args) != 2
+            or args[0] != "source"
+            or not isinstance(args[1], torch.dtype)
+            or args[1] not in _LOSSLESS_WIDTH
+        ):
+            return False
+        targets.append(args[1])
+    if targets[0] != dtype:
+        return False
+    current = dtype
+    for target in reversed(targets[1:]):
+        if target != current and _LOSSLESS_WIDTH[target] <= _LOSSLESS_WIDTH[current]:
+            return False
+        current = target
+    return True
+
+
 def _chain_key(chain: Sequence[tuple[object, ...]]) -> tuple[object, ...]:
     """The sharing key of a pointwise chain (listed from the operand value
     down to the source).
@@ -2061,6 +2326,16 @@ def _node_inputs(node: Node) -> list[Node]:
 
     map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
     return inputs
+
+
+def _bound_symbols(bound: object) -> set[sympy.Symbol]:
+    """The free symbols of a loop bound (a Python int, or an FX node whose
+    value is an int / SymInt)."""
+    if isinstance(bound, torch.fx.Node):
+        val = bound.meta.get("val")
+        if isinstance(val, torch.SymInt):
+            return {cast("sympy.Symbol", s) for s in val._sympy_().free_symbols}
+    return set()
 
 
 class _NotMine(Exception):
@@ -2243,6 +2518,30 @@ class _Matcher:
             elif not isinstance(origin, TensorSizeOrigin):
                 raise _NotMine
         return expr, tuple(sorted(loops))
+
+    def bound_varies(self, val: torch.SymInt) -> bool:
+        """Whether a grid loop bound varies within the kernel: any symbol
+        that is not a host value (a tensor size, an int argument) or a lead
+        tile's id -- an enclosing grid loop's index, a device tile's
+        position, a value minted in device code (``int or int`` on a loop
+        index), or a symbol of unknown origin.  The emitter renders bounds
+        with the host's symbols, and an enclosing loop evaluates a nested
+        loop's bounds ahead of its iteration (the early ring prologue)."""
+        from ..host_function import HostFunction
+        from ..variable_origin import TileIdOrigin
+
+        expr_to_origin = HostFunction.current().expr_to_origin
+        for symbol in val._sympy_().free_symbols:
+            info = expr_to_origin.get(cast("sympy.Symbol", symbol))
+            if info is None:
+                return True
+            origin = info.origin
+            if isinstance(origin, TileIdOrigin):
+                if self.axis_of_block(origin.block_id).kind != AXIS_LEAD:
+                    return True
+            elif not origin.is_host():
+                return True
+        return False
 
     def access(self, node: Node) -> Access:
         """Decode a load / store site; ``_NotMine`` for unsupported indexing."""
@@ -2632,6 +2931,11 @@ class _Matcher:
         access = self.access(source)
         if access.tile_dims != source_dims:
             raise _NotMine
+        if pointwise and _exact_round_trip(chain, access.dtype):
+            # ``x.float().to(x.dtype)`` leaves every element's bits as
+            # loaded: the tile is staged as loaded, no per-element pass.
+            pointwise = False
+            chain = ()
         contiguous = [
             position
             for position, stride in enumerate(access.tile_dim_strides)
@@ -2898,6 +3202,7 @@ class _Matcher:
 
     def _match(self) -> MmaDagProgram:
         from ...language import _tracing_ops
+        from ...language import memory_ops
         from ...language.matmul_ops import dot
         from ..device_ir import ForLoopGraphInfo
         from ..device_ir import ReductionLoopGraphInfo
@@ -3084,6 +3389,17 @@ class _Matcher:
         for d in program.dots:
             if d.a.dtype != d.b.dtype:
                 raise _NotMine
+        # A tensor the program both loads and stores (through any name or
+        # view: by storage) is not staged: its tiles and side loads would
+        # be read ahead of the stores.
+        stored = {
+            _storage(store.access) for store in (*program.stores, *program.vec_stores)
+        }
+        if any(
+            not _is_call(access.node, memory_ops.store) and _storage(access) in stored
+            for access in program.accesses
+        ):
+            raise _NotMine
         return program
 
     def _region(self, graph: GraphInfo, loop: int) -> tuple[Step, ...]:
@@ -3096,9 +3412,19 @@ class _Matcher:
         from ...language.matmul_ops import dot
 
         steps: list[Step] = []
+        loaded: dict[tuple[object, ...], Node] = {}
         for node in graph.graph.nodes:
             if _is_call(node, memory_ops.load):
-                self.access(node)
+                access = self.access(node)
+                signature = _tile_signature(access)
+                if signature is None:
+                    continue
+                first = loaded.setdefault(signature, node)
+                if first is not node:
+                    # The same whole tile loaded again in this region (dk
+                    # reads dL straight and transposed): one tile, every
+                    # consumer reads the first load.
+                    self.aliases[node] = first
         for node in graph.graph.nodes:
             step: Step
             if _is_call(node, _tracing_ops._for_loop):
@@ -3206,7 +3532,10 @@ class _Matcher:
                     raise _NotMine
                 for bound in (lo, hi):
                     if isinstance(bound, torch.fx.Node):
-                        if not isinstance(bound.meta.get("val"), (int, torch.SymInt)):
+                        val = bound.meta.get("val")
+                        if not isinstance(val, (int, torch.SymInt)):
+                            raise _NotMine
+                        if isinstance(val, torch.SymInt) and self.bound_varies(val):
                             raise _NotMine
                     elif type(bound) is not int:
                         raise _NotMine
@@ -4046,6 +4375,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
             source_bytes = 0
             if operand.load is not None and operand.load.dtype != operand.dtype:
                 source_bytes = operand.load.dtype.itemsize
+            frame = program.operand_frame(dot, operand)
             tiles.append(
                 TileFacts(
                     operand.rows.index,
@@ -4060,7 +4390,13 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
                     edge_keys.setdefault(operand.chain_key, len(edge_keys))
                     if operand.kind == "frag"
                     else None,
-                    program.operand_frame(dot, operand),
+                    frame,
+                    source_bytes > 0
+                    and frame == -1
+                    and program.staged_ahead_of_loops(operand.chain_key),
+                    operand.kind == "frag"
+                    and frame == -1
+                    and program.read_within_one_root_segment(operand.chain_key),
                 )
             )
     # Derived values' tiles ride the ring too (read per lane from the slot);
