@@ -2268,7 +2268,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.ones_like(x))
 
     @skipIfNotTriton(
-        "asserts the tl.debug_barrier codegen; CuTe orders cross-loop accesses with its own per-access barrier pass"
+        "asserts the tl.debug_barrier codegen; CuTe orders inter-loop accesses with its own per-access barrier pass"
     )
     def test_sequential_loops_barrier_tracks_storage_aliases(self):
         @helion.kernel(autotune_effort="none")
