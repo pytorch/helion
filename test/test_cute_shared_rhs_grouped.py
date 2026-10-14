@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
 import dataclasses
 import inspect
 import itertools
@@ -423,6 +424,178 @@ class _OffsetPointer:
         return self.values[self.offset]
 
 
+_METADATA_THREAD_NAMES = {
+    "tcgen05_grouped_metadata_thread_idx": "cute.arch.thread_idx()",
+    "tcgen05_grouped_metadata_block_dim": "cute.arch.block_dim()",
+}
+
+
+def _offset_initializer_statements(tree: ast.Module) -> list[ast.stmt]:
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    setup = next(
+        node
+        for node in function.body
+        if isinstance(node, (ast.If, ast.For))
+        and any(
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) == "tcgen05_grouped_raw_start"
+            for child in node.body
+        )
+    )
+    if isinstance(setup, ast.If):
+        return [setup]
+    assert isinstance(setup.target, ast.Name)
+    assert setup.target.id == "tcgen05_grouped_metadata_group"
+    assert isinstance(setup.iter, ast.Call)
+    assert ast.unparse(setup.iter.func) == "cutlass.range"
+    assert len(setup.iter.args) == 3
+    assert ast.unparse(setup.iter.args[0]) == (
+        "tcgen05_grouped_metadata_thread_idx[0] + "
+        "tcgen05_grouped_metadata_block_dim[0] * "
+        "(tcgen05_grouped_metadata_thread_idx[1] + "
+        "tcgen05_grouped_metadata_block_dim[1] * "
+        "tcgen05_grouped_metadata_thread_idx[2])"
+    )
+    assert ast.unparse(setup.iter.args[2]) == (
+        "tcgen05_grouped_metadata_block_dim[0] * "
+        "tcgen05_grouped_metadata_block_dim[1] * "
+        "tcgen05_grouped_metadata_block_dim[2]"
+    )
+    assert [
+        (keyword.arg, ast.literal_eval(keyword.value))
+        for keyword in setup.iter.keywords
+    ] == [("unroll", 1)]
+    assert not any(
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "cute.arch.sync_threads"
+        for statement in setup.body
+        for node in ast.walk(statement)
+    )
+    assert (
+        ast.unparse(function.body[function.body.index(setup) + 1])
+        == "cute.arch.sync_threads()"
+    )
+    prologue = [
+        node
+        for node in function.body[: function.body.index(setup)]
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) in _METADATA_THREAD_NAMES
+    ]
+    assert len(prologue) == 2
+    for node in prologue:
+        assert (
+            ast.unparse(node.value)
+            == _METADATA_THREAD_NAMES[ast.unparse(node.targets[0])]
+        )
+    return [*prologue, setup]
+
+
+def _run_offset_initializer(
+    statements: list[ast.stmt], namespace: dict[str, Any]
+) -> None:
+    """Execute the real initializer across a physical 3D block and check owners."""
+    observed: list[int] = []
+
+    class Observe(ast.NodeTransformer):
+        def visit_Assign(self, node: ast.Assign) -> ast.Assign | list[ast.stmt]:
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Subscript)
+                and ast.unparse(target.value) == "tcgen05_grouped_starts"
+                and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value)
+                == "cutlass.Int32(tcgen05_grouped_visible_start)"
+            ):
+                record = ast.Expr(
+                    ast.Call(
+                        ast.Name("_observe_group", ast.Load()),
+                        [deepcopy(target.slice)],
+                        [],
+                    )
+                )
+                return [node, record]
+            return node
+
+    tree = Observe().visit(ast.Module(body=deepcopy(statements), type_ignores=[]))
+    code = compile(ast.fix_missing_locations(tree), "<device-offsets>", "exec")
+    namespace["_observe_group"] = lambda group: observed.append(int(group))
+    namespace["cutlass"].range = lambda *args, **kwargs: range(
+        *(int(arg) for arg in args)
+    )
+    shape = (2, 2, 2)
+    namespace["cute"].arch.block_dim = lambda: shape
+    for coordinate in itertools.product(*(range(size) for size in shape)):
+        namespace["cute"].arch.thread_idx = lambda coordinate=coordinate: coordinate
+        exec(code, namespace)
+    assert sorted(observed) == list(range(namespace["tcgen05_grouped_starts"].numel()))
+
+
+def _serial_offset_initializer(tree: ast.Module) -> ast.Module:
+    """Expand only independent parallel metadata owners into the old leader form.
+
+    This retains every typed load, signed clipping operation, and record store.
+    All other generated code still participates in the exact AST comparison.
+    """
+    result = deepcopy(tree)
+    statements = _offset_initializer_statements(result)
+    setup = statements[-1]
+    if not isinstance(setup, ast.For):
+        return result
+    assert isinstance(setup.iter, ast.Call) and isinstance(setup.target, ast.Name)
+    groups = ast.literal_eval(setup.iter.args[1])
+    assert type(groups) is int and groups > 0
+    group_name = setup.target.id
+    body: list[ast.stmt] = []
+    for group in range(groups):
+
+        class Group(ast.NodeTransformer):
+            def visit_Name(self, node: ast.Name, *, group: int = group) -> ast.expr:
+                return ast.Constant(group) if node.id == group_name else node
+
+            def visit_BinOp(self, node: ast.BinOp) -> ast.expr:
+                updated = self.generic_visit(node)
+                assert isinstance(updated, ast.BinOp)
+                node = updated
+                if isinstance(node.left, ast.Constant) and isinstance(
+                    node.right, ast.Constant
+                ):
+                    if (
+                        type(node.left.value) is int
+                        and type(node.right.value) is int
+                        and isinstance(node.op, ast.Add)
+                    ):
+                        return ast.Constant(node.left.value + node.right.value)
+                return node
+
+        body.extend(Group().visit(deepcopy(node)) for node in setup.body)
+    leader = ast.parse(
+        "if cute.arch.thread_idx()[0] == 0 and cute.arch.thread_idx()[1] == 0 and cute.arch.thread_idx()[2] == 0:\n    pass"
+    ).body[0]
+    assert isinstance(leader, ast.If)
+    leader.body = body
+    function = next(
+        node
+        for node in result.body
+        if isinstance(node, ast.FunctionDef) and setup in node.body
+    )
+    remainder = [node for node in function.body if node not in statements]
+    assert not any(
+        isinstance(node, ast.Name) and node.id in _METADATA_THREAD_NAMES
+        for statement in remainder
+        for node in ast.walk(statement)
+    )
+    function.body = [
+        leader if node is setup else node
+        for node in function.body
+        if node not in statements[:-1]
+    ]
+    return result
+
+
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
 @skipUnlessBackends(["cute"])
 def test_emitted_device_metadata_preserves_clipped_signed_ranges(
@@ -433,20 +606,7 @@ def test_emitted_device_metadata_preserves_clipped_signed_ranges(
     with _target():
         bound = _bind(_offset_mm, args)
         source = bound.to_code(_selected_config(64))
-    setup = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.If)
-        and any(
-            isinstance(statement, ast.Assign)
-            and isinstance(statement.targets[0], ast.Name)
-            and statement.targets[0].id == "tcgen05_grouped_raw_start"
-            for statement in node.body
-        )
-    )
-    code = compile(
-        ast.Module(body=[setup], type_ignores=[]), "<device-offsets>", "exec"
-    )
+    statements = _offset_initializer_statements(ast.parse(source))
 
     def convert(value: object, dtype: torch.dtype) -> torch.Tensor:
         return (
@@ -477,7 +637,7 @@ def test_emitted_device_metadata_preserves_clipped_signed_ranges(
             "tcgen05_grouped_starts": starts,
             "tcgen05_grouped_problem_sizes": sizes,
         }
-        exec(code, namespace)
+        _run_offset_initializer(statements, namespace)
         # Subtraction has the input integer dtype; Python's wider sum below
         # enumerates the logical signed range without overflowing its endpoint.
         lengths = (values[1:] - values[:-1]).tolist()
