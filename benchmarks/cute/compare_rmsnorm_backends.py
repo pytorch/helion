@@ -54,6 +54,7 @@ import sys
 import time
 from typing import Any
 from typing import Callable
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 QUACK_PATH = REPO_ROOT / "quack"
@@ -245,7 +246,8 @@ def _quack_compiled_kernel(x, weight, config=None):  # noqa: ANN001, ANN202
     )
     out = torch.empty_like(x)
     rstd = torch.empty(x.size(0), device=x.device, dtype=torch.float32)
-    fn = lambda: kernel(x, weight, None, None, out, None, rstd, None, EPS)  # noqa: E731
+    kernel_callable = cast("Callable[..., object]", kernel)
+    fn = lambda: kernel_callable(x, weight, None, None, out, None, rstd, None, EPS)  # noqa: E731
     return fn, out, rstd
 
 
