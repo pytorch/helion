@@ -32,7 +32,7 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
-from .inductor_lowering import ReductionLowering
+from .inductor_lowering import reduction_block_id
 
 if TYPE_CHECKING:
     from .compile_environment import BlockSizeInfo
@@ -95,12 +95,8 @@ class ReductionRoller:
         self._size_node: torch.fx.Node | None = None
 
     def is_reduction(self, node: torch.fx.Node) -> bool:
-        """Check if a node is a reduction"""
-        return (
-            node.op == "call_function"
-            and isinstance(lowering := node.meta["lowering"], ReductionLowering)
-            and lowering.block_index == self.rdim.block_id
-        )
+        """Whether the node reduces the dimension being rolled."""
+        return reduction_block_id(node) == self.rdim.block_id
 
     def should_go_in_inner_graph(self, node: torch.fx.Node) -> bool:
         """Nodes go in the inner graph if they use the reduction dimension"""
@@ -108,10 +104,12 @@ class ReductionRoller:
             return False
         assert node.op == "call_function", f"Unsupported node type {node.op}"
 
-        if node.target is _reduce:
-            # TODO(jansel): support rolling user-defined reductions
+        if node.target is _reduce and (
+            CompileEnvironment.current().backend_name != "triton"
+            or node.args[2] is None
+        ):
             raise NotImplementedError(
-                "hl._reduce operations are not compatible with reduction rolling"
+                "custom reduction rolling requires Triton and a single reduction axis"
             )
 
         if node.target is _associative_scan:

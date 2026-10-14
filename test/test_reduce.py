@@ -1131,5 +1131,98 @@ class TestCuteBuiltinReduce(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(counts, indices.sum(-1, dtype=torch.int32))
 
 
+# Backend test marks also admit TileIR; these kernels explicitly select Triton.
+@onlyBackends(["triton"])
+class TestRolledCustomReduce(RefEagerTestBase, TestCase):
+    @skipIfRefEager("checks generated reduction-loop code")
+    def test_nonzero_identity_and_nonidentity_padding(self) -> None:
+        @helion.kernel(
+            backend="triton", autotune_effort="none", debug_dtype_asserts=True
+        )
+        def shifted_rows(
+            x: torch.Tensor,
+            other: hl.constexpr,
+            combine: hl.constexpr = lambda left, right: left + right + 1,
+        ) -> torch.Tensor:
+            out = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            for row in hl.tile(x.size(0)):
+                out[row] = hl.reduce(combine, x[row, :], dim=1, other=other)
+            return out
+
+        x = torch.randint(-10, 10, (5, 2051), device=DEVICE).float()
+        for other in (-1, 2):
+            code, result = code_and_output(
+                shifted_rows, (x, other), block_sizes=[2], reduction_loops=[256]
+            )
+            padding = 4096 - x.size(1)
+            expected = x.sum(1) + x.size(1) - 1 + padding * (other + 1)
+            torch.testing.assert_close(result, expected)
+            self.assertIn("for roffset_", code)
+            self.assertNotIn("custom_reduce_valid_combine", code)
+
+    @skipIfRefEager("Checks dynamic reduction results")
+    def test_dynamic_tuple_padding(self) -> None:
+        @helion.kernel(
+            backend="triton",
+            static_shapes=False,
+            config=helion.Config(block_sizes=[2], reduction_loops=[256]),
+        )
+        def padded_pair(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            first = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            second = torch.empty_like(first)
+            for row in hl.tile(x.size(0)):
+                a, b = hl.reduce(
+                    tuple_add_combine_fn,
+                    (x[row, :], x[row, :]),
+                    dim=1,
+                    other=(2, 3),
+                )
+                first[row] = a
+                second[row] = b
+            return first, second
+
+        storage = torch.randint(-10, 10, (5, 8192), device=DEVICE).float()
+        code, _ = code_and_output(
+            padded_pair,
+            (storage[:, :5000],),
+            block_sizes=[2],
+            reduction_loops=[256],
+        )
+        self.assertIn("custom_reduce_valid_combine", code)
+        for width in (5000, 2, 33):
+            x = storage[:, :width]
+            padding = (1 << (width - 1).bit_length()) - width
+            torch.testing.assert_close(
+                padded_pair(x), (x.sum(1) + padding * 2, x.sum(1) + padding * 3)
+            )
+
+    @skipIfRefEager("checks generated reduction-loop code")
+    def test_mixed_reduction_fusion(self) -> None:
+        @helion.kernel(backend="triton", autotune_effort="none")
+        def two_reductions(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            totals = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+            squares = torch.empty_like(totals)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                total = hl.reduce(add_combine_fn, values, dim=1, keep_dims=True)
+                totals[row] = total.squeeze(1)
+                squares[row] = (values * values).sum(1)
+            return totals, squares
+
+        x = torch.randn((5, 2051), device=DEVICE)
+        bound = two_reductions.bind((x,))
+        self.assertTrue(bound.env.config_spec.reduction_fusion_available)
+        code, (totals, squares) = code_and_output(
+            two_reductions,
+            (x,),
+            block_sizes=[2],
+            reduction_loops=[256],
+            reduction_fusion=True,
+        )
+        torch.testing.assert_close(totals, x.sum(1), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(squares, x.square().sum(1))
+        self.assertEqual(code.count("for roffset_"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

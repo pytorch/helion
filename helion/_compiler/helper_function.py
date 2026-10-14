@@ -218,10 +218,6 @@ class HelperFunctionManager:
 
         return helper_defs  # pyrefly: ignore[bad-return]
 
-    def get_final_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str:
-        """Get the final generated name for a helper function."""
-        return self._final_names.get(helper_graph_info.name, helper_graph_info.name)
-
     def _codegen_helper_function_body(
         self, helper_graph_info: HelperFunctionGraphInfo
     ) -> list[ast.stmt]:

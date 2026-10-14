@@ -72,6 +72,34 @@ class TestLLMGuidedSearch(TestCase):
             setattr(search, name, value)
         return search
 
+    def test_seed_configs_keep_candidates_before_default(self):
+        default = helion.Config(block_sizes=[64])
+        persistent = helion.Config(block_sizes=[1], reduction_loops=[None])
+        looped = helion.Config(block_sizes=[1], reduction_loops=[256])
+        for population in (
+            [default, persistent, looped],
+            [persistent, looped, default],
+        ):
+            for count in range(3):
+                with self.subTest(population=population, count=count):
+                    search = self._make_mock_search(
+                        initial_random_configs=count,
+                        config_spec=SimpleNamespace(
+                            autotune_reference_config=lambda: default,
+                        ),
+                        config_gen=SimpleNamespace(
+                            default_flat=lambda: default,
+                            random_population_flat=lambda n, configs=population: (
+                                configs[:n]
+                            ),
+                            unflatten=lambda config: config,
+                        ),
+                    )
+                    self.assertEqual(
+                        search._build_seed_configs(),
+                        [default, persistent, looped][: count + 1],
+                    )
+
     def test_trace_records_exact_async_llm_exchange_and_seed_measurements(self):
         import tempfile
 
