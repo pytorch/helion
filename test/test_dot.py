@@ -221,6 +221,42 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 @onlyBackends(["triton", "cute"])
 class TestDot(RefEagerTestBase, TestCase):
+    def test_hl_dot_operands_uniform_along_k(self):
+        """Operands expanded from size-1 dims are uniform along K, but each of
+        K's lanes is still a product of the contraction: CuTe's scalar matmul
+        summed one product per K tile (1/16 of the result)."""
+
+        @helion.kernel(
+            static_shapes=True, config=helion.Config(block_sizes=[16, 16, 16])
+        )
+        def outer_dot(
+            x: torch.Tensor, y: torch.Tensor, c: torch.Tensor, d: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n = y.size(1)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    lhs = c[tile_m][:, None].expand_as(x[tile_m, tile_k])
+                    rhs = d[tile_n][None, :].expand_as(y[tile_k, tile_n])
+                    acc = hl.dot(lhs, rhs, acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        for k in (48, 40):
+            with self.subTest(k=k):
+                x = torch.randn(32, k, device=DEVICE)
+                y = torch.randn(k, 32, device=DEVICE)
+                c = torch.randn(32, device=DEVICE)
+                d = torch.randn(32, device=DEVICE)
+                torch.testing.assert_close(
+                    outer_dot(x, y, c, d),
+                    k * c[:, None] * d[None, :],
+                    rtol=1e-2,
+                    atol=1e-1,
+                )
+
     def test_hl_dot_masks_computed_operands_along_k(self):
         """``hl.dot`` sums over K, so the products past the K tile must be 0:
         two computed operands (``x + 1``, a broadcast add) both held real
