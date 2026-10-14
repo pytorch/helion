@@ -1665,6 +1665,21 @@ class DeviceFunction:
                 if not unrolled:
                     raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
+            # Preserve the global FMA decisions above. This optional pass
+            # moves only raw packet loads/cache writes across a proven
+            # single-trip reduction; arithmetic and PDL waits stay in place.
+            if exact_thread_block_dims is not None:
+                from .cute.prefetch_reduction_packets import prefetch_reduction_packets
+
+                kernel_body = prefetch_reduction_packets(
+                    kernel_body,
+                    constexpr_values=constexpr_values,
+                    thread_block_dims=exact_thread_block_dims,
+                    tensor_dtypes=tensor_dtypes,
+                    reload_modes=reload_modes,
+                    argument_names={arg.name for arg in self.arguments},
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                )
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside
             # the body, issue iter N+1's load BEFORE iter N's compute
