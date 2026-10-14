@@ -242,6 +242,11 @@ intersphinx_resolve_self = "helion"
 # Linkcheck configuration - ignore URLs that block automated checkers
 linkcheck_ignore = [
     r"https://pytorchconference.*\.sched\.com/.*",  # Returns 403 to bots
+    # This historical PLDI event page repeatedly returns HTTP 504 in CI.
+    (
+        r"https://pldi26\.sigplan\.org/details/pldi-2026-tutorials/1/"
+        r"Writing-Performance-Portable-Kernels-Simplified-with-Helion$"
+    ),
     # Moved from helion/experimental/ in this change; the blob/main URL 404s
     # until the PR merges, then resolves.
     r"https://github\.com/pytorch/helion/blob/main/helion/autotuner/aot_kernel\.py",
