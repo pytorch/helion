@@ -94,15 +94,20 @@ def _pipe_shadow_var_count(code: str, kind: str) -> int:
 
 
 def _softmax_artifact(
-    n: int, *, block_n: int = 128, vec_width: int = 4
+    n: int, *, block_n: int = 128, vec_width: int = 4, fast_math: bool = False
 ) -> tuple[str, torch.Tensor, torch.Tensor]:
     """Compile ``softmax_two_pass_kernel`` on (4096, n) fp16 once and
     return ``(code, out, ref)`` for shared assertions."""
-    key = (n, block_n, vec_width)
+    key = (n, block_n, vec_width, fast_math)
     if key not in _ARTIFACT_CACHE:
         x = torch.randn(4096, n, device=DEVICE, dtype=HALF_DTYPE)
+        kernel = softmax_two_pass_kernel
+        if fast_math:
+            kernel = helion.kernel(
+                softmax_two_pass_kernel.fn, backend="cute", fast_math=True
+            )
         code, out = code_and_output(
-            softmax_two_pass_kernel,
+            kernel,
             (x,),
             block_sizes=[1, block_n],
             num_threads=[0, 32],
@@ -423,14 +428,14 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
     * P2/P5 fuser bail: trip = 99 > cache cap 64, so both sweeps load
       from gmem (guards the P8 register-pressure regression).
     * P14 ``merge_sibling_v_loops``: vmerge cache + preserved result dtype.
-    * P16 reciprocal hoist: ``1.0 / di`` hoisted, inner divide becomes
-      a multiply.
-    * P17 extended hoists: alias DCE (``*_copy`` chains inlined),
-      outer-in reciprocal walk (no ``1.0 * _helion_inv_div_`` cascade),
-      FMA-friendly scale hoists in both the consume loop and the reduce
-      V-loop, dead-Sub DCE, and the post-rename invariance
-      canonicalization that keeps ``mi`` loop-VARIANT in the reduce
-      loop (silent-miscompile guard).
+    * P16 reciprocal hoist: needs the ``fast_math`` setting (its pins
+      live in ``test_cute_hoist_loop_invariant_recip.py``); here the
+      consume sweep keeps its IEEE divide by ``di``.
+    * P17 extended hoists: alias DCE (``*_copy`` chains inlined), and,
+      on a ``fast_math`` artifact, FMA-friendly scale hoists in both the
+      consume loop and the reduce V-loop, dead-Sub DCE, and the
+      post-rename invariance canonicalization that keeps ``mi``
+      loop-VARIANT in the reduce loop (silent-miscompile guard).
     * P18 load pipeline: both sweeps pipelined (prologue snapshot +
       per-iter prefetch).
     """
@@ -486,22 +491,33 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
             "local_amax = cute.arch.warp_reduction_max",
             code,
         )
-        # P16: the hoisted reciprocal references the loop-external root
-        # name ``di`` (not an inside-loop ``di_copy_*`` alias) and the
-        # inner divide is rewritten to a multiply.
-        self.assertIn("_helion_inv_div_", code)
-        self.assertIn("= 1.0 / di", code)
-        self.assertIn("* _helion_inv_div_", code)
-        self.assertNotIn("/ di_copy_1_0", code)
-        # P17 outer-in walk: no ``_helion_inv_div_N = 1.0 *
-        # _helion_inv_div_{N+1}`` cascade, exactly ONE reciprocal hoist
-        # for the consume sweep's ``1.0/di``.
-        self.assertEqual(code.count("1.0 * _helion_inv_div_"), 0)
-        self.assertEqual(code.count("= 1.0 / di"), 1)
+        # P16: without fast_math the consume sweep keeps its IEEE divide,
+        # by the loop-external root name ``di`` (not an inside-loop
+        # ``di_copy_*`` alias).
+        self.assertNotIn("_helion_inv_div_", code)
+        self.assertIn("v_12 = v_11 / di\n", code)
         # P17 alias DCE: neither ``mi_copy`` nor ``di_copy`` appears —
         # both were SSA snapshots; with the snapshot removed the inner
         # use reads the root directly.
         self.assertEqual(code.count("_copy"), 0)
+        # P17 FMA scale hoist: needs fast_math (see the next test); here
+        # both sweeps keep the exact ``(x - max) * log2(e)`` exponent.
+        self.assertNotIn("_helion_scaled_", code)
+        self.assertIn("v_10 = v_9 - mi\n", code)
+        self.assertIn(
+            "v_11 = cute.math.exp2(cutlass.Float32(v_10) * 1.4426950408889634)\n",
+            code,
+        )
+        self.assertIn("v_6 = v_5 - v_1\n", code)
+        # The online-softmax rescale update contracts to a single FMA
+        # (``di = di*exp(mi-mi_next) + sum`` — same fusion quack applies).
+        self.assertIn("di = cute.math.fma(di, v_3, sum_1)", code)
+
+    def test_fma_scale_hoists_under_fast_math(self) -> None:
+        """P17 FMA scale hoists, which distribute ``(x - max) * log2(e)``
+        and so need fast_math."""
+        code, out, ref = _softmax_artifact(12672, fast_math=True)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # P17 FMA scale hoist above the consume loop: ``mi * log2(e)``
         # hoisted, inner expression rewritten to the FMA-friendly form
         # (the outer redundant ``cutlass.Float32(v_9)`` cast is
@@ -511,11 +527,13 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
         self.assertIn("cute.math.exp2(v_9 * 1.4426950408889634 - _helion_scaled_", code)
         # P17 FMA scale hoist in the reduce V-loop: ``v_1`` (the
         # new-max from the warp_reduce before the V-loop) is
-        # V-loop-invariant, so the hoist fires there too.
+        # V-loop-invariant, so the hoist fires there too (fast_math also
+        # pairs the V-loop's lanes, renaming ``v_5`` per lane).
         self.assertIn("= v_1 * 1.4426950408889634", code)
-        self.assertIn(
-            "cute.math.exp2(cute.math.fma(v_5, 1.4426950408889634, -_helion_scaled_",
+        self.assertRegex(
             code,
+            r"cute\.math\.exp2\(cute\.math\.fma\(\w*v_5\w*, "
+            r"1\.4426950408889634, -_helion_scaled_",
         )
         # P17 DCE: the consume-loop ``v_10 = v_9 - mi`` and the reduce
         # V-loop ``v_6 = v_5 - v_1`` are dead after the FMA hoists and
@@ -523,9 +541,6 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
         # ``di``) must survive.
         self.assertNotIn("v_10 = v_9 - mi", code)
         self.assertNotIn("v_6 = v_5 - v_1", code)
-        # The online-softmax rescale update contracts to a single FMA
-        # (``di = di*exp(mi-mi_next) + sum`` — same fusion quack applies).
-        self.assertIn("di = cute.math.fma(di, v_3, sum_1)", code)
         # P17 invariance canonicalization: the ``mi`` scale hoist for
         # the consume sweep lives BETWEEN the two outer for-loops
         # (after the reduce loop finishes mutating ``mi`` via the

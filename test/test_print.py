@@ -19,6 +19,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
@@ -423,7 +424,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
-    @unittest.skip("TODO(yf225): make printing reduction output work")
+    @skipIfTileIR("TileIR's device print output lacks the 'row sum: <value>' lines")
     def test_print_reduction(self):
         """Test print reduction output"""
 
@@ -452,7 +453,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(result, x.sum(dim=1))
 
             # Check that prints are generated
-            self.assertIn("'row sum: '", code)
+            self.assert_print_in_code(code, "row sum: ", 1)
 
             output_lines = [line for line in output.strip().split("\n") if line]
             self.assertGreater(

@@ -30,6 +30,7 @@ from torch._subclasses import FakeTensorMode
 import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import StatelessSymbolicContext
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils import _pytree as pytree
 
@@ -39,6 +40,7 @@ from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
+from .backend import BackendState
 from .backend_registry import get_backend_class
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -135,6 +137,31 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
             and _is_supported_tensor_input_source(source.base)
         )
     return False
+
+
+# Set by the torch.compile HOP lowering on its example inputs: the dims
+# Dynamo's graph keeps static, which the captured trace bound as literals.
+HELION_STATIC_DIMS_ATTR = "_helion_static_dims"
+
+
+def _static_dims_symbolic_context(
+    tensor: torch.Tensor,
+) -> StatelessSymbolicContext | None:
+    """A dynamic-shape fakeification of ``tensor`` that keeps its
+    ``HELION_STATIC_DIMS_ATTR`` dims static (None: the default context)."""
+    static_dims = getattr(tensor, HELION_STATIC_DIMS_ATTR, None)
+    if not static_dims:
+        return None
+    ndim = tensor.dim()
+    return StatelessSymbolicContext(
+        dynamic_sizes=[
+            DimDynamic.STATIC if i in static_dims else DimDynamic.DUCK
+            for i in range(ndim)
+        ],
+        dynamic_strides=[DimDynamic.INFER_STRIDE] * ndim,
+        constraint_sizes=[None] * ndim,
+        constraint_strides=[None] * ndim,
+    )
 
 
 def tensor_descriptor_runtime_alignment_signature(
@@ -415,7 +442,16 @@ class CompileEnvironment:
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
         self._backend.validate_environment()
-        if self._backend.experimental:
+        if (
+            settings.debug_dtype_asserts
+            and not self._backend.supports_debug_dtype_asserts
+        ):
+            raise exc.BackendUnsupported(
+                self._backend.name,
+                "debug_dtype_asserts=True (it emits Triton tl.cast / "
+                "tl.static_assert checks)",
+            )
+        if self._backend.state is BackendState.EXPERIMENTAL:
             from torch._dynamo.utils import warn_once
 
             warn_once(
@@ -450,6 +486,10 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        # Dynamic reduction extents whose CuTe persistent thread layout was
+        # sized from the size hint; the bound kernel keys their power-of-2
+        # bucket once code generation has used one.
+        self.cute_hint_sized_reduction_extents: set[sympy.Expr] = set()
         self.cute_fission_plan: MaterializedFissionPlan | None = None
         self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
         # Internal stage compilers may inherit a proved TensorMap-aligned view
@@ -501,6 +541,10 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
+        # Input sizes code generation relied on being equal (a block store
+        # bounded by its tensor covering the tile's loop) only at this
+        # binding's values; like a guard, each keys the bound kernel.
+        self.keyed_size_equalities: set[tuple[sympy.Symbol, sympy.Expr]] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
         self.tunable_symbols: set[sympy.Symbol] = set()
@@ -1145,7 +1189,7 @@ class CompileEnvironment:
 
         for shape in self.kernel_tensor_sizes:
             FlattenedTileStrategy.update_allow_flattened(shape)
-        self._disable_range_num_stages_for_aliasing()
+        self._pin_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
         self.backend.adjust_block_size_constraints(
             list(self.config_spec.block_sizes),
@@ -1282,11 +1326,20 @@ class CompileEnvironment:
             extent = self.backend.static_rdim_size(extent)
         return extent
 
-    def _disable_range_num_stages_for_aliasing(self) -> None:
+    def _pin_range_num_stages_for_aliasing(self) -> None:
         """
-        Disable pipelining only on loops that read and write the same argument.
+        Pin range_num_stages to 0 on loops that read and write the same argument.
 
-        Workaround for https://github.com/triton-lang/triton/issues/8259
+        Workaround for https://github.com/triton-lang/triton/issues/8259: such a
+        loop gets no per-loop ``num_stages``.  The slot stays in the config
+        space (``RangeNumStagesSpec.pinned``), so a saved config keeps its
+        shape whatever the alias analysis finds.  A device loop is unsafe when
+        a host tensor it reads and a host tensor it writes may share storage
+        that comes from a kernel argument, by
+        ``collect_host_tensor_roots`` with each argument its own root: any
+        view, conversion or unknown op on an argument is assumed to alias it,
+        bindings in nested host blocks count, and a tensor of unknown
+        provenance may alias anything.
         """
 
         if not self.config_spec.range_num_stages:
@@ -1295,40 +1348,77 @@ class CompileEnvironment:
         from .ast_extension import ExtendedAST
         from .ast_read_writes import ReadWrites
         from .host_function import HostFunction
-        from .loop_dependency_checker import canonical_host_tensor_name
-        from .loop_dependency_checker import collect_host_tensor_aliases
+        from .loop_dependency_checker import HOST_UNKNOWN_ROOT
+        from .loop_dependency_checker import collect_host_tensor_roots
+        from .loop_dependency_checker import is_host_argument_root
         from .type_info import IterType
         from .type_info import SequenceType
+        from .type_info import TensorType
         from .type_info import TileIndexType
 
         host_fn = HostFunction.current()
-        arg_names = set(host_fn.params.arguments.keys())
-        aliases = collect_host_tensor_aliases(host_fn.body)
+        module = ast.Module(body=host_fn.body, type_ignores=[])
+        roots = collect_host_tensor_roots(
+            host_fn.body,
+            set(host_fn.params.arguments.keys()),
+            distinct_arguments=True,
+        )
+        device_loops = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.For)
+            and isinstance(node, ExtendedAST)
+            and isinstance(node.iter, ExtendedAST)
+            and isinstance(node.iter._type_info, IterType)
+        ]
+        # Names bound inside a device loop are tiles, not host tensors.
+        device_names = {
+            name.id
+            for loop in device_loops
+            for name in ast.walk(loop)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
+        }
+        tensor_names = {
+            name.id
+            for name in ast.walk(module)
+            if isinstance(name, ast.Name)
+            and isinstance(name, ExtendedAST)
+            and isinstance(name._type_info, TensorType)
+        } - device_names
+        unknown = frozenset({HOST_UNKNOWN_ROOT})
+
+        def argument_storage(names: set[str]) -> frozenset[str]:
+            result: frozenset[str] = frozenset()
+            for name in names & tensor_names:
+                result |= roots.get(name, unknown)
+            return result
+
         unsafe_block_ids: set[int] = set()
-        for node in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
-            if not isinstance(node, ast.For) or not isinstance(node, ExtendedAST):
-                continue
+        for node in device_loops:
             rw = ReadWrites.from_list(node.body)
             # Name traversal sees the target passed to an in-place store and
             # host-side tensor metadata as reads, but neither reads storage.
-            reads = {
-                canonical_host_tensor_name(name, aliases)
-                for name, count in rw.reads.items()
-                if count
-                > rw.inplace_writes.get(name, 0) + rw.tensor_metadata_reads.get(name, 0)
-            }
-            reads.update(
-                canonical_host_tensor_name(name, aliases) for name in rw.atomic_reads
+            reads = argument_storage(
+                {
+                    name
+                    for name, count in rw.reads.items()
+                    if count
+                    > rw.inplace_writes.get(name, 0)
+                    + rw.tensor_metadata_reads.get(name, 0)
+                }
+                | set(rw.atomic_reads)
             )
-            writes = {canonical_host_tensor_name(name, aliases) for name in rw.writes}
-            if not (reads & writes & arg_names):
+            writes = argument_storage(set(rw.writes))
+            if not (
+                (reads and HOST_UNKNOWN_ROOT in writes)
+                or (writes and HOST_UNKNOWN_ROOT in reads)
+                or any(is_host_argument_root(root) for root in reads & writes)
+            ):
                 continue
             iter_node = node.iter
-            if not isinstance(iter_node, ExtendedAST):
-                continue
+            assert isinstance(iter_node, ExtendedAST)
             iter_type = iter_node._type_info
-            if not isinstance(iter_type, IterType):
-                continue
+            assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
                 unsafe_block_ids.update(
@@ -1338,9 +1428,9 @@ class CompileEnvironment:
                 )
             elif isinstance(inner, TileIndexType):
                 unsafe_block_ids.add(inner.block_id)
-        for block_id in unsafe_block_ids:
-            if block_id in self.config_spec.range_num_stages.valid_block_ids():
-                self.config_spec.range_num_stages.disable_block_id(block_id)
+        for spec in self.config_spec.range_num_stages:
+            if unsafe_block_ids.intersection(spec.block_ids):
+                spec.pinned = True
 
     def allocate_block_size(
         self,
@@ -1408,7 +1498,9 @@ class CompileEnvironment:
             )
         return idx
 
-    def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
+    def allocate_reduction_dimension(
+        self, size: torch.SymInt | int, *, guard: bool = True
+    ) -> BlockSizeInfo:
         # Check if this size is already a registered block size
         existing_block: BlockSizeInfo | None = None
         if isinstance(size, torch.SymInt):
@@ -1435,12 +1527,26 @@ class CompileEnvironment:
         # _maybe_evaluate_static (no new guards) and returns False when the
         # equality is undecidable. Backed sizes keep the guarding ``==`` so
         # distinct input symbols that are equal by hint (e.g. x.size(1) vs
-        # weight.size(0)) still unify into a single rdim.
+        # weight.size(0)) still unify into a single rdim, and so does a dynamic
+        # full slice with the dim of a specialized one (``weight[:]`` beside
+        # ``y[tile, :]`` of ``n = hl.specialize(y.size(1))``: the elementwise
+        # op between them needs the one dim).  A literal factory dim
+        # (``guard=False``, see ``BlockSizeInfo.literal_size``) matches and is
+        # matched only by sizes known equal: a padded ``hl.full([tile, 48])``
+        # must not specialize a dynamic full slice that is 48 at bind time.
         for rdim in self.block_sizes:
             if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
                 continue
-            if _has_unbacked(rdim.size) or _has_unbacked(size):
+            if (
+                not guard
+                or rdim.literal_size
+                or _has_unbacked(rdim.size)
+                or _has_unbacked(size)
+            ):
                 if self.known_equal(rdim.size, size):
+                    if guard:
+                        # A non-literal size joined it: it unifies as usual now.
+                        rdim.literal_size = False
                     return rdim
             elif rdim.size == size:
                 return rdim
@@ -1451,19 +1557,21 @@ class CompileEnvironment:
         rdim_idx = self.allocate_block_size(
             size,
             reduction=True,
-            source=ReductionLoopBlockSizeSource(
-                sum([int(bs.reduction) for bs in self.block_sizes])
-            ),
+            source=ReductionLoopBlockSizeSource(),
             # When size==0, next_power_of_2(size_hint(0)) == 1, and a hint of 1
             # causes Inductor to see reduction_numel==1 and skip the reduction
             # instead of generating a masked reduction that yields the identity value.
-            # Use hint=2 in that case so the reduction is preserved.
+            # Use hint=2 in that case so the reduction is preserved (and a dynamic
+            # empty extent does not guard its block to 1).  Test the hint: a
+            # symbolic ``size == 0`` is statically False.
             hint=2
-            if (size == 0 and next_power_of_2(self.size_hint(size)) == 1)
+            if self.size_hint(size) == 0
             else next_power_of_2(self.size_hint(size)),
             reuse_var=reuse_var,
         )
-        return self.block_sizes[rdim_idx]
+        info = self.block_sizes[rdim_idx]
+        info.literal_size = not guard
+        return info
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         source = _current_symbol_source()
@@ -1750,14 +1858,30 @@ class CompileEnvironment:
             return cached
         if free_unbacked_symbols(expr):
             result = self.create_unbacked_symint()
-        else:
-            assert isinstance(expr, sympy.Symbol)
+        elif isinstance(expr, sympy.Symbol):
             hint = int(shape_env_var_hints(outer_se)[expr])
             new_expr = self.shape_env.create_symbol(
                 hint, source, dynamic_dim=DimDynamic.DYNAMIC
             )
             result = self.shape_env.create_symintnode(
                 new_expr, hint=hint, source=source
+            )
+        else:
+            # A compound size (``s0 - 1`` for ``x[1:]``): mirror each foreign
+            # symbol, then rebuild the expression over the mirrors.  ``source``
+            # names this size, not its symbols, which get ephemeral sources.
+            hints = shape_env_var_hints(outer_se)
+            mirrors: dict[sympy.Basic, sympy.Basic] = {}
+            for symbol in expr.free_symbols:
+                assert isinstance(symbol, sympy.Symbol)
+                mirror = self._maybe_recreate_symint(
+                    outer_se.create_symintnode(symbol, hint=int(hints[symbol])),
+                    EphemeralSource(f"helion_foreign_{symbol}"),
+                )
+                assert isinstance(mirror, torch.SymInt)
+                mirrors[symbol] = mirror._sympy_()
+            result = self.shape_env.create_symintnode(
+                expr.xreplace(mirrors), hint=int(expr.xreplace(hints))
             )
         self._foreign_symint_cache[cache_key] = result
         return result
@@ -1800,7 +1924,11 @@ class CompileEnvironment:
             )
         else:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
-                self.fake_mode, tensor, shape_env=self.shape_env, source=source
+                self.fake_mode,
+                tensor,
+                shape_env=self.shape_env,
+                source=source,
+                symbolic_context=_static_dims_symbolic_context(tensor),
             )
         result = self.backend.normalize_input_fake_tensor(result)
         previous_source = self.input_sources.get(result)
@@ -1883,6 +2011,40 @@ class CompileEnvironment:
             return bool(res)
         return a == b
 
+    def resolve_broadcast_dim(
+        self,
+        size: int | torch.SymInt,
+        block_id: int,
+        offset: int | torch.SymInt = 0,
+    ) -> None:
+        """Settle whether a tensor dim indexed by block ``block_id`` is size 1.
+
+        Indexing a size-1 dim with a tile over a larger extent broadcasts.  A
+        dynamic size is compared with 1 under a guard unless it provably
+        covers the tile's extent plus ``offset``: at size 1 such a tile is at
+        most one wide there, where indexing equals broadcasting, so the
+        tile's own dim (``x[tile]`` over ``x.size()``) records no guard.  A
+        true comparison replaces the symbol by 1, which later
+        ``known_equal(size, 1)`` checks see, and either outcome's guard,
+        recorded during code generation, keys the bound kernel.
+        """
+        if not isinstance(size, torch.SymInt) or self.known_equal(size, 1):
+            return
+        if any(
+            self.get_block_id(symbol) is not None
+            for symbol in _to_sympy(size).free_symbols
+        ):
+            # A size computed from block sizes (``cdiv(n, block)`` partials)
+            # is fixed by the config, not by the inputs: a guard would settle
+            # it for whichever config compiled first.
+            return
+        extent = self.block_sizes[self.canonical_block_id(block_id)].size
+        if isinstance(extent, (int, torch.SymInt)) and self.known_nonnegative(
+            _to_sympy(size - extent - offset)
+        ):
+            return
+        bool(size == 1)
+
     def known_nonnegative(self, expression: sympy.Expr) -> bool:
         """Prove ``expression >= 0`` without adding a specialization guard."""
         expression = self.shape_env.simplify(sympy.simplify(expression))
@@ -1894,8 +2056,12 @@ class CompileEnvironment:
         return result is sympy.true
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
-        if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
-            return (int(a) % b) == 0
+        a = self.specialize_expr(_to_sympy(a))
+        b_expr = self.specialize_expr(_to_sympy(b))
+        if isinstance(a, (int, sympy.Integer)) and isinstance(
+            b_expr, (int, sympy.Integer)
+        ):
+            return (int(a) % int(b_expr)) == 0
         return False
 
     def specialized_multiple(self, value: object, divisor: int) -> bool:
@@ -2218,6 +2384,12 @@ class BlockSizeInfo:
     reduction: bool
     block_size_source: BlockSizeSource
     debug_names: set[str] = dataclasses.field(default_factory=set)
+    # A reduction dim allocated for a literal tensor-factory size
+    # (``allocate_reduction_dimension(..., guard=False)``): it unifies with
+    # another size only when they are known equal, never by guarding a dynamic
+    # input size to the literal.  Cleared once a known-equal non-literal size
+    # (a full slice of a specialized dim) joins it.
+    literal_size: bool = False
 
     def add_debug_name(self, name: str) -> None:
         if not name:
@@ -2352,19 +2524,22 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 
 @dataclasses.dataclass
 class ReductionLoopBlockSizeSource(BlockSizeSource):
-    reduction_loop: int
-
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
-        if (
-            len(config.reduction_loops) <= self.reduction_loop
-            or config.reduction_loops[self.reduction_loop] is None
-        ):
+        # ``config.reduction_loops`` holds one entry per *registered* rollable
+        # dim (``config_spec.reduction_loops``), so look the dim up by block id
+        # as the strategy selection does: an unregistered earlier dim would
+        # shift a positional index onto another dim's chunk.
+        env = CompileEnvironment.current()
+        chunk = env.config_spec.reduction_loops.config_get(
+            config.reduction_loops, block_size_info.block_id, None
+        )
+        if chunk is None:
             size = max(1, block_size_info.size_hint())
             # Backends override static_rdim_size to control whether the
             # persistent-reduction extent is rounded up to a power of two
             # (Triton/CuTe) or kept exact (Pallas).
-            return CompileEnvironment.current().backend.static_rdim_size(size)
-        return config.reduction_loops[self.reduction_loop]
+            return env.backend.static_rdim_size(size)
+        return chunk
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:

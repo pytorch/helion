@@ -282,8 +282,10 @@ def _plan_warp_per_row_execution(
         return
     # No reduction strategy (rolled reduction) — that path runs the
     # CuteTileVecWarpReduceHeuristic-style single-row layout already.
+    # A single-thread reduction claims no axis (``_claims_thread_axis``) but
+    # keeps this gate as before, so the plan's domain is unchanged.
     if any(
-        isinstance(s, ReductionStrategy) and s.thread_axes_used() > 0
+        isinstance(s, ReductionStrategy) and s._reduction_thread_count() > 0
         for s in tile_strategy.strategies
     ):
         return
@@ -402,10 +404,14 @@ def _plan_register_tile_execution(
         return
     if graph_info.cute_grid_execution_plans:
         return
+    # Counts single-thread reductions too (they claim no axis, see
+    # ``ReductionStrategy._claims_thread_axis``) so the plan's domain is
+    # unchanged.
     reductions = [
         strategy
         for strategy in tile_strategy.strategies
-        if isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
+        if isinstance(strategy, ReductionStrategy)
+        and strategy._reduction_thread_count() > 0
     ]
     if len(reductions) != 1:
         return

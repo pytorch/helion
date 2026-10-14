@@ -4,6 +4,7 @@ import ast
 import operator
 import struct
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
@@ -17,6 +18,9 @@ import helion
 from helion._compiler.cute.scalar_recipe_rounding import preserve_fp32_multiply_rounding
 from helion._testing import skipUnlessBackends
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import Kernel
 
 CUDA_DEVICE = "cuda"
 
@@ -111,6 +115,270 @@ def test_explicit_fma_survives_with_a_separately_rounded_product_input() -> None
     )
     assert source.count("mul.rn.f32") == 1
     assert "cute.math.fma(" in source
+
+
+def _render(
+    kernel: Kernel, args: tuple[torch.Tensor, ...], *, fast_math: bool = False
+) -> str:
+    bound_kernel = helion.kernel(
+        kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        fast_math=fast_math,
+    )
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(bound_kernel, args)
+        return bound.to_code(bound.config_spec.autotune_reference_config())
+
+
+def _half(*shape: int) -> torch.Tensor:
+    return torch.empty(shape, dtype=torch.float16)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_pointwise_products(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(a)
+    product = torch.empty_like(a)
+    for tile in hl.tile(a.size(0)):
+        first = a[tile].float()
+        second = b[tile].float()
+        # Both products are rounded before the subtraction.
+        out[tile] = (first * second).to(a.dtype) - (second * 1.5).to(a.dtype)
+        # A stored product is consumed as rounded; nothing can contract it.
+        product[tile] = (first * 0.75).to(a.dtype)
+    return out, product
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+@skipUnlessBackends(["cute"])
+def test_explicitly_rounded_pointwise_products_cannot_contract(
+    fast_math: bool,
+) -> None:
+    """The half FMA ptxas forms from an unrounded ``mul.f16`` + ``sub.f16``
+    would drop the product's explicit rounding (``examples/rope.py``)."""
+    source = _render(
+        _rounded_pointwise_products, (_half(64), _half(64)), fast_math=fast_math
+    )
+    assert source.count("mul.rn.f32") == (0 if fast_math else 2)
+    assert "* 0.75" in source
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_stored_and_added(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stored = torch.empty_like(a)
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size(0)):
+        rounded = (a[tile].float() * b[tile].float()).to(a.dtype)
+        stored[tile] = rounded
+        out[tile] = rounded - c[tile]
+    return stored, out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_through_view(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(c)
+    for tile in hl.tile(a.size(0)):
+        product = a[tile].float() * b[tile].float()
+        out[tile, :] = product[:, None].to(a.dtype) - c[tile, :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_square_negation_and_inplace(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size(0)):
+        first = a[tile].float()
+        second = b[tile].float()
+        scaled = a[tile].float()
+        scaled.mul_(second)
+        out[tile] = (
+            (first**2).to(a.dtype)
+            + (-(first * second)).to(a.dtype)
+            + scaled.to(a.dtype)
+            - c[tile]
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fp32_product_before_subtraction(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size(0)):
+        first = a[tile].float()
+        # ``sigmoid`` is a genuine FP32 operand: LLVM cannot narrow the product
+        # (``examples/swiglu.py``), so the cast already rounds it.
+        out[tile] = (first * torch.sigmoid(first)).to(a.dtype) - c[tile]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_with_constant_tensor(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size(0)):
+        # A scalar-filled tensor is a splat constant LLVM narrows like a scalar.
+        half = hl.full([tile], 0.5, dtype=torch.float32)
+        out[tile] = (a[tile].float() * half).to(a.dtype) - c[tile]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_negated_by_multiply(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.size(0)):
+        rounded = (a[tile].float() * b[tile].float()).to(a.dtype)
+        # ``* -1.0`` folds to a negation; the addition can still fuse the product.
+        out[tile] = rounded * -1.0 + c[tile]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_dot_operand(
+    a: torch.Tensor, b: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            operand = (a[tile_m, tile_k].float() * s[tile_k][None, :].float()).to(
+                a.dtype
+            )
+            acc = hl.dot(operand, b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_transposed_dot_operand(
+    a: torch.Tensor, b: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    k, m = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            operand = (a[tile_k, tile_m].float() * s[tile_k][:, None].float()).to(
+                a.dtype
+            )
+            acc = hl.dot(operand.T, b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_product_selected_dot_operand(
+    a: torch.Tensor, b: torch.Tensor, s: torch.Tensor, keep: torch.Tensor
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            operand = (a[tile_m, tile_k].float() * s[tile_k][None, :].float()).to(
+                a.dtype
+            )
+            operand = torch.where(
+                keep[tile_m, tile_k], operand, torch.zeros_like(operand)
+            )
+            acc = hl.dot(operand, b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("kernel", "args", "rounded_products"),
+    [
+        pytest.param(
+            _rounded_product_stored_and_added,
+            (_half(64), _half(64), _half(64)),
+            1,
+            id="store_and_subtract",
+        ),
+        pytest.param(
+            _rounded_product_through_view,
+            (_half(64), _half(64), _half(64, 4)),
+            1,
+            id="view_before_cast",
+        ),
+        pytest.param(
+            _rounded_square_negation_and_inplace,
+            (_half(64), _half(64), _half(64)),
+            3,
+            id="square_negation_inplace",
+        ),
+        pytest.param(
+            _fp32_product_before_subtraction,
+            (_half(64), _half(64), _half(64)),
+            0,
+            id="fp32_operand",
+        ),
+        pytest.param(
+            _rounded_product_with_constant_tensor,
+            (_half(64), _half(64), _half(64)),
+            1,
+            id="constant_tensor_operand",
+        ),
+        pytest.param(
+            _rounded_product_negated_by_multiply,
+            (_half(64), _half(64), _half(64)),
+            1,
+            id="multiply_by_minus_one",
+        ),
+        pytest.param(
+            _rounded_product_dot_operand,
+            (_half(64, 32), _half(32, 32), _half(32)),
+            0,
+            id="dot_operand",
+        ),
+        pytest.param(
+            _rounded_product_transposed_dot_operand,
+            (_half(32, 64), _half(32, 32), _half(32)),
+            0,
+            id="transposed_dot_operand",
+        ),
+        pytest.param(
+            _rounded_product_selected_dot_operand,
+            (
+                _half(64, 32),
+                _half(32, 32),
+                _half(32),
+                torch.empty((64, 32), dtype=torch.bool),
+            ),
+            0,
+            id="where_before_dot_operand",
+        ),
+    ],
+)
+@skipUnlessBackends(["cute"])
+def test_only_fusable_rounded_products_use_mul_rn(
+    kernel: Kernel, args: tuple[torch.Tensor, ...], rounded_products: int
+) -> None:
+    """Views, ``where``, negations and multiplies by -1.0 are followed to the
+    real producer and consumer; a store or a matmul operand cannot fuse the
+    rounded product, a product with a genuine FP32 operand is never narrowed,
+    and a scalar-filled tensor operand is a narrowable constant."""
+    assert _render(kernel, args).count("mul.rn.f32") == rounded_products
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

@@ -72,7 +72,10 @@ from helion._compiler.cute import cute_flash
 from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_L2_SHIFT_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_SKIP_DEAD_TILE_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_STAGGER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
 from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
 from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
@@ -86,6 +89,7 @@ from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from helion._compiler.cute.cute_flash import FLASH_EARLY_PROLOGUE_LOADS_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
@@ -104,6 +108,7 @@ from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
 from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_LOOP_KEY
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILIES
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
@@ -128,6 +133,7 @@ from helion._compiler.cute.cute_flash import _flash_values_tensor_4d_batch_heads
 from helion._compiler.cute.cute_flash import flash_attention_seed_config
 from helion._compiler.cute.cute_flash import flash_attention_seed_configs
 from helion._compiler.cute.cute_flash import flash_autotune_fragments
+from helion._compiler.cute.cute_flash import flash_effective_config_values
 from helion._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from helion._compiler.cute.cute_flash import resolve_flash_config
 from helion._compiler.cute.flash_policy import get_flash_target_policy
@@ -165,6 +171,7 @@ from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
+from helion._compiler.cute.tcgen05_config import Tcgen05GroupedWorklistSmemFacts
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -302,6 +309,7 @@ from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityCla
 from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1280,6 +1288,8 @@ class TestAutotunerHeuristic(TestCase):
             )
             self.assertEqual(hardware_info.call_count, 4)
 
+    # Drives the backend-independent rebinding through a kernel pinned to
+    # backend="triton", so a cute run would only repeat the Triton job.
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler seed specialization is not used in ref eager mode")
     def test_compiler_seed_specialization_rebinds_only_eligible_kernels(
@@ -3549,7 +3559,7 @@ class TestAutotunerHeuristic(TestCase):
 
         self.assertEqual(
             empty_bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
-            (groups, False),
+            Tcgen05GroupedWorklistSmemFacts(groups, False, output_dtype_bytes=2),
         )
         self.assertIsNot(bound, empty_bound)
         self.assertEqual(bound.config_spec.compiler_seed_configs, [])
@@ -3566,12 +3576,14 @@ class TestAutotunerHeuristic(TestCase):
         )
         self.assertEqual(
             bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
-            (groups, False),
+            Tcgen05GroupedWorklistSmemFacts(groups, False, output_dtype_bytes=2),
         )
         self.assertIsNot(rebound, bound)
         self.assertEqual(
             rebound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
-            (different_groups, False),
+            Tcgen05GroupedWorklistSmemFacts(
+                different_groups, False, output_dtype_bytes=2
+            ),
         )
         self.assertEqual(
             [
@@ -4136,6 +4148,12 @@ class TestAutotunerHeuristic(TestCase):
                     self.assertIsNone(spec.compiler_default_config)
 
 
+# Matmul and pointwise facts come from backend-independent device IR analysis:
+# collect them with CuTe under HELION_BACKEND=cute and with Triton otherwise
+# (incl. tileir).
+_FACTS_BACKEND = "cute" if _get_backend() == "cute" else "triton"
+
+
 class TestMatmulFacts(TestCase):
     def test_rank_reduction_scaled_accumulator_fact(self) -> None:
         from operator import eq
@@ -4175,11 +4193,11 @@ class TestMatmulFacts(TestCase):
         reduction.meta["val"] = torch.empty(1, 64, 1)
         self.assertIsNone(_rank_reduction_scaled_baddbmm_batch_block_id(output, env))
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_facts_record_kernel_structure(self) -> None:
-        @helion.kernel(backend="triton")
-        def triton_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
             out = torch.empty([m, n], dtype=x.dtype, device=x.device)
@@ -4190,8 +4208,8 @@ class TestMatmulFacts(TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        @helion.kernel(backend="triton")
-        def triton_matmul_epilogue(
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def matmul_epilogue(
             x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
         ) -> torch.Tensor:
             m, k = x.size()
@@ -4204,8 +4222,8 @@ class TestMatmulFacts(TestCase):
                 out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
             return out
 
-        @helion.kernel(backend="triton")
-        def triton_two_matmuls(
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def two_matmuls(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
         ) -> torch.Tensor:
             m, k = x.size()
@@ -4220,8 +4238,8 @@ class TestMatmulFacts(TestCase):
                 out[tile_m, tile_n] = (acc0 + acc1).to(x.dtype)
             return out
 
-        @helion.kernel(backend="triton")
-        def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        @helion.kernel(backend=_FACTS_BACKEND)
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m = x.size(0)
             out = torch.empty_like(x)
             for tile_m in hl.tile(m):
@@ -4236,10 +4254,10 @@ class TestMatmulFacts(TestCase):
         add_y = torch.empty([1024], device=DEVICE, dtype=HALF_DTYPE)
 
         cases = (
-            ("gemm", triton_matmul, (x, y), 1),
-            ("gemm_epilogue", triton_matmul_epilogue, (x, y, bias), 1),
-            ("gemm_gemm", triton_two_matmuls, (x, y, z), 2),
-            ("add", triton_add, (add_x, add_y), 0),
+            ("gemm", matmul, (x, y), 1),
+            ("gemm_epilogue", matmul_epilogue, (x, y, bias), 1),
+            ("gemm_gemm", two_matmuls, (x, y, z), 2),
+            ("add", add, (add_x, add_y), 0),
         )
 
         for name, kernel, args, expected_facts in cases:
@@ -4254,13 +4272,21 @@ class TestMatmulFacts(TestCase):
 
             self.assertEqual(len(bound.config_spec.matmul_facts), expected_facts)
             if expected_facts == 0:
-                # No matmul fact: a pure-pointwise kernel (triton_add) is instead seeded by
-                # TritonPointwiseSeedHeuristic. Assert it routes there (one seed config), not
-                # the pre-pointwise-heuristic expectation of no seed at all.
+                # No matmul fact: a pure-pointwise kernel (add) is instead seeded by
+                # the backend's pointwise heuristic. Assert it routes there (and is
+                # seeded), not the pre-pointwise-heuristic expectation of no seed at all.
+                pointwise_heuristic = {
+                    "triton": "triton_pointwise",
+                    "cute": "cute_pointwise_vec",
+                }[_FACTS_BACKEND]
                 self.assertEqual(
-                    bound.config_spec.autotuner_heuristics, ["triton_pointwise"]
+                    bound.config_spec.autotuner_heuristics, [pointwise_heuristic]
                 )
-                self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
+                if _FACTS_BACKEND == "triton":
+                    self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
+                else:
+                    # cute_pointwise_vec seeds several layout variants.
+                    self.assertTrue(bound.config_spec.compiler_seed_configs)
             for fact in bound.config_spec.matmul_facts:
                 self.assertEqual(fact.lhs_ndim, 2)
                 self.assertEqual(fact.rhs_ndim, 2)
@@ -4274,12 +4300,12 @@ class TestMatmulFacts(TestCase):
                 self.assertEqual(fact.lhs_dtype, HALF_DTYPE)
                 self.assertEqual(fact.rhs_dtype, HALF_DTYPE)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_fact_identity_does_not_depend_on_graph_walk_order(self) -> None:
         from helion._compiler.device_ir_analysis import DeviceIRAnalysis
 
-        @helion.kernel(backend="triton", static_shapes=True)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=True)
         def two_matmuls(
             x0: torch.Tensor,
             y0: torch.Tensor,
@@ -4335,10 +4361,10 @@ class TestMatmulFacts(TestCase):
             [(64, 96), (128, 160)],
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_bmm_dtype_and_nested_loop_ancestry(self) -> None:
-        @helion.kernel(backend="triton", static_shapes=True)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=True)
         def nested_attention(
             q: torch.Tensor,
             k: torch.Tensor,
@@ -4411,10 +4437,10 @@ class TestMatmulFacts(TestCase):
             any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_symbolic_loop_bound_retains_expression_and_origins(self) -> None:
-        @helion.kernel(backend="triton", static_shapes=True)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=True)
         def prefix_matmul(
             lhs: torch.Tensor,
             rhs: torch.Tensor,
@@ -4997,14 +5023,16 @@ class TestPointwiseComputeItemsize(TestCase):
         assert len(facts) == 1, facts
         return facts[0]
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_int64_indexing_does_not_inflate_compute_itemsize(self) -> None:
         # int64-INDEXED but half-precision DATA (promoting to fp32 -> 4).
         # The SCALED subscript is load-bearing: a plain ``x[tile]`` lowers to a
         # ``_get_symnode`` with no tensor val, so no int64 node exists and the test
         # would pass even with the fix reverted.
-        @helion.kernel(backend="triton", index_dtype=torch.int64, static_shapes=False)
+        @helion.kernel(
+            backend=_FACTS_BACKEND, index_dtype=torch.int64, static_shapes=False
+        )
         def add_int64_index(x: torch.Tensor) -> torch.Tensor:
             m, n2 = x.shape
             n2 = hl.specialize(n2)
@@ -5035,12 +5063,12 @@ class TestPointwiseComputeItemsize(TestCase):
         # 4 = the fp32 compute promotion, not 8 = the int64 index arithmetic.
         self.assertEqual(fact.compute_itemsize, 4)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_integer_compute_kernel_reports_its_data_width(self) -> None:
         # Guards against filtering to float dtypes: this DATA is genuinely int64, so
         # 8 is correct and a float-only walk would report 1 and emit a spilling tile.
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def add_int64_data(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -5053,12 +5081,12 @@ class TestPointwiseComputeItemsize(TestCase):
         self.assertEqual(fact.storage_itemsize, 8)
         self.assertEqual(fact.compute_itemsize, 8)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_gather_index_tensor_does_not_inflate_compute_itemsize(self) -> None:
         # A gather whose index was itself loaded as int64: the cut at loads means the
         # walk never reaches it, so the data width stays half-precision.
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_m, tile_n in hl.tile(x.size()):
@@ -5070,13 +5098,13 @@ class TestPointwiseComputeItemsize(TestCase):
         fact = self._fact(gather_rows, (x, idx))
         self.assertEqual(fact.compute_itemsize, 2)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_intermediate_wider_than_every_buffer_is_counted(self) -> None:
         # Why the walk cannot just read buffer dtypes: every buffer is half-precision
         # but an fp64 intermediate is register-resident, and under-reporting it
         # over-estimates ``reg_cap``. ``storage_itemsize`` already covers buffers.
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def fp64_intermediate(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -5106,10 +5134,10 @@ class TestPointwiseGatherStride(TestCase):
         assert len(facts) == 1, facts
         return facts[0]
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_interleaved_and_contiguous_halves_differ(self) -> None:
-        @helion.kernel(backend="triton", static_shapes=False)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=False)
         def interleaved(x: torch.Tensor) -> torch.Tensor:
             m, n2 = x.shape
             n2 = hl.specialize(n2)
@@ -5121,7 +5149,7 @@ class TestPointwiseGatherStride(TestCase):
                 out[tile_m, tile_n] = a * b
             return out
 
-        @helion.kernel(backend="triton", static_shapes=False)
+        @helion.kernel(backend=_FACTS_BACKEND, static_shapes=False)
         def halves(x: torch.Tensor) -> torch.Tensor:
             m, n2 = x.shape
             n2 = hl.specialize(n2)
@@ -5150,10 +5178,10 @@ class TestPointwiseGatherStride(TestCase):
             ]
             self.assertTrue(all(s == 1 for s in inner), inner)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_plain_elementwise_is_stride_one(self) -> None:
-        @helion.kernel(backend="triton")
+        @helion.kernel(backend=_FACTS_BACKEND)
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -5310,6 +5338,43 @@ class TestTritonReductionHeuristicUnit(TestCase):
         self.assertEqual(seed.config["reduction_loops"], [None])
         self.assertEqual(seed.config["num_warps"], 8)
         self.assertEqual(seed.config["num_stages"], 1)
+
+    def test_user_tile_seed_respects_register_block_size_cap(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(
+            BlockSizeSpec(
+                block_id=0,
+                size_hint=4096,
+                min_size=32,
+                max_size=512,
+            )
+        )
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=4))
+        desc = ReductionDescriptor(
+            category=ReductionCategory.USER_TILE,
+            block_id=0,
+            graph_id=0,
+            size_hint=4096,
+            input_load_itemsize=4,
+            row_reread=True,
+        )
+        spec.reduction_kernel_fact = ReductionKernelFact(
+            reductions=(desc,),
+            live_tile_steps=(
+                (
+                    LiveTile((1, 0), (None, None), 4, "load"),
+                    LiveTile((1,), (None,), 4, "carry"),
+                ),
+            ),
+            grid_axis_block_ids=(1,),
+        )
+        env = self._reduction_env(spec)
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            seed = TritonReductionHeuristic.get_seed_config(env, MagicMock())
+        self.assertEqual(seed.config["block_sizes"], [512, 4])
 
     def test_warp_selection_descends_when_resident_warps_are_retained(
         self,
@@ -6491,7 +6556,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         try:
             random.seed(3)
             while len(cached_configs) < 30:
-                cached_configs.add(config_gen.unflatten(config_gen.random_flat()))
+                # A random draw may combine a resident lowering with a family
+                # the resolver rejects (about 2.5% of the draws on this
+                # surface, on main as well); the population generators skip
+                # such draws, so skip them here too.
+                try:
+                    cached_configs.add(config_gen.unflatten(config_gen.random_flat()))
+                except helion.exc.InvalidConfig:
+                    continue
         finally:
             random.setstate(random_state)
         search._generate_best_available_population_flat = lambda: [
@@ -6596,6 +6668,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     "is_causal": is_causal,
                     "standard_dense_output": not is_causal,
                     "standard_causal_output": is_causal,
+                    # The sm_103 tables are written against polynomial
+                    # packets, which only the fast_math surface offers.
+                    "fast_math": True,
                 }
                 ranked = flash_attention_seed_configs(
                     64,
@@ -6937,6 +7012,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 tuning=extended_tuning,
             ),
         ):
+            # The causal templates are written against the degree-2 packet,
+            # which only the fast_math surface seeds as written.
             seeds = flash_attention_seed_configs(
                 64,
                 768,
@@ -6944,6 +7021,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 is_causal=True,
                 standard_causal_output=True,
                 target_device_capability=(10, 3),
+                fast_math=True,
             )
 
         matching = [
@@ -6953,8 +7031,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             and seed.config[FLASH_E2E_OFFSET_KEY] == 2
             and seed.config[FLASH_E2E_OFFSET0_KEY] == 3
         ]
-        self.assertEqual(len(matching), 1)
-        seed = matching[0]
+        # The registered template, plus the staggered one-head walk seeded on
+        # its knobs (``cute_flash_causal_stagger``; the hd64 stagger seed
+        # shares the template's four-deep ring).
+        template_matches = [
+            seed for seed in matching if not seed.config[FLASH_CAUSAL_STAGGER_KEY]
+        ]
+        self.assertEqual(len(template_matches), 1)
+        self.assertEqual(len(matching), 2)
+        seed = template_matches[0]
         self.assertEqual(seed.config[FLASH_KV_STAGE_KEY], 4)
         self.assertEqual(seed.config[FLASH_E2E_OFFSET_KEY], 2)
         self.assertEqual(seed.config[FLASH_E2E_OFFSET0_KEY], 3)
@@ -6991,6 +7076,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dtype=torch.float16,
                 standard_dense_output=True,
                 target_device_capability=(10, 3),
+                fast_math=True,
             )
         self.assertTrue(seeds)
         sibling = target_policy.tuning.dense_policies[1]
@@ -7194,6 +7280,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     num_kv,
                     dtype=torch.float16,
                     standard_dense_output=True,
+                    fast_math=True,
                 )
                 polynomial = {
                     seed.config[FLASH_EXP2_PACKET_KEY]: seed
@@ -7221,6 +7308,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     config,
                     dtype=torch.float16,
                     standard_dense_output=True,
+                    fast_math=True,
                 )
                 self.assertEqual(resolved.pipeline_family, "fa4_2cta")
                 self.assertEqual(resolved.exp2_packet, "deg2_16x6")
@@ -7240,6 +7328,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 num_kv,
                 dtype=torch.bfloat16,
                 standard_dense_output=True,
+                fast_math=True,
             )
             degree2 = [
                 seed
@@ -7256,6 +7345,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 config,
                 dtype=torch.bfloat16,
                 standard_dense_output=True,
+                fast_math=True,
             )
             self.assertEqual(resolved.pipeline_family, "fa4_2cta")
             self.assertEqual(resolved.exp2_packet, "deg2_16x6")
@@ -7275,6 +7365,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.bfloat16,
                     is_causal=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )
                 resident = [
                     seed
@@ -7289,6 +7380,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     is_causal=True,
                     standard_causal_output=True,
                     pipeline_family_override="fa4",
+                    fast_math=True,
                 )
                 packet_fragment = fragments[FLASH_EXP2_PACKET_KEY]
                 self.assertIsInstance(packet_fragment, EnumFragment)
@@ -7306,6 +7398,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                             dtype=torch.bfloat16,
                             is_causal=True,
                             standard_causal_output=True,
+                            fast_math=True,
                         )
                     )
                 )
@@ -7405,6 +7498,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     "is_causal": is_causal,
                     "standard_dense_output": not is_causal,
                     "standard_causal_output": is_causal,
+                    # The polynomial packets exist on the fast_math surface.
+                    "fast_math": packet in cute_flash._FLASH_FAST_MATH_EXP2_PACKETS,
                 }
                 spec = ConfigSpec(backend=CuteBackend())
                 for block_id, size_hint in enumerate((1, 128, 128)):
@@ -7635,6 +7730,197 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
         )
 
+    def test_cute_flash_causal_hd64_seeds_carry_measured_bodies(self) -> None:
+        """The causal hd64 shapes are won by the paired 16-column score-load
+        body with the 4x1 packet (s2048) and with the 8x2 packet at the 16/6
+        cadence on a seven-stage K/V ring (s8192), and by the hybrid degree-1
+        body with the two-deep chunked PASS2 (s4096); all three are seeded as
+        measured so a cold search starts on them, and all three pin the
+        dead-tile skip and the staggered walk off (the s8192 body's
+        seven-stage ring would otherwise take the stagger's default)."""
+        pair_body = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_EXP2_PACKET_KEY: "4x1",
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+            FLASH_MASKED_E2E_SCHEDULE_KEY: "xu",
+            FLASH_E2E_OFFSET_KEY: 4,
+            FLASH_E2E_OFFSET0_KEY: 4,
+            FLASH_S_LOAD_REP_KEY: 16,
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_SOFTMAX_REGS_KEY: 168,
+            FLASH_CORR_REGS_KEY: 104,
+            FLASH_OTHER_REGS_KEY: 56,
+            FLASH_RESCALE_THRESHOLD_KEY: 32.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 32,
+            FLASH_FIRST_LOAD_ORDER_KEY: 2,
+            FLASH_WAIT_HINT_KEY: 10000000,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
+            FLASH_CAUSAL_LPT_L2_SHIFT_KEY: 0,
+            FLASH_CAUSAL_STAGGER_KEY: False,
+            FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
+        }
+        long_body = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_EXP2_PACKET_KEY: "8x2",
+            FLASH_E2E_SCHEDULE_KEY: "16/6",
+            FLASH_MASKED_E2E_SCHEDULE_KEY: "xu",
+            FLASH_E2E_OFFSET_KEY: 14,
+            FLASH_E2E_OFFSET0_KEY: 2,
+            FLASH_KV_STAGE_KEY: 7,
+            FLASH_S_LOAD_REP_KEY: 16,
+            FLASH_DISC_PIPE_KEY: 2,
+            FLASH_SOFTMAX_REGS_KEY: 168,
+            FLASH_CORR_REGS_KEY: 104,
+            FLASH_OTHER_REGS_KEY: 56,
+            FLASH_RESCALE_THRESHOLD_KEY: 16.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_FIRST_LOAD_ORDER_KEY: 4,
+            FLASH_WAIT_HINT_KEY: 0,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
+            FLASH_CAUSAL_STAGGER_KEY: False,
+            FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
+        }
+        hybrid_body = {
+            FLASH_EXP2_PACKET_KEY: "hybrid_deg1_16x8",
+            FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_E2E_OFFSET_KEY: 0,
+            FLASH_E2E_OFFSET0_KEY: 4,
+            FLASH_SOFTMAX_REGS_KEY: 200,
+            FLASH_CORR_REGS_KEY: 64,
+            FLASH_OTHER_REGS_KEY: 48,
+            FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 8,
+            FLASH_FIRST_LOAD_ORDER_KEY: 2,
+            FLASH_PRECOMPUTE_QK_DESC_KEY: True,
+            FLASH_EPI_TMA_KEY: True,
+            FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            FLASH_CAUSAL_SKIP_DEAD_TILE_KEY: False,
+            FLASH_CAUSAL_STAGGER_KEY: False,
+            FLASH_EARLY_PROLOGUE_LOADS_KEY: True,
+        }
+        for num_kv in (16, 32, 64):
+            with self.subTest(num_kv=num_kv):
+                seeds = flash_attention_seed_configs(
+                    64,
+                    num_kv,
+                    num_bh=64,
+                    dtype=torch.bfloat16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                    # The hybrid body's packet is fast_math-only.
+                    fast_math=True,
+                )
+                for body in (pair_body, long_body, hybrid_body):
+                    matches = [
+                        seed.config
+                        for seed in seeds
+                        if all(seed.config.get(k) == v for k, v in body.items())
+                    ]
+                    self.assertEqual(len(matches), 1, body)
+                    resolved = resolve_flash_config(
+                        64,
+                        num_kv,
+                        matches[0],
+                        dtype=torch.bfloat16,
+                        num_bh=64,
+                        is_causal=True,
+                        standard_causal_output=True,
+                        fast_math=True,
+                    )
+                    self.assertEqual(resolved.pipeline_family, "fa4")
+                    self.assertEqual(resolved.exp2_packet, body[FLASH_EXP2_PACKET_KEY])
+                    self.assertEqual(
+                        resolved.s_load_repetition,
+                        body.get(FLASH_S_LOAD_REP_KEY, 32),
+                    )
+                    self.assertEqual(resolved.corr_regs, body[FLASH_CORR_REGS_KEY])
+                    self.assertTrue(resolved.causal_loop_split)
+                    self.assertFalse(resolved.causal_skip_dead_tile)
+                    self.assertFalse(resolved.causal_stagger)
+
+    def test_cute_flash_dense_hd64_seeds_carry_local_tma_packets(self) -> None:
+        """The fa4_local_tma family wins the dense hd64 shapes with a wide exp2
+        packet and the measured 16/4 / six-stage / direct-epilogue / FA4-role
+        structure, which the family and packet loops alone never seed."""
+        measured = {
+            FLASH_PIPELINE_FAMILY_KEY: "fa4_local_tma",
+            FLASH_E2E_SCHEDULE_KEY: "16/4",
+            FLASH_KV_STAGE_KEY: 6,
+            FLASH_EPI_TMA_KEY: False,
+            FLASH_PERSISTENT_CTAS_PER_SM_KEY: 1,
+            FLASH_PERSISTENT_LOOP_KEY: "counted",
+            FLASH_ROLE_MAP_KEY: "fa4",
+            FLASH_SOFTMAX_DISC_KEY: False,
+            FLASH_SPLIT_P_ARRIVE_KEY: True,
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+            FLASH_WAIT_HINT_KEY: 0,
+        }
+        # Threshold 16 where the dtype's largest pinned probability allows it.
+        thresholds = {torch.bfloat16: 16.0, torch.float16: 12.0}
+        for dtype in (torch.bfloat16, torch.float16):
+            measured[FLASH_RESCALE_THRESHOLD_KEY] = thresholds[dtype]
+            for num_kv in (16, 32, 64):
+                with self.subTest(dtype=dtype, num_kv=num_kv):
+                    seeds = flash_attention_seed_configs(
+                        64,
+                        num_kv,
+                        num_bh=64,
+                        dtype=dtype,
+                        standard_dense_output=True,
+                    )
+                    local_tma = {
+                        seed.config[FLASH_EXP2_PACKET_KEY]: seed.config
+                        for seed in seeds
+                        if seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4_local_tma"
+                    }
+                    self.assertEqual(set(local_tma), {"1x1", "4x2", "8x2"})
+                    for packet in ("4x2", "8x2"):
+                        config = local_tma[packet]
+                        for key, value in measured.items():
+                            self.assertEqual(config[key], value, key)
+                        resolved = resolve_flash_config(
+                            64,
+                            num_kv,
+                            config,
+                            dtype=dtype,
+                            num_bh=64,
+                            standard_dense_output=True,
+                        )
+                        self.assertEqual(resolved.pipeline_family, "fa4_local_tma")
+                        self.assertEqual(resolved.exp2_packet, packet)
+                        self.assertTrue(resolved.persistent)
+                        # The seed resolves as written (no knob is coerced).
+                        effective = flash_effective_config_values(resolved)
+                        for key, value in measured.items():
+                            self.assertEqual(effective[key], value, key)
+        # The structure is measured on dense hd64 only: causal and hd128
+        # lists keep their family seed alone.
+        for head_dim, is_causal in ((64, True), (128, False)):
+            with self.subTest(head_dim=head_dim, is_causal=is_causal):
+                seeds = flash_attention_seed_configs(
+                    head_dim,
+                    16,
+                    num_bh=64,
+                    dtype=torch.bfloat16,
+                    is_causal=is_causal,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                )
+                packets = {
+                    seed.config[FLASH_EXP2_PACKET_KEY]
+                    for seed in seeds
+                    if seed.config.get(FLASH_PIPELINE_FAMILY_KEY) == "fa4_local_tma"
+                }
+                self.assertLessEqual(packets, {"1x1"})
+
     def test_cute_flash_bf16_hd64_2cta_seed_uses_validated_schedule(
         self,
     ) -> None:
@@ -7777,27 +8063,40 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dtype=torch.bfloat16,
                 is_causal=True,
                 standard_causal_output=True,
+                fast_math=True,
             )
             hybrid = [
                 seed
                 for seed in seeds
                 if seed.config[FLASH_EXP2_PACKET_KEY] == "hybrid_deg1_16x8"
             ]
-            self.assertEqual(len(hybrid), 1)
-            resolved = resolve_flash_config(
-                64,
-                num_kv,
-                hybrid[0].config,
-                dtype=torch.bfloat16,
-                is_causal=True,
-                standard_causal_output=True,
+            # The packet-loop seed and the measured s4096 body (8-column
+            # rescale chunks at threshold 8, TMA epilogue, K-then-V-then-Q
+            # load order); both carry the 200/64/48 register split.
+            self.assertEqual(len(hybrid), 2)
+            self.assertEqual(
+                sorted(seed.config[FLASH_RESCALE_CHUNK_COLS_KEY] for seed in hybrid),
+                [8, 32],
             )
-            self.assertEqual(resolved.pipeline_family, "fa4")
-            self.assertEqual(resolved.exp2_packet, "hybrid_deg1_16x8")
-            self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 8))
-            self.assertTrue(resolved.causal_loop_split)
-            self.assertEqual(resolved.causal_kv_order, "descending")
-            configs.append(hybrid[0].config)
+            self.assertEqual(
+                [seed.config[FLASH_CORR_REGS_KEY] for seed in hybrid], [64, 64]
+            )
+            for seed in hybrid:
+                resolved = resolve_flash_config(
+                    64,
+                    num_kv,
+                    seed.config,
+                    dtype=torch.bfloat16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                    fast_math=True,
+                )
+                self.assertEqual(resolved.pipeline_family, "fa4")
+                self.assertEqual(resolved.exp2_packet, "hybrid_deg1_16x8")
+                self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 8))
+                self.assertTrue(resolved.causal_loop_split)
+                self.assertEqual(resolved.causal_kv_order, "descending")
+            configs.append(tuple(seed.config for seed in hybrid))
         self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
     def test_cute_flash_dense_degree2_seed_gates(self) -> None:
@@ -7840,7 +8139,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 case = dict(case)
                 head_dim = int(case.pop("head_dim", 64))
                 num_kv = int(case.pop("num_kv", 2048))
-                self.assertFalse(has_degree2_seed(head_dim, num_kv, **case))
+                # The other gates are tested on the fast_math surface, the only
+                # one that offers the packet at all.
+                self.assertFalse(
+                    has_degree2_seed(head_dim, num_kv, fast_math=True, **case)
+                )
+        self.assertTrue(has_degree2_seed(standard_dense_output=True, fast_math=True))
+        self.assertFalse(has_degree2_seed(standard_dense_output=True))
 
     def test_cute_flash_degree2_packet_search_is_eligibility_gated(self) -> None:
         def search_choices(
@@ -7859,7 +8164,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         self.assertIn(
             "deg2_16x6",
-            search_choices(dtype=torch.float16, standard_dense_output=True),
+            search_choices(
+                dtype=torch.float16, standard_dense_output=True, fast_math=True
+            ),
         )
         self.assertIn(
             "deg2_16x6",
@@ -7868,6 +8175,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dtype=torch.float16,
                 is_causal=True,
                 standard_causal_output=True,
+                fast_math=True,
             ),
         )
         self.assertIn(
@@ -7877,6 +8185,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dtype=torch.float16,
                 is_causal=True,
                 standard_causal_output=True,
+                fast_math=True,
             ),
         )
         excluded = (
@@ -7914,8 +8223,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 num_kv = int(case.pop("num_kv", 260))
                 self.assertNotIn(
                     "deg2_16x6",
-                    search_choices(head_dim, num_kv, **case),
+                    search_choices(head_dim, num_kv, **{"fast_math": True, **case}),
                 )
+        # Without the fast_math setting the packet is withheld everywhere.
+        self.assertNotIn(
+            "deg2_16x6",
+            search_choices(dtype=torch.float16, standard_dense_output=True),
+        )
+        self.assertNotIn(
+            "deg2_16x6",
+            search_choices(
+                num_kv=8192,
+                dtype=torch.float16,
+                is_causal=True,
+                standard_causal_output=True,
+            ),
+        )
 
     def test_cute_flash_odd_kv_search_excludes_fa4_only_aliases(self) -> None:
         fragments = flash_autotune_fragments(
@@ -7986,6 +8309,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     block_size_targets={0: 1, 1: 128, 2: 128},
                     dtype=torch.float16,
                     standard_dense_output=True,
+                    fast_math=True,
                 )
                 spec.compiler_seed_configs = list(
                     flash_attention_seed_configs(
@@ -7993,6 +8317,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         num_kv,
                         dtype=torch.float16,
                         standard_dense_output=True,
+                        fast_math=True,
                     )
                 )
                 config_gen = ConfigGeneration(spec)
@@ -8045,6 +8370,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )
                 self.assertTrue(
                     any(
@@ -8069,6 +8395,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         spec.compiler_seed_configs = list(
             flash_attention_seed_configs(
@@ -8077,6 +8404,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dtype=torch.float16,
                 is_causal=True,
                 standard_causal_output=True,
+                fast_math=True,
             )
         )
         normalized = [
@@ -8103,6 +8431,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )
                 degree2 = [
                     seed
@@ -8124,6 +8453,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )
                 self.assertEqual(resolved.pipeline_family, "fa4")
                 self.assertEqual(resolved.exp2_packet, "deg2_16x6")
@@ -8138,6 +8468,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_flash_causal_degree2_seed_gates(self) -> None:
         cases = (
             {},
+            # Without the fast_math setting the packet is withheld everywhere.
+            {"standard_causal_output": True, "fast_math": False},
             {"dtype": torch.bfloat16, "standard_causal_output": True},
             {"head_dim": 128, "standard_causal_output": True},
             {"has_kv_tile_pruning": True, "standard_causal_output": True},
@@ -8163,7 +8495,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                             head_dim,
                             4096,
                             is_causal=True,
-                            **case,
+                            **{"fast_math": True, **case},
                         )
                     )
                 )
@@ -8175,6 +8507,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         transferred = flash_autotune_fragments(
             64,
@@ -8182,6 +8515,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
+            fast_math=True,
         )
         for key in (
             FLASH_CAUSAL_LOOP_SPLIT_KEY,
@@ -8238,6 +8572,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
+                    fast_math=True,
                 )
                 spec.compiler_seed_configs = list(
                     flash_attention_seed_configs(
@@ -8246,6 +8581,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         dtype=torch.float16,
                         is_causal=True,
                         standard_causal_output=True,
+                        fast_math=True,
                     )
                 )
                 config_gen = ConfigGeneration(spec)
@@ -11403,6 +11739,8 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
     # Ref eager binding builds no device IR; the child always binds normally.
     environment.pop("HELION_INTERPRET", None)
+    # CuTe refuses debug_dtype_asserts, which the dtype-asserts CI job exports.
+    environment.pop("HELION_DEBUG_DTYPE_ASSERTS", None)
     result = subprocess.run(
         [
             sys.executable,

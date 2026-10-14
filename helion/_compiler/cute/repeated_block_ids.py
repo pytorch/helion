@@ -81,11 +81,10 @@ def check_repeated_block_ids(cg: CodegenInterface, node: Node) -> None:
     tensors (whole arrays whose static dims only coincide with a block size by
     value), stack-tensor accesses and their device-pointer table loads (which
     lower through ``_cute_stack_tensor_offset_expr``), plain loads consumed only
-    as matmul lhs/rhs operands (re-read by explicit coordinates on the
-    direct-load serial-K path), and the proven static-M==N baddbmm carry whose N
-    axis is folded away by ``_emit_cute_matmul_n_collapse`` /
-    ``completed_matmul_sum``.  Every other repeated id is a silent diagonal
-    collapse.
+    as matmul lhs/rhs operands (see ``_is_matmul_operand_load``), and the
+    proven static-M==N baddbmm carry whose N axis is folded away by
+    ``_emit_cute_matmul_n_collapse`` / ``completed_matmul_sum``.  Every other
+    repeated id is a silent diagonal collapse.
     """
     # Host tensors are whole arrays, not per-thread tiles; their static dims
     # only coincide with a block size by value.
@@ -140,12 +139,18 @@ def _is_stack_tensor_memory_op(node: Node) -> bool:
 def _is_matmul_operand_load(node: Node) -> bool:
     """A plain ``load`` (through no-op views) consumed only as matmul lhs/rhs.
 
-    Such an operand (``y[:, :]`` of a square ``y`` with K == N) is addressed
-    by explicit coordinates on the direct-load serial-K path, and the scalar
-    fallback's K-block resolver already refuses a contraction block shared
-    with M or N; a repeated id in the matmul *result* is still caught here.
-    The ``acc`` / scale operands have no such re-read, so only the lhs/rhs
-    argument slots of ``_cute_matmul_operand_indices`` qualify.
+    Such an operand (``y[:, :]`` of a square ``y`` with K == N) puts K on a
+    free axis's block, which ``cute_resolve_active_matmul_k_block_id``
+    refuses, so no lowering reduces it across threads.  The matmul either
+    takes a serial-K path that re-reads the operand from global memory by
+    explicit coordinates (``emit_cute_serial_mm_from_load_views`` for mm, bmm
+    and hl.dot; ``emit_cute_serial_scalar_mm_from_loads`` for a 2-D mm), which
+    refuses an operand whose tensor the kernel may write
+    (``_tensor_written_anywhere``), or it is refused; the diagonal value the
+    load node itself would produce is never consumed.  A repeated id in the
+    matmul *result* is still caught here.  The ``acc`` / scale operands have
+    no such re-read, so only the lhs/rhs argument slots of
+    ``_cute_matmul_operand_indices`` qualify.
     """
     if (
         node.target is not load

@@ -15,8 +15,8 @@ from torch._inductor.utils import triton_type
 
 from ...language import _decorators
 from ...language._gelu_tanh_approx import GELU_ERF_INV_SQRT2
+from ...language._gelu_tanh_approx import GELU_TANH_APPROX_CUBIC
 from ...language._gelu_tanh_approx import GELU_TANH_APPROX_KAPPA
-from ...language._gelu_tanh_approx import GELU_TANH_APPROX_LAMBDA
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ..ast_extension import expr_from_string
@@ -27,38 +27,31 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 
-# The triton template is rendered as two layers: the inner ``{x32}``
-# placeholder is fp32 (cast happens at the codegen-site for fp16 /
-# bf16 inputs to satisfy ``libdevice.tanh``'s fp32-only contract);
-# the outer ``{x}`` is the original-dtype value preserved for the
-# leading ``0.5 * x`` factor that has no transcendental component.
-# This keeps the fp32 round-trip narrow — only the ``tanh`` argument
-# is cast — and matches Helion's existing ``tanh`` lowering shape
-# (``inductor_lowering_extra.FP32_FALLBACK_OPS_UNARY``). For fp32
-# inputs the codegen treats ``{x32}`` and ``{x}`` as the same local.
+# Eager evaluates the entire expression in fp32 for fp16/bf16 inputs.
+# In particular, computing ``0.5 * x`` in fp16 first rounds odd subnormal
+# inputs before the final GELU rounding, which can change the result by an ulp.
 _GELU_TANH_APPROX_EXPR_TRITON = (
-    f"(0.5 * ({{x}}) * (1.0 + libdevice.tanh(({{x32}}) * ({GELU_TANH_APPROX_KAPPA!r}"
-    f" + {GELU_TANH_APPROX_LAMBDA!r} * ({{x32}}) * ({{x32}})))))"
+    f"(0.5 * ({{x32}}) * (1.0 + libdevice.tanh({GELU_TANH_APPROX_KAPPA!r} * (({{x32}})"
+    f" + {GELU_TANH_APPROX_CUBIC!r} * (({{x32}}) * ({{x32}}) * ({{x32}}))))))"
 )
 _GELU_ERF_EXPR_TRITON = (
-    f"(0.5 * ({{x}}) * (1.0 + libdevice.erf(({{x32}}) * {GELU_ERF_INV_SQRT2!r})))"
+    f"(0.5 * ({{x32}}) * (1.0 + libdevice.erf(({{x32}}) * {GELU_ERF_INV_SQRT2!r})))"
 )
 
 
 @_decorators.codegen(_gelu_tanh_approx, "triton")
 def _(state: CodegenState) -> ast.AST:
-    # Lift the input to a local so the four ``{x}`` references all
-    # bind to the same Triton SSA name; without the lift, the
-    # rendered expression would textually duplicate the inbound
-    # expression four times (Triton compile-time CSE handles the
+    # Lift the input to a local so the five ``{x32}``
+    # references all bind to the same Triton SSA name; without the lift,
+    # the rendered expression would textually duplicate the inbound
+    # expression five times (Triton compile-time CSE handles the
     # values, but generated source size grows quadratically with
     # chain depth, which we explicitly avoid in cute_epilogue.py too).
     input_ast = state.codegen.lift(
         state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
     )
     # ``libdevice.tanh`` is fp32-only on Triton/CUDA. For fp16 / bf16
-    # inputs cast the *tanh argument* (``{x32}``) to fp32 (the
-    # surrounding multiplies promote through to fp32 too) and then
+    # inputs evaluate the whole expression (``{x32}``) in fp32 and then
     # narrow the whole result back to the input dtype before
     # returning, matching ``register_fake``'s ``torch.empty_like(x)``
     # contract. Mirrors the round-trip Helion installs for
@@ -80,9 +73,7 @@ def _(state: CodegenState) -> ast.AST:
         x32_id = x32_local.id
     else:
         x32_id = input_ast.id
-    expr = _GELU_TANH_APPROX_EXPR_TRITON.replace("{x}", input_ast.id).replace(
-        "{x32}", x32_id
-    )
+    expr = _GELU_TANH_APPROX_EXPR_TRITON.replace("{x32}", x32_id)
     if orig_dtype is not None:
         # Narrow the fp32 polynomial result back to the input dtype so
         # the FX-level same-dtype contract holds for callers that do
@@ -110,7 +101,7 @@ def _(state: CodegenState) -> ast.AST:
         x32_id = x32_local.id
     else:
         x32_id = input_ast.id
-    expr = _GELU_ERF_EXPR_TRITON.replace("{x}", input_ast.id).replace("{x32}", x32_id)
+    expr = _GELU_ERF_EXPR_TRITON.replace("{x32}", x32_id)
     if orig_dtype is not None:
         expr = f"({expr}).to({triton_type(orig_dtype)})"
     return expr_from_string(expr)

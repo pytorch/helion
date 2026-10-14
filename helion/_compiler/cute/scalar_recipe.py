@@ -47,9 +47,12 @@ _MATH_CALLS = frozenset(
     {
         "absf",
         "acos",
+        "acosh",
         "asin",
+        "asinh",
         "atan",
         "atan2",
+        "atanh",
         "ceil",
         "copysign",
         "cos",
@@ -75,6 +78,7 @@ _MATH_CALLS = frozenset(
         "min",
         "pow",
         "rcp",
+        "roundeven",
         "rsqrt",
         "sin",
         "sinh",
@@ -127,7 +131,7 @@ _OPERATOR_CALLS = frozenset(
 _BUILTINS = frozenset({"abs", "bool", "float", "int", "max", "min", "round"})
 # Quantized decode helpers from ``quantized_helpers.py``: side-effect-free PTX
 # ``cvt`` inline asm over a register operand, so a call may be replayed or moved
-# across lane-loop scopes.  Shared with ``tile_strategy``'s relocation proofs.
+# across lane-loop scopes.
 PURE_DECODE_HELPERS = frozenset(
     {
         "_cute_float4_e2m1fn_x2_to_float32",
@@ -135,8 +139,22 @@ PURE_DECODE_HELPERS = frozenset(
         "_cute_fp8e4m3fn_x2_to_float32",
     }
 )
-_HELPERS = PURE_DECODE_HELPERS | {"_cute_python_mod"}
-_GLOBALS = _BUILTINS | _HELPERS | {"cutlass", "cute", "math", "operator"}
+# Every pure helper generated code may call: the decode helpers, Python's
+# modulo, the trace-time numeric conversion at a dynamic if-join
+# (``join_cast.py``) and the bitwise copysign (``copysign.py``).  Shared with
+# ``tile_strategy``'s relocation proofs.
+PURE_HELPERS = PURE_DECODE_HELPERS | {
+    "_cute_copysign",
+    "_cute_join_cast",
+    "_cute_python_mod",
+}
+# ``_cute_inline_asm_elementwise`` enters a recipe only as the rounded FP32
+# product ``is_rounded_fp32_multiply`` recognizes (``_PureExpression.visit_Call``).
+_GLOBALS = (
+    _BUILTINS
+    | PURE_HELPERS
+    | {"cutlass", "cute", "math", "operator", "_cute_inline_asm_elementwise"}
+)
 _METADATA = frozenset({"iterator", "layout", "shape", "stride", "element_type"})
 _AstT = TypeVar("_AstT", bound=ast.AST)
 
@@ -179,6 +197,30 @@ def _numeric_type(node: ast.expr) -> bool:
         and path[0] == "cutlass"
         and path[1] in _NUMERIC_TYPES
     )
+
+
+ROUNDED_FP32_MULTIPLY_ASM = "mul.rn.f32 $0, $1, $2;"
+ROUNDED_FP32_MULTIPLY_CONSTRAINTS = "=f,f,f"
+
+
+def is_rounded_fp32_multiply(value: ast.expr) -> bool:
+    """Recognize the explicitly rounded FP32 product of ``scalar_recipe_rounding``."""
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_cute_inline_asm_elementwise"
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Tuple)
+        and len(value.args[0].elts) == 2
+        and len(value.keywords) == 4
+    ):
+        return False
+    return {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords} == {
+        "asm": repr(ROUNDED_FP32_MULTIPLY_ASM),
+        "constraints": repr(ROUNDED_FP32_MULTIPLY_CONSTRAINTS),
+        "dtype": "cutlass.Float32",
+        "is_pure": "True",
+    }
 
 
 class _PureExpression(ast.NodeVisitor):
@@ -258,10 +300,16 @@ class _PureExpression(ast.NodeVisitor):
         self.visit(node.orelse)
 
     def visit_Call(self, node: ast.Call) -> None:
+        if is_rounded_fp32_multiply(node):
+            # ``preserve_fp32_multiply_rounding``'s spelling of an FP32
+            # product, already emitted for a product that
+            # ``mark_narrowed_fp32_multiplies`` flagged at device-IR time.
+            self.visit(node.args[0])
+            return
         path = _path(node.func)
         pure_global = path is not None and (
             len(path) == 1
-            and path[0] in _BUILTINS | _HELPERS
+            and path[0] in _BUILTINS | PURE_HELPERS
             or len(path) == 2
             and path[0] == "cutlass"
             and path[1] in _NUMERIC_TYPES | {"min", "max"}

@@ -14,8 +14,9 @@ from unittest.mock import patch
 import torch
 
 import helion
-from helion._compat import supports_torch_compile_fusion
+from helion._compat import supports_torch_compile_template_lowering
 from helion._compiler._dynamo.variables import infer_output_spec
+from helion._compiler._dynamo.variables import torch_compile_captures_kernel_hop
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.pallas.backend import PallasBackend
 from helion._compiler.triton.backend import TileIRBackend
@@ -23,6 +24,7 @@ from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import onlyBackends
 from helion._testing import skipIfTileIR
 import helion.language as hl
@@ -95,6 +97,28 @@ def _make_scale() -> helion.Kernel:
     return scale
 
 
+def _double(t: torch.Tensor) -> torch.Tensor:
+    return t * 2
+
+
+def _triple(t: torch.Tensor) -> torch.Tensor:
+    return t * 3
+
+
+def _make_apply() -> helion.Kernel:
+    @helion.kernel(
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64]),
+    )
+    def apply(x: torch.Tensor, fn: Callable[..., torch.Tensor]) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0)):
+            out[tile] = fn(x[tile])
+        return out
+
+    return apply
+
+
 def _tensor_size(values: Sequence[object]) -> int:
     value = values[0]
     assert isinstance(value, torch.Tensor)
@@ -159,6 +183,72 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first.data_ptr(), second.data_ptr())
         torch.testing.assert_close(first, x + 1)
         torch.testing.assert_close(second, other + 1)
+
+    def test_callable_argument_uses_prepared_call(self) -> None:
+        """Callable arguments (score-modifier style hooks) key by code object,
+        so repeat calls skip ``bind()``; a different function re-dispatches."""
+        apply = _make_apply()
+        x = torch.randn(64, device=DEVICE)
+        first = apply(x, _double)
+        self.assertIsNotNone(apply._prepared_call)  # type: ignore[attr-defined]
+
+        other = torch.randn_like(x)
+        with (
+            patch.object(
+                apply,
+                "_fast_dispatch_key_and_guards",
+                side_effect=AssertionError("prepared call rebuilt its dispatch key"),
+            ),
+            patch.object(
+                apply,
+                "bind",
+                side_effect=AssertionError("prepared call rebound the kernel"),
+            ),
+        ):
+            second = apply(other, _double)
+        torch.testing.assert_close(first, x * 2)
+        torch.testing.assert_close(second, other * 2)
+
+        with patch.object(
+            apply,
+            "_fast_dispatch_key_and_guards",
+            wraps=apply._fast_dispatch_key_and_guards,  # type: ignore[attr-defined]
+        ) as fast_key:
+            third = apply(x, _triple)
+        fast_key.assert_called()
+        torch.testing.assert_close(third, x * 3)
+        # Alternating functions dispatch through the cache without rebinding.
+        with patch.object(
+            apply,
+            "bind",
+            side_effect=AssertionError("cached specialization rebound the kernel"),
+        ):
+            torch.testing.assert_close(apply(x, _double), x * 2)
+            torch.testing.assert_close(apply(x, _triple), x * 3)
+
+    def test_bound_callable_argument_uses_direct_prepared_call(self) -> None:
+        apply = _make_apply()
+        x = torch.randn(64, device=DEVICE)
+        args = (x, _double)
+        bound = apply.bind(args)
+        bound(*args)
+        bound(*args)
+        if bound.kernel._has_specialization_extras:  # type: ignore[attr-defined]
+            # Backends without runtime specialization extras never rebind
+            # from ``BoundKernel.__call__`` and need no monomorphic guard.
+            self.assertIsNotNone(bound._direct_prepared_call)
+        with patch.object(
+            apply,
+            "bind",
+            side_effect=AssertionError("direct prepared call rebound the kernel"),
+        ):
+            torch.testing.assert_close(bound(*args), x * 2)
+        if bound.kernel._has_specialization_extras:  # type: ignore[attr-defined]
+            # A different callable leaves the monomorphic path and rebinds.
+            with patch.object(apply, "bind", wraps=apply.bind) as bind:
+                out = bound(x, _triple)
+            bind.assert_called()
+            torch.testing.assert_close(out, x * 3)
 
     def test_tensor_metadata_changes_use_dispatch(self) -> None:
         add_one = _make_add_one()
@@ -727,8 +817,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         self.assertFalse(add_one._bound_kernels)
 
     @unittest.skipUnless(
-        supports_torch_compile_fusion(),
-        "requires Helion's torch.compile fusion integration",
+        supports_torch_compile_template_lowering(),
+        "requires Helion's Inductor template lowering",
     )
     def test_inductor_lowering_bind_does_not_wait_for_bind_lock(self) -> None:
         from helion._compiler._inductor.template_buffer import _bind_kernel_for_lowering
@@ -1169,13 +1259,10 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 torch.testing.assert_close(compiled(x), x + x.numel() + 1)
 
     @unittest.skipUnless(
-        supports_torch_compile_fusion(),
-        "requires Helion's torch.compile fusion integration",
+        torch_compile_captures_kernel_hop(_get_backend()),
+        "requires torch.compile to capture the kernel as the Helion HOP",
     )
     def test_fullgraph_capture_preserves_eager_caches(self) -> None:
-        if not supports_torch_compile_fusion():
-            self.skipTest("torch.compile fusion is unavailable")
-
         @helion.kernel(
             static_shapes=True,
             config=helion.Config(block_sizes=[64]),

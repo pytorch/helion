@@ -7,6 +7,8 @@ description: Address CI failures and unresolved review comments on a Helion pull
 
 Goal: bring a PR green by fixing CI failures and addressing unresolved review comments. Leave the fixes **uncommitted and unstaged** — the user handles committing and updating the PR.
 
+This skill fixes the single PR for the HEAD commit. To fix every PR in a stack-pr stack, use the fix-pr-stack skill instead.
+
 ## 1. Identify the target PR
 
 Run `git log -n1` to see the current commit. The local commit must correspond to the PR being fixed.
@@ -40,15 +42,20 @@ For each failing check:
 
 ## 3. Address unresolved review comments
 
-Fetch review comments and resolve any that haven't been addressed:
+Fetch inline review threads with GraphQL — the REST endpoints don't report whether a thread is resolved:
 
 ```
-gh api repos/pytorch/helion/pulls/<number>/comments
+gh api graphql -F n=<number> -f query='query($n:Int!){repository(owner:"pytorch",name:"helion"){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:20){nodes{author{login} body diffHunk}}}}}}}'
+```
+
+Review summaries and the top-level conversation come from:
+
+```
 gh api repos/pytorch/helion/pulls/<number>/reviews
 gh pr view <number> --repo pytorch/helion --comments
 ```
 
-For each unresolved comment, apply the requested change in the working tree. Skip comments that are already resolved, are non-actionable (praise, questions answered in thread), or that the author explicitly waved off.
+For each thread with `isResolved: false`, and each unaddressed review summary or top-level comment, apply the requested change in the working tree. If `isOutdated` is true, the code changed after the comment: find the spot via `path` + `diffHunk` and check whether it's already addressed. Skip comments that are non-actionable (praise, questions answered in thread) or that the author explicitly waved off.
 
 ## 4. Wrap up
 

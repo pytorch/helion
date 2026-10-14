@@ -9,14 +9,21 @@ import unittest
 import torch
 
 import helion
+from helion._compat import supports_block_ptr
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import AssertExpectedJournal
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessBlockPtr
+from helion.autotuner.benchmark_provider import _searching_candidates
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
@@ -660,6 +667,755 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         # Verify both x_stride_0 and x_stride_1 are NOT passed as arguments (they should be inlined)
         self.assertNotIn("x_stride_0", code)
         self.assertNotIn("x_stride_1", code)
+
+    def test_dynamic_reduction_over_empty_rows(self):
+        """A dynamic reduction extent of 0 still needs a length-1 block (the
+        static path already uses one); Triton's next_power_of_2(0) is 0."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        for shape in ((64, 8), (64, 0)):
+            with self.subTest(shape=shape):
+                x = torch.randn(shape, device=DEVICE)
+                torch.testing.assert_close(row_sum(x), x.sum(-1))
+
+    @skipIfRefEager("bound kernels are not used in ref eager mode")
+    def test_looped_reduction_reuses_bound_kernel_across_extents(self):
+        """Only a config compiled to run keys a CuTe persistent reduction's
+        extent bucket: a persistent candidate a search compiles must not
+        re-bind a kernel whose looped winner works at every extent."""
+        looped = helion.Config(block_sizes=[1], reduction_loops=[64])
+        persistent = helion.Config(block_sizes=[1], reduction_loops=[None])
+
+        @helion.kernel(static_shapes=False, configs=[looped, persistent])
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 100, device=DEVICE)
+        bound = row_sum.bind((x,))
+        with _searching_candidates():
+            bound.compile_config(persistent)
+        bound.set_config(looped)
+        torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertFalse(
+            row_sum._cute_reduction_extent_descriptors.get(bound._base_spec_key)
+        )
+        y = torch.randn(64, 300, device=DEVICE)
+        torch.testing.assert_close(row_sum(y), y.sum(-1), rtol=1e-4, atol=1e-4)
+        if "input_tensor_metadata" not in bound.env.compiler_fact_specialization_facts:
+            # Otherwise the bound kernel is keyed on the exact input metadata.
+            self.assertIs(row_sum.bind((y,)), bound)
+
+    def test_looped_winner_autotunes_once_across_extent_buckets(self):
+        """The autotuner's reference baseline at n=1024 is a persistent row
+        reduction; compiling it must not key the extent bucket, so the looped
+        winner serves every later extent from the one bound kernel (and the
+        one search) of the first call.  A kernel keyed on its exact input
+        metadata re-binds and searches per shape, and none of those searches
+        may key an extent bucket either."""
+
+        @helion.kernel(
+            static_shapes=False,
+            configs=[
+                helion.Config(reduction_loops=[256]),
+                helion.Config(reduction_loops=[512]),
+            ],
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for i in hl.grid(x.size(0)):
+                out[i] = x[i, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 1024, device=DEVICE)
+        torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=1e-4, atol=1e-3)
+        bound = row_sum.bind((x,))
+        self.assertFalse(
+            row_sum._cute_reduction_extent_descriptors.get(bound._base_spec_key)
+        )
+        metadata_keyed = (
+            "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+        )
+        for n in (3000, 6000, 1500):
+            with self.subTest(n=n):
+                y = torch.randn(64, n, device=DEVICE)
+                torch.testing.assert_close(row_sum(y), y.sum(-1), rtol=1e-4, atol=1e-3)
+                rebound = row_sum.bind((y,))
+                self.assertFalse(
+                    row_sum._cute_reduction_extent_descriptors.get(
+                        rebound._base_spec_key
+                    )
+                )
+                if not metadata_keyed:
+                    # Otherwise the bound kernel is keyed on the exact input
+                    # metadata.
+                    self.assertIs(rebound, bound)
+
+    @skipIfRefEager("checks compile_config bound-kernel keying; runs no ref")
+    def test_compile_config_keys_persistent_reduction_extent(self):
+        """bound.compile_config() returns a callable compiled at the bound
+        kernel's size hints, and a CuTe persistent reduction or full-slice
+        load sizes its threads from the extent's hint: compiled at n=32, a
+        later bind() at n=64 must get its own bound kernel, not reuse it."""
+        persistent = helion.Config(block_sizes=[1], reduction_loops=[None])
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def double(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :] = x[tile_m, :] * 2
+            return out
+
+        @helion.kernel(static_shapes=False, configs=[persistent])
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        for n in (32, 64):
+            with self.subTest(n=n):
+                x = torch.randn(40, n, device=DEVICE)
+                bound = double.bind((x,))
+                compiled = bound.compile_config(bound.config_spec.default_config())
+                torch.testing.assert_close(compiled(x), x * 2, rtol=0, atol=0)
+                compiled = row_sum.bind((x,)).compile_config(persistent)
+                torch.testing.assert_close(compiled(x), x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_two_full_slice_dims_cover_each_extent_bucket(self):
+        """A CuTe kernel over two ':' dims sizes its thread layout from both
+        extents' power-of-2 buckets: calls at [48, 4, 16] and then
+        [48, 4, 32] or [48, 8, 16] need their own bound kernels to cover the
+        whole span, while [48, 4, 12] shares the first one."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def double(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :, :] = x[tile_m, :, :] * 2
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_sums(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0), x.size(1)])
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :] = x[tile_m, :, :].sum(-1)
+            return out
+
+        for shape in ((48, 4, 16), (48, 4, 32), (48, 8, 16), (48, 4, 12)):
+            with self.subTest(shape=shape):
+                x = torch.randn(shape, device=DEVICE)
+                torch.testing.assert_close(double(x), x * 2, rtol=0, atol=0)
+                torch.testing.assert_close(row_sums(x), x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipUnlessBackends(["cute"])
+    def test_compiled_config_refuses_a_larger_extent_bucket(self):
+        """A config compiled through bound.compile_config() bakes the extent
+        buckets of the bound kernel's sizes into the CuTe kernel; called
+        directly at a larger bucket it raises rather than covering half of
+        each row, and it still runs its own bucket and smaller ones, whose
+        extents the layout's masks cover."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def double(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :, :] = x[tile_m, :, :] * 2
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        x = torch.randn(48, 4, 16, device=DEVICE)
+        bound = double.bind((x,))
+        compiled = bound.compile_config(bound.config_spec.default_config())
+        for shape in ((48, 4, 16), (48, 4, 12), (48, 4, 8), (48, 2, 16), (48, 1, 4)):
+            with self.subTest(shape=shape):
+                y = torch.randn(shape, device=DEVICE)
+                torch.testing.assert_close(compiled(y), y * 2, rtol=0, atol=0)
+        for shape in ((48, 4, 32), (48, 8, 16)):
+            with (
+                self.subTest(shape=shape),
+                self.assertRaisesRegex(RuntimeError, "larger bucket"),
+            ):
+                compiled(torch.randn(shape, device=DEVICE))
+
+        x = torch.randn(64, 1024, device=DEVICE)
+        bound = row_sum.bind((x,))
+        compiled = bound.compile_config(bound.config_spec.default_config())
+        for n in (1024, 512, 96, 16, 0):
+            with self.subTest(n=n):
+                y = torch.randn(64, n, device=DEVICE)
+                torch.testing.assert_close(compiled(y), y.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_size_one_first_call_does_not_poison_later_shapes(self):
+        """A static_shapes=False kernel first bound at a size-1 dim compiles
+        code that assumes it: a compile-time ``size != 1`` guards the symbol
+        to 1, and the tile kernel drops that dim's index.  Later sizes, 0
+        included, must get a kernel that does not assume it."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        for shapes in (((64, 1), (64, 8), (64, 0)), ((64, 1), (64, 8), (64, 32))):
+            add_one.reset()
+            row_sum.reset()
+            for shape in shapes:
+                with self.subTest(shapes=shapes, shape=shape):
+                    x = torch.randn(shape, device=DEVICE)
+                    torch.testing.assert_close(add_one(x), x + 1)
+                    torch.testing.assert_close(row_sum(x), x.sum(-1))
+
+    def test_empty_reduction_first_call_does_not_poison_later_shapes(self):
+        """Bound at an empty reduction extent, the reduction block symbol must
+        not be guarded 1-wide unkeyed: a later call with real rows has to run
+        a kernel that reduces all of them."""
+
+        # ``v - v.sum(-1, keepdim=True)`` broadcasts the reduced row against
+        # the row, which is where the empty extent's block got guarded 1-wide.
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def center(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                v = x[tile_m, :]
+                out[tile_m, :] = v - v.sum(-1, keepdim=True)
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        cases = (
+            (center, lambda x: x - x.sum(-1, keepdim=True)),
+            (row_sum, lambda x: x.sum(-1)),
+        )
+        for kernel, reference in cases:
+            for columns in ((0, 8), (0, 64), (1, 0, 8)):
+                kernel.reset()
+                for n in columns:
+                    with self.subTest(kernel=kernel.name, columns=columns, n=n):
+                        x = torch.randn(32, n, device=DEVICE)
+                        torch.testing.assert_close(kernel(x), reference(x))
+
+    @skipIfNotTriton("block_ptr indexing is Triton-only")
+    @skipUnlessBlockPtr("block_ptr indexing is required")
+    def test_codegen_size_one_guard_is_keyed(self):
+        """Block-pointer codegen decides whether a dim broadcasts by comparing
+        its size with 1, which records a guard after binding; the guard must
+        key the bound kernel both ways (size-1 bias first, or full first)."""
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[8, 8, 8], indexing="block_ptr"),
+        )
+        def add_biases(
+            x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + bias1[tile] + bias2[tile]
+            return out
+
+        broadcast = ((1, 24, 32), (16, 1, 32))
+        full = ((16, 24, 32), (16, 24, 32))
+        for shapes in ((broadcast, full), (full, broadcast)):
+            add_biases.reset()
+            for bias_shapes in shapes:
+                with self.subTest(shapes=shapes, bias_shapes=bias_shapes):
+                    x = torch.randn(16, 24, 32, device=DEVICE)
+                    bias1 = torch.randn(bias_shapes[0], device=DEVICE)
+                    bias2 = torch.randn(bias_shapes[1], device=DEVICE)
+                    torch.testing.assert_close(
+                        add_biases(x, bias1, bias2), x + bias1 + bias2
+                    )
+
+    def test_size_one_broadcast_dim_is_keyed(self):
+        """Pointer and CuTe indexing broadcast a size-1 dim that a tile over a
+        larger extent indexes.  A dynamic size is compared with 1 during code
+        generation; that guard must key the bound kernel both ways (size-1
+        first, or full first), for loaded operands and an ``extra_mask``."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def add_biases(
+            x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + bias1[tile] + bias2[tile]
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def masked_copy(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m, tile_n, tile_k in hl.tile(x.size()):
+                out[tile_m, tile_n, tile_k] = hl.load(
+                    x,
+                    [tile_m, tile_n, tile_k],
+                    extra_mask=mask[tile_m, tile_n, tile_k],
+                )
+            return out
+
+        broadcast = ((1, 8, 16), (4, 1, 16))
+        full = ((4, 8, 16), (4, 8, 16))
+        for shapes in ((broadcast, full), (full, broadcast)):
+            add_biases.reset()
+            for bias_shapes in shapes:
+                with self.subTest(shapes=shapes, bias_shapes=bias_shapes):
+                    x = torch.randn(4, 8, 16, device=DEVICE)
+                    bias1 = torch.randn(bias_shapes[0], device=DEVICE)
+                    bias2 = torch.randn(bias_shapes[1], device=DEVICE)
+                    torch.testing.assert_close(
+                        add_biases(x, bias1, bias2), x + bias1 + bias2
+                    )
+
+        for mask_shapes in (((1, 4, 1), (8, 4, 16)), ((8, 4, 16), (8, 1, 16))):
+            masked_copy.reset()
+            for mask_shape in mask_shapes:
+                with self.subTest(mask_shapes=mask_shapes, mask_shape=mask_shape):
+                    x = torch.randn(8, 4, 16, device=DEVICE)
+                    mask = torch.rand(mask_shape, device=DEVICE) > 0.5
+                    torch.testing.assert_close(
+                        masked_copy(x, mask), torch.where(mask, x, 0.0)
+                    )
+
+    def test_store_target_dims_record_no_broadcast_guard(self):
+        """A store target never needs to broadcast: ``out.size(0)`` is its
+        own symbol, which a tile over ``M = a.size(0)`` cannot prove covers,
+        yet comparing it with 1 at ``M == 1`` broadcast the 16-row tile onto
+        one row, and the guard split the kernel at M == 1."""
+        configs = [helion.Config(block_sizes=[16, 32])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[16, 32], indexing=indexing)
+                for indexing in indexings
+            ]
+        for config in configs:
+
+            @helion.kernel(static_shapes=False, config=config)
+            def store_add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    out[tile_m, tile_n] = a[tile_m, tile_n] + 1.0
+                return out
+
+            @helion.kernel(static_shapes=False, config=config)
+            def atomic_add_one(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    hl.atomic_add(out, [tile_m, tile_n], a[tile_m, tile_n] + 1.0)
+                return out
+
+            for m in (1, 4, 5):
+                with self.subTest(config=config, m=m):
+                    a = torch.randn(m, 64, device=DEVICE)
+                    out = torch.randn(m, 64, device=DEVICE)
+                    torch.testing.assert_close(store_add_one(a, out.clone()), a + 1.0)
+                    torch.testing.assert_close(
+                        atomic_add_one(a, out.clone()), out + a + 1.0
+                    )
+                    if not self._in_ref_eager_mode:
+                        for kernel in (store_add_one, atomic_add_one):
+                            bound = kernel.bind((a, out))
+                            # A block store keys ``out`` matching the loop's
+                            # extent, but nothing compares a size with 1.
+                            self.assertEqual(
+                                [
+                                    fact
+                                    for fact in bound._guarded_input_facts()
+                                    if fact.extractor.rhs == 1
+                                ],
+                                [],
+                            )
+
+    def test_size_one_broadcast_store_keeps_tile_mask(self):
+        """Loading ``out`` first guards its size-1 dim to 1, so the following
+        store or atomic broadcasts a wider tile onto it; it must still mask
+        the tile's out-of-range lanes, which would otherwise race (store) or
+        accumulate (atomic) onto the one element.  Epilogue subtiling stores
+        each piece through a sub-tile of the tile."""
+        configs = [helion.Config(block_sizes=[16, 32])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[16, 32], epilogue_subtile=2),
+                *(
+                    helion.Config(block_sizes=[16, 32], indexing=indexing)
+                    for indexing in indexings
+                ),
+            ]
+        for config in configs:
+
+            @helion.kernel(static_shapes=False, config=config)
+            def accumulate(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    out[tile_m, tile_n] = out[tile_m, tile_n] + a[tile_m, tile_n]
+                return out
+
+            @helion.kernel(static_shapes=False, config=config)
+            def atomic_accumulate(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                for tile_m, tile_n in hl.tile(a.size()):
+                    hl.atomic_add(
+                        out, [tile_m, tile_n], out[tile_m, tile_n] + a[tile_m, tile_n]
+                    )
+                return out
+
+            for shape in ((1, 64), (64, 1), (4, 64)):
+                with self.subTest(config=config, shape=shape):
+                    a = torch.randn(shape, device=DEVICE)
+                    out = torch.randn(shape, device=DEVICE)
+                    torch.testing.assert_close(accumulate(a, out.clone()), out + a)
+                    torch.testing.assert_close(
+                        atomic_accumulate(a, out.clone()), 2 * out + a
+                    )
+
+    def test_size_one_store_with_scalar_index(self):
+        """``out[tile_m, 0]`` with ``out.size(0)`` guarded to 1 (by a load of
+        ``out``) has a scalar store offset, a constexpr at stride 1: it must
+        be expanded to the tile, not have the tile's value squeezed into
+        it."""
+        config = helion.Config(block_sizes=[16])
+
+        @helion.kernel(static_shapes=False, config=config)
+        def store_column(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(a.size(0)):
+                out[tile_m, 0] = a[tile_m, 0] + 1.0
+            return out
+
+        @helion.kernel(static_shapes=False, config=config)
+        def accumulate_column(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(a.size(0)):
+                out[tile_m, 0] = out[tile_m, 0] + a[tile_m, 0]
+            return out
+
+        @helion.kernel(static_shapes=False, config=config)
+        def atomic_column(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(a.size(0)):
+                hl.atomic_add(out, [tile_m, 0], out[tile_m, 0] + a[tile_m, 0])
+            return out
+
+        for m in (1, 4):
+            with self.subTest(m=m):
+                a = torch.randn(m, 3, device=DEVICE)
+                out = torch.randn(m, 3, device=DEVICE)
+                expected = out.clone()
+                expected[:, 0] = a[:, 0] + 1.0
+                torch.testing.assert_close(store_column(a, out.clone()), expected)
+                expected[:, 0] = out[:, 0] + a[:, 0]
+                torch.testing.assert_close(accumulate_column(a, out.clone()), expected)
+                expected[:, 0] += out[:, 0]
+                torch.testing.assert_close(atomic_column(a, out.clone()), expected)
+
+    @skipIfRefEager("stack tensors are not supported in ref eager mode")
+    @skipUnlessBackends(["triton", "cute"])
+    def test_size_one_stack_tensor_store(self):
+        """A stack tensor store at ``M == 1``: the target dim must not be
+        guarded to 1 by the store, and once a load guards it, the store
+        broadcasts its offset to the tile and keeps the tile's mask."""
+
+        @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[16, 32]))
+        def stack_store(
+            x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+        ) -> None:
+            hl.specialize(dev_ptrs.size(0))
+            for tile_m, tile_n in hl.tile(x.size()):
+                tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                tensors[tile_m, tile_n] = (x[tile_m, tile_n] + 1.0)[None, :, :]
+
+        @helion.kernel(static_shapes=False, config=helion.Config(block_sizes=[16, 32]))
+        def stack_accumulate(
+            x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+        ) -> None:
+            hl.specialize(dev_ptrs.size(0))
+            for tile_m, tile_n in hl.tile(x.size()):
+                tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                tensors[tile_m, tile_n] = (
+                    tensors[tile_m, tile_n] + x[tile_m, tile_n][None, :, :]
+                )
+
+        for m in (1, 4):
+            with self.subTest(m=m):
+                x = torch.randn(m, 64, device=DEVICE)
+                targets = [torch.randn(m, 64, device=DEVICE) for _ in range(3)]
+                originals = [t.clone() for t in targets]
+                ptrs = torch.as_tensor(
+                    [t.data_ptr() for t in targets], device=DEVICE, dtype=torch.uint64
+                )
+                stack_accumulate(x, ptrs, targets[0])
+                for target, original in zip(targets, originals, strict=True):
+                    torch.testing.assert_close(target, original + x)
+                stack_store(x, ptrs, targets[0])
+                for target in targets:
+                    torch.testing.assert_close(target, x + 1.0)
+                self.assertEqual(
+                    stack_store.bind((x, ptrs, targets[0]))._guarded_input_facts(), []
+                )
+
+    @skipIfNotTriton("block_ptr indexing is Triton-only")
+    @skipUnlessBlockPtr("block_ptr indexing is required")
+    def test_block_ptr_scalar_index_on_size_one_dim(self):
+        """A block_ptr block holds a broadcast dim as 1, and a scalar index
+        drops a dim from the result, so the block cannot be reshaped into the
+        tile; such loads and stores use pointer indexing."""
+        config = helion.Config(block_sizes=[16], indexing="block_ptr")
+
+        @helion.kernel(static_shapes=False, config=config)
+        def load_column(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(out.size(0)):
+                out[tile_m] = x[tile_m, 3] + 1.0
+            return out
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[16], indexing=["pointer", "block_ptr"]),
+        )
+        def store_column(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, 3] = x[tile_m] + 1.0
+            return out
+
+        # At M == 1 the tile's own dim was guarded to 1, leaving a one-element
+        # block that Triton's block pointer rewrite crashed on.
+        @helion.kernel(static_shapes=False, config=config)
+        def add_one(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m] + 1.0
+            return out
+
+        for m in (1, 4):
+            with self.subTest(m=m):
+                x = torch.randn(m, 8, device=DEVICE)
+                out = torch.empty(m, device=DEVICE)
+                torch.testing.assert_close(load_column(x, out), x[:, 3] + 1.0)
+                x = torch.randn(m, device=DEVICE)
+                out = torch.zeros(m, 8, device=DEVICE)
+                expected = out.clone()
+                expected[:, 3] = x + 1.0
+                torch.testing.assert_close(store_column(x, out), expected)
+                torch.testing.assert_close(add_one(x, torch.empty_like(x)), x + 1.0)
+
+    def test_size_one_broadcast_load_feeds_reduction(self):
+        """``bias[tile_m, tile_n]`` with ``bias.size(0) == 1`` broadcasts row
+        0 over the tile.  A load is masked to 0 past the tile's extent, which
+        lets the column sum skip its own mask, so the broadcast rows past
+        ``M`` must be zeroed too (they counted ``bias`` once per row of the
+        block)."""
+        configs = [helion.Config(block_sizes=[32, 16])]
+        if _get_backend() == "triton":
+            indexings = ["tensor_descriptor"]
+            if supports_block_ptr():
+                indexings.append("block_ptr")
+            configs += [
+                helion.Config(block_sizes=[32, 16], indexing=indexing)
+                for indexing in indexings
+            ]
+        for static_shapes in (True, False):
+            for config in configs:
+
+                @helion.kernel(static_shapes=static_shapes, config=config)
+                def column_sums(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+                    m, n = x.size()
+                    out = torch.empty([n], dtype=torch.float32, device=x.device)
+                    for tile_n in hl.tile(n):
+                        acc = hl.zeros([tile_n], dtype=torch.float32)
+                        for tile_m in hl.tile(m):
+                            acc += (x[tile_m, tile_n] + bias[tile_m, tile_n]).sum(0)
+                        out[tile_n] = acc
+                    return out
+
+                for m in (1, 4, 20):
+                    with self.subTest(static_shapes=static_shapes, config=config, m=m):
+                        x = torch.randn(m, 64, device=DEVICE)
+                        bias = torch.randn(1, 64, device=DEVICE)
+                        torch.testing.assert_close(
+                            column_sums(x, bias),
+                            (x + bias).sum(0),
+                            rtol=1e-4,
+                            atol=1e-4,
+                        )
+
+    @skipIfRefEager("stack tensors are not supported in ref eager mode")
+    @skipUnlessBackends(["triton", "cute"])
+    def test_size_one_broadcast_stack_load_feeds_reduction(self):
+        """A stack tensor load that broadcasts a size-1 dim onto a wider tile
+        must also be 0 past the tile's extent before a reduction over it."""
+        for static_shapes in (True, False):
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                config=helion.Config(block_sizes=[16, 32]),
+            )
+            def stack_column_sums(
+                x: torch.Tensor, dev_ptrs: torch.Tensor, example: torch.Tensor
+            ) -> torch.Tensor:
+                m, n = x.size()
+                s = hl.specialize(dev_ptrs.size(0))
+                out = torch.empty([s, n], dtype=torch.float32, device=x.device)
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([s, tile_n], dtype=torch.float32)
+                    for tile_m in hl.tile(m):
+                        tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                        acc += tensors[tile_m, tile_n].sum(1)
+                    out[:, tile_n] = acc
+                return out
+
+            with self.subTest(static_shapes=static_shapes):
+                x = torch.randn(20, 64, device=DEVICE)
+                rows = [torch.randn(1, 64, device=DEVICE) for _ in range(4)]
+                ptrs = torch.as_tensor(
+                    [r.data_ptr() for r in rows], device=DEVICE, dtype=torch.uint64
+                )
+                torch.testing.assert_close(
+                    stack_column_sums(x, ptrs, rows[0]),
+                    torch.stack([r[0] * 20 for r in rows]),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+
+    def test_own_extent_dims_record_no_broadcast_guard(self):
+        """A dim indexed by a tile over its own size cannot broadcast, so code
+        generation does not compare it with 1 and the kernel keeps a
+        guard-free cache key."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_sums(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile, :].sum(-1)
+            return out
+
+        for shape in ((64, 32), (100, 24)):
+            with self.subTest(shape=shape):
+                x = torch.randn(shape, device=DEVICE)
+                torch.testing.assert_close(add_one(x), x + 1)
+                torch.testing.assert_close(row_sums(x), x.sum(-1))
+                self.assertEqual(add_one.bind((x,))._guarded_input_facts(), [])
+                self.assertEqual(row_sums.bind((x,))._guarded_input_facts(), [])
+
+    @skipIfRefEager("compiles explicit configs")
+    def test_block_size_derived_dims_record_no_broadcast_guard(self):
+        """A buffer dim computed from a block size (``cdiv(n, block)``) is
+        fixed by each config, not by the inputs.  Comparing it with 1 would
+        evaluate the block size at its size hint and settle the dim for every
+        config compiled after it."""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def tile_sums(
+            x: torch.Tensor, double: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            rows, width = x.shape
+            block = hl.register_block_size(width)
+            parts = (width + block - 1) // block
+            partial = torch.empty((rows, parts), device=x.device, dtype=x.dtype)
+            out = torch.empty((rows,), device=x.device, dtype=x.dtype)
+            for row, col in hl.tile([rows, width], block_size=[1, block]):
+                partial[row, col.id] = x[row, col].sum(-1)
+            hl.barrier()
+            for row in hl.tile(rows):
+                total = partial[row, :].sum(-1)
+                out[row] = total * 2 if double else total
+            return partial, out
+
+        x = torch.arange(3 * 65, device=DEVICE, dtype=torch.float32).reshape(3, 65)
+        for block, double in ((16, False), (16, True), (32, False), (128, False)):
+            with self.subTest(block=block, double=double):
+                bound = tile_sums.bind((x, double))
+                config = bound.config_spec.default_config()
+                config.config["pid_type"] = (
+                    "flat" if _get_backend() == "cute" else "persistent_blocked"
+                )
+                config.config["block_sizes"] = [block, 4]
+                config.config.pop("reduction_loops", None)
+                partial, out = bound.compile_config(config)(x, double)
+                expected = torch.stack(
+                    [
+                        x[:, start : start + block].sum(-1)
+                        for start in range(0, 65, block)
+                    ],
+                    dim=-1,
+                )
+                torch.testing.assert_close(partial, expected)
+                torch.testing.assert_close(out, expected.sum(-1) * (2 if double else 1))
+
+    @skipIfCute("cute does not lower two reduction dims of different sizes")
+    def test_equal_reduction_extents_at_bind_do_not_poison_later_shapes(self):
+        """Bound with two equal reduction extents, a compile-time guard merges
+        their reduction dims; a later call with different extents must not
+        reuse that kernel."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def two_row_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], device=x.device)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = x[tile_m, :].sum(-1) + y[tile_m, :].sum(-1)
+            return out
+
+        for x_cols, y_cols in ((8, 8), (8, 64), (64, 8)):
+            with self.subTest(x_cols=x_cols, y_cols=y_cols):
+                x = torch.randn(16, x_cols, device=DEVICE)
+                y = torch.randn(16, y_cols, device=DEVICE)
+                torch.testing.assert_close(two_row_sums(x, y), x.sum(-1) + y.sum(-1))
+
+    def test_dynamic_reduction_extent_grows_across_calls(self):
+        """One static_shapes=False kernel must stay correct when a later call
+        grows a full-slice or reduction extent: CuTe sizes that axis's threads
+        from the compile-time hint, so a larger power-of-2 bucket needs its own
+        bound kernel."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :] = x[tile_m, :] + 1
+            return out
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def row_softmax(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :] = torch.softmax(x[tile_m, :], dim=-1)
+            return out
+
+        for shape in ((64, 8), (64, 32), (100, 300), (64, 8)):
+            with self.subTest(shape=shape):
+                x = torch.randn(shape, device=DEVICE)
+                torch.testing.assert_close(add_one(x), x + 1)
+                torch.testing.assert_close(row_softmax(x), torch.softmax(x, dim=-1))
 
 
 @onlyBackends(["triton", "cute"])

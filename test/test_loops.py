@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import functools
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ import helion
 from helion import _compat
 from helion._compat import use_tileir_tunables
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
+from helion._compiler.static_loop_unroller import unroll_static_loops
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -30,6 +32,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -73,6 +76,59 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
         for tile_inner in hl.tile(x.size(1)):
             x[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
     return x
+
+
+@helion.kernel()
+def store_through_nested_if_alias(x: torch.Tensor) -> torch.Tensor:
+    # y is x itself whenever the branch runs: the loop reads and writes x.
+    y = torch.empty_like(x)
+    if x.size(0) > 1:
+        y = x.moveaxis(0, 0)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
+@helion.kernel()
+def store_through_conditional_expression_alias(x: torch.Tensor) -> torch.Tensor:
+    y = x.ravel().view(x.shape) if x.size(0) > 1 else torch.empty_like(x)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
+@helion.kernel()
+def store_through_broadcast_to_alias(x: torch.Tensor) -> torch.Tensor:
+    y = torch.broadcast_to(x, x.shape)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
+@helion.kernel()
+def store_to_nested_if_fresh_buffer(x: torch.Tensor) -> torch.Tensor:
+    # Both bindings are fresh allocations: the loop never writes x.
+    y = torch.empty_like(x)
+    if x.size(0) > 1:
+        y = torch.zeros_like(x)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return y
+
+
+@helion.kernel()
+def store_to_view_sized_by_argument(x: torch.Tensor) -> torch.Tensor:
+    # y views a fresh buffer; only its shape comes from x.
+    rows, cols = x.shape
+    y = torch.empty([rows * cols], device=x.device, dtype=x.dtype).view(rows, cols)
+    for tile_outer in hl.tile(rows):
+        for tile_inner in hl.tile(cols):
+            y[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return y
 
 
 @helion.kernel()
@@ -133,8 +189,89 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
         hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
+@helion.kernel(autotune_effort="none")
+def long_elif_chain(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        if op == 0:
+            out[tile] = x[tile] + 0
+        elif op == 1:
+            out[tile] = x[tile] + 1
+        elif op == 2:
+            out[tile] = x[tile] + 2
+        elif op == 3:
+            out[tile] = x[tile] + 3
+        elif op == 4:
+            out[tile] = x[tile] + 4
+        elif op == 5:
+            out[tile] = x[tile] + 5
+        elif op == 6:
+            out[tile] = x[tile] + 6
+        elif op == 7:
+            out[tile] = x[tile] + 7
+        elif op == 8:
+            out[tile] = x[tile] + 8
+        elif op == 9:
+            out[tile] = x[tile] + 9
+        elif op == 10:
+            out[tile] = x[tile] + 10
+        elif op == 11:
+            out[tile] = x[tile] + 11
+        elif op == 12:
+            out[tile] = x[tile] + 12
+        elif op == 13:
+            out[tile] = x[tile] + 13
+        elif op == 14:
+            out[tile] = x[tile] + 14
+        elif op == 15:
+            out[tile] = x[tile] + 15
+        elif op == 16:
+            out[tile] = x[tile] + 16
+        elif op == 17:
+            out[tile] = x[tile] + 17
+        elif op == 18:
+            out[tile] = x[tile] + 18
+        elif op == 19:
+            out[tile] = x[tile] + 19
+        elif op == 20:
+            out[tile] = x[tile] + 20
+        else:
+            out[tile] = x[tile]
+    return out
+
+
+def _thread_barrier() -> str:
+    """The block-wide barrier the backend emits between racing accesses."""
+    if _get_backend() == "cute":
+        return "cute.arch.sync_threads()"
+    return "tl.debug_barrier()"
+
+
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
+    @skipIfRefEager(
+        "a ref-eager load is a view of the input, so in-place ops mutate it"
+    )
+    def test_inplace_ops_on_loop_values(self) -> None:
+        """In-place ops on device-loop values (``acc.mul_(y)``) mutate SSA values
+        and lower as their functional twins on every backend."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                acc = x[tile]
+                acc.mul_(y[tile])
+                acc.add_(1.0)
+                acc.sub_(x[tile])
+                out[tile] = acc
+            return out
+
+        x = torch.randn([1024], device=DEVICE)
+        y = torch.randn([1024], device=DEVICE)
+        code, result = code_and_output(fn, (x, y), block_size=128)
+        torch.testing.assert_close(result, x * y + 1.0 - x)
+
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
     def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
         node = ast.parse("while i < 4:\n    i += 1\n    i += 1\n").body[0]
@@ -161,6 +298,47 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(len(unrolled), 4)
         self.assertTrue(all(isinstance(stmt, ast.AugAssign) for stmt in unrolled))
         self.assertEqual(env["j"], 2)
+
+    @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
+    def test_static_unroller_keeps_loop_with_break_in_if_rolled(self) -> None:
+        source = (
+            "for i in [1, 2]:\n"
+            "    if a:\n"
+            "        y = i\n"
+            "    elif b:\n"
+            "        break\n"
+            "for j in [3, 4]:\n"
+            "    z = j\n"
+        )
+        holder = SimpleNamespace(body=ast.parse(source).body)
+        unroll_static_loops(holder)
+        # The loop with the break stays a loop; the other one unrolls.
+        self.assertIsInstance(holder.body[0], ast.For)
+        self.assertEqual(len(holder.body), 5)
+
+    @skipIfRefEager("counts the static loop unroller's visits")
+    def test_long_elif_chain_unrolls_linearly(self) -> None:
+        # Static loop unrolling visits each branch of an if/elif chain a fixed
+        # number of times: doubling the chain doubles the visits, and a 21-way
+        # chain binds and runs.
+        def visits(length: int) -> int:
+            source = "for i in range(n):\n" + "".join(
+                f"    {'el' if k else ''}if op == {k}:\n        y = {k}\n"
+                for k in range(length)
+            )
+            holder = SimpleNamespace(body=ast.parse(source).body)
+            with patch.object(
+                StaticLoopUnroller,
+                "visit_If",
+                autospec=True,
+                side_effect=StaticLoopUnroller.visit_If,
+            ) as visit_if:
+                unroll_static_loops(holder)
+            return visit_if.call_count
+
+        self.assertEqual(visits(10), 2 * visits(5))
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(long_elif_chain(x, 20), x + 20)
 
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -341,8 +519,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "range loop hints are only exercised on Triton and CuTe",
+    )
     def test_fixed_block_unroll_and_pipeline(self):
         @helion.kernel(static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -636,10 +816,42 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(result, args[0] + 1)
 
+    @skipIfRefEager("checks the CuTe lowering's refusal")
+    @skipUnlessBackends(["cute"])
+    def test_full_slice_of_block_sized_buffer_reduction(self):
+        """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
+        slice's reduction dim reuses the block's symbol after its loop ended.
+        CuTe must refuse it rather than reduce it with that dim's synthetic
+        lane loop, which would repeat the tile loop's atomics once per lane."""
+
+        @helion.kernel(static_shapes=True)
+        def row_sums(y: torch.Tensor) -> torch.Tensor:
+            bt, v = y.shape
+            block_size_n = hl.register_block_size(v)
+            loss_sum = torch.zeros(
+                [64, block_size_n], dtype=torch.float32, device=y.device
+            )
+            rows = torch.zeros([64], dtype=torch.float32, device=y.device)
+            for tile_bt in hl.tile(bt, block_size=64):
+                loss_sum[:, :] = hl.zeros([64, block_size_n], dtype=torch.float32)
+                for tile_v in hl.tile(v, block_size=block_size_n):
+                    hl.atomic_add(loss_sum, [tile_bt, tile_v], y[tile_bt, tile_v])
+                rows[:] = loss_sum[:, :].sum(dim=-1)
+            return rows
+
+        y = torch.randn(64, 128, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, "reduction lane owner is not proven"
+        ):
+            code_and_output(row_sums, (y,), block_sizes=[128])
+
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
-        "register-block-size reduction kernel exceeds CuTe thread-layout limits",
+        "CuTe has no lowering for reducing the full slice loss_sum[:, :] of a "
+        "buffer sized by a block: its reduction dim reuses tile_v's block, "
+        "whose loop has ended (BackendUnsupported: reduction lane owner is "
+        "not proven)",
     )
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
@@ -974,7 +1186,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
 
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_unroll_factors(self):
         # Test configuration validation - that range_unroll_factors works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -998,7 +1213,10 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_warp_specialize(self):
         # Test configuration validation - that range_warp_specialize works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1042,7 +1260,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("warp_specialize=False", code_false)
 
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_num_stages(self):
         # Test configuration validation - that range_num_stages works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1096,13 +1317,51 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn([16], device=DEVICE)
         out = torch.empty_like(x)
         spec = store_with_output_read.bind((x, out)).config_spec
-        self.assertEqual(len(spec.range_num_stages), 0)
+        self.assertTrue(all(item.pinned for item in spec.range_num_stages))
 
     @skipIfRefEager("not supported in ref eager mode")
-    def test_range_num_stages_removed_for_inplace_kernel(self):
+    def test_range_num_stages_pinned_for_inplace_kernel(self):
+        # triton#8259: every loop of the in-place nest keeps its slot (the
+        # config shape does not depend on the alias analysis) pinned to 0.
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = inplace_nested_loop_kernel.bind(args).config_spec
-        self.assertEqual(len(spec.range_num_stages), 0)
+        self.assertTrue(all(item.pinned for item in spec.range_num_stages))
+        slots = len(spec.range_num_stages)
+        normalized = spec.normalized_config(
+            helion.Config(block_sizes=[16, 16], range_num_stages=[3] * slots)
+        )
+        self.assertEqual(normalized.range_num_stages, [0] * slots)
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_pinned_for_host_aliases(self):
+        # triton#8259: a store through a host alias of x in a loop that reads
+        # x, whether the alias is bound in a nested ``if``, a conditional
+        # expression or by an op the analysis does not list.
+        args = (torch.randn([16, 16], device=DEVICE),)
+        for kernel in (
+            store_through_nested_if_alias,
+            store_through_conditional_expression_alias,
+            store_through_broadcast_to_alias,
+        ):
+            with self.subTest(kernel=kernel.name):
+                spec = kernel.bind(args).config_spec
+                self.assertTrue(all(item.pinned for item in spec.range_num_stages))
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_preserved_for_fresh_host_buffers(self):
+        # A nested-if rebinding to another fresh buffer, and a view of a fresh
+        # buffer whose shape arguments come from x (scalars share no storage).
+        args = (torch.randn([16, 16], device=DEVICE),)
+        for kernel in (
+            store_to_nested_if_fresh_buffer,
+            store_to_view_sized_by_argument,
+        ):
+            with self.subTest(kernel=kernel.name):
+                spec = kernel.bind(args).config_spec
+                self.assertGreater(len(spec.range_num_stages), 0)
+                self.assertFalse(any(item.pinned for item in spec.range_num_stages))
 
     @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
@@ -1114,7 +1373,12 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.randn([16, 16], device=DEVICE),
         )
         spec = inplace_then_independent_reduction.bind(args).config_spec
-        self.assertGreater(len(spec.range_num_stages), 0)
+        pinned = {
+            block_id: item.pinned
+            for item in spec.range_num_stages
+            for block_id in item.block_ids
+        }
+        self.assertEqual(pinned, {0: True, 1: False, 2: False, 3: False})
 
     @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
@@ -1126,12 +1390,41 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.randn([16, 16], device=DEVICE),
         )
         spec = atomic_then_independent_reduction.bind(args).config_spec
-        valid_block_ids = spec.range_num_stages.valid_block_ids()
-        self.assertNotIn(1, valid_block_ids)
-        self.assertIn(4, valid_block_ids)
+        stages = spec.range_num_stages
+        self.assertTrue(stages.block_id_lookup(1).pinned)
+        self.assertFalse(stages.block_id_lookup(4).pinned)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_config_saved_without_pinned_slots_still_loads(self):
+        # Before pinning, the triton#8259 workaround removed the atomic nest's
+        # slots: such a config lists only the free loops' values, and they
+        # must land on those loops rather than shift onto the pinned ones.
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = atomic_then_independent_reduction.bind(args).config_spec
+        pinned = [item.pinned for item in spec.range_num_stages]
+        self.assertEqual(pinned, [True, True, False, False])
+        for saved in ([1, 3], [2, 2, 1, 3]):
+            with self.subTest(saved=saved):
+                normalized = spec.normalized_config(
+                    helion.Config(
+                        block_sizes=[16, 16, 16, 16, 16],
+                        pid_type="persistent_blocked",
+                        range_num_stages=saved,
+                    )
+                )
+                self.assertEqual(normalized.range_num_stages, [0, 0, 1, 3])
 
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1172,7 +1465,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=True", code_false)
 
     @skipIfTileIR("tileir backend will ignore `range_flattens` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts the tl.range hint kwargs; CuTe accepts the key but emits "
+        "identical code"
+    )
     def test_range_flatten(self):
         # Test configuration validation - that range_flatten works
         args = (torch.randn([64, 32], device=DEVICE),)
@@ -1223,7 +1519,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("shape = (32, 16)", code)
 
     @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
-    @skipIfNotTriton("static_range is Triton-specific")
+    @skipIfNotTriton(
+        "asserts tl.static_range; CuTe accepts static_ranges but emits the same loop"
+    )
     def test_static_range_2d(self):
         @helion.kernel()
         def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:
@@ -1279,7 +1577,9 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.static_range", code_true)
 
     @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
-    @skipIfNotTriton("static_range is Triton-specific")
+    @skipIfNotTriton(
+        "asserts tl.static_range; CuTe accepts static_ranges but emits the same loop"
+    )
     def test_static_range_scalar(self):
         @helion.kernel()
         def nested_loop_kernel_scalar(x: torch.Tensor) -> torch.Tensor:
@@ -1329,15 +1629,17 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.range", code_false)
         self.assertIn("tl.static_range", code_true)
 
-    @unittest.skip("TODO(joydddd): handle constexpr type casting.")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "static_ranges is only exercised on Triton and CuTe",
+    )
     def test_static_range_casting(self):
         @helion.kernel()
         def nested_loop_kernel_w_casting(x: torch.Tensor) -> torch.Tensor:
             world_size = 4
-            # Outer loop becomes grid (no tl.range)
             for tile_outer in hl.tile(x.size(0)):
-                # Inner loop becomes device loop with tl.range / tl.static_range
-                # Specialize on x.size(1) to allow range_staitic
+                # A static range makes ``rank`` a compile-time int, which the
+                # float add must cast.
                 for rank in range(world_size):
                     x[tile_outer] = x[tile_outer] + rank
             return x
@@ -1352,10 +1654,15 @@ class TestLoops(RefEagerTestBase, TestCase):
             static_ranges=[True],
         )
 
-        torch.testing.assert_close(result, x + 5)
-        self.assertIn("tl.static_range", code)
+        torch.testing.assert_close(result, x + 6)
+        if _get_backend() == "triton":
+            # CuTe accepts static_ranges but emits the same loop either way.
+            self.assertIn("tl.static_range", code)
 
-    @skipIfNotTriton("L2 grouping is Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the L2-grouped program id mapping Triton and CuTe share",
+    )
     def test_l2_grouping_3d(self):
         """Test L2 grouping with 3D tensors - grouping should apply to innermost 2 dimensions."""
 
@@ -1384,7 +1691,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("group_id", code)
         self.assertIn("inner_2d_pid", code)
 
-    @skipIfNotTriton("L2 grouping is Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the L2-grouped program id mapping Triton and CuTe share",
+    )
     def test_l2_grouping_4d(self):
         """Test L2 grouping with 4D tensors - grouping should apply to innermost 2 dimensions."""
 
@@ -1418,7 +1728,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("pid_1 = inner_2d_pid % num_pid_in_group // group_size_m", code)
         # L2 grouping should be working correctly now
 
-    @skipIfNotTriton("L2 grouping is Triton-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the L2-grouped program id mapping Triton and CuTe share",
+    )
     def test_l2_grouping_with_loop_order(self):
         """Test L2 grouping with loop order permutation - should apply to fastest varying dims."""
 
@@ -1583,7 +1896,10 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
-    @skipIfNotTriton("range loop hints are Triton-specific")
+    @skipIfNotTriton(
+        "asserts how Triton's num_stages and tl.range unroll/pipeline hints "
+        "interact; CuTe accepts the keys but emits no such hints"
+    )
     @skipIfXPU("Accuracy issue on XPU backend")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
@@ -1680,9 +1996,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(fn(x), x)
 
     @skipIfRefEager("inspects generated code; ref eager never lowers a kernel")
-    @skipIfNotTriton(
-        "asserts on Triton's rendered bound; Pallas lowers a dependent tile "
-        "bound through its own loop codegen and never reaches this path"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts on the rendered bound; Pallas lowers a dependent tile "
+        "bound through its own loop codegen and never reaches this path",
     )
     def test_min_max_over_derived_tile_edge_keeps_its_own_formula(self):
         """A tile edge folded into ``min``/``max`` must keep its own formula.
@@ -1743,11 +2060,23 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Each edge renders its own formula; the offset alone would mean begin.
         # The id case also pins the parenthesization: unbracketed, ``2 *
         # offset_0 // BLOCK`` would floor-divide the product instead.
+        if _get_backend() == "cute":
+            end, count, tile_id = (
+                "tile_offset_0 + _BLOCK_SIZE_0",
+                "(200 - begin_0 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0",
+                "2 * (tile_offset_0 // _BLOCK_SIZE_0)",
+            )
+        else:
+            end, count, tile_id = (
+                "offset_0 + _BLOCK_SIZE_0",
+                "tl.cdiv(",
+                "2 * (offset_0 // _BLOCK_SIZE_0)",
+            )
         for label, kernel, fragment in (
-            ("end/min", end_min, "offset_0 + _BLOCK_SIZE_0"),
-            ("end/max", end_max, "offset_0 + _BLOCK_SIZE_0"),
-            ("count", count_min, "tl.cdiv("),
-            ("id", id_min, "2 * (offset_0 // _BLOCK_SIZE_0)"),
+            ("end/min", end_min, end),
+            ("end/max", end_max, end),
+            ("count", count_min, count),
+            ("id", id_min, tile_id),
         ):
             with self.subTest(edge=label):
                 # Codegen the declared config, not the spec default: the
@@ -1757,8 +2086,9 @@ class TestLoops(RefEagerTestBase, TestCase):
                 self.assertTrue(rendered, f"no rendered bound in:\n{code}")
                 self.assertIn(fragment, rendered[0])
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
     )
     @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
@@ -1803,10 +2133,13 @@ class TestLoops(RefEagerTestBase, TestCase):
                 num_stages=2,
             )
             torch.testing.assert_close(result, expected, atol=0.15, rtol=0.01)
-            self.assertIn("tl.debug_barrier()", code)
+            self.assertIn(_thread_barrier(), code)
 
     @skipIfRefEager("reduction rolling is a codegen-time transformation")
-    @skipIfNotTriton("rolled reduction loops are Triton codegen-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "asserts the rolled loop in Triton/CuTe codegen",
+    )
     def test_reduction_loop_rolling_emits_inner_for_loop(self):
         """With ``reduction_loop`` set, the per-tile reduction is rolled into
         an explicit inner Triton for-loop over chunks of the reduction dim.
@@ -1834,18 +2167,24 @@ class TestLoops(RefEagerTestBase, TestCase):
             reduction_loop=32,
         )
         # Rolled reductions emit an inner ``for r0_<n> in tl.range(...)`` loop
-        # walking chunks of the reduction dim; the un-rolled path computes the
-        # whole reduction with a single ``tl.sum`` and has no such for-loop.
+        # (CuTe: ``for roffset_<n> in range(...)``) walking chunks of the
+        # reduction dim; the un-rolled path computes the whole reduction with a
+        # single ``tl.sum`` and has no such for-loop.
+        rolled_loop = (
+            r"for\s+roffset_\d+\s+in\s+range\("
+            if _get_backend() == "cute"
+            else r"for\s+\w+\s+in\s+tl\.range\("
+        )
         self.assertRegex(
             code,
-            r"for\s+\w+\s+in\s+tl\.range\(",
-            msg="expected an inner reduction for-loop in the generated Triton code",
+            rolled_loop,
+            msg="expected an inner reduction for-loop in the generated code",
         )
         torch.testing.assert_close(result, x.sum(-1), rtol=1e-4, atol=1e-4)
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is Triton codegen-specific; "
-        "the negative assertion is trivially true on non-Triton backends"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier, so the negative assertion is trivial",
     )
     @skipIfSharedMemoryLessThan(
         65536, reason="block sizes exceed device shared memory limit"
@@ -1874,10 +2213,11 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, x + 1)
-        self.assertNotIn("tl.debug_barrier()", code)
+        self.assertNotIn(_thread_barrier(), code)
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
     )
     def test_intra_loop_store_then_load_barrier(self):
         """A store to a tensor followed by a load of the same tensor *within one
@@ -1913,12 +2253,12 @@ class TestLoops(RefEagerTestBase, TestCase):
                 num_warps=num_warps,
                 num_stages=2,
             )
-            self.assertIn("tl.debug_barrier()", code)
+            self.assertIn(_thread_barrier(), code)
             torch.testing.assert_close(result, expected)
 
-    @skipIfNotTriton(
-        "tl.debug_barrier() is Triton codegen-specific; "
-        "the negative assertion is trivially true on non-Triton backends"
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier, so the negative assertion is trivial",
     )
     def test_intra_loop_load_before_store_no_barrier(self):
         """A load that precedes the store (read-modify-write) is not a hazard and
@@ -1941,9 +2281,12 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, x + 1.0)
-        self.assertNotIn("tl.debug_barrier()", code)
+        self.assertNotIn(_thread_barrier(), code)
 
-    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "Pallas/JAX emits no thread barrier",
+    )
     def test_intra_loop_barrier_tracks_storage_aliases(self):
         @helion.kernel(autotune_effort="none")
         def store_then_load_view(x: torch.Tensor) -> torch.Tensor:
@@ -1968,10 +2311,14 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=2,
         )
-        self.assertIn("tl.debug_barrier()", code)
+        self.assertIn(_thread_barrier(), code)
         torch.testing.assert_close(result, expected)
 
-    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "cute"),
+        "intra-loop barriers are Triton and CuTe codegen (Pallas/JAX emits no "
+        "thread barrier)",
+    )
     def test_intra_loop_barrier_crosses_if_subgraph(self):
         @helion.kernel(autotune_effort="none")
         def store_then_load_in_branch(
@@ -1999,7 +2346,21 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=2,
         )
-        self.assertIn("tl.debug_barrier()", code)
+        if _get_backend() == "cute":
+            # ``flag`` and ``x`` are separate storages in this launch (the
+            # bound kernel's cache-keyed disjointness fact), so nothing writes
+            # the flag and the branch is CTA-uniform: its store/reload pair
+            # is ordered by a block-wide barrier inside it.
+            self.assertTrue(
+                any(
+                    "cute.arch.sync_threads()" in ast.unparse(node.body)
+                    for node in ast.walk(ast.parse(code))
+                    if isinstance(node, ast.If)
+                ),
+                code,
+            )
+        else:
+            self.assertIn("tl.debug_barrier()", code)
         torch.testing.assert_close(result, expected)
 
 

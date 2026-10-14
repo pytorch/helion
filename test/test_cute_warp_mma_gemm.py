@@ -597,8 +597,11 @@ def test_machine_filling_renders_carry_no_family_key() -> None:
 def test_root_statements_outside_the_gemm_fail_closed(kernel_fn: object) -> None:
     # The family replaces the whole device body.  A second store in the root
     # tile loop (before or after the K loop) is not part of the matched GEMM:
-    # it must refuse the family instead of silently dropping that store; the
-    # default (tcgen05) config of the same kernel keeps both stores.
+    # it must refuse the family instead of silently dropping that store.  The
+    # default (tcgen05) config of the same kernel runs the rest of the tile
+    # body once per thread beside its matmul, where the per-element store has
+    # no lane coordinates either: it refuses too rather than emitting a kernel
+    # that reads undefined lane indices.
     bound = _bind(
         kernel_fn,
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
@@ -611,9 +614,8 @@ def test_root_statements_outside_the_gemm_fail_closed(kernel_fn: object) -> None
         _source(bound, _warp_config([16, 8, 128], 1))
     with bound.env:
         default = bound.config_spec.default_config()
-    kernel = _kernel_body(bound.to_code(default))
-    assert "def _helion_" in kernel and "other" in kernel and "flag" in kernel
-    assert "_helion_warp_mma" not in kernel
+    with pytest.raises(BackendUnsupported, match="beside a collective matmul"):
+        bound.to_code(default)
 
 
 def test_admission_mirrors_the_detector_gates() -> None:

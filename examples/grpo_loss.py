@@ -134,7 +134,9 @@ def torch_grpo_loss(
 # ------------------------
 
 
+# fast_math: approximate exp, log and division.
 @helion.kernel(
+    fast_math=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def grpo_loss_forward(
@@ -226,7 +228,9 @@ def grpo_loss_forward(
     return loss, kl_loss, is_clipped, lse
 
 
+# fast_math: approximate exp, log and division.
 @helion.kernel(
+    fast_math=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def grpo_loss_backward(

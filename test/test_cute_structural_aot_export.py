@@ -438,16 +438,24 @@ def test_export_guards_tensor_identity_and_accepts_fresh_pointers(
             wrapper(*changed, _launcher=hold)
         hold.assert_not_called()
     if not static:
-        # Same registered storage/alignment class remains truly dynamic.
-        for count in (1, 53, 101):
+        # FP32 extents keep the same remainder in the 32-byte alignment class.
+        for count in (5, 53, 101):
             fresh = tuple(torch.empty(count) for _ in range(3))
             result, calls = _call(wrapper, fresh)
             assert result.shape == (count,)
             assert len(calls) == 1
+        singleton = tuple(torch.empty(1) for _ in range(3))
+        with pytest.raises(ValueError, match="No standalone variant"):
+            wrapper(*singleton, _launcher=hold)
+        hold.assert_not_called()
         # Other scalar/tail/stride classes need the same rebind as BoundKernel.
         # Exporting those observations accumulates their generated variants.
         extra = [
-            tuple(torch.empty(count * 3)[::3] for _ in range(3)) for count in (0, 2, 91)
+            singleton,
+            *(
+                tuple(torch.empty(count * 3)[::3] for _ in range(3))
+                for count in (0, 2, 91)
+            ),
         ]
         for fresh in extra:
             current = kernel._bind_isolated(fresh)

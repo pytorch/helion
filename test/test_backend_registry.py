@@ -11,6 +11,7 @@ from helion import exc
 from helion._compiler import backend_registry
 from helion._compiler.aten_lowering import AtenLowering
 from helion._compiler.backend import Backend
+from helion._compiler.backend import BackendState
 from helion._compiler.backend_registry import _REGISTRY
 from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
@@ -90,8 +91,8 @@ class TestBackendRegistry(unittest.TestCase):
         try:
             self.assertIn("_test_custom", list_backends())
             self.assertIs(get_backend_class("_test_custom"), _TestBackend)
-            # custom backends default to experimental=True
-            self.assertTrue(_TestBackend().experimental)
+            # custom backends default to experimental
+            self.assertIs(_TestBackend().state, BackendState.EXPERIMENTAL)
         finally:
             _REGISTRY.pop("_test_custom", None)
 

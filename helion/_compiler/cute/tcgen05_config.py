@@ -143,6 +143,7 @@ from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
 from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
@@ -161,8 +162,9 @@ from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
-from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
@@ -209,6 +211,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from .tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
@@ -272,6 +275,7 @@ class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
 class Tcgen05GroupedWorklistSmemFacts(NamedTuple):
     group_count: int
     device_split_sizes: bool
+    output_dtype_bytes: int = 2
 
 
 TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH = (
@@ -437,6 +441,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_AUX_STAGES_CONFIG_KEY,
         TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
         TCGEN05_CONSUMER_REGS_CONFIG_KEY,
+        TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
@@ -448,6 +453,8 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY,
         TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+        TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY,
+        TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
@@ -3013,7 +3020,9 @@ class CuteTcgen05Config:
         )
         if source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE:
             config["tcgen05_cluster_m"] = 1
-        elif source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+        elif (
+            source_m_tile not in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+        ):
             # The established compact source-32 profile also supports CtaGroup.ONE. The
             # reviewed source-224/256 profiles are CtaGroup.TWO even when a
             # pattern neighbor independently mutates the cluster fragment.
@@ -3400,6 +3409,76 @@ class CuteTcgen05Config:
                 "(leading passthrough) tcgen05 GEMM"
             )
 
+    @classmethod
+    def _grouped_grid_multiplier_supported(cls, config: dict[str, object]) -> bool:
+        """Admit a second independent persistent worker per physical SM.
+
+        Each worker strides by the actual grid size and owns its flattened
+        tensor-map workspace row. The launch multiplier describes the grid;
+        CUDA still schedules workers within the compiled resource limits.
+        Cluster cooperation and fixed execution signatures retain their
+        existing one-worker contract.
+        """
+        multiplier = config.get("num_sm_multiplier", 1)
+        if type(multiplier) is int and multiplier == 1:
+            return True
+        return (
+            type(multiplier) is int
+            and multiplier == 2
+            and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and not cls._is_grouped_clc_config(config)
+            and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is False
+            and config.get(TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY) is None
+            and config.get(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, 0) == 0
+        )
+
+    @classmethod
+    def _grouped_static_registers_supported(cls, config: dict[str, object]) -> bool:
+        return (
+            cls._grouped_grid_multiplier_supported({**config, "num_sm_multiplier": 2})
+            and config.get(TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY) in (None, 128)
+            and config.get(
+                TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
+                TCGEN05_GROUPED_FULL_COVERAGE_OFF,
+            )
+            == TCGEN05_GROUPED_FULL_COVERAGE_OFF
+            and physical_schedule(config) is None
+        )
+
+    def _normalize_warp_register_reallocation(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
+        if key not in config:
+            return
+        value = config[key]
+        if value is True:
+            config.pop(key)
+            return
+        if (
+            value is not False
+            or not self.search_enabled
+            or not self._grouped_static_registers_supported(config)
+        ):
+            if fix_invalid:
+                config.pop(key)
+                return
+            raise InvalidConfig(
+                f"{key}=False requires an independent single-CTA N,M worklist "
+                "with the default physical M128 register profile"
+            )
+        if TCGEN05_CONSUMER_REGS_CONFIG_KEY in config:
+            if fix_invalid:
+                config.pop(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_CONSUMER_REGS_CONFIG_KEY} requires warp register "
+                    "reallocation"
+                )
+
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3414,16 +3493,40 @@ class CuteTcgen05Config:
         )
         self._normalize_grouped_full_coverage(config, fix_invalid=fix_invalid)
         self._normalize_epilogue_fanout(config, fix_invalid=fix_invalid)
+        self._normalize_warp_register_reallocation(config, fix_invalid=fix_invalid)
+        full_a_key = TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
+        if full_a_key in config:
+            if config[full_a_key] is False:
+                config.pop(full_a_key)
+            elif config[full_a_key] is not True or not (
+                self.search_enabled
+                and self._grouped_grid_multiplier_supported(
+                    {**config, "num_sm_multiplier": 2}
+                )
+                and config.get(
+                    TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
+                    TCGEN05_GROUPED_FULL_COVERAGE_OFF,
+                )
+                == TCGEN05_GROUPED_FULL_COVERAGE_OFF
+                and physical_schedule(config) is None
+            ):
+                if fix_invalid:
+                    config.pop(full_a_key)
+                else:
+                    raise InvalidConfig(
+                        f"{full_a_key}=True requires an independent single-CTA "
+                        "device N,M worklist"
+                    )
         grouped_mode = config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
-        if (
-            grouped_mode in TCGEN05_GROUPED_MODES
-            and config.get("num_sm_multiplier", 1) != 1
+        if grouped_mode in TCGEN05_GROUPED_MODES and not (
+            self._grouped_grid_multiplier_supported(config)
         ):
             if fix_invalid:
                 config.pop("num_sm_multiplier", None)
             else:
                 raise InvalidConfig(
-                    "tcgen05 grouped kernels require num_sm_multiplier=1"
+                    "tcgen05 grouped grid multipliers require an independent "
+                    "single-CTA N,M worklist without a static execution signature"
                 )
         grouped_clc = self._is_grouped_clc_config(config)
         if grouped_clc and not self._is_grouped_runtime_direct_clc_config(config):
@@ -3471,6 +3574,21 @@ class CuteTcgen05Config:
                     f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} and one of "
                     f"{TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES}, got "
                     f"{source_m_tile!r}"
+                )
+        mma_m = config.get(TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY)
+        if mma_m is not None and (
+            type(mma_m) is not int
+            or mma_m not in (64, 128, 256)
+            or grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ):
+            if fix_invalid:
+                config.pop(TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY} requires "
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} and a physical M "
+                    "dimension in (64, 128, 256)"
                 )
         signature_key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
         runtime_direct_key = TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
@@ -3589,13 +3707,19 @@ class CuteTcgen05Config:
         )
 
     def register_grouped_worklist_smem_facts(
-        self, *, group_count: int, device_split_sizes: bool
+        self,
+        *,
+        group_count: int,
+        device_split_sizes: bool,
+        output_dtype_bytes: int = 2,
     ) -> None:
         if group_count <= 0:
             raise ValueError(
                 "grouped worklist SMEM facts require a positive group count"
             )
-        facts = Tcgen05GroupedWorklistSmemFacts(group_count, device_split_sizes)
+        facts = Tcgen05GroupedWorklistSmemFacts(
+            group_count, device_split_sizes, output_dtype_bytes
+        )
         if self.grouped_worklist_smem_facts not in (None, facts):
             raise RuntimeError(
                 "conflicting grouped worklist SMEM facts were registered for one "
@@ -4071,6 +4195,7 @@ class CuteTcgen05Config:
             bn=physical_bn,
             bk=cast("int", block_k),
             dtype_bytes=constraints.dtype_bytes,
+            output_dtype_bytes=smem_facts.output_dtype_bytes,
             ab_stages=ab_stages,
             acc_stages=2,
             c_stages=2,
@@ -5594,6 +5719,9 @@ class CuteTcgen05Config:
                 TCGEN05_GROUPED_MODES
             )
             fragments[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = BooleanFragment()
+            fragments[TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY] = EnumFragment(
+                TCGEN05_GROUPED_WORKLIST_MMA_M_CHOICES
+            )
             fragments[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
                 (
                     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
@@ -6747,6 +6875,13 @@ class CuteTcgen05Config:
             fields[TCGEN05_GROUPED_MODE_CONFIG_KEY] = _enum_fragment_with_seed_values(
                 (None,), modes, search_choices=(None,)
             )
+        if TCGEN05_GROUPED_MODE_WORKLIST_NM in modes:
+            fields[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = EnumFragment(
+                (True, False)
+            )
+            fields[TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY] = EnumFragment(
+                (False, True)
+            )
         runtime_direct = _compiler_seed_values(
             seeds,
             TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
@@ -6771,6 +6906,18 @@ class CuteTcgen05Config:
             fields[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (
                 _enum_fragment_with_seed_values(
                     (None,), source_m_tiles, search_choices=(None,)
+                )
+            )
+        mma_m_values = _compiler_seed_values(
+            seeds,
+            TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY,
+            int,
+            lambda value: value in (64, 128, 256),
+        )
+        if mma_m_values:
+            fields[TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY] = (
+                _enum_fragment_with_seed_values(
+                    (None,), mma_m_values, search_choices=(None,)
                 )
             )
         fields.update(self.strategy_autotune_fragments())

@@ -308,7 +308,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         code = _get_examples_matmul().bind(args).to_triton_code(config)
         self.assertIn("make_tensor_descriptor", code)
 
-    @skipIfNotTriton("indexing='pointer' is triton-only")
     def test_matmul_static_shapes0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),

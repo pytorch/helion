@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import threading
@@ -375,6 +376,14 @@ class TestLLMGuidedSearch(TestCase):
         )
         bound = _get_examples_matmul().bind(args)
         default_config = bound.config_spec.autotune_reference_config()
+        # test/conftest.py keeps the suite on the single-pass verification;
+        # this mocked run asserts the full-effort final selection, which the
+        # search resolves from the environment when it is constructed.
+        rounds_env = patch.dict(
+            os.environ, {"HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS": "4"}
+        )
+        rounds_env.start()
+        self.addCleanup(rounds_env.stop)
         search = LLMGuidedSearch(
             bound,
             args,
@@ -519,6 +528,44 @@ class TestLLMGuidedSearch(TestCase):
             for member in members:
                 member.perfs.append(rebench_perf_by_key[repr(member.config)])
 
+        class FakeFinalSelectionMeasurer:
+            """Stands in for the steady-window timer of the full-effort final
+            selection, which replaces the legacy final verification pass."""
+
+            def __init__(self) -> None:
+                self.finalists = []
+                self.windows: list[tuple[str, int, int]] = []
+
+            def __call__(self, finalists, policy):
+                self.finalists = list(finalists)
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info) -> None:
+                pass
+
+            def warm(self, index: int, duration_ms: int) -> None:
+                self.windows.append(("warm", index, duration_ms))
+
+            def measure(self, index: int, warmup_ms: int, rep_ms: int) -> float:
+                self.windows.append(("measure", index, rep_ms))
+                return rebench_perf_by_key[repr(self.finalists[index].config)]
+
+        final_selection = FakeFinalSelectionMeasurer()
+
+        class ListHandler(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.messages: list[str] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.messages.append(record.getMessage())
+
+        log_lines = ListHandler()
+        search.log.add_handler(log_lines)
+
         with (
             # The suite caps the final verification at two finalists
             # (test/conftest.py); this mocked run asserts the code default.
@@ -557,6 +604,7 @@ class TestLLMGuidedSearch(TestCase):
                 autospec=True,
                 side_effect=fake_rebenchmark,
             ),
+            patch.object(search, "_final_selection_measurer", new=final_selection),
         ):
             best = search.autotune(skip_cache=True)
 
@@ -576,14 +624,28 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(benchmark_batches[0][1], [sparse_config(default_config)])
         self.assertEqual(benchmark_batches[1][1], [round0_sparse])
         self.assertEqual(benchmark_batches[2][1], [round1_sparse])
+        # At full effort the harness-grade final selection replaces the legacy
+        # "Final verification" rebenchmark pass: the three shortlisted configs
+        # run the steady-window rounds and the median picks the result.
         self.assertEqual(
             rebenchmark_descs,
-            [
-                "Round 0: verifying top configs",
-                "Round 1: verifying top configs",
-                "Final verification top 3 configs",
-            ],
+            ["Round 0: verifying top configs", "Round 1: verifying top configs"],
         )
+        self.assertEqual(len(final_selection.finalists), 3)
+        rounds = [w for w in final_selection.windows if w[0] == "measure"]
+        self.assertEqual(len(rounds), 3 * 4)
+        self.assertTrue(
+            any(
+                line.startswith(
+                    "Final selection: 3 shortlisted, 3 finalists x 4 rounds"
+                )
+                for line in log_lines.messages
+            ),
+            log_lines.messages,
+        )
+        final_metrics = search._autotune_metrics.final_selection
+        assert final_metrics is not None
+        self.assertEqual(final_metrics["finalists"], 3)
         self.assertEqual(search._autotune_metrics.num_configs_tested, 3)
         self.assertEqual(len(search._all_benchmark_results), 3)
         self.assertEqual(len(search.population), 3)
@@ -1484,7 +1546,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(),
+            config_spec=SimpleNamespace(
+                backend=SimpleNamespace(supports_precompile=lambda: True)
+            ),
         )
         with patch.dict(
             os.environ,
@@ -1616,7 +1680,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(compiler_seed_timeout_retry_repetitions=None),
+            config_spec=SimpleNamespace(
+                compiler_seed_timeout_retry_repetitions=None,
+                backend=SimpleNamespace(supports_precompile=lambda: True),
+            ),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)
@@ -1841,7 +1908,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(compiler_seed_timeout_retry_repetitions=None),
+            config_spec=SimpleNamespace(
+                compiler_seed_timeout_retry_repetitions=None,
+                backend=SimpleNamespace(supports_precompile=lambda: True),
+            ),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)
