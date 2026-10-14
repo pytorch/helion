@@ -33,6 +33,7 @@ from typing import cast
 from typing_extensions import Self
 from uuid import uuid4
 
+from torch._inductor.runtime.triton_compat import IntelGPUError
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 from torch.cuda import OutOfMemoryError as CudaOOMError
@@ -977,7 +978,10 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
     # Different PTXASError classes may be raised from different modules; match by name as well
     if isinstance(err, PTXASError) or err.__class__.__name__ == "PTXASError":
         return "warn"
-
+    # IntelGPUError covers JIT and AOT build failures
+    if isinstance(err, IntelGPUError) or err.__class__.__name__ == "IntelGPUError":
+        return "warn"
+    
     msg = str(err)
     if "PassManager::run failed" in msg:
         return "warn"
