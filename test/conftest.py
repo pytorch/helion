@@ -92,6 +92,11 @@ def pytest_configure() -> None:
     # the pass covered while it stays cheap on runners that share one GPU
     # between xdist workers. Tests of the default clear this key first.
     os.environ.setdefault("HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K", "2")
+    # At full effort the harness-grade final selection (5 s thermal warmup
+    # plus four 0.6 s steady windows per finalist) replaces that pass and
+    # ignores the two knobs above. Keep the suite on the single-pass
+    # verification they size; tests of the selection enable it themselves.
+    os.environ.setdefault("HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS", "0")
 
     # The device-us re-rank needs the TPU profiler plane; under interpret
     # (CPU) it burns ~100 traced calls per candidate just to return inf.

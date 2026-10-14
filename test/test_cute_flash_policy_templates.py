@@ -61,6 +61,9 @@ def _target_seeds(
         target_device_capability=target_device_capability,
         supports_tensor_4d_tma=True,
         block_size_targets=(1, 128, 128),
+        # The tables are written against polynomial packets, which only the
+        # fast_math surface seeds as written.
+        fast_math=True,
     )
 
 
@@ -187,6 +190,8 @@ def test_pinned_family_receives_only_its_legal_template_coordinates() -> None:
         "is_causal": True,
         "standard_causal_output": True,
         "target_device_capability": (10, 3),
+        # The degree-2 packet is offered under fast_math only.
+        "fast_math": True,
     }
     for num_kv in (4, 4096):
         ws = cute_flash.flash_autotune_fragments(

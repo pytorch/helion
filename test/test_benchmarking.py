@@ -3751,7 +3751,7 @@ def _full_autotune_config_spec():
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
-    spec = ConfigSpec(backend=CuteBackend())
+    spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
     spec.enable_cute_flash_search(
@@ -3762,6 +3762,9 @@ def _full_autotune_config_spec():
         dtype=torch.float16,
         block_size_targets={0: 1, 1: 128, 2: 128},
         standard_dense_output=True,
+        # The compound-transfer fixtures project onto the degree-2 packet,
+        # which the surface offers under fast_math only.
+        fast_math=True,
     )
     seeds = spec.autotune_seed_configs()
     assert seeds
@@ -4367,10 +4370,30 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
 
     assert policy["kind"] == "canonical_cute_flash"
     # Dense populations retain the explicit standard/resident choices; every
-    # surface also seeds upstream's distinct flat ws_overlap grid.
-    assert policy["raw_config_count"] == (10 if causal else 31)
-    assert len(policy["effective_config_ids"]) == (10 if causal else 30)
-    assert len(generation_zero_ids) == 100
+    # surface also seeds upstream's distinct flat ws_overlap grid, the dense
+    # hd64 surface the two measured wide fa4_local_tma packets and the causal
+    # hd64 surface the three measured causal bodies (the paired 16-column
+    # score-load body at s2048 and s8192 and the hybrid s4096 body) and the
+    # staggered descending split walk at ring 4 (``cute_flash_causal_stagger``,
+    # one seed from the fragment defaults; the target seed's parent dedupes).
+    # The examples run without the fast_math setting, so no seed carries a
+    # polynomial exp2 packet: each such seed keeps its structure on the exact
+    # default packet instead (the same raw and effective counts).
+    assert policy["raw_config_count"] == (14 if causal else 33)
+    assert len(policy["effective_config_ids"]) == (14 if causal else 32)
+    # Generation zero retains every seed and every structural coverage row;
+    # their union may exceed the nominal 100 rows (the dense hd64 surface's
+    # resident lowerings widen the design and it seeds the two fa4_local_tma
+    # packets on top, 101 rows).
+    from helion.autotuner.search_space_logger import canonical_config_id
+
+    coverage_ids = {
+        canonical_config_id(config)
+        for config in generation.flash_deterministic_population_configs()
+    }
+    assert len(generation_zero_ids) == max(
+        100, len(coverage_ids | set(policy["effective_config_ids"]))
+    )
     assert set(policy["effective_config_ids"]) <= set(generation_zero_ids)
 
 
@@ -4378,16 +4401,26 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     ("kernel_name", "shape", "expected_raw_count", "expected_effective_count"),
     (
         # Include legal stateful schedules/mappings and upstream's flat grid,
-        # D128 batched exp2 packets and alternating-warpgroup family.
+        # D128 batched exp2 packets and alternating-warpgroup family; the
+        # dense hd64 surface also seeds the two wide fa4_local_tma packets and
+        # the causal hd64 surface the three measured causal bodies.
         ("attention_output", (2, 32, 262144, 128), 18, 18),
-        ("causal_attention_output", (2, 32, 524288, 128), 7, 7),
-        ("attention_output", (1, 32, 524288, 64), 21, 20),
-        ("causal_attention_output", (1, 32, 1048576, 64), 13, 13),
+        # The causal hd128 surface seeds the hardware-only resident cadence
+        # packet (the three polynomial cadences are fast_math-only and fold
+        # onto it without the setting) and the staggered descending split
+        # walk at ring 5 with the output in the Q stages (one seed: the
+        # target seed's and the fragment defaults' parents produce the same
+        # structure).
+        ("causal_attention_output", (2, 32, 524288, 128), 8, 8),
+        ("attention_output", (1, 32, 524288, 64), 23, 22),
+        # Every plain causal hd64 surface seeds the staggered walk at ring 4
+        # once on top of its measured bodies.
+        ("causal_attention_output", (1, 32, 1048576, 64), 17, 17),
         ("attention_output", (8, 32, 524288, 64), 1, 1),
-        ("causal_attention_output", (8, 32, 786432, 64), 11, 11),
-        ("attention_relu_output", (2, 32, 524288, 64), 21, 20),
-        ("causal_attention_relu_output", (2, 32, 1048576, 64), 11, 11),
-        ("causal_attention_output", (2, 32, 65536, 64), 15, 15),
+        ("causal_attention_output", (8, 32, 786432, 64), 15, 15),
+        ("attention_relu_output", (2, 32, 524288, 64), 23, 22),
+        ("causal_attention_relu_output", (2, 32, 1048576, 64), 15, 15),
+        ("causal_attention_output", (2, 32, 65536, 64), 19, 19),
     ),
 )
 @skipUnlessCuteAvailable("binding a cute-backend kernel requires the CuTe DSL")
@@ -4694,6 +4727,9 @@ def test_attention_autotune_provenance_records_effective_search(monkeypatch):
             is_causal=is_causal,
             standard_dense_output=not is_causal,
             standard_causal_output=is_causal,
+            # The compound structural leaves the provenance pins exist on
+            # the fast_math surface only.
+            fast_math=True,
         )
         seeds = spec.autotune_seed_configs()
         assert seeds
@@ -5047,6 +5083,8 @@ def test_attention_compound_projection_uses_shape_config_generation(
         is_causal=causal,
         standard_dense_output=not causal,
         standard_causal_output=causal,
+        # The projected polynomial packets are offered under fast_math only.
+        fast_math=True,
     )
     generation = ConfigGeneration(spec)
     source_family = "fa4" if causal else "fa4_2cta"
@@ -8180,28 +8218,45 @@ def test_attention_required_full_autotune_rejects_tampered_random_fill():
 
 
 def test_attention_strict_initial_population_replay_uses_seed_without_rng_leak():
+    from helion.autotuner.search_space_logger import canonical_config_id
 
     generation = _fresh_full_autotune_config_generation()
     original_state = random.getstate()
     try:
+        required_configs = set(generation.flash_deterministic_population_configs())
+        required_configs.update(
+            config for _flat, config in generation.seed_flat_config_pairs()
+        )
+        required_ids = {canonical_config_id(config) for config in required_configs}
+        initial_population_size = max(100, len(required_ids) + 1)
+        assert (
+            generation.flash_exact_effective_search_space_configs(
+                initial_population_size
+            )
+            is None
+        )
         random.seed(987654321)
         saved_state = random.getstate()
 
+        # The seeds and the coverage design of this surface fill 100 rows by
+        # themselves; ask for more so the seed-dependent random fill exists.
         first_ids = compare_attention_backends._replay_strict_attention_initial_population_config_ids(
             generation,
             random_seed=123,
-            initial_population_size=100,
+            initial_population_size=initial_population_size,
         )
         assert random.getstate() == saved_state
         second_ids = compare_attention_backends._replay_strict_attention_initial_population_config_ids(
             generation,
             random_seed=124,
-            initial_population_size=100,
+            initial_population_size=initial_population_size,
         )
 
         assert random.getstate() == saved_state
         assert isinstance(first_ids, list)
-        assert len(first_ids) == len(second_ids) == 100
+        assert len(first_ids) == len(second_ids) == initial_population_size
+        assert required_ids <= set(first_ids)
+        assert required_ids <= set(second_ids)
         assert first_ids != second_ids
     finally:
         random.setstate(original_state)

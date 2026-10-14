@@ -274,10 +274,13 @@ def test_byte_storage_vector_seed_uses_legal_fragment_choice() -> None:
         )
         assert seeds
         assert not failures
-        assert all(
-            max(cast("list[int]", config.config["cute_vector_widths"])) <= 8
-            for _, config in seeds
-        )
+        for _, config in seeds:
+            for value, slot in zip(
+                cast("list[int]", config.config["cute_vector_widths"]),
+                bound.config_spec.cute_vector_widths,
+                strict=True,
+            ):
+                assert value in slot._fragment(bound.config_spec).choices
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
