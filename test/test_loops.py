@@ -2215,9 +2215,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 1)
         self.assertNotIn(_thread_barrier(), code)
 
-    @skipIfFn(
-        lambda: _get_backend() not in ("triton", "cute"),
-        "Pallas/JAX emits no thread barrier",
+    @skipIfNotTriton(
+        "asserts the tl.debug_barrier codegen; CuTe orders inter-loop accesses with its own per-access barrier pass"
     )
     def test_sequential_loops_device_local_carry_has_no_barrier(self):
         @helion.kernel(autotune_effort="none")
@@ -2241,11 +2240,10 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_stages=1,
         )
         torch.testing.assert_close(result, x + x.sum(dim=1, keepdim=True))
-        self.assertNotIn(_thread_barrier(), code)
+        self.assertNotIn("tl.debug_barrier()", code)
 
-    @skipIfFn(
-        lambda: _get_backend() not in ("triton", "cute"),
-        "Pallas/JAX emits no thread barrier",
+    @skipIfNotTriton(
+        "asserts the tl.debug_barrier codegen; CuTe orders inter-loop accesses with its own per-access barrier pass"
     )
     def test_sequential_loops_atomic_add_requires_barrier(self):
         @helion.kernel(autotune_effort="none")
@@ -2266,12 +2264,11 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=1,
         )
-        self.assertIn(_thread_barrier(), code)
+        self.assertIn("tl.debug_barrier()", code)
         torch.testing.assert_close(result, torch.ones_like(x))
 
-    @skipIfFn(
-        lambda: _get_backend() not in ("triton", "cute"),
-        "Pallas/JAX emits no thread barrier",
+    @skipIfNotTriton(
+        "asserts the tl.debug_barrier codegen; CuTe orders cross-loop accesses with its own per-access barrier pass"
     )
     def test_sequential_loops_barrier_tracks_storage_aliases(self):
         @helion.kernel(autotune_effort="none")
@@ -2294,7 +2291,7 @@ class TestLoops(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=1,
         )
-        self.assertIn(_thread_barrier(), code)
+        self.assertIn("tl.debug_barrier()", code)
         torch.testing.assert_close(result, x * 2.0 + 1.0)
 
     @skipIfFn(
