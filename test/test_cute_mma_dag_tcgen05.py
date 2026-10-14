@@ -444,25 +444,40 @@ def test_renders_the_vanilla_forward_recurrence() -> None:
         "advance_start_address(2048)" in loop and "advance_start_address(6144)" in loop
     )
     assert "a_major=1, b_major=1" in body
-    # Ordering: acc wait, tcgen05.ld, staging write, fence, barrier, full
-    # wait, MMAs, commit, refill, then the store warps drain the staging tile.
+    # Ordering: the epilogue warps' branch -- acc wait, tcgen05.ld, fence,
+    # barrier, full wait, MMAs, commit, then the snapshot pack into the
+    # staging tile (under the MMA) and the hand-off barrier; the store
+    # warps' branch -- barrier, the ring refill (warp 4, off the MMA warp),
+    # hand-off barrier, drain.  Both branches run two barriers.
     order = [
         f"{RT}.mbar_wait(md_accb, md_parity ^ 1)",
+        "if md_epi:",
         f"{P}.tcgen05_ld(",
         f"{P}.tcgen05_wait(kind={P}.Tcgen05Wait.LOAD)",
-        f"{WARP_RT}.sts_v4_b32(",
         f"{P}.tcgen05_fence({P}.Tcgen05Fence.BEFORE_THREAD_SYNC)",
         "cute.arch.barrier()",
         f"{RT}.mbar_wait(md_full + md_stage, md_round)",
         f"{P}.tcgen05_mma(",
         f"{P}.tcgen05_commit(md_accb",
+        f"{WARP_RT}.sts_v4_b32(",
+        "cute.arch.barrier()",
+        "else:",
+        "cute.arch.barrier()",
+        "if md_warp == 4:",
         f"{P}.cp_async_bulk_tensor_shared_cta_global(",
-        "if md_warp >= 4:",
+        "cute.arch.barrier()",
         f"{WARP_RT}.lds_v4_b32(",
         f"{WARP_RT}.stg_v4_b32(",
     ]
-    positions = [loop.index(item) for item in order]
-    assert positions == sorted(positions), positions
+    _assert_in_order(loop, order)
+    iteration = loop.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[0]
+    assert iteration.count("cute.arch.barrier()") == 4
+    assert "if md_warp >= 4:" not in loop
+    # The pack is not ahead of the barrier that gates the MMA issue.
+    assert loop.index(f"{WARP_RT}.sts_v4_b32(") > loop.index(f"{P}.tcgen05_mma(")
+    # The MMA warp issues no refill.
+    warp0 = loop[loop.index("if md_warp == 0:") : loop.index("else:")]
+    assert f"{P}.cp_async_bulk_tensor_shared_cta_global(" not in warp0
     # No rescale round trip without a decay.
     assert f"{P}.tcgen05_st(" not in loop
     # The staging tile follows the ring (4 x 16 KB) and is double buffered.
@@ -470,13 +485,61 @@ def test_renders_the_vanilla_forward_recurrence() -> None:
     assert "alloc_smem(cutlass.Uint8, 81920, alignment=1024)" in body
 
 
-def test_four_warps_drain_the_staging_tile_themselves() -> None:
-    body = _kernel_body(_source(_bind_fwd(), _config(64, 64, warps=4, stages=2)))
+def test_four_warps_store_the_snapshot_by_tma() -> None:
+    # Without store warps the epilogue warps drained the staging tile
+    # themselves, on the chain (59 of 259 us on fwd_h_delta at s2): thread 0
+    # now stores it by TMA (the staging swizzle is TMA's).  Every warp is
+    # an epilogue warp, so the loop body needs no ``md_epi`` branch: the
+    # TMEM load alone precedes the barrier that gates the MMA issue; the
+    # pack, the staging writes and their proxy fence run under the MMA,
+    # and a second barrier hands the tile to the store thread, which waits
+    # for the previous iteration's group before the next barrier (the
+    # stage-in reusing that buffer follows it).  The ring refill stays with
+    # the MMA warp after its commit, under the MMA (130 -> 122 us on the s2
+    # vanilla forward, 177 -> 162 us on the gated one).
+    source = _source(_bind_fwd(), _config(64, 64, warps=4, stages=2))
+    body = _kernel_body(source)
+    assert "'tma_count': 3" in source
+    assert (
+        "'tma2_dims': [3, 2, 1, 0], 'tma2_box': [64, 64, 1, 1], 'tma2_swizzle': 's128b'"
+        in source
+    )
     loop = _loop(body)
-    assert "if md_warp >= 4:" not in loop
-    assert loop.count(f"{WARP_RT}.stg_v4_b32(") == 4
-    assert "if md_i + 1 < 8:" in loop
+    assert "if md_warp >= 4:" not in loop and "if md_epi:" not in loop
+    assert f"{WARP_RT}.stg_v4_b32(" not in loop and f"{WARP_RT}.lds_v4_b32(" not in loop
+    _assert_in_order(
+        loop,
+        [
+            f"{RT}.mbar_wait(md_accb, md_parity ^ 1)",
+            f"{P}.tcgen05_ld(",
+            f"{P}.tcgen05_fence({P}.Tcgen05Fence.BEFORE_THREAD_SYNC)",
+            "cute.arch.barrier()",
+            "if md_warp == 0:",
+            f"{P}.tcgen05_mma(",
+            f"{P}.tcgen05_commit(md_accb",
+            "if md_i + 1 < 8:",
+            f"{P}.cp_async_bulk_tensor_shared_cta_global(",
+            f"{WARP_RT}.sts_v4_b32(",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            "if md_tidx == 0:",
+            (
+                f"{P}.cp_async_bulk_tensor_global_shared_cta(md_tma2.get_ptr(), "
+                "md_smem + (32768 + md_parity * 8192), ["
+            ),
+            f"{P}.cp_async_bulk_commit_group()",
+            f"{P}.cp_async_bulk_wait_group(1, read=True)",
+        ],
+    )
+    iteration = loop.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[0]
+    assert iteration.count("cute.arch.barrier()") == 2
+    assert "if md_warp == 1:" not in iteration
+    assert loop.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 1
+    # The issue with its group wait, and the final drain after the loop.
+    assert loop.count("if md_tidx == 0:") == 2
+    assert f"{P}.cp_async_bulk_wait_group(0)" in loop
     assert "alloc_smem(cutlass.Uint8, 49152, alignment=1024)" in body
+    assert "md_s0 + 32768 + md_parity * 8192" in loop
 
 
 def test_renders_the_seeded_row_rescaled_forward() -> None:
@@ -491,9 +554,19 @@ def test_renders_the_seeded_row_rescaled_forward() -> None:
     assert loop.count(f"{P}.tcgen05_st(") == 1
     assert loop.count("cute.math.exp") == 1
     st = loop.index(f"{P}.tcgen05_st(")
-    assert loop.index(f"{WARP_RT}.sts_v4_b32(") < st < loop.index("cute.arch.barrier()")
+    assert st < loop.index("cute.arch.barrier()") < loop.index(f"{P}.tcgen05_mma(")
     assert loop.index(f"{P}.tcgen05_wait(kind={P}.Tcgen05Wait.STORE)") < loop.index(
         "cute.arch.barrier()"
+    )
+    # The snapshot is packed from the pre-rescale registers after the MMA
+    # issue (the rescale wrote its own arrays to tensor memory).
+    assert loop.index(f"{WARP_RT}.sts_v4_b32(") > loop.index(f"{P}.tcgen05_mma(")
+    assert loop.index(f"{WARP_RT}.sts_v4_b32(md_srow") > st
+    assert (
+        "md_rs"
+        not in loop[loop.index(f"{WARP_RT}.sts_v4_b32(") :].split(
+            "cute.arch.barrier()"
+        )[0]
     )
 
 
@@ -523,7 +596,11 @@ def test_renders_the_scalar_decay_forward_with_an_in_place_pass() -> None:
     refill = loop.index("md_ax0 = ")
     assert loop.index(f"{P}.tcgen05_commit(") < refill
     assert "if md_i + 1 < 8:" in loop[:refill]
-    assert loop.count(f"{WARP_RT}.ldg_f32(") == 3
+    # Once per branch of the split iteration (the epilogue warps' after the
+    # MMA issue, the store warps' after the barrier): three per thread.
+    epi, store = loop.split("else:", 1)
+    assert epi.count(f"{WARP_RT}.ldg_f32(") == 3
+    assert store.count(f"{WARP_RT}.ldg_f32(") == 3
     # 512 packets over 256 threads, plus the staging packets.
     assert loop.count(f"{WARP_RT}.sts_v4_b32(") == 2 + 4
     # The leaves stay fp32 and the pack rounds once: no per-element casts
@@ -630,7 +707,7 @@ def test_renders_the_k_loop_epilogue_through_an_exchange_tile() -> None:
         f"{P}.tcgen05_commit(md_eacc",
         f"{RT}.mbar_wait(md_eacc, 0)",
         f"{P}.tcgen05_ld(",
-        "md_srow = md_s0 + 0 + md_row64 * 256",
+        "md_srow = md_s0 + 0 + md_row64 * 128",
         f"{WARP_RT}.stg_v4_b32(",
         f"{P}.tcgen05_dealloc(md_acc0, 256,",
     ]
@@ -822,6 +899,10 @@ def test_renders_the_delta_loop_in_program_order() -> None:
             f"{RT}.mbar_wait(md_full + md_stage, md_round)",
             f"{P}.Tcgen05SmemDesc.build(md_s0 + 131072, leading_byte_offset=8192",
             f"{P}.tcgen05_mma(",
+            "if md_tidx == 0:",
+            f"{P}.cp_async_bulk_tensor_global_shared_cta(",
+            f"{P}.cp_async_bulk_commit_group()",
+            f"{P}.cp_async_bulk_wait_group(2, read=True)",
             f"{P}.tcgen05_commit(md_stepb",
             f"{RT}.mbar_wait(md_stepb, md_i * 1 + 0 & 1)",
             "if md_epi:",
@@ -834,15 +915,22 @@ def test_renders_the_delta_loop_in_program_order() -> None:
             "cute.arch.barrier()",
             f"{P}.Tcgen05SmemDesc.build(md_s0 + 139264, leading_byte_offset=4096",
             f"{P}.tcgen05_mma(",
+            "if md_tidx == 0:",
+            f"{P}.cp_async_bulk_tensor_global_shared_cta(",
+            f"{P}.cp_async_bulk_commit_group()",
+            f"{P}.cp_async_bulk_wait_group(2, read=True)",
             f"{P}.tcgen05_commit(md_accb",
-            f"{WARP_RT}.lds_v4_b32(",
-            f"{WARP_RT}.stg_v4_b32(",
         ],
     )
-    # The v_new rows go through a staging tile drained behind dot2's
-    # barrier (two packets per thread), the snapshot through its own (four).
+    # The snapshot and the v_new rows go out by TMA from their staging
+    # tiles: two bulk groups per iteration, each issue waiting until at most
+    # two are pending (the previous iteration's are read out before the
+    # commit that gates the stage-ins reusing their buffers).
     assert loop.count(f"{WARP_RT}.stg_b32(") == 0
-    assert loop.count(f"{WARP_RT}.stg_v4_b32(") == 4 + 2
+    assert loop.count(f"{WARP_RT}.stg_v4_b32(") == 0
+    assert loop.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 2
+    assert loop.count(f"{P}.cp_async_bulk_commit_group()") == 2
+    assert loop.count(f"{P}.cp_async_bulk_wait_group(2, read=True)") == 2
     # dot1: w K-major A, the carry MN-major B into slot 1 from zero; dot2:
     # k^T MN-major A, vnew MN-major B accumulating into the carry.
     assert "n_dim=32, m_dim=64, a_major=0, b_major=1" in prologue
@@ -926,10 +1014,10 @@ def test_body_stores_of_the_first_block_are_double_buffered() -> None:
     assert loop.count("cute.arch.barrier()") == 1
     assert loop.count(f"{P}.tcgen05_commit(") == 1
     assert "md_srow = md_s0 + 32768 + md_parity * 8192 + md_row64 * 128" in loop
-    assert loop.count(f"{WARP_RT}.lds_v4_b32(md_s0 + 32768 + md_parity * 8192 + ") == 4
-    assert (
-        loop.count(f"{WARP_RT}.stg_v4_b32(") == 4 and f"{WARP_RT}.stg_b32(" not in loop
-    )
+    # The body store goes out by TMA from its parity buffer, issued with the
+    # batch (one bulk group per iteration).
+    assert f"{WARP_RT}.lds_v4_b32(" not in loop
+    assert f"{WARP_RT}.stg_v4_b32(" not in loop and f"{WARP_RT}.stg_b32(" not in loop
     _assert_in_order(
         loop,
         [
@@ -937,12 +1025,16 @@ def test_body_stores_of_the_first_block_are_double_buffered() -> None:
             "if md_epi:",
             f"{P}.tcgen05_ld(",
             f"{WARP_RT}.sts_v4_b32(md_srow + ",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
             "cute.arch.barrier()",
             "if md_warp == 0:",
             f"{P}.tcgen05_mma(",
+            "if md_tidx == 0:",
+            f"{P}.cp_async_bulk_tensor_global_shared_cta(",
+            "md_smem + (32768 + md_parity * 8192), [",
+            f"{P}.cp_async_bulk_commit_group()",
+            f"{P}.cp_async_bulk_wait_group(1, read=True)",
             f"{P}.tcgen05_commit(md_accb",
-            f"{WARP_RT}.lds_v4_b32(md_s0 + 32768 + md_parity * 8192 + ",
-            f"{WARP_RT}.stg_v4_b32(",
         ],
     )
     # The epilogue store reuses the ring.
@@ -1397,27 +1489,55 @@ def test_renders_dqkw_nested_loops_with_staged_tiles() -> None:
     assert "n_dim=64, m_dim=64, a_major=1, b_major=1" in body
 
 
-def test_declines_mn_major_tf32_source_tiles() -> None:
-    # chunk_fwd_o_diag_anchored over fp32 inputs (the GLA example): the
-    # ``h[bhn, tile_d, tile_dv]`` B operand is an fp32 source read with K
-    # along its rows, so its tile would be MN-major tf32 -- declined at
-    # admission (the warp mode keeps the kernel), not at plan time.
+def _bind_fwd_o_anch_f32(bhn: int = 16, d: int = 128, dv: int = 128) -> BoundKernel:
+    """chunk_fwd_o_diag_anchored over fp32 inputs (the GLA example)."""
     f32 = torch.float32
-    bhn, c, d, dv = 16, 64, 128, 128
-    q = torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE)
-    v = torch.empty((bhn, c, dv), dtype=f32, device=CPU_DEVICE)
-    gc = torch.empty((bhn, c, d), dtype=f32, device=CPU_DEVICE)
-    h = torch.empty((bhn, d, dv), dtype=f32, device=CPU_DEVICE)
-    a = torch.empty((bhn, c, c), dtype=f32, device=CPU_DEVICE)
-    bound = _bind("chunk_fwd_o_diag_anchored_helion", (q, v, gc, h, a, 0.125))
+    return _bind(
+        "chunk_fwd_o_diag_anchored_helion",
+        (
+            _cpu(bhn, 64, d, dtype=f32),
+            _cpu(bhn, 64, dv, dtype=f32),
+            _cpu(bhn, 64, d, dtype=f32),
+            _cpu(bhn, d, dv, dtype=f32),
+            _cpu(bhn, 64, 64, dtype=f32),
+            0.125,
+        ),
+    )
+
+
+def test_mn_major_tf32_tiles_are_b_operands_only() -> None:
+    # The GLA example's ``h[bhn, tile_d, tile_dv]`` B operand is an fp32
+    # source read with K along its rows: an MN-major tf32 tile, read under
+    # the 32-byte-unit swizzle straight from TMA (box of 32 columns per
+    # slab, ``s128b_atom_32b``), so the kernel admits the tcgen05 mode.
+    bound = _bind_fwd_o_anch_f32()
     spec = bound.config_spec
     assert spec.cute_mma_dag is not None
-    assert spec.cute_mma_dag.choices == ("off", "warp")
+    assert spec.cute_mma_dag.choices == ("off", "warp", "tcgen05")
+    with bound.env, bound.host_function:
+        program = dag.match_mma_dag(bound.host_function.device_ir.graphs)
+        assert program is not None
+        assert regions.region_program_reason(program) is None
+    source = _source(bound, _config(1, 64, 64, warps=4, stages=2))
+    body = _kernel_body(source)
+    assert "'tma0_box': [32, 64, 1], 'tma0_swizzle': 's128b_atom_32b'" in source
+    assert (
+        "leading_byte_offset=8192, stride_byte_offset=512, "
+        f"layout={P}.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B"
+    ) in body
+    assert "a_major=0, b_major=1" in body
+    # An A operand with K along its rows stays declined (the layout is
+    # verified for B operands): the state recurrence over fp32 chunks reads
+    # ``k_i^T`` as A.
+    f32 = torch.float32
+    bound = _bind_fn(
+        _store_after, (_cpu(2, 8, 64, 64, dtype=f32), _cpu(2, 8, 64, 64, dtype=f32))
+    )
     with bound.env, bound.host_function:
         program = dag.match_mma_dag(bound.host_function.device_ir.graphs)
         assert program is not None
         assert regions.region_program_reason(program) == (
-            "ht: an MN-major tf32 operand"
+            "permute: an MN-major tf32 A operand"
         )
 
 
@@ -1477,26 +1597,28 @@ def test_renders_the_wy_chain_with_tf32_mmas() -> None:
     assert "for md_i1 in cutlass.range(0, 5):" in chain
     # The chain's carries are seeded from kk's row: both arrays evaluate the
     # pointwise seed before the loop; each step runs two tf32 batches
-    # (Apow = Apow @ Apow, then T += Apow @ T) with the transposed B tiles
-    # scattered (one store per element) and copies Apow back to its slot.
+    # (Apow = Apow @ Apow, then T += Apow @ T), the B tiles written as
+    # natural four-wide packets under the 32-byte-unit swizzle (the A tiles
+    # under SW128), and copies Apow back to its slot.
     init = kk_loop[kk_loop.index("md_rk0 = md_rk0 + 1") :]
     assert init.count(f"{P}.tcgen05_st(") == 2 and "md_seed" in init
     assert chain.count(f"{P}.tcgen05_commit(md_cb") == 2
-    assert chain.count(f"{WARP_RT}.sts_f32(") == 2 * 32
+    assert chain.count(f"{WARP_RT}.sts_f32(") == 0
+    assert chain.count(f"{RT}.sts_v4_f32(") == 40
+    assert chain.count("% 8 ^ md_row64 % 8) * 16") == 24
+    assert chain.count("% 8 ^ md_row64 % 4 * 2) * 16") == 16
     assert chain.count(f"{P}.tcgen05_st(") == 1
     _assert_in_order(
         chain,
         [
             f"{P}.tcgen05_ld(",
             f"{RT}.sts_v4_f32(",
-            f"{WARP_RT}.sts_f32(",
             "cute.arch.barrier()",
             f"{P}.Tcgen05MMAKind.TF32",
             f"{P}.tcgen05_commit(md_cb",
             f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)",
             f"{P}.tcgen05_ld(",
             f"{RT}.sts_v4_f32(",
-            f"{WARP_RT}.sts_f32(",
             "cute.arch.barrier()",
             f"{P}.Tcgen05MMAKind.TF32",
             f"{P}.tcgen05_commit(md_cb",
@@ -1505,13 +1627,28 @@ def test_renders_the_wy_chain_with_tf32_mmas() -> None:
             f"{P}.tcgen05_st(",
         ],
     )
-    # w: the bf16 k tile lands raw by TMA, the widen pass scatters beta * k
-    # into the transposed fp32 tile (four raw packets per thread), T's
-    # natural tile is the K-major A, eight tf32 MMAs, the bf16 result stages
-    # out.
+    # Descriptors: A K-major SW128 (LBO 16, SBO 1024), B MN-major under the
+    # ATOM_32B swizzle (LBO = the 32-column slab stride K * 128, SBO = the
+    # four-row swizzle period 512); the start advances 1024 B per K step.
+    assert body.count("leading_byte_offset=16, stride_byte_offset=1024") == 6
+    assert (
+        body.count(
+            "leading_byte_offset=8192, stride_byte_offset=512, "
+            f"layout={P}.Tcgen05SmemSwizzle.SWIZZLE_128B_ATOM_32B"
+        )
+        == 4
+    )
+    assert body.count("a_major=0, b_major=1") == 4
+    assert body.count("advance_start_address(1024)") == 4
+    # w: the bf16 k tile lands raw by TMA, the widen pass writes beta * k
+    # as natural fp32 packets into the MN-major B tile (four raw packets
+    # per thread, two fp32 packets each), T's natural tile is the K-major A,
+    # eight tf32 MMAs, the bf16 result stages out.
     assert w_loop.count(f"{WARP_RT}.lds_v4_b32(") == 8
     assert w_loop.count(f"{WARP_RT}.unpack_bf16x2(") == 16
-    assert w_loop.count(f"{WARP_RT}.sts_f32(") == 32
+    assert w_loop.count(f"{WARP_RT}.sts_f32(") == 0
+    assert w_loop.count(f"{RT}.sts_v4_f32(") == 16
+    assert len(re.findall(r"\^ md_pr_t\d+_\d+ % 4 \* 2\) \* 16", w_loop)) == 8
     assert w_loop.count(f"{P}.Tcgen05MMAKind.TF32") == 8
     assert w_loop.count(f"{WARP_RT}.stg_v4_b32(") == 4
     assert u_loop.count(f"{P}.Tcgen05MMAKind.TF32") == 8
@@ -2143,3 +2280,686 @@ def test_the_outer_loop_staging_waits_for_the_sibling_loop() -> None:
     assert f"{RT}.mbar_wait(md_cb, md_cn + 1 & 1)" in head
     assert f"{P}.tcgen05_commit(" not in head
     assert "cp_async_bulk_tensor" not in head
+
+
+def test_gated_dstate_computes_its_decay_tables_one_iteration_ahead() -> None:
+    # The [C, C] ``exp2((gc[:, None] - gc[None, :]) * RCP_LN2)`` of the attn
+    # exchange (dv_i's A operand) and the dv_kh row factor depend on the
+    # iteration's gc row alone: the entries this thread evaluates (32 at
+    # its row, swapped, plus the row factor) are registers computed for the
+    # next iteration under this iteration's MMAs, in the windows after the
+    # batch whose block consumed them (the exchange sits in block 1: after
+    # the second and third commits, before their waits), from gc elements
+    # loaded two iterations ahead.
+    body = _kernel_body(
+        _source(_bind_dstate(gated=True), _config(32, warps=4, stages=2))
+    )
+    prologue, loop = body.split("for md_i in cutlass.range(", 1)
+    loop = loop.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[0]
+    table = re.compile(r"md_tb0_\d+ = cutlass\.Float32\(md_v")
+    row_factor = re.compile(r"md_tb1_\d+ = cutlass\.Float32\(md_v")
+    load = re.compile(r"md_tl\d+ = _helion_mma_dag\.ldg_f32\(")
+    # Prologue: the first iteration's tables from its loads, then the
+    # second iteration's loads (dl, the row's gc, 32 column gc values).
+    assert len(table.findall(prologue)) == 32
+    assert len(row_factor.findall(prologue)) == 1
+    assert len(load.findall(prologue)) == 2 * 34
+    assert prologue.rindex("md_tl0 = ") > prologue.rindex("md_tb0_31 = ")
+    segments = loop.split(f"{P}.tcgen05_commit(")
+    assert len(segments) == 4
+    assert [len(table.findall(s)) for s in segments] == [0, 0, 16, 16]
+    assert [len(row_factor.findall(s)) for s in segments] == [0, 0, 0, 1]
+    assert [len(load.findall(s)) for s in segments] == [0, 0, 0, 34]
+    # Under the MMAs: before the wait that follows each commit.
+    assert segments[2].index("md_tb0_") < segments[2].index(
+        f"{RT}.mbar_wait(md_stepb, md_i * 2 + 1 & 1)"
+    )
+    assert segments[3].rindex("md_tl33 = ") < segments[3].index(
+        f"{RT}.mbar_wait(md_accb, md_parity)"
+    )
+    assert "if md_i + 2 < 8:" in segments[3]
+    assert segments[3].index("if md_i + 2 < 8:") > segments[3].rindex("md_tb1_")
+    # The exchange multiplies by the registers and evaluates no exp2 (the
+    # two in its segment are the dog pass's row factors, run there since
+    # the pass moved under the first batch).
+    assert re.search(r"\* md_tb0_0\b", segments[1])
+    assert re.search(r"\* md_tb0_31\b", segments[1])
+    assert segments[1].count("exp2(") == 2
+    assert segments[1].index("exp2(") < segments[1].index(f"{RT}.mbar_wait(md_stepb")
+    # 33 entries, plus the dS rescale's scalar in block 2.
+    assert sum(s.count("exp2(") for s in segments[2:]) == 33 + 1
+    # Nothing else in the loop reads the vectors the tables hold.
+    for other in (_bind_dstate(), _bind_fwd_h_delta(gated=True)):
+        assert "md_tb" not in _source(other, _config(32, warps=4, stages=2))
+
+
+def _store_after(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """A body store after the iteration's only dot: the trailing block."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    h_all = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+            h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
+    return h_all
+
+
+def _snap_reread(
+    k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Snapshots per iteration; the epilogue re-reads row 0 of the last one
+    (written by the last iteration's store) as a side vector."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    h_all = torch.empty([BH, N, D, DV], dtype=torch.float32, device=k.device)
+    out = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    ht = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            h_all[idx, i_t, tile_d, tile_dv] = h_acc
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+        ht[idx, tile_d, tile_dv] = h_acc
+        row = h_all[idx, N - 1, 0, tile_dv]
+        out[idx, tile_d, tile_dv] = h_acc + row[None, :]
+    return h_all, out, ht
+
+
+def _snap_same_dst(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """A loop-invariant snapshot (the same tile every iteration), then the
+    epilogue overwrites that tile with the final state: its write must be
+    the last."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    ht = torch.empty([BH, D, DV], dtype=k.dtype, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            ht[idx, tile_d, tile_dv] = h_acc.to(ht.dtype)
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+        ht[idx, tile_d, tile_dv] = h_acc.to(ht.dtype)
+    return ht
+
+
+def test_tma_stores_decline_tensors_the_program_stores_elsewhere() -> None:
+    # A bulk store completes at the kernel's end only (the in-loop waits order
+    # its staging reads, not the global writes).  A program that also LOADS the
+    # snapshot tensor is not the lowering's at all (``_snap_reread``); a second
+    # store to the tensor -- the epilogue storing the same tile
+    # (``_snap_same_dst``) -- is admitted and keeps the packet drain.
+    t = _tensors()
+    assert _bind_fn(_snap_reread, (t["k"], t["v"])).config_spec.cute_mma_dag is None
+    bound = _bind_fn(_snap_same_dst, (t["k"], t["v"]))
+    source = _source(bound, _config(64, 16, warps=4, stages=2))
+    body = _kernel_body(source)
+    assert f"{P}.cp_async_bulk_tensor_global_shared_cta(" not in body
+    assert f"{P}.cp_async_bulk_wait_group(" not in body
+    assert f"{WARP_RT}.stg_v4_b32(" in _loop(body)
+    assert "'tma_count': 2" in source
+    # The snapshot of a tensor nothing else touches still goes by TMA.
+    body = _kernel_body(_source(_bind_fwd(), _config(64, 16, warps=4, stages=2)))
+    assert body.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 1
+
+
+def test_trailing_tma_stores_wait_in_the_loop() -> None:
+    # A body store behind the iteration's last dot issues its group behind the
+    # trailing barrier; when no batch of the loop issues a group there was no
+    # wait before the stage-in two iterations later rewrote the buffer.  Thread
+    # 0 now waits for the previous iteration's group right after its commit
+    # (ahead of the next iteration's accb commit that the stage-in waits on).
+    t = _tensors()
+    bound = _bind_fn(_store_after, (t["k"], t["v"]))
+    for cols in (16, 32, 64):
+        body = _kernel_body(_source(bound, _config(64, cols, warps=4, stages=2)))
+        loop = _loop(body)
+        assert loop.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 1
+        _assert_in_order(
+            loop,
+            [
+                f"{P}.tcgen05_commit(md_accb",
+                "cute.arch.barrier()",
+                "if md_tidx == 0:",
+                f"{P}.cp_async_bulk_tensor_global_shared_cta(",
+                f"{P}.cp_async_bulk_commit_group()",
+                f"{P}.cp_async_bulk_wait_group(1, read=True)",
+                f"{P}.cp_async_bulk_wait_group(0)",
+            ],
+        )
+        assert loop.count(f"{P}.cp_async_bulk_wait_group(1, read=True)") == 1
+
+
+def test_passes_no_first_batch_dot_reads_run_under_the_first_batch() -> None:
+    # The gated fwd_h_delta k pass feeds dot2 only: it runs after the first
+    # batch's issue (under those MMAs), before its wait, published by the
+    # next block's proxy fence; warp 0 then waits the ring slot itself
+    # before the first batch (the pass no longer did).  The ungated kernel
+    # has no pass and is unchanged; dstate's do_i and dog passes (dv_i's B,
+    # dS's B: batches 1 and 2) run together after the first batch.
+    body = _kernel_body(
+        _source(_bind_fwd_h_delta(gated=True), _config(32, warps=4, stages=4))
+    )
+    loop = _loop(body).split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[0]
+    segments = loop.split(f"{P}.tcgen05_commit(")
+    assert len(segments) == 3
+    assert [s.count(f"{WARP_RT}.lds_v4_b32(") for s in segments] == [0, 8, 0]
+    assert [s.count(f"{WARP_RT}.sts_v4_b32(md_pa") for s in segments] == [0, 8, 0]
+    assert [
+        s.count(f"{RT}.mbar_wait(md_full + md_stage, md_round)") for s in segments
+    ] == [1, 1, 0]
+    _assert_in_order(
+        segments[0],
+        [
+            "if md_warp == 0:",
+            f"{RT}.mbar_wait(md_full + md_stage, md_round)",
+            f"{P}.tcgen05_mma(",
+        ],
+    )
+    _assert_in_order(
+        segments[1],
+        [
+            f"{RT}.mbar_wait(md_full + md_stage, md_round)",
+            f"{WARP_RT}.lds_v4_b32(",
+            f"{WARP_RT}.sts_v4_b32(md_pa",
+            f"{RT}.mbar_wait(md_stepb, md_i * 1 + 0 & 1)",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            "cute.arch.barrier()",
+            f"{P}.tcgen05_mma(",
+        ],
+    )
+    # One proxy fence per block (the exchange tiles' and the pass's are the
+    # same fence): none between the pass and the step wait.
+    pass_part = segments[1].split(f"{RT}.mbar_wait(md_stepb", 1)[0]
+    assert "fence_proxy" not in pass_part
+    body = _kernel_body(
+        _source(_bind_dstate(gated=True), _config(32, warps=4, stages=2))
+    )
+    loop = _loop(body).split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[0]
+    segments = loop.split(f"{P}.tcgen05_commit(")
+    assert [s.count(f"{WARP_RT}.lds_v4_b32(") for s in segments] == [0, 4, 0, 0]
+    assert [
+        s.count(f"{RT}.mbar_wait(md_full + md_stage, md_round)") for s in segments
+    ] == [1, 1, 0, 0]
+
+
+def _snap_reread_view(
+    k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """snap_reread through a host-side view of the snapshot tensor (another
+    argument, the same storage)."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    h_all = torch.empty([BH, N, D, DV], dtype=torch.float32, device=k.device)
+    h_last = h_all[:, N - 1]
+    out = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    ht = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            h_all[idx, i_t, tile_d, tile_dv] = h_acc
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+        ht[idx, tile_d, tile_dv] = h_acc
+        row = h_last[idx, 0, tile_dv]
+        out[idx, tile_d, tile_dv] = h_acc + row[None, :]
+    return h_all, out, ht
+
+
+def _snap_reread2(
+    k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The epilogue adds the whole last snapshot tile (a 2-D tile input of
+    an epilogue derived value) to the final state."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    h_all = torch.empty([BH, N, D, DV], dtype=torch.float32, device=k.device)
+    out = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    ht = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            h_all[idx, i_t, tile_d, tile_dv] = h_acc
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+        ht[idx, tile_d, tile_dv] = h_acc
+        out[idx, tile_d, tile_dv] = h_acc + h_all[idx, N - 1, tile_d, tile_dv]
+    return h_all, out, ht
+
+
+def test_alias_checks_see_through_host_views_and_epilogue_derived_values_decline() -> (
+    None
+):
+    # A host-side view of the snapshot tensor (``h_last = h_all[:, N - 1]``)
+    # slipped through the name-keyed alias checks, and an epilogue derived
+    # value's tile input was prefetched ahead of the last snapshot store.  Both
+    # probes load a tensor the loop stores, so the matcher declines them
+    # outright (the storage-keyed checks and the epilogue-derived decline stay
+    # for the programs it admits).  The loop's derived values keep their top
+    # prefetch.
+    t = _tensors()
+    for fn in (_snap_reread_view, _snap_reread2):
+        assert _bind_fn(fn, (t["k"], t["v"])).config_spec.cute_mma_dag is None
+    body = _kernel_body(_source(_bind_fwd_h_delta(), _config(32, warps=4, stages=4)))
+    loop, epilogue = _loop(body).split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)
+    assert "md_u = " in loop and f"{WARP_RT}.ldg_b32(" in loop
+
+
+def test_pass_warps_rewrite_the_next_tile_off_the_chain() -> None:
+    # ``cute_mma_dag_pass_warps='on'`` (eight warps, stages >= 2, loop
+    # operand passes): warps 4-7 run their own loop over the tiles, each
+    # rewritten in its ring slot once the slot's previous MMAs completed
+    # (the slot's free barrier, committed by those MMAs and arrived once per
+    # slot in the prologue) and its TMA landed (a suspended wait), published
+    # to the async proxy and signalled on the slot's pass barrier (128
+    # arrivals); the epilogue warps run the chain on a named barrier,
+    # without passes, and warp 0 waits the pass barrier ahead of the first
+    # batch reading a passed tile.  The stores take the four-warp path (TMA
+    # for the admitted snapshots).
+    bound = _bind_fwd_h_delta(gated=True)
+    source = _source(
+        bound, _config(32, warps=8, stages=4, cute_mma_dag_pass_warps="on")
+    )
+    body = _kernel_body(source)
+    assert body.count(f"{P}.mbarrier_init(md_pass + ") == 4
+    assert f"{P}.mbarrier_init(md_pass + 3, 128)" in body
+    assert body.count(f"{P}.mbarrier_init(md_free + ") == 4
+    assert f"{P}.mbarrier_init(md_free + 3, 1)" in body
+    prologue, rest = body.split("if md_warp >= 4:", 1)
+    assert prologue.count(f"{P}.mbarrier_arrive(md_free + ") == 4
+    assert prologue.index("fence_mbarrier_init()") < prologue.index(
+        "mbarrier_arrive(md_free + 0)"
+    )
+    pass_loop, epilogue_loop = rest.split("\n    else:\n", 1)
+    assert pass_loop.count("for md_j in cutlass.range(0, 8):") == 1
+    _assert_in_order(
+        pass_loop,
+        [
+            "md_stage = md_j % 4",
+            f"{RT}.mbar_wait_sleep(md_free + md_stage, md_round)",
+            f"{RT}.mbar_wait_sleep(md_full + md_stage, md_round)",
+            f"{WARP_RT}.lds_v4_b32(",
+            f"{WARP_RT}.sts_v4_b32(md_pa",
+            "cute.arch.fence_proxy(kind='async.shared', space='cta')",
+            f"{P}.mbarrier_arrive(md_pass + md_stage)",
+        ],
+    )
+    assert pass_loop.count(f"{WARP_RT}.lds_v4_b32(") == 8
+    assert "md_pr_t" in pass_loop and "(md_tidx - 128)" in pass_loop
+    assert "cute.arch.barrier" not in pass_loop
+    loop = epilogue_loop.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[0]
+    assert loop.count("for md_i in cutlass.range(0, 8):") == 1
+    assert f"{WARP_RT}.lds_v4_b32(" not in loop and "md_pr_t" not in loop
+    assert loop.count("cute.arch.barrier(barrier_id=1, number_of_threads=128)") == 2
+    assert "cute.arch.barrier()" not in loop
+    # The k pass feeds dot2: warp 0 waits the pass before the second batch,
+    # the ring slot itself before the first (no pass waited it); the
+    # iteration's last commit (acc_ready) is followed by the slot's free
+    # commit under the same elect.
+    segments = loop.split(f"{P}.tcgen05_commit(")
+    assert len(segments) == 4
+    assert segments[2].startswith("md_accb") and segments[3].startswith(
+        "md_free + md_stage"
+    )
+    assert [
+        s.count(f"{RT}.mbar_wait(md_pass + md_stage, md_round)") for s in segments
+    ] == [0, 1, 0, 0]
+    assert [
+        s.count(f"{RT}.mbar_wait(md_full + md_stage, md_round)") for s in segments
+    ] == [1, 0, 0, 0]
+    assert loop.count(f"{P}.cp_async_bulk_tensor_global_shared_cta(") == 2
+    assert "if md_warp >= 4:" not in loop
+    # After the loop every warp meets at the CTA barriers again.
+    epilogue = epilogue_loop.split(f"{RT}.mbar_wait(md_accb, 8 - 0 - 1 & 1)", 1)[1]
+    assert "cute.arch.barrier()" in epilogue
+    # Without the knob the eight-warp render keeps the store-warp drains and
+    # the passes on the chain.
+    body = _kernel_body(_source(bound, _config(32, warps=8, stages=4)))
+    assert "md_pass" not in body and "md_free" not in body
+    assert "barrier_id=1" not in body
+    assert "for md_j in" not in body and "if md_warp >= 4:" in body
+
+
+def test_pass_warps_need_a_subject() -> None:
+    # Pinned off when there is no loop pass (delta fwd_h_delta), fewer than
+    # eight warps, one ring slot, the warp mode or a region program.
+    cases = (
+        (lambda: _bind_fwd_h_delta(), _config(32, warps=8, stages=4)),
+        (lambda: _bind_fwd_h_delta(gated=True), _config(32, warps=4, stages=4)),
+        (lambda: _bind_fwd_h_delta(gated=True), _config(32, warps=8, stages=1)),
+        (lambda: _bind_wy(gated=True), _config(64, 64, 64, warps=8, stages=2)),
+    )
+    for bind, config in cases:
+        bound = bind()
+        config = dict(config.config, cute_mma_dag_pass_warps="on")
+        with bound.env:
+            bound.config_spec.normalize(config)
+        assert config["cute_mma_dag_pass_warps"] == "off", config
+    bound = _bind_fwd_h_delta(gated=True)
+    config = dict(
+        _config(32, warps=8, stages=4).config,
+        cute_mma_dag="warp",
+        cute_mma_dag_pass_warps="on",
+    )
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_pass_warps"] == "off"
+    config = dict(_config(32, warps=8, stages=2).config, cute_mma_dag_pass_warps="on")
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_pass_warps"] == "on"
+    # dstate's do_i / dog passes and the scalar bwd's q pass qualify too.
+    for bind, config in (
+        (lambda: _bind_dstate(gated=True), _config(32, warps=8, stages=2)),
+        (lambda: _bind_bwd("scalar"), _config(64, 64, warps=8, stages=2)),
+    ):
+        bound = bind()
+        config = dict(config.config, cute_mma_dag_pass_warps="on")
+        with bound.env:
+            bound.config_spec.normalize(config)
+        assert config["cute_mma_dag_pass_warps"] == "on", config
+        body = _kernel_body(_source(bound, helion.Config(**config)))
+        assert body.count("for md_j in") == 1 and "mbarrier_arrive(md_pass" in body
+
+
+def test_the_pass_warp_seed_leads_where_its_passes_pay() -> None:
+    # Programs with loop operand passes get the first tensor-memory seed
+    # again with warps 4-7 as pass warps and a ring of at least three
+    # slots.  It leads -- the promoted default -- for a one-wave grid whose
+    # passes are worth MMA_DAG_PASS_WARP_PACKETS per thread and iteration
+    # (gated fwd_h_delta's k pass: 8 packets); the small passes of gated
+    # dstate (2 + 2) and the scalar bwd (4), and the CTA-rich dqk / dv,
+    # keep the four-warp default with the pass-warp seed second.  Programs
+    # without passes (delta fwd_h_delta) and region programs (wy) seed none.
+    spec = _bind_fwd_h_delta(gated=True).config_spec
+    facts = spec.cute_mma_dag_facts
+    assert facts is not None
+    default = spec.default_config().config
+    sizes = {
+        axis.block_id: default["block_sizes"][
+            spec.block_sizes.block_id_to_index(axis.block_id)
+        ]
+        for axis in facts.axes
+        if axis.block_id in spec.block_sizes.valid_block_ids()
+    }
+    resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+    assert dag.mma_dag_pass_packets(facts, resolved) == 8
+    assert dag.mma_dag_pass_warps_lead(facts, resolved)
+    seeds = [c.config for c in spec.compiler_seed_configs]
+    assert default["cute_mma_dag"] == "tcgen05"
+    assert default["cute_mma_dag_pass_warps"] == "on"
+    assert default["cute_mma_dag_warps"] == 8 and default["cute_mma_dag_stages"] >= 3
+    assert {key: default[key] for key in seeds[0]} == seeds[0]
+    assert seeds[1]["cute_mma_dag_pass_warps"] == "off"
+    assert seeds[1]["block_sizes"] == default["block_sizes"]
+    assert sum(c["cute_mma_dag_pass_warps"] == "on" for c in seeds) == 1
+    # The one-wave condition counts the root tiles' CTAs too: the same
+    # kernel over BH = 64 heads x DV / 64 = 2 tiles (128 CTAs) leads, over
+    # BH = 128 (256 CTAs, two waves on 148 SMs) it does not.
+    for bh, leads in ((64, True), (128, False)):
+        spec = _bind_fwd_h_delta(gated=True, bh=bh, dv=128).config_spec
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None and facts.grid_blocks == bh
+        default = spec.default_config().config
+        sizes = {
+            axis.block_id: default["block_sizes"][
+                spec.block_sizes.block_id_to_index(axis.block_id)
+            ]
+            for axis in facts.axes
+            if axis.block_id in spec.block_sizes.valid_block_ids()
+        }
+        resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+        assert default["block_sizes"] == [64]
+        assert dag.mma_dag_cta_count(facts, resolved) == bh * 2
+        assert dag.mma_dag_pass_packets(facts, resolved) == 8
+        assert dag.mma_dag_pass_warps_lead(facts, resolved) is leads
+        assert (default["cute_mma_dag_pass_warps"] == "on") is leads
+    spec = _bind_fwd_h_delta().config_spec
+    assert all(
+        c.config["cute_mma_dag_pass_warps"] == "off" for c in spec.compiler_seed_configs
+    )
+    for bind, packets in (
+        (lambda: _bind_dstate(gated=True), 2),
+        (lambda: _bind_bwd("scalar"), 4),
+        (_bind_dqk, 4),
+        (_bind_dv, 4),
+    ):
+        bound = bind()
+        spec = bound.config_spec
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None
+        default = spec.default_config().config
+        sizes = {
+            axis.block_id: default["block_sizes"][
+                spec.block_sizes.block_id_to_index(axis.block_id)
+            ]
+            for axis in facts.axes
+            if axis.block_id in spec.block_sizes.valid_block_ids()
+        }
+        resolved = [facts.block_size(i, sizes) for i in range(len(facts.axes))]
+        assert dag.mma_dag_pass_packets(facts, resolved) == packets
+        assert not dag.mma_dag_pass_warps_lead(facts, resolved)
+        assert default["cute_mma_dag_pass_warps"] == "off"
+        seeds = [c.config for c in spec.compiler_seed_configs]
+        assert seeds[1]["cute_mma_dag_pass_warps"] == "on", seeds[1]
+        assert seeds[1]["cute_mma_dag_warps"] == 8
+        # The seed renders (its ring fits the shared memory).
+        assert "for md_j in" in _kernel_body(_source(bound, helion.Config(**seeds[1])))
+    # Region programs (wy's tf32 chain) seed none.
+    assert all(
+        c.config["cute_mma_dag_pass_warps"] == "off"
+        for c in _bind_wy().config_spec.compiler_seed_configs
+    )
+
+
+def test_atom_32b_exchange_writes_rotate_the_packet_order() -> None:
+    # Under the 32-byte-unit swizzle a packet column of a warp's 16 rows
+    # lands on four of the eight bank groups (the XOR runs over the row mod
+    # 4): the lanes of rows 4-7 of each eight write the next packet instead
+    # (adjacent packets differ in parity, hence in bank-group half), chosen
+    # by selects over the row's values -- same bytes at the same addresses,
+    # every store instruction over all eight groups.  The SW128 A tiles are
+    # conflict-free as they are and keep the plain order.
+    body = _kernel_body(_source(_bind_wy(), _config(64, 64, 64, warps=4, stages=2)))
+    first, rest = _split_loop(body, "md_i")
+    kk_loop, rest = _split_loop(rest, "md_i1")
+    chain, rest = _split_loop(rest, "md_i2")
+    assert chain.count("md_rot") > 0
+    assert re.search(r"md_rot(_\d+)? = md_lane // 4 % 2", chain)
+    # Per chain step: two B tiles (Apow, T) of 8 packets, 4 selects each.
+    assert len(re.findall(r"if md_rot(_\d+)? else", chain)) == 2 * 8 * 4
+    rotated = re.findall(
+        r"md_cb\d // 4 \+ \((\d) \+ md_rot(?:_\d+)?\) % 8\) % 8 \^ md_row64 % 4 \* 2",
+        chain,
+    )
+    assert sorted(rotated) == sorted([str(j) for j in range(8)] * 2)
+    # The A tiles (SW128) keep the plain packet order.
+    assert len(re.findall(r"md_cb\d // 4 \+ \d\) % 8 \^ md_row64 % 8\)", chain)) == 24
+    assert not re.search(r"md_rot(_\d+)?\) % 8\) % 8 \^ md_row64 % 8", chain)
+
+
+def _rmw_scalar_first(
+    scale: float,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    s_in: torch.Tensor,
+    s_out: torch.Tensor,
+) -> torch.Tensor:
+    """A vector store with its reduction and side load inside the
+    recurrence."""
+    BH, N, D, DV = k.size(0), k.size(1), k.size(3), v.size(3)
+    h_out = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+            s_out[idx, tile_d] = s_in[idx, tile_d] + h_acc.sum(-1) * scale
+        h_out[idx, tile_d, tile_dv] = h_acc
+    return h_out
+
+
+def test_vector_values_in_the_loop_decline_the_single_loop_emitter() -> None:
+    # The single-loop emitter rendered ``s_out[idx, tile_d] = s_in[...] +
+    # h_acc.sum(-1) * scale`` inside the recurrence without the reduction, the
+    # load or the store (s_out stayed zero while h_out was right) and tcgen05
+    # was the kernel's default.  Vector values are the region renderer's: such
+    # programs decline the mode (the warp mode renders them).
+    t = _tensors()
+    s_in = torch.empty((2, 64), dtype=torch.float32, device=CPU_DEVICE)
+    s_out = torch.empty((2, 64), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind_fn(_rmw_scalar_first, (0.5, t["k"], t["v"], s_in, s_out))
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is None
+    with bound.env, bound.host_function:
+        program = dag.match_mma_dag(bound.host_function.device_ir.graphs)
+    assert program is not None and program.simple and program.vec_stores
+    spec = bound.config_spec
+    assert spec.cute_mma_dag is not None
+    assert spec.cute_mma_dag.choices == ("off", "warp")
+    assert spec.default_config().config["cute_mma_dag"] == "warp"
+    body = _kernel_body(
+        _source(bound, helion.Config(block_sizes=[64, 64], cute_mma_dag="warp"))
+    )
+    assert "s_out" in body and "stg_f32" in body or "s_out" in body
+
+
+def test_mn_major_tf32_tiles_need_32_columns_at_config_time() -> None:
+    # The 128-byte-row rule for MN-major tf32 tiles lived in the planner only,
+    # so the fp32 GLA kernel's default and every tcgen05 seed ([1, 16, 16])
+    # raised in to_code.  ``region_config_reason`` carries it now:
+    # normalization refuses or repairs such tiles, the seeds and the default
+    # keep 32 fp32 columns at least, and they render.
+    bound = _bind_fwd_o_anch_f32()
+    spec = bound.config_spec
+    with bound.env, pytest.raises(InvalidConfig, match="128-byte rows .32 columns."):
+        spec.normalize(_config(1, 16, 16, warps=4, stages=2).config)
+    with bound.env:
+        spec.normalize(_config(1, 32, 32, warps=4, stages=2).config)
+    # block_sizes = [bhn, dv (the B tile's N), d (the K loop tile)].
+    default = spec.default_config().config
+    assert default["cute_mma_dag"] == "tcgen05" and default["block_sizes"][1] >= 32
+    assert "tcgen05_mma(" in _source(bound, helion.Config(**default))
+    seeds = [
+        c.config
+        for c in spec.compiler_seed_configs
+        if c.config["cute_mma_dag"] == "tcgen05"
+    ]
+    assert seeds and all(c["block_sizes"][1] >= 32 for c in seeds)
+    config = _config(1, 16, 16, warps=4, stages=2).config
+    with bound.env:
+        spec.normalize(config, _fix_invalid=True)
+    assert config["cute_mma_dag"] != "tcgen05" or config["block_sizes"][1] >= 32
+
+
+_SIMPLE_BINDERS: dict[str, Callable[[], BoundKernel]] = {
+    "fwd": _bind_fwd,
+    "fwd_scalar": lambda: _bind_fwd("scalar"),
+    "fwd_diag_h0": lambda: _bind_fwd("diag", has_h0=True),
+    "bwd": _bind_bwd,
+    "bwd_scalar": lambda: _bind_bwd("scalar"),
+    "fwd_o": _bind_fwd_o,
+    "fwd_o_gated": lambda: _bind_fwd_o(gated=True),
+    "dqk": _bind_dqk,
+    "dqk_gated": lambda: _bind_dqk(gated=True),
+    "dv": _bind_dv,
+    "dv_scalar": lambda: _bind_dv("scalar"),
+    "fwd_h_delta": _bind_fwd_h_delta,
+    "fwd_h_delta_gated": lambda: _bind_fwd_h_delta(gated=True),
+    "dstate": _bind_dstate,
+    "dstate_gated": lambda: _bind_dstate(gated=True),
+    "fwd_o_anch_f32": _bind_fwd_o_anch_f32,
+}
+
+
+_RENDER_BINDERS: dict[str, Callable[[], BoundKernel]] = {
+    **_SIMPLE_BINDERS,
+    **_REGION_BINDERS,
+}
+
+
+@pytest.mark.parametrize("which", ("default", "first_seed"))
+@pytest.mark.parametrize("name", sorted(_RENDER_BINDERS))
+def test_every_admitted_default_and_first_seed_renders(name: str, which: str) -> None:
+    # A config normalization admits must compile: the default config and
+    # the first tcgen05 seed of every binder that admits the mode render
+    # (the fp32 GLA default did not): one case per (binder, config), so a
+    # failure names the binder and no case is long.
+    bound = _RENDER_BINDERS[name]()
+    spec = bound.config_spec
+    if spec.cute_mma_dag is None or "tcgen05" not in spec.cute_mma_dag.choices:
+        pytest.skip(f"{name} does not admit tcgen05")
+    default = spec.default_config().config
+    if which == "default":
+        config = default
+    else:
+        seeds = [
+            c.config
+            for c in spec.compiler_seed_configs
+            if c.config["cute_mma_dag"] == "tcgen05"
+        ]
+        if not seeds:
+            pytest.skip(f"{name} has no tcgen05 seed")
+        if seeds[0] == default:
+            pytest.skip(f"{name}: the first tcgen05 seed is the default config")
+        config = seeds[0]
+    with bound.env:
+        spec.normalize(config)
+    source = _source(bound, helion.Config(**config))
+    assert "@cute.kernel" in source, (name, which)
+
+
+def _bind_fwd_scalar_unaligned() -> BoundKernel:
+    """The scalar-decay forward with k and v sliced [..., 4:68] out of
+    80-wide rows: their passes copy from global memory (the sync route)."""
+    t = _tensors()
+    k = torch.empty((2, 8, 64, 80), dtype=torch.bfloat16, device=CPU_DEVICE)[..., 4:68]
+    v = torch.empty((2, 8, 64, 80), dtype=torch.bfloat16, device=CPU_DEVICE)[..., 4:68]
+    return _bind(
+        "chunk_fwd_h_diag_fused",
+        (k, v, t["g_last_s"], t["h0"], t["gc"], True, True, False, True),
+    )
+
+
+def test_pass_warps_pace_sync_route_pass_tiles_on_the_free_barrier() -> None:
+    # The pass warps paced themselves on the ring's full barrier alone; a pass
+    # tile copied from global memory (an unaligned source) never arms it, so
+    # they overran the slot and the pass barrier's phases (0/10 launches
+    # right).  Every slot now has a free barrier the slot's MMAs commit to
+    # (pre-arrived once per slot in the prologue): the pass warps wait it
+    # before every tile, whatever fills the slot, and the full barrier only
+    # when a TMA tile does.
+    bound = _bind_fwd_scalar_unaligned()
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.tcgen05 is not None and facts.loop_passes > 0
+    config = dict(
+        _config(64, 64, warps=8, stages=3).config, cute_mma_dag_pass_warps="on"
+    )
+    with bound.env:
+        bound.config_spec.normalize(config)
+    assert config["cute_mma_dag_pass_warps"] == "on"
+    body = _kernel_body(_source(bound, helion.Config(**config)))
+    pass_loop = body.split("if md_warp >= 4:", 1)[1].split("\n    else:\n", 1)[0]
+    assert pass_loop.count("for md_j in cutlass.range(0, 8):") == 1
+    assert f"{RT}.mbar_wait_sleep(md_free + md_stage, md_round)" in pass_loop
+    assert "md_full" not in pass_loop
+    assert pass_loop.count(f"{WARP_RT}.ldg_") > 0 and "md_tma" not in pass_loop
+    assert pass_loop.index("mbar_wait_sleep(md_free") < pass_loop.index(
+        f"{WARP_RT}.ldg_"
+    )
+    assert pass_loop.count(f"{P}.mbarrier_arrive(md_pass + md_stage)") == 1
+    # The ring barriers are never armed: warp 0 waits the pass barrier only.
+    loop = body.split("\n    else:\n", 1)[1]
+    assert f"{RT}.mbar_wait(md_pass + md_stage, md_round)" in loop
+    assert "mbar_wait(md_full" not in loop
+    assert loop.count(f"{P}.tcgen05_commit(md_free + md_stage") == 1

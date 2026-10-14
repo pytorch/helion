@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import contextlib
 from typing import TYPE_CHECKING
+from typing import cast
 
 from ...runtime.config import Config
 from ..compile_environment import CompileEnvironment
 from ..cute.cute_mma_dag import MMA_DAG_KEY
+from ..cute.cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
+from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
+from ..cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from ..cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STORE_DIRECT
 from ..cute.cute_mma_dag import MMA_DAG_STORE_KEY
 from ..cute.cute_mma_dag import MMA_DAG_STORE_STAGED
 from ..cute.cute_mma_dag import MMA_DAG_TCGEN05
 from ..cute.cute_mma_dag import MMA_DAG_WARP
+from ..cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from ..cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute.cute_mma_dag import CuteMmaDagFacts
+from ..cute.cute_mma_dag import mma_dag_config_reason
+from ..cute.cute_mma_dag import mma_dag_pass_warps_lead
+from ..cute.cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute.cute_mma_dag import mma_dag_seed_configs
 from .registry import AutotunerHeuristic
 
@@ -135,8 +144,39 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             and facts.tcgen05.regions
             and not facts.tcgen05.tf32
         )
-        ranked = warp + tensor_memory if regions else tensor_memory + warp
-        for mode, (sizes, warps, stages) in ranked:
+        ranked = [
+            (mode, seed, MMA_DAG_PASS_WARPS_OFF)
+            for mode, seed in (
+                warp + tensor_memory if regions else tensor_memory + warp
+            )
+        ]
+        # Loop operand passes off the chain: the first tensor-memory seed
+        # again with warps 4-7 as pass warps and a ring of three slots at
+        # least (so the next tile lands ahead of its pass).  It leads -- the
+        # promoted default -- for a one-wave grid whose passes are worth
+        # MMA_DAG_PASS_WARP_PACKETS per thread (gated fwd_h_delta: 338 ->
+        # 270 us at s2); otherwise it follows the first seed for the
+        # autotuner (gated dstate's two small passes and the CTA-rich K-loop
+        # kernels lose with it).
+        if tensor_memory:
+            sizes, _warps, stages = tensor_memory[0][1]
+            eight = max(MMA_DAG_WARP_CHOICES)
+            stages = max(stages, MMA_DAG_PASS_WARP_STAGES)
+            if (
+                mma_dag_pass_warps_reason(facts, eight, stages, MMA_DAG_TCGEN05) is None
+                and mma_dag_config_reason(facts, sizes, eight, stages, MMA_DAG_TCGEN05)
+                is None
+            ):
+                resolved = [
+                    cast("int", facts.block_size(i, sizes))
+                    for i in range(len(facts.axes))
+                ]
+                lead = mma_dag_pass_warps_lead(facts, resolved)
+                ranked.insert(
+                    0 if lead else 1,
+                    (MMA_DAG_TCGEN05, (sizes, eight, stages), MMA_DAG_PASS_WARPS_ON),
+                )
+        for mode, (sizes, warps, stages), pass_warps in ranked:
             block_sizes = list(default_sizes)
             for block_id, size in sizes.items():
                 if block_id in block_ids:
@@ -151,6 +191,7 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                         MMA_DAG_STORE_KEY: (
                             MMA_DAG_STORE_STAGED if mode == MMA_DAG_TCGEN05 else store
                         ),
+                        MMA_DAG_PASS_WARPS_KEY: pass_warps,
                     }
                 )
             )

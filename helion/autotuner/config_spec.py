@@ -87,6 +87,10 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_KEYS
 from .._compiler.cute.cute_mma_dag import MMA_DAG_MODES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
+from .._compiler.cute.cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGE_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STAGES_KEY
 from .._compiler.cute.cute_mma_dag import MMA_DAG_STORE_CHOICES
@@ -96,6 +100,7 @@ from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .._compiler.cute.cute_mma_dag import MMA_DAG_WARPS_KEY
 from .._compiler.cute.cute_mma_dag import CuteMmaDagFacts
+from .._compiler.cute.cute_mma_dag import mma_dag_pass_warps_reason
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
@@ -1671,6 +1676,7 @@ class ConfigSpec:
         self.cute_mma_dag_stages: EnumFragment | None = None
         self.cute_mma_dag_store: EnumFragment | None = None
         self.cute_mma_dag_exchange: EnumFragment | None = None
+        self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
@@ -3112,6 +3118,7 @@ class ConfigSpec:
         )
         self.cute_mma_dag_store = EnumFragment(choices=MMA_DAG_STORE_CHOICES)
         self.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
+        self.cute_mma_dag_pass_warps = EnumFragment(choices=MMA_DAG_PASS_WARPS_CHOICES)
 
     def _normalize_cute_mma_dag(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -3129,6 +3136,7 @@ class ConfigSpec:
             (MMA_DAG_STAGES_KEY, self.cute_mma_dag_stages),
             (MMA_DAG_STORE_KEY, self.cute_mma_dag_store),
             (MMA_DAG_EXCHANGE_KEY, self.cute_mma_dag_exchange),
+            (MMA_DAG_PASS_WARPS_KEY, self.cute_mma_dag_pass_warps),
         ):
             assert fragment is not None
             value = config.setdefault(key, fragment.default())
@@ -3146,6 +3154,7 @@ class ConfigSpec:
             config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
             return
         block_sizes = config.get("block_sizes")
         assert isinstance(block_sizes, list)
@@ -3180,6 +3189,7 @@ class ConfigSpec:
                 config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
                 config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
                 config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
+                config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
                 return
             new_sizes, config[MMA_DAG_WARPS_KEY], config[MMA_DAG_STAGES_KEY] = repaired
             for block_id, index in indices.items():
@@ -3191,6 +3201,16 @@ class ConfigSpec:
             config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         if not facts.staging:
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
+        if config[MMA_DAG_PASS_WARPS_KEY] == MMA_DAG_PASS_WARPS_ON and (
+            mma_dag_pass_warps_reason(
+                facts,
+                cast("int", config[MMA_DAG_WARPS_KEY]),
+                cast("int", config[MMA_DAG_STAGES_KEY]),
+                cast("str", config[MMA_DAG_KEY]),
+            )
+            is not None
+        ):
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
         # Inert knobs: the body is replaced, so equal kernels share one
         # autotune identity (the occupancy hint stays searchable).
         config["pid_type"] = "flat"
@@ -7405,10 +7425,12 @@ class ConfigSpec:
                 assert self.cute_mma_dag_stages is not None
                 assert self.cute_mma_dag_store is not None
                 assert self.cute_mma_dag_exchange is not None
+                assert self.cute_mma_dag_pass_warps is not None
                 fields[MMA_DAG_WARPS_KEY] = self.cute_mma_dag_warps
                 fields[MMA_DAG_STAGES_KEY] = self.cute_mma_dag_stages
                 fields[MMA_DAG_STORE_KEY] = self.cute_mma_dag_store
                 fields[MMA_DAG_EXCHANGE_KEY] = self.cute_mma_dag_exchange
+                fields[MMA_DAG_PASS_WARPS_KEY] = self.cute_mma_dag_pass_warps
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
