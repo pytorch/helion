@@ -1325,15 +1325,22 @@ def _cute_grouped_reduce_cluster_warp_online_pair_body(
     scale: float,
     fastmath: bool,
     fp32_redux: bool,
+    owner_only: bool,
 ) -> tuple[cute.Numeric, cute.Numeric]:
     """Exchange one online-softmax pair per warp through one DSM barrier.
 
     ``local_max`` has already been reduced within each warp; ``local_sum``
     is the per-thread partial in that warp's maximum frame. Keeping both
     reductions within the warp removes the CTA-wide maximum and sum barriers.
+
+    ``owner_only`` requires the single-row scalar epilogue proof. Every CTA
+    still receives a complete local mirror and every thread waits for all
+    incoming complete-tx bytes. The final fold uses only that local mirror;
+    no remote receive buffer is read after another CTA can exit. Non-owners
+    return a defined neutral maximum and sum that the proved epilogue ignores.
     """
     warp_sum = cute.arch.warp_reduction_sum(local_sum, threads_in_group=32)
-    slots = (group_span // 32) * cluster_n
+    slots = group_span // 32 * cluster_n
     pairs = cute.make_tensor(buf_ptr, (slots,))
     vals = cute.make_tensor(
         cute.recast_ptr(buf_ptr, dtype=cutlass.Float32), (2 * slots,)
@@ -1355,25 +1362,31 @@ def _cute_grouped_reduce_cluster_warp_online_pair_body(
         )
     cute.arch.mbarrier_wait(mbar_ptr, phase=0)
     group_max = -cutlass.Float32.inf
-    for index in cutlass.range_constexpr(-(-slots // 32)):
-        slot = lane_in_warp + index * 32
-        value = vals[2 * slot] if slot < slots else -cutlass.Float32.inf
-        group_max = cute.arch.fmax(group_max, value, nan=True)
-    if cutlass.const_expr(fp32_redux):
-        group_max = _warp_reduce_max_native_fp32(group_max, threads_in_group=32)
-    else:
-        group_max = cute.arch.warp_reduction_max(
-            group_max, op=_cute_nan_max, threads_in_group=32
-        )
     group_sum = cutlass.Float32(0)
-    for index in cutlass.range_constexpr(-(-slots // 32)):
-        slot = lane_in_warp + index * 32
-        if slot < slots:
-            group_sum += vals[2 * slot + 1] * cute.math.exp2(
-                (vals[2 * slot] - group_max) * scale, fastmath=fastmath
+    fold_active = True
+    if cutlass.const_expr(owner_only):
+        fold_active = warp == 0 and rank == 0
+    if fold_active:
+        group_max = -cutlass.Float32.inf
+        for index in cutlass.range_constexpr(-(-slots // 32)):
+            slot = lane_in_warp + index * 32
+            value = vals[2 * slot] if slot < slots else -cutlass.Float32.inf
+            group_max = cute.arch.fmax(group_max, value, nan=True)
+        if cutlass.const_expr(fp32_redux):
+            group_max = _warp_reduce_max_native_fp32(group_max, threads_in_group=32)
+        else:
+            group_max = cute.arch.warp_reduction_max(
+                group_max, op=_cute_nan_max, threads_in_group=32
             )
-    group_sum = cute.arch.warp_reduction_sum(group_sum, threads_in_group=32)
-    return group_max, group_sum
+        group_sum = cutlass.Float32(0)
+        for index in cutlass.range_constexpr(-(-slots // 32)):
+            slot = lane_in_warp + index * 32
+            if slot < slots:
+                group_sum += vals[2 * slot + 1] * cute.math.exp2(
+                    (vals[2 * slot] - group_max) * scale, fastmath=fastmath
+                )
+        group_sum = cute.arch.warp_reduction_sum(group_sum, threads_in_group=32)
+    return (group_max, group_sum)
 
 
 def _cute_grouped_reduce_cluster_warp_online_pair(
@@ -1388,6 +1401,7 @@ def _cute_grouped_reduce_cluster_warp_online_pair(
     scale: float,
     fastmath: bool = False,
     fp32_redux: bool = False,
+    owner_only: bool = False,
 ) -> tuple[cute.Numeric, cute.Numeric]:
     return _cute_grouped_reduce_cluster_warp_online_pair_body(
         local_sum,
@@ -1400,6 +1414,7 @@ def _cute_grouped_reduce_cluster_warp_online_pair(
         scale,
         fastmath,
         fp32_redux,
+        owner_only,
     )
 
 

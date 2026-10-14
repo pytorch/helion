@@ -1089,8 +1089,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_independent_reduction",
         "cute_cluster_warp_online",
         "cute_register_row",
+        "cute_register_row_tensor_copy",
         "cute_scalar_epilogue",
         "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
@@ -1224,8 +1226,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_independent_reduction",
         "cute_cluster_warp_online",
         "cute_register_row",
+        "cute_register_row_tensor_copy",
         "cute_scalar_epilogue",
         "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
@@ -1362,8 +1366,10 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_independent_reduction",
         "cute_cluster_warp_online",
         "cute_register_row",
+        "cute_register_row_tensor_copy",
         "cute_scalar_epilogue",
         "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
@@ -4469,8 +4475,10 @@ class ConfigSpec:
             "cute_independent_reduction",
             "cute_cluster_warp_online",
             "cute_register_row",
+            "cute_register_row_tensor_copy",
             "cute_scalar_epilogue",
             "cute_scalar_epilogue_keep_inputs",
+            "cute_scalar_epilogue_owner_fold",
             "cute_warp_fp32_redux",
             "cute_replicated_reduction",
             "cute_vector_packet_unroll",
@@ -4480,6 +4488,18 @@ class ConfigSpec:
                     config[key] = False
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
+        key = "cute_scalar_epilogue_owner_fold"
+        if config.get(key) and not config.get("cute_scalar_epilogue"):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} requires cute_scalar_epilogue")
+        key = "cute_register_row_tensor_copy"
+        if config.get(key) and not config.get("cute_register_row"):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} requires cute_register_row")
 
     def _normalize_cute_warp_aggregated_atomics(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -7046,8 +7066,10 @@ class ConfigSpec:
                         "cute_independent_reduction",
                         "cute_cluster_warp_online",
                         "cute_register_row",
+                        "cute_register_row_tensor_copy",
                         "cute_scalar_epilogue",
                         "cute_scalar_epilogue_keep_inputs",
+                        "cute_scalar_epilogue_owner_fold",
                         "cute_warp_fp32_redux",
                         "cute_replicated_reduction",
                         "cute_vector_packet_unroll",
