@@ -45,10 +45,13 @@ match, the kernel keeps the two-exchange form.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import copy
 import dataclasses
 import math
 from typing import Callable
+from typing import TypeGuard
+from typing import cast
 
 _CLUSTER_REDUCE = "_cute_grouped_reduce_cluster"
 _BLOCK_REDUCE = "_cute_grouped_reduce_block"
@@ -95,12 +98,17 @@ def _reparse_expr(node: ast.expr) -> ast.expr:
     return ast.parse(ast.unparse(node), mode="eval").body
 
 
-def _is_name_assign(stmt: ast.stmt) -> bool:
+def _is_name_assign(stmt: ast.AST) -> TypeGuard[ast.Assign]:
     return (
         isinstance(stmt, ast.Assign)
         and len(stmt.targets) == 1
         and isinstance(stmt.targets[0], ast.Name)
     )
+
+
+def _assigned_name(stmt: ast.Assign) -> str:
+    """Name of a target already proved by ``_is_name_assign``."""
+    return cast("ast.Name", stmt.targets[0]).id
 
 
 def _loads(node: ast.AST) -> list[str]:
@@ -216,7 +224,7 @@ def _canonical_src(expr: ast.expr, rename: dict[str, str]) -> str:
     return ast.unparse(node)
 
 
-def _is_exp2(call: ast.AST) -> bool:
+def _is_exp2(call: ast.AST) -> TypeGuard[ast.Call]:
     return (
         isinstance(call, ast.Call)
         and len(call.args) == 1
@@ -593,6 +601,41 @@ def _strip_fp32_casts(node: ast.expr) -> ast.expr:
     return result
 
 
+def _stable_outer_definitions(body: list[ast.stmt], before: int) -> dict[str, ast.expr]:
+    """Pure scalar aliases whose dependencies have one unchanged SSA value.
+
+    Expand only definitions preceding the first reduction. Every candidate and
+    dependency is either never assigned in this body or was already proved as
+    a single-assignment scalar. A later write, including a loop-carried write,
+    therefore prevents substitution into a subsequent load site's address.
+    """
+    from ..tile_strategy import _is_proven_relocatable_assignment
+
+    module = ast.Module(body=body, type_ignores=[])
+    writes = Counter(
+        node.id
+        for node in ast.walk(module)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    )
+    stable = set(_loads(module)) - writes.keys()
+    definitions: dict[str, ast.expr] = {}
+    for statement in body[:before]:
+        if not _is_name_assign(statement):
+            continue
+        name = statement.targets[0].id
+        if (
+            writes[name] != 1
+            or not set(_loads(statement.value)) <= stable
+            or not _is_proven_relocatable_assignment(statement, allow_load=False)
+        ):
+            continue
+        # Canonicalize this acyclic prefix once, so an expression's nesting
+        # depth does not change how far its outer aliases are substituted.
+        definitions[name] = _Inliner(definitions).visit(_reparse_expr(statement.value))
+        stable.add(name)
+    return definitions
+
+
 class _ElementValues:
     """Canonical per-element values of expressions inside ``for`` nests
     whose innermost loop is ``range_constexpr(N)``: local definitions are
@@ -600,9 +643,10 @@ class _ElementValues:
     other loop indices become positional placeholders, and register-cache
     reads become the values written into them."""
 
-    def __init__(self) -> None:
+    def __init__(self, outer_definitions: dict[str, ast.expr] | None = None) -> None:
         # (cache name, canonical index) -> canonical stored value
         self.cache_values: dict[tuple[str, str], ast.expr] = {}
+        self.outer_definitions = outer_definitions or {}
 
     @staticmethod
     def _definitions(
@@ -647,7 +691,7 @@ class _ElementValues:
         definitions = self._definitions(chain)
         if definitions is None:
             return None
-        expr = _Inliner(definitions).visit(_reparse_expr(node))
+        expr = _Inliner(self.outer_definitions | definitions).visit(_reparse_expr(node))
         names: dict[str, ast.expr] = {
             loop.target.id: ast.Name(id=f"_loop{level}_", ctx=ast.Load())  # type: ignore[attr-defined]
             for level, (loop, _) in enumerate(chain)
@@ -799,7 +843,7 @@ def _reduced_values(
     chain = _loop_chain(fold, parents, root)
     if chain is None:
         return None
-    elements = _ElementValues()
+    elements = _ElementValues(_stable_outer_definitions(body, site_a.top_idx))
     # Register caches written beside the fold (same loops), and nowhere else.
     for statement in body:
         for node in ast.walk(statement):

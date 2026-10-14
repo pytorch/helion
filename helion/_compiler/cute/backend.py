@@ -1844,6 +1844,11 @@ class CuteBackend(Backend):
             or key == "cute_proven_bounds"
             or key == "cute_rng_packet"
             or key == "cute_independent_reduction"
+            or key == "cute_cluster_warp_online"
+            or key == "cute_register_row"
+            or key == "cute_scalar_epilogue"
+            or key == "cute_scalar_epilogue_keep_inputs"
+            or key == "cute_warp_fp32_redux"
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
@@ -2199,6 +2204,7 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
             "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
+            "_cute_grouped_reduce_cluster_warp_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_warp_online_pair",
             "_cute_grouped_reduce_cluster_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_online_pair",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
