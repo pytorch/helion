@@ -287,6 +287,45 @@ class TestPallasJaggedCarrySimple(TestCase):
             expected[s:e] = jagged[s:e] + 1.0 if (e - s) > 8 else jagged[s:e] * 2.0
         torch.testing.assert_close(out, expected)
 
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_carry_scalar_branch_load(self, dtype: torch.dtype, loop_type: str) -> None:
+        # The row load sits under a scalar branch, and the last group's aligned
+        # row window (48..80 for bf16) extends past L=64, which is itself a
+        # multiple of block_row=32. All three groups must match the reference.
+        @helion.kernel(backend="pallas")
+        def jagged_branch_load(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B, D, K = dense.shape
+            out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for kt in hl.tile(0, K):
+                        acc = hl.zeros([st, kt], dtype=torch.float32)
+                        for dt in hl.tile(0, D):
+                            if e - s > 0:
+                                acc = acc + torch.matmul(
+                                    jagged[st, dt], dense[g, dt, kt]
+                                )
+                        out[st, kt] = acc
+            return out
+
+        seq_offsets, jagged, dense = _inputs([0, 29, 61, 64], 128, 128, dtype)
+        code, out = _run(
+            seq_offsets,
+            jagged,
+            dense,
+            [32, 128, 128],
+            loop_type,
+            kernel=jagged_branch_load,
+        )
+        self.assertIn("lax.cond", code)
+        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
+
 
 # bf16 with the kernel's f32-accumulating MXU matches a single torch matmul of
 # the same group bit-for-bit (single D-tile), so the default tolerances hold.
@@ -327,6 +366,30 @@ class TestPallasJaggedCarryBmm(TestCase):
         seq_offsets, jagged, dense = _inputs([0, 13, 100, 113, 200], 128, 128, dtype)
         _code, out = _run(
             seq_offsets, jagged, dense, [32, 128, 128], loop_type, kernel=kernel
+        )
+        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
+
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    @parametrize(
+        "case",
+        [
+            # Total L=25 < block_row=32: the only row tile is partial.
+            subtest(([0, 13, 25], 128, 32), name="short_rows"),
+            # Total K=64 < block_col=128: the only column tile is partial.
+            subtest(([0, 13, 25, 40], 64, 16), name="short_columns"),
+        ],
+    )
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_partial_last_tile(
+        self, dtype: torch.dtype, case, kernel, loop_type: str
+    ) -> None:
+        # The carry store writes the full (block_row, block_col) block even when
+        # the output's last tile along rows or columns is partial.
+        offsets, K, block_row = case
+        seq_offsets, jagged, dense = _inputs(offsets, 128, K, dtype)
+        _code, out = _run(
+            seq_offsets, jagged, dense, [block_row, 128, 128], loop_type, kernel=kernel
         )
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
@@ -703,7 +766,7 @@ class TestPallasJaggedCarryRejects(TestCase):
         # loudly instead of clobbering the boundary with a plain store.
         seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
         with self.assertRaisesRegex(
-            exc.InductorLoweringError, "block_row .* must be a multiple"
+            exc.InvalidConfig, "block_row .* must be a multiple"
         ):
             _run(seq_offsets, jagged, dense, [8, 128, 128], loop_type, kernel=kernel)
 
@@ -914,7 +977,7 @@ class TestPallasJaggedCarryRejects(TestCase):
             return out
 
         seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
-        with self.assertRaisesRegex(exc.InductorLoweringError, "only grid dimension"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, "only grid dimension"):
             code_and_output(
                 two_grid_bmm,
                 (seq_offsets, jagged, dense),
