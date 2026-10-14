@@ -93,3 +93,45 @@ def selection_values_only(node: Node) -> bool:
             for user in node.users
         )
     )
+
+
+def unordered_topk_args(node: Node) -> tuple[Node, int, int, bool] | None:
+    """Bind a literal unordered top-k without borrowing sorting admission.
+
+    The ordinary sorting owners may emit ordered results for either top-k mode.
+    A compaction owner needs the explicit False rather than a schema default.
+    """
+    if node.target is not torch.ops.aten.topk.default:
+        return None
+    schema = node.target._schema.arguments
+    if len(node.args) > len(schema) or set(node.kwargs) - {
+        argument.name for argument in schema
+    }:
+        return None
+    arguments: dict[str, object] = {}
+    for position, argument in enumerate(schema):
+        if position < len(node.args):
+            if argument.name in node.kwargs:
+                return None
+            arguments[argument.name] = node.args[position]
+        elif argument.name in node.kwargs:
+            arguments[argument.name] = node.kwargs[argument.name]
+        elif argument.has_default_value():
+            arguments[argument.name] = argument.default_value
+        else:
+            return None
+    source = arguments["self"]
+    k, dim, largest = (
+        arguments["k"],
+        arguments["dim"],
+        arguments["largest"],
+    )
+    if (
+        not isinstance(source, Node)
+        or type(k) is not int
+        or type(dim) is not int
+        or type(largest) is not bool
+        or arguments["sorted"] is not False
+    ):
+        return None
+    return source, k, dim, largest

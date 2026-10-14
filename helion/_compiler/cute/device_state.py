@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
+    from .radix_selection import RadixSelectionPlan
     from .register_producers import RegisterProducerRequest
     from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
@@ -826,6 +827,7 @@ class CuteDeviceFunctionState:
         # the ordinary lane topology.
         self.direct_affine_plan: DirectAffinePlan | None = None
         self.topk_plan: CuteTopKPlan | None = None
+        self.radix_selection_plan: RadixSelectionPlan | None = None
         self.register_region_plan: RegisterRegionPlan | None = None
         # Packed one-warp lowering for structurally proven split-input T=1
         # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.

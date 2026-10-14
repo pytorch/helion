@@ -776,6 +776,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         raise exc.BackendUnsupported("cute", "topk failed late validation")
 
+    def _try_codegen_radix_selection_root(self) -> bool:
+        plan = self.device_function.cute_state.radix_selection_plan
+        if plan is None:
+            return False
+        from .cute.radix_selection_codegen import codegen_radix_selection_root
+
+        if codegen_radix_selection_root(self, plan):
+            return True
+        raise exc.InvalidConfig("radix selection failed its final row/grid proof")
+
     def _try_codegen_register_region(self) -> bool:
         plan = self.device_function.cute_state.register_region_plan
         if plan is None:
@@ -1931,7 +1941,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         root_graph_info.graph_id
                     )
                     if (
-                        not (
+                        not self._try_codegen_radix_selection_root()
+                        and not (
                             requested_fragment
                             and self._try_codegen_computed_fragment_root()
                         )
