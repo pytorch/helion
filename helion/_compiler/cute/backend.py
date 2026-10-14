@@ -1594,11 +1594,16 @@ class CuteBackend(Backend):
         return priors
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from ..aten_lowering import sort_lowering
         from ..aten_lowering import squeeze_lowering
         from .aten_lowering import NumericExtremumLowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target is torch.ops.aten.sort.stable:
+            # CuTe's rank/fragment sorting already breaks ties by input index.
+            # Keep other backends' existing Inductor stable-sort lowering.
+            return sort_lowering
         if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
             # These overloads have the same logical-view semantics as squeeze.dim.
             # Register them before Inductor turns them into a ReinterpretView;

@@ -3750,7 +3750,12 @@ def _cute_load_feeds_sort_or_scan(load_node: object) -> bool:
                 continue
             target = user.target
             if (
-                target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+                target
+                in (
+                    torch.ops.aten.sort.default,
+                    torch.ops.aten.sort.stable,
+                    torch.ops.aten.topk.default,
+                )
                 or getattr(target, "__name__", None) == "_associative_scan"
             ):
                 return True

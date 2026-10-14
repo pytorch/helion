@@ -8690,7 +8690,8 @@ def test_fragment_network_topk_mixed_fallback(wide):
         actual[0], x.sort(dim=-1, descending=True, stable=True).values[:, :, :3]
     )
     assert torch.equal(actual[1], y.sort(dim=-1, stable=True).values[:, :, :3])
-    assert "fragment_topk_previous_rank" in source and _has_register_selection(source)
+    assert ("fragment_topk_previous_rank" in source) is wide
+    assert _has_register_selection(source)
 
 
 @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)

@@ -82,6 +82,9 @@ from .local_atomic import terminal_loop_symbols
 from .local_atomic import uniform_local_branch_inputs
 from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
+from .ordered_selection import is_ordered_selection
+from .ordered_selection import ordered_selection_args
+from .ordered_selection import selection_values_only
 from .private_scalar_loops import private_scalar_loop_nodes
 from .private_scalar_loops import privatize_scalar_loop
 from .pure_producer_regions import pure_producer_plan
@@ -354,13 +357,16 @@ def _fragment_logical_shape(
             return ()
         if target is operator.getitem:
             parent = source.args[0]
-            if (
-                not isinstance(parent, Node)
-                or parent.target is not torch.ops.aten.topk.default
-            ):
+            if not isinstance(parent, Node) or not is_ordered_selection(parent):
                 return None
-            shape = infer(cast("Node", parent.args[0]))
-            return (*shape[:-1], dimension(parent.args[1])) if shape else None
+            arguments = ordered_selection_args(parent)
+            if arguments is None:
+                return None
+            source_node, k, *_ = arguments
+            shape = infer(source_node)
+            if not shape:
+                return None
+            return (*shape[:-1], dimension(k)) if k is not None else shape
         if target is torch.ops.aten.gather.default:
             return infer(cast("Node", source.args[2]))
         tensors = [
@@ -1915,34 +1921,54 @@ class FragmentCompiler:
         return extent
 
     def topk(self, node: Node, values: dict[Node, object]) -> tuple[Fragment, Fragment]:
-        """Complete last-axis selection inside an existing uniform fragment owner.
+        """Complete last-axis sorting/selection in a uniform fragment owner.
 
         Each worker owns one logical leading coordinate and all its selected
         slots. Integer ranks preserve subnormals, zeros, NaNs and stable index
         ties without moving comparisons across shared-memory lifetimes.
         """
-        source = values[cast("Node", node.args[0])]
+        arguments = ordered_selection_args(node)
+        assert arguments is not None
+        source_node, k, dim, largest, _ = arguments
+        source = values[source_node]
         assert isinstance(source, Fragment)
-        fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
-        k = cast("int", node.args[1])
-        largest = cast(
-            "bool",
-            node.args[3] if len(node.args) > 3 else node.kwargs.get("largest", True),
-        )
-        n = _static_selection_extent(self.env, cast("Node", node.args[0]))
+        fake = cast("torch.Tensor", source_node.meta["val"])
+        n = _static_selection_extent(self.env, source_node)
+        if k is None:
+            k = n
         bid = self.env.resolve_block_id(fake.shape[-1])
         # The configured capacity can include padding, but a rolling selection
         # would choose independent subsets instead of one complete top-k.
-        if n is None or bid in self.offsets or source.shape[-1] < n or not 0 < k <= n:
+        if (
+            n is None
+            or k is None
+            or dim not in (-1, fake.ndim - 1)
+            or bid in self.offsets
+            or source.shape[-1] < n
+            or not 0 < k <= n
+        ):
             raise exc.InvalidConfig(
                 "fragment topk requires a complete static last axis"
             )
+        from ..autotuner_heuristics.cute_fragment_topk_network import (
+            network_topk_supported,
+        )
+
+        values_only64 = source.dtype == torch.int64 and selection_values_only(node)
+        use_network = self.df.config.get(
+            "cute_fragment_topk_network", False
+        ) and network_topk_supported(source.dtype, n, k, values_only=values_only64)
         source = self.materialize(source)
         self.held.append(source)
         out_shape = (*source.shape[:-1], k)
         selected = self.allocate(Fragment(out_shape, source.dtype, lambda _: "0"))
         self.held.append(selected)
-        indices = self.allocate(Fragment(out_shape, torch.int64, lambda _: "0"))
+        # Keep tuple metadata for the proved-dead index result without reserving
+        # shared storage. Every observed-index/default path keeps its old owner.
+        if use_network and values_only64:
+            indices = Fragment(out_shape, torch.int64, lambda _: "0", True)
+        else:
+            indices = self.allocate(Fragment(out_shape, torch.int64, lambda _: "0"))
         self.held.append(indices)
         float_rank = source.dtype in (torch.float16, torch.bfloat16, torch.float32)
         rank_type = "cutlass.Int32" if float_rank else self.dtype(source.dtype)
@@ -2013,14 +2039,10 @@ class FragmentCompiler:
                 self.emit(f"{last_col} = {best_col}")
             self.cg.add_statement(loop)
 
-        from ..autotuner_heuristics.cute_fragment_topk_network import (
-            network_topk_supported,
-        )
-
-        if self.df.config.get(
-            "cute_fragment_topk_network", False
-        ) and network_topk_supported(source.dtype, n, k):
-            self.network_topk(source, selected, indices, n, k, largest)
+        if use_network:
+            self.network_topk(
+                source, selected, None if values_only64 else indices, n, k, largest
+            )
         else:
             self.elements(source.shape[:-1], select)
         self.held.pop()
@@ -2043,7 +2065,7 @@ class FragmentCompiler:
         self,
         source: Fragment,
         selected: Fragment,
-        indices: Fragment,
+        indices: Fragment | None,
         n: int,
         k: int,
         largest: bool,
@@ -2054,10 +2076,14 @@ class FragmentCompiler:
         Only key loading and exact selection change. Every lane participates in
         each network, including logical/physical padding; cyclic output owners
         store each public slot once and gather the original typed payload.
+        An Int64 value-only boundary instead carries the value itself, without
+        another original-column field or a payload gather. Complementing signed
+        keys reverses their complete order, including both Int64 extrema.
         """
         from .selection_lowering import emit_selection_network
 
         assert self.threads % 32 == 0
+        assert indices is not None or source.dtype == torch.int64
         padded_n = 1 << (n - 1).bit_length()
         padded_k = 1 << (k - 1).bit_length()
         local_n = max(1, padded_n // 32)
@@ -2092,7 +2118,11 @@ class FragmentCompiler:
                     self.emit(
                         f"{value} = {self.cast(source.read((*row, col)), source.dtype)}"
                     )
-                    if source.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    if indices is None:
+                        self.emit(
+                            f"{keys}[{local}] = {value if largest else f'~{value}'}"
+                        )
+                    elif source.dtype in (torch.float16, torch.bfloat16, torch.float32):
                         narrow = source.dtype != torch.float32
                         mask = 0x7FFF if narrow else 0x7FFFFFFF
                         infinity = {
@@ -2116,12 +2146,13 @@ class FragmentCompiler:
                         )
                     else:
                         self.emit(f"{rank} = cutlass.Int64({value})")
-                    if not largest:
+                    if indices is not None and not largest:
                         # Widen first: smallest Int32 is a valid finite key.
                         self.emit(f"{rank} = -{rank}")
-                    self.emit(
-                        f"{keys}[{local}] = ({rank} << cutlass.Int32({bits})) | cutlass.Int64({index_mask} - {col})"
-                    )
+                    if indices is not None:
+                        self.emit(
+                            f"{keys}[{local}] = ({rank} << cutlass.Int32({bits})) | cutlass.Int64({index_mask} - {col})"
+                        )
                 self.cg.add_statement(branch)
             self.cg.add_statement(loop)
             result = emit_selection_network(
@@ -2150,16 +2181,24 @@ class FragmentCompiler:
                 )
                 branch.body.clear()
                 with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
-                    self.emit(
-                        f"{column} = cutlass.Int32({index_mask}) - cutlass.Int32({result}[{output}] & cutlass.Int64({index_mask}))"
-                    )
-                    # Resident views can still emit coordinate assignments.
-                    # Resolve their read only after the selected column exists,
-                    # inside the public-slot mask, never before this loop.
-                    self.emit(
-                        f"{selected.read((*row, slot))} = {self.cast(source.read((*row, column)), source.dtype)}"
-                    )
-                    self.emit(f"{indices.read((*row, slot))} = cutlass.Int64({column})")
+                    if indices is None:
+                        value = f"{result}[{output}]"
+                        self.emit(
+                            f"{selected.read((*row, slot))} = {self.cast(value if largest else f'~{value}', torch.int64)}"
+                        )
+                    else:
+                        self.emit(
+                            f"{column} = cutlass.Int32({index_mask}) - cutlass.Int32({result}[{output}] & cutlass.Int64({index_mask}))"
+                        )
+                        # Resident views can still emit coordinate assignments.
+                        # Resolve their read only after the selected column exists,
+                        # inside the public-slot mask, never before this loop.
+                        self.emit(
+                            f"{selected.read((*row, slot))} = {self.cast(source.read((*row, column)), source.dtype)}"
+                        )
+                        self.emit(
+                            f"{indices.read((*row, slot))} = cutlass.Int64({column})"
+                        )
                 self.cg.add_statement(branch)
             self.cg.add_statement(loop)
 
@@ -3887,7 +3926,7 @@ class FragmentCompiler:
             return self.memory(
                 node, values, target is memory_ops.store, deferred_updates
             )
-        if target is torch.ops.aten.topk.default:
+        if is_ordered_selection(node):
             return self.topk(node, values)
         if target is torch.ops.aten.gather.default:
             from .bounded_gather import prove_gather
@@ -4362,11 +4401,11 @@ def computed_fragment_supported(
         node
         for info in graphs
         for node in info.graph.nodes
-        if node.target is torch.ops.aten.topk.default
+        if is_ordered_selection(node)
     ]
 
     def needs_coordinates(node: Node) -> bool:
-        if node.target is torch.ops.aten.topk.default:
+        if is_ordered_selection(node):
             source_node = cast("Node", node.args[0])
             source = source_node.meta.get("val")
             if len(selections) > 1 or (
@@ -4533,6 +4572,8 @@ def computed_fragment_supported(
         torch.ops.aten.view.dtype,
         torch.ops.aten.alias.default,
         torch.ops.aten.topk.default,
+        torch.ops.aten.sort.default,
+        torch.ops.aten.sort.stable,
         torch.ops.aten.gather.default,
     }
     if any(
@@ -4548,10 +4589,15 @@ def computed_fragment_supported(
         return False
     for info in graphs:
         for node in info.graph.nodes:
-            if node.target is torch.ops.aten.topk.default:
-                source = cast("Node", node.args[0]).meta.get("val")
-                k = node.args[1]
-                dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+            if is_ordered_selection(node):
+                arguments = ordered_selection_args(node)
+                if arguments is None:
+                    return False
+                source_node, k, dim, *_ = arguments
+                source = source_node.meta.get("val")
+                width = _static_selection_extent(env, source_node)
+                if k is None:
+                    k = width
                 if (
                     not isinstance(source, torch.Tensor)
                     or source.ndim < 1
@@ -4564,12 +4610,7 @@ def computed_fragment_supported(
                         torch.int64,
                     )
                     or dim not in (-1, source.ndim - 1)
-                    or (
-                        width := _static_selection_extent(
-                            env, cast("Node", node.args[0])
-                        )
-                    )
-                    is None
+                    or width is None
                     or not isinstance(k, int)
                     or not 0 < k <= width
                     or not all(configured_axis(size) for size in source.shape)
@@ -4598,7 +4639,7 @@ def computed_fragment_supported(
                     or index.target is not operator.getitem
                     or index.args[1] != 1
                     or not isinstance(index.args[0], Node)
-                    or index.args[0].target is not torch.ops.aten.topk.default
+                    or not is_ordered_selection(index.args[0])
                 ):
                     return False
                 original_node = cast("Node", index.args[0].args[0])
