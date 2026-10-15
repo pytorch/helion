@@ -3931,6 +3931,7 @@ class CuteBackend(Backend):
         from ..tile_strategy import PerThreadNDTileStrategy
         from .matmul_utils import cute_kernel_has_half_precision_matmul
         from .matmul_utils import cute_matmul_contraction_block_ids
+        from .matmul_utils import cute_matmul_root_placements
 
         if len(set(block_ids)) != len(block_ids):
             # ``hl.tile([m, n], block_size=[bs, bs])`` with one registered
@@ -4067,6 +4068,37 @@ class CuteBackend(Backend):
                 return bool(lhs == rhs)
 
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+            spec = env.config_spec
+            if (
+                self.name == "cute"
+                and config.get("cute_collective_mma")
+                and not spec.cute_pointwise_region_block_ids.issuperset(block_ids)
+                and (placements := cute_matmul_root_placements(env, device_ir))
+                and all(
+                    bid not in block_ids
+                    for fact, _root in placements
+                    for bid in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+                )
+            ):
+                cap = 1
+                if (
+                    block_ids in device_ir.grid_block_ids
+                    and config.get("cute_collective_compute", "warp") == "warp"
+                ):
+                    cap = min(
+                        (
+                            spec.num_threads.config_get(config.num_threads, bid, 0) or 1
+                            for fact, _root in placements
+                            for bid in (fact.m_block_id, fact.n_block_id)
+                            if bid is not None
+                        ),
+                        default=1,
+                    )
+                for i, size in enumerate(nd_block_size):
+                    if num_threads_config[i] == 0 and isinstance(size, int):
+                        num_threads_config[i] = (
+                            _largest_divisor_at_most(size, cap) if i < 2 else 1
+                        )
             original_num_threads_config = list(num_threads_config)
             mma_candidate = _is_mma_candidate_loop(
                 fn,
