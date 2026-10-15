@@ -31,6 +31,7 @@ from .._compat import device_num_sm
 from .._compat import get_device_name
 from .._compat import supports_torch_compile_fusion
 from .._compat import target_device_capability
+from .._compiler.compile_environment import TensorDescriptorAlignmentGuard
 from .._utils import counters
 from .._utils import indexing_uses_tensor_descriptor
 from ..autotuner.base_cache import helion_key
@@ -49,7 +50,9 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .kernel import BoundKernel
+    from .kernel import CompiledConfig
     from .kernel import Kernel
     from .settings import Settings
 
@@ -62,6 +65,17 @@ if TYPE_CHECKING:
         tuple[Hashable, ...],
         str,
     ]
+    # What a ``BoundKernel._specialize_extra`` extractor reads: its source, the
+    # descriptor guard and extent cap for descriptor extractors, or None for
+    # runtime input classifiers.
+    GuardSource = (
+        tuple[
+            Source,
+            TensorDescriptorLayoutGuard | TensorDescriptorAlignmentGuard | None,
+            int | None,
+        ]
+        | None
+    )
 
 log = logging.getLogger(__name__)
 _UNCACHEABLE = object()
@@ -435,6 +449,26 @@ def source_guard(source: Source, arguments: dict[str, int]) -> list[object] | No
     return None
 
 
+def _serialized_guard(
+    guard_source: GuardSource, arguments: dict[str, int], backend: str
+) -> list[object] | None:
+    """Serialize what one ``BoundKernel._specialize_extra`` extractor reads.
+
+    ``None`` marks extractors the cache cannot rebuild in a later process.
+    """
+    if guard_source is None:
+        return None
+    source, guard, extent_cap = guard_source
+    tensor_guard = source_guard(source, arguments)
+    if tensor_guard is None or guard is None:
+        return tensor_guard
+    if isinstance(guard, TensorDescriptorAlignmentGuard):
+        return ["td_alignment", tensor_guard, guard.requires_zero_storage_offset]
+    if backend != "triton":
+        return None
+    return ["td_layout", tensor_guard, guard.ndim, guard.element_size, extent_cap]
+
+
 def _valid_guard(guard: object) -> bool:
     match guard:
         case ["arg", int()]:
@@ -509,11 +543,11 @@ def save_binding(
     Kernels whose specialization includes a runtime input classifier have no
     serializable guard and keep the ordinary frontend path.
     """
-    key = bound._generated_code_artifact_key
-    input_key = bound._generated_code_input_key
-    if key is None or input_key is None or should_skip_cache():
+    state = bound._generated_code
+    if state is None or state.artifact_key is None or should_skip_cache():
         return
-    signature, guards, extra_results, compiler_seed_results, _ = input_key
+    key = state.artifact_key
+    signature, guards, extra_results, compiler_seed_results, _ = state.input_key
     # The binding is only valid under the schema its signature published in
     # this process, and only if its guards are all serializable (no ``None``).
     # A dynamic-shape binding whose own compile guarded on an input size (a
@@ -523,7 +557,7 @@ def save_binding(
     # they are saved even after another binding published facts.
     if (
         None in guards
-        or bound._guard_facts
+        or state.guard_facts
         or bound.kernel._published_guards.get(signature) != guards
     ):
         return
@@ -561,13 +595,14 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     guards. Other backends, distributed kernels and descriptor
     configs retain their ordinary codegen path.
     """
+    state = bound._generated_code
     if (
         not bound.settings.generated_code_cache
         or should_skip_cache()
         or bound.settings.backend != "triton"
         or bound.env._is_distributed
         or bound.env.runtime_input_specializations
-        or bound._generated_code_input_key is None
+        or state is None
     ):
         return None
     if any(
@@ -592,7 +627,7 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
         fn.__code__.co_filename,
         fn.__code__.co_firstlineno,
         bound.kernel.kernel_source(),
-        bound._generated_code_input_key,
+        state.input_key,
         get_device_name(bound.env.device),
         bound.config_spec.target_device_capability,
         bound.config_spec.num_sm,
@@ -603,6 +638,132 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
         settings,
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+@dataclasses.dataclass
+class GeneratedCodeState:
+    """A binding's generated code cache keys and the entries it persisted."""
+
+    input_key: GeneratedCodeInputKey
+    # Key of the binding's pre-frontend entries; None when they are not saved.
+    artifact_key: str | None
+    source_keys: dict[Config, str] = dataclasses.field(default_factory=dict)
+    # Disk entries this binding already wrote or loaded. Repeated set_config
+    # calls skip the writers' lock and eviction scan.
+    persisted_source_keys: set[str] = dataclasses.field(default_factory=set)
+    persisted_binding: tuple[Config, str] | None = None
+    # Guard facts (see BoundKernel._guarded_input_facts) the binding's frontend
+    # and its code generation so far fired; set when the binding publishes them.
+    frontend_guard_facts: int | None = None
+    guard_facts: int = 0
+
+    @classmethod
+    def create(
+        cls,
+        bound: BoundKernel,
+        args: Sequence[object],
+        artifact_key: str | None,
+        input_key: str | None,
+    ) -> GeneratedCodeState | None:
+        """The state of a binding the frontend just compiled, or None if ineligible."""
+        if input_key is None:
+            input_key = binding_input_key(bound.kernel, args)
+        if input_key is None:
+            return None
+        guard_sources: list[GuardSource] = []
+        extractors = bound._specialize_extra(guard_sources)
+        arguments = {
+            name: index
+            for index, name in enumerate(bound.kernel.signature.parameters.keys())
+        }
+        guards = tuple(
+            _serialized_guard(guard_source, arguments, bound.env.backend_name)
+            for guard_source in guard_sources
+        )
+        return cls(
+            (
+                bound._base_spec_key,
+                guards,
+                tuple(extractor(args) for extractor in extractors),
+                bound._compiler_seed_specialization_results,
+                input_key,
+            ),
+            artifact_key,
+        )
+
+    @property
+    def guards(self) -> tuple[list[object] | None, ...]:
+        """The specialization guards as the cache saves them."""
+        return self.input_key[1]
+
+    @property
+    def codegen_fired_guard_facts(self) -> bool:
+        """Whether code generation guarded on inputs beyond what the frontend did.
+
+        The generated source key covers the frontend, so a guard that only code
+        generation recorded is not part of it.
+        """
+        return self.guard_facts != self.frontend_guard_facts
+
+    def record_guard_facts(self, count: int) -> None:
+        """Record the facts the binding published so far.
+
+        Binding publishes them before any code generation, and code generation
+        after each config, so the first count is the frontend's.
+        """
+        if self.frontend_guard_facts is None:
+            self.frontend_guard_facts = count
+        self.guard_facts = count
+
+    def load(self, config: Config) -> str | None:
+        """Saved source for a normalized config that ``compile_and_save`` keyed."""
+        if (source_key := self.source_keys.get(config)) is None:
+            return None
+        source = load_generated_code(source_key)
+        if source is not None and not self.codegen_fired_guard_facts:
+            self.persisted_source_keys.add(source_key)
+        return source
+
+    def compile_and_save(self, bound: BoundKernel, config: Config) -> CompiledConfig:
+        """Compile the config ``set_config`` selected and persist its source.
+
+        Only a selected config is saved: autotuning candidates compiled with
+        ``compile_config`` stay off disk.
+        """
+        normalized = bound._normalized_config_copy(config)
+        source_key = None
+        if not bound.settings.print_output_code:
+            source_key = self.source_keys.get(normalized)
+            if source_key is None:
+                source_key = generated_code_cache_key(bound, normalized)
+            if source_key is not None:
+                self.source_keys[normalized] = source_key
+        run = bound.compile_config(config)
+        # compile_config wrote the source now or, for an autotuning winner,
+        # earlier. Persist that file without generating it again.
+        if (
+            source_key is not None
+            and source_key not in self.persisted_source_keys
+            and not self.codegen_fired_guard_facts
+            and (path := bound._cache_path_map.get(normalized)) is not None
+        ):
+            # PyCodeCache writes the supplied source unchanged; its extra key
+            # changes the module identity, not the stored source text.
+            try:
+                source = Path(path).read_text(encoding="utf-8")
+            except OSError as error:
+                log.warning("Could not read generated code %s: %s", path, error)
+            else:
+                save_generated_code(source_key, source)
+                self.persisted_source_keys.add(source_key)
+        if (
+            self.artifact_key is not None
+            and (source_key := self.source_keys.get(normalized)) is not None
+            and self.persisted_binding != (config, source_key)
+        ):
+            save_binding(bound, config, normalized, source_key)
+            self.persisted_binding = (config, source_key)
+        return run
 
 
 def _cache_path(key: str) -> Path:

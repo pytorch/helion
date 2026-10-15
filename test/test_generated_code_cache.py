@@ -24,7 +24,6 @@ from helion._utils import counters
 from helion.autotuner.base_search import BaseAutotuner
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
-from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
 from helion.runtime.kernel import KernelCompiler
 from helion.runtime.kernel import PyCodeCache
@@ -224,15 +223,12 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
             bound.compile_config(config)
             with (
                 patch.object(
-                    # helion.runtime.kernel names the decorator, not the module.
-                    sys.modules[BoundKernel.__module__],
+                    cache,
                     "generated_code_cache_key",
                     side_effect=cache.generated_code_cache_key,
                 ) as source_key,
                 patch.object(
-                    sys.modules[BoundKernel.__module__],
-                    "save_binding",
-                    side_effect=cache.save_binding,
+                    cache, "save_binding", side_effect=cache.save_binding
                 ) as save_binding,
                 patch.object(
                     cache, "_save_entry", side_effect=cache._save_entry
