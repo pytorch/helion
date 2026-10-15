@@ -163,26 +163,27 @@ class TestCuteRolledCluster(TestCase):
         torch.testing.assert_close(out, x.float().amax(dim=-1))
         self.assertIn("_cute_grouped_reduce_cluster(", code)
 
-    def test_rolled_cluster_skipped_indivisible(self) -> None:
-        """When the extent does not split into whole per-CTA chunk multiples
-        the knob is silently inert (single-CTA rolled codegen, still
-        correct)."""
-        x = torch.randn(32, 6144, device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn(6144, device=DEVICE, dtype=torch.bfloat16)
-        code, (out, inv_rms) = code_and_output(
-            rms_norm_rolled_kernel,
-            (x, weight),
-            block_sizes=[1],
-            num_threads=[1, 128],
-            reduction_loops=[2048],
-            cute_vector_widths=[8, 1],
-            cute_cluster_n=4,
-        )
-        ref_out, ref_inv_rms = _rms_ref(x, weight)
-        torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(inv_rms, ref_inv_rms, rtol=1e-3, atol=1e-3)
-        self.assertNotIn("_cute_grouped_reduce_cluster(", code)
-        self.assertNotIn("_helion_cute_cluster_shape", code)
+    def test_rolled_cluster_masks_indivisible_static_extents(self) -> None:
+        """Padded CTA slices retain the original extent mask, including a
+        partial vector packet and a completely empty final CTA."""
+        for columns in (6144, 6147):
+            with self.subTest(columns=columns):
+                x = torch.randn(32, columns, device=DEVICE, dtype=torch.bfloat16)
+                weight = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+                code, (out, inv_rms) = code_and_output(
+                    rms_norm_rolled_kernel,
+                    (x, weight),
+                    block_sizes=[1],
+                    num_threads=[1, 128],
+                    reduction_loops=[2048],
+                    cute_vector_widths=[8, 1],
+                    cute_cluster_n=4,
+                )
+                ref_out, ref_inv_rms = _rms_ref(x, weight)
+                torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+                torch.testing.assert_close(inv_rms, ref_inv_rms, rtol=1e-3, atol=1e-3)
+                self.assertIn("_cute_grouped_reduce_cluster(", code)
+                self.assertIn("_helion_cute_cluster_shape = (1, 4, 1)", code)
 
     def test_rolled_cluster_skipped_multirow_cta(self) -> None:
         """Multiple rows per CTA (a sibling thread axis) would make the

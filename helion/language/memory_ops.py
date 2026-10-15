@@ -72,8 +72,8 @@ from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
-from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
@@ -2493,7 +2493,7 @@ def _codegen_cute_store_tcgen05_tile(
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M-oriented worklist path supports only an identity FP16/BF16 store",
+            "tcgen05 N,M-oriented worklist path supports only an identity store",
         )
     assert (
         sum(
@@ -2598,26 +2598,33 @@ def _codegen_cute_store_tcgen05_tile(
     if tcgen05_value.orientation is Tcgen05Orientation.NM and target_dtype not in (
         "cutlass.Float16",
         "cutlass.BFloat16",
+        "cutlass.Float32",
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M-oriented worklist path requires a fixed FP16/BF16 store",
+            "tcgen05 N,M-oriented worklist path requires an FP16/BF16/FP32 store",
         )
     tcgen05_d_store_layout = tcgen05_value.d_store_layout
     tcgen05_nm_store = tcgen05_value.orientation is Tcgen05Orientation.NM
-    if tcgen05_nm_store and (
-        tcgen05_value.explicit_epi_tile_m,
-        tcgen05_value.explicit_epi_tile_n,
-        tcgen05_value.explicit_d_store_box_n,
-    ) != (
+    tcgen05_nm_store_shape = (
         (row_union.schedule.epi_m, row_union.schedule.epi_n, row_union.schedule.epi_n)
         if row_union is not None and row_union.schedule is not None
-        else TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+        else tcgen05_grouped_worklist_store_shape(tcgen05_value.bm, tcgen05_value.bn)
+    )
+    if (
+        tcgen05_nm_store
+        and (
+            tcgen05_value.explicit_epi_tile_m,
+            tcgen05_value.explicit_epi_tile_n,
+            tcgen05_value.explicit_d_store_box_n,
+        )
+        != tcgen05_nm_store_shape
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented store requires explicit "
-            "epi_tile=(128, 32) and d_store_box_n=32",
+            f"epi_tile={tcgen05_nm_store_shape[:2]} and "
+            f"d_store_box_n={tcgen05_nm_store_shape[2]}",
         )
     if len(subscript) != (3 if leading_passthrough_output else 2):
         if tcgen05_value.pure_matmul_role_lifecycle:
@@ -6671,6 +6678,14 @@ def _codegen_cute_store_tcgen05_tile(
     )
 
     def worklist_nm_explicit_store_wave_setup_lines() -> list[str]:
+        # The transposed stmatrix atom packs pairs of 16-bit output elements.
+        # FP32 identity outputs retain the TMEM partition and copy its original
+        # scalar coordinates to the transposed shared-memory destination.
+        copy_op = (
+            "cute.nvgpu.CopyUniversalOp()"
+            if tensor.dtype is torch.float32
+            else "cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4)"
+        )
         return [
             f"{tacc_epi} = cute.flat_divide({tacc}, {epi_tile})",
             (
@@ -6688,12 +6703,7 @@ def _codegen_cute_store_tcgen05_tile(
                 "cutlass.Float32)"
             ),
             f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
-            (
-                f"{copy_atom_r2s} = cute.make_copy_atom("
-                "cute.nvgpu.warp.StMatrix8x8x16bOp("
-                "transpose=True, num_matrices=4), "
-                f"{target_dtype})"
-            ),
+            (f"{copy_atom_r2s} = cute.make_copy_atom({copy_op}, {target_dtype})"),
             (
                 f"{tiled_copy_r2s} = cute.make_tiled_copy_D("
                 f"{copy_atom_r2s}, {tiled_copy_t2r})"

@@ -170,7 +170,9 @@ def test_direct_generation_preserves_its_subset_view_and_explicit_errors() -> No
         explicit.unflatten(explicit.default_flat())
 
 
-@pytest.mark.timeout(120)
+# This builds a complete coverage design, including probes for unreachable
+# override values. Allow the same shared-CI headroom as the population test above.
+@pytest.mark.timeout(240)
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_unpaired_store_override_retains_unrelated_coverage_gap(
     dtype: torch.dtype,

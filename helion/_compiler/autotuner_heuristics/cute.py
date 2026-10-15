@@ -3593,6 +3593,119 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
             return None
 
 
+class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
+    """Vectorized cluster seeds for static row reductions with a padded tail.
+
+    The rolled cluster lowering gives each CTA disjoint whole chunks and
+    retains the original row bound on its loads and reduction inputs. Seed
+    both one wide chunk and several short chunks at the same register
+    footprint so the search can compare load scheduling and occupancy.
+    """
+
+    name = "cute_masked_rolled_cluster"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        if not is_canonical_row_reduction(env):
+            return []
+        spec = env.config_spec
+        reduction = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        if spec.target_device_capability is None or spec.target_device_capability < (
+            9,
+            0,
+        ):
+            return []
+        numel = env.specialize_expr(env.block_sizes[reduction.block_id].numel)
+        if not isinstance(numel, sympy.Integer):
+            return []
+        extent = int(numel)
+        if extent < 16384:
+            return []
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_seed_reduction_dtype(reduction, device_ir)
+        )
+        if vec <= 1 or extent % vec:
+            return []
+        row_block = spec.block_sizes[0].block_id
+        seeds: list[Config] = []
+        for threads in (256, 128, 512):
+            cluster = min(16, max(2, next_power_of_2(-(-extent // (threads * 64)))))
+            wide_chunk = next_power_of_2(extent) // cluster
+            for chunk in dict.fromkeys((wide_chunk, min(wide_chunk, 4096))):
+                if chunk < threads * vec or (
+                    spec.max_reduction_loop is not None
+                    and chunk > spec.max_reduction_loop
+                ):
+                    continue
+                slice_len = -(-extent // (cluster * chunk)) * chunk
+                elements = slice_len // threads
+                if elements > 128:
+                    continue
+                seeds.append(
+                    Config.from_dict(
+                        {
+                            "block_sizes": [1],
+                            "num_threads": _seq_config_list(
+                                spec.num_threads,
+                                {row_block: 1, reduction.block_id: threads},
+                            ),
+                            "reduction_loops": [chunk],
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths, {reduction.block_id: vec}
+                            ),
+                            "cute_lane_layouts": _seq_config_list(
+                                spec.cute_lane_layouts,
+                                {reduction.block_id: "strided"},
+                            ),
+                            "cute_reduction_reloads": ["register"],
+                            "cute_cluster_n": cluster,
+                            "cute_cluster_warp_online": True,
+                            "cute_scalar_epilogue": True,
+                            "cute_min_blocks_per_mp": 3
+                            if elements > 64
+                            else max(1, 768 // threads),
+                        }
+                    )
+                )
+        independent = [
+            Config.from_dict(
+                deepcopy(seed.config) | {"cute_independent_reduction": True}
+            )
+            for seed in seeds
+        ]
+        register_rows = [
+            Config.from_dict(deepcopy(seed.config) | {"cute_register_row": True})
+            for seed in seeds
+        ]
+        kept_inputs = [
+            Config.from_dict(
+                deepcopy(seed.config) | {"cute_scalar_epilogue_keep_inputs": True}
+            )
+            for seed in register_rows
+        ]
+        native_redux = [
+            Config.from_dict(deepcopy(seed.config) | {"cute_warp_fp32_redux": True})
+            for seed in [*register_rows, *kept_inputs]
+        ]
+        return dedupe_configs(
+            [*seeds, *independent, *register_rows, *kept_inputs, *native_redux]
+        )
+
+
 def _block_size_value_reachable(
     spec: ConfigSpec,
     block_index: int,
@@ -4294,6 +4407,7 @@ def _tcgen05_grouped_output_ring_seeds(
     group_count: int,
     dtype_bytes: int,
     capacity_bytes: int,
+    output_dtype_bytes: int | None = None,
 ) -> list[Config]:
     """Cover the alternate output ring for device-metadata mailbox schedules.
 
@@ -4333,6 +4447,7 @@ def _tcgen05_grouped_output_ring_seeds(
                 bn=profile.mma_n,
                 bk=block_k,
                 dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
                 ab_stages=ab_stages,
                 acc_stages=cast("int", seed.config["tcgen05_acc_stages"]),
                 c_stages=4,
@@ -4471,6 +4586,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             spec.register_cute_tcgen05_grouped_worklist_smem_facts(
                 group_count=seed_facts.groups_hint,
                 device_split_sizes=seed_facts.device_split_sizes,
+                output_dtype_bytes=(analysis.output_dtype or fact.lhs_dtype).itemsize,
             )
         # A coordinate without any carrier would perturb the old random domain
         # even when additive coverage has no declaration. Share the complete
@@ -4642,6 +4758,9 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                         ],
                         group_count=seed_facts.groups_hint,
                         dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
                         capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
                             env.device
                         ),
@@ -5270,6 +5389,29 @@ class CuteTopKHeuristic(AutotunerHeuristic):
         integer_key = "int64" if full_precision else "int32"
         padded_k = 1 << (plan.k - 1).bit_length()
         seeds = []
+        small_row_seed = None
+        per_warp_lane = (plan.n + 31) // 32
+        if (
+            env.block_sizes[plan.row_block_id].size_hint() <= 8
+            and plan.n >= 32
+            and per_warp_lane <= 32
+        ):
+            # A warp per row exposes parallelism when only a few rows exist.
+            # Bound the per-lane register footprint and append this hint after
+            # every existing family; ordinary defaults and their order stay put.
+            small_row_seed = env.config_spec.default_config()
+            small_row_seed.config.update(
+                cute_topk_lanes_per_row=32,
+                cute_topk_rows_per_block=1,
+                cute_topk_vector_width=min(4, 1 << (per_warp_lane.bit_length() - 1)),
+                cute_topk_output_vector_width=1,
+                cute_topk_value_mode="decode",
+                cute_topk_key_dtype=integer_key,
+                cute_topk_rank_mode="ordinal",
+                cute_topk_selection_layout="distributed",
+                cute_topk_sort_network="compact_pruned",
+                cute_topk_merge_schedule="balanced",
+            )
         # Retain the original register-pressure and occupancy candidates. All
         # seeds are search hints, not promoted defaults.
         for target, threads, value_mode, rank_mode, layout in (
@@ -5360,6 +5502,8 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                         cute_topk_key_recovery="packed",
                     )
                     seeds.append(config)
+            if small_row_seed is not None:
+                seeds.append(small_row_seed)
             return dedupe_configs(seeds)
         # Replicated ordinal decoding can avoid irregular value gathers. Add
         # all encoder implementations at two bounded register-fragment sizes;
@@ -5516,6 +5660,8 @@ class CuteTopKHeuristic(AutotunerHeuristic):
                     cute_topk_merge_schedule="balanced",
                 )
                 seeds.append(config)
+        if small_row_seed is not None:
+            seeds.append(small_row_seed)
         return dedupe_configs(seeds)
 
     @classmethod

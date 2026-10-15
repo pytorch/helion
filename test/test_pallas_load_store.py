@@ -57,7 +57,8 @@ def jagged_dense_bmm(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
     L, D = jagged.shape
-    B, D, K = dense.shape
+    B, D2, K = dense.shape
+    assert D == D2
     out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
     for g in hl.grid(B):
         s = seq_offsets[g]
@@ -76,7 +77,8 @@ def jagged_dense_bmm_2d_loop(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
     L, D = jagged.shape
-    B, D, K = dense.shape
+    B, D2, K = dense.shape
+    assert D == D2
     out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
     for g in hl.grid(B):
         s = seq_offsets[g]
@@ -499,6 +501,49 @@ class TestPallasJaggedCarryBmm(TestCase):
         self.assertIn("(B,)", code)
         torch.testing.assert_close(out, jagged * 2)
 
+    @parametrize(
+        "case",
+        [
+            subtest((8, 128, torch.float32), name="load_only_d8_f32"),
+            subtest((64, 64, torch.bfloat16), name="load_and_store_64_bf16"),
+            subtest((64, 64, torch.float32), name="load_and_store_64_f32"),
+            subtest((8, 8, torch.float32), name="load_and_store_8_f32"),
+        ],
+    )
+    @parametrize(
+        "offsets",
+        [
+            subtest([0, 13, 61, 192], name="unaligned_groups"),
+        ],
+    )
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_unaligned_full_dim_dynamic_shapes(
+        self,
+        case: tuple[int, int, torch.dtype],
+        offsets: list[int],
+        kernel,
+        loop_type: str,
+    ) -> None:
+        # With static_shapes=False, minor dims narrower than 128 lanes lower
+        # through the ordered carry when the block covers the full tensor dim
+        # (block_d == D, block_k == K).
+        d, k, dtype = case
+        seq_offsets, jagged, dense = _inputs(offsets, d, k, dtype)
+        dynamic_kernel = helion.kernel(kernel.fn, backend="pallas", static_shapes=False)
+        code, out = _run(
+            seq_offsets,
+            jagged,
+            dense,
+            [16, k, d],
+            loop_type,
+            kernel=dynamic_kernel,
+        )
+        self.assertIn("carry", code)
+        self.assertNotIn("one_hot", code)
+        ref = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        torch.testing.assert_close(out[offsets[0] :], ref[offsets[0] :])
+
 
 def _ref_jagged_row_sum(seq_offsets: torch.Tensor, jagged: torch.Tensor):
     ref = torch.zeros(
@@ -770,6 +815,37 @@ class TestPallasJaggedCarryRejects(TestCase):
         ):
             _run(seq_offsets, jagged, dense, [8, 128, 128], loop_type, kernel=kernel)
 
+    @parametrize(
+        "K,block_k,dtype",
+        [
+            (12, 16, torch.float32),
+            (24, 32, torch.float32),
+            (48, 64, torch.bfloat16),
+        ],
+    )
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_unaligned_store_block_rejected(
+        self,
+        K: int,
+        block_k: int,
+        dtype: torch.dtype,
+        kernel,
+        loop_type: str,
+    ) -> None:
+        # Padded store blocks narrower than 128 lanes (K < block_k < 128) are
+        # not TPU DMA aligned since block_k != K and block_k % 128 != 0.
+        seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, K, dtype)
+        with self.assertRaisesRegex(exc.InvalidConfig, "not TPU DMA aligned"):
+            _run(
+                seq_offsets,
+                jagged,
+                dense,
+                [16, block_k, 128],
+                loop_type,
+                kernel=kernel,
+            )
+
     @parametrize("loop_type", _LOOP_TYPES)
     @parametrize("out_dtype", [torch.bfloat16, torch.float32])
     def test_untiled_column_store_rejected(
@@ -984,6 +1060,86 @@ class TestPallasJaggedCarryRejects(TestCase):
                 block_sizes=[16, 128, 128],
                 pallas_loop_type=loop_type,
             )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_in_place_store_rejected(self, loop_type: str) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def in_place_jagged_bmm(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            dense: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            B, D, K = dense.shape
+            for g in hl.grid(B):
+                s, e = seq_offsets[g], seq_offsets[g + 1]
+                for st, kt in hl.tile((s, 0), (e, K)):
+                    acc = hl.zeros([st, kt], dtype=torch.float32)
+                    for dt in hl.tile(0, D):
+                        acc = acc + torch.matmul(jagged[st, dt], dense[g, dt, kt])
+                    out[st, kt] = acc.to(out.dtype)
+            return out
+
+        seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "store target aliases a loaded tensor"
+        ):
+            in_place_jagged_bmm.bind((seq_offsets, jagged, dense, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128, 128], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_skipping_nonempty_group_rejected(self, loop_type: str) -> None:
+        # At an unaligned group boundary, each group adds the shared boundary
+        # rows saved in the carry buffer by the last group that stored, so a
+        # conditional skipping a non-empty group (around the row loop or its
+        # store) makes its successor add a stale boundary;
+        # test_carry_scalar_branch_store covers an `if` storing the same tile in
+        # both branches.
+        @helion.kernel(backend="pallas")
+        def conditional_store(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            min_rows: hl.constexpr,
+            kind: hl.constexpr,
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s, e = seq_offsets[g], seq_offsets[g + 1]
+                col_end = e - s if kind == "dyn_col" else D
+                if e - s > min_rows if kind == "outer" else True:
+                    for st in hl.tile(s, e):
+                        for dt in hl.tile(0, col_end):
+                            if e - s > min_rows if kind == "inner" else True:
+                                hl.store(
+                                    out,
+                                    [st, dt],
+                                    jagged[st, dt] * 2,
+                                    extra_mask=(
+                                        st.index[:, None] < e
+                                        if kind == "mask"
+                                        else None
+                                    ),
+                                )
+            return out
+
+        seq_offsets, jagged, _ = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
+        config = helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+        # `e - s > 0` around the row loop only skips empty groups.
+        conditional_store.bind((seq_offsets, jagged, 0, "outer")).to_code(config)
+        for kind, min_rows, msg in (
+            ("outer", 8, "may skip the row loop or its store"),
+            ("inner", 8, "may skip the row loop or its store"),
+            ("dyn_col", 0, "may skip the row loop or its store"),
+            ("mask", 0, "extra_mask on a carried store is not supported"),
+        ):
+            conditional_store.reset()
+            with self.assertRaisesRegex(exc.BackendUnsupported, msg):
+                conditional_store.bind((seq_offsets, jagged, min_rows, kind)).to_code(
+                    config
+                )
 
     def test_non_jagged_emit_pipeline_unaffected(self) -> None:
         # Static (compile-time) tile bounds never trip the gate: a plain
