@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_bwd_match import FlexBwdMatch
     from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .gdn_recurrence import CuteGdnRecurrencePlan
@@ -886,8 +887,12 @@ class CuteDeviceFunctionState:
         self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
-        self.attention_flash_bwd_match: AttentionBwdMatch | None = None
+        self.attention_flash_bwd_match: AttentionBwdMatch | FlexBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # The FlexAttention backward envelope (``flex_bwd_match.py``): the
+        # whole-graph-set match, probed once per device function.
+        self.attention_flex_bwd_match: FlexBwdMatch | None = None
+        self.attention_flex_bwd_probed: bool = False
         # Set by the register-MMA GEMM detector (``cute_matmul_family=
         # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
         # its tile; the dedicated codegen emits the whole device body and

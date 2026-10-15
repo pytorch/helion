@@ -370,6 +370,7 @@ def flash_bwd_shared_storage(
     do_stage: int,
     kv_stage: int = 1,
     dtype: object = cutlass.Float16,
+    steps: int = 0,
 ) -> type:
     """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
 
@@ -380,10 +381,15 @@ def flash_bwd_shared_storage(
     over the same bytes); sdQaccum stages the row-major fp32 dQ tile for the
     ``cp.reduce.async.bulk`` global add. sLSE/sDelta are parity-double-buffered
     per-warpgroup column stagings of the base-2 LSE and delta row vectors.
+    ``steps`` > 0 (the FlexAttention list walk) adds the per-CTA step table:
+    one packed int32 per Q-tile step (``q tile | q head << 16 | masked << 24``)
+    every warp role reads instead of walking the BlockMask lists itself.
     """
+    steps_entries = max(steps, 1)
 
     @cute.struct
     class SharedStorage:
+        sSteps: cute.struct.MemRange[cutlass.Int32, steps_entries]
         q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
         do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, do_stage * 2]
         k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
@@ -499,6 +505,85 @@ def fbwd_p_pairs_packed(
             b = Float32(cutlass.select_(kb, b, Float32(0.0)))
         frg_any[off + 2 * v] = a
         frg_any[off + 2 * v + 1] = b
+
+
+@dsl_user_op
+def fbwd_pin_i32(
+    value: cutlass.Int32,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """``value`` through a volatile ``mov.b32``: an optimization barrier.
+
+    ptxas computes everything that depends only on the step's Q tile (the
+    score_mod / mask_mod hooks' coordinate terms, one per lane) as early as
+    possible -- ahead of the ``s_full`` wait -- and spills the 64 results
+    per thread to local memory. A volatile asm keeps its order with the
+    volatile mbarrier wait, so deriving the hook's tile coordinate from this
+    copy keeps the per-lane terms after the wait, interleaved with the exp2
+    pass that consumes them.
+    """
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [value.ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def fbwd_lse_fold(lse_frg: cute.Tensor, bias_frg: cute.Tensor, factor: Float32) -> None:
+    """In-place ``lse[i] += factor * bias[i]`` over a chunk, packed pairs: an
+    additive score bias ``g`` folded into the exp2 base LSE term
+    (``exp2(c (s + g) - lse) == exp2(c s - (lse - c g))``, ``factor = -c``)."""
+    lse_any = cast("Any", lse_frg)
+    bias_any = cast("Any", bias_frg)
+    n = cute.size(lse_frg)
+    for v in range(n // 2):
+        a, b = cute.arch.fma_packed_f32x2(
+            (bias_any[2 * v], bias_any[2 * v + 1]),
+            (factor, factor),
+            (lse_any[2 * v], lse_any[2 * v + 1]),
+        )
+        lse_any[2 * v] = a
+        lse_any[2 * v + 1] = b
+
+
+def fbwd_lse_to_log2(lse_frg: cute.Tensor, factor: Float32) -> None:
+    """In-place ``lse = where(lse == -inf, 0, lse) * factor`` over a staged LSE
+    fragment: the forward's natural-log row statistic in the exp2 base, with a
+    row that saw no key (``-inf``) mapped to 0 so ``s - lse`` stays finite (its
+    P is 0 anyway: every score of such a row is masked)."""
+    lse_any = cast("Any", lse_frg)
+    n = cute.size(lse_frg)
+    for i in range(n):
+        value = Float32(lse_any[i])
+        finite = cutlass.Boolean(value != -Float32.inf)
+        lse_any[i] = Float32(cutlass.select_(finite, value, Float32(0.0))) * factor
+
+
+def fbwd_mul_pairs_packed(
+    dst_frg: cute.Tensor,
+    src_frg: cute.Tensor,
+    src_off: int,
+    cnt: int,
+) -> None:
+    """In-place ``dst[i] *= src[src_off + i]`` over one chunk, packed pairs
+    (the ``score_mod_bwd`` Jacobian applied to dS)."""
+    dst_any = cast("Any", dst_frg)
+    src_any = cast("Any", src_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.mul_packed_f32x2(
+            (dst_any[2 * v], dst_any[2 * v + 1]),
+            (src_any[src_off + 2 * v], src_any[src_off + 2 * v + 1]),
+        )
+        dst_any[2 * v] = a
+        dst_any[2 * v + 1] = b
 
 
 def fbwd_ds_pairs_packed(
