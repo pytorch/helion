@@ -33,6 +33,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .cute.persistent_branch_vec import PACKET_STORE_BYTES
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.scalar_recipe import PURE_HELPERS
 from .cute.scalar_recipe import is_rounded_fp32_multiply
@@ -3616,11 +3617,7 @@ def _contains_sync_threads(stmt: ast.AST) -> bool:
 
 
 def _memory_write_calls(stmt: ast.AST) -> list[ast.Call]:
-    helper_stores = {
-        "_cute_store_u16_vec",
-        "_cute_store_u32_vec",
-        "_helion_persistent_branch_vec_store",
-    }
+    helper_stores = {*PACKET_STORE_BYTES, "_helion_persistent_branch_vec_store"}
     helper_atomics = {
         "_cute_atomic_max_float32",
         "_cute_atomic_min_float32",
@@ -3657,14 +3654,14 @@ def _is_persistent_branch_vec_store(call: ast.Call) -> bool:
 
 
 def _is_vector_flush_store(call: ast.Call) -> bool:
-    """``_cute_store_u16_vec(ptr, values)`` / ``_cute_store_u32_vec(ptr, values)``.
+    """A ``_cute_store_*_vec(ptr, values)`` packet flush (``PACKET_STORE_BYTES``).
 
     The flush of a V-loop's collected per-element values into one vector
     store; its destination is the first argument and its value the second.
     """
     return (
         isinstance(call.func, ast.Name)
-        and call.func.id in ("_cute_store_u16_vec", "_cute_store_u32_vec")
+        and call.func.id in PACKET_STORE_BYTES
         and len(call.args) == 2
         and not call.keywords
     )
@@ -5718,6 +5715,12 @@ def _is_proven_relocatable_call(
     name = _qualified_name(call.func)
     if name is None:
         return False
+    if name == "_cute_inline_asm_elementwise":
+        from .cute.pure_lane_packets import _pure_packet_call
+
+        # Reuse the packet pass's scalar-arithmetic proof: declared purity
+        # alone does not exclude hidden memory accesses or synchronization.
+        return _pure_packet_call(call)
     if name in _PURE_RELOCATABLE_NAMES or name in PURE_HELPERS:
         return True
     if name.startswith("cutlass."):
