@@ -1425,6 +1425,7 @@ class DeviceIR:
                         block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
                         allow_non_power_of_two=env.backend_name == "cute",
+                        allow_full_extent=env.backend_name == "cute",
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(
@@ -3576,6 +3577,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
+            from .cute.mxfp8_mma import expose_mxfp8
             from .cute.scaled_contraction import expose_scaled_contractions
 
             canonicalize_reductions(device_ir)
@@ -3584,6 +3586,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 fold_noop_stores(graph_info.graph)
                 fuse_mm_accumulation(graph_info)
                 fuse_u32_multiply(graph_info.graph)
+            expose_mxfp8(device_ir)
         if (
             CompileEnvironment.current().backend.name == "cute"
             and CompileEnvironment.current().settings.fast_math
@@ -3740,6 +3743,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_list_walk=flash_shape.has_list_walk,
                     flex_has_score_region=flash_shape.flex_has_score_region,
                     flex_has_mask_region=flash_shape.flex_has_mask_region,
+                    flex_trivial_walk=flash_shape.flex_trivial_walk,
                     q_seq=flash_shape.q_seq,
                     kv_seq=flash_shape.kv_seq,
                     flex_aux_smem_candidates=flash_shape.flex_aux_smem_candidates,

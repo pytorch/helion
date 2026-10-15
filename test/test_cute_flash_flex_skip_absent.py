@@ -59,6 +59,9 @@ BODY: dict[str, object] = {
     cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
     cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
     cute_flash.FLASH_EPI_TMA_KEY: True,
+    # These tests inspect the one-item render (the list walk is persistent
+    # by default; the persistent form repeats the setup per role).
+    cute_flash.FLASH_PERSISTENT_KEY: False,
 }
 
 

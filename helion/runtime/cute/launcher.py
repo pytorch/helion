@@ -83,8 +83,8 @@ from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Generator
     from collections.abc import Hashable
-    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from torch.cuda import _POOL_HANDLE
@@ -151,6 +151,7 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
             torch.bfloat16: cutlass.BFloat16,
             torch.float8_e4m3fn: cutlass.Float8E4M3FN,
             torch.float8_e5m2: cutlass.Float8E5M2,
+            torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
             torch.float4_e2m1fn_x2: cutlass.Uint8,
             # CuTe does not support i1 global-memory tensors; torch.bool is
             # stored as one byte, so pass bool tensor pointers as uint8 and
@@ -526,7 +527,8 @@ def _append_cute_wrapper_plan(
     kind = plan["kind"]
     if kind == "block_scaled_mma":
         if (
-            plan_int("bn") not in (128, 256)
+            plan_int("bn")
+            not in ((64, 128, 256) if plan.get("format") == "mxfp8" else (128, 256))
             or plan_int("bk") not in (64, 128, 256)
             or plan_int("stages") not in (2, 3, 4, 5)
             or plan_int("cluster_m") not in (1, 2)
@@ -1542,6 +1544,7 @@ def _append_cute_wrapper_plan(
             num_sm=num_sm,
             cluster_m=max(1, cluster_m),
             reserved_sms=reserved_sms,
+            num_sm_multiplier=plan_int("num_sm_multiplier", 1),
         )
         quota_args = tuple(
             str(arg)
@@ -1683,6 +1686,7 @@ def _append_cute_wrapper_plan(
     swapped_nm = orientation == "nm"
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     fixed_ab_tensormaps = bool(plan.get("fixed_ab_tensormaps"))
+    full_allocation_a = bool(plan.get("full_allocation_a"))
     fixed_grouped_b_rank3 = bool(plan.get("fixed_grouped_b_rank3"))
     if fixed_grouped_b_rank3 and not fixed_ab_tensormaps:
         raise exc.BackendUnsupported(
@@ -1731,6 +1735,18 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormap_rank2 = (
         dynamic_ab_tensormaps and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
     )
+    if full_allocation_a and not (
+        swapped_nm
+        and dynamic_ab_tensormap_rank2
+        and lhs_rank3_grouped_nt
+        and not shared_rhs
+        and a_k_major
+        and cluster_m == 1
+        and cluster_n == 1
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "full-allocation A requires a K-major grouped ONE-CTA N,M input"
+        )
     if shared_rhs and (
         not swapped_nm
         or not dynamic_ab_tensormap_rank2
@@ -1799,7 +1815,7 @@ def _append_cute_wrapper_plan(
                 f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape0), "
                 f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride0)"
             )
-        elif fixed_ab_tensormaps:
+        elif fixed_ab_tensormaps or full_allocation_a:
             if fixed_grouped_b_rank3:
                 lhs_tma_layout = (
                     f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2, "
@@ -3341,7 +3357,7 @@ def cute_cuda_graph(
     pool: _POOL_HANDLE | None = None,
     stream: torch.cuda.Stream | None = None,
     capture_error_mode: str = "global",
-) -> Iterator[_CuteCUDAGraph]:
+) -> Generator[_CuteCUDAGraph, None, None]:
     """Capture CuTe launches while tying raw-pointer owners to ``graph``.
 
     Raw ``torch.cuda.graph`` captures cannot expose their Python graph owner to
@@ -3610,6 +3626,10 @@ def _cute_staged_plan_operands(
     for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
         kind = str(plan.get("kind"))
         roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
+        if kind == "block_scaled_mma" and plan.get("format") == "mxfp8":
+            # Unlike packed NVFP4, MXFP8 TMA reads the original FP8 allocations.
+            # Preserve their values when a replacement binding is under-aligned.
+            roles = (("lhs_idx", "rhs_idx"), ())
         if roles is None:
             continue
         input_keys, output_keys = roles
@@ -3739,6 +3759,7 @@ def _tcgen05_grouped_static_active_clusters(
     num_sm: int,
     cluster_m: int,
     reserved_sms: int,
+    num_sm_multiplier: int = 1,
 ) -> int:
     if num_sm <= 0:
         raise ValueError("num_sm must be positive")
@@ -3746,8 +3767,10 @@ def _tcgen05_grouped_static_active_clusters(
         raise ValueError("cluster_m must be positive")
     if reserved_sms < 0:
         raise ValueError("reserved_sms must be non-negative")
+    if type(num_sm_multiplier) is not int or num_sm_multiplier not in (1, 2):
+        raise ValueError("num_sm_multiplier must be one or two")
     active_sms = max(1, num_sm - reserved_sms)
-    return max(1, active_sms // cluster_m)
+    return max(1, active_sms * num_sm_multiplier // cluster_m)
 
 
 def _tcgen05_grouped_static_quotas(
@@ -3845,13 +3868,20 @@ def _tcgen05_grouped_dynamic_tensormap_workspace(
     *,
     device: torch.device,
     tensormap_count: int,
+    num_sm_multiplier: int = 1,
 ) -> torch.Tensor:
     num_sm = get_num_sm(device)
+    workspace_rows = _tcgen05_grouped_static_active_clusters(
+        num_sm=num_sm,
+        cluster_m=1,
+        reserved_sms=0,
+        num_sm_multiplier=num_sm_multiplier,
+    )
     stream_handle, capture_id = _cuda_stream_capture_context(device)
     cache_key = (
         device.type,
         device.index,
-        num_sm,
+        workspace_rows,
         tensormap_count,
         stream_handle,
         capture_id,
@@ -3873,7 +3903,7 @@ def _tcgen05_grouped_dynamic_tensormap_workspace(
     if workspace is not None:
         return workspace
     workspace = torch.empty(
-        (num_sm, tensormap_count, 128 // 8),
+        (workspace_rows, tensormap_count, 128 // 8),
         dtype=torch.int64,
         device=device,
     )
@@ -3933,8 +3963,18 @@ def _tcgen05_grouped_static_layout_arg(
 
 
 def _tcgen05_grouped_device_source_m_tile_supported(plan: dict[str, object]) -> bool:
-    """Keep legacy widths and admit source64 only with its compiler proof."""
+    """Admit compact ONE profiles and retain the proved source64 contract."""
     source_m_tile = plan.get("source_m_tile")
+    if type(source_m_tile) is int and source_m_tile in (8, 16):
+        return (
+            plan.get("kind") == "tcgen05_grouped_static_persistent"
+            and plan.get("scheduler_mode") == "device_group_search"
+            and plan.get("orientation") == "nm"
+            and plan.get("bm") == 128
+            and plan.get("bn") == source_m_tile
+            and plan.get("cluster_m") == 1
+            and plan.get("cluster_n") == 1
+        )
     if source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
         return True
     if (
@@ -6421,6 +6461,7 @@ def _build_cute_schema_and_args(
                 cute_kernel,
                 device=layout.device,
                 tensormap_count=tensormap_count,
+                num_sm_multiplier=cast("int", plan.get("num_sm_multiplier", 1)),
             )
             append_wrapper_tensor(workspace_name, workspace, owned=True)
 

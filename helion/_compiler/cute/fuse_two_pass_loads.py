@@ -42,6 +42,8 @@ two for-loops' ``target`` / ``iter`` / range bounds.
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
+from dataclasses import dataclass
 import re
 from typing import cast
 
@@ -54,6 +56,134 @@ from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
+
+
+def _pure_scalar_definition(stmt: ast.stmt) -> tuple[str, ast.expr] | None:
+    if not (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+    ):
+        return None
+    has_memory_access = any(
+        isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("load", "store")
+            or isinstance(node.func, ast.Name)
+            and node.func.id.startswith(
+                ("_cute_load_", "_cute_store_", "_cute_atomic_")
+            )
+        )
+        for node in ast.walk(stmt.value)
+    )
+    return None if has_memory_access else (stmt.targets[0].id, stmt.value)
+
+
+@dataclass
+class _PrefixState:
+    statements: list[ast.stmt]
+    stop: int
+    writes: set[str]
+    definitions: dict[str, ast.expr]
+
+
+class _AnalysisCache:
+    """Read-only facts for one unchanged AST epoch of a sibling fusion scope.
+
+    Every successful rewrite clears all facts before mutating the AST. Neither
+    mutable expressions nor statement-list prefixes are cached across scopes,
+    passes, or configurations. Capacity limits only decline caching.
+    """
+
+    _CAPACITY = 512
+
+    def __init__(self) -> None:
+        self._effects: dict[
+            ast.stmt, tuple[frozenset[str], tuple[str, ast.expr] | None]
+        ] = {}
+        self._scopes: dict[int, _PrefixState] = {}
+        self._prefixes: OrderedDict[
+            tuple[int, int], tuple[frozenset[str], dict[str, ast.expr]]
+        ] = OrderedDict()
+        self._aliases: dict[ast.For, dict[str, str]] = {}
+
+    def clear(self) -> None:
+        self._effects.clear()
+        self._scopes.clear()
+        self._prefixes.clear()
+        self._aliases.clear()
+
+    def pure_definitions_before(
+        self,
+        statements: list[ast.stmt],
+        stop: int,
+        inherited: dict[str, ast.expr] | None,
+    ) -> dict[str, ast.expr]:
+        key = (id(statements), stop)
+        prefix = self._prefixes.get(key)
+        if prefix is None:
+            state = self._scopes.get(id(statements))
+            if state is None or stop < state.stop:
+                state = _PrefixState(statements, 0, set(), {})
+                if len(self._scopes) < self._CAPACITY or id(statements) in self._scopes:
+                    self._scopes[id(statements)] = state
+            for stmt in statements[state.stop : stop]:
+                effects = self._effects.get(stmt)
+                if effects is None:
+                    effects = (
+                        frozenset(ReadWrites.from_ast(stmt).writes),
+                        _pure_scalar_definition(stmt),
+                    )
+                    if len(self._effects) < self._CAPACITY:
+                        self._effects[stmt] = effects
+                writes, definition = effects
+                state.writes.update(writes)
+                for name in writes:
+                    state.definitions.pop(name, None)
+                if definition is not None:
+                    name, value = definition
+                    state.definitions[name] = value
+            state.stop = stop
+            prefix = (frozenset(state.writes), dict(state.definitions))
+            # Retain the list as well as its id so a temporary container cannot
+            # be collected and its id reused while a prefix is cached.
+            if self._scopes.get(id(statements)) is state:
+                self._prefixes[key] = prefix
+                if len(self._prefixes) > self._CAPACITY:
+                    self._prefixes.popitem(last=False)
+        else:
+            self._prefixes.move_to_end(key)
+        writes, local = prefix
+        definitions = dict(inherited or {})
+        for name in writes:
+            definitions.pop(name, None)
+        definitions.update(local)
+        return definitions
+
+    def loop_aliases(self, loop: ast.For) -> dict[str, str]:
+        aliases = self._aliases.get(loop)
+        if aliases is None:
+            aliases = {}
+            # Preserve ast.walk's first-match order while collecting every
+            # requested prefix in one traversal rather than eight per pair.
+            for node in ast.walk(loop):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            for prefix in (
+                                "reduction_lane_base_",
+                                "reduction_vec_lane_",
+                                "lane_base_",
+                            ):
+                                if target.id.startswith(prefix):
+                                    aliases.setdefault(prefix, target.id)
+                elif isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+                    if node.target.id.startswith("vec_lane_"):
+                        aliases.setdefault("vec_lane_", node.target.id)
+            if len(self._aliases) < self._CAPACITY:
+                self._aliases[loop] = aliases
+        return aliases
 
 
 def _unwrap_persistent_branch_vec_load(node: ast.AST) -> ast.AST:
@@ -786,36 +916,19 @@ class _CuteFuseTwoPassLoads:
         statements: list[ast.stmt],
         stop: int,
         inherited: dict[str, ast.expr] | None = None,
+        *,
+        analysis: _AnalysisCache | None = None,
     ) -> dict[str, ast.expr]:
         """Collect dominating, side-effect-free scalar definitions."""
+        if analysis is not None:
+            return analysis.pure_definitions_before(statements, stop, inherited)
         definitions = dict(inherited or {})
         for stmt in statements[:stop]:
             for name in ReadWrites.from_ast(stmt).writes:
                 definitions.pop(name, None)
-            if (
-                isinstance(stmt, ast.Assign)
-                and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name)
-            ):
-                target = stmt.targets[0].id
-                has_memory_access = any(
-                    isinstance(node, ast.Call)
-                    and (
-                        (
-                            isinstance(node.func, ast.Attribute)
-                            and node.func.attr in ("load", "store")
-                        )
-                        or (
-                            isinstance(node.func, ast.Name)
-                            and node.func.id.startswith(
-                                ("_cute_load_", "_cute_store_", "_cute_atomic_")
-                            )
-                        )
-                    )
-                    for node in ast.walk(stmt.value)
-                )
-                if not has_memory_access:
-                    definitions[target] = stmt.value
+            if (definition := _pure_scalar_definition(stmt)) is not None:
+                target, value = definition
+                definitions[target] = value
         return definitions
 
     @staticmethod
@@ -998,7 +1111,11 @@ class _CuteFuseTwoPassLoads:
         return lane_loop.body, cache_index, trip * lane_trip
 
     def _build_second_alias(
-        self, first_loop: ast.For, second_loop: ast.For
+        self,
+        first_loop: ast.For,
+        second_loop: ast.For,
+        *,
+        analysis: _AnalysisCache | None = None,
     ) -> dict[str, str]:
         """Collect per-loop variable renames that need to be normalised so
         the two sweeps' load expressions compare equal.
@@ -1010,6 +1127,14 @@ class _CuteFuseTwoPassLoads:
             ``lane_base_<N>``, ``_tile_unroll_vec_<N>_<sweep>``,
             ``vec_lane_<N>``.
         """
+        if analysis is not None:
+            first_aliases = analysis.loop_aliases(first_loop)
+            second_aliases = analysis.loop_aliases(second_loop)
+            return {
+                second_var: first_aliases[prefix]
+                for prefix, second_var in second_aliases.items()
+                if prefix in first_aliases and first_aliases[prefix] != second_var
+            }
         alias: dict[str, str] = {}
 
         def _collect_assign(loop: ast.For, prefix: str) -> str | None:
@@ -1145,6 +1270,7 @@ class _CuteFuseTwoPassLoads:
             }
         dynamic_groups: list[tuple[ast.For, ast.For, str]] = []
         fused_spans: list[tuple[ast.For, ast.For]] = []
+        analysis = _AnalysisCache()
         for group in groups:
             if len(group) < 2:
                 continue
@@ -1186,7 +1312,7 @@ class _CuteFuseTwoPassLoads:
             cache_size = first_cache_size
             first_loop_index = new_body.index(first_loop)
             first_scope_definitions = self._pure_definitions_before(
-                new_body, first_loop_index
+                new_body, first_loop_index, analysis=analysis
             )
 
             # Gather ALL subsequent sweeps in the group that share the
@@ -1212,9 +1338,11 @@ class _CuteFuseTwoPassLoads:
                     continue
                 body_idx = new_body.index(loop_k)
                 alias_k = self._canonical_aliases(
-                    self._build_second_alias(first_loop, loop_k)
+                    self._build_second_alias(first_loop, loop_k, analysis=analysis)
                 )
-                scope_definitions = self._pure_definitions_before(new_body, body_idx)
+                scope_definitions = self._pure_definitions_before(
+                    new_body, body_idx, analysis=analysis
+                )
                 sweeps.append(
                     (
                         body_idx,
@@ -1273,6 +1401,8 @@ class _CuteFuseTwoPassLoads:
                 # (re-load later sweeps from gmem/L2).
                 if _fuser_mode == "gmem":
                     _fuser_mode = "disabled"
+            if _fuser_mode == "register_prefetch":
+                _fuser_mode = "register"
             if _fuser_mode == "disabled":
                 continue
             if _fuser_mode == "register":
@@ -1335,7 +1465,7 @@ class _CuteFuseTwoPassLoads:
                     if kind == "vec" and v_width is None:
                         continue
                     first_definitions = self._pure_definitions_before(
-                        first_container, j, first_scope_definitions
+                        first_container, j, first_scope_definitions, analysis=analysis
                     )
                     key = _canonical_load_text(s.value, {}, first_definitions)
                     tracked[key] = (
@@ -1400,7 +1530,7 @@ class _CuteFuseTwoPassLoads:
                         # Canonicalise this sweep's load text against the
                         # first sweep's variable names before keying.
                         definitions_at_load = self._pure_definitions_before(
-                            container_k, j, scope_definitions
+                            container_k, j, scope_definitions, analysis=analysis
                         )
                         key = _canonical_load_text(
                             s.value, alias_k, definitions_at_load
@@ -1575,6 +1705,7 @@ class _CuteFuseTwoPassLoads:
             # tracked load assignment.  Vec loads write V scalars per
             # cache slot; scalar loads write a single scalar.
             new_first_body: list[ast.stmt] = []
+            analysis.clear()
             for s in first_container:
                 new_first_body.append(s)
                 if (

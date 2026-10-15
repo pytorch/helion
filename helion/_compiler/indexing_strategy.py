@@ -27,7 +27,6 @@ from .compile_environment import warning
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 from .host_function import HostFunction
-from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
@@ -53,6 +52,10 @@ class TileWithOffsetInfo(NamedTuple):
     block_id: int
     offset: int | torch.SymInt
     block_size: int | torch.SymInt | None = None
+    # An epilogue-subtile piece's offset within its tile, which its loop-end
+    # mask compares, where ``offset`` also includes the store's own offset
+    # (``tile.index + k``); None when that is ``offset``.
+    mask_offset: int | torch.SymInt | None = None
 
     def resolved_block_size_var(self, env: CompileEnvironment) -> int | torch.SymInt:
         """Return block_size if set, otherwise fall back to the env block_size var."""
@@ -82,7 +85,9 @@ def subscript_tile_info(
         offset = metadata.get("offset", 0)
         block_size = metadata.get("block_size")
         if isinstance(block_id, int) and isinstance(offset, (int, torch.SymInt)):
-            return TileWithOffsetInfo(block_id, offset, block_size)
+            return TileWithOffsetInfo(
+                block_id, offset, block_size, metadata.get("mask_offset")
+            )
         return None
     block_id = env.resolve_block_id(subscript.meta.get("val"))
     if block_id is None:
@@ -297,6 +302,7 @@ def _get_tile_with_offset_info(
             meta["block_id"],
             meta["offset"],
             meta.get("block_size"),
+            meta.get("mask_offset"),
         )
 
     return None
@@ -1223,7 +1229,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if extra_mask is not None or not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript
+            state, fake_tensor, subscript, for_store=True
         ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
@@ -1258,6 +1264,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state: CodegenState,
         fake_tensor: torch.Tensor,
         subscript: list[object],
+        *,
+        for_store: bool = False,
     ) -> bool:
         """Check if tensor descriptor indexing is supported with additional requirements."""
         # First check the basic BlockedSubscriptIndexing requirements
@@ -1266,6 +1274,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             fake_tensor,
             subscript,
             allow_descriptor_coordinates=True,
+            for_store=for_store,
         ):
             return False
 
@@ -1516,7 +1525,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if extra_mask is not None or not self.is_supported(
-            state, fake_tensor, subscript
+            state, fake_tensor, subscript, for_store=True
         ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
@@ -1577,7 +1586,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # Descriptor atomics have no sem parameter; fall back for non-relaxed
         if isinstance(sem, ast.Constant) and sem.value != "relaxed":
             return fallback(op, state, fake_tensor, subscript, value, sem)
-        if not self.is_supported(state, fake_tensor, subscript):
+        if not self.is_supported(state, fake_tensor, subscript, for_store=True):
             return fallback(op, state, fake_tensor, subscript, value, sem)
         indexing = BlockedSubscriptIndexing.create(
             state, fake_tensor, subscript, for_store=True
@@ -2137,7 +2146,8 @@ class SubscriptIndexing(NamedTuple):
                     )
                     index_values.append(f"{index_expr}{expand}")
                     # An epilogue-subtile piece of the tile: mask it like the
-                    # tile, by the loop's end rather than the target's size
+                    # tile, by its lanes' place in the loop (not shifted by the
+                    # store's own offset) against the loop's end
                     if state.codegen.mask_var(block_id) and (
                         not _is_size_one(fake_value.size(i)) or broadcast
                     ):
@@ -2147,12 +2157,22 @@ class SubscriptIndexing(NamedTuple):
                             .end_var_name
                         )
                         assert end is not None
+                        if tile_info.mask_offset is not None:
+                            mask_start = state.device_function.literal_expr(
+                                tile_info.mask_offset
+                            )
+                            tile_expr = (
+                                f"(({base_offset}) + {mask_start} + "
+                                f"tl.arange(0, {block_size_expr}).to({dtype}))"
+                            )
+                        else:
+                            tile_expr = index_expr
                         masks = (
                             broadcast_masks
                             if broadcast and not for_store
                             else mask_values
                         )
-                        masks.setdefault(f"({index_expr} < {end}){expand}")
+                        masks.setdefault(f"({tile_expr} < {end}){expand}")
                 else:
                     index_var = state.codegen.index_var(block_id)
                     offset_expr = state.device_function.literal_expr(tile_info.offset)
@@ -2504,7 +2524,24 @@ class BlockedSubscriptIndexing:
         index: list[object],
         *,
         allow_descriptor_coordinates: bool = False,
+        for_store: bool = False,
     ) -> bool:
+        def tile_ends_short(block_index: int, size: int | torch.SymInt) -> bool:
+            """Whether the tile's loop ends short of the dim it indexes.  The
+            block is only bounded by the dim, so a store would write past the
+            loop, and a load whose masked value matters would read data there
+            instead of 0."""
+            loop_state = state.codegen.active_device_loops[block_index][-1]
+            info = loop_state.block_id_to_info.get(block_index)
+            if info is None:
+                return False
+            if for_store:
+                return not info.is_end_matching_keyed(size)
+            assert state.fx_node is not None
+            return "masked_value" in state.fx_node.meta and not info.is_end_matching(
+                size
+            )
+
         # Triton's block_ptr (make_block_ptr) only supports 32-bit offsets.
         # Tensor descriptors use independent multidimensional coordinates, so
         # a large total tensor numel does not impose this linear-offset limit.
@@ -2525,14 +2562,8 @@ class BlockedSubscriptIndexing:
                     state.codegen.offset_var(block_index)
                 except NotImplementedError:
                     return False
-                loop_state = state.codegen.active_device_loops[block_index][-1]
-                if isinstance(loop_state, DeviceLoopState):
-                    if not loop_state.block_id_to_info[block_index].is_end_matching(
-                        input_size
-                    ):
-                        assert state.fx_node is not None
-                        if "masked_value" in state.fx_node.meta:
-                            return False
+                if tile_ends_short(block_index, input_size):
+                    return False
             elif isinstance(k, torch.SymInt):
                 symbol = _symint_expr(k)
                 origin = None
@@ -2546,21 +2577,10 @@ class BlockedSubscriptIndexing:
                         state.codegen.offset_var(block_index)
                     except NotImplementedError:
                         return False
-                    loop_state = state.codegen.active_device_loops[block_index][-1]
-                    if isinstance(loop_state, DeviceLoopState):
-                        """
-                        Check for a corner case where the loop size does not match the tensor size.
-                        In this case, the block masking will be incorrect.  So we check if the
-                        masking is needed and bail if it is.
-                        """
-                        if not loop_state.block_id_to_info[block_index].is_end_matching(
-                            input_size
-                        ):
-                            assert state.fx_node is not None
-                            if "masked_value" in state.fx_node.meta:
-                                # TODO(jansel): in this case we should be able to lower to block_ptr+tl.where
-                                # see test/test_loops.py::TestLoops::test_data_dependent_bounds2
-                                return False
+                    if tile_ends_short(block_index, input_size):
+                        # TODO(jansel): a load could lower to block_ptr+tl.where
+                        # see test/test_loops.py::TestLoops::test_data_dependent_bounds2
+                        return False
             elif isinstance(k, torch.Tensor):
                 # A device-produced scalar is a uniform base offset for the
                 # rectangular block, not advanced/vector indexing.  This is

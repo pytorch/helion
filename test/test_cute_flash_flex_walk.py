@@ -259,6 +259,28 @@ def test_resolver_pins_the_list_walk_to_the_plain_fa4_pair_body() -> None:
         assert cfg.kv_order == "ascending"
 
 
+def test_trivial_flex_walk_is_never_persistent() -> None:
+    """Torch's empty BlockMask (``kv_walk.trivial``: one KV block over the
+    sequence, no tables) resolves non-persistent, requested or not, and the
+    search surface pins the knob: the persistent list walk decodes its work
+    items from the host-built item order those tables define."""
+    key = cute_flash.FLASH_PERSISTENT_KEY
+    assert _resolve({**BODY, key: True}).persistent is True
+    assert _resolve({**BODY, key: True}, flex_trivial_walk=True).persistent is False
+    assert _resolve(BODY, flex_trivial_walk=True).persistent is False
+    with patch.dict(os.environ, {}, clear=True):
+        fragment = cute_flash.flash_autotune_fragments(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            flex_trivial_walk=True,
+        )[key]
+    assert fragment.default() is False  # pyrefly: ignore[missing-attribute]
+    assert tuple(fragment.search_choices) == (False,)  # pyrefly: ignore[missing-attribute]
+
+
 def test_resolver_defaults_the_list_walk_to_the_descending_order() -> None:
     assert _resolve(None).causal_kv_order == "descending"
     assert (
@@ -498,7 +520,8 @@ def test_flex_prefetch_knob_is_searched_only_with_per_chunk_table_loads() -> Non
     to the smallest one with the same loads and depth at the config's chunk
     width; resolved to 0 off flex plans."""
     key = cute_flash.FLASH_FLEX_PREFETCH_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-3] == key
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys[keys.index(key) + 1] == cute_flash.FLASH_FLEX_COALESCE_KEY
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_prefetch"].default
         == 0
@@ -599,7 +622,8 @@ def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
     width (0 where its staging leaves no two-deep ring); resolved to 0 off
     flex plans."""
     key = cute_flash.FLASH_FLEX_COALESCE_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-2] == key
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys[keys.index(key) + 1] == cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_coalesce"].default
         == 0
@@ -855,7 +879,8 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
     stream's next-tile choice a select, and the register prefetch budget
     resolves to 0 (its slot lists cannot take a runtime chunk index)."""
     key = cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys[keys.index(key) + 1] == cute_flash.FLASH_FLEX_ITEM_WORDS_KEY
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__[
             "flex_rolled_chunks"
@@ -1251,6 +1276,56 @@ def test_codegen_splices_the_next_chunk_prefetch_around_the_t2r_copy() -> None:
         assert len(fill_line) - len(fill_line.lstrip()) == for_indent + 4
     for text in ("flash_flex_pc", "flash_kv_peek", "flash_flex_pkv"):
         assert text not in plain, text
+
+
+def test_resident_tiles_keep_the_prefetch_fill_in_every_fused_branch() -> None:
+    """``cute_flash_s_resident`` with the hook's table prefetch: every fused
+    tile branch (the masked reload arm, the resident arm and the zero-P
+    arm) runs the cross-tile prefetch fill after PASS1 and ahead of PASS2's
+    ``flash_p_sum`` reset; the pre-loop peek is the reload render's."""
+    from helion._compiler.cute.flash_score_mod import FlexHookCode
+
+    stub = cute_flash.render_flex_hook
+
+    def prefetching(*args: object, **kwargs: object) -> FlexHookCode:
+        kwargs.pop("prefetch_regs", None)
+        code = stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+        return FlexHookCode(
+            code.item_prelude,
+            code.tile_prologue,
+            code.chunk_body,
+            " " * 16 + "'flex prefetch chunk=flash_flex_pc'\n",
+            1,
+        )
+
+    key = cute_flash.FLASH_S_RESIDENT_KEY
+    with patch.object(cute_flash, "render_flex_hook", prefetching):
+        src = _render(
+            _resolve(
+                {**RESIDENT_BODY, key: True, cute_flash.FLASH_FLEX_PREFETCH_KEY: 32},
+                flex_prefetch_regs=(32,),
+            ),
+            _flex_plan(mask_region=object()),
+        )
+    marker = "'flex prefetch chunk=flash_flex_pc'"
+    stages = src.split("flash_row_sum = cutlass.Float32(0.0)")[1:]
+    assert len(stages) == 2
+    for stage_src in stages:
+        loop_at = stage_src.index("for flash_kv_iter in cutlass.range(")
+        assert stage_src[:loop_at].count(marker) == 2
+        body = stage_src[loop_at:]
+        assert body.count("fa4_disc_exp_convert_store_resident_rep32(") == 1
+        # Three fused arms (masked reload, resident, zero P), each with its
+        # own cross-tile fill ahead of PASS2's reset.
+        fills = [m.start() for m in re.finditer("flash_flex_pkv = flash_kv_peek", body)]
+        resets = [
+            m.start()
+            for m in re.finditer(r"flash_p_sum = cutlass\.Float32\(0\.0\)", body)
+        ]
+        assert len(fills) == 3
+        for fill, following in zip(fills, [*fills[1:], len(body)], strict=True):
+            assert any(fill < reset < following for reset in resets)
+            assert marker in body[fill:following]
 
 
 def test_fragment_surface_is_length_invariant_for_the_list_walk() -> None:
@@ -1682,7 +1757,6 @@ def test_flex_seeds_carry_the_fa4_defaults_and_the_pruned_campaign_structure(
     for cfg in resolved:
         # Every seed resolves to the pinned plan category.
         assert cfg.pipeline_family == "fa4"
-        assert not cfg.persistent
         assert cfg.softmax_disc
         assert cfg.stat_transport == "ring2"
         assert cfg.kv_tile_n == 128
@@ -1694,6 +1768,8 @@ def test_flex_seeds_carry_the_fa4_defaults_and_the_pruned_campaign_structure(
         (cfg.exp2_packet, cfg.e2e_schedule)
         for cfg in resolved
         if cfg.exp2_packet == "8x2"
+        and cfg.persistent
+        and cfg.kv_split == 1
         and cfg.disc_pipe_depth == 2
         and cfg.split_p_arrive
         and cfg.causal_kv_order == "descending"
@@ -1704,6 +1780,24 @@ def test_flex_seeds_carry_the_fa4_defaults_and_the_pruned_campaign_structure(
         and cfg.s_load_repetition == 32
     }
     assert structures == {("8x2", "16/8"), ("8x2", "8/2")}
+    # The two campaign-winner bodies (short and medium list walks), persistent
+    # with their deeper rings and the 160-register softmax warps.
+    cap = cute_flash._flash_aliased_kv_stage_cap(HEAD_DIM, stage_output=True)
+    winners = {
+        (
+            cfg.e2e_schedule,
+            cfg.exp2_packet,
+            cfg.kv_stage,
+            cfg.softmax_regs,
+            cfg.corr_regs,
+        )
+        for cfg in resolved
+        if cfg.exp2_packet == "4x2" and cfg.persistent and cfg.kv_split == 1
+    }
+    assert {
+        ("16/4", "4x2", min(7, cap), 160, 128),
+        ("8/2", "4x2", min(8, cap), 160, 112),
+    } <= winners
     # The fa4 defaults (the family seed) are there as well.
     with patch.dict(os.environ, {}, clear=True):
         defaults = cute_flash.resolve_flash_config(
@@ -1836,8 +1930,11 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
         return bound.to_code(bound._normalized_config_copy(helion.Config(**config)))
 
 
+@pytest.mark.parametrize("item_words", [True, False])
 @pytest.mark.parametrize("seq", [2048, 2048 + 128])
-def test_codegen_emits_the_fa4_list_walk_at_every_kv_tile_count(seq: int) -> None:
+def test_codegen_emits_the_fa4_list_walk_at_every_kv_tile_count(
+    seq: int, item_words: bool
+) -> None:
     code = _codegen_with_flex_plan(
         seq,
         {
@@ -1845,9 +1942,11 @@ def test_codegen_emits_the_fa4_list_walk_at_every_kv_tile_count(seq: int) -> Non
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
             cute_flash.FLASH_EPI_TMA_KEY: True,
             cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+            cute_flash.FLASH_FLEX_ITEM_WORDS_KEY: item_words,
         },
     )
     pairs = -(-seq // 256)
+    num_kv = -(-seq // 128)
     # The fa4 pair body (512 threads, 2 * 4 * pairs work items), not the
     # dense ws_overlap body an odd KV tile count used to fall back to.
     assert "'topology': 'fa4'" in code
@@ -1855,16 +1954,469 @@ def test_codegen_emits_the_fa4_list_walk_at_every_kv_tile_count(seq: int) -> Non
     assert "block=(512, 1, 1)" in code
     assert "flash_flex_status" in code
     assert "flash_num_active_kv = cutlass.max(cutlass.Int32(1)" in code
-    # The tables are plain kernel params the body binds by name.
-    assert "_flash_mFlexPartCnt = part_cnt" in code
-    assert "_flash_mFlexFullIdx = full_idx" in code
+    # The tables are plain kernel params.
     assert (
         "def _helion__probe_attention(q_view, k_view, v_view, out, lse, part_cnt, part_idx, full_cnt, full_idx"
         in code
     )
+    if item_words:
+        # The default: every role loads the pair's [partial, full] words per
+        # stage from the host-built table (one word per 32 KV tiles) instead
+        # of rebuilding the masks from the counts and index lists.
+        assert (
+            "_helion_flash_flex_item_words(part_cnt, part_idx, full_cnt, full_idx, "
+            f"q_block=128, batch=2, heads=4, num_pairs={pairs}, num_kv={num_kv})"
+        ) in code
+        assert "_flash_mFlexWords = flash_flex_words" in code
+        assert (
+            f"flash_flex_wrow = (flash_bh * cutlass.Int32({pairs}) + flash_m_pair) "
+            "* cutlass.Int32(4)"
+        ) in code
+        assert (
+            "flash_flex_f1_0 = cutlass.Int32(_flash_mFlexWords[flash_flex_wrow + cutlass.Int32(3)])"
+            in code
+        )
+        assert "for flash_flex_i in cutlass.range(flash_flex_c" not in code
+        assert "_flash_mFlexPartCnt" not in code
+    else:
+        # The device walk: the body binds the tables by name and builds the
+        # masks from the counts and lists.
+        assert "_flash_mFlexPartCnt = part_cnt" in code
+        assert "_flash_mFlexFullIdx = full_idx" in code
+        assert "for flash_flex_i in cutlass.range(flash_flex_cp0, unroll=1):" in code
+        assert "_helion_flash_flex_item_words" not in code
+        assert "_flash_mFlexWords" not in code
     # Q and K/V share one length here: no separate K/V length in the plan.
     assert "'kv_seq'" not in code
     assert ("flash_live_rows0" in code) == (seq % 256 != 0)
+
+
+def test_flex_item_words_knob_is_an_appended_axis_on_by_default_for_list_walks() -> (
+    None
+):
+    """``cute_flash_flex_item_words``: the appended schema axis behind the
+    rolled chunk loop, resolved on for list-walk plans without the key and off
+    elsewhere, searched (both values) only with a list walk, carried as True
+    by every list-walk seed."""
+    key = cute_flash.FLASH_FLEX_ITEM_WORDS_KEY
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys.count(key) == 1
+    assert keys.index(key) == keys.index(cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY) + 1
+    assert cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+    }
+    assert (
+        cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_item_words"].default
+        is False
+    )
+    assert _resolve(BODY).flex_item_words is True
+    assert _resolve({**BODY, key: False}).flex_item_words is False
+    assert _resolve(BODY, has_list_walk=False).flex_item_words is False
+    assert _resolve({**BODY, key: True}, has_list_walk=False).flex_item_words is False
+    for resolved in (_resolve(BODY), _resolve({**BODY, key: False})):
+        assert cute_flash.flash_effective_config_values(resolved)[key] is (
+            resolved.flex_item_words
+        )
+
+    def search(has_list_walk: bool) -> tuple[object, ...]:
+        with patch.dict(os.environ, {}, clear=True):
+            fragment = cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                16,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=has_list_walk,
+            )[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        picked = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if picked is None else tuple(picked)
+
+    # (The default leads the search choices.)
+    assert search(True) == (True, False)
+    assert search(False) == (False,)
+    assert all(seed.flex_item_words is True for seed in _flex_seeds(16))
+
+
+RESIDENT_BODY: dict[str, object] = {
+    **BODY,
+    cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    cute_flash.FLASH_P_STORE_REP_KEY: 32,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+    cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+    cute_flash.FLASH_CORR_REGS_KEY: 64,
+    cute_flash.FLASH_OTHER_REGS_KEY: 48,
+}
+
+
+def test_s_resident_knob_is_legal_on_the_rep32_chunked_body_only() -> None:
+    """``cute_flash_s_resident``: appended behind the item words; legal on the
+    list walk's fa4 chunked softmax with Rep32 score loads (any P store
+    form), off causal bodies, score-region plans and the two-CTA bodies;
+    searched only with a list walk without a score region; three resident
+    seeds, none with a score region."""
+    key = cute_flash.FLASH_S_RESIDENT_KEY
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys.count(key) == 1
+    assert keys.index(key) == keys.index(cute_flash.FLASH_FLEX_ITEM_WORDS_KEY) + 1
+    assert cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    }
+    assert _resolve(RESIDENT_BODY).s_resident is False
+    assert _resolve({**RESIDENT_BODY, key: True}).s_resident is True
+    # Pinned off by Rep16 score loads (the resident fragments are the Rep32
+    # load chunks; the resolver may canonicalize the repetitions together,
+    # the knob follows the resolved body), by a score region (every tile
+    # runs the hook's reload path) and off the list walk.
+    rep16_loads = _resolve(
+        {**RESIDENT_BODY, cute_flash.FLASH_S_LOAD_REP_KEY: 16, key: True}
+    )
+    assert rep16_loads.s_resident is (rep16_loads.s_load_repetition == 32)
+    assert (
+        _resolve({**RESIDENT_BODY, key: True}, has_score_modifiers=True).s_resident
+        is False
+    )
+    assert (
+        _resolve({**RESIDENT_BODY, key: True}, has_list_walk=False).s_resident is False
+    )
+    # Rep32 stores with the split P arrival (FA4's mixed Rep32/Rep16
+    # publication) take the resident form as well.
+    assert (
+        _resolve(
+            {**RESIDENT_BODY, cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True, key: True}
+        ).s_resident
+        is True
+    )
+    # Rep16 P stores keep the split P arrival (one store per score chunk).
+    rep16 = _resolve(
+        {
+            **RESIDENT_BODY,
+            cute_flash.FLASH_P_STORE_REP_KEY: 16,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+            key: True,
+        }
+    )
+    assert rep16.s_resident and rep16.split_p_arrive and rep16.p_store_repetition == 16
+    with patch.dict(os.environ, {}, clear=True):
+        causal = cute_flash.resolve_flash_config(
+            HEAD_DIM,
+            16,
+            {**RESIDENT_BODY, key: True},
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+    assert causal.s_resident is False
+    for resolved in (_resolve(RESIDENT_BODY), _resolve({**RESIDENT_BODY, key: True})):
+        assert (
+            cute_flash.flash_effective_config_values(resolved)[key]
+            is resolved.s_resident
+        )
+
+    def search(has_list_walk: bool, score_region: bool = False) -> tuple[object, ...]:
+        with patch.dict(os.environ, {}, clear=True):
+            fragment = cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                16,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=has_list_walk,
+                flex_has_score_region=score_region,
+            )[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        picked = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if picked is None else tuple(picked)
+
+    assert search(True) == (False, True)
+    assert search(True, score_region=True) == (False,)
+    assert search(False) == (False,)
+    with patch.dict(os.environ, {}, clear=True):
+        scored_seeds = cute_flash.flash_attention_seed_configs(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            score_modifier_kinds=(FLEX_SCORE_KIND,),
+            plain_row_body=False,
+            has_score_modifiers=True,
+        )
+    assert not any(seed.config.get(key) for seed in scored_seeds)
+    # Three resident seeds (short walk, medium walk, FA4 template), all with
+    # the mixed Rep32/Rep16 store (split P arrival), FA4's register split and
+    # 8-column correction tiles (the 32-column correction epilogue spills
+    # beside a resident softmax).
+    resident_seeds = [cfg for cfg in _flex_seeds(16) if cfg.s_resident]
+    assert len(resident_seeds) == 3
+    assert {
+        (
+            cfg.e2e_schedule,
+            cfg.softmax_regs,
+            cfg.corr_regs,
+            cfg.other_regs,
+            cfg.split_p_arrive,
+            cfg.p_store_repetition,
+            cfg.corr_tile_size,
+            cfg.rescale_chunk_cols,
+        )
+        for cfg in resident_seeds
+    } == {
+        ("16/4", 200, 64, 48, True, 32, 8, 8),
+        ("8/2", 200, 64, 48, True, 32, 8, 8),
+    }
+
+
+def test_tmem_rowmax_is_legal_for_list_walks_and_reduces_the_full_tiles() -> None:
+    """``cute_flash_rowmax="tmem"`` resolves for list-walk plans on hardware
+    with the TMEM reduction (GB300; the B200 policy has none): the full tiles
+    fold the hardware per-load maxima, the masked tiles keep the hook's
+    software row max, and the resident PASS1 reads the chunk and its maximum
+    in one load."""
+    key = cute_flash.FLASH_ROWMAX_KEY
+    body = {
+        **BODY,
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+        cute_flash.FLASH_P_STORE_REP_KEY: 32,
+        cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+        key: "tmem",
+    }
+    gb300 = {"target_device_capability": (10, 3)}
+    assert _resolve(body, **gb300).rowmax == "tmem"
+    assert _resolve(body, target_device_capability=(10, 0)).rowmax == "software"
+    # (The dense plan was compatible already; Rep16 loads are not.)
+    assert _resolve(body, has_list_walk=False, **gb300).rowmax == "tmem"
+    assert (
+        _resolve(
+            {
+                **body,
+                cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+                cute_flash.FLASH_P_STORE_REP_KEY: 16,
+            },
+            **gb300,
+        ).rowmax
+        == "software"
+    )
+    plan = _flex_plan(mask_region=object())
+
+    def render(cfg: cute_flash.FlashAttentionConfig) -> str:
+        body_stmts = cute_flash.emit_flash_fa4_device_body(
+            cast("DeviceFunction", None),
+            head_dim=HEAD_DIM,
+            num_kv=16,
+            sequence_extent=2048,
+            num_bh=NUM_BH,
+            total_tiles=NUM_BH * 8,
+            cfg=cfg,
+            has_lse=True,
+            io_dtype="cutlass.BFloat16",
+            score_plan=plan,
+            num_heads=NUM_HEADS,
+            flex_item_table="flex_items",
+            target_device_capability=(10, 3),
+        )
+        return "\n".join(ast.unparse(stmt) for stmt in body_stmts)
+
+    code = render(_resolve(body, **gb300))
+    assert code.count("_helion_flash_rt.disc_rowmax_ldred(") == 2
+    assert "fa4_disc_rowmax_balanced(" not in code
+    resident = render(
+        _resolve(
+            {
+                **body,
+                cute_flash.FLASH_S_RESIDENT_KEY: True,
+                cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+                cute_flash.FLASH_CORR_REGS_KEY: 64,
+                cute_flash.FLASH_OTHER_REGS_KEY: 48,
+            },
+            **gb300,
+        )
+    )
+    assert (
+        resident.count(
+            "cute.copy(flash_tiled_ldred0, tLDRedtS0[None, 3, None, None], (flash_res_frg3, flash_res_red3))"
+        )
+        == 1
+    )
+    assert (
+        resident.count(
+            "flash_row_max = cute.arch.fmax(flash_row_max, flash_res_red3[flash_red_i])"
+        )
+        == 2
+    )
+    assert "disc_rowmax_ldred(" not in resident
+    assert resident.count("fa4_disc_exp_convert_store_resident_rep32(") == 2
+
+
+@pytest.mark.parametrize("seq", [2048, 2048 + 128])
+def test_codegen_s_resident_keeps_the_score_row_in_registers_for_unmasked_tiles(
+    seq: int,
+) -> None:
+    config = {
+        "block_sizes": [1, 128, 128],
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_EPI_TMA_KEY: True,
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+        cute_flash.FLASH_P_STORE_REP_KEY: 32,
+        cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+        cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+        cute_flash.FLASH_CORR_REGS_KEY: 64,
+        cute_flash.FLASH_OTHER_REGS_KEY: 48,
+    }
+    plain = _codegen_with_flex_plan(seq, config)
+    resident = _codegen_with_flex_plan(
+        seq, {**config, cute_flash.FLASH_S_RESIDENT_KEY: True}
+    )
+    assert "fa4_disc_exp_convert_store_resident_rep32(" not in plain
+    assert "flash_res_frg3" not in plain
+    # Both softmax stages: PASS1 loads the four 32-column chunks into resident
+    # fragments (one trailing fence), PASS2 consumes them without a TMEM reload.
+    assert (
+        resident.count(
+            "fa4_disc_exp_convert_store_resident_rep32((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), "
+        )
+        == 2
+    )
+    assert (
+        resident.count(
+            "flash_res_frg3 = cute.make_rmem_tensor(flash_res_ld_shape, cutlass.Float32)"
+        )
+        == 2
+    )
+    assert "fa4_disc_rowmax_balanced(" not in resident
+    # The masked tiles (the probe plan has a mask region) keep the reload path.
+    assert "fa4_disc_exp_convert_store_rep32" in resident
+    assert (
+        "flash_pfor_ptr + 0, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS"
+        in resident
+    )
+    # Rep16 P stores: the resident PASS2 keeps the split P arrival.
+    rep16 = _codegen_with_flex_plan(
+        seq,
+        {
+            **config,
+            cute_flash.FLASH_S_RESIDENT_KEY: True,
+            cute_flash.FLASH_P_STORE_REP_KEY: 16,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        },
+    )
+    assert rep16.count("fa4_disc_exp_convert_store_resident_rep16(") == 2
+    # Rep32 stores with the split P arrival: the mixed Rep32/Rep16
+    # publication over the resident chunks (FA4's 3/4 release).
+    mixed = _codegen_with_flex_plan(
+        seq,
+        {
+            **config,
+            cute_flash.FLASH_S_RESIDENT_KEY: True,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        },
+    )
+    assert mixed.count("fa4_disc_exp_convert_store_resident_rep32_split(") == 2
+    assert (
+        "flash_tiled_st32_0, tST32tS0, tST32cS, flash_tiled_st0, tSTtS0, tSTcS" in mixed
+    )
+    assert "flash_pfor_ptr + 0, flash_pfor2_ptr + 0, flash_LD_CHUNKS" in mixed
+    assert (
+        "flash_pfor_ptr + 1, flash_pfor2_ptr + 1, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS"
+        in rep16
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_block", "rows", "num_pairs", "table_batch", "table_heads", "num_kv"),
+    [
+        (128, 17, 9, 2, 4, 37),
+        (128, 16, 8, 1, 1, 70),
+        (256, 9, 9, 1, 4, 32),
+        (128, 18, 9, 2, 1, 33),
+    ],
+)
+def test_flex_item_words_pack_the_pair_rows_into_tile_bitmasks(
+    q_block: int,
+    rows: int,
+    num_pairs: int,
+    table_batch: int,
+    table_heads: int,
+    num_kv: int,
+) -> None:
+    from helion.runtime.cute.flash_flex import flex_item_table
+    from helion.runtime.cute.flash_flex import flex_item_words
+
+    batch, heads = 2, 4
+    generator = torch.Generator().manual_seed(q_block + rows + num_kv)
+    partial = (
+        torch.rand(table_batch, table_heads, rows, num_kv, generator=generator) < 0.3
+    )
+    full = torch.rand(table_batch, table_heads, rows, num_kv, generator=generator) < 0.2
+    full &= ~partial
+    tables = []
+    for member in (partial, full):
+        order = torch.argsort(
+            member.to(torch.int8), dim=-1, descending=True, stable=True
+        )
+        tables.extend(
+            (member.sum(-1).to(torch.int32), order.to(torch.int32).contiguous())
+        )
+    part_cnt, part_idx, full_cnt, full_idx = tables
+    kwargs = {
+        "q_block": q_block,
+        "batch": batch,
+        "heads": heads,
+        "num_pairs": num_pairs,
+        "num_kv": num_kv,
+    }
+    flat = flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs)
+    nwords = -(-num_kv // 32)
+    lists = 2 if q_block == 256 else 4
+    assert flat.dtype == torch.int32
+    assert flat.shape == (batch * heads * num_pairs * lists * nwords,)
+    assert flat.is_contiguous()
+    words = flat.view(batch * heads * num_pairs, lists * nwords)
+
+    def bit(word: int, tile: int) -> int:
+        return ((word & 0xFFFFFFFF) >> (tile & 31)) & 1
+
+    for b in range(batch):
+        for h in range(heads):
+            for pair in range(num_pairs):
+                row = words[(b * heads + h) * num_pairs + pair].tolist()
+                if q_block == 256:
+                    members = [(partial, pair), (full, pair)]
+                else:
+                    members = [
+                        (partial, 2 * pair),
+                        (full, 2 * pair),
+                        (partial, 2 * pair + 1),
+                        (full, 2 * pair + 1),
+                    ]
+                for index, (member, table_row) in enumerate(members):
+                    for tile in range(num_kv):
+                        expect = (
+                            int(
+                                member[
+                                    b % table_batch, h % table_heads, table_row, tile
+                                ]
+                            )
+                            if table_row < rows
+                            else 0
+                        )
+                        assert bit(row[index * nwords + tile // 32], tile) == expect, (
+                            b,
+                            h,
+                            pair,
+                            index,
+                            tile,
+                        )
+    # Built together with the item order and cached with it: the same
+    # tensors return the same tables; an in-place write rebuilds both.
+    order = flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs)
+    assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is flat
+    assert flex_item_table(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is order
+    full_cnt[0, 0, 0] = 0
+    assert flex_item_words(part_cnt, part_idx, full_cnt, full_idx, **kwargs) is not flat
 
 
 # --------------------------------------------------------------------------
@@ -2181,6 +2733,7 @@ def test_codegen_binds_the_host_sorted_item_table_for_the_persistent_walk() -> N
         {
             "block_sizes": [1, 128, 128],
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            cute_flash.FLASH_PERSISTENT_KEY: False,
             cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
         },
     )
@@ -2214,7 +2767,7 @@ def test_ragged_tma_epilogue_passes_the_plain_output_view(seq: int) -> None:
     assert ("fa4_store_o_smem_to_gmem_rows(" in code) == ragged
 
 
-def test_persistence_stays_pinned_off_for_interval_plans_and_is_searched_for_flex() -> (
+def test_persistence_stays_pinned_off_for_interval_plans_and_is_on_by_default_for_flex() -> (
     None
 ):
     assert (
@@ -2242,6 +2795,16 @@ def test_persistence_stays_pinned_off_for_interval_plans_and_is_searched_for_fle
             score_modifier_kinds=(FLEX_SCORE_KIND,),
         )
     assert not causal.persistent
+    # The list walk defaults to the persistent strided loop over the
+    # longest-first item order (every 2026-10-12 campaign winner) and still
+    # searches both.
     fragment = fragments[cute_flash.FLASH_PERSISTENT_KEY]
-    assert fragment.default() is False
+    assert fragment.default() is True
     assert set(fragment.search_choices) == {False, True}  # pyrefly: ignore[missing-attribute]
+    assert _resolve(BODY).persistent is False  # BODY pins it off
+    assert (
+        _resolve(
+            {k: v for k, v in BODY.items() if k != cute_flash.FLASH_PERSISTENT_KEY}
+        ).persistent
+        is True
+    )

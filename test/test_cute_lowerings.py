@@ -273,6 +273,7 @@ from helion._testing import code_and_output
 from helion._testing import default_cute_mma_support
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfLowVRAM
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -24965,6 +24966,14 @@ def _cute_bmm_fold_int64(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# The last q rows start past 2**31 elements of a strided view, so every
+# re-read offset must be formed in Int64 (an Int32 product wraps negative: an
+# illegal memory access).
+_BMM_FOLD_L, _BMM_FOLD_H, _BMM_FOLD_D = 64, 4, 32
+_BMM_FOLD_ROW_STRIDE = 2**31 // (_BMM_FOLD_L - 2) + 1
+_BMM_FOLD_NUMEL = (_BMM_FOLD_L - 1) * _BMM_FOLD_ROW_STRIDE + _BMM_FOLD_H * _BMM_FOLD_D
+
+
 @helion.kernel(backend="cute", static_shapes=True)
 def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
     G, B, C, D, E = x.shape
@@ -25082,19 +25091,16 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
             atol=1e-4,
         )
 
+    # The bf16 storage plus 1 GiB of slack.
+    @skipIfLowVRAM(
+        "Test requires ~5 GiB of free VRAM",
+        required_bytes=2 * _BMM_FOLD_NUMEL + (1 << 30),
+    )
     def test_bmm_fold_forms_offsets_in_the_kernel_index_type(self) -> None:
-        # The last q rows start past 2**31 elements of a strided view, so
-        # every re-read offset must be formed in Int64 (an Int32 product
-        # wraps negative: an illegal memory access).
-        L, H, D = 64, 4, 32
-        row_stride = 2**31 // (L - 2) + 1
-        numel = (L - 1) * row_stride + H * D
-        free, _total = torch.cuda.mem_get_info()
-        if free < 2 * numel + (1 << 30):
-            self.skipTest(f"needs {(2 * numel) >> 30} GiB of free device memory")
+        L, H, D = _BMM_FOLD_L, _BMM_FOLD_H, _BMM_FOLD_D
         torch.manual_seed(0)
-        storage = torch.zeros(numel, dtype=torch.bfloat16, device=DEVICE)
-        q = storage.as_strided((L, H, D), (row_stride, D, 1))
+        storage = torch.zeros(_BMM_FOLD_NUMEL, dtype=torch.bfloat16, device=DEVICE)
+        q = storage.as_strided((L, H, D), (_BMM_FOLD_ROW_STRIDE, D, 1))
         q.copy_(torch.randn(L, H, D, device=DEVICE))
         k = torch.randn(L, H, D, device=DEVICE, dtype=torch.bfloat16)
         code, out = code_and_output(_cute_bmm_fold_int64, (q, k), block_sizes=[32, 32])

@@ -6640,6 +6640,44 @@ class LoopDimInfo:
             shape_env, self.end_expr
         )
 
+    def is_end_matching_keyed(self, size: int | torch.SymInt) -> bool:
+        """``is_end_matching`` for every input the bound kernel serves: input
+        sizes that match only at these values key the bound kernel on their
+        equality (``CompileEnvironment.keyed_size_equalities``)."""
+        expected = _to_sympy(size)
+        if expected == self.end_expr:
+            return True
+        if (
+            self.end_expr is None
+            or _has_unbacked(self.end_expr)
+            or _has_unbacked(expected)
+        ):
+            return False
+        env = CompileEnvironment.current()
+        # Specialized sizes are keyed by their values already.
+        expected = env.specialize_expr(expected)
+        end = env.specialize_expr(self.end_expr)
+        if expected == end:
+            return True
+        static = env.shape_env._maybe_evaluate_static(sympy.Eq(expected, end))
+        if static is not None:
+            return bool(static)
+        sources = env.shape_env.var_to_sources
+        if (
+            not isinstance(expected, sympy.Symbol)
+            or not all(
+                sources.get(symbol)
+                for symbol in end.free_symbols
+                if isinstance(symbol, sympy.Symbol)
+            )
+            or not sources.get(expected)
+            or shape_env_size_hint(env.shape_env, expected)
+            != shape_env_size_hint(env.shape_env, end)
+        ):
+            return False
+        env.keyed_size_equalities.add((expected, end))
+        return True
+
 
 @dataclasses.dataclass
 class DeviceLoopOrGridState:

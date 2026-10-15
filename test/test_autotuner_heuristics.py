@@ -171,6 +171,7 @@ from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
+from helion._compiler.cute.tcgen05_config import Tcgen05GroupedWorklistSmemFacts
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -3556,7 +3557,7 @@ class TestAutotunerHeuristic(TestCase):
 
         self.assertEqual(
             empty_bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
-            (groups, False),
+            Tcgen05GroupedWorklistSmemFacts(groups, False, output_dtype_bytes=2),
         )
         self.assertIsNot(bound, empty_bound)
         self.assertEqual(bound.config_spec.compiler_seed_configs, [])
@@ -3573,12 +3574,14 @@ class TestAutotunerHeuristic(TestCase):
         )
         self.assertEqual(
             bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
-            (groups, False),
+            Tcgen05GroupedWorklistSmemFacts(groups, False, output_dtype_bytes=2),
         )
         self.assertIsNot(rebound, bound)
         self.assertEqual(
             rebound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
-            (different_groups, False),
+            Tcgen05GroupedWorklistSmemFacts(
+                different_groups, False, output_dtype_bytes=2
+            ),
         )
         self.assertEqual(
             [

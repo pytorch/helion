@@ -904,6 +904,13 @@ def _cute_register_unroll_vec_hoist(
     from ..reduction_strategy import LoopedReductionStrategy
 
     assert isinstance(strategy, LoopedReductionStrategy)
+    proof = _cute_looped_unroll_uniform_definitions(
+        state, strategy, index_exprs, mask_expr
+    )
+    if proof is None:
+        return None
+    scope, definitions = proof
+    _cute_relocate_above_vloop(scope, definitions.moved)
     # Looped reductions expose their reduction index directly in the last
     # position, so replacing that component is sufficient.
     base_exprs = list(index_exprs)
@@ -3750,7 +3757,12 @@ def _cute_load_feeds_sort_or_scan(load_node: object) -> bool:
                 continue
             target = user.target
             if (
-                target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+                target
+                in (
+                    torch.ops.aten.sort.default,
+                    torch.ops.aten.sort.stable,
+                    torch.ops.aten.topk.default,
+                )
                 or getattr(target, "__name__", None) == "_associative_scan"
             ):
                 return True
@@ -4078,6 +4090,53 @@ class _CuteTileUnrollHoist:
     moved: list[ast.AST]
     uniform_mask: str | None
     lane_base_expr: str | None
+
+
+def _cute_looped_unroll_uniform_definitions(
+    state: CodegenState,
+    strategy: LoopedReductionStrategy,
+    index_exprs: list[str],
+    mask_expr: str | None,
+) -> tuple[_CuteVloopScope, _CuteTileUnrollHoist] | None:
+    """Prove the row pointer and mask above a rolled reduction's V-loop.
+
+    Generated copies of an outer row coordinate may sit inside the V-loop.
+    Reuse the tile protocol's pure single-assignment proof to relocate those
+    copies and their dependencies. The actual lane index and constexpr lane
+    stay unavailable; a mask or row gather depending on either remains scalar.
+    """
+    from ..tile_strategy import _is_proven_relocatable_assignment
+
+    vloop = strategy._cute_lane_vloop
+    lane_body = strategy._cute_lane_body
+    if (
+        vloop is None
+        or lane_body is None
+        or not isinstance(vloop.target, ast.Name)
+        or state.codegen.statements_stack[-1] is not vloop.body
+        or vloop not in lane_body
+        or any(
+            not _is_proven_relocatable_assignment(statement, allow_load=True)
+            for statement in vloop.body
+        )
+    ):
+        return None
+    scope = _CuteVloopScope(
+        cast("list[ast.AST]", vloop.body),
+        frozenset((vloop.target.id, strategy.index_var(strategy.block_index))),
+        [],
+        lane_body,
+        vloop,
+    )
+    non_lane = (
+        _cute_vector_load_non_lane_mask(mask_expr, strategy._mask_var)
+        if mask_expr is not None
+        else None
+    )
+    proof = _cute_tile_unroll_uniform_definitions(
+        scope, index_exprs, len(index_exprs) - 1, non_lane
+    )
+    return (scope, proof) if proof is not None else None
 
 
 def _cute_grid_lane_setup_names_from_depth(
@@ -4931,7 +4990,9 @@ def _cute_tile_packet_is_aligned(
     a packed integer carrier of at most eight bytes.
     """
     vector_bytes = vec_width * tensor.dtype.itemsize
-    if vec_width < 2 or _CUTE_VECTOR_MAX_BYTES % vector_bytes:
+    capability = env.config_spec.target_device_capability
+    max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+    if vec_width < 2 or max_bytes % vector_bytes:
         return False
     if tensor.dtype.itemsize == 1 and vec_width not in (2, 4, 8):
         return False
@@ -5187,20 +5248,30 @@ def _cute_vector_load_ctx(
         strategy,
         (LoopedReductionStrategy, PersistentReductionStrategy),
     ):
-        # Reduction hoists place the row coordinate as-is; only the tile lane
-        # protocol below knows how to guard a gathered row, shift a lane
-        # coordinate or prove an ``extra_mask`` uniform across the packet, so
-        # such sites keep their scalar loads here (the branch-local vectorizer
-        # would otherwise wrap a masked load the lane-reduction restore proof
-        # cannot re-derive).
+        # The rolled integer-carrier protocol accepts a gathered row whose
+        # coordinates and mask are already available above the V-loop. Its
+        # caller proves both invariants before placing the packet. Shifted
+        # lane coordinates and persistent gathered rows use the separate tile
+        # and branch-local protocols.
         if (
             not lane_on_stride1
-            or gathered_index
+            or (
+                gathered_index
+                and not (
+                    isinstance(strategy, LoopedReductionStrategy)
+                    and strategy._cute_reduction_vec_mode == "unroll"
+                    and lane_axis_pos == len(index_exprs) - 1
+                )
+            )
             or lane_shift_terms is not None
             or (
                 extra_mask is not None
                 and not (
                     isinstance(extra_mask, ast.Constant) and extra_mask.value is True
+                )
+                and not (
+                    isinstance(strategy, LoopedReductionStrategy)
+                    and strategy._cute_reduction_vec_mode == "unroll"
                 )
             )
         ):
@@ -6175,8 +6246,14 @@ def _(state: CodegenState) -> object:
         elif (
             vec_mode == "unroll"
             and isinstance(strategy, LoopedReductionStrategy)
-            and _cute_looped_vec_mask_is_uniform(
-                strategy, mask_expr, _cute_active_mask_var(state, vec_block_id)
+            and (
+                _cute_looped_vec_mask_is_uniform(
+                    strategy, mask_expr, _cute_active_mask_var(state, vec_block_id)
+                )
+                or _cute_looped_unroll_uniform_definitions(
+                    state, strategy, index_exprs, mask_expr
+                )
+                is not None
             )
         ):
             # The outer terms (a row mask) are defined above the lane body, so

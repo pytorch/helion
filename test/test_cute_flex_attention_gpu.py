@@ -350,9 +350,10 @@ def _run(
 
 
 def _assert_list_walk(code: str, *, mask: bool, score: bool) -> None:
-    """The fa4 list-walk body: the union bitmask, the per-step status and
-    the hooks the plan's regions call for."""
-    assert "_flash_mFlexPartCnt = " in code
+    """The fa4 list-walk body: the union bitmask (from the host-built item
+    words by default, or rebuilt from the count tables), the per-step status
+    and the hooks the plan's regions call for."""
+    assert "_flash_mFlexWords = " in code or "_flash_mFlexPartCnt = " in code
     assert "flash_flex_u0 = " in code
     assert "flash_flex_status = " in code
     assert ("flash_flex_needs_mask" in code) == mask
@@ -668,7 +669,10 @@ def test_256_row_block_mask() -> None:
     block_mask = _block_mask(_causal, 2, 4, 1024, 1024, block_size=(256, 128))
     code, out, lse, ref_out, ref_lse = _run(q, k, v, block_mask)
     _assert_list_walk(code, mask=True, score=False)
-    assert "flash_flex_row0 = flash_m_pair" in code
+    # One 256-row list per pair: two words per item (partial, full), no
+    # second-stage words.
+    assert ") * cutlass.Int32(2)" in code
+    assert "flash_flex_f0_0 = " in code and "flash_flex_p1_0" not in code
     _assert_close(out, lse, ref_out, ref_lse)
 
 
