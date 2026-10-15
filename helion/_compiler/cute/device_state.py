@@ -37,12 +37,15 @@ if TYPE_CHECKING:
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
+    from .flex_match import FlexMatch
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .published_scalars import PublishedScalarRequest
+    from .radix_selection import RadixSelectionPlan
     from .register_producers import RegisterProducerRequest
+    from .register_region import RegisterRegionPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
@@ -50,6 +53,7 @@ if TYPE_CHECKING:
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+    from .topk import CuteTopKPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -822,6 +826,9 @@ class CuteDeviceFunctionState:
         # Its CTA shape is authoritative because the direct lowering replaces
         # the ordinary lane topology.
         self.direct_affine_plan: DirectAffinePlan | None = None
+        self.topk_plan: CuteTopKPlan | None = None
+        self.radix_selection_plan: RadixSelectionPlan | None = None
+        self.register_region_plan: RegisterRegionPlan | None = None
         # Packed one-warp lowering for structurally proven split-input T=1
         # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.
         self.split_single_token_rank1_plan: CuteSplitSingleTokenRank1Plan | None = None
@@ -857,6 +864,12 @@ class CuteDeviceFunctionState:
         # ``.notes/spikes/fa_tcgen05_spike.py``.
         self.attention_flash_block_ids: list[int] | None = None
         self.attention_flash_score_plan: AttentionScorePlan | None = None
+        # Set by the flex-envelope matcher (``flex_match.py``): the
+        # whole-graph-set match, probed once per device function. Every
+        # device loop of the two BlockMask list walks answers ``mma_mode``
+        # from it, and the flash codegen reads its operands from it.
+        self.attention_flex_match: FlexMatch | None = None
+        self.attention_flex_probed: bool = False
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128

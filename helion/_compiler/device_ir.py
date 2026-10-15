@@ -148,6 +148,14 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
     decomp_table = select_decomp_table().copy()
+    if (
+        CompileEnvironment.has_current()
+        and CompileEnvironment.current().backend_name == "cute"
+    ):
+        # CuTe lowers these native numeric extrema directly. Preserve their
+        # distinction from NaN-propagating minimum/maximum during tracing.
+        decomp_table.pop(torch.ops.aten.fmin.default, None)
+        decomp_table.pop(torch.ops.aten.fmax.default, None)
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
@@ -1416,6 +1424,8 @@ class DeviceIR:
                     ReductionLoopSpec(
                         block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
+                        allow_non_power_of_two=env.backend_name == "cute",
+                        allow_full_extent=env.backend_name == "cute",
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(
@@ -3567,6 +3577,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
+            from .cute.mxfp8_mma import expose_mxfp8
             from .cute.scaled_contraction import expose_scaled_contractions
 
             canonicalize_reductions(device_ir)
@@ -3575,6 +3586,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 fold_noop_stores(graph_info.graph)
                 fuse_mm_accumulation(graph_info)
                 fuse_u32_multiply(graph_info.graph)
+            expose_mxfp8(device_ir)
         if (
             CompileEnvironment.current().backend.name == "cute"
             and CompileEnvironment.current().settings.fast_math
@@ -3703,6 +3715,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
                 config_spec.enable_cute_flash_search(
                     head_dim=flash_shape.head_dim,
+                    head_dim_v=flash_shape.head_dim_v,
                     num_kv=flash_shape.num_kv,
                     num_bh=flash_shape.num_bh,
                     tensor_4d_heads=flash_shape.tensor_4d_heads,
@@ -3721,9 +3734,22 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_row_epilogue=flash_shape.has_row_epilogue,
                     plain_row_body=flash_shape.plain_row_body,
                     has_score_modifiers=flash_shape.has_score_modifiers,
+                    score_modifier_kinds=flash_shape.score_modifier_kinds,
                     device_sm_count=_cuda_num_sms_or_zero(
                         CompileEnvironment.current().device
                     ),
+                    kv_group=flash_shape.kv_group,
+                    fast_math=CompileEnvironment.current().settings.fast_math,
+                    has_list_walk=flash_shape.has_list_walk,
+                    flex_has_score_region=flash_shape.flex_has_score_region,
+                    flex_has_mask_region=flash_shape.flex_has_mask_region,
+                    flex_trivial_walk=flash_shape.flex_trivial_walk,
+                    q_seq=flash_shape.q_seq,
+                    kv_seq=flash_shape.kv_seq,
+                    flex_aux_smem_candidates=flash_shape.flex_aux_smem_candidates,
+                    flex_prefetch_regs=flash_shape.flex_prefetch_regs,
+                    flex_coalesce_steps=flash_shape.flex_coalesce_steps,
+                    flex_hook_ops=flash_shape.flex_hook_ops,
                 )
             elif gated_surface is not None:
                 # The fused gated body owns the whole root; tcgen05 matmul

@@ -98,15 +98,15 @@ def test_promoted_grouped_worklist_seed_runs_exactly(
         assert config.config["tcgen05_grouped_mode"] == "worklist_nm"
         assert str(config.config["pid_type"]).startswith("persistent")
         code = bound.to_code(config)
-    assert "indices_0" not in code
-    bound.set_config(config)
-    out = bound(*args)
-    expected = torch.empty_like(out)
-    for group, start, _valid_m, store_m in worklist.tolist():
-        rows = slice(start, start + store_m)
-        expected[rows] = (a[rows].float() @ b[group].float().T).to(out.dtype)
-    torch.testing.assert_close(out, expected, atol=0.25, rtol=1e-2)
-    torch.testing.assert_close(side, worklist[:, 3].float())
+        assert "indices_0" not in code
+        bound.set_config(config)
+        out = bound(*args)
+        expected = torch.empty_like(out)
+        for group, start, _valid_m, store_m in worklist.tolist():
+            rows = slice(start, start + store_m)
+            expected[rows] = (a[rows].float() @ b[group].float().T).to(out.dtype)
+        torch.testing.assert_close(out, expected, atol=0.25, rtol=1e-2)
+        torch.testing.assert_close(side, worklist[:, 3].float())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

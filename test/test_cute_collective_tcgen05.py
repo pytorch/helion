@@ -40,13 +40,46 @@ def _kernel_ast(source: str) -> ast.FunctionDef:
 
 
 def _scalar_epilogues(source: str) -> list[str]:
+    class NameConjunctions(ast.NodeTransformer):
+        def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+            self.generic_visit(node)
+            if not isinstance(node.op, ast.And):
+                return node
+            values: list[ast.expr] = []
+            for value in node.values:
+                if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
+                    values.extend(value.values)
+                else:
+                    values.append(value)
+            # Numeric mask names are pure. Preserve every operand and its
+            # order; calls and other expressions keep their original grouping.
+            if all(isinstance(value, ast.Name) for value in values):
+                node.values = values
+            return node
+
     return [
-        ast.unparse(node)
+        ast.unparse(NameConjunctions().visit(node))
         for node in ast.walk(_kernel_ast(source))
         if isinstance(node, ast.For)
         and isinstance(node.target, ast.Name)
         and node.target.id.startswith("lane_")
     ]
+
+
+def test_scalar_epilogue_projection_preserves_mask_names_and_order() -> None:
+    def program(condition: str, value: str = "value") -> str:
+        return (
+            "def _helion_example():\n"
+            "    for lane_0 in range(4):\n"
+            f"        if {condition}:\n"
+            f"            output.store({value})\n"
+        )
+
+    expected = _scalar_epilogues(program("valid and row and column"))
+    assert _scalar_epilogues(program("valid and (row and column)")) == expected
+    assert _scalar_epilogues(program("valid and column and row")) != expected
+    assert _scalar_epilogues(program("valid and row")) != expected
+    assert _scalar_epilogues(program("valid and row and column", "other")) != expected
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

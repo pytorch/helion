@@ -35,6 +35,7 @@ from ..backend import _largest_divisor_at_most
 from ..backend import _loop_contains_matmul
 from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
+from .attention_plan import flash_head_dims_supported
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import argreduce_candidate_expr
@@ -1004,6 +1005,81 @@ def _detect_attention_bwd_mma_loop(
     return True
 
 
+def _attention_config_envelope_ok(config: Config) -> bool:
+    """The fused flash bodies emit their own program mapping and own the
+    whole CTA: only the flat pid with no reordering, no L2 grouping, no
+    explicit thread counts and no lane vectors is valid."""
+    if config.pid_type != "flat":
+        return False
+    if any(grouping != 1 for grouping in config.l2_groupings):
+        return False
+    if any(order != [*range(len(order))] for order in config.loop_orders):
+        return False
+    if any(thread_count != 0 for thread_count in config.num_threads):
+        return False
+    cute_vector_widths = config.config.get("cute_vector_widths", [])
+    return not (
+        isinstance(cute_vector_widths, list)
+        and any(width != 1 for width in cute_vector_widths)
+    )
+
+
+def _detect_flex_attention_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> bool:
+    """True when ``block_ids`` is one of the device loops of a matched
+    FlexAttention envelope (``flex_match.match_flex_envelope``).
+
+    The match runs once per device function on the codegen graph copies and
+    is cached on ``cute_state``; the outer list loops and the inner KV loops
+    of both walks all answer True so the SIMT planner never allocates thread
+    axes for them. The config envelope mirrors the collapsed detector plus
+    the unit b/h tiles and the 128x128 (tile_m, tile_n) pins.
+    """
+    from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
+    from .flex_match import FLEX_PLAN_ENABLED
+    from .flex_match import match_flex_envelope
+
+    if not FLEX_PLAN_ENABLED:
+        return False
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return False
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(root_grid_ids) != 3 or len(block_ids) != 1 or block_ids[0] in root_grid_ids:
+        return False
+    env = CompileEnvironment.current()
+    state = fn.cute_state
+    if not state.attention_flex_probed:
+        state.attention_flex_probed = True
+        state.attention_flex_match = match_flex_envelope(
+            fn.codegen.codegen_graphs, root_grid_ids, env=env
+        )
+    match = state.attention_flex_match
+    if match is None or block_ids[0] not in match.loop_block_ids:
+        return False
+    if not _attention_config_envelope_ok(config):
+        return False
+    bm = env.block_sizes[match.q_block_id].from_config(config)
+    bn = env.block_sizes[match.kv_block_id].from_config(config)
+    if bm != 128 or bn != 128:
+        return False
+    if any(
+        env.block_sizes[block_id].from_config(config) != 1
+        for block_id in (match.b_block_id, match.h_block_id)
+    ):
+        return False
+    if not flash_head_dims_supported(match.head_dim, match.head_dim_v):
+        return False
+    state.attention_flash_score_plan = match.plan
+    state.attention_flash_block_ids = list(match.loop_block_ids)
+    return True
+
+
 def _detect_attention_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -1024,6 +1100,9 @@ def _detect_attention_mma_loop(
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
+        # The FlexAttention envelope (3-axis grid, BlockMask list walks).
+        if _detect_flex_attention_loop(fn, block_ids, config=config):
+            return True
         # Softmax-free (gated) attention over jagged rows: same tcgen05 body
         # family, selected by the same config envelope (128-row tiles).
         from .cute_flash_gated import detect_gated_attention_loop
@@ -1048,11 +1127,23 @@ def _detect_attention_mma_loop(
     ):
         return False
     bk = score_plan.head_dim
-    # Validated envelope mirrors the spike: 128x128 mma_tiler, head_dim 64/128.
-    if bm == 128 and bn == 128 and bk in (64, 128):
-        fn.cute_state.attention_flash_score_plan = score_plan
-        return True
-    return False
+    # Validated envelope mirrors the spike: 128x128 mma_tiler and one of the
+    # fused head-dim pairs (64/64, 128/128, 192/128).
+    if bm != 128 or bn != 128:
+        return False
+    if not flash_head_dims_supported(bk, score_plan.value_head_dim):
+        return False
+    if score_plan.asymmetric_head_dims:
+        # Only the FA4 topology carries the pair: two 128-row query tiles per
+        # CTA, so the sequence has to be a multiple of 256.
+        env = CompileEnvironment.current()
+        kv_seq = env.block_sizes[block_ids[0]].size
+        if not isinstance(kv_seq, int) or kv_seq % 256 != 0:
+            return False
+        if score_plan.requires_ws_overlap:
+            return False
+    fn.cute_state.attention_flash_score_plan = score_plan
+    return True
 
 
 def _is_mma_candidate_loop(
@@ -1503,15 +1594,23 @@ class CuteBackend(Backend):
         return priors
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from ..aten_lowering import sort_lowering
         from ..aten_lowering import squeeze_lowering
+        from .aten_lowering import NumericExtremumLowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target is torch.ops.aten.sort.stable:
+            # CuTe's rank/fragment sorting already breaks ties by input index.
+            # Keep other backends' existing Inductor stable-sort lowering.
+            return sort_lowering
         if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
             # These overloads have the same logical-view semantics as squeeze.dim.
             # Register them before Inductor turns them into a ReinterpretView;
             # the CuTe handler uses the traced output shape, not a scalar dim.
             return squeeze_lowering
+        if node.target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
+            return NumericExtremumLowering()
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -1569,13 +1668,29 @@ class CuteBackend(Backend):
         from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .literal_dims import annotate_literal_dims
+        from .radix_selection import plan_radix_selection_root
+        from .register_region import plan_register_region
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
             plan_split_single_token_rank1_recurrence,
         )
+        from .topk import plan_topk_root
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
+        device_function.cute_state.radix_selection_plan = plan_radix_selection_root(
+            graphs, tile_strategy
+        )
+        if device_function.cute_state.radix_selection_plan is not None:
+            return
+        device_function.cute_state.topk_plan = plan_topk_root(graphs, tile_strategy)
+        if device_function.cute_state.topk_plan is not None:
+            return
+        device_function.cute_state.register_region_plan = plan_register_region(
+            graphs, tile_strategy
+        )
+        if device_function.cute_state.register_region_plan is not None:
+            return
         direct_affine_requested = (
             config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
         )
@@ -1678,6 +1793,19 @@ class CuteBackend(Backend):
                 "cute_fragment_register_loads",
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
+                "cute_fragment_topk_network",
+                "cute_selection_algorithm",
+                "cute_radix_threads",
+                "cute_radix_candidate_key_cache",
+                "cute_radix_scalar_candidates",
+                "cute_radix_valid_domain",
+                "cute_radix_ticket_stores",
+                "cute_radix_cached_payload_inverse",
+                "cute_radix_packet_bits",
+                "cute_radix_scan_unroll",
+                "cute_radix_cluster_ctas",
+                "cute_radix_candidate_capacity",
+                "cute_radix_histogram_mode",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",
@@ -1716,12 +1844,20 @@ class CuteBackend(Backend):
             or key == "cute_proven_bounds"
             or key == "cute_rng_packet"
             or key == "cute_independent_reduction"
+            or key == "cute_cluster_warp_online"
+            or key == "cute_register_row"
+            or key == "cute_register_row_tensor_copy"
+            or key == "cute_scalar_epilogue"
+            or key == "cute_scalar_epilogue_keep_inputs"
+            or key == "cute_scalar_epilogue_owner_fold"
+            or key == "cute_warp_fp32_redux"
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
             in (
@@ -1752,6 +1888,23 @@ class CuteBackend(Backend):
             or key == "cute_min_blocks_per_mp"
             or key == "cute_matmul_family"
             or key == "cute_warp_mma_warps"
+            or key
+            in (
+                "cute_topk_lanes_per_row",
+                "cute_topk_rows_per_block",
+                "cute_topk_vector_width",
+                "cute_topk_output_vector_width",
+                "cute_topk_value_mode",
+                "cute_topk_key_dtype",
+                "cute_topk_rank_mode",
+                "cute_topk_selection_layout",
+                "cute_topk_sort_network",
+                "cute_topk_key_encoder",
+                "cute_topk_defer_value_gathers",
+                "cute_topk_merge_schedule",
+                "cute_topk_coarse_keys",
+                "cute_topk_key_recovery",
+            )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )
@@ -1780,6 +1933,8 @@ class CuteBackend(Backend):
             # does not support scalar dereference for its 4-bit type yet, so
             # SIMT scalar loads treat the tensor as raw byte storage.
             return "cutlass.Uint8"
+        if dtype is torch.float8_e8m0fnu:
+            return "cutlass.Float8E8M0FNU"
         if dtype is torch.uint32:
             return "cutlass.Uint32"
         if dtype is torch.uint64:
@@ -2049,13 +2204,24 @@ class CuteBackend(Backend):
             "_cute_try_paired_sum_cast": "from helion.runtime.cute.paired_sum import try_paired_sum_cast as _cute_try_paired_sum_cast",
             "_cute_try_single_sum_cast": "from helion.runtime.cute.single_sum import try_single_sum_cast as _cute_try_single_sum_cast",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_complete_row_tensor_copy": "from helion._compiler.cute.tensor_copy_helpers import _cute_complete_row_tensor_copy",
             "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
             "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
+            "_cute_grouped_reduce_cluster_warp_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_warp_online_pair",
             "_cute_grouped_reduce_cluster_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_online_pair",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_python_mod": "from helion._compiler.cute.integer_helpers import python_mod as _cute_python_mod",
+            "_cute_flex_tanh": "from helion._compiler.cute.flex_score_mod_runtime import tanh_f32 as _cute_flex_tanh",
+            "_cute_flex_load_vec": "from helion._compiler.cute.flex_score_mod_runtime import load_vec as _cute_flex_load_vec",
+            "_cute_flex_load_run": "from helion._compiler.cute.flex_score_mod_runtime import load_run as _cute_flex_load_run",
+            "_cute_flex_load_window": "from helion._compiler.cute.flex_score_mod_runtime import load_window as _cute_flex_load_window",
+            "_cute_flex_coop_lane": "from helion._compiler.cute.flex_score_mod_runtime import coop_lane_map as _cute_flex_coop_lane",
+            "_cute_flex_coop_issue": "from helion._compiler.cute.flex_score_mod_runtime import coop_issue as _cute_flex_coop_issue",
+            "_cute_flex_lane_below": "from helion._compiler.cute.flex_score_mod_runtime import lane_below as _cute_flex_lane_below",
+            "_cute_flex_fmod": "from helion._compiler.cute.flex_score_mod_runtime import fmod as _cute_flex_fmod",
+            "_cute_flex_remainder": "from helion._compiler.cute.flex_score_mod_runtime import remainder_f32 as _cute_flex_remainder",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
@@ -2096,6 +2262,7 @@ class CuteBackend(Backend):
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
+            "_cute_warp_fetch_add_int32": "from helion._compiler.cute.warp_atomic_runtime import warp_fetch_add_int32 as _cute_warp_fetch_add_int32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -2630,7 +2797,8 @@ class CuteBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
-        self._check_thread_axis(axis)
+        # Complete root owners can discard this scalar grid setup. Validate
+        # surviving coordinates after ownership lowering and dead-code removal.
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
             f" + {dtype}(cute.arch.thread_idx()[{axis}])"
@@ -2698,7 +2866,8 @@ class CuteBackend(Backend):
             return None
         padded_size = next_power_of_2(max(1, size_hint))
         if padded_size > thread_count:
-            return padded_size // thread_count
+            # Whole-warp thread counts need not divide the padded extent.
+            return (padded_size + thread_count - 1) // thread_count
         return None
 
     def reduction_axis_first(self) -> bool:
@@ -2710,7 +2879,7 @@ class CuteBackend(Backend):
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
-        self._check_thread_axis(axis)
+        # A complete root owner can also discard the speculative grid mask.
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
@@ -3087,6 +3256,16 @@ class CuteBackend(Backend):
             return launcher_args
 
         direct_affine_plan = device_function.cute_state.direct_affine_plan
+        topk_plan = device_function.cute_state.topk_plan
+        if topk_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({topk_plan.threads}, 1, 1)"
+            )
+        register_region_plan = device_function.cute_state.register_region_plan
+        if register_region_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({register_region_plan.threads}, 1, 1)"
+            )
         if direct_affine_plan is not None:
             x, y, z = direct_affine_plan.cta_shape
             check_thread_block_dims(
@@ -4075,8 +4254,11 @@ class CuteBackend(Backend):
                     # loops (mma_mode) and run a single 128-thread warpgroup
                     # like the spike. The dedicated flash codegen emits the
                     # whole device body; the FX-graph statement walk is bypassed.
+                    # The flex envelope records every loop it owns up front
+                    # (two nests); keep that list instead of the current loop.
                     mma_mode = True
-                    fn.cute_state.attention_flash_block_ids = list(block_ids)
+                    if fn.cute_state.attention_flash_block_ids is None:
+                        fn.cute_state.attention_flash_block_ids = list(block_ids)
                 elif _detect_attention_bwd_mma_loop(
                     fn,
                     block_ids,

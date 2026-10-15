@@ -941,7 +941,14 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
         provider._benchmark_worker = None
         runs: list[object] = []
 
-        def hang_on_the_second(fn: object, *, warmup: int, rep: int) -> float:
+        def hang_on_the_second(
+            fn: object,
+            *,
+            warmup: int,
+            rep: int,
+            args_slot: int | None = None,
+            timeout: float | None = None,
+        ) -> float:
             runs.append(fn)
             if len(runs) == 2:
                 raise BenchmarkWorkerUnkillable("worker remained alive")
@@ -960,7 +967,14 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
         worker = Mock()
         worker.shutdown.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
 
-        def run_and_leave_a_worker(fn: object, *, warmup: int, rep: int) -> float:
+        def run_and_leave_a_worker(
+            fn: object,
+            *,
+            warmup: int,
+            rep: int,
+            args_slot: int | None = None,
+            timeout: float | None = None,
+        ) -> float:
             runs.append(fn)
             provider._benchmark_worker = worker
             return 1.0
@@ -988,6 +1002,8 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             *,
             warmup: int,
             rep: int,
+            args_slot: int | None = None,
+            timeout: float | None = None,
         ) -> None:
             nonlocal isolated_calls
             isolated_calls += 1

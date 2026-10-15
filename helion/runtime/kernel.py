@@ -237,7 +237,74 @@ def _nested_fast_dispatch_key(
         except TypeError:
             return None
         return (value_type, tuple(entries)), has_tensor
+    if value_type is types.FunctionType and not specialize_numeric:
+        return _function_fast_dispatch_key(cast("types.FunctionType", value))
+    if value_type is types.BuiltinFunctionType:
+        # ``_specialization_extractors`` keys builtins by identity.
+        return (value_type, value), False
     return None
+
+
+def _function_fast_dispatch_key(
+    fn: types.FunctionType,
+) -> tuple[Hashable, bool] | None:
+    """Refine ``_function_key``: the code object, every closure cell's key and
+    every default value's key.
+
+    Callable arguments (score-modifier style hooks) are common in attention
+    kernels; keying them by code object keeps repeat calls on the prepared
+    fast path even when the caller rebuilds the function object per call.
+    Closure cells are re-read on every call because ``nonlocal`` rebinding can
+    change their contents without changing the function object.  Default
+    values are baked into the compiled kernel when the lifted function is
+    traced (``lift_closures`` passes ``__defaults__`` through), so they key by
+    value like constexpr arguments; a default the constexpr rules cannot key
+    (a tensor, a function) keeps the slow path.  Module globals the function
+    reads are not part of the key: like the kernel's own globals they are read
+    from the module when the kernel runs and specialized once, on the first
+    call's values.
+    """
+    closure = fn.__closure__
+    defaults = _function_defaults_fast_dispatch_key(fn)
+    if defaults is None:
+        return None
+    if not closure and not defaults:
+        return (types.FunctionType, fn.__code__), False
+    cells: list[Hashable] = []
+    has_tensor = False
+    for cell in closure or ():
+        nested = _nested_fast_dispatch_key(cell.cell_contents)
+        if nested is None:
+            return None
+        cell_key, cell_has_tensor = nested
+        cells.append(cell_key)
+        has_tensor = has_tensor or cell_has_tensor
+    if not defaults:
+        return (types.FunctionType, fn.__code__, tuple(cells)), has_tensor
+    return (types.FunctionType, fn.__code__, tuple(cells), defaults), has_tensor
+
+
+def _function_defaults_fast_dispatch_key(fn: types.FunctionType) -> Hashable | None:
+    """Value keys of ``fn``'s positional and keyword-only defaults (``()`` when
+    it has none; ``None`` when a default has no constexpr key)."""
+    defaults = fn.__defaults__ or ()
+    kwdefaults = fn.__kwdefaults__ or {}
+    if not defaults and not kwdefaults:
+        return ()
+    positional: list[Hashable] = []
+    for value in defaults:
+        nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+        if nested is None:
+            return None
+        positional.append(nested[0])
+    keyword: list[tuple[str, Hashable]] = []
+    for name, value in kwdefaults.items():
+        nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+        if nested is None:
+            return None
+        keyword.append((name, nested[0]))
+    keyword.sort()
+    return (tuple(positional), tuple(keyword))
 
 
 _TensorMetadataPathStep = (
@@ -637,6 +704,38 @@ def _make_prepared_arg_guard(
             else:
                 namespace[f"value_{token}"] = inner
                 checks.append(f"{prefix}.value == value_{token}")
+        elif value_type is types.FunctionType and annotation is not ConstExpr:
+            # Mirror ``_function_key``: the code object identifies the
+            # function, every closure cell is guarded like an argument of its
+            # own type (cells are re-read because ``nonlocal`` can rebind them
+            # without replacing the function object), and every default value
+            # like a constexpr argument (defaults are baked into the traced
+            # kernel).  Module globals the function reads are not guarded, as
+            # the kernel's own globals are not.
+            function = cast("types.FunctionType", value)
+            namespace[f"code_{token}"] = function.__code__
+            checks.append(f"{prefix}.__code__ is code_{token}")
+            for cell_index, cell in enumerate(function.__closure__ or ()):
+                append_checks(
+                    cell.cell_contents,
+                    f"{prefix}.__closure__[{cell_index}].cell_contents",
+                )
+            if _function_defaults_fast_dispatch_key(function) is None:
+                raise TypeError("callable default without a constexpr key")
+            defaults = function.__defaults__ or ()
+            checks.append(f"len({prefix}.__defaults__ or ()) == {len(defaults)}")
+            for default_index, default in enumerate(defaults):
+                append_checks(
+                    default, f"{prefix}.__defaults__[{default_index}]", ConstExpr
+                )
+            kwdefaults = function.__kwdefaults__ or {}
+            checks.append(f"len({prefix}.__kwdefaults__ or {{}}) == {len(kwdefaults)}")
+            for name, default in kwdefaults.items():
+                checks.append(f"{name!r} in {prefix}.__kwdefaults__")
+                append_checks(default, f"{prefix}.__kwdefaults__[{name!r}]", ConstExpr)
+        elif value_type is types.BuiltinFunctionType:
+            namespace[f"value_{token}"] = value
+            checks.append(f"{prefix} is value_{token}")
         else:
             raise TypeError(f"unsupported prepared-call argument: {value_type!r}")
 
@@ -1390,7 +1489,13 @@ class Kernel(Generic[_R]):
                 key.append(None)
             elif t is torch.dtype or t is torch.device:
                 key.append(a)
-            elif t is tuple or t is list or t is dict:
+            elif (
+                t is tuple
+                or t is list
+                or t is dict
+                or t is types.FunctionType
+                or t is types.BuiltinFunctionType
+            ):
                 nested = _nested_fast_dispatch_key(
                     a,
                     specialize_numeric=annotation is ConstExpr,
@@ -3472,6 +3577,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if expr != symbol
         ]
         relations.extend(
+            (symbol, expr, True) for symbol, expr in self.env.keyed_size_equalities
+        )
+        relations.extend(
             (lhs, rhs, False)
             # Binding records ``!= 1`` for any size it saw >= 2 without code
             # depending on it; code generation's (block pointers keep a
@@ -4170,13 +4278,125 @@ def _number_key(fn: Kernel, n: float | bool) -> object:
     return type(n)
 
 
-def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
-    if obj.__closure__:
-        closures = [
-            fn._specialization_key(cell.cell_contents) for cell in obj.__closure__
-        ]
-        return (obj.__code__, *closures)
-    return obj.__code__
+def _function_key(
+    fn: Kernel, obj: types.FunctionType, *, baked: bool = False
+) -> object:
+    """Specialization key of a callable argument: its code object, the key of
+    every closure cell and the key of every default.
+
+    A cell of the argument itself is a runtime input of the compiled kernel
+    (``lift_closures`` lifts it, so it is read on each call) and keys like an
+    argument of its type. Defaults are baked into the kernel when the lifted
+    function is traced, so they key like constexprs through ``_constant_key``,
+    and so does everything reachable from a default: with ``baked`` the
+    function is itself a default (``lift_closures`` passes ``__defaults__``
+    through raw, so a default function is traced with its own cells, which
+    are never lifted) and its cells key by value too. Module globals the
+    function reads are not part of the key: like the kernel's own globals
+    they are read from the module when the kernel runs and specialized once,
+    on the first call's values."""
+    cells = obj.__closure__ or ()
+    defaults = obj.__defaults__ or ()
+    kwdefaults = obj.__kwdefaults__ or {}
+    if not cells and not defaults and not kwdefaults:
+        return obj.__code__
+    if baked:
+        closures = tuple(_constant_key(fn, cell.cell_contents) for cell in cells)
+    else:
+        closures = tuple(fn._specialization_key(cell.cell_contents) for cell in cells)
+    return (
+        obj.__code__,
+        closures,
+        tuple(_constant_key(fn, value) for value in defaults),
+        tuple(
+            sorted(
+                (name, _constant_key(fn, value)) for name, value in kwdefaults.items()
+            )
+        ),
+    )
+
+
+class _IdentityKey:
+    """Hashable stand-in for a baked-in value that cannot key by its own
+    equality (a tensor or a container holding one, whose ``==`` is not a
+    bool; an unhashable object): equal only to a key of the same object. It
+    keeps the object alive, so its identity cannot pass to another object
+    while a cache holds the key."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _IdentityKey and other.value is self.value
+
+    def __repr__(self) -> str:
+        return f"_IdentityKey({self.value!r})"
+
+
+def _constant_key(fn: Kernel, value: object) -> Hashable:
+    """Key of a value baked into the compiled kernel: by value through the
+    constexpr rules (numbers, strings, dtypes, containers of them), a
+    function through ``_function_key`` with its cells baked too (a lambda
+    default rebuilt per call keys like one passed as an argument), any other
+    hashable value with no tensor inside by its own equality (a frozenset,
+    a namedtuple, an enum member, a frozen dataclass, a bound method), else
+    by identity (a tensor or a container holding one, an unhashable
+    object).
+
+    Equality here is Python's: a frozenset, namedtuple or frozen dataclass
+    holding ``1``, ``1.0`` or ``True`` (or ``0.0`` and ``-0.0``) shares one
+    specialization although the baked constant differs (``1.0`` casts an
+    int32 input through float32), the same merge a constexpr argument
+    holding that container makes. Only a default that is itself a function
+    is read through ``_function_key``: a function inside a container
+    default keys by identity with the container, so its cells are not
+    re-read (a ``nonlocal`` rebind reuses the old kernel) and a lambda
+    rebuilt per call inside a tuple is a new specialization each call."""
+    if type(value) is types.FunctionType:
+        return cast("Hashable", _function_key(fn, value, baked=True))
+    nested = _nested_fast_dispatch_key(value, specialize_numeric=True)
+    if nested is not None:
+        return nested[0]
+    try:
+        hash(value)
+    except TypeError:
+        return _IdentityKey(value)
+    if _contains_tensor(value, set()):
+        return _IdentityKey(value)
+    return (type(value), cast("Hashable", value))
+
+
+def _contains_tensor(value: object, visited: set[int]) -> bool:
+    """Whether a ``torch.Tensor`` is reachable from ``value`` through tuples,
+    lists, sets, frozensets, dict keys and values, dataclass fields or a
+    bound method's ``__self__``. ``visited`` holds the ids of the objects
+    already walked (every object reachable from ``value`` stays alive for
+    the walk), so a cycle such as a dataclass holding itself ends."""
+    if isinstance(value, torch.Tensor):
+        return True
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return any(_contains_tensor(item, visited) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_tensor(key, visited) or _contains_tensor(item, visited)
+            for key, item in value.items()
+        )
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _contains_tensor(getattr(value, field.name), visited)
+            for field in dataclasses.fields(value)
+        )
+    if isinstance(value, types.MethodType):
+        return _contains_tensor(value.__self__, visited)
+    return False
 
 
 def _cute_grouped_layout_has_m_tail(

@@ -25,6 +25,11 @@ import helion
 from helion import exc
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
+from helion._compiler.cute.attention_plan import ROW_KV_BEGIN_MASK_KIND
+from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
+from helion._compiler.cute.attention_plan import AttentionScoreModifier
+from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.cute_flash import _flash_clc_heads_per_batch_candidates
 from helion._compiler.cute.cute_flash import (
     _flash_clc_heads_per_batch_coverage_candidates,
@@ -2674,6 +2679,8 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             dtype=torch.float16,
             block_size_targets={0: 1, 1: 128, 2: 128},
             standard_dense_output=True,
+            # The compound variants below exist on the fast_math surface only.
+            fast_math=True,
         )
 
         def make_search(generation):
@@ -2858,6 +2865,8 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
 
     def test_flash_initial_prefix_second_witnesses_only_ordinary_leaves(self):
+        # The compound (polynomial exp2 packet) leaves this test tells apart
+        # from the ordinary ones exist on the fast_math surface only.
         with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
             spec = ConfigSpec(
                 backend=CuteBackend(),
@@ -2873,6 +2882,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             dtype=torch.float16,
             block_size_targets={0: 1, 1: 128, 2: 128},
             standard_dense_output=True,
+            fast_math=True,
         )
         fragments = cute_flash.flash_autotune_fragments(
             64,
@@ -2880,6 +2890,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             num_bh=64,
             dtype=torch.float16,
             standard_dense_output=True,
+            fast_math=True,
         )
         ws_values = cute_flash.flash_effective_config_values(
             cute_flash.resolve_flash_config(
@@ -2889,6 +2900,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 dtype=torch.float16,
                 num_bh=64,
                 standard_dense_output=True,
+                fast_math=True,
             )
         )
         live_prefix_keys = {
@@ -7633,6 +7645,13 @@ class TestCuteAutotuner(TestCase):
                 "cute_proven_bounds",
                 "cute_packet_prefetch",
                 "cute_independent_reduction",
+                "cute_cluster_warp_online",
+                "cute_register_row",
+                "cute_register_row_tensor_copy",
+                "cute_scalar_epilogue",
+                "cute_scalar_epilogue_keep_inputs",
+                "cute_scalar_epilogue_owner_fold",
+                "cute_warp_fp32_redux",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",
                 "cute_vloop_sink",
@@ -7665,6 +7684,13 @@ class TestCuteAutotuner(TestCase):
                     "cute_proven_bounds",
                     "cute_packet_prefetch",
                     "cute_independent_reduction",
+                    "cute_cluster_warp_online",
+                    "cute_register_row",
+                    "cute_register_row_tensor_copy",
+                    "cute_scalar_epilogue",
+                    "cute_scalar_epilogue_keep_inputs",
+                    "cute_scalar_epilogue_owner_fold",
+                    "cute_warp_fp32_redux",
                     "cute_replicated_reduction",
                     "cute_vector_packet_unroll",
                     "cute_vloop_sink",
@@ -7911,10 +7937,17 @@ class TestCuteAutotuner(TestCase):
                 key,
             )
 
+        # A single contiguous-interval mask (sliding window here) prunes KV
+        # tiles but runs on both families: the fa4 pair body takes the union
+        # of its two query tiles' intervals, so the surface searches fa4 next
+        # to ws_overlap and defaults to fa4 at an even tile count. Only plans
+        # whose active tiles are not one interval (two composed masks) keep
+        # the ws_overlap lock; the per-row KV lower bound evaluates its range
+        # prelude per resident query tile, so it runs on the pair body too.
         sparse_bound = sparse_flash_attention.bind((q, k, v))
         sparse_spec = sparse_bound.config_spec
         self.assertTrue(sparse_spec._cute_flash_has_kv_tile_pruning)
-        self.assertTrue(sparse_spec._cute_flash_requires_ws_overlap)
+        self.assertFalse(sparse_spec._cute_flash_requires_ws_overlap)
         sparse_bound_fragments = sparse_spec._flat_fields()
         self.assertEqual(
             set(
@@ -7922,16 +7955,14 @@ class TestCuteAutotuner(TestCase):
                     sparse_bound_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
                 )
             ),
-            {"ws_overlap"},
+            {"fa4", "ws_overlap"},
         )
         sparse_default = sparse_spec.default_config().config
-        self.assertEqual(
-            sparse_default[cute_flash.FLASH_PIPELINE_FAMILY_KEY], "ws_overlap"
-        )
+        self.assertEqual(sparse_default[cute_flash.FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertTrue(sparse_default[cute_flash.FLASH_PACKED_REDUCE_KEY])
         stale_sparse = helion.Config(
             block_sizes=[1, 128, 128],
-            cute_flash_topology="fa4",
+            cute_flash_topology="ws_overlap",
         )
         sparse_spec.normalize(stale_sparse)
         self.assertEqual(
@@ -7939,6 +7970,90 @@ class TestCuteAutotuner(TestCase):
             "ws_overlap",
         )
         self.assertNotIn(cute_flash.FLASH_TOPOLOGY_KEY, stale_sparse.config)
+        window = AttentionScoreModifier(SLIDING_WINDOW_MASK_KIND, window_size=64)
+        causal = AttentionScoreModifier(CAUSAL_MASK_KIND)
+        row_kv_begin = AttentionScoreModifier(
+            ROW_KV_BEGIN_MASK_KIND, tensor_name="lb", index_mode="identity"
+        )
+        for modifiers, locked in (
+            ((window,), False),
+            ((causal, window), True),
+            ((row_kv_begin,), False),
+        ):
+            plan = AttentionScorePlan(
+                head_dim=64, qk_scale_log2=1.0, modifiers=modifiers
+            )
+            self.assertTrue(plan.has_kv_tile_pruning)
+            self.assertIs(plan.requires_ws_overlap, locked, modifiers)
+
+        # A ws_overlap-locked plan (two composed masks here: the causal mask
+        # applied by its own ``torch.where`` ahead of the window, which detects
+        # as two mask modifiers whose active tiles are not one interval)
+        # carries a single-family surface: a config that asks for the fa4
+        # family (a cached winner of another plan, say) normalizes back to
+        # ws_overlap.
+        @helion.kernel(backend="cute", static_shapes=True)
+        def chained_sparse_flash_attention(q_in, k_in, v_in):
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    causal = tile_m.index[None, :, None] >= tile_n.index[None, None, :]
+                    qk = torch.where(causal, qk, float("-inf"))
+                    delta = tile_m.index[None, :, None] - tile_n.index[None, None, :]
+                    qk = torch.where((delta >= 0) & (delta <= 64), qk, float("-inf"))
+                    m_ij_keepdim = torch.maximum(
+                        m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+                    )
+                    qk = qk - m_ij_keepdim
+                    m_ij = m_ij_keepdim.squeeze(-1)
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        locked_spec = chained_sparse_flash_attention.bind((q, k, v)).config_spec
+        self.assertTrue(locked_spec.cute_flash_search_enabled)
+        self.assertTrue(locked_spec._cute_flash_requires_ws_overlap)
+        self.assertEqual(
+            set(
+                active_choices(
+                    locked_spec._flat_fields()[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+                )
+            ),
+            {"ws_overlap"},
+        )
+        wants_fa4 = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+        )
+        locked_spec.normalize(wants_fa4)
+        self.assertEqual(
+            wants_fa4.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY], "ws_overlap"
+        )
+        self.assertEqual(
+            locked_spec.default_config().config[cute_flash.FLASH_PIPELINE_FAMILY_KEY],
+            "ws_overlap",
+        )
 
         # Aligned lengths share the same general search space. Only structural
         # legality, such as the parity needed by two-CTA families, may narrow it.
@@ -8006,9 +8121,11 @@ class TestCuteAutotuner(TestCase):
             cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY,
         ):
             self.assertGreater(len(active_choices(causal_short[key])), 1, key)
+        # FA4's L2-sized group (0, resolved per length), the serial head order
+        # and the whole 16-head grid.
         self.assertEqual(
             set(active_choices(causal_short[cute_flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY])),
-            {1},
+            {0, 1, 16},
         )
 
         sparse = cute_flash.flash_autotune_fragments(
@@ -8297,7 +8414,15 @@ class TestCuteAutotuner(TestCase):
             block_sizes=[1, 128, 128],
             cute_flash_exp2_packet="deg2_16x6",
         )
-        long_bound.config_spec.normalize(manual_packet)
+        # The degree-2 polynomial packet is an approximation: without the
+        # fast_math setting it is not a legal value; with it the manual packet
+        # keeps its measured cadence.
+        with self.assertRaisesRegex(exc.InvalidConfig, "deg2_16x6"):
+            long_bound.config_spec.normalize(copy.deepcopy(manual_packet))
+        fast_math_bound = helion.kernel(
+            flash_attention.fn, backend="cute", static_shapes=True, fast_math=True
+        ).bind((long_q, long_k, long_v))
+        fast_math_bound.config_spec.normalize(manual_packet)
         self.assertEqual(
             manual_packet.config[cute_flash.FLASH_EXP2_PACKET_KEY],
             "deg2_16x6",
@@ -8332,19 +8457,21 @@ class TestCuteAutotuner(TestCase):
         with self.assertRaises(exc.InvalidConfig):
             long_bound.config_spec.normalize(invalid_manual)
 
-        for config in (
-            family_compound,
-            family_two_cta,
-            source_schedule,
-            manual_values,
-            manual_packet,
+        fast_math_gen = ConfigGeneration(fast_math_bound.config_spec)
+        for generation, config in (
+            (long_gen, family_compound),
+            (long_gen, family_two_cta),
+            (long_gen, source_schedule),
+            (long_gen, manual_values),
+            # The degree-2 packet is legal on the fast_math surface only.
+            (fast_math_gen, manual_packet),
         ):
-            flat = long_gen.flatten(config)
-            long_gen.encode_config(flat)
+            flat = generation.flatten(config)
+            generation.encode_config(flat)
             expected = dict(config.config)
             expected.pop("cute_vector_widths", None)
             expected.pop("cute_lane_layouts", None)
-            self.assertEqual(long_gen.unflatten(flat).config, expected)
+            self.assertEqual(generation.unflatten(flat).config, expected)
 
         random_configs = [long_gen.random_config() for _ in range(24)]
         self.assertGreater(

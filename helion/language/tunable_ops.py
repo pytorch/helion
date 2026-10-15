@@ -99,6 +99,7 @@ def _(
     loop_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
+    loop_spec.declared_max_size = loop_spec.max_size
     return BlockSizeType(origin, env.block_sizes[block_id].var, block_id)
 
 
