@@ -79,6 +79,7 @@ from typing import Any
 from typing import Callable
 from typing import Iterable
 from typing import NamedTuple
+from typing import cast
 
 import torch
 
@@ -1124,7 +1125,9 @@ def _benchmark_quack(args: argparse.Namespace) -> dict[str, Any]:
     dtype, a, b, bias, residual = _make_matmul_problem(args)
     expected = _matmul_expected(args, a, b, bias, residual, dtype)
     if not args.skip_correctness:
-        _check_close(gemm(a, b, bias=bias, out_dtype=dtype), expected, dtype)
+        # A torch.dtype output selects Quack's Tensor return contract.
+        actual = cast("torch.Tensor", gemm(a, b, bias=bias, out_dtype=dtype))
+        _check_close(actual, expected, dtype)
     fn = lambda: gemm(a, b, bias=bias, out_dtype=dtype)  # noqa: E731
     stats = _bench_steady(
         fn,
