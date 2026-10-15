@@ -237,7 +237,7 @@ def test_literal_fp32_helper_keeps_direct_fp8_rounding(
             patch.object(
                 vec_utils,
                 "store_u8_vec",
-                side_effect=lambda pointer, values: stored_lanes.extend(values),
+                side_effect=lambda pointer, values, **_: stored_lanes.extend(values),
             ),
         ):
             value = midpoint + 2.0**-26
