@@ -100,6 +100,7 @@ from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
+from .common import matches_hardware
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -1867,11 +1868,12 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
 
 
 class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
-    """Seed collective operand staging for independent contractions."""
+    """Seed collective operand staging with hardware-specific initial priority."""
 
     name = "cute_collective_matmul"
     backend = "cute"
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    CACHE_NAMED_TARGETS = frozenset({("cuda", "NVIDIA H100 PCIe", "sm90")})
 
     @classmethod
     def register_facts(
@@ -2429,9 +2431,24 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
-        return cls._interleave_bounded_k_seeds(
+        result = cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
+        if (
+            result
+            and len(spec.matmul_facts) == 1
+            and spec.matmul_facts[0].lhs_dtype == torch.float16
+            and result[0].block_sizes == [64, 32, 64]
+            and result[0].num_threads == [4, 32, 1]
+            and matches_hardware(env, None, named_targets=cls.CACHE_NAMED_TARGETS)
+        ):
+            # Keep derivation/interleaving intact; prefer only the measured geometry.
+            preferred = Config.from_dict(
+                result[0].config | {"cute_collective_copy": "async"}
+            )
+            if preferred in result:
+                result.insert(0, result.pop(result.index(preferred)))
+        return result
 
 
 def _cute_reread_cache_policies(
