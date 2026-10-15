@@ -33,8 +33,10 @@ def _run(run_id: str, date: str) -> dict[str, object]:
     }
 
 
-def _write_artifact(cache_dir: Path, run_id: str, records: list[dict]) -> None:
-    artifact_dir = cache_dir / run_id / "pretuned-results-h100"
+def _write_artifact(
+    cache_dir: Path, run_id: str, records: list[dict], platform: str = "h100"
+) -> None:
+    artifact_dir = cache_dir / run_id / f"pretuned-results-{platform}"
     artifact_dir.mkdir(parents=True)
     (artifact_dir / "pretuned-bench.json").write_text(json.dumps(records))
 
@@ -115,3 +117,59 @@ def test_latest_kernel_failure_replaces_previous_speedup(tmp_path: Path) -> None
     assert data["stats"]["failed_count"] == 1
     assert data["stats"]["unchanged_count"] == 0
     assert data["stats"]["geomean"] == 3.0
+
+
+def test_xpu_artifact_keeps_platform_and_graph_metadata(tmp_path: Path) -> None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    run = _run("xpu", now.isoformat())
+    common = {
+        "device": "Intel(R) Arc(TM) Pro B70 Graphics",
+        "compute_capability": "Intel(R) Arc(TM) Pro B70 Graphics",
+    }
+    baseline = {"torch": {"wins": 1, "total": 1, "geomean": 1.25}}
+    _write_artifact(
+        tmp_path,
+        "xpu",
+        [
+            {
+                **common,
+                "kernel": "scaled_mm",
+                "cudagraph": True,
+                "geomean": 1.25,
+                "helion_wins": 1,
+                "total": 1,
+                "best_speedup": 1.25,
+                "baselines": baseline,
+            },
+            {
+                **common,
+                "kernel": "vector_add",
+                "cudagraph": False,
+                "geomean": 1.1,
+                "helion_wins": 1,
+                "total": 1,
+                "best_speedup": 1.1,
+                "baselines": baseline,
+            },
+        ],
+        platform="xpu",
+    )
+
+    dispatch_workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "benchmark_pretuned_dispatch.yml"
+    )
+    active_platforms = _BUILDER.get_active_platforms(dispatch_workflow)
+    assert active_platforms is not None and "xpu" in active_platforms
+    data = _BUILDER.build_dashboard_data(
+        tmp_path, [run], active_platforms=active_platforms
+    )
+    summary = {entry["kernel"]: entry for entry in data["summary"]}
+
+    assert data["platform_shorts"] == ["xpu"]
+    assert summary["scaled_mm"]["platform_short"] == "xpu"
+    assert summary["scaled_mm"]["cudagraph"] is True
+    assert summary["scaled_mm"]["history"][0]["cudagraph"] is True
+    assert summary["vector_add"]["cudagraph"] is False
