@@ -765,17 +765,36 @@ for bound, config in (
         self.assertEqual(keys[0], keys[1])
 
     def test_tunable_fragment_source_hit_in_fresh_process(self) -> None:
-        bound = _cached_bound(_cached_tunable.fn, torch.ones(16))
-        sources: list[str] = []
-        with patch.object(
-            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
-        ):
-            bound.set_config(_TUNABLE_CONFIG)
-        self.assertEqual(len(sources), 1)
+        # Both sides run in fresh processes: state left by earlier tests in
+        # this pytest process must not decide whether the key matches.
+        parent = self.cache_root / "parent"
         child = self.cache_root / "child"
+        parent.mkdir()
         child.mkdir()
+        save = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+sources = []
+with patch.object(module.PyCodeCache, "load", side_effect=module._source_loader(Path(sys.argv[3]), sources)):
+    bound = module._cached_bound(module._cached_tunable.fn, torch.ones(16))
+    bound.set_config(module._TUNABLE_CONFIG)
+assert len(sources) == 1, sources
+"""
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                save,
+                __file__,
+                _cached_tunable.fn.__module__,
+                str(parent),
+            ],
+            check=True,
+            timeout=60,
+        )
         # Without saved bindings the fresh process runs the frontend and must
-        # still find the source this process saved.
+        # still find the source the other process saved.
         code = (
             _FRESH_PROCESS_PRELUDE
             + """
@@ -801,7 +820,7 @@ assert sources == [Path(sys.argv[4]).read_text()], sources
                 __file__,
                 _cached_tunable.fn.__module__,
                 str(child),
-                str(self.cache_root / "module_1.py"),
+                str(parent / "module_1.py"),
             ],
             check=True,
             timeout=60,

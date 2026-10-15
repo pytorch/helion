@@ -174,7 +174,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             ),
             patch.object(
                 add_one,
-                "bind",
+                "_dispatch_bind",
                 side_effect=AssertionError("prepared call rebound the kernel"),
             ),
         ):
@@ -201,7 +201,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             ),
             patch.object(
                 apply,
-                "bind",
+                "_dispatch_bind",
                 side_effect=AssertionError("prepared call rebound the kernel"),
             ),
         ):
@@ -220,7 +220,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         # Alternating functions dispatch through the cache without rebinding.
         with patch.object(
             apply,
-            "bind",
+            "_dispatch_bind",
             side_effect=AssertionError("cached specialization rebound the kernel"),
         ):
             torch.testing.assert_close(apply(x, _double), x * 2)
@@ -239,13 +239,15 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             self.assertIsNotNone(bound._direct_prepared_call)
         with patch.object(
             apply,
-            "bind",
+            "_dispatch_bind",
             side_effect=AssertionError("direct prepared call rebound the kernel"),
         ):
             torch.testing.assert_close(bound(*args), x * 2)
         if bound.kernel._has_specialization_extras:  # type: ignore[attr-defined]
             # A different callable leaves the monomorphic path and rebinds.
-            with patch.object(apply, "bind", wraps=apply.bind) as bind:
+            with patch.object(
+                apply, "_dispatch_bind", wraps=apply._dispatch_bind
+            ) as bind:
                 out = bound(x, _triple)
             bind.assert_called()
             torch.testing.assert_close(out, x * 3)
