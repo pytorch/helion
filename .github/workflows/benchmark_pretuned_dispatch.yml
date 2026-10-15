@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: true
+      run_xpu:
+        description: 'Run pretuned benchmarks on Intel Arc Pro B70'
+        required: false
+        type: boolean
+        default: false
       kernels:
         description: 'Comma-separated list of kernels to run (empty = all)'
         required: false
@@ -64,9 +69,25 @@ jobs:
       kernels: ${{ github.event.inputs.kernels || '' }}
       env-vars: ${{ github.event.inputs.env_vars || '' }}
 
+  run-xpu:
+    if: ${{ github.event.inputs.run_xpu == 'true' }}
+    uses: ./.github/workflows/benchmark_pretuned.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.idc.xpu
+      python-version: "3.12"
+      image: intel/omix:0.4.0-devel-ubuntu26.04
+      runtime-version: xpu
+      container-options: --device=/dev/dri --group-add video --ipc=host -e ZE_AFFINITY_MASK
+      alias: xpu
+      kernels: ${{ github.event.inputs.kernels || '' }}
+      env-vars: ${{ github.event.inputs.env_vars || '' }}
+
   trigger-docs-deploy:
     if: always()
-    needs: [run-h100, run-b200]
+    needs: [run-h100, run-b200, run-xpu]
     runs-on: ubuntu-latest
     permissions:
       actions: write

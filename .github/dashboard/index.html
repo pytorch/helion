@@ -164,8 +164,14 @@ a:hover{text-decoration:underline}
 <script>
 const REPO = 'pytorch/helion';
 let DATA = typeof EMBEDDED_DATA !== 'undefined' ? EMBEDDED_DATA : null;
-const PLAT_COLORS = { h100: '#3fb950', b200: '#58a6ff', b200_cute: '#39c5cf', mi325x: '#f0883e', mi350x: '#bc8cff', tpu: '#d29922' };
-const PLAT_NAMES = { h100: 'H100', b200: 'B200', b200_cute: 'B200 CuTe', mi325x: 'MI325X', mi350x: 'MI350X', tpu: 'TPU v7' };
+const PLAT_COLORS = {
+  h100: '#3fb950', b200: '#58a6ff', b200_cute: '#39c5cf', mi325x: '#f0883e',
+  mi350x: '#bc8cff', tpu: '#d29922', xpu: '#e35205',
+};
+const PLAT_NAMES = {
+  h100: 'H100', b200: 'B200', b200_cute: 'B200 CuTe', mi325x: 'MI325X',
+  mi350x: 'MI350X', tpu: 'TPU v7', xpu: 'Intel Arc Pro B70',
+};
 const plotlyDark = {
   paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
   font: { color: '#e6edf3', size: 11 },
@@ -201,8 +207,11 @@ function platBadge(ps) {
 }
 function cudagraphBadge(on) {
   return on
-    ? '<span class="plat-badge" style="background:#bc8cff22;color:#bc8cff" title="Benchmarked under CUDA graphs (do_bench_cudagraph)">CUDA Graph</span>'
-    : '<span class="plat-badge" style="background:#8b949e22;color:#8b949e" title="Benchmarked with do_bench (no CUDA graph)">do_bench</span>';
+    ? '<span class="plat-badge" style="background:#bc8cff22;color:#bc8cff" ' +
+      'title="Benchmarked under a captured device graph with ' +
+      'L2-cleared replays">Device Graph</span>'
+    : '<span class="plat-badge" style="background:#8b949e22;color:#8b949e" ' +
+      'title="Benchmarked with do_bench (no graph)">do_bench</span>';
 }
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 // -------- Helper: status card (overview row) --------
