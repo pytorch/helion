@@ -45,13 +45,13 @@ This document explains how to work effectively in this repository.
 - For long outputs, pipe to a file: `... -s 2>&1 | tee /tmp/pytest.out`.
 - Enable dtype/codegen checks when chasing codegen bugs: set `HELION_DEBUG_DTYPE_ASSERTS=1` and/or `HELION_PRINT_OUTPUT_CODE=1`.
 - Show skip reasons with `pytest -ra`; narrow with `-k <pattern>` for fast cycles.
-- When running many tests, prefer `pytest-xdist` with `-n4`
+- pytest runs in parallel by default: `test/conftest.py` sizes the pytest-xdist worker count to the free memory of the first visible GPU (NVIDIA, ROCm, or XPU) and the CPU count, running serially without a GPU and uses `--dist worksteal`. `-s`, `--pdb`, and `-n0` run in a single process; `-n N` picks the count.
 
 ## GPU Usage
 
 - You are often running on a shared machine with multiple GPUs, assign tasks to specific GPUs with `CUDA_VISIBLE_DEVICES=...`
 - Play nice with others: check for other GPU users with `nvidia-smi` and avoid assigning tasks to a busy GPU
-- `pytest-xdist` with `-n4` will saturate a GPU, so only run one of those at a time per GPU
+- A parallel pytest run sizes itself to fill its GPU, so only run one at a time per GPU
 - Autotuning and performance measurement is sensitive to GPU load, so make sure to assign those to idle GPUs
 - Performance can vary between GPUs, even though they are the same model, so don't compare absolute measurements taken on one GPU to those taken on another
 - Performance can vary with GPU thermals, so watch out for that.  You may need to interleave measurements or wait for the GPU to cool down.
