@@ -22,6 +22,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
@@ -37,6 +39,7 @@ from helion._compiler.autotuner_heuristics.cute import (
 )
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
+from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
@@ -11348,6 +11351,138 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertEqual(seed["block_sizes"][apply_idx], expected_apply_block)
             # H100 and B200 share the candidate and warp policy.
             self.assertEqual(seed["num_warps"], 8)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "width,strided",
+    [
+        (1, False),
+        (3, False),
+        (4, False),
+        (8, False),
+        (64, False),
+        (128, False),
+        (256, False),
+        (512, False),
+        (4, True),
+    ],
+)
+def test_cute_narrow_pointwise_seeds_with_safe_loads(
+    dtype: torch.dtype, width: int, strided: bool
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for rows, columns in hl.tile(x.shape):
+            out[rows, columns] = x[rows, columns] + y[rows, columns]
+        return out
+
+    def thread_count(config: helion.Config) -> int:
+        return math.prod(max(1, n) for n in config.num_threads)
+
+    x = torch.empty(16384, width * (2 if strided else 1), dtype=dtype)
+    args = (x[:, ::2] if strided else x,) * 2
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(add, args)
+        spec = bound.config_spec
+        assert "cute_pointwise_vec" in spec.autotuner_heuristics
+        if width <= 8:
+            assert "cute_resident_row" not in spec.autotuner_heuristics
+        failures: list[str] = []
+        candidates = [
+            config
+            for _, config in ConfigGeneration(spec).seed_flat_config_pairs(
+                failures.append
+            )
+            if any(config.config.get("flatten_loops", [])) == (width > 1)
+            and math.prod(config.block_sizes) >= 512
+            and thread_count(config) >= 128
+        ]
+        assert not failures
+        assert candidates
+        assert thread_count(candidates[0]) == 256
+        assert any(thread_count(config) == 512 for config in candidates)
+        vector = 16 // x.element_size()
+        for threads in (128, 256):
+            for packet_width in (4, 8):
+                if packet_width > vector:
+                    continue
+                assert any(
+                    math.prod(config.block_sizes) == threads * packet_width
+                    and thread_count(config) == threads
+                    and max(config["cute_vector_widths"]) == packet_width
+                    for config in candidates
+                )
+        assert all(max(config["cute_vector_widths"]) <= vector for config in candidates)
+        assert any(config.get("cute_packet_prefetch") == 2 for config in candidates)
+        for config in candidates:
+            code = bound.to_code(config)
+            assert ("ir.VectorType.get([" in code) == (not strided)
+        if not strided:
+            assert f"ir.VectorType.get([{vector}]," in bound.to_code(candidates[0])
+        assert bound.host_function is not None
+        seeds = CutePointwiseVecHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        lists = [
+            id(value)
+            for seed in seeds
+            for value in seed.config.values()
+            if isinstance(value, list)
+        ]
+        assert len(lists) == len(set(lists))
+
+
+@pytest.mark.parametrize("shape", [(1026,), (513, 2)])
+def test_cute_pointwise_packet_widths_divide_extent(shape: tuple[int, ...]) -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.shape):
+            out[tile] = x[tile] + 1
+        return out
+
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(add, (torch.empty(shape, dtype=torch.bfloat16),))
+        assert bound.host_function is not None
+        seeds = CutePointwiseVecHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        assert seeds
+        for seed in seeds:
+            assert max(seed["cute_vector_widths"]) == 2
+            assert "ir.VectorType.get([2]," in bound.to_code(seed)
+
+
+@pytest.mark.parametrize("width", [4095, 4096])
+def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def add(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for rows, columns in hl.tile(x.shape):
+            out[rows, columns] = x[rows, columns] + 1
+        return out
+
+    with _mock_cuda_unavailable(), _forbid_native_compile():
+        bound = _cpu_bind(add, (torch.empty(8, width, dtype=torch.bfloat16).T,))
+        assert bound.host_function is not None
+        seeds = CutePointwiseVecHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        if width % 2:
+            assert seeds == []
+        else:
+            assert seeds
+            assert all(not any(seed.get("flatten_loops", [])) for seed in seeds)
+            assert seeds[0]["cute_vector_widths"] == [8, 1]
+            assert "ir.VectorType.get([8]," in bound.to_code(seeds[0])
+        failures: list[str] = []
+        assert ConfigGeneration(bound.config_spec).seed_flat_config_pairs(
+            failures.append
+        )
+        assert not failures
+        bound.to_code(bound.config_spec.default_config())
 
 
 def _cute_matmul_for_heuristics(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
