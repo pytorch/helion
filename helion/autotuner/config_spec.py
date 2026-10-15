@@ -1045,6 +1045,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_hook_cols",
         "cute_flash_bwd_hook_pin",
         "cute_flash_bwd_bias_fold",
+        "cute_flash_bwd_tile_group",
+        "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_exp2_emu",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_GDN_RECURRENCE_STAGES_KEY,
@@ -1289,6 +1292,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_hook_cols",
         "cute_flash_bwd_hook_pin",
         "cute_flash_bwd_bias_fold",
+        "cute_flash_bwd_tile_group",
+        "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_exp2_emu",
         "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1878,6 +1884,8 @@ class ConfigSpec:
         self._cute_flash_bwd_persistent_allowed: bool = True
         # The FlexAttention backward envelope: opens the mask-form knob.
         self._cute_flash_bwd_flex: bool = False
+        self._cute_flash_bwd_tile_groups: tuple[int, ...] = (0,)
+        self._cute_flash_bwd_fast_math: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
@@ -3332,6 +3340,8 @@ class ConfigSpec:
         two_cta_allowed: bool = False,
         persistent_allowed: bool = True,
         flex: bool = False,
+        tile_groups: tuple[int, ...] = (0,),
+        fast_math: bool = False,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3345,6 +3355,8 @@ class ConfigSpec:
         self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
         self._cute_flash_bwd_persistent_allowed = persistent_allowed
         self._cute_flash_bwd_flex = flex
+        self._cute_flash_bwd_tile_groups = tile_groups
+        self._cute_flash_bwd_fast_math = fast_math
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
@@ -7102,6 +7114,20 @@ class ConfigSpec:
                     fields["cute_flash_bwd_hook_pin"] = EnumFragment(choices=(1, 0))
                     # Fold an additive score bias into the LSE term (see additive_bias_region).
                     fields["cute_flash_bwd_bias_fold"] = EnumFragment(choices=(1, 0))
+                    # Block-index -> (batch-head, KV tile) walk: heaviest-first
+                    # inside L2-sized batch-head groups (see fbwd_tile_group_choices).
+                    fields["cute_flash_bwd_tile_group"] = EnumFragment(
+                        choices=self._cute_flash_bwd_tile_groups
+                    )
+                    # Per-column LSE / delta terms through K-slice MMAs instead of
+                    # broadcast smem loads in the compute passes (see _fit_smem_budget).
+                    fields["cute_flash_bwd_stats_mma"] = EnumFragment(choices=(0, 1))
+                    if self._cute_flash_bwd_fast_math:
+                        # Elements of every 16 sent to the polynomial exp2 on the
+                        # FMA pipe (an approximation: fast_math kernels only).
+                        fields["cute_flash_bwd_exp2_emu"] = EnumFragment(
+                            choices=(0, 8, 4)
+                        )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path

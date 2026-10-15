@@ -785,7 +785,7 @@ def _fbwd_epilogue_block(
         fbwd_epi_slot0 = {f"{d // 64} * (FBWD_KV_SLOT)" if h == 0 else "0"}
         fbwd_gEpi = cute.local_tile({gm}, (128, 64), (None, None)){kv_empty}{chunks}
         if warp_idx == {warp_lo}:
-            cute.arch.cp_async_bulk_wait_group(0){hs}
+            cute.arch.cp_async_bulk_wait_group(0, read=True){hs}
 """
 
 
@@ -1111,7 +1111,7 @@ def _fbwd_wrap_persistent(body: str, plan: AttentionBwdPlan, total_tiles: int) -
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0, read=True)", s)
         while e + 1 < len(lines) and lines[e + 1].startswith("            "):
             e += 1  # WG0's V-slot release sits under the same if
         regions.append((s, e))
@@ -1639,7 +1639,7 @@ def _fbwd2_wrap_persistent(body: str, plan: AttentionBwdPlan, total_pairs: int) 
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0, read=True)", s)
         while e + 1 < len(lines) and lines[e + 1].startswith("            "):
             e += 1
         regions.append((s, e))
@@ -2644,10 +2644,14 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     targets = {match.kv_block_id: 128, match.q_block_id: 128}
     if not _flash_block_sizes_reachable(env, targets):
         return False
+    from .cute_flash_bwd_flex import fbwd_tile_group_choices
+
     env.config_spec.enable_cute_flash_bwd_search(
         block_size_targets=targets,
         two_cta_allowed=False,
         persistent_allowed=False,
         flex=True,
+        tile_groups=fbwd_tile_group_choices(match.plan),
+        fast_math=bool(env.settings.fast_math),
     )
     return True
