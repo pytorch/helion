@@ -2398,13 +2398,16 @@ class DeviceFunction:
         rename_groups = {
             name: aliases[0] for name, aliases in self._variable_renames.items()
         }
-        for _ in range(8):
-            rw = ReadWrites.from_list([*self.preamble, *self.body])
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
+        while True:
+            previous_rw = rw
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
             dead_lane_loop_elimination(self.body, rename_groups)
             dead_lane_loop_elimination(self.preamble, rename_groups)
-        rw = ReadWrites.from_list([*self.preamble, *self.body])
+            rw = ReadWrites.from_list([*self.preamble, *self.body])
+            if rw == previous_rw:
+                break
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).
