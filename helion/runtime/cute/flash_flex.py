@@ -8,6 +8,10 @@ count of a BlockMask varies with the mask, and a plain strided order over
 ``(bh, pair)`` was measured 6-8% behind the non-persistent grid at 15-40%
 density).
 
+``flex_item_words`` packs every pair item's BlockMask rows into tile
+bitmask words (``cute_flash_flex_item_words``) so the device roles load a
+few words per item instead of rebuilding the masks from the index lists.
+
 ``flex_split_workspace`` allocates the split-KV walk's partial-output
 workspace and arrival counters (``cute_flash_kv_split``).
 """
@@ -115,7 +119,107 @@ def _dense_tiles(count: torch.Tensor, index: torch.Tensor, num_kv: int) -> torch
     return dense[..., :num_kv]
 
 
-def _build_flex_item_table(
+def _pack_tile_words(dense: torch.Tensor, num_kv: int) -> torch.Tensor:
+    """``(..., words)`` int32 bitmask words of a ``(..., num_kv)`` 0/1
+    membership: tile ``t`` is bit ``t & 31`` of word ``t >> 5`` (the device
+    walk's ``_flash_flex_mask_build`` layout)."""
+    words = -(-num_kv // 32)
+    padded = torch.nn.functional.pad(dense.to(torch.int64), (0, words * 32 - num_kv))
+    shifts = torch.arange(32, device=dense.device, dtype=torch.int64)
+    packed = (padded.reshape(*dense.shape[:-1], words, 32) << shifts).sum(dim=-1)
+    # Two's complement: bit 31 set is a negative int32.
+    packed = torch.where(packed >= 1 << 31, packed - (1 << 32), packed)
+    return packed.to(torch.int32)
+
+
+def _build_flex_item_tables(
+    part_cnt: torch.Tensor,
+    part_idx: torch.Tensor,
+    full_cnt: torch.Tensor,
+    full_idx: torch.Tensor,
+    *,
+    q_block: int,
+    batch: int,
+    heads: int,
+    num_pairs: int,
+    num_kv: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The item order and the per-item bitmask words (see ``flex_item_table``
+    and ``flex_item_words``), built together from one pass over the tables."""
+    # Every op below has a static shape (no ``nonzero`` / ``.item()``), so
+    # the build is legal inside a CUDA-graph capture.
+    assert q_block in (128, 256)
+    table_batch, table_heads, rows = part_cnt.shape
+    assert batch % table_batch == 0 and heads % table_heads == 0
+    part = _dense_tiles(part_cnt, part_idx, num_kv)
+    full = _dense_tiles(full_cnt, full_idx, num_kv)
+    if q_block == 256:
+        assert rows >= num_pairs
+        part = part[:, :, :num_pairs]
+        full = full[:, :, :num_pairs]
+        pair_union = torch.maximum(part, full)
+        # One row per pair: [partial words, full words].
+        per_pair = torch.stack([part, full], dim=3)
+    else:
+        # Rows ``2p`` and ``2p + 1`` form pair ``p``; a ragged query length
+        # leaves the last pair with a single row (its second stage: no tiles).
+        assert num_pairs * 2 >= rows >= num_pairs * 2 - 1
+        if rows < num_pairs * 2:
+            pad = (0, 0, 0, num_pairs * 2 - rows)
+            part = torch.nn.functional.pad(part, pad)
+            full = torch.nn.functional.pad(full, pad)
+        part = part.reshape(table_batch, table_heads, num_pairs, 2, num_kv)
+        full = full.reshape(table_batch, table_heads, num_pairs, 2, num_kv)
+        pair_union = torch.maximum(part, full).amax(dim=3)
+        # Per pair: [stage-0 partial, stage-0 full, stage-1 partial, stage-1 full].
+        per_pair = torch.stack(
+            [part[:, :, :, 0], full[:, :, :, 0], part[:, :, :, 1], full[:, :, :, 1]],
+            dim=3,
+        )
+    count = pair_union.to(torch.int32).sum(dim=-1)
+    words = _pack_tile_words(per_pair, num_kv)  # (Bm, Hm, pairs, lists, W)
+    # Broadcast tables (``Bm`` / ``Hm`` of 1, or any divisor) index with
+    # ``b % Bm`` / ``h % Hm`` like the device body.
+    b_index = torch.arange(batch, device=count.device) % table_batch
+    h_index = torch.arange(heads, device=count.device) % table_heads
+    count = count[b_index][:, h_index].reshape(-1)
+    # Flat: the device indexes it linearly (``item * stride + word``); a 2-D
+    # CuTe tensor would resolve a linear index through its column-major
+    # layout instead.
+    words = words[b_index][:, h_index].reshape(-1)
+    # Longest-first, stable: equal counts keep the ``(bh, pair)`` order.
+    order = torch.sort(count, descending=True, stable=True).indices
+    return order.to(torch.int32), words.contiguous()
+
+
+def _flex_item_tables(
+    part_cnt: torch.Tensor,
+    part_idx: torch.Tensor,
+    full_cnt: torch.Tensor,
+    full_idx: torch.Tensor,
+    **kwargs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_build_flex_item_tables`` cached per ``part_cnt`` tensor behind the
+    four tables' pointers and version counters (rebuilt on every call under
+    CUDA-graph capture and for inference tensors)."""
+    tables = (part_cnt, part_idx, full_cnt, full_idx)
+    if any(table.is_inference() for table in tables) or (
+        part_cnt.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
+        return _build_flex_item_tables(*tables, **kwargs)
+    key = (
+        tuple(sorted(kwargs.items())),
+        tuple((table.data_ptr(), table._version) for table in tables),
+    )
+    cached = _FLEX_ITEM_TABLE_CACHE.get(part_cnt)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    built = _build_flex_item_tables(*tables, **kwargs)
+    _FLEX_ITEM_TABLE_CACHE[part_cnt] = (key, built)
+    return built
+
+
+def flex_item_words(
     part_cnt: torch.Tensor,
     part_idx: torch.Tensor,
     full_cnt: torch.Tensor,
@@ -127,36 +231,31 @@ def _build_flex_item_table(
     num_pairs: int,
     num_kv: int,
 ) -> torch.Tensor:
-    # Every op below has a static shape (no ``nonzero`` / ``.item()``), so
-    # the build is legal inside a CUDA-graph capture.
-    assert q_block in (128, 256)
-    table_batch, table_heads, rows = part_cnt.shape
-    assert batch % table_batch == 0 and heads % table_heads == 0
-    union = torch.maximum(
-        _dense_tiles(part_cnt, part_idx, num_kv),
-        _dense_tiles(full_cnt, full_idx, num_kv),
-    )
-    if q_block == 256:
-        assert rows >= num_pairs
-        pair_union = union[:, :, :num_pairs]
-    else:
-        # Rows ``2p`` and ``2p + 1`` form pair ``p``; a ragged query length
-        # leaves the last pair with a single row.
-        assert num_pairs * 2 >= rows >= num_pairs * 2 - 1
-        if rows < num_pairs * 2:
-            union = torch.nn.functional.pad(union, (0, 0, 0, num_pairs * 2 - rows))
-        pair_union = union.reshape(table_batch, table_heads, num_pairs, 2, num_kv).amax(
-            dim=3
-        )
-    count = pair_union.to(torch.int32).sum(dim=-1)
-    # Broadcast tables (``Bm`` / ``Hm`` of 1, or any divisor) index with
-    # ``b % Bm`` / ``h % Hm`` like the device body.
-    b_index = torch.arange(batch, device=count.device) % table_batch
-    h_index = torch.arange(heads, device=count.device) % table_heads
-    count = count[b_index][:, h_index].reshape(-1)
-    # Longest-first, stable: equal counts keep the ``(bh, pair)`` order.
-    order = torch.sort(count, descending=True, stable=True).indices
-    return order.to(torch.int32)
+    """Per-item KV tile bitmasks of the flex list walk
+    (``cute_flash_flex_item_words``).
+
+    A flat ``int32`` table of ``batch * heads * num_pairs`` rows of ``lists *
+    words`` entries (row ``bh * num_pairs + pair`` at ``row * lists * words``);
+    ``words = ceil(num_kv / 32)``; the lists are
+    ``[partial, full]`` of the pair's row for a 256-row BlockMask and
+    ``[partial(2p), full(2p), partial(2p+1), full(2p+1)]`` for a 128-row one
+    (a ragged last pair's missing row: zero words).  Tile ``t`` is bit
+    ``t & 31`` of word ``t >> 5``, the layout the device walk builds from the
+    index lists; every walking role reads its words instead of walking the
+    lists (one load per word, no dependent chain).  Broadcast tables are
+    expanded per ``(b, h)``.  Cached and rebuilt like ``flex_item_table``.
+    """
+    return _flex_item_tables(
+        part_cnt,
+        part_idx,
+        full_cnt,
+        full_idx,
+        q_block=q_block,
+        batch=batch,
+        heads=heads,
+        num_pairs=num_pairs,
+        num_kv=num_kv,
+    )[1]
 
 
 def flex_item_table(
@@ -184,25 +283,14 @@ def flex_item_table(
     Cached per ``part_cnt`` tensor behind the four tables' pointers and
     version counters; rebuilt on every call under CUDA-graph capture.
     """
-    tables = (part_cnt, part_idx, full_cnt, full_idx)
-    kwargs = {
-        "q_block": q_block,
-        "batch": batch,
-        "heads": heads,
-        "num_pairs": num_pairs,
-        "num_kv": num_kv,
-    }
-    if any(table.is_inference() for table in tables) or (
-        part_cnt.is_cuda and torch.cuda.is_current_stream_capturing()
-    ):
-        return _build_flex_item_table(*tables, **kwargs)
-    key = (
-        tuple(kwargs.values()),
-        tuple((table.data_ptr(), table._version) for table in tables),
-    )
-    cached = _FLEX_ITEM_TABLE_CACHE.get(part_cnt)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    table = _build_flex_item_table(*tables, **kwargs)
-    _FLEX_ITEM_TABLE_CACHE[part_cnt] = (key, table)
-    return table
+    return _flex_item_tables(
+        part_cnt,
+        part_idx,
+        full_cnt,
+        full_idx,
+        q_block=q_block,
+        batch=batch,
+        heads=heads,
+        num_pairs=num_pairs,
+        num_kv=num_kv,
+    )[0]
