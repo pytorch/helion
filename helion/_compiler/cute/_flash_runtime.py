@@ -422,6 +422,8 @@ def flash_bwd_shared_storage(
             dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
+            flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
             tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_holding_buf: cutlass.Int32
             mma_base: cute.struct.MemRange[cutlass.Int32, 8]
@@ -471,6 +473,8 @@ def flash_bwd_shared_storage(
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         # the step's dK MMA (the last reader of the dS staging) complete
         dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
+        flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
         # MMA operand start addresses, re-read with ld.volatile per iteration
@@ -752,6 +756,8 @@ def flash_bwd_2cta_shared_storage(
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         # the step's dK MMA (the last reader of the dS staging) complete
         dk_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # flex list walk, persistent: table_full[2], table_empty[2], sds_free, tile_issued
+        flex_mbar: cute.struct.MemRange[cutlass.Int64, 8]
         ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         s_read_mbar: cute.struct.MemRange[cutlass.Int64, 1]

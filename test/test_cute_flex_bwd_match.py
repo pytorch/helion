@@ -205,13 +205,15 @@ def test_causal_mask_plan_and_surface() -> None:
     # The surface detector pinned the KV tile and the Q tile to 128.
     spec = bound.config_spec
     assert spec.cute_flash_bwd_search_enabled
-    assert spec._cute_flash_bwd_flex and not spec._cute_flash_bwd_persistent_allowed
+    assert spec._cute_flash_bwd_flex and spec._cute_flash_bwd_persistent_allowed
     config = spec.default_config()
     assert config.config["cute_flash_bwd_regs"] == "120/152/88"
     assert config.config["cute_flash_bwd_exp2_f32"] == 1
-    # The L2-sized batch-head group and the statistics-through-MMA mode are
-    # knobs; the group starts at the widest fit (2 batch-heads of 512 rows at
-    # head dim 64), the statistics on the register path.
+    # The persistent CLC walk, the L2-sized batch-head group and the
+    # statistics-through-MMA mode are knobs; the walk starts non-persistent,
+    # the group at the widest fit (2 batch-heads of 512 rows at head dim 64),
+    # the statistics on the register path.
+    assert config.config["cute_flash_bwd_persistent"] == 0
     assert config.config["cute_flash_bwd_tile_group"] == 8
     assert config.config["cute_flash_bwd_stats_mma"] == 0
     # The polynomial exp2 share is offered (the example runs fast_math) but
