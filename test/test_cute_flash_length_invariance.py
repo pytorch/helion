@@ -2033,14 +2033,15 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # table loads) and the flex table request width
     # (``cute_flash_flex_coalesce``, live only on flex plans with a
     # coalescible row-table run) and the rolled flex chunk loop
-    # (``cute_flash_flex_rolled_chunks``, live only on list-walk plans) and
-    # the host-built item words (``cute_flash_flex_item_words``, live only
-    # on list-walk plans); the two-warpgroup body measures both of its O
-    # epilogues
+    # (``cute_flash_flex_rolled_chunks``, live only on list-walk plans), the
+    # host-built item words (``cute_flash_flex_item_words``, live only on
+    # list-walk plans) and the register-resident chunked PASS2
+    # (``cute_flash_s_resident``, live only on list-walk plans without a
+    # score region); the two-warpgroup body measures both of its O epilogues
     # (``cute_flash_epi_stg``).
     # Resident-only coordinates add exactly three inactive singletons; keep
     # the upstream bound on all other values and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 79
+    assert len(active_values) - len(resident_defaults) <= 80
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(

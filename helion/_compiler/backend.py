@@ -3625,6 +3625,7 @@ def flex_search_surface(
     from .cute.cute_flash import _flash_flex_hook_ops
     from .cute.cute_flash import _flash_flex_prefetch_regs
     from .cute.cute_flash import _flash_output_requires_tma
+    from .cute.cute_flash import flash_tmem_rowmax_score_plan_supported
     from .cute.flash_score_mod import flex_aux_smem_candidates
 
     plan = match.plan
@@ -3656,6 +3657,9 @@ def flex_search_surface(
         # The flex emitter reads its 4-D operands directly; the collapsed
         # path's reshape-view TMA proof does not apply.
         supports_tensor_4d_tma=False,
+        # The hardware row max reduces the list walk's full tiles (raw
+        # scores); a score region runs the hook on every tile.
+        tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(plan),
         has_row_epilogue=False,
         # The hook bodies exist only in the 128-row bodies.
         plain_row_body=False,

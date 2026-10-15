@@ -1278,6 +1278,56 @@ def test_codegen_splices_the_next_chunk_prefetch_around_the_t2r_copy() -> None:
         assert text not in plain, text
 
 
+def test_resident_tiles_keep_the_prefetch_fill_in_every_fused_branch() -> None:
+    """``cute_flash_s_resident`` with the hook's table prefetch: every fused
+    tile branch (the masked reload arm, the resident arm and the zero-P
+    arm) runs the cross-tile prefetch fill after PASS1 and ahead of PASS2's
+    ``flash_p_sum`` reset; the pre-loop peek is the reload render's."""
+    from helion._compiler.cute.flash_score_mod import FlexHookCode
+
+    stub = cute_flash.render_flex_hook
+
+    def prefetching(*args: object, **kwargs: object) -> FlexHookCode:
+        kwargs.pop("prefetch_regs", None)
+        code = stub(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+        return FlexHookCode(
+            code.item_prelude,
+            code.tile_prologue,
+            code.chunk_body,
+            " " * 16 + "'flex prefetch chunk=flash_flex_pc'\n",
+            1,
+        )
+
+    key = cute_flash.FLASH_S_RESIDENT_KEY
+    with patch.object(cute_flash, "render_flex_hook", prefetching):
+        src = _render(
+            _resolve(
+                {**RESIDENT_BODY, key: True, cute_flash.FLASH_FLEX_PREFETCH_KEY: 32},
+                flex_prefetch_regs=(32,),
+            ),
+            _flex_plan(mask_region=object()),
+        )
+    marker = "'flex prefetch chunk=flash_flex_pc'"
+    stages = src.split("flash_row_sum = cutlass.Float32(0.0)")[1:]
+    assert len(stages) == 2
+    for stage_src in stages:
+        loop_at = stage_src.index("for flash_kv_iter in cutlass.range(")
+        assert stage_src[:loop_at].count(marker) == 2
+        body = stage_src[loop_at:]
+        assert body.count("fa4_disc_exp_convert_store_resident_rep32(") == 1
+        # Three fused arms (masked reload, resident, zero P), each with its
+        # own cross-tile fill ahead of PASS2's reset.
+        fills = [m.start() for m in re.finditer("flash_flex_pkv = flash_kv_peek", body)]
+        resets = [
+            m.start()
+            for m in re.finditer(r"flash_p_sum = cutlass\.Float32\(0\.0\)", body)
+        ]
+        assert len(fills) == 3
+        for fill, following in zip(fills, [*fills[1:], len(body)], strict=True):
+            assert any(fill < reset < following for reset in resets)
+            assert marker in body[fill:following]
+
+
 def test_fragment_surface_is_length_invariant_for_the_list_walk() -> None:
     def surface(num_kv: int) -> dict[str, tuple[object, ...]]:
         with patch.dict(os.environ, {}, clear=True):
@@ -1986,6 +2036,293 @@ def test_flex_item_words_knob_is_an_appended_axis_on_by_default_for_list_walks()
     assert search(True) == (True, False)
     assert search(False) == (False,)
     assert all(seed.flex_item_words is True for seed in _flex_seeds(16))
+
+
+RESIDENT_BODY: dict[str, object] = {
+    **BODY,
+    cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    cute_flash.FLASH_P_STORE_REP_KEY: 32,
+    cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+    cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+    cute_flash.FLASH_CORR_REGS_KEY: 64,
+    cute_flash.FLASH_OTHER_REGS_KEY: 48,
+}
+
+
+def test_s_resident_knob_is_legal_on_the_rep32_chunked_body_only() -> None:
+    """``cute_flash_s_resident``: appended behind the item words; legal on the
+    list walk's fa4 chunked softmax with Rep32 score loads (any P store
+    form), off causal bodies, score-region plans and the two-CTA bodies;
+    searched only with a list walk without a score region; three resident
+    seeds, none with a score region."""
+    key = cute_flash.FLASH_S_RESIDENT_KEY
+    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    assert keys.count(key) == 1
+    assert keys.index(key) == keys.index(cute_flash.FLASH_FLEX_ITEM_WORDS_KEY) + 1
+    assert cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+    }
+    assert _resolve(RESIDENT_BODY).s_resident is False
+    assert _resolve({**RESIDENT_BODY, key: True}).s_resident is True
+    # Pinned off by Rep16 score loads (the resident fragments are the Rep32
+    # load chunks; the resolver may canonicalize the repetitions together,
+    # the knob follows the resolved body), by a score region (every tile
+    # runs the hook's reload path) and off the list walk.
+    rep16_loads = _resolve(
+        {**RESIDENT_BODY, cute_flash.FLASH_S_LOAD_REP_KEY: 16, key: True}
+    )
+    assert rep16_loads.s_resident is (rep16_loads.s_load_repetition == 32)
+    assert (
+        _resolve({**RESIDENT_BODY, key: True}, has_score_modifiers=True).s_resident
+        is False
+    )
+    assert (
+        _resolve({**RESIDENT_BODY, key: True}, has_list_walk=False).s_resident is False
+    )
+    # Rep32 stores with the split P arrival (FA4's mixed Rep32/Rep16
+    # publication) take the resident form as well.
+    assert (
+        _resolve(
+            {**RESIDENT_BODY, cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True, key: True}
+        ).s_resident
+        is True
+    )
+    # Rep16 P stores keep the split P arrival (one store per score chunk).
+    rep16 = _resolve(
+        {
+            **RESIDENT_BODY,
+            cute_flash.FLASH_P_STORE_REP_KEY: 16,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+            key: True,
+        }
+    )
+    assert rep16.s_resident and rep16.split_p_arrive and rep16.p_store_repetition == 16
+    with patch.dict(os.environ, {}, clear=True):
+        causal = cute_flash.resolve_flash_config(
+            HEAD_DIM,
+            16,
+            {**RESIDENT_BODY, key: True},
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+    assert causal.s_resident is False
+    for resolved in (_resolve(RESIDENT_BODY), _resolve({**RESIDENT_BODY, key: True})):
+        assert (
+            cute_flash.flash_effective_config_values(resolved)[key]
+            is resolved.s_resident
+        )
+
+    def search(has_list_walk: bool, score_region: bool = False) -> tuple[object, ...]:
+        with patch.dict(os.environ, {}, clear=True):
+            fragment = cute_flash.flash_autotune_fragments(
+                HEAD_DIM,
+                16,
+                dtype=torch.bfloat16,
+                num_bh=NUM_BH,
+                has_list_walk=has_list_walk,
+                flex_has_score_region=score_region,
+            )[key]
+        choices = tuple(fragment.choices)  # pyrefly: ignore[missing-attribute]
+        picked = fragment.search_choices  # pyrefly: ignore[missing-attribute]
+        return choices if picked is None else tuple(picked)
+
+    assert search(True) == (False, True)
+    assert search(True, score_region=True) == (False,)
+    assert search(False) == (False,)
+    with patch.dict(os.environ, {}, clear=True):
+        scored_seeds = cute_flash.flash_attention_seed_configs(
+            HEAD_DIM,
+            16,
+            dtype=torch.bfloat16,
+            num_bh=NUM_BH,
+            has_list_walk=True,
+            score_modifier_kinds=(FLEX_SCORE_KIND,),
+            plain_row_body=False,
+            has_score_modifiers=True,
+        )
+    assert not any(seed.config.get(key) for seed in scored_seeds)
+    # Three resident seeds (short walk, medium walk, FA4 template), all with
+    # the mixed Rep32/Rep16 store (split P arrival), FA4's register split and
+    # 8-column correction tiles (the 32-column correction epilogue spills
+    # beside a resident softmax).
+    resident_seeds = [cfg for cfg in _flex_seeds(16) if cfg.s_resident]
+    assert len(resident_seeds) == 3
+    assert {
+        (
+            cfg.e2e_schedule,
+            cfg.softmax_regs,
+            cfg.corr_regs,
+            cfg.other_regs,
+            cfg.split_p_arrive,
+            cfg.p_store_repetition,
+            cfg.corr_tile_size,
+            cfg.rescale_chunk_cols,
+        )
+        for cfg in resident_seeds
+    } == {
+        ("16/4", 200, 64, 48, True, 32, 8, 8),
+        ("8/2", 200, 64, 48, True, 32, 8, 8),
+    }
+
+
+def test_tmem_rowmax_is_legal_for_list_walks_and_reduces_the_full_tiles() -> None:
+    """``cute_flash_rowmax="tmem"`` resolves for list-walk plans on hardware
+    with the TMEM reduction (GB300; the B200 policy has none): the full tiles
+    fold the hardware per-load maxima, the masked tiles keep the hook's
+    software row max, and the resident PASS1 reads the chunk and its maximum
+    in one load."""
+    key = cute_flash.FLASH_ROWMAX_KEY
+    body = {
+        **BODY,
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+        cute_flash.FLASH_P_STORE_REP_KEY: 32,
+        cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+        key: "tmem",
+    }
+    gb300 = {"target_device_capability": (10, 3)}
+    assert _resolve(body, **gb300).rowmax == "tmem"
+    assert _resolve(body, target_device_capability=(10, 0)).rowmax == "software"
+    # (The dense plan was compatible already; Rep16 loads are not.)
+    assert _resolve(body, has_list_walk=False, **gb300).rowmax == "tmem"
+    assert (
+        _resolve(
+            {
+                **body,
+                cute_flash.FLASH_S_LOAD_REP_KEY: 16,
+                cute_flash.FLASH_P_STORE_REP_KEY: 16,
+            },
+            **gb300,
+        ).rowmax
+        == "software"
+    )
+    plan = _flex_plan(mask_region=object())
+
+    def render(cfg: cute_flash.FlashAttentionConfig) -> str:
+        body_stmts = cute_flash.emit_flash_fa4_device_body(
+            cast("DeviceFunction", None),
+            head_dim=HEAD_DIM,
+            num_kv=16,
+            sequence_extent=2048,
+            num_bh=NUM_BH,
+            total_tiles=NUM_BH * 8,
+            cfg=cfg,
+            has_lse=True,
+            io_dtype="cutlass.BFloat16",
+            score_plan=plan,
+            num_heads=NUM_HEADS,
+            flex_item_table="flex_items",
+            target_device_capability=(10, 3),
+        )
+        return "\n".join(ast.unparse(stmt) for stmt in body_stmts)
+
+    code = render(_resolve(body, **gb300))
+    assert code.count("_helion_flash_rt.disc_rowmax_ldred(") == 2
+    assert "fa4_disc_rowmax_balanced(" not in code
+    resident = render(
+        _resolve(
+            {
+                **body,
+                cute_flash.FLASH_S_RESIDENT_KEY: True,
+                cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+                cute_flash.FLASH_CORR_REGS_KEY: 64,
+                cute_flash.FLASH_OTHER_REGS_KEY: 48,
+            },
+            **gb300,
+        )
+    )
+    assert (
+        resident.count(
+            "cute.copy(flash_tiled_ldred0, tLDRedtS0[None, 3, None, None], (flash_res_frg3, flash_res_red3))"
+        )
+        == 1
+    )
+    assert (
+        resident.count(
+            "flash_row_max = cute.arch.fmax(flash_row_max, flash_res_red3[flash_red_i])"
+        )
+        == 2
+    )
+    assert "disc_rowmax_ldred(" not in resident
+    assert resident.count("fa4_disc_exp_convert_store_resident_rep32(") == 2
+
+
+@pytest.mark.parametrize("seq", [2048, 2048 + 128])
+def test_codegen_s_resident_keeps_the_score_row_in_registers_for_unmasked_tiles(
+    seq: int,
+) -> None:
+    config = {
+        "block_sizes": [1, 128, 128],
+        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        cute_flash.FLASH_EPI_TMA_KEY: True,
+        cute_flash.FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        cute_flash.FLASH_S_LOAD_REP_KEY: 32,
+        cute_flash.FLASH_P_STORE_REP_KEY: 32,
+        cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+        cute_flash.FLASH_SOFTMAX_REGS_KEY: 200,
+        cute_flash.FLASH_CORR_REGS_KEY: 64,
+        cute_flash.FLASH_OTHER_REGS_KEY: 48,
+    }
+    plain = _codegen_with_flex_plan(seq, config)
+    resident = _codegen_with_flex_plan(
+        seq, {**config, cute_flash.FLASH_S_RESIDENT_KEY: True}
+    )
+    assert "fa4_disc_exp_convert_store_resident_rep32(" not in plain
+    assert "flash_res_frg3" not in plain
+    # Both softmax stages: PASS1 loads the four 32-column chunks into resident
+    # fragments (one trailing fence), PASS2 consumes them without a TMEM reload.
+    assert (
+        resident.count(
+            "fa4_disc_exp_convert_store_resident_rep32((flash_res_frg0, flash_res_frg1, flash_res_frg2, flash_res_frg3), "
+        )
+        == 2
+    )
+    assert (
+        resident.count(
+            "flash_res_frg3 = cute.make_rmem_tensor(flash_res_ld_shape, cutlass.Float32)"
+        )
+        == 2
+    )
+    assert "fa4_disc_rowmax_balanced(" not in resident
+    # The masked tiles (the probe plan has a mask region) keep the reload path.
+    assert "fa4_disc_exp_convert_store_rep32" in resident
+    assert (
+        "flash_pfor_ptr + 0, None, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS"
+        in resident
+    )
+    # Rep16 P stores: the resident PASS2 keeps the split P arrival.
+    rep16 = _codegen_with_flex_plan(
+        seq,
+        {
+            **config,
+            cute_flash.FLASH_S_RESIDENT_KEY: True,
+            cute_flash.FLASH_P_STORE_REP_KEY: 16,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        },
+    )
+    assert rep16.count("fa4_disc_exp_convert_store_resident_rep16(") == 2
+    # Rep32 stores with the split P arrival: the mixed Rep32/Rep16
+    # publication over the resident chunks (FA4's 3/4 release).
+    mixed = _codegen_with_flex_plan(
+        seq,
+        {
+            **config,
+            cute_flash.FLASH_S_RESIDENT_KEY: True,
+            cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: True,
+        },
+    )
+    assert mixed.count("fa4_disc_exp_convert_store_resident_rep32_split(") == 2
+    assert (
+        "flash_tiled_st32_0, tST32tS0, tST32cS, flash_tiled_st0, tSTtS0, tSTcS" in mixed
+    )
+    assert "flash_pfor_ptr + 0, flash_pfor2_ptr + 0, flash_LD_CHUNKS" in mixed
+    assert (
+        "flash_pfor_ptr + 1, flash_pfor2_ptr + 1, flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS"
+        in rep16
+    )
 
 
 @pytest.mark.parametrize(
