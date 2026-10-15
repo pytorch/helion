@@ -1050,11 +1050,46 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
     def register_facts(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        if cls._has_static_persistent_row_reduction(env):
+            # Exact thread dimensions and the static reduction extent suffice
+            # for the late integer interval proof. Admission is independent of
+            # vector seed eligibility, so smaller word reductions can use the
+            # same proof without changing their seeds or default configuration.
+            env.config_spec.enable_cute_proven_bounds()
         # The lane-splitting legality proof consumes exact runtime strides.
         # Register this independently of seed generation so explicitly pinned
         # configs and autotuner-disabled compilation remain cache-safe.
         return (
             cls.CACHE_SPECIALIZATION_FACTS if cls._plan(env, device_ir) else frozenset()
+        )
+
+    @staticmethod
+    def _has_static_persistent_row_reduction(env: CompileEnvironment) -> bool:
+        spec = env.config_spec
+        if (
+            spec.backend_name != "cute"
+            or spec.matmul_facts
+            or spec.reduction_loops
+            or len(spec.block_sizes) != 1
+        ):
+            return False
+        row_spec = cast("Any", spec.block_sizes[0])
+        if len(row_spec.block_ids) != 1:
+            return False
+        reductions = [block for block in env.block_sizes if block.reduction]
+        if len(reductions) != 1:
+            return False
+        (reduction,) = reductions
+        if not isinstance(reduction.size, (int, torch.SymInt)):
+            return False
+        extent = reduction.numel
+        if not isinstance(extent, sympy.Integer) or not 0 < extent < 2**31:
+            return False
+        thread_blocks = spec.num_threads.valid_block_ids()
+        return (
+            row_spec.block_id != reduction.block_id
+            and row_spec.block_id in thread_blocks
+            and reduction.block_id in thread_blocks
         )
 
     @staticmethod
@@ -1100,12 +1135,12 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
         vec = _cute_tile_seed_vec_width_for_dtype(
             cls._reduction_dtype(device_ir, reduction_size)
         )
-        if vec <= 1 or not 128 <= reduction_size <= 256:
+        if vec <= 1 or not 32 <= reduction_size <= 256:
             return None
         if reduction_size % vec:
             return None
         reduction_threads = reduction_size // vec
-        if reduction_threads not in (16, 32):
+        if reduction_threads not in (4, 8, 16, 32):
             return None
 
         row_spec = cast("Any", spec.block_sizes[0])
@@ -1285,6 +1320,42 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
                     row_block_size=cls.FULL_ROW_BLOCK_SIZE,
                 )
             )
+        if int(env.block_sizes[reduction_block_id].numel) <= 64:
+            # Short independent reductions can fit several groups in a warp.
+            # Cover full CTAs as well as the latency-oriented small row tiles.
+            # The wider fragment uses two 16-byte input packets on SM100+.
+            if env.config_spec.cute_l2_evict_last_store_policy_supported:
+                # Small CTAs can hide launch/tail latency while preserving
+                # dirty output packets and streaming read-only input packets.
+                # Keep these as seeds; the memory proofs choose eligible sites.
+                for row_block_size in (64, 128):
+                    if not row_spec.min_size <= row_block_size <= row_spec.max_size:
+                        continue
+                    cache_seed = cls._seed_config(
+                        env,
+                        row_block_id,
+                        reduction_block_id,
+                        reduction_threads // 2,
+                        row_block_size=row_block_size,
+                        row_threads=row_block_size,
+                    )
+                    cache_seed.config["load_eviction_policies"] = "nc_l2_first"
+                    cache_seed.config["cute_store_policy"] = "l2_evict_last"
+                    seeds.append(cache_seed)
+            for group_threads in (reduction_threads, reduction_threads // 2):
+                row_threads = min(row_spec.max_size, 512 // group_threads)
+                if row_threads < 16:
+                    continue
+                seeds.append(
+                    cls._seed_config(
+                        env,
+                        row_block_id,
+                        reduction_block_id,
+                        group_threads,
+                        row_block_size=row_threads,
+                        row_threads=row_threads,
+                    )
+                )
         return seeds
 
 
