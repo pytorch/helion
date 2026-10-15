@@ -63,6 +63,7 @@ _PURE = _CASTS | {
     "cutlass.range_constexpr",
     "cute.arch.thread_idx",
     "cute.arch.block_idx",
+    "cute.arch.block_dim",
     "ir.VectorType.get",
     "cute.math.rsqrt",
     "cute.math.sqrt",
