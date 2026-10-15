@@ -72,12 +72,13 @@ from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
-from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from .._compiler.cute.tile_ops import cute_masked_block_end
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
@@ -548,6 +549,7 @@ def _cute_index_exprs(
     *,
     inactive_slice_expr: str | None = None,
     inactive_singleton_slice_expr: str | None = None,
+    for_store: bool = False,
 ) -> list[str]:
     env = CompileEnvironment.current()
 
@@ -716,7 +718,9 @@ def _cute_index_exprs(
         tile_info = _get_tile_with_offset_info(
             idx, getattr(state, "fx_node", None), pos
         )
-        if tensor is not None and tensor_dim < tensor.ndim:
+        # A store target never needs to broadcast (a valid store's dim covers
+        # the tile's extent), so its dynamic sizes are not compared with 1.
+        if tensor is not None and tensor_dim < tensor.ndim and not for_store:
             if tile_info is not None:
                 env.resolve_broadcast_dim(
                     tensor.shape[tensor_dim], tile_info.block_id, tile_info.offset
@@ -1860,17 +1864,36 @@ def _cute_combined_mask(
                 )
             local_coord = f"({idx_var}) - ({begin_var})"
 
+        offset_expr = state.device_function.literal_expr(tile_info.offset)
+        global_coord = f"({begin_var}) + cutlass.Int32({offset_expr}) + ({local_coord})"
         tile_terms = []
         if tile_info.block_size is not None:
             block_size_expr = state.device_function.literal_expr(tile_info.block_size)
             tile_terms.append(f"({local_coord}) < cutlass.Int32({block_size_expr})")
+            if mask_var_for_block_id(block_id) is not None and (
+                end := cute_masked_block_end(
+                    state.codegen,
+                    _cute_remap_block_id(state, block_id),
+                    "an epilogue-subtile store",
+                )
+            ):
+                # An epilogue-subtile piece of the tile: mask it like the
+                # tile, by its lanes' place in the loop (not shifted by the
+                # store's own offset) against the loop's end, which the
+                # target may exceed
+                loop_coord = global_coord
+                if tile_info.mask_offset is not None:
+                    mask_offset = state.device_function.literal_expr(
+                        tile_info.mask_offset
+                    )
+                    loop_coord = (
+                        f"({begin_var}) + cutlass.Int32({mask_offset}) + "
+                        f"({local_coord})"
+                    )
+                tile_terms.append(f"({loop_coord}) < {end}")
         if tensor is not None and tensor_dim < tensor.ndim:
-            offset_expr = state.device_function.literal_expr(tile_info.offset)
             dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
-            tile_terms.append(
-                f"(({begin_var}) + cutlass.Int32({offset_expr}) + "
-                f"({local_coord})) < {dim_size}"
-            )
+            tile_terms.append(f"({global_coord}) < {dim_size}")
         return tile_terms
 
     def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:
@@ -2470,7 +2493,7 @@ def _codegen_cute_store_tcgen05_tile(
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M-oriented worklist path supports only an identity FP16/BF16 store",
+            "tcgen05 N,M-oriented worklist path supports only an identity store",
         )
     assert (
         sum(
@@ -2575,26 +2598,33 @@ def _codegen_cute_store_tcgen05_tile(
     if tcgen05_value.orientation is Tcgen05Orientation.NM and target_dtype not in (
         "cutlass.Float16",
         "cutlass.BFloat16",
+        "cutlass.Float32",
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M-oriented worklist path requires a fixed FP16/BF16 store",
+            "tcgen05 N,M-oriented worklist path requires an FP16/BF16/FP32 store",
         )
     tcgen05_d_store_layout = tcgen05_value.d_store_layout
     tcgen05_nm_store = tcgen05_value.orientation is Tcgen05Orientation.NM
-    if tcgen05_nm_store and (
-        tcgen05_value.explicit_epi_tile_m,
-        tcgen05_value.explicit_epi_tile_n,
-        tcgen05_value.explicit_d_store_box_n,
-    ) != (
+    tcgen05_nm_store_shape = (
         (row_union.schedule.epi_m, row_union.schedule.epi_n, row_union.schedule.epi_n)
         if row_union is not None and row_union.schedule is not None
-        else TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+        else tcgen05_grouped_worklist_store_shape(tcgen05_value.bm, tcgen05_value.bn)
+    )
+    if (
+        tcgen05_nm_store
+        and (
+            tcgen05_value.explicit_epi_tile_m,
+            tcgen05_value.explicit_epi_tile_n,
+            tcgen05_value.explicit_d_store_box_n,
+        )
+        != tcgen05_nm_store_shape
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented store requires explicit "
-            "epi_tile=(128, 32) and d_store_box_n=32",
+            f"epi_tile={tcgen05_nm_store_shape[:2]} and "
+            f"d_store_box_n={tcgen05_nm_store_shape[2]}",
         )
     if len(subscript) != (3 if leading_passthrough_output else 2):
         if tcgen05_value.pure_matmul_role_lifecycle:
@@ -6648,6 +6678,14 @@ def _codegen_cute_store_tcgen05_tile(
     )
 
     def worklist_nm_explicit_store_wave_setup_lines() -> list[str]:
+        # The transposed stmatrix atom packs pairs of 16-bit output elements.
+        # FP32 identity outputs retain the TMEM partition and copy its original
+        # scalar coordinates to the transposed shared-memory destination.
+        copy_op = (
+            "cute.nvgpu.CopyUniversalOp()"
+            if tensor.dtype is torch.float32
+            else "cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4)"
+        )
         return [
             f"{tacc_epi} = cute.flat_divide({tacc}, {epi_tile})",
             (
@@ -6665,12 +6703,7 @@ def _codegen_cute_store_tcgen05_tile(
                 "cutlass.Float32)"
             ),
             f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
-            (
-                f"{copy_atom_r2s} = cute.make_copy_atom("
-                "cute.nvgpu.warp.StMatrix8x8x16bOp("
-                "transpose=True, num_matrices=4), "
-                f"{target_dtype})"
-            ),
+            (f"{copy_atom_r2s} = cute.make_copy_atom({copy_op}, {target_dtype})"),
             (
                 f"{tiled_copy_r2s} = cute.make_tiled_copy_D("
                 f"{copy_atom_r2s}, {tiled_copy_t2r})"

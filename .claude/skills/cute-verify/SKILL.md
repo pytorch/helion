@@ -6,11 +6,11 @@ description: Verify changes to the Helion CuTe backend by running both test suit
 Run all four checks, then fix any issues:
 
 1. **Lint** — `./lint.sh` (Ruff + Pyrefly).
-2. **Default test suite** — `pytest test/ -n4 -q --tb=line`.
-3. **CuTe test suite** — `HELION_BACKEND=cute pytest test/ -n4 -q --tb=line`.
+2. **Default test suite** — `pytest test/ -q --tb=line`.
+3. **CuTe test suite** — `HELION_BACKEND=cute pytest test/ -q --tb=line`.
 4. **Code review** — spawn an Opus-class `general-purpose` subagent with the diff (`git diff HEAD~` covers the last commit plus staged and unstaged changes, but not untracked files; pick the right scope for the situation).
 
-**Parallelism:** Running lint and the code-review subagent in parallel with the test suites is fine. Each pytest suite uses `-n4`, which saturates a GPU, so **never run the two suites on the same GPU** — 8 workers on one GPU causes OOMs and flaky failures. Run them in parallel on two different idle GPUs (`CUDA_VISIBLE_DEVICES=...`), or sequentially if only one GPU is free.
+**Parallelism:** Running lint and the code-review subagent in parallel with the test suites is fine. Each pytest suite picks enough xdist workers to fill the GPU it sees, so **never run the two suites on the same GPU** — twice the workers on one GPU causes OOMs and flaky failures. Run them in parallel on two different idle GPUs (`CUDA_VISIBLE_DEVICES=...`), or sequentially if only one GPU is free.
 
 **Review subagent prompt** (use `subagent_type: general-purpose`, `model: opus`):
 

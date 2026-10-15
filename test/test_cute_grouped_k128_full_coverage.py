@@ -14,6 +14,7 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_full_coverage import _dump
 from test.test_cute_grouped_full_coverage import _inverse
 from test.test_cute_shared_rhs_grouped import _plans
+from test.test_cute_shared_rhs_grouped import _serial_offset_initializer
 from test.test_cute_shared_rhs_grouped import _target
 
 import helion
@@ -55,13 +56,15 @@ def _bound(
         torch.empty((k, n), dtype=torch.bfloat16),
         torch.arange(groups + 1, dtype=torch.int32) * (m // groups),
     )
-    kernel = helion.kernel(
+    kernel = helion.Kernel(
         grouped_gemm_jagged.fn,
-        backend="cute",
-        static_shapes=False,
-        autotune_effort="full",
-        cute_segmented_matmul_tiling=True,
-        **settings,
+        settings=helion.Settings(
+            backend="cute",
+            static_shapes=False,
+            autotune_effort="full",
+            cute_segmented_matmul_tiling=True,
+            **settings,
+        ),
     )
     return kernel._bind_isolated(args), args
 
@@ -87,7 +90,7 @@ def test_only_complete_typed_pipeline_profiles(
 
 @pytest.mark.parametrize("index", (0, 1, 2))
 def test_pipeline_profile_rejects_equal_valued_float(index: int) -> None:
-    values: list[object] = [128, 4, 256]
+    values: list[int | float] = [128, 4, 256]
     values[index] = float(values[index])
     assert not full_coverage_pipeline_supported(*values)
 
@@ -111,7 +114,9 @@ def test_public_k128_complete_inverse_and_unchanged_allocations(
     ordinary = bound.to_code(control)
     candidate = bound.to_code(dense)
     inverse, counts = _inverse(candidate)
-    assert _dump(inverse) == _dump(ast.parse(ordinary))
+    assert _dump(_serial_offset_initializer(inverse)) == _dump(
+        _serial_offset_initializer(ast.parse(ordinary))
+    )
     assert counts == {
         "metadata": 1,
         "flag": 1,

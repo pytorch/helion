@@ -241,14 +241,24 @@ def _(state: CodegenState) -> ast.AST:
         return state.ast_arg(0)
     mask_expr = " and ".join(mask_exprs)
     input_dtype = tensor.dtype
-    expr_typed = cast_ast(state.ast_arg(0), input_dtype)
+    # CuTe cannot select between float8 scalars; they convert to float32 and
+    # back exactly.
+    select_dtype = (
+        torch.float32
+        if input_dtype.itemsize == 1 and input_dtype.is_floating_point
+        else input_dtype
+    )
+    expr_typed = cast_ast(state.ast_arg(0), select_dtype)
     other_typed = CompileEnvironment.current().backend.cast_ast(
         expr_from_string(constant_repr(other)),
-        input_dtype,
+        select_dtype,
     )
-    return expr_from_string(
+    result = expr_from_string(
         "({expr} if {mask} else {other})",
         expr=expr_typed,
         mask=expr_from_string(mask_expr),
         other=other_typed,
     )
+    if select_dtype != input_dtype:
+        result = cast_ast(result, input_dtype)
+    return result

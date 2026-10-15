@@ -1209,7 +1209,9 @@ def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
 
 
 # Device modules a dry pass runs unchanged: memory goes through ``tl`` only.
-_DRY_PASS_PURE_MODULES = frozenset({"tl", "triton_helpers", "tl_math", "libdevice"})
+_DRY_PASS_PURE_MODULES = frozenset(
+    {"tl", "triton_helpers", "helion_triton_helpers", "tl_math", "libdevice"}
+)
 # Inductor helpers that only compute; the others load, spin, or publish.
 _DRY_PASS_PURE_HELPERS = frozenset(
     {
@@ -1219,6 +1221,8 @@ _DRY_PASS_PURE_HELPERS = frozenset(
         *("welford", "welford_reduce", "welford_combine"),
     }
 )
+# Helion's own Triton helpers that only reduce; ``triton_wait_signal`` spins.
+_DRY_PASS_PURE_HELION_HELPERS = frozenset({"max_propagate_nan", "min_propagate_nan"})
 # Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
 _DRY_PASS_PURE_METHODS = frozenset(
     {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}
@@ -1238,6 +1242,8 @@ def _dry_pass_call_kind(call: ast.Call, helpers: frozenset[str]) -> str:
         return "pure" if func.attr in _DRY_PASS_PURE_METHODS else "skipped"
     if func.value.id == "triton_helpers":
         return "pure" if func.attr in _DRY_PASS_PURE_HELPERS else "skipped"
+    if func.value.id == "helion_triton_helpers":
+        return "pure" if func.attr in _DRY_PASS_PURE_HELION_HELPERS else "skipped"
     if func.value.id != "tl":
         return "pure"
     if func.attr == "inline_asm_elementwise":

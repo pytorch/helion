@@ -302,7 +302,7 @@ For detailed documentation, see the [TileIR Backend Guide](docs/tileir_backend.m
 
 ## CuTe Backend (CUDA 13+)
 
-Helion has an experimental [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass) backend that lowers kernels through CuTe instead of Triton.
+Helion has a beta [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass) backend that lowers kernels through CuTe instead of Triton.
 
 **Requirements:** PyTorch must be built against **CUDA 13 or later** (`torch.version.cuda >= "13"`). The backend will refuse to launch on older CUDA builds.
 

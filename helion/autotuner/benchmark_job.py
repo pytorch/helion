@@ -13,6 +13,7 @@ from .accuracy import assert_close
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import load_private_kernel_args
 from .kernel_args import load_trusted_kernel_args
 from .logger import capture_output
 from .precompile_future import _load_compiled_fn
@@ -47,6 +48,9 @@ class BenchmarkJob:
     use_wall_clock: bool = False
     fixed_repetitions: int | None = None
     probe_long_kernel: bool = False
+    # Finalist slot whose private argument copies this job reads (None shares
+    # the cached arguments with every other job).
+    args_slot: int | None = None
 
     def __call__(self) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
@@ -54,7 +58,10 @@ class BenchmarkJob:
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
-                args = load_trusted_kernel_args(self.args_path)
+                if self.args_slot is None:
+                    args = load_trusted_kernel_args(self.args_path)
+                else:
+                    args = load_private_kernel_args(self.args_path, self.args_slot)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)

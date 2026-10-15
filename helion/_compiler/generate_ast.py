@@ -540,8 +540,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
         ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
-        on the second loop's ``ForLoopGraphInfo`` when there is a global RAW
-        dependency.
+        on the second loop's ``ForLoopGraphInfo`` when their underlying tensor
+        storages have a RAW dependency.
 
         TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
         to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
@@ -550,9 +550,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         from ..language._tracing_ops import _for_loop
         from ..language._tracing_ops import _for_loop_step
         from .device_ir import ForLoopGraphInfo
-        from .loop_dependency_checker import (
-            needs_inter_loop_debug_barrier_for_global_raw,
-        )
+        from .loop_dependency_checker import graph_memory_access_storage_ids
 
         env = CompileEnvironment.current()
         if env.codegen_name != "triton" or env.backend.name == "tileir":
@@ -564,7 +562,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             # before a loop, it flushes all earlier writes, so the pending set
             # is reset and only writes from loops AFTER the barrier need to be
             # tracked for subsequent siblings.
-            pending_global_writes: set[str] = set()
+            pending_writes: set[int] = set()
             for node in graph_info.graph.nodes:
                 if node.op != "call_function":
                     continue
@@ -575,19 +573,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 cur_info = self.codegen_graphs[cur_id]
                 if not isinstance(cur_info, ForLoopGraphInfo):
                     continue
-                need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
-                    pending_global_writes,
-                    cur_info.host_loop_reads,
-                    global_barrier_tensor_names=self._triton_global_barrier_tensor_names,
+                reads, writes = graph_memory_access_storage_ids(
+                    self.codegen_graphs, cur_id
                 )
+                need_barrier = bool(pending_writes & reads)
                 cur_info.needs_barrier_before = need_barrier
                 if need_barrier:
                     # Barrier flushes everything written before it.
-                    pending_global_writes = set()
+                    pending_writes.clear()
                 # Accumulate the current loop's writes for future siblings.
-                pending_global_writes |= self._triton_global_barrier_tensor_names(
-                    cur_info.host_loop_writes
-                )
+                pending_writes.update(writes)
 
     def _compute_intra_loop_barriers(self) -> None:
         """Mark loads that read a tensor an earlier store in the same body wrote,
@@ -615,46 +610,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             mark_in_divergent_control_flow=env.backend.name != "cute",
         )
 
-    def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
-        """Names that may participate in cross-wavefront global (HBM) coherence.
-
-        Triton-specific: the Pallas SMEM filter is intentionally omitted here
-        because the only caller (``_compute_inter_loop_barriers``) gates on
-        Triton codegen.  The ``triton_`` prefix and the assertion below encode
-        that precondition so a future non-Triton caller fails loudly rather
-        than silently mis-classifying SMEM-only tensors as needing a global
-        barrier.
-        """
-        from .type_info import StackTensorType
-        from .type_info import TensorType
-
-        env = CompileEnvironment.current()
-        assert env.codegen_name == "triton" and env.backend.name != "tileir", (
-            "_triton_global_barrier_tensor_names called outside Triton codegen"
-        )
-
-        out: set[str] = set()
-        scratch_names = {s.name for s in self.device_function._scratch_args}
-        local_types = self.host_function.local_types
-        for name in names:
-            if name in scratch_names:
-                continue
-            if local_types is None:
-                out.add(name)
-                continue
-            ti = local_types.get(name)
-            if ti is None:
-                out.add(name)
-                continue
-            if isinstance(ti, (TensorType, StackTensorType)):
-                out.add(name)
-        return out
-
     def _clear_attention_flash_state(self) -> None:
         cute_state = self.device_function.cute_state
         cute_state.attention_flash_block_ids = None
         cute_state.attention_flash_score_plan = None
         cute_state.attention_flash_gated_match = None
+        cute_state.attention_flex_match = None
         cute_state.attention_flash_threads = 128
 
     def _try_codegen_attention_flash_root(self) -> bool:
@@ -764,6 +725,36 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 )
             )
         )
+
+    def _try_codegen_topk_root(self) -> bool:
+        plan = self.device_function.cute_state.topk_plan
+        if plan is None:
+            return False
+        from .cute.topk import codegen_topk_root
+
+        if codegen_topk_root(self, plan):
+            return True
+        raise exc.BackendUnsupported("cute", "topk failed late validation")
+
+    def _try_codegen_radix_selection_root(self) -> bool:
+        plan = self.device_function.cute_state.radix_selection_plan
+        if plan is None:
+            return False
+        from .cute.radix_selection_codegen import codegen_radix_selection_root
+
+        if codegen_radix_selection_root(self, plan):
+            return True
+        raise exc.InvalidConfig("radix selection failed its final row/grid proof")
+
+    def _try_codegen_register_region(self) -> bool:
+        plan = self.device_function.cute_state.register_region_plan
+        if plan is None:
+            return False
+        from .cute.register_region import codegen_register_region
+
+        if codegen_register_region(self, plan):
+            return True
+        raise exc.BackendUnsupported("cute", "register region failed late validation")
 
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
@@ -1910,11 +1901,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         root_graph_info.graph_id
                     )
                     if (
-                        not (
+                        not self._try_codegen_radix_selection_root()
+                        and not (
                             requested_fragment
                             and self._try_codegen_computed_fragment_root()
                         )
                         and not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_topk_root()
+                        and not self._try_codegen_register_region()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_gdn_recurrence_root()
@@ -3004,6 +2998,10 @@ def _generate_ast(
                         "bias_name",
                         "alibi_name",
                         "document_name",
+                        "document_range_name",
+                        "row_kv_begin_name",
+                        "row_kv_begin_work_name",
+                        "scale_name",
                         "layout_name",
                         "n_sizes_name",
                         "k_sizes_name",

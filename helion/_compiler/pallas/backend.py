@@ -20,6 +20,7 @@ from ..._compat import num_compute_units
 from ..ast_extension import expr_from_string
 from ..backend import AutotuneGridPolicy
 from ..backend import Backend
+from ..backend import BackendState
 from ..backend import LauncherInfo
 from ..backend import _loop_contains_matmul
 from ..backend import _validate_subscript_indices
@@ -273,6 +274,10 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
+
+    @property
+    def state(self) -> BackendState:
+        return BackendState.BETA
 
     @staticmethod
     # Overrides Backend.map_dot_precision.

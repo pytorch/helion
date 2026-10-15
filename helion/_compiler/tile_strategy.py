@@ -6640,6 +6640,44 @@ class LoopDimInfo:
             shape_env, self.end_expr
         )
 
+    def is_end_matching_keyed(self, size: int | torch.SymInt) -> bool:
+        """``is_end_matching`` for every input the bound kernel serves: input
+        sizes that match only at these values key the bound kernel on their
+        equality (``CompileEnvironment.keyed_size_equalities``)."""
+        expected = _to_sympy(size)
+        if expected == self.end_expr:
+            return True
+        if (
+            self.end_expr is None
+            or _has_unbacked(self.end_expr)
+            or _has_unbacked(expected)
+        ):
+            return False
+        env = CompileEnvironment.current()
+        # Specialized sizes are keyed by their values already.
+        expected = env.specialize_expr(expected)
+        end = env.specialize_expr(self.end_expr)
+        if expected == end:
+            return True
+        static = env.shape_env._maybe_evaluate_static(sympy.Eq(expected, end))
+        if static is not None:
+            return bool(static)
+        sources = env.shape_env.var_to_sources
+        if (
+            not isinstance(expected, sympy.Symbol)
+            or not all(
+                sources.get(symbol)
+                for symbol in end.free_symbols
+                if isinstance(symbol, sympy.Symbol)
+            )
+            or not sources.get(expected)
+            or shape_env_size_hint(env.shape_env, expected)
+            != shape_env_size_hint(env.shape_env, end)
+        ):
+            return False
+        env.keyed_size_equalities.add((expected, end))
+        return True
+
 
 @dataclasses.dataclass
 class DeviceLoopOrGridState:
@@ -8360,9 +8398,11 @@ class TileStrategy:
                     end_expr = _to_sympy(end)
                     end_var_name = state.sympy_expr(end_expr)
                 else:
-                    # Tensor (data-dependent) - end_expr is None, but we still need end_var
+                    # Tensor (data-dependent): no sympy end, so name its load
                     end_expr = None
-                    end_var_name = None
+                    end_var_name = state.codegen.lift(
+                        begin_to_ast(end), dce=True, prefix="end"
+                    ).id
                 block_id_to_info[block_id] = LoopDimInfo(
                     begin_var_name=begin_var_name,
                     begin_expr=begin_expr,

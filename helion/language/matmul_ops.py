@@ -344,9 +344,41 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
     return fact_id
 
 
+def dot_operand_indices(node: torch.fx.Node) -> tuple[int, int] | None:
+    """Positions of an ``hl.dot``/``hl.dot_scaled`` node's two matrices among
+    its args, or None for any other node."""
+    if node.target is dot:
+        return 0, 1
+    if node.target is dot_scaled:
+        return 0, 3
+    return None
+
+
 def _associate_latest_matmul_fact(node: torch.fx.Node, *_args: object) -> None:
-    """Attach the fact created by prepare_args to this exact API node."""
-    facts = CompileEnvironment.current().config_spec.matmul_facts
+    """Attach the fact created by prepare_args to this exact API node, and
+    zero each operand's lanes past its K tile, which the products along K
+    would otherwise sum (``remove_unnecessary_masking`` drops the masks an
+    operand or its partner's zeros make redundant)."""
+    from .._compiler.node_masking import apply_masking
+
+    env = CompileEnvironment.current()
+
+    def mask_along_k(mat: torch.fx.node.Argument, k_dim: int) -> torch.fx.Node:
+        assert isinstance(mat, torch.fx.Node)
+        # Only a tile's lanes can be masked; a K built otherwise (such as
+        # an unpacked ``2 * block``) is zero-padded by its own loads.
+        if env.resolve_block_id(mat.meta["val"].size(k_dim)) is None:
+            return mat
+        return apply_masking(mat, base_node=node, other=0)
+
+    indices = dot_operand_indices(node)
+    assert indices is not None
+    lhs, rhs = indices
+    args = [*node.args]
+    args[lhs] = mask_along_k(args[lhs], -1)
+    args[rhs] = mask_along_k(args[rhs], -2)
+    node.args = tuple(args)
+    facts = env.config_spec.matmul_facts
     fact_id = len(facts) - 1
     assert fact_id >= 0
     node.meta[MATMUL_FACT_ID_META] = fact_id

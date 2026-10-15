@@ -28,6 +28,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfLowVRAM
 import helion.language as hl
 
 pytest.importorskip("cutlass")
@@ -878,17 +879,22 @@ def test_row_mma_falls_back_to_tcgen05_for_an_under_aligned_base(
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
+# (batch, heads, seq, head_dim) with 2**30 + 8192 elements per tensor: the
+# last heads' bases lie past 2**31 bytes while the element count stays inside
+# the flash surface's bound, so every offset must be formed in Int64.
+_TWO_GIB_SHAPE = (1, 131073, 128, 64)
+
+
 @onlyBackends(["cute"])
+# q, k, v, and the output in bf16, the fp32 lse, and 1 GiB of slack.
+@skipIfLowVRAM(
+    "Test requires ~9 GiB of free VRAM",
+    required_bytes=4 * math.prod(_TWO_GIB_SHAPE) * 2
+    + math.prod(_TWO_GIB_SHAPE[:3]) * 4
+    + (1 << 30),
+)
 def test_row_mma_byte_offsets_pass_two_gib() -> None:
-    # 2**30 + 8192 elements per tensor: the last heads' bases lie past 2**31
-    # bytes while the element count stays inside the flash surface's bound,
-    # so every offset must be formed in Int64.
-    batch, heads, seq, head_dim = 1, 131073, 128, 64
-    numel = batch * heads * seq * head_dim
-    needed = 4 * numel * 2 + batch * heads * seq * 4 + (1 << 30)
-    free, _total = torch.cuda.mem_get_info()
-    if free < needed:
-        pytest.skip(f"needs {needed >> 30} GiB of free device memory")
+    batch, heads, seq, head_dim = _TWO_GIB_SHAPE
     torch.manual_seed(8)
     q, k, v = (
         torch.randn(batch, heads, seq, head_dim, dtype=torch.bfloat16, device=DEVICE)

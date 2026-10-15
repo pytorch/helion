@@ -52,6 +52,30 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
         if not cls.is_eligible(env, device_ir):
             return []
         base = env.config_spec._base_default_config().config
+        variants = (
+            (
+                (1, 128, 128, 2, True),
+                (1, 256, 128, 3, True),
+                (2, 256, 128, 3, True),
+                (2, 256, 256, 2, True),
+                (1, 128, 256, 2, True),
+                (1, 128, 128, 3, False),
+                (1, 64, 128, 2, True),
+                (1, 64, 256, 2, True),
+                (2, 64, 256, 2, True),
+            )
+            if env.config_spec.cute_mxfp8_mma_available
+            else (
+                (2, 256, 256, 5, True),
+                (1, 128, 64, 3, True),
+                (2, 256, 256, 4, True),
+                (2, 256, 128, 4, True),
+                (1, 256, 128, 3, True),
+                (2, 128, 128, 4, True),
+                (1, 128, 128, 4, False),
+                (2, 256, 256, 4, False),
+            )
+        )
         return [
             Config.from_dict(
                 base
@@ -65,14 +89,5 @@ class CuteBlockScaledMmaHeuristic(AutotunerHeuristic):
                     "cute_scaled_persistent": persistent,
                 }
             )
-            for cluster, n, k, stages, persistent in (
-                (2, 256, 256, 5, True),
-                (1, 128, 64, 3, True),
-                (2, 256, 256, 4, True),
-                (2, 256, 128, 4, True),
-                (1, 256, 128, 3, True),
-                (2, 128, 128, 4, True),
-                (1, 128, 128, 4, False),
-                (2, 256, 256, 4, False),
-            )
+            for cluster, n, k, stages, persistent in variants
         ]

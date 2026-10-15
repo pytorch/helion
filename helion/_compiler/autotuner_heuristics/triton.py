@@ -12,6 +12,7 @@ from typing import cast
 
 import torch
 
+from ..._utils import prev_power_of_2
 from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ...autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
@@ -4481,6 +4482,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     FULL_GRID_SPLIT_GAIN_THRESHOLD = 2.0
     SERIAL_LOOP_COST_ALPHA = 1.1
     MAX_BLOCK_ADJUSTMENT_PASSES = 20
+    ROW_PACK_WORKING_SET = 4096
+    MIN_ROW_PACK_WAVES = 8
 
     # Structural fact accessors.
     @classmethod
@@ -5008,6 +5011,18 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             *coalescing_ids,
         )
 
+        row_pack_floor = 1
+        if len(grid_ids) == 1:
+            (row_id,) = grid_ids
+            reduction_numel = math.prod(map(_np2, raw_reduction_extents.values()))
+            row_pack_floor = min(
+                prev_power_of_2(cls.ROW_PACK_WORKING_SET // reduction_numel),
+                prev_power_of_2(
+                    specs[slot_of[row_id]].size_hint
+                    // (cls.MIN_ROW_PACK_WAVES * num_sm)
+                ),
+            )
+
         def axis_value(current: _ReductionCandidate, block_id: int) -> int:
             if block_id in reduction_widths:
                 return current.reduction_width(block_id)
@@ -5077,7 +5092,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                         else cls.GRID_RESIDENCY_GAIN_THRESHOLD
                     )
                     worthwhile = (
-                        trial_ctas / max(current_ctas, 1e-9) + 1e-9 >= required_gain
+                        trial_value >= row_pack_floor
+                        and trial_ctas / max(current_ctas, 1e-9) + 1e-9 >= required_gain
                     )
                 else:
                     trial_steps = max(
