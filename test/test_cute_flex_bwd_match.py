@@ -222,6 +222,8 @@ def test_causal_mask_plan_and_surface() -> None:
     # The polynomial exp2 share is offered (the example runs fast_math) but
     # starts at 0 (every element on MUFU).
     assert config.config["cute_flash_bwd_exp2_emu"] == 0
+    # dS^T through TMEM for the dK MMA is offered at head dim 64 (off first).
+    assert config.config["cute_flash_bwd_ds_tmem"] == 0
     # No gathered aux table: nothing to stage, no staging knob.
     assert fbwd_aux_smem_candidates(plan) == ()
     assert "cute_flash_bwd_aux_smem" not in spec._flat_fields()
@@ -239,6 +241,8 @@ def test_runtime_scale_and_grouped_heads() -> None:
     match = _match_or_fail(bound)
     assert match.plan.group == 4 and match.plan.head_dim == 128
     assert match.plan.max_steps == 4 * 4
+    # At head dim 128 the dQ accumulator aliases the dP columns: no TMEM dS^T.
+    assert "cute_flash_bwd_ds_tmem" not in bound.config_spec._flat_fields()
 
 
 def test_additive_bias_score_mod_is_an_lse_fold() -> None:
