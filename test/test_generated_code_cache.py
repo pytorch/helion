@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
+from typing import Callable
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -22,6 +23,8 @@ import helion
 from helion._testing import TestCase
 from helion._utils import counters
 from helion.autotuner.base_search import BaseAutotuner
+from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
 from helion.runtime.kernel import Kernel
@@ -64,6 +67,36 @@ def _cached_shift(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="triton")
+def _cached_tunable(x: torch.Tensor) -> torch.Tensor:
+    use_add = hl.register_tunable("use_add", BooleanFragment())
+    scale = hl.register_tunable("scale", EnumFragment((2, 3)))
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        if use_add:
+            out[tile] = x[tile] + scale
+        else:
+            out[tile] = x[tile] * scale
+    return out
+
+
+_TUNABLE_CONFIG = helion.Config(block_sizes=[32], use_add=True, scale=3)
+
+
+@helion.kernel(backend="triton")
+def _cached_apply(
+    x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = fn(x[tile])
+    return out
+
+
+def _double(value: torch.Tensor) -> torch.Tensor:
+    return value * 2
+
+
 def _runner(kernel: Kernel, args: tuple[object, ...]):
     """The binding eager dispatch uses: on a warm cache a disk runner.
 
@@ -82,6 +115,31 @@ def _bound(x: torch.Tensor, scale: int = 2, **settings: object):
     return _runner(kernel, (x, scale))
 
 
+def _cached_bound(fn: Callable[..., torch.Tensor], *args: object):
+    kernel = helion.kernel(
+        backend="triton", generated_code_cache=True, autotune_effort="none"
+    )(fn)
+    return _runner(kernel, args)
+
+
+# Loads this test module in a fresh process with the CPU tests' patched keys.
+_FRESH_PROCESS_PRELUDE = """
+import importlib.util
+from pathlib import Path
+import sys
+from unittest.mock import patch
+import torch
+
+spec = importlib.util.spec_from_file_location(sys.argv[2], sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+for name in ("helion_key", "torch_key_wrapper", "triton_key_wrapper"):
+    setattr(module.cache, name, lambda name=name: {"helion_key": "helion-v1", "torch_key_wrapper": "torch-v1", "triton_key_wrapper": "triton-v1"}[name])
+module.cache.supports_torch_compile_fusion = lambda: True
+"""
+
+
 def _source_loader(root: Path, sources: list[str]):
     def load(source: str, *, extra: str = ""):
         sources.append(source)
@@ -91,6 +149,7 @@ def _source_loader(root: Path, sources: list[str]):
         return SimpleNamespace(
             __file__=str(path),
             _cached_scale=lambda *args: None,
+            _cached_tunable=lambda *args: None,
             _runtime_scale=operator.mul,
         )
 
@@ -635,20 +694,9 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
             PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
         ):
             bound.set_config(helion.Config(block_sizes=[32]))
-        code = """
-import importlib.util
-from pathlib import Path
-import sys
-from unittest.mock import patch
-import torch
-
-spec = importlib.util.spec_from_file_location(sys.argv[2], sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-for name in ("helion_key", "torch_key_wrapper", "triton_key_wrapper"):
-    setattr(module.cache, name, lambda name=name: {"helion_key": "helion-v1", "torch_key_wrapper": "torch-v1", "triton_key_wrapper": "triton-v1"}[name])
-module.cache.supports_torch_compile_fusion = lambda: True
+        code = (
+            _FRESH_PROCESS_PRELUDE
+            + """
 sources = []
 with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("frontend cache miss")), patch.object(module.PyCodeCache, "load", side_effect=module._source_loader(Path(sys.argv[3]), sources)):
     bound = module._bound(torch.ones(16))
@@ -656,6 +704,7 @@ with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("
         bound.set_config(module.helion.Config(block_sizes=[32]))
 assert module.counters["generated_code_cache"]["hit"] == 1
 """
+        )
         subprocess.run(
             [
                 sys.executable,
@@ -668,6 +717,94 @@ assert module.counters["generated_code_cache"]["hit"] == 1
             check=True,
             env={**os.environ, "PYTHONHASHSEED": hash_seed},
             timeout=30,
+        )
+
+    def test_object_reprs_keep_keys_in_fresh_processes(self) -> None:
+        # A fragment without a repr of its own prints its address in the
+        # frontend debug string, a callable argument's code object in the
+        # specialization key. Padding moves both between the two processes.
+        code = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+padding = [module.BooleanFragment() for _ in range(int(sys.argv[3]))]
+padding.extend(compile("0", "padding", "eval") for _ in range(int(sys.argv[3])))
+for bound, config in (
+    (
+        module._cached_bound(module._cached_tunable.fn, torch.ones(16)),
+        module._TUNABLE_CONFIG,
+    ),
+    (
+        module._cached_bound(module._cached_apply.fn, torch.ones(16), module._double),
+        module.helion.Config(block_sizes=[32]),
+    ),
+):
+    config = bound._normalized_config_copy(config)
+    print(module.cache.generated_code_cache_key(bound, config))
+    print(bound._generated_code.artifact_key)
+"""
+        )
+        keys = [
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    code,
+                    __file__,
+                    _cached_tunable.fn.__module__,
+                    padding,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONHASHSEED": hash_seed},
+                timeout=60,
+            ).stdout.splitlines()[-4:]
+            for padding, hash_seed in (("0", "0"), ("64", "1"))
+        ]
+        self.assertNotIn("None", keys[0])
+        self.assertEqual(keys[0], keys[1])
+
+    def test_tunable_fragment_source_hit_in_fresh_process(self) -> None:
+        bound = _cached_bound(_cached_tunable.fn, torch.ones(16))
+        sources: list[str] = []
+        with patch.object(
+            PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
+        ):
+            bound.set_config(_TUNABLE_CONFIG)
+        self.assertEqual(len(sources), 1)
+        child = self.cache_root / "child"
+        child.mkdir()
+        # Without saved bindings the fresh process runs the frontend and must
+        # still find the source this process saved.
+        code = (
+            _FRESH_PROCESS_PRELUDE
+            + """
+padding = [module.BooleanFragment() for _ in range(64)]
+sources = []
+with (
+    patch("helion.runtime.cached_kernel.load_cached_kernel", return_value=None) as load_binding,
+    patch.object(sys.modules[module.Kernel.__module__], "generate_ast", side_effect=AssertionError("codegen cache miss")),
+    patch.object(module.PyCodeCache, "load", side_effect=module._source_loader(Path(sys.argv[3]), sources)),
+):
+    bound = module._cached_bound(module._cached_tunable.fn, torch.ones(16))
+    bound.set_config(module._TUNABLE_CONFIG)
+assert load_binding.call_count == 1
+assert module.counters["generated_code_cache"]["hit"] == 1
+assert sources == [Path(sys.argv[4]).read_text()], sources
+"""
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                __file__,
+                _cached_tunable.fn.__module__,
+                str(child),
+                str(self.cache_root / "module_1.py"),
+            ],
+            check=True,
+            timeout=60,
         )
 
 

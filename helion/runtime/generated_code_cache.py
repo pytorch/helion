@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import types
@@ -85,6 +86,17 @@ _UNCACHEABLE = object()
 _SIZE_INDEX = ".size"
 _SIZE_INDEX_RESCAN_WRITES = 1024
 _DEFAULT_CACHE_LIMIT = 1 << 30
+# Default reprs carry a per-process address, e.g. a fragment passed to
+# hl.register_tunable in the frontend debug string, or the code object or
+# builtin of a callable argument in the specialization key. The keys identify
+# these objects by content elsewhere (kernel source, binding_input_key, the
+# config), and binding_input_key rejects arguments it cannot fingerprint, so
+# dropping the address loses nothing.
+_OBJECT_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
+
+
+def _without_addresses(value: object) -> str:
+    return _OBJECT_ADDRESS.sub("", value if isinstance(value, str) else repr(value))
 
 
 @functools.cache
@@ -362,7 +374,7 @@ def compiled_kernel_cache_key(
         torch_key_wrapper(),
         triton_key_wrapper(),
         inputs,
-        base_spec_key,
+        _without_addresses(base_spec_key),
         hardware,
         settings,
         kernel.settings.autotune_effort,
@@ -655,7 +667,7 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     host_function = bound.host_function
     assert host_function is not None
     with bound.env:
-        frontend = host_function.debug_str()
+        frontend = _without_addresses(host_function.debug_str())
     settings = _compilation_settings_key(bound.settings)
     facts = bound._guard_fact_results()
     if settings is _UNCACHEABLE or facts is None:
@@ -669,7 +681,7 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
         fn.__code__.co_filename,
         fn.__code__.co_firstlineno,
         bound.kernel.kernel_source(),
-        state.input_key,
+        _without_addresses(state.input_key),
         get_device_name(bound.env.device),
         bound.config_spec.target_device_capability,
         bound.config_spec.num_sm,
