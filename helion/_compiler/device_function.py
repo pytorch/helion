@@ -2081,6 +2081,52 @@ class DeviceFunction:
             # Keep ordinary load/effect recognition intact through all memory
             # scheduling, including the late published/register-producer cuts.
             definition.body = lower_scalar_policy_loads(definition.body)
+            from .cute.packet_store_policy import lower_packet_store_policy
+
+            variable_renames = {
+                name: aliases[0] for name, aliases in self._variable_renames.items()
+            }
+            global_tensor_names = frozenset(
+                variable_renames.get(argument.name, argument.name)
+                for argument in param_args
+                if isinstance(argument, TensorArg)
+                and not isinstance(argument, TensorDescriptorArg)
+            )
+            argument_names = frozenset(
+                argument.arg for argument in definition.args.args
+            )
+            if any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_cute_load_nc_l2_first_candidate"
+                for statement in definition.body
+                for node in ast.walk(statement)
+            ):
+                from .cute.readonly_packet_loads import lower_readonly_packet_loads
+
+                definition.body = lower_readonly_packet_loads(
+                    definition.body,
+                    tensor_names=set(global_tensor_names),
+                    argument_names=set(argument_names),
+                    proven_disjoint_tensor_pairs={
+                        frozenset(variable_renames.get(name, name) for name in pair)
+                        for pair in self.proven_disjoint_tensor_pairs()
+                    },
+                    target_device_capability=(
+                        CompileEnvironment.current().config_spec.target_device_capability
+                    ),
+                    cuda_version=torch.version.cuda,
+                )
+            definition.body = lower_packet_store_policy(
+                definition.body,
+                policy=self.config.cute_store_policy,
+                global_tensor_names=global_tensor_names,
+                argument_names=argument_names,
+                target_device_capability=(
+                    CompileEnvironment.current().config_spec.target_device_capability
+                ),
+                cuda_version=torch.version.cuda,
+            )
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"

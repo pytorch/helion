@@ -1495,7 +1495,7 @@ class CuteBackend(Backend):
         )
 
     # Bump when config_value_priors() changes its candidate distribution.
-    config_value_priors_version = 3
+    config_value_priors_version = 4
 
     @property
     def name(self) -> str:
@@ -1567,6 +1567,7 @@ class CuteBackend(Backend):
             "cute_async_load_group_rows": weighted_choice({2: 4.0, 4: 1.0}),
             "cute_async_load_cache": weighted_choice({"cg": 4.0, "ca": 1.0}),
             "cute_async_store_policy": weighted_choice(async_store_policy_weights),
+            "cute_store_policy": weighted_choice(async_store_policy_weights),
             "cute_bf16x2_recurrence": weighted_choice({True: 4.0, False: 1.0}),
             "cute_proven_bounds": weighted_choice({False: 4.0, True: 1.0}),
             # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
@@ -1825,6 +1826,7 @@ class CuteBackend(Backend):
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
+            or key == "cute_store_policy"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_register_chain"
             or key == "cute_signed_bitfield_bf16"
@@ -2233,6 +2235,9 @@ class CuteBackend(Backend):
             "_cute_store_u8_vec": "from helion._compiler.cute.vec_utils import store_u8_vec as _cute_store_u8_vec",
             "_cute_store_fp8e4m3fn_vec": "from helion._compiler.cute.vec_utils import store_fp8e4m3fn_vec as _cute_store_fp8e4m3fn_vec",
             "_cute_store_fp8e5m2_vec": "from helion._compiler.cute.vec_utils import store_fp8e5m2_vec as _cute_store_fp8e5m2_vec",
+            "_cute_store_u8_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_u8_vec_l2_evict_last as _cute_store_u8_vec_l2_evict_last",
+            "_cute_store_fp8e4m3fn_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_l2_evict_last as _cute_store_fp8e4m3fn_vec_l2_evict_last",
+            "_cute_store_fp8e5m2_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e5m2_vec_l2_evict_last as _cute_store_fp8e5m2_vec_l2_evict_last",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
             "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
@@ -2249,6 +2254,9 @@ class CuteBackend(Backend):
             "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
             "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
             "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_load_nc_l2_first_candidate": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_first_candidate as _cute_load_nc_l2_first_candidate",
+            "_cute_load_nc_l2_evict_first_32b": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_evict_first_32b as _cute_load_nc_l2_evict_first_32b",
+            "_cute_load_nc_l2_evict_first_16b": "from helion._compiler.cute.readonly_packet_load_helpers import load_nc_l2_evict_first_16b as _cute_load_nc_l2_evict_first_16b",
             "_cute_scalar_policy_load": "from helion._compiler.cute.l2_policy import scalar_policy_load as _cute_scalar_policy_load",
             "_cute_load_l1_l2_evict_first": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_first as _cute_load_l1_l2_evict_first",
             "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",

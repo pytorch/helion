@@ -34,7 +34,6 @@ from ...language.atomic_ops import ATOMIC_OPS
 from ...language.creation_ops import full
 from ...language.matmul_ops import dot as hl_dot
 from ...language.matmul_ops import dot_scaled as hl_dot_scaled
-from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
@@ -71,6 +70,9 @@ from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
+from .cache_policy_loads import _CUTE_NC_L2_FIRST_SUFFIX
+from .cache_policy_loads import cache_hinted_load_helper
+from .cache_policy_loads import is_cache_policy_suffix
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index
@@ -852,7 +854,13 @@ def _cute_vector_load_expr(
 ) -> str:
     elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
     ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
+        if eviction_suffix == _CUTE_NC_L2_FIRST_SUFFIX:
+            helper = cache_hinted_load_helper(
+                eviction_suffix, vec_width * dtype.itemsize
+            )
+            if helper is not None:
+                return f"{helper}({ptr}, ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
         # Explicit-vec ("vec" mode) loads return FLOAT vectors, not the
         # carrier form the L2 helper produces; drop the hint here.
         eviction_suffix = ""
@@ -6240,7 +6248,7 @@ def _(state: CodegenState) -> object:
                 )
             if policy == "streaming":
                 eviction_suffix = ", cop='cs'"
-            elif policy in ("l2_last", "l1_l2_first", "l1_l2_last"):
+            elif policy in ("l2_last", "l1_l2_first", "l1_l2_last", "nc_l2_first"):
                 # Inline-PTX L2 hints apply only to aligned 16-byte packets.
                 eviction_suffix = f"__{policy}__"
             elif mapped := _CUTE_EVICTION_POLICY_MAP.get(policy, ""):

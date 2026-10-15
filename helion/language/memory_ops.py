@@ -21,8 +21,8 @@ from .._compiler.compile_environment import _symint_expr
 from .._compiler.cute.access_regions import access_address
 from .._compiler.cute.access_regions import block_size_symbol
 from .._compiler.cute.access_regions import tile_begin_symbol
-from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .._compiler.cute.cache_policy_loads import cache_hinted_load_helper
+from .._compiler.cute.cache_policy_loads import is_cache_policy_suffix
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
@@ -1079,7 +1079,7 @@ def _cute_scalar_load_expr(
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             "cutlass.Uint8)"
         )
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
         # The L2 policy helper only exists in 16-byte vector form.
         eviction_suffix = ""
     if eviction_suffix and dtype.itemsize >= 4 and dtype is not torch.bool:
@@ -1217,7 +1217,7 @@ def _cute_unroll_vec_load_expr(
     ``createpolicy.fractional`` helper of its width; byte-packed dtypes and
     2-byte scalars silently drop the hint.
     """
-    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
+    if is_cache_policy_suffix(eviction_suffix):
         helper = (
             None
             if _cute_is_byte_packed(dtype)

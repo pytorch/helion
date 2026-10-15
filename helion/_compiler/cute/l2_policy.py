@@ -232,7 +232,7 @@ def _store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:
         None,
         [address, *words, policy],
         _ASM_STORE_V4_B32_L2_EVICT_LAST,
-        "l,r,r,r,r,l",
+        "l,r,r,r,r,l,~{memory}",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

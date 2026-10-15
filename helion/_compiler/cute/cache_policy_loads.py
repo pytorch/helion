@@ -18,6 +18,10 @@ from __future__ import annotations
 # The eviction suffix ``memory_ops`` attaches to a hinted load site (it is not
 # a ``cute.arch.load`` kwarg but a marker for the helper form).
 _CUTE_L2_LAST_SUFFIX = "__l2_last__"
+_CUTE_NC_L2_FIRST_SUFFIX = "__nc_l2_first__"
+_CUTE_NC_L2_FIRST_CANDIDATE = "_cute_load_nc_l2_first_candidate"
+_CUTE_NC_L2_FIRST_32B_HELPER = "_cute_load_nc_l2_evict_first_32b"
+_CUTE_NC_L2_FIRST_16B_HELPER = "_cute_load_nc_l2_evict_first_16b"
 # Eviction suffix -> 16-byte helper.
 _CUTE_CACHE_LOAD_HELPERS = {
     _CUTE_L2_LAST_SUFFIX: "_cute_load_l2_evict_last",
@@ -44,7 +48,18 @@ _CUTE_CACHE_LOAD_HELPER_NAMES = frozenset(
     name
     for helpers in _CUTE_CACHE_LOAD_HELPERS_BY_BYTES.values()
     for name in helpers.values()
-)
+) | {
+    _CUTE_NC_L2_FIRST_CANDIDATE,
+    _CUTE_NC_L2_FIRST_32B_HELPER,
+    _CUTE_NC_L2_FIRST_16B_HELPER,
+}
+
+
+def is_cache_policy_suffix(eviction_suffix: str) -> bool:
+    return (
+        eviction_suffix in _CUTE_CACHE_LOAD_HELPERS
+        or eviction_suffix == _CUTE_NC_L2_FIRST_SUFFIX
+    )
 
 
 def cache_hinted_load_helper(eviction_suffix: str, packet_bytes: int) -> str | None:
@@ -52,6 +67,8 @@ def cache_hinted_load_helper(eviction_suffix: str, packet_bytes: int) -> str | N
     load site carries ``eviction_suffix``, or None when the suffix is not an
     L2 policy marker or no helper exists for that width (the caller then
     emits the plain ``cute.arch.load``)."""
+    if eviction_suffix == _CUTE_NC_L2_FIRST_SUFFIX:
+        return _CUTE_NC_L2_FIRST_CANDIDATE if packet_bytes in (16, 32) else None
     helpers = _CUTE_CACHE_LOAD_HELPERS_BY_BYTES.get(packet_bytes)
     if helpers is None:
         return None
