@@ -159,6 +159,7 @@ from .cute_radix_selection import CuteRadixSelectionHeuristic
 from .cute_radix_selection import register_radix_selection_coverage
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
+from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_split_k_cluster import CuteSplitKClusterHeuristic
@@ -357,9 +358,13 @@ def compiler_seed_specialization_facts(
     one heuristic registered for the backend happens to depend on it.
     """
     fired = frozenset(fired_heuristics)
+    heuristics = get_heuristics(backend)
+    if backend == "cute":
+        # This bounded family is appended after the complete legacy seed list.
+        heuristics = (*heuristics, CuteRolledClusterPacketHeuristic)
     return frozenset(
         fact
-        for heuristic in get_heuristics(backend)
+        for heuristic in heuristics
         if heuristic.name in fired
         for fact in heuristic.CACHE_SPECIALIZATION_FACTS
     )
@@ -502,6 +507,14 @@ def compiler_seed_configs(
         if full_chunks:
             configs.extend(full_chunks)
             env.config_spec.autotuner_heuristics.append(CuteFullChunkRowHeuristic.name)
+        cluster_packets = CuteRolledClusterPacketHeuristic.get_seed_configs(
+            env, device_ir
+        )
+        if cluster_packets:
+            configs.extend(cluster_packets)
+            env.config_spec.autotuner_heuristics.append(
+                CuteRolledClusterPacketHeuristic.name
+            )
     return dedupe_configs(configs)
 
 
