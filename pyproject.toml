@@ -30,6 +30,7 @@ dev = [
     "expecttest",
     "pytest",
     "pytest-timeout",
+    "pytest-xdist",
     "pre-commit",
     "hypothesis",
     "tabulate",
