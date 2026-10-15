@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -97,8 +98,8 @@ def main(verbose: bool = True) -> dict:
 
     def make_calls(shape: tuple[int, int]) -> tuple:
         tokens, vocab = shape
-        logits = torch.randn([tokens, vocab], device="cuda", dtype=torch.bfloat16)
-        labels = torch.randint(0, vocab, [tokens], device="cuda", dtype=torch.int64)
+        logits = torch.randn([tokens, vocab], device=DEVICE, dtype=torch.bfloat16)
+        labels = torch.randint(0, vocab, [tokens], device=DEVICE, dtype=torch.int64)
 
         def helion_call() -> torch.Tensor:
             return cross_entropy(logits, labels)
