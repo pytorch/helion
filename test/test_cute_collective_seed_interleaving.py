@@ -304,28 +304,38 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
     )
     bound = _cpu_bind(_matmul_with_unrelated_knob, args)
     assert bound.host_function is not None
+    legacy: list[helion.Config] = []
+    expected: list[helion.Config] = []
+    interleave = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds
+
+    def capture_interleaving(
+        spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
+    ) -> list[helion.Config]:
+        legacy[:] = seeds
+        expected[:] = interleave(spec, seeds, parameters)
+        return expected.copy()
+
     # This checks this heuristic's permutation, before later independent
     # overlays append their own policy siblings to the merged registry.
-    with bound.env:
+    with (
+        bound.env,
+        patch.object(
+            CuteCollectiveMatmulHeuristic,
+            "_interleave_bounded_k_seeds",
+            side_effect=capture_interleaving,
+        ),
+    ):
         actual = CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
-        with patch.object(
-            CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
-            side_effect=_legacy_order,
-        ):
-            legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
-                bound.env, bound.host_function.device_ir
-            )
     assert any(seed.get("cute_collective_tmem_a") for seed in legacy)
     assert len(legacy) == len(actual)
     assert set(legacy) == set(actual)
-    assert legacy[0] == actual[0]
-    assert legacy != actual
+    assert legacy[0] == expected[0]
+    assert legacy != expected
     assert all("gain" not in seed.config for seed in actual)
-    # This kernel's computed A independently admits the TMEM schedule family.
-    # Its unrelated gain remains outside both K provenance and grouping keys.
+    # The computed A admits TMEM schedules; an unrelated gain must not change
+    # their interleaving. Compare before the separate async-priority step.
     with_gain = [
         helion.Config.from_dict(seed.config | {"gain": 1 << (index % 3)})
         for index, seed in enumerate(legacy)
@@ -338,4 +348,4 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
             {key: value for key, value in seed.config.items() if key != "gain"}
         )
         for seed in interleaved
-    ] == actual
+    ] == expected

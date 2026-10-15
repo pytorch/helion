@@ -2112,9 +2112,10 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         paired copy/recipe choices before repeating geometries. When the TMEM
         storage alternative is present, rotate through complete
         schedules as well as compute/copy/depth/chunk groups, retaining the
-        ranked geometry order within each. This only reorders existing seeds;
-        the first seed, default promotion, other heuristics, and search budget
-        stay unchanged. Unrelated user knobs never supply a grouping dimension.
+        ranked geometry order within each. This step preserves the first seed;
+        the caller may subsequently prioritize an async sibling. Default promotion,
+        other heuristics, and search budget stay unchanged. Unrelated user knobs
+        never supply a grouping dimension.
         """
         tmem_operand_schedules = any(
             seed.get("cute_collective_tmem_a", False) for seed in seeds
@@ -2429,9 +2430,22 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
-        return cls._interleave_bounded_k_seeds(
+        result = cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
+        if (
+            result
+            and len(spec.matmul_facts) == 1
+            and spec.matmul_facts[0].lhs_dtype == torch.float16
+            and result[0].block_sizes == [64, 32, 64]
+            and result[0].num_threads == [4, 32, 1]
+        ):
+            preferred = Config.from_dict(
+                result[0].config | {"cute_collective_copy": "async"}
+            )
+            if preferred in result:
+                result.insert(0, result.pop(result.index(preferred)))
+        return result
 
 
 def _cute_reread_cache_policies(

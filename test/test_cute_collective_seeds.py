@@ -6,13 +6,18 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+from examples.matmul import matmul
 import pytest
 import torch
+
+from test._cute_binding import _forbid_native_compile
+from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.matmul_utils import cute_matmul_root_placements
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import RootGridFact
@@ -21,6 +26,7 @@ import helion.language as hl
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.device_ir import DeviceIR
+    from helion.autotuner.config_spec import ConfigSpec
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -157,3 +163,94 @@ def test_matmul_placement_rejects_missing_attribution(unknown: str) -> None:
         active = [[0, 1], [6, 7]]
     ir = cast("DeviceIR", SimpleNamespace(grid_block_ids=active))
     assert cute_matmul_root_placements(env, ir) == ()
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    ("capability", "num_sm", "dtype", "m", "preferred"),
+    [
+        ((8, 0), 108, torch.float16, 128, True),
+        ((8, 9), 128, torch.float16, 128, True),
+        ((9, 0), 114, torch.float16, 128, True),
+        ((9, 0), 114, torch.float16, 129, True),
+        ((9, 0), 114, torch.float16, 32, False),
+        ((9, 0), 114, torch.bfloat16, 128, False),
+        ((10, 0), 148, torch.float16, 128, True),
+        ((10, 0), 148, torch.bfloat16, 128, False),
+    ],
+)
+def test_collective_async_priority_preserves_candidates_and_default(
+    capability: tuple[int, int],
+    num_sm: int,
+    dtype: torch.dtype,
+    m: int,
+    preferred: bool,
+) -> None:
+    kernel = helion.kernel(
+        matmul.fn, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    args = (torch.empty((m, 256), dtype=dtype), torch.empty((256, 64), dtype=dtype))
+    heuristic = CuteCollectiveMatmulHeuristic
+    original: list[helion.Config] = []
+    interleave = heuristic._interleave_bounded_k_seeds
+
+    def capture_order(
+        spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
+    ) -> list[helion.Config]:
+        result = interleave(spec, seeds, parameters)
+        original[:] = result
+        return result
+
+    with ExitStack() as stack:
+        stack.enter_context(_mock_cuda_unavailable())
+        stack.enter_context(_forbid_native_compile())
+        stack.enter_context(
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden"))
+        )
+        for name, value in (
+            ("helion.runtime.kernel.target_device_capability", capability),
+            (
+                "helion._compiler.compile_environment.target_device_capability",
+                capability,
+            ),
+            ("helion.runtime.get_num_sm", num_sm),
+        ):
+            stack.enter_context(patch(name, return_value=value))
+        bound = kernel._bind_isolated(args)
+        assert bound.host_function is not None
+        with bound.env:
+            ir = bound.host_function.device_ir
+            default = bound.config_spec.default_config()
+            assert bound.config_spec.compiler_default_config is None
+            with patch.object(
+                heuristic, "_interleave_bounded_k_seeds", side_effect=capture_order
+            ):
+                actual = heuristic.get_seed_configs(bound.env, ir)
+            assert bound.config_spec.default_config() == default
+            assert original[0]["cute_collective_copy"] == "scalar"
+            if preferred:
+                async_seed = helion.Config.from_dict(
+                    original[0].config | {"cute_collective_copy": "async"}
+                )
+                assert actual == [async_seed, *[s for s in original if s != async_seed]]
+                if capability[0] == 10:
+                    assert (
+                        helion.Config.from_dict(
+                            original[0].config
+                            | {
+                                "cute_collective_copy": "async_cached",
+                                "cute_collective_compute": "tcgen05",
+                            }
+                        )
+                        in actual
+                    )
+            else:
+                assert actual == original
+            assert not heuristic.promote_seed_to_default
+            with patch.object(bound.config_spec, "compiler_seed_configs", actual):
+                normalized = ConfigGeneration(
+                    bound.config_spec
+                ).seed_flat_config_pairs()
+            assert normalized[0][1]["cute_collective_copy"] == (
+                "async" if preferred else "scalar"
+            )
