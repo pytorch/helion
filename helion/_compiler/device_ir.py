@@ -1418,6 +1418,7 @@ class DeviceIR:
                         block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
                         allow_non_power_of_two=env.backend_name == "cute",
+                        allow_full_extent=env.backend_name == "cute",
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(
@@ -3743,6 +3744,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_list_walk=flash_shape.has_list_walk,
                     flex_has_score_region=flash_shape.flex_has_score_region,
                     flex_has_mask_region=flash_shape.flex_has_mask_region,
+                    flex_trivial_walk=flash_shape.flex_trivial_walk,
                     q_seq=flash_shape.q_seq,
                     kv_seq=flash_shape.kv_seq,
                     flex_aux_smem_candidates=flash_shape.flex_aux_smem_candidates,

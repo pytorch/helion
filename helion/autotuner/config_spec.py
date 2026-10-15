@@ -78,6 +78,21 @@ from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.radix_selection_config import ALGORITHM_KEY as RADIX_ALGORITHM_KEY
+from .._compiler.cute.radix_selection_config import ALGORITHMS as RADIX_ALGORITHMS
+from .._compiler.cute.radix_selection_config import BOOLEAN_KEYS as RADIX_BOOLEAN_KEYS
+from .._compiler.cute.radix_selection_config import CONFIG_KEYS as RADIX_CONFIG_KEYS
+from .._compiler.cute.radix_selection_config import (
+    GEOMETRY_CHOICES as RADIX_GEOMETRY_CHOICES,
+)
+from .._compiler.cute.radix_selection_config import HISTOGRAM_KEY as RADIX_HISTOGRAM_KEY
+from .._compiler.cute.radix_selection_config import (
+    HISTOGRAM_MODES as RADIX_HISTOGRAM_MODES,
+)
+from .._compiler.cute.radix_selection_config import (
+    PIPELINE_CHOICES as RADIX_PIPELINE_CHOICES,
+)
+from .._compiler.cute.radix_selection_config import normalize_radix_selection
 from .._compiler.cute.split_k_cluster import validate_cluster_config
 from .._compiler.cute.split_k_cluster_config import (
     FINALIZER_KEY as SPLIT_K_FINALIZER_KEY,
@@ -166,6 +181,7 @@ if TYPE_CHECKING:
     )
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
+    from .._compiler.cute.radix_selection import RadixSelectionGraph
     from .._compiler.cute.split_k_cluster import ClusterKFacts
     from .._compiler.cute.tcgen05_constants import Tcgen05RowvecAuxFacts
     from ..runtime.config import IndexingLiteral
@@ -1008,6 +1024,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
+        *RADIX_CONFIG_KEYS,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -1072,11 +1089,19 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
+        "cute_cluster_warp_online",
+        "cute_register_row",
+        "cute_register_row_tensor_copy",
+        "cute_scalar_epilogue",
+        "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
+        "cute_warp_fp32_redux",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1117,6 +1142,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         *CUTE_TOPK_CONFIG_KEYS,
+        *RADIX_CONFIG_KEYS,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1200,11 +1226,19 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
+        "cute_cluster_warp_online",
+        "cute_register_row",
+        "cute_register_row_tensor_copy",
+        "cute_scalar_epilogue",
+        "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
+        "cute_warp_fp32_redux",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1254,6 +1288,7 @@ MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
+        *RADIX_CONFIG_KEYS,
         "loop_orders",
         "flatten_loops",
         "l2_groupings",
@@ -1331,11 +1366,19 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
+        "cute_cluster_warp_online",
+        "cute_register_row",
+        "cute_register_row_tensor_copy",
+        "cute_scalar_epilogue",
+        "cute_scalar_epilogue_keep_inputs",
+        "cute_scalar_epilogue_owner_fold",
+        "cute_warp_fp32_redux",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
         "cute_pdl",
+        "cute_warp_aggregated_atomics",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1499,6 +1542,7 @@ class ConfigSpec:
         self.cute_mxfp8_mma_available = False
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
+        self.cute_warp_aggregated_atomics_enabled = False
         self.cute_packet_prefetch_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -1610,6 +1654,7 @@ class ConfigSpec:
         self.cute_topk_coarse_keys_search_enabled = False
         self.cute_topk_key_recovery_search_enabled = False
         self.cute_topk_choices = dict(CUTE_TOPK_CHOICES)
+        self.cute_radix_selection_graph: RadixSelectionGraph | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
         # A separately launched, proved pointwise producer can share one
@@ -1744,6 +1789,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk: bool = False
         self._cute_flash_flex_has_score_region: bool = False
         self._cute_flash_flex_has_mask_region: bool = False
+        self._cute_flash_flex_trivial_walk: bool = False
         self._cute_flash_q_seq: int | None = None
         self._cute_flash_kv_seq: int | None = None
         self._cute_flash_flex_aux_smem_candidates: tuple[int, ...] = ()
@@ -2063,7 +2109,9 @@ class ConfigSpec:
                 has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                 has_list_walk=self._cute_flash_has_list_walk,
+                flex_trivial_walk=self._cute_flash_flex_trivial_walk,
                 flex_has_mask_region=self._cute_flash_flex_has_mask_region,
+                flex_has_score_region=self._cute_flash_flex_has_score_region,
                 device_sm_count=self._cute_flash_device_sm_count,
                 q_seq=self._cute_flash_q_seq,
                 flex_aux_smem_candidates=self._cute_flash_flex_aux_smem_candidates,
@@ -2110,6 +2158,7 @@ class ConfigSpec:
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
             has_list_walk=self._cute_flash_has_list_walk,
+            flex_trivial_walk=self._cute_flash_flex_trivial_walk,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
@@ -2653,6 +2702,7 @@ class ConfigSpec:
         has_list_walk: bool = False,
         flex_has_score_region: bool = False,
         flex_has_mask_region: bool = False,
+        flex_trivial_walk: bool = False,
         q_seq: int | None = None,
         kv_seq: int | None = None,
         flex_aux_smem_candidates: Sequence[int] = (),
@@ -2698,6 +2748,7 @@ class ConfigSpec:
         self._cute_flash_has_list_walk = has_list_walk
         self._cute_flash_flex_has_score_region = flex_has_score_region
         self._cute_flash_flex_has_mask_region = flex_has_mask_region
+        self._cute_flash_flex_trivial_walk = flex_trivial_walk
         self._cute_flash_q_seq = q_seq
         self._cute_flash_kv_seq = kv_seq
         self._cute_flash_flex_aux_smem_candidates = tuple(flex_aux_smem_candidates)
@@ -3387,6 +3438,7 @@ class ConfigSpec:
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                     has_list_walk=self._cute_flash_has_list_walk,
+                    flex_trivial_walk=self._cute_flash_flex_trivial_walk,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
@@ -3429,11 +3481,16 @@ class ConfigSpec:
         )
 
     def register_cute_tcgen05_grouped_worklist_smem_facts(
-        self, *, group_count: int, device_split_sizes: bool
+        self,
+        *,
+        group_count: int,
+        device_split_sizes: bool,
+        output_dtype_bytes: int = 2,
     ) -> None:
         self._cute_tcgen05_config.register_grouped_worklist_smem_facts(
             group_count=group_count,
             device_split_sizes=device_split_sizes,
+            output_dtype_bytes=output_dtype_bytes,
         )
 
     @staticmethod
@@ -4025,7 +4082,7 @@ class ConfigSpec:
             config,
             "cute_fragment_packet_loads",
             self.cute_fragment_packet_load_root_ids,
-            "a complete fragment root with readonly Float32 host loads",
+            "a complete fragment root with readonly Float32, Float16 or BFloat16 host loads",
             fix_invalid=fix_invalid,
         )
 
@@ -4425,6 +4482,13 @@ class ConfigSpec:
     ) -> None:
         for key in (
             "cute_independent_reduction",
+            "cute_cluster_warp_online",
+            "cute_register_row",
+            "cute_register_row_tensor_copy",
+            "cute_scalar_epilogue",
+            "cute_scalar_epilogue_keep_inputs",
+            "cute_scalar_epilogue_owner_fold",
+            "cute_warp_fp32_redux",
             "cute_replicated_reduction",
             "cute_vector_packet_unroll",
         ):
@@ -4433,6 +4497,36 @@ class ConfigSpec:
                     config[key] = False
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
+        key = "cute_scalar_epilogue_owner_fold"
+        if config.get(key) and not config.get("cute_scalar_epilogue"):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} requires cute_scalar_epilogue")
+        key = "cute_register_row_tensor_copy"
+        if config.get(key) and not config.get("cute_register_row"):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} requires cute_register_row")
+
+    def _normalize_cute_warp_aggregated_atomics(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_warp_aggregated_atomics"
+        if not self.cute_warp_aggregated_atomics_enabled:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_warp_aggregated_atomics requires relaxed Int32 tickets"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, False)
+        if type(value) is not bool:
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
 
     def _normalize_cute_pdl(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -5125,8 +5219,12 @@ class ConfigSpec:
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_topk(config, fix_invalid=_fix_invalid)
+            normalize_radix_selection(self, config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_warp_aggregated_atomics(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
@@ -6335,6 +6433,12 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == RADIX_ALGORITHM_KEY:
+                return True, "legacy"
+            if key == RADIX_HISTOGRAM_KEY:
+                return True, RADIX_HISTOGRAM_MODES[0]
+            if key in RADIX_GEOMETRY_CHOICES:
+                return True, RADIX_GEOMETRY_CHOICES[key][0]
             if key == "cute_materialized_schedule":
                 return True, "off"
             if key == "cute_materialized_operand_schedule":
@@ -6493,6 +6597,11 @@ class ConfigSpec:
         config = self.flat_config(lambda x: x.default())
         # The additive finalizer choice must not change existing seed configs.
         config.config.pop(SPLIT_K_FINALIZER_KEY, None)
+        if config.get(RADIX_ALGORITHM_KEY, "legacy") == "legacy":
+            # Optional radix coverage represents these defaults in flat space.
+            # Keep the ordinary public default and seed payloads unchanged.
+            for key in RADIX_CONFIG_KEYS:
+                config.config.pop(key, None)
         if self.cute_matmul_min_blocks_search_enabled:
             # This optional matmul coordinate has no old default Config key.
             # Keep the public default exact; flat search still represents zero.
@@ -6969,9 +7078,18 @@ class ConfigSpec:
                     )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
+                if self.cute_warp_aggregated_atomics_enabled:
+                    fields["cute_warp_aggregated_atomics"] = BooleanFragment()
                 if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
                     for key in (
                         "cute_independent_reduction",
+                        "cute_cluster_warp_online",
+                        "cute_register_row",
+                        "cute_register_row_tensor_copy",
+                        "cute_scalar_epilogue",
+                        "cute_scalar_epilogue_keep_inputs",
+                        "cute_scalar_epilogue_owner_fold",
+                        "cute_warp_fp32_redux",
                         "cute_replicated_reduction",
                         "cute_vector_packet_unroll",
                     ):
@@ -7146,6 +7264,25 @@ class ConfigSpec:
             if self.cross_loop_pipeline is not None:
                 fields["cross_loop_pipeline"] = self.cross_loop_pipeline
             fields.update(self.user_defined_tunables)
+            if self.cute_radix_selection_graph is not None:
+                fields[RADIX_ALGORITHM_KEY] = EnumFragment(choices=RADIX_ALGORITHMS)
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in RADIX_GEOMETRY_CHOICES.items()
+                )
+                fields[RADIX_HISTOGRAM_KEY] = EnumFragment(
+                    choices=RADIX_HISTOGRAM_MODES
+                )
+                fields.update(
+                    (key, BooleanFragment())
+                    for key in RADIX_BOOLEAN_KEYS
+                    if key != "cute_radix_valid_domain"
+                    or self.cute_radix_selection_graph.largest
+                )
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in RADIX_PIPELINE_CHOICES.items()
+                )
             return fields
 
         # Only add sequence keys that the backend supports
@@ -7298,6 +7435,20 @@ class ConfigSpec:
         result: list[tuple[str | int, ...]] = [
             (key, *field.fingerprint()) for key, field in self._flat_fields().items()
         ]
+        full_extent_slots = tuple(
+            int(item.allow_full_extent) for item in self.reduction_loops
+        )
+        if any(full_extent_slots):
+            # Old flat full-size tokens represented persistent reductions. Do
+            # not reinterpret a cached legacy token as an explicit full loop.
+            # Version the capability, not the bound extent: autotune_multi must
+            # accept the same kernel at power-of-two and neighboring shapes.
+            result.append(
+                (
+                    "reduction_loop_full_extent_encoding_v2",
+                    *full_extent_slots,
+                )
+            )
         acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
         if acf_fragment is not None:
             result.append(
@@ -7742,10 +7893,20 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         block_id: int,
         size_hint: int,
         allow_non_power_of_two: bool = False,
+        allow_full_extent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
+        self.allow_full_extent = allow_full_extent
+
+    def _full_extent_chunk(self) -> int | None:
+        # A padded single iteration can preserve vector packets where an exact
+        # non-power-of-two chunk leaves too few elements per thread. Keep it
+        # distinct from persistent None, just like an exact full-width chunk.
+        if self.allow_full_extent and self.size_hint >= 8:
+            return next_power_of_2(self.size_hint)
+        return None
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -7760,6 +7921,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
+        if high == self._full_extent_chunk():
+            # The full padded chunk now denotes an explicit rolled loop.
+            # Reserve the next power of two for None, retaining the old default
+            # whenever that default selected a persistent reduction.
+            old_high = high
+            high *= 2
+            if default == old_high:
+                default = high
         return BlockSizeFragment(low, high, default)
 
     def _flat_config(
@@ -7775,18 +7944,21 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
         if value >= self.size_hint and not (
-            self.allow_non_power_of_two
-            and value == self.size_hint
-            and value & (value - 1) != 0
+            value == self._full_extent_chunk()
+            or (
+                self.allow_non_power_of_two
+                and value == self.size_hint
+                and value & (value - 1) != 0
+            )
         ):
             return None  # max size becomes persistent reduction
         return value
 
     def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
         # Encode None ("persistent reduction") so the inverse ``_flat_config``
-        # decodes it back to None. ``_flat_config`` returns None for any value
-        # >= size_hint, so the encoding must also be >= size_hint: use the
-        # fragment's ``high`` (always >= size_hint). The fragment *default* is
+        # decodes it back to None. The fragment's ``high`` is >= size_hint,
+        # and strictly greater when the full extent is an explicit loop.
+        # The fragment *default* is
         # capped at max_reduction_loop and can fall below size_hint, which would
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
@@ -7829,11 +8001,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # multi-pass kernel like layer_norm reuses the loaded inputs across
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
-        # sync regardless of how the value was generated.
+        # sync regardless of how the value was generated. CuTe can opt into
+        # a distinct explicit full-loop encoding; None remains persistent.
+        # This distinction does not waive multi-pass cache correctness checks.
         if (
             isinstance(normalized, int)
             and normalized >= self.size_hint
             and normalized & (normalized - 1) == 0
+            and normalized != self._full_extent_chunk()
         ):
             return None
         return normalized
@@ -7844,7 +8019,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
-_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = (
+    "auto",
+    "register",
+    "gmem",
+    "register_prefetch",
+)
 # Manual unroll of the row lane loop of a sunk vector nest (``cute_vloop_sink``).
 _CUTE_LANE_UNROLL_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 
@@ -7867,7 +8047,9 @@ class CuteReductionReloadSpec(_BlockIdItem):
     per-thread slice is small; spills to local memory when it is not).
     ``"gmem"`` re-loads from global memory on later sweeps (the row is usually
     still resident in L2, and no registers are burned).  ``"auto"`` (default)
-    keeps the legacy size heuristic in ``fuse_two_pass_loads``.
+    keeps the legacy size heuristic in ``fuse_two_pass_loads``. The optional
+    ``"register_prefetch"`` mode retains register reloads and also prefetches
+    one proven read-only consumer packet across a one-trip reduction.
     """
 
     def __init__(self, *, block_id: int) -> None:

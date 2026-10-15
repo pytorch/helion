@@ -64,15 +64,9 @@ GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 # ``.format(inner=...)`` against the lifted local name to share the
 # same template across the splice site and pointwise paths.
 #
-# The triton template is rendered as two layers: the inner ``{x32}``
-# placeholder is fp32 (cast happens at the codegen-site for fp16 /
-# bf16 inputs to satisfy ``libdevice.tanh``'s fp32-only contract);
-# the outer ``{x}`` is the original-dtype value preserved for the
-# leading ``0.5 * x`` factor that has no transcendental component.
-# This keeps the fp32 round-trip narrow — only the ``tanh`` argument
-# is cast — and matches Helion's existing ``tanh`` lowering shape
-# (``inductor_lowering_extra.FP32_FALLBACK_OPS_UNARY``). For fp32
-# inputs the codegen treats ``{x32}`` and ``{x}`` as the same local.
+# The Triton pointwise template evaluates the entire expression in fp32
+# for fp16/bf16 inputs, then rounds the result back to the input dtype.
+# Keeping the leading ``0.5 * x`` in fp32 avoids premature subnormal rounding.
 # NOTE: the cute template has no bf16/fp16 round-trip on the carrier,
 # unlike the triton template below. The tcgen05 chain analyzer splices
 # this template at a per-thread T2R register where the accumulator is

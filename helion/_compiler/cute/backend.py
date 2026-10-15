@@ -1594,11 +1594,16 @@ class CuteBackend(Backend):
         return priors
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from ..aten_lowering import sort_lowering
         from ..aten_lowering import squeeze_lowering
         from .aten_lowering import NumericExtremumLowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
+        if node.target is torch.ops.aten.sort.stable:
+            # CuTe's rank/fragment sorting already breaks ties by input index.
+            # Keep other backends' existing Inductor stable-sort lowering.
+            return sort_lowering
         if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
             # These overloads have the same logical-view semantics as squeeze.dim.
             # Register them before Inductor turns them into a ReinterpretView;
@@ -1663,6 +1668,7 @@ class CuteBackend(Backend):
         from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .literal_dims import annotate_literal_dims
+        from .radix_selection import plan_radix_selection_root
         from .register_region import plan_register_region
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
@@ -1672,6 +1678,11 @@ class CuteBackend(Backend):
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
+        device_function.cute_state.radix_selection_plan = plan_radix_selection_root(
+            graphs, tile_strategy
+        )
+        if device_function.cute_state.radix_selection_plan is not None:
+            return
         device_function.cute_state.topk_plan = plan_topk_root(graphs, tile_strategy)
         if device_function.cute_state.topk_plan is not None:
             return
@@ -1783,6 +1794,18 @@ class CuteBackend(Backend):
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
                 "cute_fragment_topk_network",
+                "cute_selection_algorithm",
+                "cute_radix_threads",
+                "cute_radix_candidate_key_cache",
+                "cute_radix_scalar_candidates",
+                "cute_radix_valid_domain",
+                "cute_radix_ticket_stores",
+                "cute_radix_cached_payload_inverse",
+                "cute_radix_packet_bits",
+                "cute_radix_scan_unroll",
+                "cute_radix_cluster_ctas",
+                "cute_radix_candidate_capacity",
+                "cute_radix_histogram_mode",
                 "cute_fragment_atomic_aggregation",
                 "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",
@@ -1821,12 +1844,20 @@ class CuteBackend(Backend):
             or key == "cute_proven_bounds"
             or key == "cute_rng_packet"
             or key == "cute_independent_reduction"
+            or key == "cute_cluster_warp_online"
+            or key == "cute_register_row"
+            or key == "cute_register_row_tensor_copy"
+            or key == "cute_scalar_epilogue"
+            or key == "cute_scalar_epilogue_keep_inputs"
+            or key == "cute_scalar_epilogue_owner_fold"
+            or key == "cute_warp_fp32_redux"
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
             or key == "cute_pdl"
+            or key == "cute_warp_aggregated_atomics"
             or key == "cross_loop_pipeline"
             or key
             in (
@@ -2173,8 +2204,10 @@ class CuteBackend(Backend):
             "_cute_try_paired_sum_cast": "from helion.runtime.cute.paired_sum import try_paired_sum_cast as _cute_try_paired_sum_cast",
             "_cute_try_single_sum_cast": "from helion.runtime.cute.single_sum import try_single_sum_cast as _cute_try_single_sum_cast",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_complete_row_tensor_copy": "from helion._compiler.cute.tensor_copy_helpers import _cute_complete_row_tensor_copy",
             "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
             "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
+            "_cute_grouped_reduce_cluster_warp_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_warp_online_pair",
             "_cute_grouped_reduce_cluster_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_online_pair",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
@@ -2229,6 +2262,7 @@ class CuteBackend(Backend):
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
+            "_cute_warp_fetch_add_int32": "from helion._compiler.cute.warp_atomic_runtime import warp_fetch_add_int32 as _cute_warp_fetch_add_int32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

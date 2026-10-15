@@ -30,6 +30,8 @@ _DTYPE_INFO = {
     "cutlass.BFloat16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
     "cutlass.Float16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
     "cutlass.Float32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
+    "cutlass.Int32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
+    "cutlass.Uint32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
 }
 
 

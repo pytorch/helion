@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch.fx import Node
 
 from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
@@ -21,11 +20,18 @@ if TYPE_CHECKING:
 KEY = "cute_fragment_topk_network"
 
 
-def network_topk_supported(dtype: torch.dtype, n: int | None, k: int) -> bool:
+def network_topk_supported(
+    dtype: torch.dtype, n: int | None, k: int, *, values_only: bool = False
+) -> bool:
     # At most 32 Int64 register keys per lane. Larger/different-typed selections
-    # keep the serial implementation, including Int64 extrema without packing.
+    # keep the serial implementation. Int64 values need no index packing when
+    # the selection's public index output is proved unused.
     return (
-        dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int32)
+        (
+            dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int32)
+            or dtype == torch.int64
+            and values_only
+        )
         and n is not None
         and 0 < k <= n <= 1024
     )
@@ -41,6 +47,9 @@ class CuteFragmentTopKNetworkHeuristic(AutotunerHeuristic):
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
         from ..cute.computed_fragment import _static_selection_extent
         from ..cute.computed_fragment import computed_fragment_supported
+        from ..cute.ordered_selection import is_ordered_selection
+        from ..cute.ordered_selection import ordered_selection_args
+        from ..cute.ordered_selection import selection_values_only
         from ..cute.topk import match_topk_root
 
         host = device_ir.host_function
@@ -62,15 +71,18 @@ class CuteFragmentTopKNetworkHeuristic(AutotunerHeuristic):
                     continue
                 for info in graphs:
                     for node in info.graph.nodes:
-                        if node.target is not torch.ops.aten.topk.default:
+                        if not is_ordered_selection(node):
                             continue
-                        source = node.args[0]
-                        assert isinstance(source, Node)
+                        arguments = ordered_selection_args(node)
+                        assert arguments is not None
+                        source, k, *_ = arguments
                         value = source.meta["val"]
                         assert isinstance(value, torch.Tensor)
-                        k = node.args[1]
+                        n = _static_selection_extent(env, source)
+                        if k is None:
+                            k = n
                         if isinstance(k, int) and network_topk_supported(
-                            value.dtype, _static_selection_extent(env, source), k
+                            value.dtype, n, k, values_only=selection_values_only(node)
                         ):
                             roots.add(root)
         env.config_spec.cute_fragment_topk_network_root_ids = frozenset(roots)
