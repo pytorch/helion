@@ -1251,17 +1251,14 @@ def _persistent_vec_is_exact_aligned(
         ):
             return False
     else:
-        # Kernel-owned allocations are suitably aligned by the backend.  A
-        # nonzero or symbolic view offset cannot establish that guarantee.
-        if env.tensor_input_source(tensor) is not None:
-            return False
-        storage_offset = tensor.storage_offset()
-        if not isinstance(storage_offset, int) or storage_offset != 0:
-            return False
         strides = tensor.stride()
         sizes = tensor.shape
         element_size = tensor.element_size()
         required_alignment = vec_width * element_size
+        # Lacking an input source does not make a tensor kernel-owned: a
+        # host-side view of an input inherits that input's runtime base.
+        if not cute_tensor_base_is_aligned(env, tensor, required_alignment):
+            return False
 
     if len(strides) != len(rebased):
         return False
