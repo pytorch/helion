@@ -14,6 +14,7 @@ from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
+from test.test_cute_gathered_mma_codegen import _bound as _gathered_bound
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
@@ -68,7 +69,7 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
         bound.env,
         patch.object(
             CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
+            "_interleave_schedule_seeds",
             side_effect=_legacy_order,
         ),
     ):
@@ -91,7 +92,7 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
 
 def _initial_population(
     bound: BoundKernel,
-    args: tuple[torch.Tensor, torch.Tensor],
+    args: tuple[object, ...],
     *,
     seeds: list[helion.Config] | None = None,
     count: int | None = None,
@@ -243,12 +244,17 @@ def test_initial_population_uses_config_provenance_not_parameter_spelling(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _ordinary_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def _ordinary_matmul(
+    a: torch.Tensor, b: torch.Tensor, seed: torch.Tensor | None = None
+) -> torch.Tensor:
     m, k = a.shape
     n = b.size(1)
     out = torch.empty((m, n), dtype=a.dtype, device=a.device)
     for row, column in hl.tile([m, n]):
-        acc = hl.zeros([row, column], dtype=torch.float32)
+        if seed is None:
+            acc = hl.zeros([row, column], dtype=torch.float32)
+        else:
+            acc = seed[row, column]
         for inner in hl.tile(k):
             acc = torch.addmm(acc, a[row, inner], b[inner, column])
         out[row, column] = acc.to(out.dtype)
@@ -276,7 +282,7 @@ def _fixed_chunk_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         (matmul_split_k, False),
     ],
 )
-def test_no_config_owned_k_chunk_preserves_initial_population(
+def test_no_config_owned_k_chunk_preserves_seeds_and_covers_schedules(
     kernel: helion.Kernel, static_shapes: bool
 ) -> None:
     args = (
@@ -291,10 +297,86 @@ def test_no_config_owned_k_chunk_preserves_initial_population(
     )
     bound = _cpu_bind(variant, args)
     legacy_seeds = _legacy_registered_seeds(bound)
-    assert legacy_seeds == bound.config_spec.compiler_seed_configs
-    assert _initial_population(bound, args, seeds=legacy_seeds) == _initial_population(
-        bound, args
+    seeds = bound.config_spec.compiler_seed_configs
+    assert len(legacy_seeds) == len(seeds)
+    assert set(legacy_seeds) == set(seeds)
+    assert legacy_seeds[0] == seeds[0]
+    normal = [seed for seed in seeds if not seed.get("cute_collective_static_layouts")]
+    assert seeds[: len(normal)] == normal
+    population = _initial_population(bound, args)
+    legacy_population = _initial_population(bound, args, seeds=legacy_seeds)
+    assert len(population) == len(legacy_population)
+    assert {seed.get("cute_collective_copy") for seed in population} >= {
+        "scalar",
+        "async",
+        "async_cached",
+    }
+    assert {seed.get("cute_collective_recipe", "scalar") for seed in population} >= {
+        "scalar",
+        "vector",
+        "vector_unrolled",
+    }
+    assert {seed.get("cute_collective_stages", 1) for seed in population} >= {1, 2, 4}
+    assert {seed.get("cute_collective_epilogue", "scalar") for seed in population} >= {
+        "scalar",
+        "vector",
+        "vector_unrolled",
+    }
+    assert any(seed.get("cute_proven_bounds") for seed in population)
+    assert any(seed.get("cute_collective_static_layouts") for seed in population)
+    assert any(not seed.get("cute_collective_static_layouts") for seed in population)
+    if kernel is _ordinary_matmul:
+        before = {tuple(seed.block_sizes) for seed in legacy_population}
+        after = {tuple(seed.block_sizes) for seed in population}
+        # At the full-profile budget on SM100, only the last two geometries drop.
+        assert after <= before
+        assert before - after == {(32, 64, 32), (32, 64, 64)}
+        early = _initial_population(bound, args, count=30)
+        early_legacy = _initial_population(bound, args, seeds=legacy_seeds, count=30)
+        assert (
+            len(
+                {
+                    tuple(seed.block_sizes)
+                    for seed in early_legacy
+                    if seed.get("cute_collective_mma")
+                }
+            )
+            == 8
+        )
+        assert {
+            tuple(seed.block_sizes) for seed in early if seed.get("cute_collective_mma")
+        } == {(64, 32, 64), (64, 64, 64)}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_nonzero_accumulator_reaches_native_seed_schedules(dtype: torch.dtype) -> None:
+    args = (
+        torch.empty((128, 512), dtype=dtype),
+        torch.empty((512, 256), dtype=dtype),
+        torch.empty((128, 256), dtype=torch.float32),
     )
+    bound = _cpu_bind(_ordinary_matmul, args)
+    legacy = _initial_population(bound, args, seeds=_legacy_registered_seeds(bound))
+    assert not any(seed.get("cute_collective_tmem_seed") for seed in legacy)
+    population = _initial_population(bound, args)
+    native = [
+        seed for seed in population if seed.get("cute_collective_compute") == "tcgen05"
+    ]
+    assert not any(seed.get("cute_collective_tmem_a") for seed in population)
+    for key in ("cute_collective_native_seeded", "cute_collective_tmem_seed"):
+        assert {seed.get(key, False) for seed in native} == {False, True}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gathered_schedules_preserve_the_existing_seed_order(
+    dtype: torch.dtype,
+) -> None:
+    bound = _gathered_bound((1024, 512, 512, 8), dtype, False)
+    assert any(
+        seed.get("cute_collective_compute") == "tma_gather"
+        for seed in bound.config_spec.compiler_seed_configs
+    )
+    assert bound.config_spec.compiler_seed_configs == _legacy_registered_seeds(bound)
 
 
 def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
@@ -312,7 +394,7 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
         )
         with patch.object(
             CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
+            "_interleave_schedule_seeds",
             side_effect=_legacy_order,
         ):
             legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -330,7 +412,7 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
         helion.Config.from_dict(seed.config | {"gain": 1 << (index % 3)})
         for index, seed in enumerate(legacy)
     ]
-    interleaved = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
+    interleaved = CuteCollectiveMatmulHeuristic._interleave_schedule_seeds(
         bound.config_spec, with_gain, ()
     )
     assert [

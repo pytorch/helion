@@ -2095,7 +2095,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         return result, tuple(parameters)
 
     @staticmethod
-    def _interleave_bounded_k_seeds(
+    def _interleave_schedule_seeds(
         spec: ConfigSpec,
         seeds: list[Config],
         parameters: tuple[str, ...],
@@ -2112,9 +2112,14 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         paired copy/recipe choices before repeating geometries. When the TMEM
         storage alternative is present, rotate through complete
         schedules as well as compute/copy/depth/chunk groups, retaining the
-        ranked geometry order within each. This only reorders existing seeds;
-        the first seed, default promotion, other heuristics, and search budget
-        stay unchanged. Unrelated user knobs never supply a grouping dimension.
+        ranked geometry order within each. Without bounded-K, TMEM-operand,
+        register-recipe, or packet schedules, rotate through complete schedules
+        including native/TMEM seed reuse, recipes, epilogues, and bounds policies.
+        An otherwise ordinary list containing gathered-row seeds keeps its
+        existing order.
+        This only reorders existing seeds; the first seed, default promotion,
+        other heuristics, and search budget stay unchanged. Unrelated user
+        knobs never supply a grouping dimension.
         """
         tmem_operand_schedules = any(
             seed.get("cute_collective_tmem_a", False) for seed in seeds
@@ -2128,11 +2133,14 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         packet_schedules = any(
             seed.get("cute_collective_operand_packets", False) for seed in seeds
         )
-        if (
-            not parameters
-            and not tmem_operand_schedules
-            and not register_recipe_schedules
-            and not packet_schedules
+        ordinary = not (
+            parameters
+            or tmem_operand_schedules
+            or register_recipe_schedules
+            or packet_schedules
+        )
+        if ordinary and any(
+            seed.get("cute_collective_compute") == "tma_gather" for seed in seeds
         ):
             return seeds
         default = spec._base_default_config()
@@ -2144,7 +2152,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                 seed.get("cute_collective_stages", 1),
                 *(seed.get(parameter, default[parameter]) for parameter in parameters),
             )
-            if tmem_operand_schedules:
+            if ordinary or tmem_operand_schedules:
                 key += (
                     seed.get("cute_collective_native_seeded", False),
                     seed.get("cute_collective_recipe", "scalar"),
@@ -2429,7 +2437,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
-        return cls._interleave_bounded_k_seeds(
+        return cls._interleave_schedule_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
 

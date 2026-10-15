@@ -55,7 +55,7 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
         bound.env,
         patch.object(
             CuteCollectiveMatmulHeuristic,
-            "_interleave_bounded_k_seeds",
+            "_interleave_schedule_seeds",
             side_effect=_legacy_order,
         ),
     ):
@@ -187,7 +187,7 @@ def test_tmem_schedule_order_preserves_budget_and_explicit_user_priority(
     assert population[1] == normalized
 
 
-def test_unrelated_seed_configs_retain_their_exact_order(
+def test_schedules_without_tmem_operands_advance_seed_reuse(
     dependent_case: tuple[BoundKernel, tuple[torch.Tensor, ...]],
 ) -> None:
     bound, _args = dependent_case
@@ -196,9 +196,13 @@ def test_unrelated_seed_configs_retain_their_exact_order(
         for config in _legacy_registered_seeds(bound)
         if not config.get("cute_collective_tmem_a", False)
     ]
-    assert (
-        CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
-            bound.config_spec, seeds, ()
-        )
-        is seeds
+    reordered = CuteCollectiveMatmulHeuristic._interleave_schedule_seeds(
+        bound.config_spec, seeds, ()
     )
+    assert reordered[0] == seeds[0]
+    assert len(reordered) == len(seeds)
+    assert set(reordered) == set(seeds)
+    assert any(seed.get("cute_collective_tmem_seed") for seed in seeds)
+    assert next(
+        i for i, seed in enumerate(reordered) if seed.get("cute_collective_tmem_seed")
+    ) < next(i for i, seed in enumerate(seeds) if seed.get("cute_collective_tmem_seed"))
