@@ -2555,6 +2555,16 @@ class FlashAttentionConfig:
     # table-free hooks 2-6), off below (searched either way).  Only the flex
     # list-walk plans realize it; elsewhere False.
     flex_rolled_chunks: bool = False
+    # FlexAttention list walk (``cute_flash_flex_item_words``): the per-item
+    # tile bitmasks come from a host-built table (``flex_item_words``: one
+    # int32 word per 32 KV tiles per (stage, list), cached per BlockMask
+    # like the item order) and every walking role loads its words at the
+    # item prelude instead of reading the four counts and walking the index
+    # lists (up to two loads per list entry per role per item, a dependent
+    # chain on the MMA and softmax warps' critical path between items:
+    # 16 entries on flamingo 8K, 36 on sta2d).  Default on for list-walk
+    # plans (searched: the device walk stays available); elsewhere False.
+    flex_item_words: bool = False
     # Skip the MMA work of query stage 0's fully masked KV tile. With two
     # 128-row query tiles (2p, 2p+1) per CTA and 128-wide KV tiles both stages
     # walk KV tiles 0..2p+1, but tile 2p+1 lies entirely above stage 0's
@@ -3632,6 +3642,31 @@ def _flash_kv_split_legal(*, has_list_walk: bool, pipeline_family: str) -> bool:
     )
 
 
+def _flash_kv_split_choices(
+    *, num_bh: int | None, q_seq: int | None, head_dim_v: int
+) -> tuple[int, ...]:
+    """The ``cute_flash_kv_split`` values worth searching: 1 and the splits
+    whose merge workspace (``splits * items * 2 * 128 * (head_dim_v + 2)``
+    fp32, ``items = num_bh * ceil(q_seq / 256)``) fits the
+    ``HELION_CUTE_FLASH_KV_SPLIT_WORKSPACE_MB`` budget codegen applies (256 MB
+    by default).  Codegen declines a split past the budget to an unsplit
+    render, so searching it only re-times the ``kv_split = 1`` kernel under
+    another name (every 8K winner of the 2026-10-12 campaign carried a
+    declined 2 or 4).  Every value when the grid is unknown."""
+    if not num_bh or not q_seq or q_seq <= 0:
+        return FLASH_KV_SPLITS
+    items = num_bh * -(-q_seq // 256)
+    cap = (
+        int(_flash_env_get("HELION_CUTE_FLASH_KV_SPLIT_WORKSPACE_MB", "256")) << 20
+    ) // 4
+    cap = min(cap, 1 << 31)
+    return tuple(
+        value
+        for value in FLASH_KV_SPLITS
+        if value == 1 or value * items * 2 * 128 * (head_dim_v + 2) <= cap
+    )
+
+
 def _flash_kv_split_seed(
     *, device_sm_count: int, num_bh: int | None, q_seq: int | None
 ) -> int:
@@ -3840,6 +3875,7 @@ def resolve_flash_config(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
     flex_aux_smem_candidates: Sequence[int] = (),
     flex_prefetch_regs: Sequence[int] = (),
     flex_coalesce_steps: Sequence[int] = (),
@@ -3858,6 +3894,10 @@ def resolve_flash_config(
     epilogue; those rows exist only in the 128-row body, so the 64-row query
     tile is canonicalized away instead of aliasing it. *has_row_epilogue*
     keeps fused row epilogues on the chunked FA4 softmax body.
+    *flex_trivial_walk* marks torch's empty BlockMask (one KV block over the
+    whole sequence, ``kv_walk.trivial``): a flex plan with no tables to read,
+    never persistent (the persistent list walk decodes its work items from
+    the host-built item order, which those tables define).
     *has_score_modifiers* is True when the score plan carries a modifier
     (mask, bias, softcap, ...); ``plain_row_body`` alone cannot tell that
     apart from a fused row epilogue, which the ``row_mma`` row programs do
@@ -4138,16 +4178,21 @@ def resolve_flash_config(
     # carries the raw-mbarrier phases (s_full/pfor/pfor2/o_full) across work-items in
     # its own strided loop, so it does not depend on the cutlass-pipeline s_stage path.
     # The causal and pruned-interval plans decode their KV interval in the
-    # CTA-wide setup (one work item per CTA); the list walk re-reads its
-    # tables per work item in each role, so it may also run the static
-    # strided persistent loop (off by default: searched).
+    # CTA-wide setup (one work item per CTA); the list walk decodes its item
+    # per role from the host-built tables and runs the static strided loop
+    # over the longest-first item order (searched; on by default: every
+    # list-walk winner of the 2026-10-12 attention-gym campaign, 54 of 54,
+    # was persistent, and the pinned seeds without it trailed by 37-46% on
+    # flamingo and 10-13% on sta2d).
     interval_setup = is_causal or has_kv_tile_pruning
     if topology == "fa4":
         if persistent_cfg is not None:
-            persistent = bool(persistent_cfg) and not interval_setup
+            persistent = (
+                bool(persistent_cfg) and not interval_setup and not flex_trivial_walk
+            )
         else:
             persistent = (
-                _flash_persistent() and not interval_setup and not has_list_walk
+                _flash_persistent() and not interval_setup and not flex_trivial_walk
             )
         if (
             (is_causal or dense_hd64_fa4)
@@ -5676,6 +5721,13 @@ def resolve_flash_config(
             if flex_rolled_chunks_cfg is None
             else bool(flex_rolled_chunks_cfg)
         )
+    # The host-built per-item bitmask words (list-walk plans): on by default.
+    flex_item_words = False
+    if has_list_walk:
+        flex_item_words_cfg = _cfg(FLASH_FLEX_ITEM_WORDS_KEY)
+        flex_item_words = (
+            True if flex_item_words_cfg is None else bool(flex_item_words_cfg)
+        )
     flex_prefetch = 0
     if flex_prefetch_regs and not flex_rolled_chunks:
         flex_prefetch = flash_flex_prefetch_default(flex_prefetch_regs)
@@ -5936,6 +5988,7 @@ def resolve_flash_config(
         flex_coalesce=flex_coalesce,
         flex_coalesce_slots=flex_coalesce_slots,
         flex_rolled_chunks=flex_rolled_chunks,
+        flex_item_words=flex_item_words,
         causal_skip_dead_tile=causal_skip_dead_tile,
         causal_stagger=causal_stagger,
         causal_head_pair=causal_head_pair,
@@ -6214,6 +6267,7 @@ FLASH_FLEX_AUX_SMEM_KEY = "cute_flash_flex_aux_smem"
 FLASH_FLEX_PREFETCH_KEY = "cute_flash_flex_prefetch"
 FLASH_FLEX_COALESCE_KEY = "cute_flash_flex_coalesce"
 FLASH_FLEX_ROLLED_CHUNKS_KEY = "cute_flash_flex_rolled_chunks"
+FLASH_FLEX_ITEM_WORDS_KEY = "cute_flash_flex_item_words"
 FLASH_CAUSAL_SKIP_DEAD_TILE_KEY = "cute_flash_causal_skip_dead_tile"
 FLASH_CAUSAL_STAGGER_KEY = "cute_flash_causal_stagger"
 FLASH_CAUSAL_HEAD_PAIR_KEY = "cute_flash_causal_head_pair"
@@ -6356,6 +6410,10 @@ FLASH_AUTOTUNE_VALUE_DEPENDENCIES: dict[tuple[str, object], dict[str, object]] =
         FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_SOFTMAX_DISC_KEY: True,
     },
+    (FLASH_FLEX_ITEM_WORDS_KEY, True): {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_SOFTMAX_DISC_KEY: True,
+    },
     # Segment-aligned tiling of the per-row KV lower bound: the
     # non-persistent FA4 pair body with a staged epilogue in its own ``sO``
     # (the item loop reloads Q, so the output cannot live in the Q stages).
@@ -6487,6 +6545,7 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_FLEX_PREFETCH_KEY,
     FLASH_FLEX_COALESCE_KEY,
     FLASH_FLEX_ROLLED_CHUNKS_KEY,
+    FLASH_FLEX_ITEM_WORDS_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -6596,6 +6655,7 @@ def flash_effective_config_values(
         FLASH_FLEX_PREFETCH_KEY: config.flex_prefetch,
         FLASH_FLEX_COALESCE_KEY: config.flex_coalesce,
         FLASH_FLEX_ROLLED_CHUNKS_KEY: config.flex_rolled_chunks,
+        FLASH_FLEX_ITEM_WORDS_KEY: config.flex_item_words,
     }
 
 
@@ -7125,6 +7185,7 @@ def _flash_seed_values(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
 ) -> dict[str, object]:
     fragments = flash_autotune_fragments(
         head_dim,
@@ -7151,6 +7212,7 @@ def _flash_seed_values(
         kv_group=kv_group,
         fast_math=fast_math,
         has_list_walk=has_list_walk,
+        flex_trivial_walk=flex_trivial_walk,
     )
     return {key: fragment.default() for key, fragment in fragments.items()}
 
@@ -7399,6 +7461,7 @@ def _flash_target_seed_templates(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Project every target template onto the current implementation's legality.
 
@@ -7470,6 +7533,7 @@ def _flash_target_seed_templates(
                 kv_group=kv_group,
                 fast_math=fast_math,
                 has_list_walk=has_list_walk,
+                flex_trivial_walk=flex_trivial_walk,
             ).exp2_packet
             legality, _ = _flash_target_policy_values(
                 expected, default_packet=default_packet, fast_math=fast_math
@@ -7495,6 +7559,7 @@ def _flash_target_seed_templates(
             kv_group=kv_group,
             fast_math=fast_math,
             has_list_walk=has_list_walk,
+            flex_trivial_walk=flex_trivial_walk,
         )
         if not _flash_config_matches_tuning_values(
             resolved,
@@ -7763,6 +7828,7 @@ def _flash_validated_target_seed(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
     exact_table: bool = True,
 ) -> Config:
     """Build a target seed and reject policies normalized by config resolution.
@@ -7808,6 +7874,7 @@ def _flash_validated_target_seed(
         kv_group=kv_group,
         fast_math=fast_math,
         has_list_walk=has_list_walk,
+        flex_trivial_walk=flex_trivial_walk,
     )
     actual = flash_effective_config_values(resolved)
     # The dead-tile skip, the staggered walk and the head pair default on
@@ -7868,6 +7935,7 @@ def _flash_target_seed_configs(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
 ) -> tuple[Config, ...]:
     if tmem_rowmax_compatible is None:
         tmem_rowmax_compatible = standard_dense_output or standard_causal_output
@@ -7892,6 +7960,7 @@ def _flash_target_seed_configs(
         "kv_group": kv_group,
         "fast_math": fast_math,
         "has_list_walk": has_list_walk,
+        "flex_trivial_walk": flex_trivial_walk,
     }
     families = _flash_legal_autotune_pipeline_families(
         head_dim, num_kv, output_requires_tma=False, requested_family=None, **common
@@ -7962,6 +8031,7 @@ def _flash_target_seed_configs(
                 kv_group=kv_group,
                 fast_math=fast_math,
                 has_list_walk=has_list_walk,
+                flex_trivial_walk=flex_trivial_walk,
                 exact_table=exact_table,
                 values={
                     "block_sizes": block_sizes,
@@ -8005,6 +8075,7 @@ def flash_attention_seed_config(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
 ) -> Config | None:
     """Return the first legal template in deterministic order, or a generic seed.
 
@@ -8040,6 +8111,7 @@ def flash_attention_seed_config(
             kv_group=kv_group,
             fast_math=fast_math,
             has_list_walk=has_list_walk,
+            flex_trivial_walk=flex_trivial_walk,
         )
         if target_seeds:
             return target_seeds[0]
@@ -8070,6 +8142,7 @@ def flash_attention_seed_config(
         kv_group=kv_group,
         fast_math=fast_math,
         has_list_walk=has_list_walk,
+        flex_trivial_walk=flex_trivial_walk,
     )
     if seed_kind == "default":
         return _flash_config_with_values(block_sizes, values)
@@ -8194,6 +8267,7 @@ class _FlashSeedFacts(TypedDict):
     kv_group: int
     fast_math: bool
     has_list_walk: bool
+    flex_trivial_walk: bool
 
 
 def flash_attention_seed_configs(
@@ -8224,6 +8298,7 @@ def flash_attention_seed_configs(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
     q_seq: int | None = None,
     flex_aux_smem_candidates: Sequence[int] = (),
     flex_prefetch_regs: Sequence[int] = (),
@@ -8285,6 +8360,7 @@ def flash_attention_seed_configs(
         "kv_group": kv_group,
         "fast_math": fast_math,
         "has_list_walk": has_list_walk,
+        "flex_trivial_walk": flex_trivial_walk,
     }
     # The fragment-only facts (the device and the query length seed the
     # split-KV knob; the target seed does not take them).
@@ -9097,8 +9173,18 @@ def flash_attention_seed_configs(
         # MMA) at both measured cadences: the causal winners' 16/8 and the
         # 8/2 the pinned pruned sweep preferred on short work items. No loop
         # split (an owned no-op here) and the inherited masked cadence.
+        # Persistent with a deeper ring than the fragment default: the
+        # 2026-10-12 attention-gym campaign's list-walk winners were all
+        # persistent with kv_stage 4-8 (TMA epilogue); the split-KV knob
+        # stays at the fragment default, the grid-derived seeded split
+        # (``_flash_kv_split_seed``: 1 once the pair items fill the device).
+        list_kv_stage_cap = _flash_aliased_kv_stage_cap(
+            head_dim, stage_output=True, head_dim_v=head_dim_v
+        )
         flex_fa4_structure = {
             FLASH_PIPELINE_FAMILY_KEY: "fa4",
+            FLASH_PERSISTENT_KEY: True,
+            FLASH_KV_STAGE_KEY: min(5, list_kv_stage_cap),
             FLASH_EXP2_PACKET_KEY: "8x2",
             FLASH_SOFTMAX_DISC_KEY: True,
             FLASH_DISC_PIPE_KEY: 2,
@@ -9109,6 +9195,42 @@ def flash_attention_seed_configs(
             FLASH_EPI_TMA_KEY: True,
             FLASH_FIRST_LOAD_ORDER_KEY: 3,
             FLASH_MMA_INTERLEAVE_KEY: True,
+        }
+        # The campaign winners' bodies as seeds: the short walk (flamingo 8K,
+        # about 7 blocks per item: 16/4 cadence, 4x2 packets, four-deep PASS2
+        # pipe, 160/128/64 registers, ring 7) and the medium walk (sta2d, 18
+        # blocks per item: 8/2 cadence, split P arrival, 8-row correction
+        # tiles, ring 8).
+        flex_short_walk = {
+            **flex_fa4_structure,
+            FLASH_E2E_OFFSET_KEY: 13,
+            FLASH_E2E_OFFSET0_KEY: 6,
+            FLASH_EXP2_PACKET_KEY: "4x2",
+            FLASH_DISC_PIPE_KEY: 4,
+            FLASH_SPLIT_P_ARRIVE_KEY: False,
+            FLASH_P_STORE_REP_KEY: 32,
+            FLASH_FIRST_LOAD_ORDER_KEY: 0,
+            FLASH_WAIT_HINT_KEY: 10_000_000,
+            FLASH_KV_STAGE_KEY: min(7, list_kv_stage_cap),
+            FLASH_RESCALE_THRESHOLD_KEY: 16.0,
+            FLASH_SOFTMAX_REGS_KEY: 160,
+            FLASH_CORR_REGS_KEY: 128,
+            FLASH_OTHER_REGS_KEY: 64,
+            FLASH_CORR_TILE_SIZE_KEY: 32,
+        }
+        flex_medium_walk = {
+            **flex_fa4_structure,
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+            FLASH_E2E_OFFSET_KEY: 4,
+            FLASH_E2E_OFFSET0_KEY: 1,
+            FLASH_DISC_PIPE_KEY: 1,
+            FLASH_P_STORE_REP_KEY: 32,
+            FLASH_KV_STAGE_KEY: min(8, list_kv_stage_cap),
+            FLASH_RESCALE_THRESHOLD_KEY: 4.0,
+            FLASH_SOFTMAX_REGS_KEY: 160,
+            FLASH_CORR_REGS_KEY: 112,
+            FLASH_OTHER_REGS_KEY: 80,
+            FLASH_CORR_TILE_SIZE_KEY: 8,
         }
         source_variants += (
             (
@@ -9121,6 +9243,8 @@ def flash_attention_seed_configs(
                 },
             ),
             (FLASH_E2E_SCHEDULE_KEY, "8/2", flex_fa4_structure),
+            (FLASH_E2E_SCHEDULE_KEY, "16/4", flex_short_walk),
+            (FLASH_EXP2_PACKET_KEY, "4x2", flex_medium_walk),
         )
     if has_row_epilogue:
         # The fa4 family seeds carry the softmax-warpgroup row epilogue (the
@@ -9317,6 +9441,7 @@ def flash_attention_seed_configs(
             FLASH_FLEX_ROLLED_CHUNKS_KEY: flash_flex_rolled_chunks_default(
                 flex_hook_ops
             ),
+            FLASH_FLEX_ITEM_WORDS_KEY: True,
         }
         unique = [Config.from_dict({**seed.config, **flex_values}) for seed in unique]
     return tuple(unique)
@@ -9345,6 +9470,7 @@ def _flash_legal_autotune_pipeline_families(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
 ) -> tuple[str, ...]:
     """Enumerate families whose requested structure survives normalization."""
     candidates = (
@@ -9403,6 +9529,7 @@ def _flash_legal_autotune_pipeline_families(
             score_modifier_kinds=score_modifier_kinds,
             fast_math=fast_math,
             has_list_walk=has_list_walk,
+            flex_trivial_walk=flex_trivial_walk,
         )
         if effective.pipeline_family != family:
             continue
@@ -9440,6 +9567,7 @@ def flash_autotune_fragments(
     kv_group: int = 1,
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
     flex_has_mask_region: bool = False,
     device_sm_count: int = 0,
     q_seq: int | None = None,
@@ -9546,6 +9674,7 @@ def flash_autotune_fragments(
         kv_group=kv_group,
         fast_math=fast_math,
         has_list_walk=has_list_walk,
+        flex_trivial_walk=flex_trivial_walk,
     )
     # The asymmetric (192, 128) pair: only the plain fa4 family hosts it, its
     # aliased ring slots are the wider K tile, and staged O fits only when the
@@ -9860,8 +9989,12 @@ def flash_autotune_fragments(
     elif has_list_walk:
         # The list walk searches the persistent loop (its per-item count
         # prelude re-reads the tables); one CTA per SM, no coordinate
-        # recompute.
-        persistent = enum(defaults.persistent, (False, True), (False, True))
+        # recompute.  Torch's empty BlockMask has no tables: no item order
+        # to walk, pinned non-persistent.
+        if flex_trivial_walk:
+            persistent = enum(False, (False, True), (False,))
+        else:
+            persistent = enum(defaults.persistent, (False, True), (False, True))
         persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
         recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
     elif variable_trip_count or num_kv < 2:
@@ -10271,14 +10404,18 @@ def flash_autotune_fragments(
     kv_split_searchable = _flash_kv_split_legal(
         has_list_walk=has_list_walk, pipeline_family="fa4"
     )
+    kv_split_choices = _flash_kv_split_choices(
+        num_bh=num_bh, q_seq=q_seq, head_dim_v=head_dim_v or head_dim
+    )
+    kv_split_seed = _flash_kv_split_seed(
+        device_sm_count=device_sm_count, num_bh=num_bh, q_seq=q_seq
+    )
+    if kv_split_seed not in kv_split_choices:
+        kv_split_seed = 1
     kv_split = enum(
-        _flash_kv_split_seed(
-            device_sm_count=device_sm_count, num_bh=num_bh, q_seq=q_seq
-        )
-        if kv_split_searchable
-        else defaults.kv_split,
+        kv_split_seed if kv_split_searchable else defaults.kv_split,
         FLASH_KV_SPLITS,
-        FLASH_KV_SPLITS if kv_split_searchable else (defaults.kv_split,),
+        kv_split_choices if kv_split_searchable else (defaults.kv_split,),
     )
     role_chain_supported = any(
         flags is not None
@@ -10521,6 +10658,7 @@ def flash_autotune_fragments(
                 score_modifier_kinds=score_modifier_kinds,
                 fast_math=fast_math,
                 has_list_walk=has_list_walk,
+                flex_trivial_walk=flex_trivial_walk,
             ).exp2_packet
             == packet
         ]
@@ -10834,6 +10972,11 @@ def flash_autotune_fragments(
             (False, True),
             (False, True) if has_list_walk else (False,),
         ),
+        FLASH_FLEX_ITEM_WORDS_KEY: enum(
+            has_list_walk,
+            (False, True),
+            (False, True) if has_list_walk else (False,),
+        ),
     }
     if valid_family == "fa4_alt":
         for key, value in (
@@ -10930,6 +11073,7 @@ def flash_config_from_config(
     score_modifier_kinds: Sequence[str] = (),
     fast_math: bool = False,
     has_list_walk: bool = False,
+    flex_trivial_walk: bool = False,
     flex_aux_smem_candidates: Sequence[int] = (),
     flex_prefetch_regs: Sequence[int] = (),
     flex_coalesce_steps: Sequence[int] = (),
@@ -10963,6 +11107,7 @@ def flash_config_from_config(
         score_modifier_kinds=score_modifier_kinds,
         fast_math=fast_math,
         has_list_walk=has_list_walk,
+        flex_trivial_walk=flex_trivial_walk,
         flex_aux_smem_candidates=flex_aux_smem_candidates,
         flex_prefetch_regs=flex_prefetch_regs,
         flex_coalesce_steps=flex_coalesce_steps,
@@ -11103,6 +11248,11 @@ _FLASH_FLEX_ITEM_PREAMBLE_IMPORTS = """\
 from helion.runtime.cute.flash_flex import flex_item_table as _helion_flash_flex_item_table
 """
 
+# Only list walks reading the host-built bitmask words import their builder.
+_FLASH_FLEX_WORDS_PREAMBLE_IMPORTS = """\
+from helion.runtime.cute.flash_flex import flex_item_words as _helion_flash_flex_item_words
+"""
+
 # Only split-KV list walks import the workspace allocator.
 _FLASH_FLEX_SPLIT_PREAMBLE_IMPORTS = """\
 from helion.runtime.cute.flash_flex import flex_split_workspace as _helion_flash_flex_split_workspace
@@ -11115,6 +11265,15 @@ def emit_flash_flex_item_module_statements(cg: GenerateAST) -> None:
         return
     cg._helion_flash_flex_item_module_emitted = True  # type: ignore[attr-defined]
     for line_stmt in ast.parse(_FLASH_FLEX_ITEM_PREAMBLE_IMPORTS).body:
+        cg.module_statements.append(line_stmt)
+
+
+def emit_flash_flex_words_module_statements(cg: GenerateAST) -> None:
+    """Emit the once-per-module import of the flex item-words builder."""
+    if getattr(cg, "_helion_flash_flex_words_module_emitted", False):
+        return
+    cg._helion_flash_flex_words_module_emitted = True  # type: ignore[attr-defined]
+    for line_stmt in ast.parse(_FLASH_FLEX_WORDS_PREAMBLE_IMPORTS).body:
         cg.module_statements.append(line_stmt)
 
 
@@ -11193,6 +11352,48 @@ def _flash_flex_item_arg(
         df.new_var("flash_flex_items"),
         fake,
         f"_helion_flash_flex_item_table({tables}, q_block={q_block}, "
+        f"batch={batch}, heads={heads}, num_pairs={num_pairs}, num_kv={num_kv})",
+    )
+    df.arguments.append(arg)
+    df._tensor_args[fake] = arg
+    return arg
+
+
+def _flash_flex_words_arg(
+    df: DeviceFunction,
+    walk_args: Sequence[TensorArg],
+    *,
+    q_block: int,
+    batch: int,
+    heads: int,
+    num_pairs: int,
+    num_kv: int,
+) -> TensorArg:
+    """Bind the host-built per-item tile bitmask words of the flex list walk
+    (``flex_item_words``): a flat int32 table of ``batch * heads * num_pairs``
+    rows of ``lists * words`` entries, row ``bh * num_pairs + pair``, lists
+    ``[partial, full]`` per 128-row stage (one stage for a 256-row BlockMask);
+    the device indexes it linearly.
+
+    Like the item order, the host expression runs inside the generated
+    launch on every call and is cached per BlockMask behind the tables'
+    version counters (rebuilt unconditionally under CUDA-graph capture).
+    """
+    assert len(walk_args) == 4
+    lists = 2 if q_block == 256 else 4
+    words = _flash_flex_mask_words(num_kv)
+    env = CompileEnvironment.current()
+    with env.fake_mode:
+        fake = torch.empty(
+            (batch * heads * num_pairs * lists * words,),
+            dtype=torch.int32,
+            device=env.device,
+        )
+    tables = ", ".join(arg.host_str() for arg in walk_args)
+    arg = TensorArg(
+        df.new_var("flash_flex_words"),
+        fake,
+        f"_helion_flash_flex_item_words({tables}, q_block={q_block}, "
         f"batch={batch}, heads={heads}, num_pairs={num_pairs}, num_kv={num_kv})",
     )
     df.arguments.append(arg)
@@ -14873,8 +15074,16 @@ def _flash_flex_setup(
     bindings: bool = True,
     kv_split: int = 1,
     descending: bool = True,
+    words_table: str | None = None,
+    words_pairs: int | None = None,
 ) -> str:
     """CTA-wide per-item setup of the BlockMask list walk (unindented lines).
+
+    ``words_table`` (``cute_flash_flex_item_words``): the per-item bitmask
+    words are loaded from the host-built table ``_flash_mFlexWords`` (row
+    ``flash_bh * words_pairs + flash_m_pair``, ``[partial, full]`` words per
+    stage) instead of being rebuilt from the counts and index lists; the
+    union, population and everything after are unchanged.
 
     Reads the four tables' rows of the pair (rows ``2p`` / ``2p + 1`` of a
     128-row BlockMask, row ``p`` of a 256-row one), builds one tile bitmask
@@ -14908,11 +15117,14 @@ def _flash_flex_setup(
             if bindings
             else []
         ),
-        f"_flash_mFlexPartCnt = {walk.part_cnt_name}",
-        f"_flash_mFlexPartIdx = {walk.part_idx_name}",
-        f"_flash_mFlexFullCnt = {walk.full_cnt_name}",
-        f"_flash_mFlexFullIdx = {walk.full_idx_name}",
     ]
+    if words_table is None:
+        lines += [
+            f"_flash_mFlexPartCnt = {walk.part_cnt_name}",
+            f"_flash_mFlexPartIdx = {walk.part_idx_name}",
+            f"_flash_mFlexFullCnt = {walk.full_cnt_name}",
+            f"_flash_mFlexFullIdx = {walk.full_idx_name}",
+        ]
     batch = num_bh // num_heads
     if walk.table_batch == 1:
         lines.append("flash_flex_b = cutlass.Int32(0)")
@@ -14943,7 +15155,27 @@ def _flash_flex_setup(
             ("0", "flash_m_tile0", True),
             ("1", "flash_m_tile1", table_rows % 2 == 0),
         ]
-    for stage, row_expr, always in rows:
+    if words_table is not None:
+        # One row of words per pair item: the stages' [partial, full] words.
+        assert words_pairs is not None
+        stride = 2 * len(rows) * words
+        lines.append(
+            f"flash_flex_wrow = (flash_bh * cutlass.Int32({words_pairs}) + flash_m_pair) "
+            f"* cutlass.Int32({stride})"
+        )
+        offset = 0
+        for stage, _row_expr, _always in rows:
+            for kind in ("p", "f"):
+                for word in range(words):
+                    lines.append(
+                        f"flash_flex_{kind}{stage}_{word} = cutlass.Int32("
+                        f"_flash_mFlexWords[flash_flex_wrow + cutlass.Int32({offset})])"
+                    )
+                    offset += 1
+        rows_to_build: list[tuple[str, str, bool]] = []
+    else:
+        rows_to_build = rows
+    for stage, row_expr, always in rows_to_build:
         lines.append(f"flash_flex_row{stage} = {row_expr}")
         if always:
             lines += [
@@ -15258,6 +15490,8 @@ def emit_flash_fa4_device_body(
     num_heads: int | None = None,
     flex_scalar_exprs: Sequence[str] = (),
     flex_item_table: str | None = None,
+    flex_words_table: str | None = None,
+    flex_words_pairs: int | None = None,
     kv_split: int | None = None,
     flex_split_arg: str | None = None,
 ) -> list[ast.stmt]:
@@ -16386,6 +16620,8 @@ flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
         if flex_persistent:
             assert flex_item_table is not None
             flex_bindings += f"\n_flash_mFlexItems = {flex_item_table}"
+        if flex_words_table is not None:
+            flex_bindings += f"\n_flash_mFlexWords = {flex_words_table}"
         if flex_kv_split > 1:
             # (The counters' view over the workspace tail is built in the
             # correction warps: a pointer built here lives across every role.)
@@ -16404,6 +16640,8 @@ flash_num_active_kv = flash_kv_last - flash_kv_first + cutlass.Int32(1)"""
                 bindings=False,
                 kv_split=flex_kv_split,
                 descending=causal_desc_kv,
+                words_table=flex_words_table,
+                words_pairs=flex_words_pairs,
             )
         else:
             # The trivial walk: every tile, no tables.
@@ -22361,6 +22599,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         dtype=io_dtype,
         num_bh=batch,
         is_causal=is_causal,
+        flex_trivial_walk=score_plan.is_flex and not score_plan.has_list_walk,
         has_kv_tile_pruning=score_plan.has_kv_tile_pruning,
         requires_ws_overlap=score_plan.requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
@@ -22699,24 +22938,42 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             wrapper_plan["row_kv_begin_work_rows"] = int(work_arg.fake_value.shape[0])
             df.placeholder_args.add(work_arg.name)
     flex_item_table: str | None = None
-    if score_plan.is_flex and cfg.persistent:
-        # The persistent list walk's host-sorted item order (a plain kernel
-        # param like the tables; the launcher passes it positionally).
+    flex_words_table: str | None = None
+    flex_words_pairs: int | None = None
+    flex_words_wanted = score_plan.has_list_walk and cfg.flex_item_words
+    if score_plan.has_list_walk and (cfg.persistent or flex_words_wanted):
+        # The persistent list walk's host-sorted item order and the per-item
+        # bitmask words (plain kernel params like the tables; the launcher
+        # passes them positionally).  The trivial walk (torch's empty
+        # BlockMask: one KV block over the sequence, ``kv_walk.trivial``)
+        # has no tables to read and runs the plain tile order.
         flex_walk = score_plan.kv_walk
         assert flex_walk is not None
         flex_heads = plan.tensor_4d_heads or batch
-        emit_flash_flex_item_module_statements(cg)
-        item_arg = _flash_flex_item_arg(
-            df,
-            plan.kv_walk_args,
-            q_block=flex_walk.q_block,
-            batch=batch // flex_heads,
-            heads=flex_heads,
-            num_pairs=total_tiles // batch,
-            num_kv=num_kv,
-        )
-        df.placeholder_args.add(item_arg.name)
-        flex_item_table = item_arg.name
+        if cfg.persistent:
+            emit_flash_flex_item_module_statements(cg)
+        if flex_words_wanted:
+            emit_flash_flex_words_module_statements(cg)
+        flex_table_geometry = {
+            "q_block": flex_walk.q_block,
+            "batch": batch // flex_heads,
+            "heads": flex_heads,
+            "num_pairs": total_tiles // batch,
+            "num_kv": num_kv,
+        }
+        if cfg.persistent:
+            item_arg = _flash_flex_item_arg(
+                df, plan.kv_walk_args, **flex_table_geometry
+            )
+            df.placeholder_args.add(item_arg.name)
+            flex_item_table = item_arg.name
+        if flex_words_wanted:
+            words_arg = _flash_flex_words_arg(
+                df, plan.kv_walk_args, **flex_table_geometry
+            )
+            df.placeholder_args.add(words_arg.name)
+            flex_words_table = words_arg.name
+            flex_words_pairs = total_tiles // batch
     # The split-KV walk (``cute_flash_kv_split``): the grid takes ``splits``
     # CTAs per pair item and the correction warps merge the partials through
     # the workspace. Declined (an unsplit render, the strategy stays in the
@@ -22911,6 +23168,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 ),
                 flex_scalar_exprs=plan.flex_scalar_exprs,
                 flex_item_table=flex_item_table,
+                flex_words_table=flex_words_table,
+                flex_words_pairs=flex_words_pairs,
                 kv_split=kv_split,
                 flex_split_arg=flex_split_arg,
             )

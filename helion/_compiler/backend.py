@@ -98,6 +98,7 @@ class FlashSearchSurface(NamedTuple):
     has_list_walk: bool = False
     flex_has_score_region: bool = False
     flex_has_mask_region: bool = False
+    flex_trivial_walk: bool = False
     q_seq: int | None = None
     kv_seq: int | None = None
     # Padded sizes of the flex hook's shared-memory aux staging candidates
@@ -3667,6 +3668,7 @@ def flex_search_surface(
         has_list_walk=plan.has_list_walk,
         flex_has_score_region=plan.flex_has_score_region,
         flex_has_mask_region=plan.flex_has_mask_region,
+        flex_trivial_walk=not plan.has_list_walk,
         q_seq=match.q_seq,
         kv_seq=match.kv_seq,
         flex_aux_smem_candidates=flex_aux_smem_candidates(plan),
