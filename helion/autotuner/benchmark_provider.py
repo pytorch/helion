@@ -48,6 +48,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import release_private_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import capture_output
@@ -470,6 +471,11 @@ class BenchmarkResult(NamedTuple):
     # Per-result evidence survives later measurements of normalized aliases.
     per_shape: tuple[float, ...] = ()
     per_shape_statuses: tuple[str, ...] = ()
+
+
+# Private per-finalist argument copies are only taken when they leave most of
+# the device memory untouched (the worker holds the originals as well).
+_PRIVATE_ARGUMENT_COPIES_MEMORY_FRACTION = 0.5
 
 
 class IsolatedBenchmarkFailure(NamedTuple):
@@ -2150,6 +2156,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         warmup: int,
         rep: int,
         fixed_repetitions: int | None = None,
+        args_slot: int | None = None,
+        timeout: float | None = None,
     ) -> float | None:
         if self._precompile_args_path is None or self._subprocess_wrapper_unloadable:
             return None
@@ -2169,14 +2177,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
             probe_long_kernel=self._probe_long_kernel(),
             fixed_repetitions=fixed_repetitions,
+            args_slot=args_slot,
         )
+        if timeout is None:
+            timeout = float(self.settings.autotune_benchmark_timeout)
         try:
-            return float(
-                self._benchmark_worker.run(
-                    job,
-                    timeout=float(self.settings.autotune_benchmark_timeout),
-                )
-            )
+            return float(self._benchmark_worker.run(job, timeout=timeout))
         except CompiledFunctionLoadError as error:
             self._disable_unloadable_benchmark_worker(error)
             return None
@@ -2198,6 +2204,68 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             f"falling back in-process: {error}"
         )
 
+    def steady_window_benchmark_available(self) -> bool:
+        """Whether finalists can be timed in the killable benchmark worker."""
+        return (
+            self._subprocess_benchmark_enabled()
+            and self.settings.autotune_benchmark_fn is None
+        )
+
+    def private_argument_copies_affordable(self, count: int) -> bool:
+        """Whether ``count`` private copies of the kernel arguments fit on the
+        device next to the originals (CUDA tensors only; other devices share)."""
+        tensors = [
+            leaf
+            for leaf in tree_flatten(self.args)[0]
+            if isinstance(leaf, torch.Tensor) and leaf.device.type != "cpu"
+        ]
+        if not tensors:
+            return True
+        if not all(tensor.is_cuda for tensor in tensors):
+            return False
+        total_bytes = 0
+        seen_storages: set[int] = set()
+        for tensor in tensors:
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() in seen_storages:
+                continue
+            seen_storages.add(storage.data_ptr())
+            total_bytes += storage.nbytes()
+        free_bytes, _total = torch.cuda.mem_get_info(tensors[0].device)
+        return (
+            count * total_bytes <= _PRIVATE_ARGUMENT_COPIES_MEMORY_FRACTION * free_bytes
+        )
+
+    def release_private_argument_copies(self) -> None:
+        """Free the finalists' private argument copies held by the worker.
+
+        Best-effort: the selection that used the copies is complete, so a
+        release that fails is logged and left for the worker's next job. A
+        worker that times out or dies on the release is killed (the copies
+        die with it) and respawns on that job; a job that raises in the
+        worker (a sticky CUDA error from a finalist's kernel, surfaced by
+        the cache release as a ``RuntimeError``) has dropped the copies
+        from the cache before the error, and ``BenchmarkWorker.run`` kills
+        the worker when the error is unrecoverable. Only those two kinds
+        are logged (the ``BenchmarkSubprocessError`` family and
+        ``RuntimeError``); a worker that survived its kill still raises
+        ``BenchmarkWorkerUnkillable`` and any other error propagates.
+        """
+        if self._benchmark_worker is None or not self._benchmark_worker.alive():
+            return
+        try:
+            self._benchmark_worker.run(
+                release_private_kernel_args,
+                timeout=float(self.settings.autotune_benchmark_timeout),
+            )
+        except BenchmarkWorkerUnkillable:
+            raise
+        except (RuntimeError, BenchmarkSubprocessError) as error:
+            self.log.warning(
+                "Releasing the final selection's private argument copies failed; "
+                f"the benchmark worker's next job proceeds without them: {error!r}"
+            )
+
     def benchmark_isolated(
         self,
         fns: list[Callable[..., object]],
@@ -2206,14 +2274,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         rep: int,
         desc: str = "Benchmarking",
         fresh_process: bool = False,
+        args_slots: Sequence[int | None] | None = None,
+        timeout: float | None = None,
     ) -> list[IsolatedBenchmarkTiming] | None:
         if not self._subprocess_benchmark_enabled():
             return None
         if self.settings.autotune_benchmark_fn is not None:
             return None
+        if args_slots is None:
+            args_slots = [None] * len(fns)
 
         timings: list[IsolatedBenchmarkTiming] = []
-        for index, fn in enumerate(fns):
+        for index, (fn, args_slot) in enumerate(zip(fns, args_slots, strict=True)):
             if fresh_process and self._benchmark_worker is not None:
                 self._shutdown_isolated_worker(index - 1 if index else None)
             try:
@@ -2222,6 +2294,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         cast("CompiledConfig", fn),
                         warmup=warmup,
                         rep=rep,
+                        args_slot=args_slot,
+                        timeout=timeout,
                     )
                 except BenchmarkWorkerUnkillable as error:
                     # the worker that could not be reaped ran this candidate

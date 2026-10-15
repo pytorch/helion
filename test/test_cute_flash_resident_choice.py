@@ -255,7 +255,13 @@ def test_auto_preserves_existing_resident_lowerings(
     assert marker not in standard
 
 
-def _spec(head_dim: int, num_kv: int, dtype: torch.dtype = torch.float16) -> ConfigSpec:
+def _spec(
+    head_dim: int,
+    num_kv: int,
+    dtype: torch.dtype = torch.float16,
+    *,
+    fast_math: bool = False,
+) -> ConfigSpec:
     spec = ConfigSpec(
         backend=CuteBackend(),
         target_device_capability=(10, 3),
@@ -270,6 +276,7 @@ def _spec(head_dim: int, num_kv: int, dtype: torch.dtype = torch.float16) -> Con
         dtype=dtype,
         block_size_targets={0: 1, 1: 128, 2: 128},
         standard_dense_output=True,
+        fast_math=fast_math,
     )
     return spec
 

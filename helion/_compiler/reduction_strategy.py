@@ -366,6 +366,22 @@ class ReductionStrategy(TileStrategy):
         """Return threads used for this reduction on thread-aware backends."""
         return 0
 
+    def use_shared_thread_extent(self, extent: int) -> None:
+        """Spread the reduction over ``extent`` threads of its launch axis.
+
+        See ``TileStrategyDispatch._normalize_shared_reduction_thread_extents``.
+        """
+        raise self._shared_thread_extent_error(extent)
+
+    def _shared_thread_extent_error(self, extent: int) -> exc.BackendUnsupported:
+        return exc.BackendUnsupported(
+            CompileEnvironment.current().backend_name,
+            f"reduction block {self.block_index} spans "
+            f"{self._reduction_thread_count()} lanes but its launch axis has "
+            f"{extent} threads; the surplus lanes would corrupt the cross-lane "
+            "reduction",
+        )
+
     def _claims_thread_axis(self) -> bool:
         """Whether this reduction owns a launch thread axis.
 
@@ -1162,7 +1178,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         from .device_ir import ReductionLoopGraphInfo
 
         env = CompileEnvironment.current()
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
         if isinstance(numel, (int, sympy.Integer)):
             size_hint = int(numel)
         elif isinstance(numel, sympy.Expr):
@@ -1342,6 +1358,20 @@ class PersistentReductionStrategy(ReductionStrategy):
                 lane_extent = env.backend.create_synthetic_reduction_lanes(
                     self._thread_count, size_hint
                 )
+                if (
+                    env.backend.name == "cute"
+                    and lane_extent is not None
+                    and self._thread_count * lane_extent
+                    != next_power_of_2(max(1, size_hint))
+                ):
+                    # Uneven synthetic slices would let an unmasked vector or
+                    # register row access beyond its padded reduction extent.
+                    # Keep a power-of-two live count within the thread budget
+                    # so every slice fits, then plan the layout from that count.
+                    self._thread_count = 1 << (self._thread_count.bit_length() - 1)
+                    lane_extent = env.backend.create_synthetic_reduction_lanes(
+                        self._thread_count, size_hint
+                    )
                 # A merged tiled axis can still contain a serial source lane
                 # when its configured total extent fits in one warp. Keep an
                 # explicit logical owner for the reduction; after wrapping,
@@ -1456,6 +1486,21 @@ class PersistentReductionStrategy(ReductionStrategy):
     def _reduction_thread_count(self) -> int:
         return self._thread_count
 
+    def use_shared_thread_extent(self, extent: int) -> None:
+        if self._synthetic_cute_lane_var is not None or (
+            extent > _CUTE_WARP_REDUCTION_THREADS
+            and _block_has_indexed_reduction(self.fn, self.block_index)
+        ):
+            # The lane loop strides by the thread count, so the surplus
+            # threads would alias the elements of later lanes; argmin/argmax
+            # combine within one warp only (see ``__init__``).
+            raise self._shared_thread_extent_error(extent)
+        # One thread per element: the extent mask also drops the surplus
+        # threads, which then hold the identity through the widened combine.
+        self._thread_count = extent
+        if self._mask_var is None:
+            self._mask_var = self.fn.new_var(f"mask_{self.block_index}", dce=True)
+
     def cute_tile_base_expr(self, block_id: int) -> str | None:
         """The persistent axis covers its whole extent: the tile base is 0."""
         if block_id != self.block_index:
@@ -1531,7 +1576,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         backend = env.backend
         block_idx = self.block_index
-        numel = env.block_sizes[block_idx].numel
+        numel = env.specialize_expr(env.block_sizes[block_idx].numel)
         index_var = self.index_var(block_idx)
         mask_var = self._mask_var
         block_size_var = self.block_size_var(self.block_index)
@@ -2048,6 +2093,21 @@ class PersistentReductionStrategy(ReductionStrategy):
             return expr_from_string(
                 backend.full_expr(shape_dims, constant_repr(default), fake_output.dtype)
             )
+        if backend.name == "cute" and backend.is_indexed_reduction(reduction_type):
+            from .cute.argreduce import codegen_packed_reduction
+
+            packed = codegen_packed_reduction(
+                state,
+                self,
+                None,
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                fake_output,
+            )
+            if packed is not None:
+                return packed
         acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
@@ -2304,9 +2364,8 @@ class LoopedReductionStrategy(ReductionStrategy):
                     self._cute_reduction_lane_extent = (
                         self._cute_reduction_lane_extent // vec_width
                     )
-        if env.known_multiple(
-            env.block_sizes[block_index].numel, self._loop_block_size
-        ):
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if env.known_multiple(numel, self._loop_block_size):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
@@ -2345,6 +2404,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         # cluster; decided lazily at the first ``codegen_device_loop`` (see
         # ``_maybe_apply_cute_rolled_cluster``).
         self._cute_rolled_cluster_n = 1
+        self._cute_rolled_cluster_slice_len = 0
         self._cute_rolled_cluster_checked = False
 
     def _maybe_apply_cute_rolled_cluster(self, state: CodegenState) -> None:
@@ -2385,11 +2445,6 @@ class LoopedReductionStrategy(ReductionStrategy):
             or _block_has_indexed_reduction(self.fn, self.block_index)
         ):
             return
-        # A masked roll cannot be cluster-split: the mask compares against
-        # the full extent, so a partial trailing chunk would read into the
-        # next rank's slice and double-count it.
-        if self._mask_var is not None:
-            return
         # Statements outside the roll loop execute once per cluster CTA —
         # benign for plain (idempotent) stores, but a read-modify-write
         # would repeat ``cluster_n`` times.
@@ -2404,16 +2459,34 @@ class LoopedReductionStrategy(ReductionStrategy):
             size > 1 for size in grid_axis_sizes.values()
         ):
             return
-        numel = env.block_sizes[self.block_index].numel
-        try:
-            numel_int = int(numel)
-        except (TypeError, ValueError):
+        numel = env.specialize_expr(env.block_sizes[self.block_index].numel)
+        # Static tails can be padded to whole chunks per CTA. Each rank owns
+        # a disjoint contiguous padded slice, and the original extent still
+        # masks the loads and reduction inputs. Dynamic extents retain the
+        # exact input-metadata guard used by the unmasked cluster schedule.
+        static_numel = isinstance(numel, sympy.Integer)
+        if not static_numel and not env.specialized_multiple(
+            numel, cl * self._loop_block_size
+        ):
             return
-        # Each CTA must roll whole chunks of its own contiguous slice.
-        if numel_int % (cl * self._loop_block_size) != 0:
+        numel_int = shape_env_size_hint(env.shape_env, numel)
+        if numel_int <= 0:
             return
+        slice_len = (
+            -(-numel_int // (cl * self._loop_block_size)) * self._loop_block_size
+            if static_numel
+            else numel_int // cl
+        )
         self._cute_rolled_cluster_n = cl
+        self._cute_rolled_cluster_slice_len = slice_len
         self.fn.cute_state.simt_cluster_n = cl
+        if slice_len * cl == numel_int:
+            self._mask_var = None
+        elif self._mask_var is None:
+            self._mask_var = self.fn.new_var(f"mask_{self.block_index}", dce=True)
+            self._cute_reduction_chunk_uniform_mask = env.known_multiple(
+                numel, self._cute_reduction_vec_width
+            )
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -2813,7 +2886,11 @@ class LoopedReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         self._maybe_apply_cute_rolled_cluster(state)
         block_index = self.block_index
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if self._cute_rolled_cluster_n > 1:
+            # Only the successfully claimed cluster needs a concrete extent.
+            # The coverage proof used this exact metadata-guarded bound value.
+            numel = sympy.Integer(shape_env_size_hint(env.shape_env, numel))
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
         block_size_var = self.block_size_var(block_index)
@@ -2993,7 +3070,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             # own contiguous slice (the launch adds a grid dim of
             # ``cluster_n`` CTAs per outer index); the finalize combines
             # the partials across the cluster.
-            slice_len = int(numel) // self._cute_rolled_cluster_n
+            slice_len = self._cute_rolled_cluster_slice_len
             rank_expr = env.backend.program_id_expr(1, index_dtype="cutlass.Int32")
             range_begin = f"{rank_expr} * {slice_len}"
             range_end = f"{rank_expr} * {slice_len} + {slice_len}"
@@ -3064,6 +3141,21 @@ class LoopedReductionStrategy(ReductionStrategy):
             backend = env.backend
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
             assert isinstance(device_loop, DeviceLoopState)
+            if backend.name == "cute" and backend.is_indexed_reduction(reduction_type):
+                from .cute.argreduce import codegen_packed_reduction
+
+                packed = codegen_packed_reduction(
+                    state,
+                    self,
+                    device_loop,
+                    input_name,
+                    reduction_type,
+                    dim,
+                    fake_input,
+                    fake_output,
+                )
+                if packed is not None:
+                    return packed
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
             acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)

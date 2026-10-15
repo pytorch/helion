@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -11,11 +12,14 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from test._cute_binding import _mock_cuda_unavailable
 from test._cute_binding import _require_cute_codegen
 from test.test_cute_materialized_fission import _HostModules
 from test.test_cute_materialized_fission import _sources
 
 import helion
+from helion import _compat
+from helion import _hardware
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -134,9 +138,15 @@ def test_later_root_reduction_host_dependencies(
         if backend == "cute" and kind == "multi"
         else "persistent_blocked",
     )
+    cached_capabilities: tuple[Any, ...] = (
+        _compat._supports_tensor_descriptor,
+        _compat._supports_maxnreg,
+        _hardware.get_hardware_info,
+    )
+    cache_info_before = [function.cache_info() for function in cached_capabilities]
     with ExitStack() as stack:
         stack.enter_context(patch("torch.cuda.current_device", return_value=0))
-        stack.enter_context(patch("torch.cuda.is_available", return_value=False))
+        stack.enter_context(_mock_cuda_unavailable())
         stack.enter_context(
             patch(
                 "torch.cuda._lazy_init", side_effect=AssertionError("unexpected CUDA")
@@ -162,6 +172,17 @@ def test_later_root_reduction_host_dependencies(
         stack.enter_context(patch("helion._compat._is_hip", return_value=False))
         stack.enter_context(patch("helion.runtime.get_num_sm", return_value=148))
         stack.enter_context(
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=_hardware.HardwareInfo(
+                    device_kind="cuda",
+                    hardware_name="NVIDIA GB300",
+                    runtime_version="13.0",
+                    compute_capability="sm103",
+                ),
+            )
+        )
+        stack.enter_context(
             patch("helion.autotuner.config_spec.num_compute_units", return_value=148)
         )
         mode = FakeTensorMode()
@@ -172,6 +193,9 @@ def test_later_root_reduction_host_dependencies(
         result = _host_result(code, function.__name__, torch.empty(65))
         assert result.shape == ((5,) if kind == "gather" else (65,))
         assert result.device.type == "cpu"
+    assert [
+        function.cache_info() for function in cached_capabilities
+    ] == cache_info_before
 
 
 @skipIfRefEager("requires compiler IR and explicit configurations")

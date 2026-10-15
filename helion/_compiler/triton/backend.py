@@ -18,6 +18,7 @@ import torch
 from ... import _compat
 from ... import exc
 from ..backend import Backend
+from ..backend import BackendState
 from ..backend import LauncherInfo
 from ..backend import log
 
@@ -61,8 +62,8 @@ class TritonBackend(Backend):
         return "triton"
 
     @property
-    def experimental(self) -> bool:
-        return False
+    def state(self) -> BackendState:
+        return BackendState.STABLE
 
     @property
     def supports_debug_dtype_asserts(self) -> bool:

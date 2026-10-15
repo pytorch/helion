@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from torch._inductor.utils import triton_type
 
 from ... import exc
 from ...language import _decorators
@@ -175,13 +176,66 @@ def _(state: CodegenState) -> ast.AST:
     device_fn.atomic_op_index += 1
     _sync_before_release(state)
 
-    indices = SubscriptIndexing.create(state, target, index)
+    indices = SubscriptIndexing.create(state, target, index, for_store=True)
     name = state.device_function.tensor_arg(target).name
+    output_size = SubscriptIndexing.compute_shape(target, index, state)
+    if indices.has_mask():
+        # Triton's CAS takes no mask: a masked-off lane instead swaps an
+        # element for its own expected value, a no-op.  Each index past its
+        # dim wraps around (clamped in case it is past twice), which keeps
+        # such lanes in bounds without piling them onto a few addresses.
+        fn = state.device_function
+        terms = []
+        for i, index in enumerate(indices.dim_index_exprs):
+            if CompileEnvironment.current().known_equal(target.size(i), 1):
+                continue
+            size = fn.tensor_size(target, i).name
+            stride = fn.tensor_stride(target, i).name
+            terms.append(
+                f"tl.minimum(tl.where({index} < {size}, {index}, {index} - {size}),"
+                f" {size} - 1) * {stride}"
+            )
+        if terms:
+            indices = indices._replace(index_expr=expr_from_string(" + ".join(terms)))
+    offset = indices.broadcast_offset(state, output_size)
 
     exp_ast, val_ast = _to_ast_values([exp_expr, val_expr])
+    # Triton's CAS neither broadcasts nor converts cmp and val to the
+    # pointer's block and element type (a value computed in float32 for a
+    # float16 target is not converted either), so make them match.
+    dtype = triton_type(target.dtype)
+    shape = state.tile_strategy.shape_str(output_size)
+
+    def as_operand(proxy: object, value: ast.AST) -> ast.AST:
+        if not output_size:
+            # A literal Triton already types like the target needs no cast
+            if (
+                isinstance(proxy, int)
+                and not isinstance(proxy, bool)
+                and target.dtype == torch.int32
+                and -(2**31) <= proxy < 2**31
+            ) or (isinstance(proxy, float) and target.dtype == torch.float32):
+                return value
+            return expr_from_string(f"tl.cast({{value}}, {dtype})", value=value)
+        rank = proxy.ndim if isinstance(proxy, torch.Tensor) else 0
+        if 0 < rank < len(output_size):
+            # Broadcasting aligns trailing dims
+            dims = ["None"] * (len(output_size) - rank) + [":"] * rank
+            value = expr_from_string(f"{{value}}[{', '.join(dims)}]", value=value)
+        return expr_from_string(
+            f"tl.broadcast_to(tl.cast({{value}}, {dtype}), {shape})", value=value
+        )
+
+    exp_ast = as_operand(state.proxy_arg(2), exp_ast)
+    val_ast = as_operand(state.proxy_arg(3), val_ast)
+    if indices.has_mask():
+        mask = state.codegen.lift(indices.mask_expr, dce=True, prefix="cas_mask").id
+        exp = state.codegen.lift(exp_ast, dce=True, prefix="cas_exp").id
+        exp_ast = expr_from_string(exp)
+        val_ast = expr_from_string(f"tl.where({mask}, {{val}}, {exp})", val=val_ast)
     atomic = expr_from_string(
         f"tl.atomic_cas({name} + {{offset}}, {{exp}}, {{val}}, sem={{sem}})",
-        offset=indices.index_expr,
+        offset=offset,
         exp=exp_ast,
         val=val_ast,
         sem=sem,

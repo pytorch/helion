@@ -27,6 +27,7 @@ the body does.
 from __future__ import annotations
 
 import math
+import os
 import re
 from unittest.mock import patch
 
@@ -394,16 +395,25 @@ class TestCuteSingleThreadReduction(TestCase):
 
     @skipIfNotCUDA()
     def test_attention_with_narrower_value_head_dim_matches_sdpa(self) -> None:
-        """The generic SIMT path (the flash plan declines a value head dim
-        that differs from the q/k head dim) with the two single-thread mask
-        dims sharing no launch axis."""
+        """The (192, 128) head-dim pair runs on the fused flash path by default
+        and on the generic SIMT path with the fused lowering switched off
+        (``HELION_CUTE_FLASH=0``); both match SDPA, and the generic path keeps
+        its two single-thread mask dims off the launch axes."""
         q, k, v = _attention_inputs(DEVICE, 192, 192, 128)
-        code, out = code_and_output(
-            _attention_mla, (q, k, v), block_sizes=[1, 128, 128]
-        )
         expected = torch.nn.functional.scaled_dot_product_attention(
             q.float(), k.float(), v.float(), is_causal=True
         )
+        code, out = code_and_output(
+            _attention_mla, (q, k, v), block_sizes=[1, 128, 128]
+        )
+        self.assertIn("_helion_flash_rt", code)
+        torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+        with patch.dict(os.environ, {"HELION_CUTE_FLASH": "0"}):
+            _attention_mla.reset()
+            code, out = code_and_output(
+                _attention_mla, (q, k, v), block_sizes=[1, 128, 128]
+            )
+        self.assertNotIn("_helion_flash_rt", code)
         torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
         self.assertIn("block=(256, 4, 1)", code)
         self.assertNotIn("thread_idx()[3]", code)

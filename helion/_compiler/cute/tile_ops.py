@@ -50,7 +50,7 @@ def cute_tile_begin_expr(codegen: GenerateAST, index: int) -> str:
         # tile boundary from creating false lane-index dependencies in siblings.
         return strategy.offset_var(index)
     if isinstance(strategy, PerThreadFlattenedTileStrategy):
-        # The flattened per-thread tile records ``pid * BLOCK``; its
+        # The flattened per-thread tile records ``begin + pid * BLOCK``; its
         # thread-local coordinate is ``thread * elements_per_thread + lane``,
         # so ``index - thread_idx`` (the generic path below) is only the tile
         # base when each thread owns one element.
@@ -70,7 +70,7 @@ def cute_tile_begin_expr(codegen: GenerateAST, index: int) -> str:
         thread_axis = grid_state.block_thread_axes.get(index)
     if thread_axis is None:
         # No thread axis owns this block: the strategy knows its tile base
-        # (the loop offset, or ``pid * BLOCK`` for the flattened per-thread
+        # (the loop offset, or ``begin + pid * BLOCK`` for the flattened per-thread
         # tile whose offset is already the per-element index).
         if strategy is not None:
             return strategy.tile_begin_var(index)
@@ -111,8 +111,6 @@ def cute_masked_block_end(codegen: GenerateAST, block_id: int, what: str) -> str
             "cute", f"{what} along a masked dim without a logical tile owner"
         )
     if isinstance(owner, DeviceGridState):
-        # A root grid's ``end_expr`` is its extent past ``begin``; the index
-        # runs up to the absolute end.
         if info.grid_end_expr is None:
             raise exc.BackendUnsupported(
                 "cute", f"{what} along a grid dim without a logical tile end"
