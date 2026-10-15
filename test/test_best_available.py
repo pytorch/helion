@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -13,6 +14,8 @@ from unittest.mock import patch
 
 import torch
 
+from helion._compiler.backend import Backend
+from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TileIRBackend
 from helion._compiler.backend import TritonBackend
 from helion._testing import DEVICE
@@ -31,6 +34,7 @@ from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import RangeUnrollFactorSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import SavedBestConfig
 from helion.autotuner.local_cache import iter_cache_entries
@@ -1621,9 +1625,11 @@ class TestHardwareDetection(unittest.TestCase):
 class TestGenerateBestAvailablePopulation(unittest.TestCase):
     """Tests for _generate_best_available_population_flat orchestration."""
 
-    def _make_config_gen(self):
+    def _make_config_gen(self, backend: Backend | None = None) -> ConfigGeneration:
         """Create a ConfigGeneration with a simple 2-block spec."""
-        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec = ConfigSpec(
+            backend=backend or TritonBackend(), target_device_capability=None
+        )
         config_spec.block_sizes.append(
             BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
         )
@@ -1825,6 +1831,225 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         normalized_seed = config_gen.unflatten(config_gen.flatten(seed))
         self.assertEqual(config_gen.unflatten(result[0]), normalized_seed)
         self.assertEqual(result[1], config_gen.default_flat())
+
+    def test_de_padding_preserves_best_available_seeds_and_cached_configs(self):
+        generation = self._make_config_gen(CuteBackend())
+        seeds = [Config(block_sizes=[size, 64]) for size in (16, 32, 64, 128, 256)]
+        generation.config_spec.compiler_seed_configs = seeds
+        source = self._make_mock_search(generation, cached_configs=[seeds[-1]])
+        source._autotune_seed_configs.return_value = seeds[:2]
+        search = self._make_de_search(source)
+        search._best_available_seed_configs = [seeds[-2]]
+        search.population_size = 2
+        search.best_available_pad_random = False
+        expected = search._generate_initial_population_flat()
+        search.best_available_pad_random = True
+        with patch.object(generation, "random_flat") as random_flat:
+            actual = search._generate_initial_population_flat()
+        self.assertGreater(len(expected), search.population_size * 2)
+        self.assertEqual(actual, expected)
+        configs = [generation.unflatten(row) for row in actual]
+        self.assertIn(generation.unflatten(generation.default_flat()), configs)
+        for seed in (*seeds[:2], *seeds[-2:]):
+            self.assertIn(self._normalize(generation, seed), configs)
+        random_flat.assert_not_called()
+
+    def test_compiler_seed_limit_counts_unique_rows(self):
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                generation = self._make_config_gen(CuteBackend())
+                default = generation.unflatten(generation.default_flat())
+                grid = self._seed_grid()
+                seeds = [
+                    config
+                    for config in grid
+                    if self._normalize(generation, config) != default
+                ]
+                # Duplicate seeds and a seed aliasing the default take no rows.
+                generation.config_spec.compiler_seed_configs = [
+                    seeds[0],
+                    seeds[0],
+                    default,
+                    *seeds[1:],
+                ]
+                search = self._make_mock_search(generation, cached_configs=[])
+                search._autotune_seed_configs.return_value = (
+                    seeds[:1] if explicit else []
+                )
+                rows = self._populate(search, compiler_seed_limit=4)
+                configs = [generation.unflatten(row) for row in rows]
+                self.assertEqual(len(configs), 4)
+                self.assertEqual(len(set(configs)), 4)
+                self.assertIn(default, configs)
+                search.log.assert_any_call(
+                    "Compiler seed budget of 4 rows (explicit seeds, compiler "
+                    "seeds, default) did not admit 21 of 25 compiler seed configs"
+                )
+
+    def test_compiler_seed_limit_fills_budget_with_default(self):
+        for backend, explicit_count in itertools.product(
+            (TritonBackend, CuteBackend), (0, 1, 4)
+        ):
+            with self.subTest(backend=backend.__name__, explicit=explicit_count):
+                generation = self._make_config_gen(backend())
+                spec = generation.config_spec
+                # The grid includes the fragment default, [32, 32].
+                spec.compiler_seed_configs = self._seed_grid()
+                search = self._make_mock_search(generation, cached_configs=[])
+                explicit = spec.compiler_seed_configs[:explicit_count]
+                search._autotune_seed_configs.return_value = explicit
+                rows = self._populate(search, compiler_seed_limit=4)
+                configs = [generation.unflatten(row) for row in rows]
+                self.assertEqual(len(configs), max(4, explicit_count + 2))
+                self.assertEqual(len(configs), len(set(configs)))
+                default = generation.unflatten(generation.default_flat())
+                self.assertIn(default, configs)
+                # The admitted compiler seeds are the list-order prefix.
+                normalized = [
+                    self._normalize(generation, config)
+                    for config in spec.compiler_seed_configs
+                ]
+                admitted = [config for config in configs if config != default]
+                self.assertEqual(
+                    admitted, [c for c in normalized if c != default][: len(admitted)]
+                )
+                self.assertEqual(
+                    configs[:explicit_count],
+                    [self._normalize(generation, config) for config in explicit],
+                )
+
+    def test_compiler_seed_limit_keeps_protected_seeds(self):
+        generation = self._make_config_gen(CuteBackend())
+        spec = generation.config_spec
+        spec.compiler_seed_configs = self._seed_grid()
+        promoted, backend_seed = spec.compiler_seed_configs[-2:]
+        spec.compiler_default_config = promoted
+        search = self._make_mock_search(generation, cached_configs=[])
+        with patch.object(spec, "autotune_seed_configs", return_value=[backend_seed]):
+            rows = self._populate(search, compiler_seed_limit=4)
+        configs = [generation.unflatten(row) for row in rows]
+        self.assertEqual(len(configs), 4)
+        for config in (promoted, backend_seed):
+            self.assertIn(self._normalize(generation, config), configs)
+        self.assertIn(generation.unflatten(generation.default_flat()), configs)
+
+    def test_compiler_seed_limit_admits_protected_seeds_past_limit(self):
+        generation = self._make_config_gen(CuteBackend())
+        spec = generation.config_spec
+        promoted, *spec.compiler_seed_configs = self._seed_grid()
+        backend_seeds = spec.compiler_seed_configs[-5:]
+        # A promoted default outside the seed list reserves nothing.
+        spec.compiler_default_config = promoted
+        search = self._make_mock_search(generation, cached_configs=[])
+        with patch.object(spec, "autotune_seed_configs", return_value=backend_seeds):
+            rows = self._populate(search, compiler_seed_limit=2)
+        configs = [generation.unflatten(row) for row in rows]
+        self.assertEqual(len(configs), len(backend_seeds) + 1)
+        self.assertEqual(
+            set(configs),
+            {
+                *(self._normalize(generation, s) for s in backend_seeds),
+                generation.unflatten(generation.default_flat()),
+            },
+        )
+
+    def test_compiler_seed_limit_does_not_cap_flash(self):
+        with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
+            spec = ConfigSpec(
+                backend=CuteBackend(), target_device_capability=(10, 0), num_sm=148
+            )
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=512,
+            num_bh=96,
+            dtype=torch.float16,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            standard_dense_output=True,
+        )
+        spec.compiler_seed_configs = spec.autotune_seed_configs()
+        self.assertGreater(len(spec.compiler_seed_configs), 2)
+        search = self._make_mock_search(ConfigGeneration(spec), cached_configs=[])
+        # Unprotect the flash seeds so only the flash exemption keeps them.
+        with patch.object(spec, "autotune_seed_configs", return_value=[]):
+            self.assertEqual(
+                self._populate(search, compiler_seed_limit=2),
+                self._populate(search),
+            )
+
+    def test_de_pads_short_capped_population_to_target(self):
+        generation = self._make_config_gen(CuteBackend())
+        generation.config_spec.compiler_seed_configs = [Config(block_sizes=[16, 64])]
+        source = self._make_mock_search(generation, cached_configs=[])
+        search = self._make_de_search(source)
+        search.population_size = 4
+        search.best_available_pad_random = True
+        with patch.object(
+            generation, "random_flat", return_value=generation.default_flat()
+        ):
+            self.assertEqual(len(search._generate_initial_population_flat()), 8)
+
+    def test_de_slices_padded_flash_population_to_target(self):
+        generation = self._make_config_gen(CuteBackend())
+        source = self._make_mock_search(generation, cached_configs=[])
+        search = self._make_de_search(source)
+        search.population_size = 2
+        search.best_available_pad_random = True
+        rows = [[16, 64], [32, 64], [64, 64], [128, 64], [256, 64]]
+        with (
+            patch.object(search.config_spec, "cute_flash_search_enabled", True),
+            patch.object(
+                search, "_generate_best_available_population_flat", return_value=rows
+            ),
+        ):
+            self.assertEqual(search._generate_initial_population_flat(), rows[:4])
+
+    def test_invalid_best_available_seed_is_logged_and_skipped(self):
+        generation = self._make_config_gen(CuteBackend())
+        search = self._make_mock_search(generation, cached_configs=[])
+        search._best_available_seed_configs = [Config(block_sizes=[16, 64])]
+        with patch.object(generation, "flatten", side_effect=InvalidConfig("bad seed")):
+            rows = self._populate(search)
+        self.assertEqual(rows, [generation.default_flat()])
+        search.log.assert_any_call(
+            "Failed to transfer autotune seed config 1: bad seed"
+        )
+
+    @staticmethod
+    def _seed_grid() -> list[Config]:
+        """25 distinct two-block seed configs, including the default [32, 32]."""
+        sizes = (16, 32, 64, 128, 256)
+        return [
+            Config(block_sizes=list(pair))
+            for pair in itertools.product(sizes, repeat=2)
+        ]
+
+    @staticmethod
+    def _populate(search: MagicMock, **kwargs: int) -> list[list[object]]:
+        return PopulationBasedSearch._generate_best_available_population_flat(
+            search, **kwargs
+        )
+
+    @staticmethod
+    def _normalize(generation: ConfigGeneration, config: Config) -> Config:
+        return generation.unflatten(generation.flatten(config))
+
+    def _make_de_search(self, source: MagicMock) -> DifferentialEvolutionSearch:
+        """A FROM_BEST_AVAILABLE DE search backed by a _make_mock_search source."""
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search.config_spec = source.config_gen.config_spec
+        search.config_gen = source.config_gen
+        search.settings = source.settings
+        search.log = source.log
+        search._autotune_seed_configs = source._autotune_seed_configs
+        search._find_similar_cached_configs = source._find_similar_cached_configs
+        search._pinned_finalist_configs = set()
+        search._best_available_seed_configs = []
+        search.initial_population_strategy = (
+            InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        )
+        return search
 
     def test_duplicate_configs_deduplicated(self):
         """Duplicate cached configs are discarded."""
