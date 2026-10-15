@@ -1105,6 +1105,27 @@ class TestCrossLoopCodegenHelpers(TestCase):
         rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
         self.assertFalse(_dry_pass_binds(rewritten, guards, set()))
 
+    def test_dry_pass_runs_helion_reduction_helpers(self) -> None:
+        # max/min reductions lower to Helion's NaN-propagating helpers; they only
+        # compute, so a root that reduces still gets its warm-up pass.
+        body = ast.parse(
+            "amax = helion_triton_helpers.max_propagate_nan(value, 0)\n"
+            "amin = helion_triton_helpers.min_propagate_nan(value, 0)\n"
+            "tl.store(out, amax - amin)\n"
+        ).body
+        guards: list[ast.If] = []
+        rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
+        self.assertEqual(guards, [])
+        self.assertTrue(_dry_pass_binds(rewritten, guards, set()))
+        # The signal wait still spins, so it stays skipped.
+        body = ast.parse(
+            "flag = helion_triton_helpers.triton_wait_signal(addr, 1)\n"
+            "tl.store(out, flag)\n"
+        ).body
+        guards = []
+        rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
+        self.assertFalse(_dry_pass_binds(rewritten, guards, set()))
+
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
         cloned = _clone_opaque_statements(body)
