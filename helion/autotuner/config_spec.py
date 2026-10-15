@@ -7475,8 +7475,12 @@ class ConfigSpec:
                     fields["cute_min_blocks_per_mp"] = EnumFragment(
                         choices=(0, 1, 2, 3, 4, 6)
                     )
+            # The fused flash bodies (forward and backward) emit their own
+            # epilogues; the subtiled store split rewrites the graphs the
+            # attention matchers read, so the knob leaves the search space.
             if (
                 not self.cute_flash_search_enabled
+                and not self.cute_flash_bwd_search_enabled
                 and self.epilogue_subtile_autotune_choices is not None
             ):
                 fields["epilogue_subtile"] = EnumFragment(
