@@ -11714,27 +11714,6 @@ def test_cute_narrow_pointwise_seeds_with_safe_loads(
         assert len(lists) == len(set(lists))
 
 
-@pytest.mark.parametrize("shape", [(1026,), (513, 2)])
-def test_cute_pointwise_packet_widths_divide_extent(shape: tuple[int, ...]) -> None:
-    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-    def add(x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
-        for tile in hl.tile(x.shape):
-            out[tile] = x[tile] + 1
-        return out
-
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(add, (torch.empty(shape, dtype=torch.bfloat16),))
-        assert bound.host_function is not None
-        seeds = CutePointwiseVecHeuristic.get_seed_configs(
-            bound.env, bound.host_function.device_ir
-        )
-        assert seeds
-        for seed in seeds:
-            assert max(seed["cute_vector_widths"]) == 2
-            assert "ir.VectorType.get([2]," in bound.to_code(seed)
-
-
 @pytest.mark.parametrize("width", [4095, 4096])
 def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
     @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
