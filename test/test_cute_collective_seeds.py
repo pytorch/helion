@@ -14,10 +14,8 @@ from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
-from helion._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.matmul_utils import cute_matmul_root_placements
-from helion._hardware import HardwareInfo
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import KernelGridFact
@@ -28,6 +26,7 @@ import helion.language as hl
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.device_ir import DeviceIR
+    from helion.autotuner.config_spec import ConfigSpec
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -168,31 +167,40 @@ def test_matmul_placement_rejects_missing_attribution(unknown: str) -> None:
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
-    ("hardware_name", "capability", "dtype", "m", "preferred"),
+    ("capability", "num_sm", "dtype", "m", "preferred"),
     [
-        ("NVIDIA H100 PCIe", (9, 0), torch.float16, 128, True),
-        ("NVIDIA H100 PCIe", (9, 0), torch.float16, 129, True),
-        ("NVIDIA H100 PCIe", (9, 0), torch.float16, 32, False),
-        ("NVIDIA H100 PCIe", (9, 0), torch.bfloat16, 128, False),
-        ("NVIDIA H200", (9, 0), torch.float16, 128, False),
-        ("NVIDIA B200", (10, 0), torch.float16, 128, False),
+        ((8, 0), 108, torch.float16, 128, True),
+        ((8, 9), 128, torch.float16, 128, True),
+        ((9, 0), 114, torch.float16, 128, True),
+        ((9, 0), 114, torch.float16, 129, True),
+        ((9, 0), 114, torch.float16, 32, False),
+        ((9, 0), 114, torch.bfloat16, 128, False),
+        ((10, 0), 148, torch.float16, 128, True),
+        ((10, 0), 148, torch.bfloat16, 128, False),
     ],
 )
 def test_collective_async_priority_preserves_candidates_and_default(
-    hardware_name: str,
     capability: tuple[int, int],
+    num_sm: int,
     dtype: torch.dtype,
     m: int,
     preferred: bool,
 ) -> None:
-    hardware = HardwareInfo(
-        "cuda", hardware_name, "13.0", f"sm{capability[0]}{capability[1]}"
-    )
     kernel = helion.kernel(
         matmul.fn, backend="cute", static_shapes=True, autotune_effort="none"
     )
     args = (torch.empty((m, 256), dtype=dtype), torch.empty((256, 64), dtype=dtype))
     heuristic = CuteCollectiveMatmulHeuristic
+    original: list[helion.Config] = []
+    interleave = heuristic._interleave_bounded_k_seeds
+
+    def capture_order(
+        spec: ConfigSpec, seeds: list[helion.Config], parameters: tuple[str, ...]
+    ) -> list[helion.Config]:
+        result = interleave(spec, seeds, parameters)
+        original[:] = result
+        return result
+
     with ExitStack() as stack:
         stack.enter_context(_mock_cuda_unavailable())
         stack.enter_context(_forbid_native_compile())
@@ -205,31 +213,37 @@ def test_collective_async_priority_preserves_candidates_and_default(
                 "helion._compiler.compile_environment.target_device_capability",
                 capability,
             ),
-            (
-                "helion.runtime.get_num_sm",
-                {"NVIDIA H100 PCIe": 114, "NVIDIA H200": 132, "NVIDIA B200": 148}[
-                    hardware_name
-                ],
-            ),
-            ("helion._hardware.get_hardware_info", hardware),
+            ("helion.runtime.get_num_sm", num_sm),
         ):
             stack.enter_context(patch(name, return_value=value))
         bound = kernel._bind_isolated(args)
         assert bound.host_function is not None
         with bound.env:
             ir = bound.host_function.device_ir
-            actual = heuristic.get_seed_configs(bound.env, ir)
             default = bound.config_spec.default_config()
             assert bound.config_spec.compiler_default_config is None
-            with patch.object(heuristic, "CACHE_NAMED_TARGETS", frozenset()):
-                original = heuristic.get_seed_configs(bound.env, ir)
-                assert bound.config_spec.default_config() == default
+            with patch.object(
+                heuristic, "_interleave_bounded_k_seeds", side_effect=capture_order
+            ):
+                actual = heuristic.get_seed_configs(bound.env, ir)
+            assert bound.config_spec.default_config() == default
             assert original[0]["cute_collective_copy"] == "scalar"
             if preferred:
                 async_seed = helion.Config.from_dict(
                     original[0].config | {"cute_collective_copy": "async"}
                 )
                 assert actual == [async_seed, *[s for s in original if s != async_seed]]
+                if capability[0] == 10:
+                    assert (
+                        helion.Config.from_dict(
+                            original[0].config
+                            | {
+                                "cute_collective_copy": "async_cached",
+                                "cute_collective_compute": "tcgen05",
+                            }
+                        )
+                        in actual
+                    )
             else:
                 assert actual == original
             assert not heuristic.promote_seed_to_default
@@ -240,7 +254,3 @@ def test_collective_async_priority_preserves_candidates_and_default(
             assert normalized[0][1]["cute_collective_copy"] == (
                 "async" if preferred else "scalar"
             )
-        key = dict(compiler_promotion_specialization_key("cute", torch.device("cuda")))
-        assert key[heuristic.name] == (
-            hardware_name if hardware_name == "NVIDIA H100 PCIe" else None
-        )

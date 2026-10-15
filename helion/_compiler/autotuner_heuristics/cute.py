@@ -100,7 +100,6 @@ from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
-from .common import matches_hardware
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -1868,12 +1867,11 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
 
 
 class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
-    """Seed collective operand staging with hardware-specific initial priority."""
+    """Seed collective operand staging for independent contractions."""
 
     name = "cute_collective_matmul"
     backend = "cute"
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
-    CACHE_NAMED_TARGETS = frozenset({("cuda", "NVIDIA H100 PCIe", "sm90")})
 
     @classmethod
     def register_facts(
@@ -2114,9 +2112,10 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         paired copy/recipe choices before repeating geometries. When the TMEM
         storage alternative is present, rotate through complete
         schedules as well as compute/copy/depth/chunk groups, retaining the
-        ranked geometry order within each. This only reorders existing seeds;
-        the first seed, default promotion, other heuristics, and search budget
-        stay unchanged. Unrelated user knobs never supply a grouping dimension.
+        ranked geometry order within each. This step preserves the first seed;
+        the caller may subsequently prioritize an async sibling. Default promotion,
+        other heuristics, and search budget stay unchanged. Unrelated user knobs
+        never supply a grouping dimension.
         """
         tmem_operand_schedules = any(
             seed.get("cute_collective_tmem_a", False) for seed in seeds
@@ -2440,9 +2439,8 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             and spec.matmul_facts[0].lhs_dtype == torch.float16
             and result[0].block_sizes == [64, 32, 64]
             and result[0].num_threads == [4, 32, 1]
-            and matches_hardware(env, None, named_targets=cls.CACHE_NAMED_TARGETS)
         ):
-            # Keep derivation/interleaving intact; prefer only the measured geometry.
+            # Move the H100-measured async sibling first, after derivation/interleaving.
             preferred = Config.from_dict(
                 result[0].config | {"cute_collective_copy": "async"}
             )
