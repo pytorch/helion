@@ -20,6 +20,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -74,16 +75,40 @@ def _kernel_body(code: str) -> str:
 
 
 def _run(
-    dtype: torch.dtype, threads: int, vec: int, policies: list[str]
+    dtype: torch.dtype,
+    threads: int,
+    vec: int,
+    policies: list[str],
+    *,
+    width: int = 1024,
 ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
-    x = torch.randn(256, 1024, dtype=dtype, device=DEVICE)
-    weight = torch.randn(1024, dtype=dtype, device=DEVICE)
+    x = torch.randn(256, width, dtype=dtype, device=DEVICE)
+    weight = torch.randn(width, dtype=dtype, device=DEVICE)
     bound = _kernel().bind((x, weight))
     config = _row_config(bound, reduction_threads=threads, vec=vec, policies=policies)
     code = bound.to_code(config)
     out, inv = bound.compile_config(config)(x, weight)
     return code, x, weight, out, inv
+
+
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    "width,threads,vec",
+    [(1024, 224, 4), (1024, 480, 2), (512, 160, 4), (1024, 288, 4)],
+)
+def test_whole_warp_thread_request_matches_the_full_row_reference(
+    width: int, threads: int, vec: int
+) -> None:
+    # Requested packet layouts can under- or over-cover the row. The repaired
+    # launch must compute the complete reduction and write every output column.
+    _code, x, weight, out, inv = _run(
+        torch.bfloat16, threads, vec, ["", ""], width=width
+    )
+    ref_out, ref_inv = _reference(x, weight)
+    torch.testing.assert_close(inv, ref_inv, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 @skipUnlessBackends(["cute"])

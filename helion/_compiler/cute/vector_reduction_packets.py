@@ -17,6 +17,7 @@ from ..ast_extension import statement_from_string
 from ._ast_pass_utils import _assignment_lhs_name
 from ._ast_pass_utils import _names_read
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .prefetch_reduction_packets import _index_expression
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -162,6 +163,153 @@ def _pure_scalar(node: ast.expr, scalars: set[str], vectors: set[str]) -> bool:
     )
 
 
+def _bounded_count(loop: ast.For, constants: Mapping[str, object]) -> int | None:
+    """Exact nonnegative ranges whose induction arithmetic fits signed Int32."""
+    call = loop.iter
+    if not isinstance(call, ast.Call):
+        return None
+    values = [_integer(arg, constants) for arg in call.args]
+    if any(value is None or not 0 <= value <= 2**31 - 1 for value in values):
+        return None
+    count = _range_size(loop, constants)
+    if count is None:
+        return None
+    start = values[0] if len(values) > 1 else 0
+    step = values[2] if len(values) == 3 else 1
+    assert start is not None and step is not None
+    return count if step > 0 and start + count * step <= 2**31 - 1 else None
+
+
+def _private_raw_caches(
+    body: list[ast.stmt], constants: Mapping[str, object]
+) -> set[str]:
+    module = ast.Module(body=body, type_ignores=[])
+    parents = {
+        child: parent
+        for parent in ast.walk(module)
+        for child in ast.iter_child_nodes(parent)
+    }
+    result: set[str] = set()
+    for stmt in body:
+        name = _assignment_lhs_name(stmt)
+        if name is None or not isinstance(stmt, ast.Assign):
+            continue
+        value = stmt.value
+        if not (
+            isinstance(value, ast.Call)
+            and ast.unparse(value.func) == "cute.make_rmem_tensor"
+            and len(value.args) == 2
+            and not value.keywords
+            and ast.unparse(value.args[1]) in {"cutlass.Uint16", "cutlass.Uint32"}
+        ):
+            continue
+        size = _integer(value.args[0], constants)
+        if size is None or not 1 <= size <= 128:
+            continue
+        # Direct register-root subscriptions only: no alias assignment, escape,
+        # pointer extraction, rebinding, or hidden mutation through a helper.
+        if all(
+            (n is stmt.targets[0])
+            or (
+                isinstance(parents[n], ast.Subscript)
+                and cast("ast.Subscript", parents[n]).value is n
+            )
+            for n in ast.walk(module)
+            if isinstance(n, ast.Name) and n.id == name
+        ):
+            result.add(name)
+    return result
+
+
+def _packet_load(node: ast.expr, width: int, tensors: set[str]) -> bool:
+    if not (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) in _VECTOR_LOADS
+        and len(node.args) == 2
+        and not node.keywords
+        and _index_expression(node.args[0], tensors)
+    ):
+        return False
+    typ = node.args[1]
+    return (
+        isinstance(typ, ast.Call)
+        and ast.unparse(typ.func) == "ir.VectorType.get"
+        and not typ.keywords
+        and len(typ.args) == 2
+        and isinstance(typ.args[0], ast.List)
+        and len(typ.args[0].elts) == 1
+        and isinstance(typ.args[0].elts[0], ast.Constant)
+        and type(typ.args[0].elts[0].value) is int
+        and typ.args[0].elts[0].value == width
+        and ast.unparse(typ.args[1])
+        in {"cutlass.Uint16.mlir_type", "cutlass.Uint32.mlir_type"}
+    )
+
+
+def _boolean(node: ast.expr, booleans: set[str], scalars: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in booleans
+    if isinstance(node, ast.Compare):
+        return all(
+            isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq))
+            for op in node.ops
+        ) and all(
+            _pure_scalar(x, scalars, set()) for x in (node.left, *node.comparators)
+        )
+    if isinstance(node, ast.BoolOp):
+        return isinstance(node.op, (ast.And, ast.Or)) and all(
+            _boolean(x, booleans, scalars) for x in node.values
+        )
+    return (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.Not)
+        and _boolean(node.operand, booleans, scalars)
+    )
+
+
+def _packet_scalar(
+    node: ast.expr, scalars: set[str], vectors: set[str], booleans: set[str]
+) -> bool:
+    if _pure_scalar(node, scalars, vectors):
+        return True
+    if not (
+        isinstance(node, ast.IfExp)
+        and _boolean(node.test, booleans, scalars)
+        and _pure_scalar(node.body, scalars, vectors)
+    ):
+        return False
+    zero = node.orelse
+    if not (
+        isinstance(zero, ast.Call)
+        and ast.unparse(zero.func)
+        in {"cutlass.Float16", "cutlass.BFloat16", "cutlass.Float32"}
+        and len(zero.args) == 1
+        and not zero.keywords
+        and isinstance(zero.args[0], ast.Constant)
+        and type(zero.args[0].value) in (int, float)
+        and zero.args[0].value == 0
+        and not ast.unparse(zero.args[0]).startswith("-")
+    ):
+        return False
+    # Keep the existing typed-zero selection. Do not speculate the register
+    # conversion, erase a mask, or reinterpret padded raw-cache contents.
+    body = node.body
+    return isinstance(body, ast.Call) and (
+        (
+            ast.dump(body.func) == ast.dump(zero.func)
+            and len(body.args) == 1
+            and not body.keywords
+        )
+        or (
+            isinstance(body.func, ast.Attribute)
+            and body.func.attr == "bitcast"
+            and len(body.args) == 1
+            and not body.keywords
+            and ast.dump(body.args[0]) == ast.dump(zero.func)
+        )
+    )
+
+
 class _Substitute(ast.NodeTransformer):
     def __init__(self, replacements: Mapping[str, ast.expr]) -> None:
         self.replacements = replacements
@@ -182,6 +330,7 @@ class _PacketReductions:
         constants: Mapping[str, object],
         thread_block_dims: tuple[int, int, int] | None,
     ) -> None:
+        self.body = body
         self.constants = constants
         self.thread_block_dims = thread_block_dims
         self.names = {
@@ -346,6 +495,208 @@ class _PacketReductions:
         result.append(statement_from_string(f"{accumulator} = {partials[0]}"))
         return result
 
+    def split_carried(self, init: ast.stmt, outer: ast.For) -> list[ast.stmt] | None:
+        """Split only the scalar packet traversal; preserve carried-cache order.
+
+        This deliberately leaves serial/packet headers and all memory operations
+        in place. Only the opted-in FP32 summation tree changes. At most eight
+        new FP32 register slots are used, independently of the retained cache.
+        """
+        accumulator = _assignment_lhs_name(init)
+        if not (
+            accumulator and isinstance(init, ast.Assign) and _float_zero(init.value)
+        ):
+            return None
+        module = ast.Module(body=self.body, type_ignores=[])
+        writes = Counter(
+            n.id
+            for n in ast.walk(module)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+        )
+        if set(writes) & ({"cute", "cutlass", "ir", "range"} | set(_VECTOR_LOADS)):
+            return None
+        constants = {k: v for k, v in self.constants.items() if not writes[k]}
+        wrappers: list[ast.For] = []
+        loop = outer
+        packets = 1
+        while not (
+            isinstance(loop.iter, ast.Call)
+            and ast.unparse(loop.iter.func) == "cutlass.range_constexpr"
+        ):
+            count = _bounded_count(loop, constants)
+            if count is None or not 1 <= count <= 16 or len(wrappers) == 2:
+                return None
+            packets *= count
+            if packets > 64 or not loop.body or not isinstance(loop.body[-1], ast.For):
+                return None
+            wrappers.append(loop)
+            loop = loop.body[-1]
+        inner = loop
+        width = _bounded_count(inner, constants)
+        if not (
+            wrappers
+            and width in (2, 4, 8)
+            and isinstance(inner.iter, ast.Call)
+            and len(inner.iter.args) == 1
+        ):
+            return None
+        loops = [*wrappers, inner]
+        if not all(isinstance(x.target, ast.Name) for x in loops):
+            return None
+        coordinates = [cast("ast.Name", x.target).id for x in loops]
+        if len(set(coordinates)) != len(coordinates) or accumulator in coordinates:
+            return None
+        # The expanded traversal no longer assigns its induction variable.
+        lane = coordinates[-1]
+        reads = Counter(
+            n.id
+            for n in ast.walk(inner)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        )
+        if reads[lane] != self.read_counts[lane]:
+            return None
+        prefixes = [stmt for wrapper in wrappers for stmt in wrapper.body[:-1]]
+        if any(accumulator in _names_read(stmt) for stmt in prefixes):
+            return None
+        cache_roots = _private_raw_caches(self.body, constants)
+        tensors = {
+            n.value.id
+            for n in ast.walk(outer)
+            if isinstance(n, ast.Attribute)
+            and n.attr == "iterator"
+            and isinstance(n.value, ast.Name)
+        }
+        prefix_names = {
+            name
+            for stmt in prefixes
+            if (name := _assignment_lhs_name(stmt)) is not None
+        }
+        if accumulator in prefix_names:
+            return None
+        leaf_names = {
+            name
+            for stmt in inner.body
+            if (name := _assignment_lhs_name(stmt)) is not None
+        }
+        locals_ = leaf_names - {accumulator}
+        if locals_ & (prefix_names | set(coordinates)) or prefix_names & set(
+            coordinates
+        ):
+            return None
+        if any(self.read_counts[name] != reads[name] for name in locals_):
+            return None
+        scalars = set(coordinates)
+        booleans: set[str] = set()
+        vectors: set[str] = set()
+        assigned: set[str] = set()
+        for stmt in prefixes:
+            if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                return None
+            if (_names_read(stmt.value) & (prefix_names | locals_)) - assigned:
+                return None
+            name = _assignment_lhs_name(stmt)
+            if name is None:
+                target = stmt.targets[0]
+                if not (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in cache_roots
+                    and not (
+                        (_names_read(target.slice) & (prefix_names | locals_))
+                        - assigned
+                    )
+                    and _index_expression(target.slice, set())
+                    and _pure_scalar(stmt.value, scalars, vectors)
+                ):
+                    return None
+                continue
+            vectors.discard(name)
+            booleans.discard(name)
+            scalars.discard(name)
+            if _packet_load(stmt.value, width, tensors):
+                vectors.add(name)
+            elif _index_expression(stmt.value, tensors):
+                if _boolean(stmt.value, booleans, scalars):
+                    booleans.add(name)
+                scalars.add(name)
+            else:
+                return None
+            assigned.add(name)
+        if not inner.body or any(
+            not isinstance(stmt, ast.Assign) or _assignment_lhs_name(stmt) is None
+            for stmt in inner.body
+        ):
+            return None
+        updates = [
+            stmt for stmt in inner.body if _assignment_lhs_name(stmt) == accumulator
+        ]
+        if len(updates) != 1 or updates[0] is not inner.body[-1]:
+            return None
+        update = cast("ast.Assign", updates[0])
+        rhs = update.value
+        if not (
+            isinstance(rhs, ast.BinOp)
+            and isinstance(rhs.op, ast.Add)
+            and isinstance(rhs.left, ast.Name)
+            and rhs.left.id == accumulator
+            and isinstance(rhs.right, ast.Call)
+            and ast.unparse(rhs.right.func) == "cutlass.Float32"
+            and len(rhs.right.args) == 1
+            and not rhs.right.keywords
+        ):
+            return None
+        assigned.clear()
+        for stmt in inner.body[:-1]:
+            assert isinstance(stmt, ast.Assign)
+            name = _assignment_lhs_name(stmt)
+            assert name is not None
+            if (
+                accumulator in _names_read(stmt)
+                or ((_names_read(stmt.value) & locals_) - assigned)
+                or not _packet_scalar(stmt.value, scalars, vectors, booleans)
+            ):
+                return None
+            scalars.add(name)
+            assigned.add(name)
+        if (
+            accumulator in _names_read(rhs.right)
+            or ((_names_read(rhs.right) & locals_) - assigned)
+            or not _packet_scalar(rhs.right, scalars, vectors, booleans)
+        ):
+            return None
+        partials = [self.fresh("sum") for _ in range(width)]
+        result = [
+            statement_from_string(f"{name} = cutlass.Float32(0)") for name in partials
+        ]
+        transformed = _clone(outer)
+        packet = transformed
+        for _ in wrappers[1:]:
+            packet = cast("ast.For", packet.body[-1])
+        packet.body.pop()
+        for index, name in enumerate(partials):
+            substitute = _Substitute(
+                {
+                    lane: ast.Constant(index),
+                    accumulator: ast.Name(id=name, ctx=ast.Load()),
+                }
+            )
+            packet.body.extend(substitute.visit(_clone(stmt)) for stmt in inner.body)
+        result.append(transformed)
+        while len(partials) > 1:
+            half = len(partials) // 2
+            combined = []
+            for index in range(half):
+                name = self.fresh("join")
+                result.append(
+                    statement_from_string(
+                        f"{name} = {partials[index]} + {partials[index + half]}"
+                    )
+                )
+                combined.append(name)
+            partials = combined
+        result.append(statement_from_string(f"{accumulator} = {partials[0]}"))
+        return result
+
     def replicate(
         self, stmt: ast.stmt, prefix: list[ast.stmt]
     ) -> list[ast.stmt] | None:
@@ -468,6 +819,8 @@ class _PacketReductions:
             if isinstance(stmt, ast.For):
                 if split and result:
                     changed = self.split(result[-1], stmt)
+                    if changed is None:
+                        changed = self.split_carried(result[-1], stmt)
                     if changed is not None:
                         result.pop()
                         result.extend(changed)

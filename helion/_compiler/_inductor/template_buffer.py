@@ -796,7 +796,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         #    store_output() sets on range tree entries.  The x_ prefix ensures
         #    get_block_shape recognizes them as XBLOCK-sized.
         per_dim = SubscriptIndexing.compute_per_dim_indexing(
-            state, tensor, [*subscript], extra_mask
+            state, tensor, [*subscript], extra_mask, for_store=True
         )
         assert not per_dim.needs_broadcast(), (
             f"Epilogue fusion does not support broadcasted stores for param "

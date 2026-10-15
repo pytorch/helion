@@ -15,10 +15,13 @@ if TYPE_CHECKING:
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 # Ordinary generated kernels import these helpers without a wrapper plan.
-# Include their implementations and the L2 compatibility helper in every key;
+# Include their implementations and transitive cluster support in every key;
 # a generated import statement alone cannot identify the compiled device code.
 _COMMON_DEPENDENCIES = (
     "runtime/cute/launcher.py",
+    "runtime/cute/register_tensor.py",
+    "_compiler/cute/reduce_helpers.py",
+    "_compiler/cute/cluster_helpers.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
     "_compiler/cute/cutedsl_compat.py",
@@ -71,6 +74,8 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/block_scaled_config.py",
         "_compiler/cute/block_scaled_prepare.py",
         "_compiler/cute/block_scaled_runtime.py",
+        "_compiler/cute/mxfp8_mma.py",
+        "_compiler/cute/mxfp8_prepare.py",
     ),
     "gathered_mma_tma": (
         "_compiler/cute/_mlir_compat.py",

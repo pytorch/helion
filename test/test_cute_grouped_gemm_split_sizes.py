@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import itertools
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,7 @@ import helion
 from helion._compat import requires_cuda_version
 from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_config import Tcgen05GroupedWorklistSmemFacts
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from helion._compiler.cute.tcgen05_constants import (
@@ -677,8 +679,7 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     seed_facts = analysis.seed_facts
     assert seed_facts.device_split_sizes
     assert bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts == (
-        8,
-        True,
+        Tcgen05GroupedWorklistSmemFacts(8, True, output_dtype_bytes=2)
     )
     seeds = [
         config
@@ -771,7 +772,49 @@ def test_grouped_device_offsets_are_recognized_and_normalized() -> None:
         m_size=args[0].size(0),
         orientation="nm",
     )
-    assert "iterator + cutlass.Int64(8) * cutlass.Int64(" in code
+    # The parallel initializer loads offsets[g] and offsets[g+1] instead of
+    # spelling an unrolled literal8. Prove the same int64 strided addresses,
+    # including the final boundary, for every logical group.
+    pointers = [
+        node.func.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load"
+        and "offsets.iterator" in ast.unparse(node.func.value)
+    ]
+    assert len(pointers) == 2
+    coordinates = {
+        node.id
+        for pointer in pointers
+        for node in ast.walk(pointer)
+        if isinstance(node, ast.Name) and node.id not in ("offsets", "cutlass")
+    }
+    assert len(coordinates) == 1
+    (coordinate,) = coordinates
+    for pointer in pointers:
+        assert {
+            ast.unparse(node.func)
+            for node in ast.walk(pointer)
+            if isinstance(node, ast.Call)
+        } == {"cutlass.Int64"}
+    stride = args[2].stride(0)
+    assert stride == 2 and args[2].dtype is torch.int64
+    namespace = {
+        "__builtins__": {},
+        "cutlass": SimpleNamespace(Int64=int),
+        "offsets": SimpleNamespace(
+            iterator=0, layout=SimpleNamespace(stride=(stride,))
+        ),
+    }
+    addresses = [
+        tuple(
+            eval(ast.unparse(pointer), namespace | {coordinate: group})
+            for pointer in pointers
+        )
+        for group in range(8)
+    ]
+    assert addresses == [(group * stride, (group + 1) * stride) for group in range(8)]
 
 
 @pytest.mark.parametrize(

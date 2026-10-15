@@ -46,11 +46,18 @@ def _(state: CodegenState) -> None:
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
     parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
+    idx_str = ", ".join(parts)
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
+    from .ordered_carry import emit_carry_store
+
+    if not isinstance(plan, (DmaScatterPlan, OneHotScatterPlan)) and (
+        state.device_function.carry_tiles
+    ):
+        if emit_carry_store(state, tensor, name, idx_str, value):
+            return
     value = pallas_codegen.sliced_value_for_store(
         state, tensor, subscript, parts, value
     )
-    idx_str = ", ".join(parts)
-    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
     if isinstance(plan, DmaScatterPlan):
         dma_ref = pallas_codegen.memory_op_dma_scratch(state)
         if dma_ref is None:
@@ -66,14 +73,8 @@ def _(state: CodegenState) -> None:
         return
     from .gather import emit_scatter_store
 
-    is_scatter = isinstance(plan, OneHotScatterPlan)
-    if is_scatter:
+    if isinstance(plan, OneHotScatterPlan):
         value = emit_scatter_store(state, plan.plan, name, idx_str, value)
-    from .ordered_carry import emit_carry_store
-
-    if not is_scatter and state.device_function.carry_tiles:
-        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
-            return
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )

@@ -1,4 +1,9 @@
-"""Inactive LPT aliases must retain each topology's real conditional domain."""
+"""The causal launch group is a free coordinate of every fa4 lowering.
+
+Only the WS leaf and dense kernels keep the inactive ``0``; no lowering owns
+the coordinate, so explicit groups are honoured (and clamped to the grid) on
+``auto``/``standard`` as on the explicit stateful lowering.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +18,6 @@ from .test_cute_flash_stateful_lpt import _spec
 from helion._compiler.cute import cute_flash as flash
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.exc import InvalidConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,11 +31,14 @@ def _cpu_only() -> Iterator[None]:
 
 @pytest.mark.parametrize("causal", (False, True))
 @pytest.mark.parametrize("topology", ("fa4", "ws_overlap"))
-def test_inactive_domain_matches_resolver(causal: bool, topology: str) -> None:
-    domain = flash._flash_inactive_lpt_domain(is_causal=causal, topology=topology)
-    assert domain[0] == int(causal and topology == "fa4")
+def test_causal_launch_group_is_free_on_every_lowering(
+    causal: bool, topology: str
+) -> None:
+    # The fa4 causal body decodes its grid pair-major inside the requested
+    # group (0 names FA4's L2-sized group, sized by the emitter); the WS leaf
+    # and dense kernels keep the inactive 0.
     for lowering in ("auto", "standard"):
-        for width in domain:
+        for width in (0, 1, 8, 64):
             resolved = flash.resolve_flash_config(
                 64,
                 32,
@@ -45,11 +52,10 @@ def test_inactive_domain_matches_resolver(causal: bool, topology: str) -> None:
                 standard_causal_output=causal,
                 standard_dense_output=not causal,
             )
-            owned = flash._flash_resident_softmax_overrides(
-                lowering, is_causal=causal, topology=resolved.topology
-            )
-            assert owned[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == domain[0]
-            assert resolved.causal_lpt_swizzle == domain[0]
+            owned = flash._flash_resident_softmax_overrides(lowering)
+            assert flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY not in owned
+            expected = width if causal and resolved.topology == "fa4" else 0
+            assert resolved.causal_lpt_swizzle == expected
 
 
 @pytest.mark.parametrize("disc", (False, True))
@@ -80,7 +86,9 @@ def test_causal_ws_leaf_retains_historical_width_aliases(
     root = ConfigGeneration(spec)
     owned = root.flash_owned_coordinate_indices(config)
     identities = root._flat_coordinate_identities()
-    assert flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY in {identities[i][0] for i in owned}
+    # No lowering owns the launch group; the WS leaf's fragment is what keeps
+    # it at 0.
+    assert flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY not in {identities[i][0] for i in owned}
     assert flash.FLASH_SOFTMAX_LOWERING_KEY not in {identities[i][0] for i in owned}
 
 
@@ -109,17 +117,22 @@ def test_narrowed_ws_alias_domain_is_intersected_without_replacement(
 
 
 @pytest.mark.parametrize("topology", ("fa4", "ws_overlap"))
-def test_wide_nonstateful_fixed_request_remains_invalid(topology: str) -> None:
+def test_wide_nonstateful_fixed_request_is_legal(topology: str) -> None:
+    # An explicit group is honoured on every lowering of the fa4 body; the WS
+    # leaf folds it to its inactive 0.
     spec = _spec(64)
-    with pytest.raises(InvalidConfig, match="requires cute_flash_causal_lpt_swizzle"):
-        generation = spec.create_config_generation(
-            overrides={
-                flash.FLASH_PIPELINE_FAMILY_KEY: topology,
-                flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
-                flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: 8,
-            }
-        )
-        generation.canonicalize_flat(generation.default_flat())
+    generation = spec.create_config_generation(
+        overrides={
+            flash.FLASH_PIPELINE_FAMILY_KEY: topology,
+            flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
+            flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: 8,
+        }
+    )
+    _flat, config = generation.canonicalize_flat(generation.default_flat())
+    assert config.config[flash.FLASH_SOFTMAX_LOWERING_KEY] == "auto"
+    assert config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == (
+        8 if topology == "fa4" else 0
+    )
     fields = spec._flat_fields()
     key = flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
     fragment = fields[key]
@@ -127,13 +140,13 @@ def test_wide_nonstateful_fixed_request_remains_invalid(topology: str) -> None:
     fields[key] = dataclasses.replace(
         fragment, search_choices=(8,), coverage_choices=(8,)
     )
-    with pytest.raises(ValueError, match="search_choices must not be empty"):
-        ConfigGeneration(
-            spec,
-            overrides={flash.FLASH_SOFTMAX_LOWERING_KEY: "auto"},
-            _field_view=fields,
-            _flash_pipeline_family_override=topology,
-        )
+    narrowed = ConfigGeneration(
+        spec,
+        overrides={flash.FLASH_SOFTMAX_LOWERING_KEY: "auto"},
+        _field_view=fields,
+        _flash_pipeline_family_override=topology,
+    )
+    assert narrowed._flat_fields()[key]._active_choices() == (8,)
     assert fields[key]._active_choices() == (8,)
 
 
@@ -209,7 +222,12 @@ def test_family_view_alone_retains_ws_conditional_domain() -> None:
     assert config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 0
 
 
-def test_unknown_topology_does_not_claim_an_owned_lpt_value() -> None:
-    owned = flash._flash_resident_softmax_overrides("auto", is_causal=True)
+@pytest.mark.parametrize(
+    "lowering", ("auto", "standard", "resident_value_graph", "resident_stateful")
+)
+def test_no_lowering_owns_the_launch_group(lowering: str) -> None:
+    owned = flash._flash_resident_softmax_overrides(lowering)
     assert flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY not in owned
-    assert owned[flash.FLASH_ROW_SUM_SCHEDULE_KEY] == "post_acquire"
+    assert owned.get(flash.FLASH_ROW_SUM_SCHEDULE_KEY) == (
+        None if lowering == "resident_stateful" else "post_acquire"
+    )
