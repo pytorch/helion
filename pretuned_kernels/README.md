@@ -7,10 +7,10 @@ who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
 autotuning.  Each entry lists the NVIDIA architecture it supports (currently
-H100, B200, or both), and Helion picks the matching file at runtime.  Treat the
-files as kernel recipes: copy the kernel and its local `_helion_aot_*` heuristic
-into your code, then retune when your target shapes or hardware differ
-materially from the included sweep.
+H100, B200, GB300, or a combination), and Helion picks the matching file at
+runtime.  Treat the files as kernel recipes: copy the kernel and its local
+`_helion_aot_*` heuristic into your code, then retune when your target shapes or
+hardware differ materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against one or more named
 reference baselines.
@@ -30,7 +30,7 @@ pretuned_kernels/
 ├── cross_entropy/
 ├── rope/
 ├── scaled_mm/
-├── scale_mm_cute/                    # B200 CuTe (tcgen05) rowwise FP8 GEMM
+├── scaled_mm_cute/                   # B200/GB300 CuTe (tcgen05) FP8 GEMM
 ├── grouped_gemm/                     # B200 grouped FP16 GEMM vs CuTeDSL
 ├── grouped_gemm_deepgemm/            # B200 grouped BF16 vs DeepGEMM + cuBLAS
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
@@ -64,7 +64,7 @@ At runtime Helion picks the file matching the current GPU.
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
-| `scale_mm_cute` | Skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes (B200 CuTe backend only) | `torch._scaled_mm` (rowwise) + vLLM CUTLASS |
+| `scaled_mm_cute` | B200: 45 skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes with rowwise/channel scales. GB300: five `(M, K, N)` shapes × four scalar/vector scale modes; see below (GB300 is not in the nightly matrix). | `torch._scaled_mm` + vLLM CUTLASS |
 | `grouped_gemm` | Seven CUTLASS-example-derived heterogeneous FP16 grouped-NT cases (3--4 GEMMs, including M/N tails; B200 CuTe only) | pinned NVIDIA CUTLASS CuTeDSL kernel |
 | `grouped_gemm_deepgemm` | Eight official DeepGEMM BF16 grouped-NT shapes with deterministic heterogeneous per-group M (B200 CuTe only) | pinned DeepGEMM `m_grouped_bf16_gemm_nt_contiguous` + CUDA's `cublasGemmGroupedBatchedEx` |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
@@ -89,6 +89,35 @@ PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
 against the eager reference). The grouped-GEMM entries instead use the named
 CUDA references in the table. The headline speedup is Helion vs the *fastest*
 available baseline, and the per-kernel dropdown reports every baseline.
+
+`scaled_mm_cute` combines the original B200 preset (previously named
+`scale_mm_cute`) and the GB300 preset. Its public `scaled_mm()` wrapper dispatches
+by the input device's compute capability and shape. The matching SM100 or SM103
+AOT file selects configurations for that architecture; both ship beside the
+single source file.
+
+The B200 sweep preserves the original 45 single-row decode, small-batch, and
+decoder-layer shapes with per-row activation and per-channel weight scales.
+Single-row cases use a skinny kernel, selected small-M cases compute the
+transposed product, and other cases use regular `(M, N)` tiling. The original
+B200 kernel bodies and tuned configurations are preserved under the corrected
+name.
+
+The GB300 sweep covers `(M, K, N) = (1, 4096, 4096)`, `(64, 4096, 4096)`,
+`(256, 4096, 2048)`, `(128, 2880, 5120)`, and `(4096, 4096, 2880)`. Each shape
+has per-tensor or per-token `scale_a` and per-tensor or per-channel `scale_b`,
+giving twenty cases. The shape keys and configurations live in
+`scaled_mm_cute/_helion_aot_scaled_mm_cute_cuda_sm103.py`.
+
+For the GB300 `(256, 4096, 2048)` cases, the wrapper passes `b.T` and `a.T` to
+a separate Helion definition that computes `out.T = b.T @ a.T`. It tiles over
+`(N, M)`, writes a column-major output view, and returns contiguous `(M, N)`
+output without a transpose copy. Scales retain `acc * scale_a * scale_b` order.
+The four configs use physical blocks `[128, 64, 256]`; the other 12 multi-row
+configs use the ordinary implementation and the four single-row cases use the
+skinny kernel. Scoped GB300 correctness validation covers all four transposed
+scale modes. The saved hillclimb timings describe the earlier body; the
+frontend implementation still needs fresh performance measurements.
 
 `grouped_gemm` compares Helion with the same pinned CUTLASS kernel. Required
 device pointer tables are initialized before graph capture, and both
@@ -147,7 +176,9 @@ the shapes or target hardware differ from the included sweep, generate and
 commit an AOT heuristic for the application's target shapes and hardware.
 
 For AOT pretuned kernels, Helion's runtime looks for
-`_helion_aot_<kernel>_cuda_sm<NN>.py` next to the kernel source file.  Helion
+`_helion_aot_<source_stem>_cuda_sm<NN>.py` next to the kernel source file, where
+`<source_stem>` is the kernel file name without `.py`; one heuristic file serves
+every kernel defined in that source file.  Helion
 looks for AOT heuristic files for the current compute capability first, then
 falls back to older compatible CUDA/ROCm capabilities.  For example, on
 `sm120`, if no `sm120` heuristic exists, an `sm100` heuristic file can be used.
@@ -180,7 +211,7 @@ nightly workflow fetches, builds, and verifies those revisions automatically.
 These kernels ship pretuned heuristics for specific GPU architectures.  To add
 another GPU, run the AOT autotune workflow on that hardware against the kernel;
 the runner emits a new
-`_helion_aot_<kernel>_<device>_<cc>.py` next to the kernel source, which
+`_helion_aot_<source_stem>_<device>_<cc>.py` next to the kernel source, which
 you commit alongside the existing one(s).  Helion picks the right one at
 runtime based on the running GPU's compute capability (with fallback to
 older compatible capabilities, e.g. `sm120` → `sm100`).

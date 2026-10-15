@@ -6,6 +6,7 @@ the hardware where each kernel's checked-in heuristics apply.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import importlib.util
 import inspect
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._hardware import HardwareInfo
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
@@ -36,6 +38,10 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessBackends
+from helion.autotuner.aot_cache import clear_heuristic_cache
+from helion.autotuner.aot_cache import find_heuristic_file
+from helion.autotuner.aot_kernel import HeuristicKeyFunction
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1108,9 +1114,433 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
 
+def _scaled_mm_cute_cpu_args(
+    m: int, k: int, n: int, mode: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Empty CPU arguments with the scale views that ``scaled_mm()`` passes."""
+    mode_a, mode_b = mode.split("-")
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn).T
+    scale_a = torch.empty((m,) if mode_a == "token" and m > 1 else ())
+    scale_b = torch.empty((n,) if mode_b == "channel" else ())
+    return a, b, scale_a, scale_b
+
+
+@pytest.mark.parametrize("index", range(20))
+def test_scaled_mm_cute_dispatch(index: int) -> None:
+    """Shape dispatch swaps only the transposed kernel's input views."""
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    m, k, n, mode = module.CASES[index]
+    a, b, scale_a, scale_b = _scaled_mm_cute_cpu_args(m, k, n, mode)
+    # Exercise the public wrapper's scalar normalization rather than providing
+    # the already normalized scalar views used by the codegen test below.
+    scale_a = scale_a.reshape(-1)
+    scale_b = scale_b.reshape(-1)
+    result = torch.empty(0)
+    with (
+        patch.object(module, "_device_capability", return_value=(10, 3)),
+        patch.object(module, "scaled_mm_cute_sm103", return_value=result) as regular,
+        patch.object(module, "scaled_mm_skinny_cute", return_value=result) as skinny,
+        patch.object(
+            module, "scaled_mm_transposed_cute", return_value=result
+        ) as transposed,
+    ):
+        assert module.scaled_mm(a, b, scale_a, scale_b) is result
+    if m == 1:
+        selected = skinny
+        assert not regular.called and not transposed.called
+    elif (m, k, n) == (256, 4096, 2048):
+        selected = transposed
+        assert not regular.called and not skinny.called
+    else:
+        selected = regular
+        assert not skinny.called and not transposed.called
+    selected.assert_called_once()
+    received_a, received_b, received_sa, received_sb = selected.call_args.args
+    if selected is transposed:
+        assert received_a.shape == (n, k) and received_a.stride() == b.T.stride()
+        assert received_b.shape == (k, m) and received_b.stride() == a.T.stride()
+        assert torch._C._is_alias_of(received_a, b)
+        assert torch._C._is_alias_of(received_b, a)
+    else:
+        assert received_a is a and received_b is b
+    assert received_sa.shape == (() if scale_a.numel() == 1 else (m,))
+    assert received_sb.shape == (() if scale_b.numel() == 1 else (n,))
+    assert torch._C._is_alias_of(received_sa, scale_a)
+    assert torch._C._is_alias_of(received_sb, scale_b)
+
+
+@pytest.mark.parametrize(
+    "shape", [(256, 4096, 4096), (128, 4096, 2048), (256, 2048, 2048)]
+)
+def test_scaled_mm_cute_dispatch_requires_exact_transposed_shape(
+    shape: tuple[int, int, int],
+) -> None:
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    args = _scaled_mm_cute_cpu_args(*shape, "token-channel")
+    with (
+        patch.object(module, "_device_capability", return_value=(10, 3)),
+        patch.object(module, "scaled_mm_cute_sm103") as regular,
+        patch.object(module, "scaled_mm_transposed_cute") as transposed,
+    ):
+        module.scaled_mm(*args)
+    regular.assert_called_once()
+    transposed.assert_not_called()
+
+
+@pytest.mark.parametrize("index", range(45))
+def test_scaled_mm_cute_b200_dispatch_preserves_shapes(index: int) -> None:
+    """All existing B200 shapes still dispatch to their measured kernel body."""
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    assert len(module.B200_SHAPES) == 45
+    m, k, n = module.B200_SHAPES[index]
+    a, b, scale_a, scale_b = _scaled_mm_cute_cpu_args(m, k, n, "token-channel")
+    scale_a = scale_a.reshape(m, 1).expand(m, n)
+    result = torch.empty(0)
+    with (
+        patch.object(module, "_device_capability", return_value=(10, 0)),
+        patch.object(module, "scaled_mm_cute", return_value=result) as regular,
+        patch.object(module, "scaled_mm_cute_skinny_m", return_value=result) as skinny,
+        patch.object(module, "scaled_mm_cute_swap_ab", return_value=result) as swapped,
+        patch.object(module, "scaled_mm_cute_sm103") as gb300,
+    ):
+        assert module.scaled_mm(a, b, scale_a, scale_b) is result
+    if m == 1:
+        selected = skinny
+        assert not regular.called and not swapped.called
+    elif (m, k, n) in module._SWAP_AB_SHAPES:
+        selected = swapped
+        assert not regular.called and not skinny.called
+    else:
+        selected = regular
+        assert not skinny.called and not swapped.called
+    selected.assert_called_once()
+    gb300.assert_not_called()
+    received_a, received_b, received_sa, received_sb = selected.call_args.args
+    assert received_a is a and received_b is b
+    assert received_sa.shape == ((m,) if selected is swapped else (m, n))
+    assert received_sb.shape == (n,)
+    assert torch._C._is_alias_of(received_sa, scale_a)
+    assert torch._C._is_alias_of(received_sb, scale_b)
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("layout", ["vector", "row-column", "row-broadcast"])
+@pytest.mark.parametrize(
+    "shape", [(1, 4096, 4096), (64, 4096, 4096), (256, 4096, 2048)]
+)
+def test_scaled_mm_cute_normalizes_scale_views(
+    capability: tuple[int, int], layout: str, shape: tuple[int, int, int]
+) -> None:
+    """Legacy row scales and new vector scales keep their values and storage."""
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    m, k, n = shape
+    a, b, _sa, _sb = _scaled_mm_cute_cpu_args(m, k, n, "token-channel")
+    rows = torch.arange(m, dtype=torch.float32) + 0.5
+    columns = torch.arange(n, dtype=torch.float32) + 0.25
+    if layout == "vector":
+        scale_a, scale_b = rows, columns
+    elif layout == "row-column":
+        scale_a, scale_b = rows[:, None], columns[None, :]
+    else:
+        scale_a, scale_b = rows[:, None].expand(m, n), columns
+    if capability == (10, 0):
+        name = "scaled_mm_cute_skinny_m" if m == 1 else "scaled_mm_cute"
+    elif m == 1:
+        name = "scaled_mm_skinny_cute"
+    elif m == 256:
+        name = "scaled_mm_transposed_cute"
+    else:
+        name = "scaled_mm_cute_sm103"
+    with (
+        patch.object(module, "_device_capability", return_value=capability),
+        patch.object(module, name) as implementation,
+    ):
+        module.scaled_mm(a, b, scale_a, scale_b)
+    implementation.assert_called_once()
+    _a, _b, received_sa, received_sb = implementation.call_args.args
+    if capability == (10, 0):
+        assert received_sa.shape == (m, n) and received_sa.stride(1) == 0
+        torch.testing.assert_close(received_sa[:, 0], rows)
+    else:
+        assert received_sa.shape == (() if m == 1 else (m,))
+        torch.testing.assert_close(received_sa, rows.reshape(()) if m == 1 else rows)
+    torch.testing.assert_close(received_sb, columns)
+    assert torch._C._is_alias_of(received_sa, scale_a)
+    assert torch._C._is_alias_of(received_sb, scale_b)
+
+
+@pytest.mark.parametrize("mode", ["tensor-tensor", "tensor-channel", "token-tensor"])
+def test_scaled_mm_cute_b200_accepts_scalar_scales(mode: str) -> None:
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    m, k, n = 64, 4096, 4096
+    args = _scaled_mm_cute_cpu_args(m, k, n, mode)
+    scale_a = torch.full_like(args[2], 0.5)
+    scale_b = torch.full_like(args[3], 0.25)
+    with (
+        patch.object(module, "_device_capability", return_value=(10, 0)),
+        patch.object(module, "scaled_mm_cute") as implementation,
+    ):
+        module.scaled_mm(*args[:2], scale_a, scale_b)
+    _a, _b, received_sa, received_sb = implementation.call_args.args
+    assert received_sa.shape == (m, n)
+    assert received_sb.shape == (n,)
+    torch.testing.assert_close(received_sa, torch.full((m, n), 0.5))
+    torch.testing.assert_close(received_sb, torch.full((n,), 0.25))
+    assert torch._C._is_alias_of(received_sa, scale_a)
+    assert torch._C._is_alias_of(received_sb, scale_b)
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 1), (11, 0)])
+def test_scaled_mm_cute_rejects_unpretuned_architecture(
+    capability: tuple[int, int],
+) -> None:
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    args = _scaled_mm_cute_cpu_args(64, 4096, 4096, "token-channel")
+    with (
+        patch.object(module, "_device_capability", return_value=capability),
+        pytest.raises(ValueError, match="no pretuned kernels"),
+    ):
+        module.scaled_mm(*args)
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_scaled_mm_cute_rejects_scale_a_that_varies_across_columns(
+    capability: tuple[int, int],
+) -> None:
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    a, b, _sa, scale_b = _scaled_mm_cute_cpu_args(64, 4096, 4096, "token-channel")
+    scale_a = torch.empty((64, 4096))
+    with (
+        patch.object(module, "_device_capability", return_value=capability),
+        pytest.raises(AssertionError, match="broadcast across N"),
+    ):
+        module.scaled_mm(a, b, scale_a, scale_b)
+
+
+def test_scaled_mm_cute_b200_exact_config_coverage() -> None:
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    heuristic = _import_pretuned_heuristic("scaled_mm_cute", "sm100")
+    table_shapes = set()
+    for name, expected_count in (
+        ("scaled_mm_cute", 15),
+        ("scaled_mm_cute_skinny_m", 2),
+        ("scaled_mm_cute_swap_ab", 31),
+    ):
+        keys = getattr(heuristic, f"_KEYS_{name}")
+        configs = getattr(heuristic, f"_CONFIGS_{name}")
+        assert len(keys) == len(configs) == expected_count
+        assert len(set(keys)) == expected_count
+        table_shapes.update(keys)
+    assert table_shapes == set(module.B200_SHAPES)
+
+
+def test_scaled_mm_cute_has_one_registry_entry_and_both_architectures() -> None:
+    path = PRETUNED_KERNELS_DIR / "run.py"
+    spec = importlib.util.spec_from_file_location("_scaled_mm_pretuned_runner", path)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    assert runner.KERNELS.count("scaled_mm_cute") == 1
+    assert "scale_mm_cute" not in runner.KERNELS
+    assert not (PRETUNED_KERNELS_DIR / "scale_mm_cute").exists()
+    assert runner._supported_hardware("scaled_mm_cute") == {
+        "b200",
+        runner._HARDWARE_BY_COMPUTE.get("sm103", "sm103"),
+    }
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    assert set(module.SHAPES) == set(module.B200_SHAPES) | set(module.GB300_SHAPES)
+    assert module.GB300_SHAPES == (
+        (1, 4096, 4096),
+        (64, 4096, 4096),
+        (256, 4096, 2048),
+        (128, 2880, 5120),
+        (4096, 4096, 2880),
+    )
+    assert set(module.CASES) == {
+        (*shape, mode) for shape in module.GB300_SHAPES for mode in module.SCALE_MODES
+    }
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    ("name", "index"),
+    [
+        (name, index)
+        for name, count in (
+            ("scaled_mm_cute", 15),
+            ("scaled_mm_cute_skinny_m", 2),
+            ("scaled_mm_cute_swap_ab", 31),
+        )
+        for index in range(count)
+    ],
+)
+def test_scaled_mm_cute_b200_configs_generate(name: str, index: int) -> None:
+    """All existing B200 configs resolve the renamed AOT shim and generate."""
+    from test._cute_binding import _forbid_cuda_work
+    from test._cute_dense_tcgen05 import cpu_codegen_target
+
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    heuristic = _import_pretuned_heuristic("scaled_mm_cute", "sm100")
+    key = getattr(heuristic, f"_KEYS_{name}")[index]
+    m, k, n = key
+    a, b, scale_a, scale_b = _scaled_mm_cute_cpu_args(m, k, n, "token-channel")
+    scale_a = (
+        scale_a.reshape(m)
+        if name == "scaled_mm_cute_swap_ab"
+        else scale_a.reshape(m, 1).expand(m, n)
+    )
+    args = (a, b, scale_a, scale_b)
+    assert getattr(heuristic, f"key_{name}")(*args) == index
+    config = getattr(heuristic, f"autotune_{name}")(*args)
+    assert config == getattr(heuristic, f"_CONFIGS_{name}")[index]
+    b200 = HardwareInfo("cuda", "NVIDIA B200", "13.0", "sm100")
+    clear_heuristic_cache()
+    HeuristicKeyFunction.clear_cache()
+    try:
+        with patch("helion.autotuner.aot_cache.get_hardware_info", return_value=b200):
+            found = find_heuristic_file(module.__file__, kernel_name=name)
+            with cpu_codegen_target(), _forbid_cuda_work():
+                source = getattr(module, name)._bind_isolated(args).to_code(config)
+    finally:
+        clear_heuristic_cache()
+        HeuristicKeyFunction.clear_cache()
+    assert found is not None
+    assert found.name == "_helion_aot_scaled_mm_cute_cuda_sm100.py"
+    assert f"def {name}(" in source
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("index", range(20))
+def test_scaled_mm_cute_gb300_configs_generate(index: int) -> None:
+    """Each GB300 case finds the shared heuristic, its exact config, and codegen."""
+    # CuTe-only CPU fixtures; importing them here keeps them out of the Triton job.
+    from test._cute_binding import _forbid_cuda_work
+    from test._cute_dense_tcgen05 import gb300_target
+    from test._cute_dense_tcgen05 import wrapper_plans
+
+    module = _import_pretuned_kernel_module("scaled_mm_cute")
+    heuristic = _import_pretuned_heuristic("scaled_mm_cute", "sm103")
+    assert len(module.CASES) == 20
+    m, k, n, mode = module.CASES[index]
+    args = _scaled_mm_cute_cpu_args(m, k, n, mode)
+    if m == 1:
+        name = "scaled_mm_skinny_cute"
+    elif (m, k, n) == (256, 4096, 2048):
+        name = "scaled_mm_transposed_cute"
+        args = (args[1].T, args[0].T, *args[2:])
+        assert (
+            heuristic._transposed_key(args) in heuristic._KEYS_scaled_mm_transposed_cute
+        )
+    else:
+        name = "scaled_mm_cute_sm103"
+        assert heuristic._key(args) in heuristic._KEYS_scaled_mm_cute_sm103
+    config = getattr(heuristic, f"autotune_{name}")(*args)
+    gb300 = HardwareInfo("cuda", "NVIDIA GB300", "13.0", "sm103")
+    # Binding resolves the AOT key function through aot_cache's hardware lookup.
+    # Patch that lookup for the whole test so the fake GB300 never reaches the
+    # cached helion._hardware.get_hardware_info, and leave no cached heuristic.
+    clear_heuristic_cache()
+    HeuristicKeyFunction.clear_cache()
+    try:
+        with patch("helion.autotuner.aot_cache.get_hardware_info", return_value=gb300):
+            found = find_heuristic_file(module.__file__, kernel_name=name)
+            with gb300_target(), _forbid_cuda_work():
+                source = getattr(module, name)._bind_isolated(args).to_code(config)
+    finally:
+        clear_heuristic_cache()
+        HeuristicKeyFunction.clear_cache()
+    assert found is not None
+    assert found.name == "_helion_aot_scaled_mm_cute_cuda_sm103.py"
+    assert f"def {name}(" in source
+    if name == "scaled_mm_transposed_cute":
+        assert config["block_sizes"] == [128, 64, 256]
+        assert config["tcgen05_cta_group"] == "two"
+        assert config["tcgen05_ab_stages"] == 8
+        assert config["tcgen05_acc_stages"] == (2 if mode == "tensor-tensor" else 1)
+        assert "tcgen05_orientation" not in config
+        assert "PipelineTmaUmma" in source
+        assert "PipelineTmaStore.create" in source
+        assert "LayoutEnum.COL_MAJOR" in source
+        assert "epilogue_smem_copy_and_partition(" in source
+        ab, output = wrapper_plans(source)
+        assert (ab["lhs_idx"], ab["rhs_idx"]) == (0, 1)
+        assert (ab["bm"], ab["bn"], ab["bk"]) == (128, 64, 256)
+        assert ab["ab_stage_count"] == 8
+        assert output["d_column_major"]
+        assert output["rank3_mnl_tensor"]
+        k_ranges = [
+            node.iter
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "tile_offset_2"
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Attribute)
+            and node.iter.func.attr == "range"
+        ]
+        assert len(k_ranges) == 2  # The TMA producer and MMA consumer K loops.
+        assert all(
+            any(
+                option.arg == "unroll"
+                and isinstance(option.value, ast.Constant)
+                and option.value.value == 1
+                for option in loop_range.keywords
+            )
+            for loop_range in k_ranges
+        )
+
+
 @onlyBackends(["cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedCuteCodegen(TestCase):
+    def test_scaled_mm_cute_gb300_correctness(self) -> None:
+        """All transposed scale modes plus one mode for every other tuned shape."""
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 3):
+            self.skipTest("scaled_mm_cute is pretuned for NVIDIA SM103 (GB300).")
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
+        cases = (
+            (1, 4096, 4096, "tensor-channel"),
+            (64, 4096, 4096, "token-tensor"),
+            (128, 2880, 5120, "tensor-tensor"),
+            (4096, 4096, 2880, "tensor-channel"),
+            *((256, 4096, 2048, mode) for mode in module.SCALE_MODES),
+        )
+        for m, k, n, mode in cases:
+            with self.subTest(case=(m, k, n, mode)):
+                a, b, scale_a, scale_b = module._make_inputs(m, k, n, mode)
+                out = module.scaled_mm(a, b, scale_a, scale_b)
+                assert out.shape == (m, n) and out.is_contiguous()
+                ref = (
+                    (a.double() @ b.double())
+                    * scale_a.double().reshape(-1, 1)
+                    * scale_b.double().reshape(1, -1)
+                )
+                torch.testing.assert_close(
+                    out, ref.to(torch.bfloat16), atol=5e-2, rtol=2e-2
+                )
+
+    def test_scaled_mm_cute_gb300_legacy_scale_views_correctness(self) -> None:
+        """Legacy row-broadcast scales work in skinny, regular and transposed GEMMs."""
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 3):
+            self.skipTest("scaled_mm_cute is pretuned for NVIDIA SM103 (GB300).")
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
+        for m, k, n in ((1, 4096, 4096), (64, 4096, 4096), (256, 4096, 2048)):
+            with self.subTest(shape=(m, k, n)):
+                a, b, scale_a, scale_b = module._make_inputs(m, k, n, "token-channel")
+                legacy_sa = scale_a.reshape(m, 1).expand(m, n)
+                legacy_sb = scale_b.reshape(1, n)
+                out = module.scaled_mm(a, b, legacy_sa, legacy_sb)
+                assert out.shape == (m, n) and out.is_contiguous()
+                ref = (
+                    (a.double() @ b.double())
+                    * scale_a.double().reshape(m, 1)
+                    * scale_b.double().reshape(1, n)
+                )
+                torch.testing.assert_close(
+                    out, ref.to(torch.bfloat16), atol=5e-2, rtol=2e-2
+                )
+
     def test_grouped_gemm_deepgemm_aot_global_tile_extent(self) -> None:
         """Exercise the AOT module's TILE_M source, not a literal tile extent."""
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
@@ -1162,13 +1592,13 @@ class TestPretunedCuteCodegen(TestCase):
                 self.assertIn(name, runner.KERNELS)
                 self.assertEqual(runner._supported_hardware(name), {"b200"})
 
-    def test_scale_mm_pretuned_explicit_epilogue_configs(self) -> None:
+    def test_scaled_mm_pretuned_explicit_epilogue_configs(self) -> None:
         path = (
             PRETUNED_KERNELS_DIR
-            / "scale_mm_cute"
-            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+            / "scaled_mm_cute"
+            / "_helion_aot_scaled_mm_cute_cuda_sm100.py"
         )
-        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        spec = importlib.util.spec_from_file_location("_scaled_mm_cute_aot", path)
         assert spec is not None and spec.loader is not None
         heuristic = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(heuristic)
@@ -1182,8 +1612,8 @@ class TestPretunedCuteCodegen(TestCase):
         explicit_configs = {
             tuple(shape): config
             for shape, config in zip(
-                heuristic._KEYS_scale_mm_cute,
-                heuristic._CONFIGS_scale_mm_cute,
+                heuristic._KEYS_scaled_mm_cute,
+                heuristic._CONFIGS_scaled_mm_cute,
                 strict=True,
             )
             if config.get("tcgen05_layout_strategy") == "explicit_epi_tile"
@@ -1200,23 +1630,23 @@ class TestPretunedCuteCodegen(TestCase):
                     expected_layouts[shape],
                 )
 
-    def test_scale_mm_pretuned_swap_ab_aux_load_placement(self) -> None:
+    def test_scaled_mm_pretuned_swap_ab_aux_load_placement(self) -> None:
         """Checked-in M=16/32 configs opt into pre-wait auxiliary loads."""
 
         path = (
             PRETUNED_KERNELS_DIR
-            / "scale_mm_cute"
-            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+            / "scaled_mm_cute"
+            / "_helion_aot_scaled_mm_cute_cuda_sm100.py"
         )
-        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        spec = importlib.util.spec_from_file_location("_scaled_mm_cute_aot", path)
         assert spec is not None and spec.loader is not None
         heuristic = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(heuristic)
 
         configs = dict(
             zip(
-                heuristic._KEYS_scale_mm_cute_swap_ab,
-                heuristic._CONFIGS_scale_mm_cute_swap_ab,
+                heuristic._KEYS_scaled_mm_cute_swap_ab,
+                heuristic._CONFIGS_scaled_mm_cute_swap_ab,
                 strict=True,
             )
         )
@@ -1225,30 +1655,30 @@ class TestPretunedCuteCodegen(TestCase):
         for config in selected:
             self.assertEqual(config["tcgen05_aux_load_placement"], "pre_acc_wait")
 
-    def test_scale_mm_pretuned_swapped_configs(self) -> None:
+    def test_scaled_mm_pretuned_swapped_configs(self) -> None:
         path = (
             PRETUNED_KERNELS_DIR
-            / "scale_mm_cute"
-            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+            / "scaled_mm_cute"
+            / "_helion_aot_scaled_mm_cute_cuda_sm100.py"
         )
-        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        spec = importlib.util.spec_from_file_location("_scaled_mm_cute_aot", path)
         assert spec is not None and spec.loader is not None
         heuristic = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(heuristic)
-        module = _import_pretuned_kernel_module("scale_mm_cute")
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
 
         configs = dict(
             zip(
-                heuristic._KEYS_scale_mm_cute_swap_ab,
-                heuristic._CONFIGS_scale_mm_cute_swap_ab,
+                heuristic._KEYS_scaled_mm_cute_swap_ab,
+                heuristic._CONFIGS_scaled_mm_cute_swap_ab,
                 strict=True,
             )
         )
         self.assertEqual(set(configs), module._SWAP_AB_SHAPES)
 
-    def test_scale_mm_explicit_epilogue_tile(self) -> None:
-        module = _import_pretuned_kernel_module("scale_mm_cute")
-        args = module._make_inputs(64, 128, 64)
+    def test_scaled_mm_explicit_epilogue_tile(self) -> None:
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
+        args = module._make_inputs_sm100(64, 128, 64)
         config = helion.Config(
             block_sizes=[64, 64, 128],
             l2_groupings=[1],
@@ -1269,7 +1699,7 @@ class TestPretunedCuteCodegen(TestCase):
         )
 
         with patch_cute_mma_support():
-            bound = module.scale_mm_cute.bind(args)
+            bound = module.scaled_mm_cute.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
             bound.set_config(config)
@@ -1280,18 +1710,18 @@ class TestPretunedCuteCodegen(TestCase):
             code,
         )
         torch.testing.assert_close(
-            out, module._scale_mm_torch(*args), atol=2e-1, rtol=1e-2
+            out, module._scaled_mm_torch_sm100(*args), atol=2e-1, rtol=1e-2
         )
 
-    def test_scale_mm_swap_ab_small_n(self) -> None:
+    def test_scaled_mm_swap_ab_small_n(self) -> None:
         """The swapped small-N path compiles and preserves exact FP8 results."""
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f8:
             self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
 
-        module = _import_pretuned_kernel_module("scale_mm_cute")
-        x, y, scale_a, scale_b = module._make_inputs(2, 4096, 256)
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs_sm100(2, 4096, 256)
         swap_args = (x, y, scale_a[:, 0], scale_b)
         config = helion.Config(
             block_sizes=[64, 16, 256],
@@ -1307,11 +1737,11 @@ class TestPretunedCuteCodegen(TestCase):
             tcgen05_l2_swizzle_size=1,
             tcgen05_persistence_model="static_persistent",
         )
-        bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+        bound = module.scaled_mm_cute_swap_ab.bind(swap_args)
         code = bound.to_triton_code(config)
         bound.set_config(config)
         actual = bound(*swap_args)
-        expected = module._scale_mm_torch(x, y, scale_a, scale_b)
+        expected = module._scaled_mm_torch_sm100(x, y, scale_a, scale_b)
 
         aux0_loaded = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
         aux1_loaded = code.index("tcgen05_aux_loaded_1 = tcgen05_aux_rmem_1.load()")
@@ -1334,10 +1764,10 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertNotIn(".advance_to_next_work()", code)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
+    def test_scaled_mm_one_shot_uses_target_sm_count(self) -> None:
         """One-shot codegen follows the compile target's actual SM count."""
 
-        module = _import_pretuned_kernel_module("scale_mm_cute")
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
         m, k, n = 64, 5120, 5120
         x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
         y = torch.empty((n, k), device=DEVICE, dtype=torch.float8_e4m3fn).T
@@ -1360,7 +1790,7 @@ class TestPretunedCuteCodegen(TestCase):
         )
 
         with patch_cute_mma_support():
-            bound = module.scale_mm_cute.bind(args)
+            bound = module.scaled_mm_cute.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.num_sm = 80
             one_shot_code = bound.to_triton_code(config)
@@ -1388,11 +1818,11 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
 
-    def test_scale_mm_n_edge_one_shot_is_automatic(self) -> None:
+    def test_scaled_mm_n_edge_one_shot_is_automatic(self) -> None:
         """A one-wave FP8 N-edge grid automatically uses one-shot scheduling."""
 
-        module = _import_pretuned_kernel_module("scale_mm_cute")
-        x, y, scale_a, scale_b = module._make_inputs(2, 4096, 256)
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs_sm100(2, 4096, 256)
         args = (x, y, scale_a[:, 0], scale_b)
         config_values = {
             "block_sizes": [64, 16, 256],
@@ -1410,7 +1840,7 @@ class TestPretunedCuteCodegen(TestCase):
         }
 
         with patch_cute_mma_support():
-            bound = module.scale_mm_cute_swap_ab.bind(args)
+            bound = module.scaled_mm_cute_swap_ab.bind(args)
             original_search_enabled = bound.env.config_spec.cute_tcgen05_search_enabled
             original_num_sm = bound.env.config_spec.num_sm
             try:
@@ -1429,11 +1859,11 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertNotIn(role_loop, one_shot_code)
         self.assertIn(role_loop, persistent_code)
 
-    def test_scale_mm_swap_ab_aux_load_placement(self) -> None:
+    def test_scaled_mm_swap_ab_aux_load_placement(self) -> None:
         """The placement config hoists full-tile SIMT scale loads."""
 
-        module = _import_pretuned_kernel_module("scale_mm_cute")
-        x, y, scale_a, scale_b = module._make_inputs(16, 4096, 256)
+        module = _import_pretuned_kernel_module("scaled_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs_sm100(16, 4096, 256)
         swap_args = (x, y, scale_a[:, 0], scale_b)
         base = {
             "block_sizes": [64, 16, 256],
@@ -1450,7 +1880,7 @@ class TestPretunedCuteCodegen(TestCase):
             "tcgen05_persistence_model": "static_persistent",
         }
         with patch_cute_mma_support():
-            bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+            bound = module.scaled_mm_cute_swap_ab.bind(swap_args)
             codes = {
                 placement: bound.to_triton_code(
                     helion.Config(
