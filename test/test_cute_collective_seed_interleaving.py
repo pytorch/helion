@@ -14,6 +14,7 @@ from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
 from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
+from test.test_cute_collective_warp_tf32 import _seeded_fp32
 from test.test_cute_gathered_mma_codegen import _bound as _gathered_bound
 
 import helion
@@ -244,17 +245,12 @@ def test_initial_population_uses_config_provenance_not_parameter_spelling(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _ordinary_matmul(
-    a: torch.Tensor, b: torch.Tensor, seed: torch.Tensor | None = None
-) -> torch.Tensor:
+def _ordinary_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     n = b.size(1)
     out = torch.empty((m, n), dtype=a.dtype, device=a.device)
     for row, column in hl.tile([m, n]):
-        if seed is None:
-            acc = hl.zeros([row, column], dtype=torch.float32)
-        else:
-            acc = seed[row, column]
+        acc = hl.zeros([row, column], dtype=torch.float32)
         for inner in hl.tile(k):
             acc = torch.addmm(acc, a[row, inner], b[inner, column])
         out[row, column] = acc.to(out.dtype)
@@ -327,14 +323,17 @@ def test_nonzero_accumulator_reaches_native_seed_schedules(dtype: torch.dtype) -
         torch.empty((512, 256), dtype=dtype),
         torch.empty((128, 256), dtype=torch.float32),
     )
-    bound = _cpu_bind(_ordinary_matmul, args)
+    bound = _cpu_bind(_seeded_fp32, args)
     legacy = _initial_population(bound, args, seeds=_legacy_registered_seeds(bound))
     assert not any(seed.get("cute_collective_tmem_seed") for seed in legacy)
     population = _initial_population(bound, args)
     native = [
         seed for seed in population if seed.get("cute_collective_compute") == "tcgen05"
     ]
-    assert not any(seed.get("cute_collective_tmem_a") for seed in population)
+    assert not any(
+        seed.get("cute_collective_tmem_a")
+        for seed in bound.config_spec.compiler_seed_configs
+    )
     for key in ("cute_collective_native_seeded", "cute_collective_tmem_seed"):
         assert {seed.get(key, False) for seed in native} == {False, True}
 
