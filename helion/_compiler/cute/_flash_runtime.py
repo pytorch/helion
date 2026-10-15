@@ -6,6 +6,7 @@
 # generated Helion module DOES carry ``from __future__ import annotations`` at
 # its top, so the struct + the inline-traced rescale helper must live here, in a
 # real module compiled without that flag, and be imported by the generated code.
+from collections.abc import Sequence
 from dataclasses import dataclass
 import functools
 from functools import partial
@@ -132,6 +133,10 @@ def flash_fa4_shared_storage(
     separate_kv: bool = False,
     kv_tile_n: int = 128,
     kv_cta_group_size: int = 1,
+    head_dim_v: int | None = None,
+    uneven_kv_ring: bool = False,
+    flex_aux_bytes: int = 0,
+    flex_coop_bytes: int = 0,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -155,14 +160,44 @@ def flash_fa4_shared_storage(
     Allocate its per-CTA extent, matching make_smem_layout_b. Query/output
     storage stays local and is unchanged. A two-CTA cluster using local MMA
     still passes kv_cta_group_size=1.
+    ``head_dim_v`` is the V/O head dim when it differs from the Q/K
+    ``head_dim`` (the 192/128 MLA pair): sQ keeps ``head_dim``, every aliased
+    K/V slot is the wider tile (V's TMA box lands at the K stage stride), and
+    the separate V ring / ``sO`` follow the V width. ``uneven_kv_ring`` is
+    FA4's three-slot [wide, narrow, wide] aliased ring for that pair: the
+    stage stride is half a K plus half a V tile and the ring ends one wide
+    tile after the last stride (see ``uneven_kv_ring_slot``). ``flex_aux_bytes``
+    (a multiple of 16) is the flex hook's shared-memory aux staging region
+    (``sFlexAux``, the staged tables back to back, each padded with a zero
+    sentinel element), filled once per CTA at the setup; it sits in the
+    alignment padding below ``sQ`` when it fits there.  ``flex_coop_bytes``
+    (a multiple of 16) is the hook's warp-cooperative table-load staging
+    (``sFlexCoop``: one 32-row buffer per softmax warp, see
+    ``flex_score_mod_runtime.coop_exchange``).
     """
     assert kv_cta_group_size in (1, 2)
     assert kv_tile_n % kv_cta_group_size == 0
+    flex_aux_words = flex_aux_bytes // 4
+    if head_dim_v is None:
+        head_dim_v = head_dim
+    kv_slot_dim = max(head_dim, head_dim_v)
     softmax_threads = 128
-    kv_elements = kv_tile_n * head_dim * kv_stage // kv_cta_group_size
+    k_elements = kv_tile_n * head_dim * kv_stage // kv_cta_group_size
+    v_elements = kv_tile_n * head_dim_v * kv_stage // kv_cta_group_size
+    if uneven_kv_ring:
+        # The pair's one-CTA ring: no cooperative partition of the slots.
+        assert not separate_kv
+        assert head_dim_v != head_dim
+        assert kv_cta_group_size == 1
+        kv_ring_elems = (
+            kv_tile_n * (head_dim + head_dim_v) // 2 * (kv_stage - 1)
+            + kv_tile_n * kv_slot_dim
+        )
+    else:
+        kv_ring_elems = kv_tile_n * kv_slot_dim * kv_stage // kv_cta_group_size
     clc_response_size = clc_stages * 4 if use_clc_scheduler else 0
     clc_mbar_size = clc_stages * 2 if use_clc_scheduler else 0
-    separate_o_size = 128 * head_dim * 2 if epi_tma else 0
+    separate_o_size = 128 * head_dim_v * 2 if epi_tma else 0
 
     if separate_kv:
 
@@ -190,11 +225,21 @@ def flash_fa4_shared_storage(
             ]
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+            # The flex hook's staged aux tables: declared before the
+            # 1024-aligned tiles so a small region lives in the alignment
+            # padding below ``sQ`` instead of growing the dynamic shared
+            # memory (crossing a carveout step costs L1 capacity).
+            sFlexAux: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+            ]
+            sFlexCoop: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, flex_coop_bytes], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
-            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
-            sV: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, k_elements], 1024]
+            sV: cute.struct.Align[cute.struct.MemRange[dtype, v_elements], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
         return SharedStorage
@@ -232,11 +277,20 @@ def flash_fa4_shared_storage(
             clc_response: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
             ]
+            # See the separate-KV struct: in the padding below ``sQ``.
+            sFlexAux: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+            ]
+            sFlexCoop: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, flex_coop_bytes], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
-            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
-            sO: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim * 2], 1024]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
+            sO: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim_v * 2], 1024
+            ]
 
         return SharedStorage
 
@@ -270,12 +324,43 @@ def flash_fa4_shared_storage(
         clc_response: cute.struct.Align[
             cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
         ]
+        # See the separate-KV struct: in the padding below ``sQ``.
+        sFlexAux: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+        ]
+        sFlexCoop: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int8, flex_coop_bytes], 16
+        ]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
-        sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_elements], 1024]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, kv_ring_elems], 1024]
 
     return SharedStorage
+
+
+@cute.jit
+def uneven_kv_ring_slot(
+    slot: cute.Tensor, index: cutlass.Int32, shift_elems: int
+) -> cute.Tensor:
+    """Address an operand's slot of FA4's uneven [wide, narrow, wide] K/V ring.
+
+    ``slot`` is the ring tensor already sliced at stage ``index`` with the
+    uneven stage stride (half a K plus half a V tile). The even slots sit at
+    their strided addresses; the odd slot is shifted by half the width
+    difference toward the operand it holds: ``shift_elems`` is positive for
+    the narrow operand (V, which fills the middle) and negative for the wide
+    one (K, which reaches back into the previous round's drained K bytes).
+    K and V alternate through the ring and the depth is odd, so which operand
+    a slot holds is fixed by the operand of the load, not by the round. The
+    shift is a whole number of 1024-byte swizzle periods (checked by the
+    schedule), so the swizzled pointer stays valid.
+    """
+    # ``divby=512`` elements is the 1024-byte swizzle period of the 2-byte
+    # operands: it tells the DSL the shifted pointer keeps the alignment the
+    # swizzled layout (and the TMA / descriptor consumers) assume.
+    offset = cute.assume((index & 1) * shift_elems, divby=512)
+    return cute.make_tensor(slot.iterator + offset, slot.layout)
 
 
 @functools.cache
@@ -1205,6 +1290,58 @@ def add_score_bias_t2r_contiguous(
             )
 
 
+def _add_affine_bias_t2r_hoisted(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    slope_scaled: Float32,
+    *,
+    packed: bool,
+) -> None:
+    """Add ``(key - query) * slope_scaled`` to a one-row score fragment.
+
+    The per-fragment base ``(col0 - row) * slope_scaled`` is computed once;
+    element ``i`` then adds ``fma(offset_i, slope_scaled, base)`` where
+    ``offset_i = coord[i][1] - coord[0][1]`` is the fragment's own column
+    offset. The t2r coordinates are a per-thread dynamic base plus a static
+    per-element offset, so the difference folds to a constant and the
+    per-element work is pure FP32: one FFMA with an immediate plus one FADD
+    (``packed=False``) or, per column pair, one packed FFMA over a constant
+    register pair plus one packed FADD (``packed=True``). Both forms evaluate
+    the same two IEEE operations in the same order per element (the packed
+    f32x2 ops round each lane like their scalar twins), so their outputs are
+    bitwise identical and the autotuner may choose between them freely; the
+    scalar form wins on the 128-column whole-row bodies (no constant register
+    pairs), the packed form on the 32-column chunked fa4 disc body.
+    """
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    score = cast("Any", tLDrS)
+    coord = cast("Any", tLDcS)
+    col0 = coord[0][1] + n_block * 128
+    base = cutlass.Float32(col0 - row_idx) * slope_scaled
+    n = cute.size(tLDrS)
+    offsets = [cutlass.Float32(coord[i][1] - coord[0][1]) for i in range(n)]
+    if not packed:
+        for i in range(n):
+            score[i] = cutlass.Float32(score[i]) + cute.math.fma(
+                offsets[i], slope_scaled, base
+            )
+        return
+    assert n % 2 == 0, "packed affine bias needs an even fragment"
+    for i in range(0, n, 2):
+        b0, b1 = cute.arch.fma_packed_f32x2(
+            (offsets[i], offsets[i + 1]),
+            (slope_scaled, slope_scaled),
+            (base, base),
+        )
+        s0, s1 = cute.arch.add_packed_f32x2(
+            (cutlass.Float32(score[i]), cutlass.Float32(score[i + 1])), (b0, b1)
+        )
+        score[i] = s0
+        score[i + 1] = s1
+
+
 def add_relative_bias_t2r(
     tLDrS: cute.Tensor,
     tLDcS: cute.Tensor,
@@ -1212,7 +1349,15 @@ def add_relative_bias_t2r(
     n_block: cutlass.Int32,
     bias_scale: Float32,
 ) -> None:
-    """Add a relative-position linear bias to a loaded score row."""
+    """Add a relative-position linear bias to a loaded score row.
+
+    Always the per-element integer difference (int sub, I2F, FMUL, FADD):
+    ``cute_flash_bias_form`` does not reach this bias. Its hoisted affine
+    forms (``_add_affine_bias_t2r_hoisted``) round differently and both
+    regressed the relative bias's fa4 whole-row winner by 8-12% at s8192, so
+    the emitter renders this form even next to an ALiBi bias that takes a
+    hoisted one.
+    """
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     score = cast("Any", tLDrS)
     coord = cast("Any", tLDcS)
@@ -1232,13 +1377,32 @@ def add_alibi_bias_t2r(
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
     bias_scale: Float32,
+    form: str = "scalar",
 ) -> None:
-    """Add ALiBi-style ``(key - query) * slope`` to a loaded score row."""
+    """Add ALiBi-style ``(key - query) * slope`` to a loaded score row.
+
+    ``form`` selects the ``cute_flash_bias_form`` lowering: ``scalar`` and
+    ``packed`` hoist the slope and the per-fragment base so each element is
+    one FFMA and one FADD (``_add_affine_bias_t2r_hoisted``; the two are
+    bitwise identical and are the searched values); ``direct`` is the
+    per-element integer form (int add/sub, I2F, two FMUL, FADD per element),
+    a different rounding that only an explicit pin reaches.
+    """
+    alibi = cast("Any", mAlibi)
+    slope = cutlass.Float32(alibi[bh % alibi_count])
+    if form != "direct":
+        _add_affine_bias_t2r_hoisted(
+            tLDrS,
+            tLDcS,
+            m_block,
+            n_block,
+            slope * bias_scale,
+            packed=form == "packed",
+        )
+        return
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     score = cast("Any", tLDrS)
     coord = cast("Any", tLDcS)
-    alibi = cast("Any", mAlibi)
-    slope = cutlass.Float32(alibi[bh % alibi_count])
     for i in range(cute.size(tLDrS)):
         col_idx = coord[i][1] + n_block * 128
         score[i] = (
@@ -1262,6 +1426,28 @@ def sliding_window_mask_t2r(
     mask_r2p_sm100_range(tLDrS, col_start, col_limit)
 
 
+def sliding_window_mask_t2r_chunk(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    window_size: cutlass.Int32,
+    chunk_idx: int,
+) -> None:
+    """Window-mask one FA4 32-column score chunk after a T2R load.
+
+    The chunk holds columns ``[chunk_idx * chunk_cols, +chunk_cols)`` of the
+    KV tile, so the tile-relative window bounds shift by the chunk origin
+    (the same offset ``causal_mask_t2r_chunk`` applies).
+    """
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    chunk_cols = cute.size(tLDrS.shape)
+    block_start = n_block * 128 + cutlass.Int32(chunk_idx * chunk_cols)
+    col_start = row_idx - window_size - block_start
+    col_limit = row_idx + 1 - block_start
+    mask_r2p_sm100_range(tLDrS, col_start, col_limit)
+
+
 def prefix_lm_mask_t2r(
     tLDrS: cute.Tensor,
     tLDcS: cute.Tensor,
@@ -1273,6 +1459,206 @@ def prefix_lm_mask_t2r(
     row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
     col_limit = cutlass.max(row_idx + 1, prefix_length) - n_block * 128
     mask_r2p_sm100_rank1(tLDrS, col_limit)
+
+
+def prefix_lm_mask_t2r_chunk(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    prefix_length: cutlass.Int32,
+    chunk_idx: int,
+) -> None:
+    """Prefix-LM-mask one FA4 32-column score chunk after a T2R load."""
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    chunk_cols = cute.size(tLDrS.shape)
+    col_limit = (
+        cutlass.max(row_idx + 1, prefix_length)
+        - n_block * 128
+        - cutlass.Int32(chunk_idx * chunk_cols)
+    )
+    mask_r2p_sm100_rank1(tLDrS, col_limit)
+
+
+def row_kv_begin_mask_t2r(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_lb: cutlass.Int32,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+) -> None:
+    """Apply a per-row KV lower bound with the causal bound: ``lb <= key <= query``.
+
+    ``row_lb`` is this thread's row entry of the ``[batch, seq]`` lower-bound
+    table, loaded once per query tile (``row_kv_begin_row_bound``); the mask is
+    the same column range form as ``sliding_window_mask_t2r``. A row whose
+    bound lies past the row keeps no key at all; the consumer turns its zero
+    row sum into a 0 output (the FlexAttention / FA4 convention) where the
+    kernel source and the Triton lowering produce NaN.
+    """
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    block_start = n_block * 128
+    mask_r2p_sm100_range(tLDrS, row_lb - block_start, row_idx + 1 - block_start)
+
+
+def row_kv_begin_mask_t2r_chunk(
+    tLDrS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_lb: cutlass.Int32,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    chunk_idx: int,
+) -> None:
+    """Per-row-bound-mask one FA4 32-column score chunk after a T2R load
+    (the chunk origin shifts both range bounds, as in
+    ``sliding_window_mask_t2r_chunk``)."""
+    row_idx = cast("Any", tLDcS)[0][0] + m_block * 128
+    chunk_cols = cute.size(tLDrS.shape)
+    block_start = n_block * 128 + cutlass.Int32(chunk_idx * chunk_cols)
+    mask_r2p_sm100_range(tLDrS, row_lb - block_start, row_idx + 1 - block_start)
+
+
+def fa4_disc_rowmax_live_rows(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_max: Float32,
+    ld_chunks: int,
+    row_live: cutlass.Boolean,
+) -> Float32:
+    """``fa4_disc_rowmax_balanced`` for a KV tile that is either fully visible
+    to a row or fully hidden from it (``row_live`` per thread): the dense
+    fold is kept for the visible rows and discarded for the hidden ones --
+    exactly the fold the per-element mask would produce, since a hidden
+    row's masked scores are all ``-inf`` and leave its row max unchanged.
+
+    The hidden rows' raw scores are read unmasked here and in the matching
+    PASS2 (``row_minus_max_scale``).  This fold discards them whole, so the
+    row max is the masked path's for any score value; the PASS2 identity
+    needs them finite -- see ``row_minus_max_scale`` for the contract."""
+    folded = fa4_disc_rowmax_balanced(tiled_ld, tLDtS, tLDcS, row_max, ld_chunks)
+    return Float32(cutlass.select_(row_live, folded, row_max))
+
+
+def row_minus_max_scale(minus_max_scale: Float32, row_live: cutlass.Boolean) -> Float32:
+    """The scaled negative row max PASS2 adds to each score, or ``-inf`` for
+    a row the KV tile hides entirely.
+
+    PASS2 computes ``exp2(score * scale + minus_max_scale)``; with ``-inf``
+    in place of ``minus_max_scale`` every finite score of the row maps to
+    the same ``-inf`` argument a masked (``-inf``) score produces, so the
+    probabilities, the row sum and the stored P are bitwise those of the
+    masked tile without masking or storing the scores back.
+
+    That identity assumes the hidden rows' raw scores are finite:
+    ``fma(score, scale, -inf)`` is ``-inf`` only then, whereas the
+    per-element mask replaces the score unconditionally.  A ``NaN`` or
+    ``inf`` raw score at a position the query never attends -- uninitialised
+    padding between packed documents, a Q.K product overflowing fp32 --
+    makes P and the row's output NaN here where the masked tile hid it.
+    Such inputs are outside the row-bound kind's contract: the attended
+    positions of every flash body already assume finite scores, and this
+    path extends that assumption to the rows a KV tile hides whole."""
+    return Float32(cutlass.select_(row_live, minus_max_scale, -cutlass.Float32.inf))
+
+
+def _row_kv_begin_clamped(value: object, limit: cutlass.Int32) -> cutlass.Int32:
+    """A lower-bound table entry clamped to ``[0, limit]`` as an exact Int32.
+
+    The clamp runs in Int64 so int64 tables are read exactly and an int32
+    sentinel (``INT32_MAX`` for "no key") cannot overflow the tile arithmetic
+    of the range prelude (``(max + 127) // 128``). Clamping is exact for the
+    mask: a bound below 0 admits every key a bound of 0 admits, and a bound at
+    or past ``limit`` (the end of the query tile, or the row itself plus one)
+    masks every key the unclamped bound masks within that limit.
+    """
+    bounded = cutlass.max(cutlass.Int64(value), cutlass.Int64(0))
+    bounded = cutlass.min(bounded, cutlass.Int64(limit))
+    return cutlass.Int32(bounded)
+
+
+def row_kv_begin_row_bound(
+    lb_tensor: object,
+    lb_bh: cutlass.Int32,
+    row_idx: cutlass.Int32,
+) -> cutlass.Int32:
+    """This row's KV lower bound from the ``[batch, seq]`` table, clamped to
+    ``[0, row_idx + 1]`` (``row_idx + 1`` leaves the row without a key)."""
+    lb = cast("Any", lb_tensor)
+    return _row_kv_begin_clamped(lb[row_idx, lb_bh], row_idx + cutlass.Int32(1))
+
+
+def rcp_approx_ftz_or_zero(row_sum: Float32) -> Float32:
+    """``rcp_approx_ftz(row_sum)``, or 0 when the row sum is 0.
+
+    A per-row KV lower bound can leave a query row with no visible key; its
+    probabilities are all zero, so the output row must be 0 (the
+    FlexAttention / FA4 convention) rather than ``0 * inf``.  The fa4 body
+    (the kind's default family) publishes exactly 0 for such a row
+    (``row_kv_begin_row_sum``), so the ``== 0`` test is exact.  Every other
+    row's sum is at least about 1 (its row max contributes ``exp2(0)``), far
+    from the subnormal range where ``rcp.approx.ftz`` flushes; the approximate
+    reciprocal is then within 1 ulp of the ws_overlap body's exact divide.
+    """
+    return Float32(
+        cutlass.select_(row_sum == Float32(0.0), Float32(0.0), rcp_approx_ftz(row_sum))
+    )
+
+
+def row_kv_begin_row_sum(row_sum: Float32, row_max: Float32) -> Float32:
+    """The row sum a per-row KV lower bound plan publishes to its normalizer:
+    exactly 0 when the row max is still ``-inf`` (no visible key).
+
+    The hardware exp2 of a masked (``-inf``) score is 0, but the polynomial
+    exp2 packets evaluate it as the clamped argument ``-127``: the degree-2
+    constant term (``_POLY_EX2_DEG2[0]``, not exactly 1) shifted down by 127
+    binades is a subnormal of about 2e-41 per lane, so an empty row's sum is a
+    nonzero subnormal that ``rcp.approx.ftz`` flushes to ``inf`` (and the
+    output row to ``0 * inf``).  The row max tells the two cases apart
+    exactly: it is ``-inf`` if and only if every score of the row was masked.
+    """
+    return Float32(
+        cutlass.select_(row_max == -cutlass.Float32.inf, Float32(0.0), row_sum)
+    )
+
+
+def row_kv_begin_bounds_warp(
+    lb_tensor: object,
+    lb_bh: cutlass.Int32,
+    row_start: cutlass.Int32,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """Warp-cooperative ``(min, max)`` of the KV lower bound over 128 query rows.
+
+    Four table loads per lane plus two five-step butterfly reductions; every
+    lane returns the same pair.  ``min // 128`` is the first KV tile any row
+    of the query tile can see and ``ceil(max / 128)`` the first tile no row
+    masks (tiles before it need the per-row mask).  Every entry is clamped to
+    ``[0, row_start + 128]`` (``_row_kv_begin_clamped``) so the pair is a
+    plain Int32 range inside the query tile for any int32 or int64 table.
+    The result is exact for any lower-bound table: it only bounds the tile
+    range, the per-row mask stays exact.
+    """
+    lb = cast("Any", lb_tensor)
+    lane = cute.arch.lane_idx()
+    row_limit = row_start + cutlass.Int32(128)
+    lo = cutlass.Int32(2147483647)
+    hi = cutlass.Int32(-2147483648)
+    for i in range(4):
+        value = _row_kv_begin_clamped(
+            lb[row_start + lane + cutlass.Int32(i * 32), lb_bh], row_limit
+        )
+        lo = cutlass.min(lo, value)
+        hi = cutlass.max(hi, value)
+    for offset in (16, 8, 4, 2, 1):
+        lo = cutlass.min(
+            lo,
+            cute.arch.shuffle_sync_bfly(lo, offset=offset, mask=-1, mask_and_clamp=31),
+        )
+        hi = cutlass.max(
+            hi,
+            cute.arch.shuffle_sync_bfly(hi, offset=offset, mask=-1, mask_and_clamp=31),
+        )
+    return lo, hi
 
 
 def document_mask_t2r(
@@ -1300,54 +1686,106 @@ def document_mask_t2r(
 
 
 def document_tile_maybe_active(
-    mDoc: cute.Tensor,
+    bounds_tensor: object,
     bh: cutlass.Int32,
     doc_heads_per_batch: cutlass.Int32,
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
 ) -> cutlass.Boolean:
-    """Conservative whole-tile predicate for causal same-document masking."""
-    doc = cast("Any", mDoc)
-    doc_bh = bh // doc_heads_per_batch
-    q_start = m_block * 128
-    k_start = n_block * 128
-    q_bits = cutlass.Int32(0)
-    k_bits = cutlass.Int32(0)
-    for i in range(128):
-        q_doc = cast("Any", cutlass.Int32(doc[q_start + i, doc_bh]))
-        k_doc = cast("Any", cutlass.Int32(doc[k_start + i, doc_bh]))
-        q_bits = q_bits | (cutlass.Int32(1) << (q_doc & cutlass.Int32(31)))
-        k_bits = k_bits | (cutlass.Int32(1) << (k_doc & cutlass.Int32(31)))
-    return (n_block <= m_block) & ((q_bits & k_bits) != 0)
+    """Conservative whole-tile predicate for causal same-document masking.
 
-
-def _document_tile_bits_warp(
-    doc_tensor: object,
-    doc_bh: cutlass.Int32,
-    start: cutlass.Int32,
-) -> cutlass.Int32:
-    """Modulo-32 doc-id fingerprint used only for conservative tile pruning.
-
-    Collisions are allowed: the exact per-score document mask still runs for every
-    retained tile, so false positives only cost extra work and never affect output.
+    ``bounds_tensor`` is the wrapper-built ``(num_tiles, batch, 2)`` table of
+    the smallest / largest document id in each 128-token tile (see
+    ``helion.runtime.cute.flash_document.document_tile_bounds``). Interval
+    overlap is a superset of "the tiles share an id" for arbitrary ids; the
+    exact per-score mask still runs on every retained tile.
     """
-    doc = cast("Any", doc_tensor)
-    lane = cute.arch.lane_idx()
-    bits = cutlass.Int32(0)
-    for i in range(4):
-        doc_id = cast(
-            "Any",
-            cutlass.Int32(doc[start + lane + cutlass.Int32(i * 32), doc_bh]),
+    bounds = cast("Any", bounds_tensor)
+    doc_bh = bh // doc_heads_per_batch
+    q_lo = cutlass.Int32(bounds[m_block, doc_bh, 0])
+    q_hi = cutlass.Int32(bounds[m_block, doc_bh, 1])
+    k_lo = cutlass.Int32(bounds[n_block, doc_bh, 0])
+    k_hi = cutlass.Int32(bounds[n_block, doc_bh, 1])
+    return (n_block <= m_block) & (k_hi >= q_lo) & (k_lo <= q_hi)
+
+
+def document_tile_needs_mask(
+    bounds_tensor: object,
+    bh: cutlass.Int32,
+    doc_heads_per_batch: cutlass.Int32,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+) -> cutlass.Boolean:
+    """Whether the causal same-document mask may hide a score of this tile.
+
+    False only when the KV tile is strictly below the diagonal and both tiles
+    hold a single, identical document id (the id-bounds table's min and max
+    agree), which makes every (row, key) pair visible.
+    """
+    bounds = cast("Any", bounds_tensor)
+    doc_bh = bh // doc_heads_per_batch
+    q_lo = cutlass.Int32(bounds[m_block, doc_bh, 0])
+    q_hi = cutlass.Int32(bounds[m_block, doc_bh, 1])
+    k_lo = cutlass.Int32(bounds[n_block, doc_bh, 0])
+    k_hi = cutlass.Int32(bounds[n_block, doc_bh, 1])
+    return (n_block >= m_block) | (q_lo != q_hi) | (k_lo != k_hi) | (q_lo != k_lo)
+
+
+def document_tile_range_warp(
+    bounds_tensor: object,
+    doc_bh: cutlass.Int32,
+    m_block: cutlass.Int32,
+    num_kv: int,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """Warp-parallel inclusive ``[first, last]`` KV tile range of a query tile.
+
+    ``bounds_tensor`` is the wrapper-built ``(num_kv, batch, 2)`` table of the
+    smallest / largest document id in each 128-token tile. A KV tile is kept
+    when it is on or below the diagonal and its id interval overlaps the query
+    tile's. For ARBITRARY id assignments that is a superset of "the two tiles
+    share an id" (a shared id lies inside both intervals), so no monotone or
+    packed layout is assumed: ``[first, last]`` is a contiguous superset of the
+    active tiles and the exact per-score document mask still runs on every
+    retained tile. Lane ``l`` owns tiles ``l, l + 32, ...`` (two loads each)
+    and one butterfly min/max pair merges the lanes, so the prelude costs
+    ``2 * ceil(num_kv / 32)`` loads and 10 shuffles per lane. Falls back to
+    the diagonal tile when nothing is active (it always is under
+    ``doc_q == doc_k`` & causal). Must be called by a full, converged warp.
+    """
+    bounds = cast("Any", bounds_tensor)
+    lane = cutlass.Int32(cute.arch.lane_idx())
+    q_lo = cutlass.Int32(bounds[m_block, doc_bh, 0])
+    q_hi = cutlass.Int32(bounds[m_block, doc_bh, 1])
+    first = cutlass.Int32(num_kv)
+    last = cutlass.Int32(-1)
+    for i in range((num_kv + 31) // 32):
+        t = lane + cutlass.Int32(i * 32)
+        t_c = cutlass.min(t, cutlass.Int32(num_kv - 1))
+        k_lo = cutlass.Int32(bounds[t_c, doc_bh, 0])
+        k_hi = cutlass.Int32(bounds[t_c, doc_bh, 1])
+        active = (t <= m_block) & (k_hi >= q_lo) & (k_lo <= q_hi)
+        first = cutlass.Int32(
+            cutlass.select_(active & (first == cutlass.Int32(num_kv)), t, first)
         )
-        bits = bits | (cutlass.Int32(1) << (doc_id & cutlass.Int32(31)))
+        last = cutlass.Int32(cutlass.select_(active, t, last))
     for offset in (16, 8, 4, 2, 1):
-        bits = bits | cute.arch.shuffle_sync_bfly(
-            bits,
-            offset=offset,
-            mask=-1,
-            mask_and_clamp=31,
+        first = cutlass.min(
+            first,
+            cute.arch.shuffle_sync_bfly(
+                first, offset=offset, mask=-1, mask_and_clamp=31
+            ),
         )
-    return bits
+        last = cutlass.max(
+            last,
+            cute.arch.shuffle_sync_bfly(
+                last, offset=offset, mask=-1, mask_and_clamp=31
+            ),
+        )
+    first = cutlass.Int32(
+        cutlass.select_(first == cutlass.Int32(num_kv), m_block, first)
+    )
+    last = cutlass.Int32(cutlass.select_(last < cutlass.Int32(0), m_block, last))
+    return first, last
 
 
 # ``2 * log2(e)``: ``tanh(y) = 1 - 2 / (exp2(2 * log2(e) * y) + 1)``.
@@ -1655,6 +2093,45 @@ def fa4_disc_rowmax_causal_balanced(
         )
         row_max = _fmax_reduce_chunk_balanced(frg, row_max)
     cute.arch.fence_view_async_tmem_load()
+    return row_max
+
+
+def fa4_disc_rowmax_causal_store_balanced(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_max: Float32,
+    ld_chunks: int,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    tiled_score_st: object,
+    tScoreSTtS: cute.Tensor,
+) -> Float32:
+    """``fa4_disc_rowmax_causal_balanced`` that writes the masked chunks back.
+
+    The causal mask is applied once: PASS1 stores each masked fp32 score chunk
+    back over its own TMEM columns (the store atom repeats the load atom's
+    column count, so chunk ``ci`` of the store aliases chunk ``ci`` of the
+    load), and PASS2 runs the plain exp pass on the stored scores. On the
+    latency-bound diagonal tile this removes the per-chunk R2P/select chain
+    from PASS2's load -> exp -> store dependency chain. The trailing
+    ``tcgen05.wait::st`` orders the stores before PASS2's loads.
+    """
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(ld_chunks):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ci, None, None]),
+            m_block,
+            n_block,
+            ci,
+        )
+        row_max = _fmax_reduce_chunk_balanced(frg, row_max)
+        cute.copy(tiled_score_st, frg, tScoreSTtS[None, ci, None, None])
+    cute.arch.fence_view_async_tmem_load()
+    cute.arch.fence_view_async_tmem_store()
     return row_max
 
 
@@ -2407,6 +2884,240 @@ def fa4_disc_exp_convert_store_rep32_pipe(
     return p_sum
 
 
+def fa4_disc_exp_convert_store_resident_rep32(
+    frgs: tuple,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    p_store_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
+) -> Float32:
+    """Rep32 PASS2 over the score chunks PASS1 left resident in registers
+    (``cute_flash_s_resident``) without the split P arrival (with it the
+    Rep32 stores take ``fa4_disc_exp_convert_store_resident_rep32_split``):
+    no TMEM reload, the same per-chunk numerics and P-store pairing as
+    ``fa4_disc_exp_convert_store_rep32_pipe`` and one release after the
+    last pair.  ``frgs`` are the ``2 * p_store_chunks`` 32-column fragments
+    in column order, already fenced by PASS1's
+    ``fence_view_async_tmem_load``."""
+    p_sum = cutlass.Float32(0.0)
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    ld_chunks = p_store_chunks * 2
+    for pair_ci in range(p_store_chunks):
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        for half in range(2):
+            ld_ci = pair_ci * 2 + half
+            cur = frgs[ld_ci]
+            _disc_chunk_exp(
+                cur,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ld_ci >= ld_chunks - 1,
+                pair_batch,
+                emu_batch,
+                degree2,
+                degree1,
+            )
+            pchunk_half = cute.make_tensor(
+                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
+                cur.layout,
+            )
+            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+            p_sum = p_sum + _disc_chunk_rowsum(cur)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_resident_rep32_split(
+    frgs: tuple,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    ld_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
+) -> Float32:
+    """``fa4_disc_exp_convert_store_rep32_split`` over the score chunks PASS1
+    left resident in registers (``cute_flash_s_resident``): Rep32 stores of
+    the chunk pairs below the 3/4 split, a Rep16 store of the odd chunk,
+    the staged-P release at 96 columns, the last Rep16 chunk and the final
+    release; no TMEM reload."""
+    p_sum = cutlass.Float32(0.0)
+    split_ld_chunks = ld_chunks * 3 // 4
+    pair_chunks = split_ld_chunks // 2
+    for pair_ci in range(pair_chunks):
+        frg0 = frgs[pair_ci * 2]
+        frg1 = frgs[pair_ci * 2 + 1]
+        _disc_chunk_exp(
+            frg0,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            False,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
+        )
+        _disc_chunk_exp(
+            frg1,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            pair_ci * 2 + 1 >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
+        )
+        _disc_chunk_pair_convert_store(
+            frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
+        )
+        p_sum = p_sum + _disc_chunk_rowsum(frg0) + _disc_chunk_rowsum(frg1)
+    ld_ci = pair_chunks * 2
+    if cutlass.const_expr(split_ld_chunks % 2 != 0):
+        frg = frgs[ld_ci]
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ld_ci >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
+        )
+        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        ld_ci += 1
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    for ci in range(ld_ci, ld_chunks):
+        frg = frgs[ci]
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
+        )
+        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_resident_rep16(
+    frgs: tuple,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
+    pforc_ptr_stage: object = None,
+) -> Float32:
+    """Rep16 PASS2 over the score chunks PASS1 left resident in registers
+    (``cute_flash_s_resident`` with Rep16 P stores): one store chunk per
+    32-column score chunk and the staged-P releases of
+    ``fa4_disc_exp_convert_store_pipe`` (the 3/4 + 1/4 split or the per-chunk
+    arrivals), without the TMEM reload."""
+    p_sum = cutlass.Float32(0.0)
+    for ci in range(p_store_chunks):
+        cur = frgs[ci]
+        _disc_chunk_exp(
+            cur,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= p_store_chunks - 1,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
+        )
+        _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(cur)
+        _disc_chunk_release(
+            ci,
+            p_store_split,
+            p_store_chunks,
+            pfor_ptr_stage,
+            pfor2_ptr_stage,
+            pforc_ptr_stage,
+            pfor_peer_cta_rank,
+            pfor_self_cta_rank,
+        )
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
 def fa4_disc_exp_convert_store_sload16_pair_pipe(
     tiled_ld: object,
     tLDtS: cute.Tensor,
@@ -2971,6 +3682,60 @@ def fa4_store_o_smem_to_gmem_whole(
         )
 
 
+@cute.jit
+def fa4_store_o_smem_to_gmem_rows(
+    gmem_tiled_copy: object,
+    gmem_thr_copy: object,
+    tOsO: cute.Tensor,
+    tOgO: cute.Tensor,
+    tOcO: cute.Tensor,
+    live_rows: cutlass.Int32,
+    io_dtype: type[Numeric] = cutlass.Float16,
+) -> None:
+    """``fa4_store_o_smem_to_gmem`` for a ragged output tile: only the rows
+    before ``live_rows`` are stored.
+
+    ``tOcO`` is this thread's partition of the tile's identity tensor, so
+    ``tOcO[0, rest_m, 0][0]`` is the tile row of row slice ``rest_m``.  The
+    segment-aligned per-row-KV-lower-bound tiling computes the rows of a
+    segment's last pair past the segment end with whatever keys follow them;
+    those rows belong to the next segment's pair and must not be written (a
+    full-tile store would race with that pair's store).  FA4's varlen
+    epilogue (``_store_O_to_gmem``) guards its rows the same way.
+    """
+    tOgO_epi = cast("Any", gmem_thr_copy).partition_D(tOgO)
+    coord = cast("Any", tOcO)
+    for rest_m in cutlass.range_constexpr(cute.size(tOsO, mode=[1])):
+        if coord[0, rest_m, 0][0] < live_rows:
+            src = cast("cute.Tensor", tOsO[None, rest_m, None])
+            out = cute.make_fragment_like(src, io_dtype)
+            cute.autovec_copy(src, out)
+            cute.copy(gmem_tiled_copy, out, tOgO_epi[None, rest_m, None])
+
+
+@cute.jit
+def fa4_store_o_smem_to_gmem_whole_rows(
+    gmem_tiled_copy: object,
+    gmem_thr_copy: object,
+    tOsO: cute.Tensor,
+    tOgO: cute.Tensor,
+    tOcO: cute.Tensor,
+    live_rows: cutlass.Int32,
+    io_dtype: type[Numeric] = cutlass.Float16,
+) -> None:
+    """``fa4_store_o_smem_to_gmem_whole`` with the row guard of
+    ``fa4_store_o_smem_to_gmem_rows``."""
+    tOgO_epi = cast("Any", gmem_thr_copy).partition_D(tOgO)
+    coord = cast("Any", tOcO)
+    out = cute.make_fragment_like(tOsO, io_dtype)
+    cute.autovec_copy(tOsO, out)
+    for rest_m in cutlass.range_constexpr(cute.size(out, mode=[1])):
+        if coord[0, rest_m, 0][0] < live_rows:
+            cute.copy(
+                gmem_tiled_copy, out[None, rest_m, None], tOgO_epi[None, rest_m, None]
+            )
+
+
 @dsl_user_op
 def _cvt_rn_bf16_hi(
     x: object,
@@ -3337,6 +4102,192 @@ def fa4_correction_epilogue_to_smem_scoped(
         if cutlass.const_expr(relu_output):
             relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
+
+
+@dsl_user_op
+def fa4_correction_epilogue_merge_to_smem_scoped(
+    flash_pvt: object,
+    tOtO0: cute.Tensor,
+    tOtO1: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    w0: object,
+    w1: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``fa4_correction_epilogue_to_smem_scoped`` over two output accumulators
+    of the same rows: ``O0 * w0 + O1 * w1`` (the FlexAttention list walk's
+    dead-stage split, whose two softmax warpgroups each took half of one
+    stage's tiles; the weights carry the merged normalizer)."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (128, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=False,
+    )
+    cO = cute.make_identity_tensor((128, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO0_i = cute.logical_divide(tOtO0, cute.make_layout((128, corr_tile_size)))
+    tOtO1_i = cute.logical_divide(tOtO1, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO0_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO0_t2r = thr_t2r.partition_S(tOtO0_i[(None, None), None])
+    tOtO1_t2r = thr_t2r.partition_S(tOtO1_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg0 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        reg1 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO0_t2r[None, 0, 0, i], reg0)
+        cute.copy(tiled_t2r, tOtO1_t2r[None, 0, 0, i], reg1)
+        reg0.store(reg0.load() * w0 + reg1.load() * w1)
+        cvt_copy(tiled_r2s, reg0, tOsO_r2s[None, 0, 0, i])
+
+
+def _fa4_split_tile_partitions(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    tiles: Sequence[cute.Tensor],
+    tidx: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+) -> tuple[object, list[cute.Tensor], list[cute.Tensor], cute.Tensor]:
+    """The t2r tiled copy of the correction epilogue over ``tOtO`` and this
+    thread's partitions of the (128, head_dim) gmem ``tiles`` in the same
+    fragment order: ``(tiled_t2r, tmem fragments, gmem fragments,
+    coordinate fragment)`` (the split-KV partial store and merge address the
+    workspace tiles exactly like the staged epilogue addresses ``sO``)."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (128, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=False,
+    )
+    chunk = cute.make_layout((128, corr_tile_size))
+    cO = cute.make_identity_tensor((128, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO_i = cute.logical_divide(flash_pvt_copy.partition_C(cO), chunk)
+    tOtO_i = cute.logical_divide(tOtO, chunk)
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    gmem = []
+    for tile in tiles:
+        tOgT_i = cute.logical_divide(
+            flash_pvt_copy.get_slice(0).partition_C(tile), chunk
+        )
+        gmem.append(thr_t2r.partition_D(tOgT_i[(None, None), None]))
+    return tiled_t2r, [tOtO_t2r], gmem, tOcO_t2r
+
+
+@dsl_user_op
+def fa4_split_partial_store(
+    flash_pvt: object,
+    tOtO0: cute.Tensor,
+    tOtO1: cute.Tensor | None,
+    gP: cute.Tensor,
+    tidx: object,
+    w0: object,
+    w1: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Split-KV walk (``cute_flash_kv_split``): store this thread's rows of the
+    unnormalized fp32 partial output ``O0 * w0 (+ O1 * w1)`` to the (128,
+    head_dim) workspace tile ``gP``. ``tOtO1`` None: one accumulator; ``w0``
+    None: unscaled (the dead-stage split merges a split CTA's two
+    accumulators here, with the merged statistics stored beside them)."""
+    tiled_t2r, (tOtO0_t2r,), (tOgP_t2r,), tOcO_t2r = _fa4_split_tile_partitions(
+        flash_pvt, tOtO0, (gP,), tidx, head_dim, corr_tile_size, o_dtype
+    )
+    tOtO1_t2r = None
+    if tOtO1 is not None:
+        chunk = cute.make_layout((128, corr_tile_size))
+        tOtO1_i = cute.logical_divide(tOtO1, chunk)
+        tOtO1_t2r = (
+            cast("Any", tiled_t2r)
+            .get_slice(tidx)
+            .partition_S(tOtO1_i[(None, None), None])
+        )
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg0 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO0_t2r[None, 0, 0, i], reg0)
+        if tOtO1_t2r is not None:
+            reg1 = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+            cute.copy(tiled_t2r, tOtO1_t2r[None, 0, 0, i], reg1)
+            reg0.store(reg0.load() * w0 + reg1.load() * w1)
+        elif w0 is not None:
+            reg0.store(reg0.load() * w0)
+        cute.autovec_copy(reg0, tOgP_t2r[None, 0, 0, i])
+
+
+@dsl_user_op
+def fa4_split_merge_store(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    partials: Sequence[cute.Tensor],
+    weights: Sequence[object],
+    gO: cute.Tensor,
+    tidx: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Split-KV walk: ``O = sum_j partials[j] * weights[j]`` over this
+    thread's rows (the weights carry the merged normalizer; fixed split
+    order, so the result does not depend on which CTA merges), cast to
+    ``o_dtype`` and stored to the (128, head_dim) output tile ``gO``.
+    ``tOtO`` only lends the accumulator layout the fragments follow."""
+    _, _, gmem, tOcO_t2r = _fa4_split_tile_partitions(
+        flash_pvt, tOtO, (gO, *partials), tidx, head_dim, corr_tile_size, o_dtype
+    )
+    tOgO_t2r, *tOgP_t2r = gmem
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        acc = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.autovec_copy(tOgP_t2r[0][None, 0, 0, i], acc)
+        acc.store(acc.load() * weights[0])
+        for j in range(1, len(partials)):
+            part = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+            cute.autovec_copy(tOgP_t2r[j][None, 0, 0, i], part)
+            acc.store(acc.load() + part.load() * weights[j])
+        out = cute.make_rmem_tensor(reg_src.shape, o_dtype)
+        out.store(acc.load().to(o_dtype))
+        cute.autovec_copy(out, tOgO_t2r[None, 0, 0, i])
 
 
 @dsl_user_op

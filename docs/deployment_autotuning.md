@@ -218,6 +218,23 @@ finishes in seconds (e.g. ~3s / ~32 configs for a simple kernel),
 compared to `"full"` which generates a large random initial population
 and runs many more generations (often ~10 minutes).
 
+`"full"` also ends with a **final selection**: after the search (and after
+the finishing phase and any backend-specific refinement) the retained
+shortlist is re-timed in the clock regime a deployment timer sees, with a
+thermal warmup, one screen when the shortlist is long, and four rounds of
+500+500 ms steady windows per finalist in alternating order; the median
+across rounds picks the returned config.  This adds roughly 60-150 s to
+every full-effort autotune on every backend (the search's own 50-200 ms
+windows mis-rank finalists by 3-6% on power-limited GPUs such as B200, and
+a window needs about 500 ms of warmup after the idle gap between windows
+before the B200 power limiter settles).
+Set `HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0` to fall back to the cheaper
+single-pass final verification; under `HELION_AUTOTUNE_BUDGET_SECONDS` the
+search stops early enough for the phase (its estimate plus one generation
+of overrun, together at most a quarter of the budget but never less than
+the phase's smallest plan) and the phase is sized to the time left (see
+[Settings](api/settings.md)).
+
 ### Initial Population Strategies
 
 The initial population strategy determines how the autotuner generates

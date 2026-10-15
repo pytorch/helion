@@ -25,11 +25,13 @@ from .cute.attention_plan import CAUSAL_MASK_KIND
 from .cute.attention_plan import DOCUMENT_MASK_KIND
 from .cute.attention_plan import PREFIX_LM_MASK_KIND
 from .cute.attention_plan import RELATIVE_BIAS_KIND
+from .cute.attention_plan import ROW_KV_BEGIN_MASK_KIND
 from .cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from .cute.attention_plan import SOFTCAP_KIND
 from .cute.attention_plan import TENSOR_BIAS_KIND
 from .cute.attention_plan import AttentionScoreModifier
 from .cute.attention_plan import AttentionScorePlan
+from .cute.attention_plan import flash_head_dims_supported
 from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
     from .aten_lowering import Lowering
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
+    from .cute.flex_match import FlexMatch
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import DeviceIR
@@ -81,8 +84,38 @@ class FlashSearchSurface(NamedTuple):
     has_row_epilogue: bool
     plain_row_body: bool
     has_score_modifiers: bool
+    score_modifier_kinds: tuple[str, ...]
     tmem_rowmax_compatible: bool = False
     causal_resident_compatible: bool = False
+    # V/O head dim when it differs from the Q/K ``head_dim`` (MLA prefill).
+    head_dim_v: int | None = None
+    # Grouped-query divisor (``heads_q // heads_kv``; 1 for plain attention).
+    kv_group: int = 1
+    # Flex envelope facts (``AttentionScorePlan.is_flex``): a data-dependent
+    # BlockMask list walk (variable trip count driven by tables), whether the
+    # captured score / mask regions exist, and the separate Q / KV lengths
+    # (which need not be equal nor multiples of 128).
+    has_list_walk: bool = False
+    flex_has_score_region: bool = False
+    flex_has_mask_region: bool = False
+    flex_trivial_walk: bool = False
+    q_seq: int | None = None
+    kv_seq: int | None = None
+    # Padded sizes of the flex hook's shared-memory aux staging candidates
+    # (``flash_score_mod.flex_aux_smem_candidates``, plan order): the budget
+    # knob's search choices and default resolve against them.
+    flex_aux_smem_candidates: tuple[int, ...] = ()
+    # Registers of the hook's prefetchable per-chunk table loads at 32
+    # columns (``flash_score_mod.flex_prefetch_regs``): the prefetch budget
+    # knob's choices resolve against them.
+    flex_prefetch_regs: tuple[int, ...] = ()
+    # Bytes per column of the hook's coalescible row-table runs
+    # (``flash_score_mod.flex_coalesce_steps``): the cooperative request
+    # width knob's choices resolve against them.
+    flex_coalesce_steps: tuple[int, ...] = ()
+    # Per-element operations of the score hook
+    # (``flash_score_mod.flex_hook_ops``): the chunk-loop roll's default.
+    flex_hook_ops: int = 0
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -92,6 +125,10 @@ class AttentionSoftmaxPattern(NamedTuple):
     @property
     def head_dim(self) -> int:
         return self.score_plan.head_dim
+
+    @property
+    def head_dim_v(self) -> int:
+        return self.score_plan.value_head_dim
 
     @property
     def is_causal(self) -> bool:
@@ -2443,6 +2480,41 @@ def _attention_document_mask_name(
     return (lhs[0], lhs[2]) if {lhs[1], rhs[1]} == {"q", "kv"} else None
 
 
+def _attention_row_kv_begin_mask_name(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[str, _AttentionBatchIndex] | None:
+    """Match ``kv_idx >= lb[batch, q_tile]`` (or ``lb[...] <= kv_idx``).
+
+    ``lb`` is a ``[B, S]`` per-row KV lower bound loaded at the Q tile, the
+    document-table index form of ``_attention_doc_id_load``.
+    """
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or len(node.args) < 2
+    ):
+        return None
+    if node.target is torch.ops.aten.ge.Tensor:
+        kv_node, bound_node = node.args[:2]
+    elif node.target is torch.ops.aten.le.Tensor:
+        bound_node, kv_node = node.args[:2]
+    else:
+        return None
+    if not _attention_is_kv_tile_index(kv_node, kv_block_id):
+        return None
+    bound = _attention_doc_id_load(
+        bound_node,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if bound is None or bound[1] != "q":
+        return None
+    return bound[0], bound[2]
+
+
 def _attention_mask_modifier_from_predicate(
     pred: torch.fx.Node,
     q_placeholder: torch.fx.Node,
@@ -2484,6 +2556,8 @@ def _attention_mask_modifier_from_predicate(
         window = None
         document_name = None
         document_index: _AttentionBatchIndex | None = None
+        row_kv_begin_name = None
+        row_kv_begin_index: _AttentionBatchIndex | None = None
         for term in and_terms:
             if _attention_is_causal_predicate(
                 term,
@@ -2512,7 +2586,30 @@ def _attention_mask_modifier_from_predicate(
                     return None
                 document_name, document_index = term_document
                 continue
+            term_row_kv_begin = _attention_row_kv_begin_mask_name(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            if term_row_kv_begin is not None:
+                if row_kv_begin_name is not None:
+                    return None
+                row_kv_begin_name, row_kv_begin_index = term_row_kv_begin
+                continue
             return None
+        if row_kv_begin_name is not None:
+            if not has_causal or window is not None or document_name is not None:
+                return None
+            return AttentionScoreModifier(
+                ROW_KV_BEGIN_MASK_KIND,
+                tensor_name=row_kv_begin_name,
+                index_mode=row_kv_begin_index.mode
+                if row_kv_begin_index is not None
+                else None,
+                index_divisor=row_kv_begin_index.divisor
+                if row_kv_begin_index is not None
+                else None,
+            )
         if has_causal and window is not None and document_name is None:
             return AttentionScoreModifier(
                 SLIDING_WINDOW_MASK_KIND,
@@ -2743,6 +2840,37 @@ def _attention_k_load_indices(
     if not isinstance(source, torch.fx.Node):
         return None
     return _attention_canonical_kv_load_indices(source, kv_block_id=kv_block_id)
+
+
+def _attention_k_load_head_dim(node: torch.fx.Node) -> int | None:
+    """Return K's static head dim from the host tensor behind ``K^T``.
+
+    ``node`` is the transposed K operand of the score matmul; its source is the
+    canonical ``k_view[b, tile_n, :]`` load whose host tensor keeps the
+    specialized head dim (the loop graph's operand metadata does not).
+    """
+    from ..language import memory_ops
+    from ..language._tracing_ops import _host_tensor
+
+    if node.op != "call_function" or not node.args:
+        return None
+    source = node.args[0]
+    if not isinstance(source, torch.fx.Node):
+        return None
+    if source.op != "call_function" or source.target is not memory_ops.load:
+        return None
+    tensor = source.args[0] if source.args else None
+    if (
+        not isinstance(tensor, torch.fx.Node)
+        or tensor.op != "call_function"
+        or tensor.target is not _host_tensor
+    ):
+        return None
+    value = tensor.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.ndim != 3:
+        return None
+    head_dim = value.shape[2]
+    return head_dim if isinstance(head_dim, int) else None
 
 
 def _attention_v_load_indices(
@@ -3117,13 +3245,22 @@ def _attention_softmax_pattern_head_dim(
             operand_dtype = operand_val.dtype
         elif operand_val.dtype != operand_dtype:
             return None
-    head_dim = pv_val.shape[2]
-    if not isinstance(head_dim, int) or head_dim not in (64, 128):
+    head_dim_v = pv_val.shape[2]
+    if not isinstance(head_dim_v, int):
         return None
     if not isinstance(qk_node.args[1], torch.fx.Node):
         return None
     k_indices = _attention_k_load_indices(qk_node.args[1], kv_block_id=kv_block_id)
     if k_indices is None:
+        return None
+    # The Q/K head dim comes from K's host tensor: the loop graph's operand
+    # metadata carries the contraction as an unbacked symbol, while the host
+    # tensor keeps the specialized width. A K load without a host tensor keeps
+    # the historical symmetric reading (the scale check below still pins it).
+    head_dim = _attention_k_load_head_dim(qk_node.args[1])
+    if head_dim is None:
+        head_dim = head_dim_v
+    if not flash_head_dims_supported(head_dim, head_dim_v):
         return None
     if len(pv_node.args) < 3 or not isinstance(pv_node.args[2], torch.fx.Node):
         return None
@@ -3204,6 +3341,7 @@ def _attention_softmax_pattern_head_dim(
         lse_scale=lse_scale,
         modifiers=scaled_modifiers,
         kv_group=k_indices.kv_group,
+        head_dim_v=None if head_dim_v == head_dim else head_dim_v,
     )
     if not score_plan.has_lowering():
         return None
@@ -3212,9 +3350,18 @@ def _attention_softmax_pattern_head_dim(
 
 
 def _flash_block_sizes_reachable(
-    env: CompileEnvironment, targets: dict[int, int]
+    env: CompileEnvironment,
+    targets: dict[int, int],
+    *,
+    overshoot_dimension: bool = False,
 ) -> bool:
-    """True when every block id's fragment range can reach its flash target."""
+    """True when every block id's fragment range can reach its flash target.
+
+    ``overshoot_dimension``: the fused body tiles past the dimension's extent
+    (ragged query rows), so the extent's cap on the range (``update_hint``)
+    does not count against the target; only a declared ceiling
+    (``BlockSizeSpec.declared_max_size``) does.
+    """
     from ..autotuner.config_fragment import BlockSizeFragment
 
     if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
@@ -3223,7 +3370,11 @@ def _flash_block_sizes_reachable(
         block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
         fragment = block_spec._fragment(env.config_spec)
         assert isinstance(fragment, BlockSizeFragment)
-        if not fragment.low <= target <= fragment.high:
+        high = fragment.high
+        if overshoot_dimension:
+            declared = block_spec.declared_max_size
+            high = max(high, target if declared is None else declared)
+        if not fragment.low <= target <= high:
             return False
     return True
 
@@ -3243,14 +3394,17 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
 
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return None
-    # Attention binds to a 2-axis root grid (tile_b, tile_m) plus one inner
-    # tile_n device loop.
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
+    env = CompileEnvironment.current()
+    # The FlexAttention envelope binds to a 3-axis root grid (tile_b, tile_h,
+    # tile_m) with unit b/h tiles; the collapsed envelope below to a 2-axis
+    # grid (tile_b, tile_m) plus one inner tile_n device loop.
+    if len(root_grid_ids) == 3:
+        return _detect_flex_search_surface(device_ir, root_grid_ids, env)
     if len(root_grid_ids) != 2:
         return None
-    env = CompileEnvironment.current()
 
     def block_sizes_reachable(targets: dict[int, int]) -> bool:
         return _flash_block_sizes_reachable(env, targets)
@@ -3353,8 +3507,17 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             continue
         num_kv = (kv_seq + 127) // 128
         output_requires_tma = _flash_output_requires_tma(
-            num_bh, q_seq, pattern.head_dim
+            num_bh, q_seq, pattern.head_dim_v
         )
+        # Only the plain FA4 topology (two 128-row query tiles per CTA, direct
+        # output store: staged O does not fit next to 2 x 192-wide Q tiles)
+        # hosts the asymmetric head-dim pair.
+        if pattern.score_plan.asymmetric_head_dims and (
+            num_kv % 2 != 0
+            or pattern.score_plan.requires_ws_overlap
+            or output_requires_tma
+        ):
+            continue
         # TMA output is currently FA4-only. Do not expose a flash search whose
         # only legal output path is unavailable; the generic CuTe search can
         # still handle these uncommon large-output shapes.
@@ -3411,13 +3574,118 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(
                     pattern.score_plan
                 ),
+                score_modifier_kinds=pattern.score_plan.modifier_kinds,
+                head_dim_v=pattern.score_plan.head_dim_v,
+                kv_group=pattern.score_plan.kv_group,
+                has_list_walk=pattern.score_plan.has_list_walk,
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(
             block_size_targets=generic_fallback_targets
         )
         return None
+    if flash_surface is None:
+        flash_surface = _detect_flex_search_surface(device_ir, root_grid_ids, env)
     return flash_surface
+
+
+def _detect_flex_search_surface(
+    device_ir: DeviceIR,
+    root_grid_ids: Sequence[int],
+    env: CompileEnvironment,
+) -> FlashSearchSurface | None:
+    """The flex-envelope surface: the whole-graph-set matcher on
+    ``device_ir.graphs`` (never cache its node identities; codegen re-runs
+    it on the graph copies)."""
+    from .cute.flex_match import FLEX_PLAN_ENABLED
+    from .cute.flex_match import match_flex_envelope
+
+    if not FLEX_PLAN_ENABLED:
+        return None
+    match = match_flex_envelope(device_ir.graphs, root_grid_ids, env=env)
+    if match is None:
+        return None
+    return flex_search_surface(match, env)
+
+
+def flex_search_surface(
+    match: FlexMatch, env: CompileEnvironment
+) -> FlashSearchSurface | None:
+    """Build the autotune surface of a matched flex kernel.
+
+    Only the tunable (tile_m, tile_n) ids enter ``block_size_targets`` (the
+    unit b/h axes are ``FixedBlockSizeSource(1)``, which the matcher already
+    verified; ``block_id_lookup`` has no entry for them). ``num_kv`` is the
+    upper bound ``cdiv(kv_seq, 128)`` of the list walk. The 128-row pins
+    hold for every ``q_seq >= 1``: the emitter row-guards a ragged last tile,
+    so a query length below 128 (which caps the generic range at its extent)
+    is not a decline; a declared ceiling below 128 is.
+    """
+    from .cute.cute_flash import _flash_flex_coalesce_steps
+    from .cute.cute_flash import _flash_flex_hook_ops
+    from .cute.cute_flash import _flash_flex_prefetch_regs
+    from .cute.cute_flash import _flash_output_requires_tma
+    from .cute.cute_flash import flash_tmem_rowmax_score_plan_supported
+    from .cute.flash_score_mod import flex_aux_smem_candidates
+
+    plan = match.plan
+    num_bh = match.num_bh
+    # LSE uses a direct layout with signed Int32 element coordinates.
+    if match.lse_name is not None and num_bh * match.q_seq > 1 << 31:
+        return None
+    block_size_targets = {match.q_block_id: 128, match.kv_block_id: 128}
+    if not _flash_block_sizes_reachable(
+        env, block_size_targets, overshoot_dimension=True
+    ):
+        return None
+    return FlashSearchSurface(
+        head_dim=match.head_dim,
+        num_kv=match.num_kv,
+        num_bh=num_bh,
+        tensor_4d_heads=match.heads,
+        io_dtype=match.io_dtype,
+        block_size_targets=block_size_targets,
+        is_causal=False,
+        has_kv_tile_pruning=False,
+        requires_ws_overlap=False,
+        small_biased_candidate=False,
+        standard_dense_output=False,
+        standard_causal_output=False,
+        output_requires_tma=_flash_output_requires_tma(
+            num_bh, match.q_seq, match.head_dim_v
+        ),
+        # The flex emitter reads its 4-D operands directly; the collapsed
+        # path's reshape-view TMA proof does not apply.
+        supports_tensor_4d_tma=False,
+        # The hardware row max reduces the list walk's full tiles (raw
+        # scores); a score region runs the hook on every tile.
+        tmem_rowmax_compatible=flash_tmem_rowmax_score_plan_supported(plan),
+        has_row_epilogue=False,
+        # The hook bodies exist only in the 128-row bodies.
+        plain_row_body=False,
+        # Mask-only plans keep the dense body on full tiles: only a score
+        # region (or an unpeeled scale) makes every tile run the hook.
+        has_score_modifiers=plan.flex_has_score_region,
+        score_modifier_kinds=plan.modifier_kinds,
+        head_dim_v=plan.head_dim_v,
+        kv_group=plan.kv_group,
+        has_list_walk=plan.has_list_walk,
+        flex_has_score_region=plan.flex_has_score_region,
+        flex_has_mask_region=plan.flex_has_mask_region,
+        flex_trivial_walk=not plan.has_list_walk,
+        q_seq=match.q_seq,
+        kv_seq=match.kv_seq,
+        flex_aux_smem_candidates=flex_aux_smem_candidates(plan),
+        flex_prefetch_regs=_flash_flex_prefetch_regs(
+            plan, num_bh, match.heads or num_bh, match.num_kv
+        ),
+        flex_coalesce_steps=_flash_flex_coalesce_steps(
+            plan, num_bh, match.heads or num_bh, match.num_kv
+        ),
+        flex_hook_ops=_flash_flex_hook_ops(
+            plan, num_bh, match.heads or num_bh, match.num_kv
+        ),
+    )
 
 
 class _SpecializedMmaPlan(NamedTuple):

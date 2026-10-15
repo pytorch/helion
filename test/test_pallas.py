@@ -4160,6 +4160,37 @@ class TestPallas(TestCase):
         result = bound.compile_config(numerical_config)(x, y)
         torch.testing.assert_close(result, (x + y).to(result.device))
 
+    @parametrize("loop_type", ("fori_loop", "emit_pipeline"))
+    def test_outer_loop_short_extent_padded(self, loop_type: str) -> None:
+        """A partial final tile of an outer device loop yields correct output.
+
+        N = 192 is not a multiple of block_n = 128, so the last iteration of
+        the outer hl.tile(N) loop covers only 64 columns of b and out.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            M, K = a.shape
+            _, N = b.shape
+            out = torch.empty([M, N], dtype=a.dtype, device=a.device)
+            for mt in hl.tile(M):
+                for nt in hl.tile(N):
+                    acc = hl.zeros([mt, nt], dtype=torch.float32)
+                    for kt in hl.tile(K):
+                        acc = acc + torch.matmul(a[mt, kt], b[kt, nt])
+                    out[mt, nt] = acc.to(a.dtype)
+            return out
+
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(128, 192, device=DEVICE, dtype=torch.bfloat16)
+        _code, out = code_and_output(
+            static_matmul,
+            (a, b),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(out, a @ b, rtol=1e-2, atol=1e-2)
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""
@@ -6299,6 +6330,53 @@ class TestPallas(TestCase):
             f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
         )
 
+    @parametrize(
+        "kernel_name,begin,expected_extra_pad",
+        (("from_zero", 0, 0), ("from_four", 4, 7)),
+    )
+    def test_device_loop_begin_aligned_skips_pad(
+        self, kernel_name: str, begin: int, expected_extra_pad: int
+    ) -> None:
+        # Like test_pipeline_begin_aligned_skips_pad, but the outer tile is a
+        # device loop under a grid rather than a grid dim, so its begin is a
+        # literal. An inner tile starting at the outer offset needs no pad when
+        # that literal is 0, and the conservative block_size - 1 otherwise.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def from_zero(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for mb_cta in hl.tile(0, m, block_size=8):
+                    for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                        out[mb, :] = x[mb, :] * r[mb, :]
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def from_four(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for mb_cta in hl.tile(4, m, block_size=8):
+                    for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                        out[mb, :] = x[mb, :] * r[mb, :]
+            return out
+
+        kernel = locals()[kernel_name]
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel, (x, r), block_sizes=[8], pallas_loop_type="fori_loop"
+        )
+        torch.testing.assert_close(result[begin:], (x * r)[begin:])
+        match = re.search(r"_ds_pad_dims=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match)
+        pad_dims = ast.literal_eval(match.group(1))
+        self.assertTrue(pad_dims)
+        self.assertTrue(
+            all(pad == expected_extra_pad for *_, pad in pad_dims),
+            f"expected extra_pad == {expected_extra_pad}, got {pad_dims}",
+        )
+
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
@@ -7454,6 +7532,9 @@ class TestPallas(TestCase):
             "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
             code,
         )
+
+
+instantiate_parametrized_tests(TestPallas)
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")

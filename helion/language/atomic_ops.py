@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import itertools
 from typing import Callable
 
 import torch
@@ -105,77 +104,49 @@ def _ref_atomic_binop(
     return prev
 
 
-def _ref_apply(
-    target: torch.Tensor,
-    index: list[object],
-    apply_fn: Callable[[torch.Tensor, tuple, object], None],
-    value: object,
-) -> None:
-    from ..runtime.ref_mode import cartesian_indices
-    from .ref_tile import RefTile
-
-    # Convert indices to proper format
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-
-    # Find tensor indices that need element-wise processing
-    tensor_indices = [
-        (i, idx)
-        for i, idx in enumerate(processed_index)
-        if isinstance(idx, torch.Tensor) and idx.numel() > 1
-    ]
-
-    if len(tensor_indices) > 1:
-        # Several tensor indices broadcast together (Helion indexes several
-        # 1-D tensors as a cartesian product), so the value is indexed by the
-        # joint position.  Apply element by element so repeated indices
-        # accumulate.
-        joint_index = cartesian_indices(processed_index)
-        positions = torch.arange(target.numel(), device=target.device).view(
-            target.shape
-        )[tuple(joint_index)]  # pyrefly: ignore [bad-index]
-        values = (
-            value.expand(positions.shape).reshape(-1)
-            if isinstance(value, torch.Tensor) and value.numel() > 1
-            else None
-        )
-        for flat, position in enumerate(positions.reshape(-1).tolist()):
-            target_coords: list[int] = []
-            for size in reversed(target.shape):
-                position, coord = divmod(position, size)
-                target_coords.append(coord)
-            apply_fn(
-                target,
-                tuple(reversed(target_coords)),
-                value if values is None else values[flat],
+def _ref_lane_coords(target: torch.Tensor, index: list[object]) -> list[torch.Tensor]:
+    """Each lane's coordinate along every dim of ``target``, laid out like
+    the compiled result of ``target[index]``: several 1-D index tensors
+    form a cartesian product, one dim each in place, while other index
+    tensors broadcast together into dims at the first one's place.  Negative
+    indices wrap and out-of-range ones raise, as in eager indexing."""
+    tensors = [idx for idx in index if isinstance(idx, torch.Tensor)]
+    cartesian = len(tensors) > 1 and all(t.ndim == 1 for t in tensors)
+    group = () if cartesian else torch.broadcast_shapes(*(t.shape for t in tensors))
+    placed: list[tuple[torch.Tensor, int]] = []
+    rank = 0
+    group_start: int | None = None
+    for dim, (idx, size) in enumerate(zip(index, target.shape, strict=True)):
+        if isinstance(idx, slice):
+            placed.append(
+                (torch.arange(*idx.indices(size), device=target.device), rank)
             )
-    elif tensor_indices:
-        # Element-wise processing for tensor indices (handle first tensor index)
-        i, tensor_idx = tensor_indices[0]
-
-        if tensor_idx.ndim == 0:
-            coords_iter = [()]
+            rank += 1
+            continue
+        coord = torch.as_tensor(idx, device=target.device, dtype=torch.int64)
+        if bool(((coord < -size) | (coord >= size)).any()):
+            raise IndexError(f"index out of range for dim {dim} of size {size}")
+        coord = torch.where(coord < 0, coord + size, coord)
+        if not isinstance(idx, torch.Tensor):
+            placed.append((coord, rank))
+        elif cartesian:
+            placed.append((coord, rank))
+            rank += 1
         else:
-            ranges = [range(dim) for dim in tensor_idx.shape]
-            coords_iter = itertools.product(*ranges)
-
-        for coords in coords_iter:
-            elem = tensor_idx[coords].item()
-            new_index = processed_index.copy()
-            new_index[i] = int(elem)
-            if isinstance(value, torch.Tensor) and value.numel() > 1:
-                next_value = value[coords]
-            else:
-                next_value = value
-            _ref_apply(target, new_index, apply_fn, next_value)
-    else:
-        apply_fn(target, tuple(processed_index), value)
+            if group_start is None:
+                group_start = rank
+                rank += len(group)
+            placed.append((coord.expand(group), group_start))
+    return list(
+        torch.broadcast_tensors(
+            *(
+                coord.view(
+                    *[1] * start, *coord.shape, *[1] * (rank - start - coord.ndim)
+                )
+                for coord, start in placed
+            )
+        )
+    )
 
 
 # -- atomic_add --
@@ -264,14 +235,13 @@ def _(
     _refuse_device_load_target(target, "atomic_add")
     from .ref_tile import RefTile
 
-    # Convert indices for shape computation and fast path detection
     processed_index: list[object] = []
     has_tensor_index = False
     for idx in index:
         if isinstance(idx, RefTile):
             processed_index.append(idx._slice)
         elif isinstance(idx, torch.Tensor):
-            if idx.numel() == 1:
+            if idx.ndim == 0:
                 processed_index.append(int(idx.item()))
             else:
                 processed_index.append(idx)
@@ -288,21 +258,18 @@ def _(
         return torch.as_tensor(val, dtype=target.dtype, device=target.device)
 
     if has_tensor_index:
-        ret_shape = SubscriptIndexing.compute_shape(target, processed_index)
-        prev_chunks: list[torch.Tensor] = []
-
-        def apply(t: torch.Tensor, idx_tuple: tuple, v: object) -> None:
-            prev_val = t[idx_tuple].clone()
-            val_tensor = _convert_value_to_target_dtype(v)
-            t[idx_tuple] = t[idx_tuple] + val_tensor
-            prev_chunks.append(prev_val.reshape(-1))
-
-        _ref_apply(target, index, apply, value)
-        if prev_chunks:
-            flat_prev = torch.cat(prev_chunks)
-        else:
-            flat_prev = target.new_empty(0, dtype=target.dtype, device=target.device)
-        return flat_prev.reshape(ret_shape)
+        # Add lane by lane, in the result's layout, so repeated indices
+        # accumulate and each lane returns the value its own add replaced.
+        coords = _ref_lane_coords(target, processed_index)
+        shape = coords[0].shape
+        values = _convert_value_to_target_dtype(value).expand(shape).reshape(-1)
+        prev = target.new_empty(shape)
+        flat_prev = prev.view(-1)
+        lanes = zip(*(coord.reshape(-1).tolist() for coord in coords), strict=True)
+        for flat, element in enumerate(lanes):
+            flat_prev[flat] = target[element]
+            target[element] += values[flat]
+        return prev
 
     idx_tuple = tuple(processed_index)
     # pyrefly: ignore [bad-index]
@@ -663,8 +630,10 @@ def atomic_cas(
         torch.Tensor: The previous value(s) stored at ``target[index]`` before the compare-and-swap.
 
     Note:
-        Triton CAS doesn’t support a masked form; our generated code uses
-        an unmasked CAS and relies on index masking to avoid OOB.
+        Triton CAS has no masked form.  A lane of a tile past the target's
+        extent instead swaps an in-bounds element (its indices clamped to
+        each dim's last element) for that lane's expected value, which
+        leaves memory unchanged; its returned value is meaningless.
     """
     raise exc.NotInsideKernel
 

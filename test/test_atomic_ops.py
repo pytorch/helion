@@ -478,6 +478,88 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, y)
         torch.testing.assert_close(prev, torch.zeros_like(x))
 
+    def test_atomic_add_returns_prev_with_tensor_index_beside_tile(self):
+        """A tensor index after a tile returns each lane's previous value in
+        the ``[tile_m, tile_n]`` layout, and lanes adding into one element
+        each see a distinct previous value."""
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8]))
+        def scatter_columns(
+            x: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            prev = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_n] = hl.atomic_add(
+                    out, [tile_m, cols[tile_n]], x[tile_m, tile_n]
+                )
+            return out, prev
+
+        x = torch.ones(4, 8, device=DEVICE)
+        out = torch.zeros(4, 2, device=DEVICE)
+        cols = torch.tensor([0, 1, 1, 1, 1, 1, 1, 1], device=DEVICE)
+        out, prev = scatter_columns(x, cols, out)
+        torch.testing.assert_close(out, torch.tensor([[1.0, 7.0]] * 4, device=DEVICE))
+        torch.testing.assert_close(prev[:, 0], torch.zeros(4, device=DEVICE))
+        torch.testing.assert_close(
+            prev[:, 1:].sort(dim=1).values,
+            torch.arange(7, device=DEVICE, dtype=torch.float32).expand(4, 7),
+        )
+
+    def test_atomic_add_tensor_index_layouts(self):
+        """Tensor indices separated by a tile return each lane's previous
+        value in the compiled ``[m, k, n]`` layout (eager indexing would put
+        the indexed dims first), and a one-element index keeps its dim."""
+        if _get_backend() == "pallas":
+            self.skipTest("Pallas/TPU does not support integer tensor indexing")
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8, 4]))
+        def scatter_around_tile(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_m, tile_k, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_k, tile_n] = hl.atomic_add(
+                    out, [rows[tile_m], tile_k, cols[tile_n]], x[tile_m, tile_k, tile_n]
+                )
+            return prev
+
+        @helion.kernel(config=helion.Config(block_sizes=[4, 8]))
+        def scatter_pairs(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            prev = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                prev[tile_m, tile_n] = hl.atomic_add(
+                    out, [rows[tile_m], cols[tile_n]], x[tile_m, tile_n]
+                )
+            return prev
+
+        out = torch.arange(3 * 8 * 5, device=DEVICE, dtype=torch.float32).view(3, 8, 5)
+        rows = torch.tensor([2, 0], device=DEVICE)
+        cols = torch.tensor([4, 1, 3, 0], device=DEVICE)
+        x = torch.ones(2, 8, 4, device=DEVICE)
+        expected_prev = out[rows][:, :, cols]
+        prev = scatter_around_tile(x, rows, cols, out.clone())
+        torch.testing.assert_close(prev, expected_prev)
+
+        out = torch.arange(3 * 5, device=DEVICE, dtype=torch.float32).view(3, 5)
+        rows = torch.tensor([1], device=DEVICE)
+        cols = torch.tensor([4, 0, 2, 3, 1, 2, 0, 4], device=DEVICE)
+        x = torch.ones(1, 8, device=DEVICE)
+        prev = scatter_pairs(x, rows, cols, out.clone())
+        self.assertEqual(prev.shape, (1, 8))
+        # A column added to k times returns its value plus 0..k-1.
+        expected = [
+            out[1, c].item() + j
+            for c in cols.unique().tolist()
+            for j in range(int((cols == c).sum()))
+        ]
+        torch.testing.assert_close(
+            prev[0].sort().values, torch.tensor(sorted(expected), device=DEVICE)
+        )
+
     @xfailIfPallas("gather indexing with different-sized tensors unsupported on Pallas")
     def test_overlapping_atomic_add(self):
         # Test with overlapping indices
@@ -976,6 +1058,92 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_cas", code)
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfTileIR("TileIR does not compile a float16 atomic_cas")
+    def test_atomic_cas_operands_made_into_blocks(self):
+        """Triton's CAS neither broadcasts nor converts its compare and swap
+        values to the pointer's block and type: scalars and int literals over
+        a tile, lower-rank or size-1-dim tensors, values computed in float32
+        for a float16 target, and an int literal into a float scalar target
+        all failed to compile."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def claim(x: torch.Tensor) -> torch.Tensor:
+            old = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                old[tile_m, tile_n] = hl.atomic_cas(x, [tile_m, tile_n], 0, 1)
+            return old
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def swap_rows(
+            x: torch.Tensor, expected: torch.Tensor, value: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_cas(x, [tile_m, tile_n], expected[tile_n], value[tile_m, :])
+            return x
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def increment(x: torch.Tensor) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile(x.size()):
+                hl.atomic_cas(
+                    x, [tile_m, tile_n], x[tile_m, tile_n], x[tile_m, tile_n] + 1
+                )
+            return x
+
+        @helion.kernel(config=helion.Config(block_sizes=[16]))
+        def claim_first(x: torch.Tensor) -> torch.Tensor:
+            for _ in hl.tile(x.size(0)):
+                hl.atomic_cas(x, [0], 0, 1)
+            return x
+
+        for m in (4, 16):
+            with self.subTest(m=m):
+                x = torch.zeros(m, 64, device=DEVICE)
+                x[0, 0] = 5.0
+                expected = torch.ones_like(x)
+                expected[0, 0] = 5.0
+                old = claim(x)
+                torch.testing.assert_close(x, expected)
+                torch.testing.assert_close(old, torch.where(expected == 5.0, 5.0, 0.0))
+
+                x = torch.zeros(m, 64, device=DEVICE)
+                value = torch.arange(m, device=DEVICE, dtype=torch.float32)[:, None]
+                torch.testing.assert_close(
+                    swap_rows(x, torch.zeros(64, device=DEVICE), value),
+                    value.expand(m, 64),
+                )
+
+                x = torch.randn(m, 64, device=DEVICE, dtype=torch.float16)
+                torch.testing.assert_close(increment(x.clone()), x + 1)
+
+        torch.testing.assert_close(
+            claim_first(torch.zeros(4, device=DEVICE)),
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE),
+        )
+
+    def test_atomic_cas_masks_tile_lanes(self):
+        """Triton's CAS takes no mask, so the lanes of a tile past the
+        tensor's extent wrote past its end (768 elements of the buffer here)."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[16, 32]))
+        def cas(x: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+            old = torch.empty_like(expected)
+            for tile_m, tile_n in hl.tile(expected.size()):
+                old[tile_m, tile_n] = hl.atomic_cas(
+                    x,
+                    [tile_m, tile_n],
+                    expected[tile_m, tile_n],
+                    expected[tile_m, tile_n] + 1.0,
+                )
+            return old
+
+        buffer = torch.zeros(64, 64, device=DEVICE)
+        x = buffer[:4]
+        expected = torch.zeros(4, 64, device=DEVICE)
+        torch.testing.assert_close(cas(x, expected), torch.zeros_like(expected))
+        torch.testing.assert_close(x, expected + 1.0)
+        torch.testing.assert_close(buffer[4:], torch.zeros_like(buffer[4:]))
 
     @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()

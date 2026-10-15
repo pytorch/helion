@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import enum
+import functools
 import linecache
 import os
 import re
@@ -180,6 +181,13 @@ def create_arguments(args: list[ast.arg]) -> ast.arguments:
     )
 
 
+@functools.lru_cache(maxsize=512)
+def _parse_statement(template: str) -> ast.stmt:
+    # Substitution rebuilds this raw tree with fresh nodes and source locations.
+    (statement,) = ast.parse(template).body
+    return statement
+
+
 def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     """
     Create an AST statement from a template string with placeholders.
@@ -225,7 +233,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     modified_template = re.sub(pattern, make_unique, template)
 
     # Parse the modified template into an AST
-    (statement,) = ast.parse(modified_template).body
+    statement = _parse_statement(modified_template)
 
     # Second pass: Recursively walk the AST and replace __placeholder_N__ identifiers
     # with the actual AST nodes provided by the user

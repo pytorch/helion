@@ -313,7 +313,6 @@ jobs:
         run: |
           set -e -o pipefail
           source .venv/bin/activate
-          uv pip install pytest-xdist
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
@@ -328,6 +327,8 @@ jobs:
           export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
           # -rf: print failed tests
           # --timeout: max allowed time for each test
+          # -n: xdist workers (test/conftest.py defaults the scheduler to worksteal).
+          # Without -n, conftest sizes the workers to the GPU, so always pass it.
           PARALLEL="-n4"
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
@@ -335,11 +336,11 @@ jobs:
           elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py --ignore=test/test_remote_copy.py"
-            PARALLEL=""
+            PARALLEL="-n0"
           elif [[ "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
-            PARALLEL=""
+            PARALLEL="-n0"
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
@@ -349,19 +350,13 @@ jobs:
           # only needs a small allocation.
           # The MI350X runner also exposes a single GPU. Four workers sharing it
           # pushed the autotune and benchmark tests past their per-test timeout.
-          if [[ -n "$PARALLEL" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
+          if [[ "$PARALLEL" != "-n0" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
             PARALLEL="-n2"
           fi
           # B200 containers have 28 CPUs and most tests are CPU-bound compilation
           # (the GPU sits mostly idle), so eight workers roughly halve the suite.
-          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == "b200" ]]; then
+          if [[ "$PARALLEL" != "-n0" && "${{ matrix.alias }}" == "b200" ]]; then
             PARALLEL="-n8"
-          fi
-          # worksteal lets idle workers take tests queued behind a long-running
-          # one; the default "load" scheduler leaves them stuck on a single worker
-          # (e.g. the FLA-backed linear examples serialized into a ~16 min tail).
-          if [[ -n "$PARALLEL" ]]; then
-            PARALLEL="$PARALLEL --dist worksteal"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
@@ -392,13 +387,13 @@ jobs:
           # JAX and TorchTPU initialize the TPU runtime differently. Run the
           # physical remote-copy suites in fresh, sequential pytest processes.
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
-            pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
-            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
+            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
+            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
           fi
           # Each remote-copy test launches one process per GPU, so run this class
           # serially rather than assigning its tests to concurrent xdist workers.
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
-            pytest -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
           fi
 
   test-notebooks:

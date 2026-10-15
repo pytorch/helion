@@ -19,8 +19,11 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test.test_cute_shared_rhs_grouped import _bind
 from test.test_cute_shared_rhs_grouped import _explicit_offset_mm
+from test.test_cute_shared_rhs_grouped import _offset_initializer_statements
 from test.test_cute_shared_rhs_grouped import _OffsetPointer
 from test.test_cute_shared_rhs_grouped import _plans
+from test.test_cute_shared_rhs_grouped import _run_offset_initializer
+from test.test_cute_shared_rhs_grouped import _serial_offset_initializer
 from test.test_cute_shared_rhs_grouped import _target
 
 import helion
@@ -160,7 +163,9 @@ def test_full_source_inverse_and_unchanged_wrapper(m: int, n: int, k: int) -> No
         "copy": 1,
         "dense": 1,
     }
-    assert _dump(reversed_tree) == _dump(ast.parse(ordinary))
+    assert _dump(_serial_offset_initializer(reversed_tree)) == _dump(
+        _serial_offset_initializer(ast.parse(ordinary))
+    )
     assert _plans(dense) == _plans(ordinary)
     assert "init_tensormap_from_atom(tma_atom_b" not in dense
 
@@ -294,18 +299,7 @@ def test_unproved_alias_effect_or_group_dependence_declines(
 
 
 def _metadata_code(source: str) -> Any:
-    tree = ast.parse(source)
-    setup = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and any(
-            isinstance(child, ast.Assign)
-            and ast.unparse(child.targets[0]) == "tcgen05_grouped_raw_start"
-            for child in node.body
-        )
-    )
-    return compile(ast.Module(body=[setup], type_ignores=[]), "<metadata>", "exec")
+    return _offset_initializer_statements(ast.parse(source))
 
 
 def _metadata(
@@ -335,7 +329,7 @@ def _metadata(
         "tcgen05_grouped_starts": starts,
         "tcgen05_grouped_problem_sizes": sizes,
     }
-    exec(code, namespace)
+    _run_offset_initializer(code, namespace)
     return starts, sizes
 
 

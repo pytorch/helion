@@ -138,8 +138,9 @@ Least recently used entries are evicted when a write would exceed the budget. Se
 .. autoattribute:: Settings.fast_math
 
    If ``True``, enable fast math approximations. This activates both Helion-level optimizations
-   (e.g. fast sigmoid) and Inductor-level fast math (flush-to-zero exp, fast online softmax,
-   etc.). May reduce numerical precision and change NaN/Inf behavior. Default is ``False``.
+   (e.g. fast sigmoid, the CuTe flash-attention polynomial exp2 packets) and Inductor-level fast
+   math (flush-to-zero exp, fast online softmax, etc.). May reduce numerical precision and change
+   NaN/Inf behavior. Default is ``False``.
    Controlled by ``HELION_FAST_MATH=1``.
 
 .. autoattribute:: Settings.persistent_reserved_sms
@@ -442,6 +443,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_BEST_AVAILABLE_MAX_CONFIGS`` | ``autotune_best_available_max_configs`` | Maximum cached configs to seed when using ``from_best_available`` strategy. |
 | ``HELION_BEST_AVAILABLE_MAX_CACHE_SCAN`` | ``autotune_best_available_max_cache_scan`` | Maximum cache files to scan when using ``from_best_available`` strategy. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
+| ``HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS`` | (effort profile ``final_selection``) | Rounds of the full-effort final selection, which picks the returned config with harness-grade windows after the search (and after the finishing phase and any backend refinement): a 5 s thermal warmup, one 500+500 ms screen of the retained shortlist when it is longer than the finalists, then the best 8 survivors plus the best seed and the search's incumbent run 4 rounds of 500+500 ms steady windows in alternating order; the median across rounds decides and a finalist that misses a round cannot win. This adds about 60-150 s to every full-effort autotune on every backend (the search's own 50-200 ms windows mis-rank finalists by 3-6% on power-limited GPUs, and a window needs about 500 ms of warmup after the idle gap between windows before the B200 power limiter settles). ``0`` restores the single-pass final verification and its ``HELION_AUTOTUNE_FINAL_REBENCHMARK_*`` knobs, which the selection otherwise ignores (warned once). Under ``HELION_AUTOTUNE_BUDGET_SECONDS`` the search phase keeps the phase's estimated time back plus the wall time of one search generation (the generation in flight finishes its benchmark pass after the budget check); together they take at most a quarter of the budget, so a long generation shortens the selection rather than the search, except that the selection's smallest plan (up to four finalists: two survivors plus the seed and the incumbent, two rounds, no screen or thermal warmup, about 11-17 s) stays reserved past that generation whenever a quarter of the budget covers it (budgets under about 70 s do not, and skip the selection). The phase is sized to whatever is left when it starts: the screen goes first, then rounds (down to 2), then survivors (down to 2), then the thermal warmup; it is skipped when even that does not fit. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |

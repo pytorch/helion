@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 import dataclasses
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
@@ -14,6 +15,7 @@ import torch
 
 from ._cute_binding import _forbid_native_compile
 from ._cute_binding import _mock_cuda_unavailable
+from .test_cute_flash_exp2 import _policy_template_seed
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.backend import CuteBackend
@@ -85,6 +87,7 @@ def _source(
     rowmax: str = "tmem",
     has_lse: bool = False,
     overrides: Mapping[str, object] | None = None,
+    fast_math: bool = False,
 ) -> tuple[cute_flash.FlashAttentionConfig, str]:
     requested: dict[str, object] = {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
@@ -103,6 +106,7 @@ def _source(
         standard_causal_output=causal and not has_lse,
         tmem_rowmax_compatible=True,
         target_device_capability=(10, 3),
+        fast_math=fast_math,
     )
     body = cute_flash.emit_flash_fa4_device_body(
         cast("DeviceFunction", None),
@@ -216,16 +220,20 @@ def test_causal_hardware_maximum_only_updates_unmasked_rows(
     assert config.rowmax == "tmem"
     # The unacknowledged whole-row causal protocol remains canonically unavailable.
     assert config.softmax_disc
-    assert "fa4_disc_rowmax_causal_balanced" in source
+    # The masked tiles keep the software causal reduce (with the store-back
+    # of ``cute_flash_causal_mask_storeback`` on the plain body).
+    assert re.search(r"fa4_disc_rowmax_causal(_store)?_balanced", source)
     assert "disc_rowmax_ldred" in source
 
 
 def test_partial_resident_causal_scores_retain_hardware_maxima() -> None:
     packet = cute_flash._FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET
+    # The degree-2 resident cadence is offered under fast_math only.
     config, source = _source(
         dtype=torch.bfloat16,
         causal=True,
         overrides={cute_flash.FLASH_EXP2_PACKET_KEY: packet},
+        fast_math=True,
     )
     assert config.exp2_packet == packet
     assert "flash_res_frg0, flash_res_red" in source
@@ -238,7 +246,7 @@ def test_partial_resident_causal_scores_retain_hardware_maxima() -> None:
             "for flash_kv_unmask_iter"
         )
     ]
-    assert "fa4_disc_rowmax_causal_balanced" in masked
+    assert re.search(r"fa4_disc_rowmax_causal(_store)?_balanced", masked)
     assert "flash_res_red" not in masked
 
 
@@ -347,13 +355,11 @@ def test_score_transform_proof_rejects_pre_transform_maximum() -> None:
 
 
 def test_native_causal_lowering_remains_available_and_software_is_independent() -> None:
-    seed = cute_flash.flash_attention_seed_config(
-        64,
-        512,
-        dtype=torch.float16,
-        is_causal=True,
-        standard_causal_output=True,
-        target_device_capability=(10, 3),
+    # The resident-native route takes the length's causal policy row, which is
+    # written against the degree-2 packet (fast_math only); select it out of
+    # the compiler's template union.
+    seed = _policy_template_seed(
+        512, is_causal=True, capability=(10, 3), fast_math=True
     )
     assert seed is not None
     for mode in ("software", "tmem"):
@@ -362,6 +368,7 @@ def test_native_causal_lowering_remains_available_and_software_is_independent() 
             num_kv=512,
             causal=True,
             overrides={**seed.config, cute_flash.FLASH_ROWMAX_KEY: mode},
+            fast_math=True,
         )
         if mode == "software":
             assert "LdRed32x32bOp" not in source

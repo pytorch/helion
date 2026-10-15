@@ -310,7 +310,7 @@ def _randn_like_inputs(inputs: tuple[torch.Tensor, ...]) -> None:
         ),
     ),
 )
-def test_rolled_fallback_matches_reference(
+def test_supported_store_and_rolled_fallback_match_reference(
     kernel: helion.Kernel,
     reference: Callable[..., torch.Tensor],
     dtype: torch.dtype,
@@ -319,9 +319,8 @@ def test_rolled_fallback_matches_reference(
     reduction_threads: int,
     vec: int,
 ) -> None:
-    # A register-tile config over a body the two-pass schedule cannot place
-    # (a per-element fp32 store of a bf16 tile, a live-value budget overrun)
-    # compiles with the rolled lane nesting instead of raising.
+    # SM100 can pack eight widened fp32 results into one 32-byte output packet.
+    # Older targets and live-value budget overruns retain rolled fallback.
     torch.manual_seed(0)
     tensors = tuple(
         torch.randn(128, 16384, device=DEVICE).to(dtype) for _ in range(inputs)
@@ -332,7 +331,16 @@ def test_rolled_fallback_matches_reference(
     )
     assert config.reduction_loops == [None]
     code = bound.to_code(config)
-    assert "for synthetic_lane_1 in range(" in code
+    wide_store = dtype is torch.bfloat16 and torch.cuda.get_device_capability() >= (
+        10,
+        0,
+    )
+    if wide_store:
+        assert "for synthetic_lane_1 in cutlass.range_constexpr(" in code
+        assert COLUMN_REDUCE in code
+        assert code.count("_cute_store_u32_vec(out.iterator") == 1
+    else:
+        assert "for synthetic_lane_1 in range(" in code
     assert "_lane_stash" not in code
     compiled = bound.compile_config(config)
     for _ in range(2):

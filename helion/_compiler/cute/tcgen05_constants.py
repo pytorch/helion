@@ -564,6 +564,12 @@ TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
 TCGEN05_CONSUMER_REGS_DEFAULT = 256
 TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
 
+# Independent single-CTA grouped worklists can use ptxas's static register
+# allocation instead of reserving a separate producer/consumer warpgroup budget.
+# Keep the existing reallocation by default; the static alternative changes no
+# MMA, pipeline, or memory ownership and remains subject to compiled resources.
+TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY = "tcgen05_warp_register_reallocation"
+
 # Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
 # general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
 # ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow
@@ -657,6 +663,11 @@ TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY = (
     "tcgen05_grouped_worklist_source_m_tile"
 )
+# The physical UMMA M dimension is the logical output-column tile in N,M
+# orientation. None retains the established CTA-group-dependent geometry.
+TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY = "tcgen05_grouped_worklist_mma_m"
+TCGEN05_GROUPED_WORKLIST_MMA_M_CHOICES = (None, 64, 128, 256)
+TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY = "tcgen05_grouped_full_allocation_a"
 # Reviewed runtime-variable-M profiles may opt into the host-expanded direct
 # tile table.  Absence or explicit ``False`` retains the established
 # scheduler-warp/SMEM-mailbox path, so profiles can choose between the two
@@ -679,20 +690,42 @@ TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES = (
 # N,M orientation maps the packed source-M tile onto the physical MMA-N mode.
 # Keep the role-specific alias so descriptor assertions do not appear to be
 # validating an MMA dimension against an unrelated packing knob.
-# The established external/TWO domain remains unchanged. Source64 is a
-# device-offset ONE profile, admitted only by the dense-local proof.
+# The established external/TWO domain remains unchanged. The compact8/16
+# device-offset ONE profiles use smaller routed-column MMA tiles. Source64
+# remains admitted only by the dense-local proof.
 TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE = 64
 TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES = (
+    8,
+    16,
     TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
     TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
 )
 TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES = (
+    8,
+    16,
     *TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
     TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
 )
 TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 TCGEN05_GROUPED_WORKLIST_MMA_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
+
+
+def tcgen05_grouped_worklist_store_shape(
+    mma_m: int, mma_n: int
+) -> tuple[int, int, int]:
+    """Epilogue tile and store box for one physical MMA.
+
+    The physical N dimension is routed rows. Small N tiles must keep their
+    actual routed extent through TMEM loads, C staging and the TMA store box.
+    """
+    return (
+        min(mma_m, TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[0]),
+        min(mma_n, TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[1]),
+        min(mma_n, TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2]),
+    )
+
+
 # The grouped scheduler mailbox reserves slots for CTA M/N, validity,
 # metadata/group indices, problem M/N/K, and the packed-output row start.
 # Generated consumers determine which non-validity slots are published.
@@ -743,12 +776,13 @@ def resolve_tcgen05_grouped_worklist_mma_shape(
     cluster_m: object,
     block_k: object,
     source_m_tile: object,
+    mma_m: object | None = None,
 ) -> tuple[int, int] | None:
     """Resolve the physical ``(M, N)`` UMMA tile for a worklist profile.
 
     The public DSL tile remains 256x128 for every grouped N,M worklist.  The
     physical collective is instead 256x``source_m_tile`` for CtaGroup.TWO, or
-    128x32, or the BK128-only 128x64 CtaGroup.ONE profile. Keep this shared by
+    M128x8/16/32, M64x32, or the BK128-only M128x64 CtaGroup.ONE profile. Keep this shared by
     MMA selection, codegen, and SMEM validation so logical tile dimensions do
     not accidentally leak into physical resource accounting.
     """
@@ -768,10 +802,20 @@ def resolve_tcgen05_grouped_worklist_mma_shape(
             and block_k != 128
         ):
             return None
-        return TCGEN05_ONE_CTA_MAX_BLOCK_M, source_m_tile
+        if mma_m is None:
+            mma_m = TCGEN05_ONE_CTA_MAX_BLOCK_M
+        if type(mma_m) is not int or mma_m not in (64, 128):
+            return None
+        if (
+            mma_m == 64
+            and source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+        ):
+            return None
+        return mma_m, source_m_tile
     if (
         cluster_m == 2
         and source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        and (mma_m is None or mma_m == TCGEN05_GROUPED_WORKLIST_MMA_M_TILE)
     ):
         return TCGEN05_GROUPED_WORKLIST_MMA_M_TILE, source_m_tile
     return None
@@ -801,6 +845,7 @@ def resolve_tcgen05_grouped_worklist_mma_profile(
         cluster_m=cluster_m,
         block_k=block_k,
         source_m_tile=source_m_tile,
+        mma_m=config.get(TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY),
     )
     if shape is None:
         return None
@@ -830,6 +875,7 @@ def tcgen05_grouped_worklist_smem_bytes(
     acc_stages: int,
     c_stages: int,
     cluster_m: int,
+    output_dtype_bytes: int | None = None,
 ) -> int:
     """Return a conservative SMEM upper bound across all worklist modes.
 
@@ -842,6 +888,9 @@ def tcgen05_grouped_worklist_smem_bytes(
     assert group_count > 0 and sched_stage_count > 0 and cluster_m in (1, 2)
     assert bm > 0 and bn > 0 and bk > 0 and dtype_bytes > 0
     assert ab_stages > 0 and acc_stages > 0 and c_stages > 0
+    if output_dtype_bytes is None:
+        output_dtype_bytes = dtype_bytes
+    assert output_dtype_bytes > 0
     a_stage_bytes = bm * bk * dtype_bytes
     b_stage_bytes = bn * bk * dtype_bytes
     assert a_stage_bytes % cluster_m == 0
@@ -878,9 +927,9 @@ def tcgen05_grouped_worklist_smem_bytes(
     # Mutable output TensorMap and the aligned TMA-store ring.
     offset = _append_aligned_tcgen05_smem(offset, 128, 128)
     c_smem_bytes = tcgen05_c_smem_bytes_per_cta(
-        epi_tile_m=TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[0],
-        epi_tile_n=TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[1],
-        dtype_bytes=dtype_bytes,
+        epi_tile_m=tcgen05_grouped_worklist_store_shape(bm, bn)[0],
+        epi_tile_n=tcgen05_grouped_worklist_store_shape(bm, bn)[1],
+        dtype_bytes=output_dtype_bytes,
         c_stages=c_stages,
     )
     return _append_aligned_tcgen05_smem(offset, c_smem_bytes, 1024)

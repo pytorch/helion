@@ -73,6 +73,7 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_pdl: bool | None = None,
+        cute_warp_aggregated_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -88,6 +89,7 @@ class Config(Mapping[str, object]):
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
         xcd_remap: bool | None = None,
+        reduction_fusion: bool | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -154,6 +156,9 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
+                reservations for equal addresses within each active warp. Each
+                lane retains its own valid fetch-add return value. Off by default.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -208,6 +213,11 @@ class Config(Mapping[str, object]):
                 improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
                 "flat", "persistent_blocked", and "persistent_interleaved"; composes with
                 ``l2_groupings``.
+            reduction_fusion: When multiple independent reductions in a looped
+                (rolled) reduction read the same operand, fold them into one loop
+                with a single shared load instead of re-reading the operand per
+                reduction. Trades global-memory bandwidth for register pressure,
+                so it is autotuned. Defaults to False.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -244,6 +254,7 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_pdl": cute_pdl,
+            "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,
@@ -259,6 +270,7 @@ class Config(Mapping[str, object]):
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
+            "reduction_fusion": reduction_fusion,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -429,6 +441,10 @@ class Config(Mapping[str, object]):
     @property
     def host_tensor_descriptors(self) -> bool:
         return cast("bool", self.config.get("host_tensor_descriptors", False))
+
+    @property
+    def reduction_fusion(self) -> bool:
+        return cast("bool", self.config.get("reduction_fusion", False))
 
     @property
     def range_unroll_factors(self) -> list[int]:

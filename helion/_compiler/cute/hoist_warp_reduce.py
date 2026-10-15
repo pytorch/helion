@@ -1203,6 +1203,7 @@ def validate_cluster_reduce_placement(
                         in (
                             "_cute_grouped_reduce_cluster",
                             "_cute_grouped_reduce_cluster_online_pair",
+                            "_cute_grouped_reduce_cluster_warp_online_pair",
                         )
                     ):
                         raise exc.BackendUnsupported(

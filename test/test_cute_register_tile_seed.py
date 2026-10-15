@@ -74,11 +74,12 @@ def test_register_tile_heuristic_seeds_the_geometry() -> None:
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
-    ("kernel", "make_arguments"),
+    ("kernel", "make_arguments", "capability"),
     (
         pytest.param(
             col_sum_f32_out,
             lambda: (torch.empty((128, 1024), dtype=torch.bfloat16),),
+            (9, 0),
             id="bf16-column-sum-fp32-out",
         ),
         pytest.param(
@@ -86,19 +87,23 @@ def test_register_tile_heuristic_seeds_the_geometry() -> None:
             lambda: tuple(
                 torch.empty((128, 1024), dtype=torch.float32) for _ in range(3)
             ),
+            (10, 0),
             id="three-stashed-tiles",
         ),
     ),
 )
 def test_seed_compiles_bodies_the_register_tile_cannot_schedule(
-    kernel: helion.Kernel, make_arguments: Callable[[], tuple[Any, ...]]
+    kernel: helion.Kernel,
+    make_arguments: Callable[[], tuple[Any, ...]],
+    capability: tuple[int, int],
 ) -> None:
     # The device IR admits these bodies, so the seed is offered; the split-time
-    # lowering rejects them (a per-element fp32 store of a bf16 tile, a
+    # lowering rejects them (a 32-byte fp32 store on SM90, a
     # live-value budget overrun) and the seed compiles with the rolled lane
     # nesting instead of raising.
     arguments = make_arguments()
     bound = _cpu_bind(kernel, arguments)
+    bound.config_spec.target_device_capability = capability
     host = bound.host_function
     assert host is not None
     assert CuteRegisterTileHeuristic.is_eligible(bound.env, host.device_ir)
@@ -110,6 +115,24 @@ def test_seed_compiles_bodies_the_register_tile_cannot_schedule(
     assert ROLLED_OWNER in code
     assert CONSTEXPR_OWNER not in code
     assert "_lane_stash" not in code
+
+
+@skipUnlessBackends(["cute"])
+def test_seed_keeps_bf16_to_fp32_column_store_on_sm100() -> None:
+    arguments = (torch.empty((128, 1024), dtype=torch.bfloat16),)
+    bound = _cpu_bind(col_sum_f32_out, arguments)
+    bound.config_spec.target_device_capability = (10, 0)
+    host = bound.host_function
+    assert host is not None
+    seed = CuteRegisterTileHeuristic.get_seed_config(bound.env, host.device_ir)
+    assert seed is not None
+    config = bound.config_spec.normalized_config(seed)
+    assert config.reduction_loops == [None]
+    code = bound.to_code(config)
+    assert CONSTEXPR_OWNER in code
+    assert ROLLED_OWNER not in code
+    assert code.count(COLUMN_REDUCE) == 1
+    assert code.count("_cute_store_u32_vec(out.iterator") == 1
 
 
 @skipUnlessBackends(["cute"])

@@ -1,7 +1,9 @@
-"""SM100 packed E2M1/UE4M3 pipeline for proved block-scaled contractions.
+"""SM100 native E2M1/UE4M3 and E4M3/UE8M0 block-scaled pipelines.
 
 Prepared operands contain only byte permutations, sign normalization and zero
 padding. The native consumer keeps them packed through TMA and shared memory.
+MXFP8 operands are read directly from their original K-major tensors; only
+their scale bytes need preparation into the native 128-row, four-group layout.
 Its producer, MMA and output roles communicate through CUTLASS pipelines. Scale
 TMEM is disjoint from the accumulator, including while the epilogue drains it.
 """
@@ -73,22 +75,38 @@ class Sm100BlockScaledGemm:
         persistent: bool,
         num_sm: int,
         round_dtypes: tuple[type[cutlass.Numeric], ...] = (),
+        *,
+        operand_format: str = "nvfp4",
     ) -> None:
-        assert m > 0 and n > 0 and k > 0 and k % 16 == 0
-        assert bn in (128, 256) and bk in (64, 128, 256)
+        assert operand_format in ("nvfp4", "mxfp8")
+        self.operand_format = operand_format
+        self.operand_dtype = (
+            cutlass.Float4E2M1FN if operand_format == "nvfp4" else cutlass.Float8E4M3FN
+        )
+        self.scale_dtype = (
+            cutlass.Float8E4M3FN if operand_format == "nvfp4" else cutlass.Float8E8M0FNU
+        )
+        self.scale_vector_size = 16 if operand_format == "nvfp4" else 32
+        self.mma_k = 64 if operand_format == "nvfp4" else 32
+        self.scale_chunk_k = 4 * self.scale_vector_size
+        assert m > 0 and n > 0 and k > 0 and k % self.scale_vector_size == 0
+        assert bn in ((64, 128, 256) if operand_format == "mxfp8" else (128, 256))
+        assert bk in (64, 128, 256)
+        assert bk % self.scale_chunk_k == 0
         assert stages in (2, 3, 4, 5) and cluster_m in (1, 2)
         self.m, self.n, self.k = m, n, k
         self.mp, self.np, self.kp = block_scaled_workspace_shape(m, n, k, bn, bk)
         self.bm, self.bn, self.bk = 128 * cluster_m, bn, bk
+        self.sf_n_chunks = (bn + 127) // 128
         self.stages = stages
         self.cluster_m = cluster_m
         self.round_dtypes = round_dtypes
         self.group = tcgen05.CtaGroup.ONE if cluster_m == 1 else tcgen05.CtaGroup.TWO
         self.tile = (self.bm, bn, bk)
-        self.qa_bytes = self.mp * self.kp // 2
-        self.qb_bytes = self.np * self.kp // 2
-        self.sa_bytes = self.mp * self.kp // 16
-        self.sb_bytes = self.np * self.kp // 16
+        self.qa_bytes = self.mp * self.kp // 2 if operand_format == "nvfp4" else 0
+        self.qb_bytes = self.np * self.kp // 2 if operand_format == "nvfp4" else 0
+        self.sa_bytes = self.mp * self.kp // self.scale_vector_size
+        self.sb_bytes = self.np * self.kp // self.scale_vector_size
         self.qb_offset = self.qa_bytes
         self.sa_offset = self.qb_offset + self.qb_bytes
         self.sb_offset = self.sa_offset + self.sa_bytes
@@ -110,6 +128,7 @@ class Sm100BlockScaledGemm:
         alpha: cutlass.Float32,
         stream: CUstream,
     ) -> None:
+        assert self.operand_format == "nvfp4"
         workspace_pointer = cast("cute.Pointer", workspace.iterator)
         qa = cute.make_tensor(
             cute.recast_ptr(workspace_pointer, dtype=cutlass.Float4E2M1FN),
@@ -129,13 +148,59 @@ class Sm100BlockScaledGemm:
             cute.recast_ptr(workspace_pointer + self.sb_offset, dtype=cutlass.Int16),
             cute.make_layout((256, self.kp // 64, self.np // 128)),
         )
+        self._launch(qa, qb, sa, sb, output, alpha, stream)
+
+    @cute.jit
+    def mxfp8(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        workspace: cute.Tensor,
+        output: cute.Tensor,
+        alpha: cutlass.Float32,
+        stream: CUstream,
+    ) -> None:
+        """Read native FP8 operands directly and consume prepared E8M0 scales."""
+        assert self.operand_format == "mxfp8"
+        a_strides = cast("tuple[int | cutlass.Int64, int | cutlass.Int64]", a.stride)
+        b_strides = cast("tuple[int | cutlass.Int64, int | cutlass.Int64]", b.stride)
+        qa = cute.make_tensor(
+            cute.recast_ptr(a.iterator, dtype=self.operand_dtype),
+            cute.make_layout((self.m, self.k, 1), stride=(*a_strides, 0)),
+        )
+        qb = cute.make_tensor(
+            cute.recast_ptr(b.iterator, dtype=self.operand_dtype),
+            cute.make_layout((self.n, self.k, 1), stride=(*b_strides, 0)),
+        )
+        workspace_pointer = cast("cute.Pointer", workspace.iterator)
+        sa = cute.make_tensor(
+            cute.recast_ptr(workspace_pointer, dtype=cutlass.Int16),
+            cute.make_layout((256, self.kp // self.scale_chunk_k, self.mp // 128)),
+        )
+        sb = cute.make_tensor(
+            cute.recast_ptr(workspace_pointer + self.sb_offset, dtype=cutlass.Int16),
+            cute.make_layout((256, self.kp // self.scale_chunk_k, self.np // 128)),
+        )
+        self._launch(qa, qb, sa, sb, output, alpha, stream)
+
+    @cute.jit
+    def _launch(
+        self,
+        qa: cute.Tensor,
+        qb: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        output: cute.Tensor,
+        alpha: cutlass.Float32,
+        stream: CUstream,
+    ) -> None:
         mma = blackwell_helpers.make_blockscaled_trivial_tiled_mma(
-            cutlass.Float4E2M1FN,
-            cutlass.Float4E2M1FN,
+            self.operand_dtype,
+            self.operand_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
-            cutlass.Float8E4M3FN,
-            16,
+            self.scale_dtype,
+            self.scale_vector_size,
             self.group,
             (self.bm, self.bn),
         )
@@ -143,15 +208,21 @@ class Sm100BlockScaledGemm:
             cute.make_layout((self.cluster_m, 1, 1)), (mma.thr_id.shape,)
         )
         al = blackwell_helpers.make_smem_layout_a(
-            mma, self.tile, cutlass.Float4E2M1FN, self.stages
+            mma, self.tile, self.operand_dtype, self.stages
         )
         bl = blackwell_helpers.make_smem_layout_b(
-            mma, self.tile, cutlass.Float4E2M1FN, self.stages
+            mma, self.tile, self.operand_dtype, self.stages
         )
-        sal = blockscaled_layout.make_smem_layout_sfa(mma, self.tile, 16, self.stages)
-        sbl = blockscaled_layout.make_smem_layout_sfb(mma, self.tile, 16, self.stages)
-        sa_window = cute.make_layout((256, self.bk // 64, 1))
-        sb_window = cute.make_layout((256, self.bk // 64, self.bn // 128))
+        sal = blockscaled_layout.make_smem_layout_sfa(
+            mma, self.tile, self.scale_vector_size, self.stages
+        )
+        sbl = blockscaled_layout.make_smem_layout_sfb(
+            mma, self.tile, self.scale_vector_size, self.stages
+        )
+        sa_window = cute.make_layout((256, self.bk // self.scale_chunk_k, 1))
+        sb_window = cute.make_layout(
+            (256, self.bk // self.scale_chunk_k, self.sf_n_chunks)
+        )
         assert cute.cosize(sal) == cute.cosize(sa_window) * 2 * self.stages
         assert cute.cosize(sbl) == cute.cosize(sb_window) * 2 * self.stages
         a_atom, a_tma = cute.nvgpu.make_tiled_tma_atom_A(
@@ -170,6 +241,34 @@ class Sm100BlockScaledGemm:
             mma,
             cluster.shape,
         )
+        # A statically unit row mode disappears from CuTe's coordinate tensor,
+        # although the TMA descriptor and its tile retain both K and row modes.
+        # Restore only the coordinate domain; descriptor bounds still describe
+        # the original allocation, so TMA zero-fills the extra coordinates.
+        if cutlass.const_expr(self.operand_format == "mxfp8" and self.m == 1):
+            a_tma = cute.make_tensor(
+                (0, 0),
+                cute.make_layout(
+                    (2, self.k, 1),
+                    stride=(
+                        cute.ScaledBasis(1, mode=[1]),
+                        cute.ScaledBasis(1, mode=[0]),
+                        0,
+                    ),
+                ),
+            )
+        if cutlass.const_expr(self.operand_format == "mxfp8" and self.n == 1):
+            b_tma = cute.make_tensor(
+                (0, 0),
+                cute.make_layout(
+                    (2, self.k, 1),
+                    stride=(
+                        cute.ScaledBasis(1, mode=[1]),
+                        cute.ScaledBasis(1, mode=[0]),
+                        0,
+                    ),
+                ),
+            )
         sa_atom, sa_tma = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(self.group),
             sa,
@@ -183,8 +282,8 @@ class Sm100BlockScaledGemm:
             sb_window.shape,
         )
         self.tx_bytes = self.cluster_m * (
-            cute.size_in_bytes(cutlass.Float4E2M1FN, al) // self.stages
-            + cute.size_in_bytes(cutlass.Float4E2M1FN, bl) // self.stages
+            cute.size_in_bytes(self.operand_dtype, al) // self.stages
+            + cute.size_in_bytes(self.operand_dtype, bl) // self.stages
             + cute.cosize(sal) // self.stages
             + cute.cosize(sbl) // self.stages
         )
@@ -243,29 +342,35 @@ class Sm100BlockScaledGemm:
         leader = v == 0
         first_tile = block // self.cluster_m
         tile_stride = cutlass.Int32(cute.arch.grid_dim()[0]) // self.cluster_m
-        ap = cute.arch.alloc_smem(cutlass.Uint8, cute.cosize(al) // 2, alignment=1024)
-        bp = cute.arch.alloc_smem(cutlass.Uint8, cute.cosize(bl) // 2, alignment=1024)
+        ap = cute.arch.alloc_smem(
+            cutlass.Uint8,
+            cute.size_in_bytes(self.operand_dtype, al),
+            alignment=1024,
+        )
+        bp = cute.arch.alloc_smem(
+            cutlass.Uint8,
+            cute.size_in_bytes(self.operand_dtype, bl),
+            alignment=1024,
+        )
         a = cute.make_tensor(
-            cute.recast_ptr(ap, al.inner, dtype=cutlass.Float4E2M1FN), al.outer
+            cute.recast_ptr(ap, al.inner, dtype=self.operand_dtype), al.outer
         )
         b = cute.make_tensor(
-            cute.recast_ptr(bp, bl.inner, dtype=cutlass.Float4E2M1FN), bl.outer
+            cute.recast_ptr(bp, bl.inner, dtype=self.operand_dtype), bl.outer
         )
-        sap = cute.arch.alloc_smem(
-            cutlass.Float8E4M3FN, cute.cosize(sal), alignment=128
-        )
-        sbp = cute.arch.alloc_smem(
-            cutlass.Float8E4M3FN, cute.cosize(sbl), alignment=128
-        )
+        sap = cute.arch.alloc_smem(self.scale_dtype, cute.cosize(sal), alignment=128)
+        sbp = cute.arch.alloc_smem(self.scale_dtype, cute.cosize(sbl), alignment=128)
         sa = cute.make_tensor(sap, sal)
         sb = cute.make_tensor(sbp, sbl)
         sa_chunks = cute.make_tensor(
             cute.recast_ptr(sap, dtype=cutlass.Int16),
-            cute.make_layout((256, self.bk // 64, 1, self.stages)),
+            cute.make_layout((256, self.bk // self.scale_chunk_k, 1, self.stages)),
         )
         sb_chunks = cute.make_tensor(
             cute.recast_ptr(sbp, dtype=cutlass.Int16),
-            cute.make_layout((256, self.bk // 64, self.bn // 128, self.stages)),
+            cute.make_layout(
+                (256, self.bk // self.scale_chunk_k, self.sf_n_chunks, self.stages)
+            ),
         )
         ab_barriers = cute.arch.alloc_smem(cutlass.Int64, 2 * self.stages, alignment=8)
         c_barriers = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)
@@ -295,16 +400,22 @@ class Sm100BlockScaledGemm:
         )
         c_layout = mma.make_fragment_C(mma.partition_shape_C((self.bm, self.bn))).layout
         sa_layout = blockscaled_layout.make_tmem_layout_sfa(
-            mma, self.tile, 16, cute.slice_(sal, (None, None, None, 0))
+            mma,
+            self.tile,
+            self.scale_vector_size,
+            cute.slice_(sal, (None, None, None, 0)),
         )
         sb_layout = blockscaled_layout.make_tmem_layout_sfb(
-            mma, self.tile, 16, cute.slice_(sbl, (None, None, None, 0))
+            mma,
+            self.tile,
+            self.scale_vector_size,
+            cute.slice_(sbl, (None, None, None, 0)),
         )
         # Layout footprints are TMEM columns when inspected through a fake
         # pointer. Real pointers are retrieved only after allocation completes.
         c_columns = self.bn
-        sa_columns = self.bk // 16
-        sb_columns = (self.bn // 128) * (self.bk // 16)
+        sa_columns = self.bk // self.scale_vector_size
+        sb_columns = self.sf_n_chunks * (self.bk // self.scale_vector_size)
         columns = 1 << (c_columns + sa_columns + sb_columns - 1).bit_length()
         assert columns <= 512
         allocator.allocate(columns)
@@ -312,10 +423,10 @@ class Sm100BlockScaledGemm:
         tmem = allocator.retrieve_ptr(cutlass.Float32)
         acc = cute.make_tensor(tmem, c_layout)
         tsa = cute.make_tensor(
-            cute.recast_ptr(tmem + c_columns, dtype=cutlass.Float8E4M3FN), sa_layout
+            cute.recast_ptr(tmem + c_columns, dtype=self.scale_dtype), sa_layout
         )
         tsb = cute.make_tensor(
-            cute.recast_ptr(tmem + c_columns + sa_columns, dtype=cutlass.Float8E4M3FN),
+            cute.recast_ptr(tmem + c_columns + sa_columns, dtype=self.scale_dtype),
             sb_layout,
         )
         assert tcgen05.find_tmem_tensor_col_offset(acc) == c_columns
@@ -351,10 +462,14 @@ class Sm100BlockScaledGemm:
                     )
                 )
                 gsa = cute.local_tile(
-                    sa_tma, (256, self.bk // 64, 1), (0, None, mi * self.cluster_m + v)
+                    sa_tma,
+                    (256, self.bk // self.scale_chunk_k, 1),
+                    (0, None, mi * self.cluster_m + v),
                 )
                 gsb = cute.local_tile(
-                    sb_tma, (256, self.bk // 64, self.bn // 128), (0, None, ni)
+                    sb_tma,
+                    (256, self.bk // self.scale_chunk_k, self.sf_n_chunks),
+                    (0, None, ni // 2 if cutlass.const_expr(self.bn == 64) else ni),
                 )
                 da, ga = cpasync.tma_partition(
                     a_atom,
@@ -421,15 +536,28 @@ class Sm100BlockScaledGemm:
                 for _tile_index in cutlass.range(
                     first_tile, self.tile_count, tile_stride, unroll=1
                 ):
+                    mma_sfb = tsb
+                    if cutlass.const_expr(self.bn == 64):
+                        # Two N64 tiles share one prepared 128-row SFB chunk.
+                        # The upper 64 rows start two Float32 TMEM columns past
+                        # the unshifted scale base, as required by tcgen05.
+                        offset = cutlass.Int32((_tile_index % self.n_tiles % 2) * 2)
+                        mma_sfb = cute.make_tensor(
+                            cute.recast_ptr(
+                                tmem + c_columns + sa_columns + offset,
+                                dtype=self.scale_dtype,
+                            ),
+                            sb_layout,
+                        )
                     c_pipe.producer_acquire(cstate)
                     mma.set(tcgen05.Field.ACCUMULATE, False)
                     for _ki in cutlass.range(self.kp // self.bk, unroll=1):
                         ab_pipe.consumer_wait(state)
                         _scale_copy(sa, tsa, state.index, self.group)
                         _scale_copy(sb, tsb, state.index, self.group)
-                        for kk in cutlass.range_constexpr(self.bk // 64):
+                        for kk in cutlass.range_constexpr(self.bk // self.mma_k):
                             mma.set(tcgen05.Field.SFA, tsa[None, None, kk].iterator)
-                            mma.set(tcgen05.Field.SFB, tsb[None, None, kk].iterator)
+                            mma.set(tcgen05.Field.SFB, mma_sfb[None, None, kk].iterator)
                             cute.gemm(
                                 mma,
                                 acc,
