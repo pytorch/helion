@@ -2440,7 +2440,6 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
             and result[0].block_sizes == [64, 32, 64]
             and result[0].num_threads == [4, 32, 1]
         ):
-            # Move the H100-measured async sibling first, after derivation/interleaving.
             preferred = Config.from_dict(
                 result[0].config | {"cute_collective_copy": "async"}
             )
