@@ -96,6 +96,7 @@ from .cute_structural_config import select_structural_policy
 from .generated_code_cache import GeneratedCodeState
 from .generated_code_cache import binding_input_key
 from .generated_code_cache import compiled_kernel_cache_key
+from .generated_code_cache import serialized_fact
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -1453,9 +1454,25 @@ class Kernel(Generic[_R]):
                         )
                     ] = bound
             self._specialize_extra[signature] = [*published, *new_facts]
-            # The serialized guards stay the schema's prefix. Bindings whose own
-            # code fired a fact are not saved (see save_binding).
-            self._published_guards.setdefault(signature, None)
+            # The generated code cache saves the facts after the guards. One
+            # it cannot serialize (None) stops saving bindings of the signature.
+            arguments = {
+                name: index for index, name in enumerate(self.signature.parameters)
+            }
+            guards = self._published_guards.get(signature)
+            self._published_guards[signature] = (
+                None
+                if guards is None
+                else (
+                    *guards,
+                    *(
+                        serialized_fact(
+                            cast("_GuardedInputFact", fact.extractor), arguments
+                        )
+                        for fact in new_facts
+                    ),
+                )
+            )
             self._has_specialization_extras = True
             self._specialization_generation += 1
             for fast_key, cached_bound in list(self._dispatch_cache.items()):
@@ -2481,6 +2498,23 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _guard_fact_value(self, fact: _GuardedInputFact) -> Hashable:
         """``fact`` at this binding's bind-time hints (None when not recoverable)."""
         return fact.bound_value(self.env)
+
+    def _guard_fact_results(self) -> tuple[tuple[str, Hashable], ...] | None:
+        """Each guard fact published after this binding's guards, with its value here.
+
+        Code generation reads them, so the generated code cache keys them.
+        None when the schema holds something else there.
+        """
+        assert self._generated_code is not None
+        facts = self.kernel._specialize_extra.get(self._base_spec_key, [])[
+            len(self._generated_code.guards) :
+        ]
+        results = _bound_guarded_input_facts(self, facts)
+        return (
+            None
+            if results is None
+            else tuple(zip(map(repr, facts), results, strict=True))
+        )
 
     def __init__(
         self,
@@ -3631,10 +3665,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _publish_guarded_input_facts(self) -> None:
         """Extend the dispatch schema with guard facts it does not check yet."""
         if self._cache_managed:
-            facts = self._guarded_input_facts()
-            if self._generated_code is not None:
-                self._generated_code.record_guard_facts(len(facts))
-            self.kernel._publish_guard_facts(self, facts)
+            self.kernel._publish_guard_facts(self, self._guarded_input_facts())
 
     def _guarded_input_facts(
         self,
@@ -3730,10 +3761,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
             if lhs.free_symbols and all(free in sources for free in free_symbols):
                 facts.setdefault(
-                    _GuardedInputFact(
+                    _GuardedInputFact.create(
                         lhs,
                         expr,
-                        tuple((free, sources[free]) for free in free_symbols),
+                        {free: sources[free] for free in free_symbols},
                         block,
                         equal,
                         param_names,
@@ -4600,6 +4631,43 @@ class _GuardedInputFact:
     block: bool
     equal: bool
     param_names: tuple[str, ...]
+
+    @classmethod
+    def create(
+        cls,
+        lhs: sympy.Expr,
+        rhs: sympy.Expr,
+        sources: dict[sympy.Symbol, TensorPropertySource],
+        block: bool,
+        equal: bool,
+        param_names: tuple[str, ...],
+    ) -> _GuardedInputFact:
+        """The fact with each symbol named by the input size or stride it reads.
+
+        Equal facts then compare equal across bindings and processes, the ones
+        the generated code cache saved included.
+        """
+        names = {
+            symbol: sympy.Symbol(
+                f"{cast('LocalSource', source.base).local_name}"
+                f".{source.prop.name.lower()}({source.idx})",
+                integer=True,
+            )
+            for symbol, source in sources.items()
+        }
+        return cls(
+            lhs.xreplace(names),
+            rhs.xreplace(names),
+            tuple(
+                sorted(
+                    ((names[symbol], source) for symbol, source in sources.items()),
+                    key=lambda item: str(item[0]),
+                )
+            ),
+            block,
+            equal,
+            param_names,
+        )
 
     def _holds(self, values: dict[sympy.Symbol, int]) -> bool:
         lhs = _evaluate(self.lhs, values)

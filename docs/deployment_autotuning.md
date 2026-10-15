@@ -70,9 +70,11 @@ Bindings keep the ordinary frontend path, and no binding entry is saved, when:
 - the kernel is distributed, uses a tensor-descriptor config or has runtime
   input specializations;
 - a dynamic-shape compilation (`static_shapes=False`) guarded on input sizes
-  the saved guards cannot express, such as a size-1 dimension. This applies to
-  that binding only: other bindings of the kernel are still saved, and runners
-  a process already loaded keep serving their inputs;
+  in a form the cache cannot save. Guards that compare an input size or stride
+  with a constant or with another one, such as a size-1 dimension, are saved
+  with the binding. After any other guard, no binding of that signature is
+  saved in the process, and runners it already loaded keep serving their
+  inputs;
 - a Python dependency cannot be fingerprinted;
 - `force_autotune`, printing code or repro callers, reference mode or
   TorchDynamo tracing is active;

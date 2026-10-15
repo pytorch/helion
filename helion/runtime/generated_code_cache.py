@@ -20,6 +20,7 @@ from typing import cast
 
 from filelock import FileLock
 from filelock import Timeout
+import sympy
 import torch
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from .kernel import BoundKernel
     from .kernel import CompiledConfig
     from .kernel import Kernel
+    from .kernel import _GuardedInputFact
     from .settings import Settings
 
     # Specialization key, serialized guards, their results, compiler seed
@@ -469,10 +471,41 @@ def _serialized_guard(
     return ["td_layout", tensor_guard, guard.ndim, guard.element_size, extent_cap]
 
 
+def serialized_fact(
+    fact: _GuardedInputFact, arguments: dict[str, int]
+) -> list[object] | None:
+    """Serialize a guard fact on an input size or stride and a constant or another one.
+
+    ``None`` marks other facts, such as one on a reduction extent expression.
+    """
+    sources = dict(fact.sources)
+
+    def operand(expr: sympy.Expr) -> list[object] | int | None:
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        source = sources.get(cast("sympy.Symbol", expr))
+        return None if source is None else source_guard(source, arguments)
+
+    lhs = operand(fact.lhs)
+    rhs = operand(fact.rhs)
+    if not isinstance(lhs, list) or rhs is None:
+        return None
+    return ["fact", lhs, rhs, fact.equal, fact.block]
+
+
+def _valid_fact_operand(operand: object) -> bool:
+    match operand:
+        case ["size" | "stride", ["arg", int()], int()]:
+            return True
+    return type(operand) is int
+
+
 def _valid_guard(guard: object) -> bool:
     match guard:
         case ["arg", int()]:
             return True
+        case ["fact", list() as lhs, rhs, bool(), bool()]:
+            return _valid_fact_operand(lhs) and _valid_fact_operand(rhs)
         case ["item", base, int() | str()]:
             return _valid_guard(base)
         case ["size" | "stride", base, int()]:
@@ -540,30 +573,33 @@ def save_binding(
 ) -> None:
     """Save a binding with the guards that select it before the frontend runs.
 
-    Kernels whose specialization includes a runtime input classifier have no
-    serializable guard and keep the ordinary frontend path.
+    Kernels whose specialization includes a runtime input classifier, or a
+    guard fact the cache cannot serialize, keep the ordinary frontend path.
     """
     state = bound._generated_code
     if state is None or state.artifact_key is None or should_skip_cache():
         return
     key = state.artifact_key
-    signature, guards, extra_results, compiler_seed_results, _ = state.input_key
+    signature, own_guards, guard_results, compiler_seed_results, _ = state.input_key
+    guards = bound.kernel._published_guards.get(signature)
+    facts = bound._guard_fact_results()
     # The binding is only valid under the schema its signature published in
-    # this process, and only if its guards are all serializable (no ``None``).
-    # A dynamic-shape binding whose own compile guarded on an input size (a
-    # guard fact, such as ``size == 1``) is not saved either: the saved guards
-    # would accept inputs its code was not compiled for. Bindings of the same
-    # signature that fired no fact serve every input their guards accept, so
-    # they are saved even after another binding published facts.
+    # this process: its guards, then the guard facts (see
+    # BoundKernel._guarded_input_facts) bindings of the signature fired so far,
+    # keyed by their values here. All of it must be serializable (no ``None``).
     if (
-        None in guards
-        or state.guard_facts
-        or bound.kernel._published_guards.get(signature) != guards
+        guards is None
+        or None in guards
+        or facts is None
+        or guards[: len(own_guards)] != own_guards
+        or len(guards) != len(own_guards) + len(facts)
     ):
         return
-    # One schema per signature, and the last writer wins. Should bindings of
-    # one signature ever save different guard lists, the earlier variants
-    # (keyed by the schema JSON) become unreachable until eviction removes them.
+    # One schema per signature, and the last writer wins. Facts published
+    # later extend it; earlier variants stay reachable (see load_cached_kernel).
+    # Should bindings of one signature ever save different guard lists, the
+    # earlier variants (keyed by the schema JSON) become unreachable until
+    # eviction removes them.
     schema: dict[str, list[object]] = {
         "guards": list(guards),
         "compiler_seed_facts": [
@@ -581,7 +617,12 @@ def save_binding(
         },
     )
     save_compiled_kernel(
-        binding_variant_key(key, schema, extra_results, compiler_seed_results),
+        binding_variant_key(
+            key,
+            schema,
+            (*guard_results, *(value for _, value in facts)),
+            compiler_seed_results,
+        ),
         config,
         normalized,
         source_key,
@@ -616,7 +657,8 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
     with bound.env:
         frontend = host_function.debug_str()
     settings = _compilation_settings_key(bound.settings)
-    if settings is _UNCACHEABLE:
+    facts = bound._guard_fact_results()
+    if settings is _UNCACHEABLE or facts is None:
         return None
     payload = (
         "helion-generated-code-v1",
@@ -636,6 +678,7 @@ def generated_code_cache_key(bound: BoundKernel, config: Config) -> str | None:
         bound.config_spec.cache_fingerprint_hash(),
         config.to_json(),
         settings,
+        facts,
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
@@ -652,10 +695,6 @@ class GeneratedCodeState:
     # calls skip the writers' lock and eviction scan.
     persisted_source_keys: set[str] = dataclasses.field(default_factory=set)
     persisted_binding: tuple[Config, str] | None = None
-    # Guard facts (see BoundKernel._guarded_input_facts) the binding's frontend
-    # and its code generation so far fired; set when the binding publishes them.
-    frontend_guard_facts: int | None = None
-    guard_facts: int = 0
 
     @classmethod
     def create(
@@ -696,31 +735,12 @@ class GeneratedCodeState:
         """The specialization guards as the cache saves them."""
         return self.input_key[1]
 
-    @property
-    def codegen_fired_guard_facts(self) -> bool:
-        """Whether code generation guarded on inputs beyond what the frontend did.
-
-        The generated source key covers the frontend, so a guard that only code
-        generation recorded is not part of it.
-        """
-        return self.guard_facts != self.frontend_guard_facts
-
-    def record_guard_facts(self, count: int) -> None:
-        """Record the facts the binding published so far.
-
-        Binding publishes them before any code generation, and code generation
-        after each config, so the first count is the frontend's.
-        """
-        if self.frontend_guard_facts is None:
-            self.frontend_guard_facts = count
-        self.guard_facts = count
-
     def load(self, config: Config) -> str | None:
         """Saved source for a normalized config that ``compile_and_save`` keyed."""
         if (source_key := self.source_keys.get(config)) is None:
             return None
         source = load_generated_code(source_key)
-        if source is not None and not self.codegen_fired_guard_facts:
+        if source is not None:
             self.persisted_source_keys.add(source_key)
         return source
 
@@ -738,13 +758,25 @@ class GeneratedCodeState:
                 source_key = generated_code_cache_key(bound, normalized)
             if source_key is not None:
                 self.source_keys[normalized] = source_key
+        published = bound.kernel._specialize_extra.get(bound._base_spec_key)
         run = bound.compile_config(config)
+        if (
+            source_key is not None
+            and source_key not in self.persisted_source_keys
+            and bound.kernel._specialize_extra.get(bound._base_spec_key)
+            is not published
+        ):
+            # Code generation published guard facts; key them too.
+            source_key = generated_code_cache_key(bound, normalized)
+            if source_key is None:
+                del self.source_keys[normalized]
+            else:
+                self.source_keys[normalized] = source_key
         # compile_config wrote the source now or, for an autotuning winner,
         # earlier. Persist that file without generating it again.
         if (
             source_key is not None
             and source_key not in self.persisted_source_keys
-            and not self.codegen_fired_guard_facts
             and (path := bound._cache_path_map.get(normalized)) is not None
         ):
             # PyCodeCache writes the supplied source unchanged; its extra key

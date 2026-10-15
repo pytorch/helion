@@ -11,8 +11,11 @@ from typing import TypeVar
 from typing import cast
 import weakref
 
+import sympy
 import torch
+from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
@@ -34,6 +37,7 @@ from .generated_code_cache import load_binding_schema
 from .generated_code_cache import load_compiled_kernel
 from .kernel import BoundKernel
 from .kernel import _CompilerSeedSpecializationExtractor
+from .kernel import _GuardedInputFact
 from .kernel import _load_code
 from .kernel import _PreparedMetadataSpecializationExtractor
 from .kernel import _tensor_descriptor_extent_class
@@ -43,8 +47,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import Hashable
 
-    from torch._dynamo.source import TensorPropertySource
-
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
@@ -52,7 +54,6 @@ if TYPE_CHECKING:
     from .kernel import CompiledConfig
     from .kernel import ConfigLike
     from .kernel import Kernel
-    from .kernel import _GuardedInputFact
     from .kernel import _PreparedCall
     from .settings import Settings
 
@@ -188,7 +189,38 @@ def _guard_value(guard: list[object]) -> Callable[[Sequence[object]], Hashable]:
     return tensor_property
 
 
-def _guard_extractor(guard: list[object]) -> Callable[[Sequence[object]], Hashable]:
+def _guard_fact(guard: list[object], param_names: tuple[str, ...]) -> _GuardedInputFact:
+    """Rebuild a guard fact ``generated_code_cache.serialized_fact`` saved."""
+    _, lhs, rhs, equal, block = guard
+    sources: dict[sympy.Symbol, TensorPropertySource] = {}
+
+    def operand(item: object) -> sympy.Expr:
+        if isinstance(item, int):
+            return sympy.Integer(item)
+        kind, (_, index), dim = cast("tuple[str, tuple[str, int], int]", item)
+        symbol = sympy.Dummy()
+        sources[symbol] = TensorPropertySource(
+            LocalSource(param_names[index], is_input=True),
+            TensorProperty.SIZE if kind == "size" else TensorProperty.STRIDE,
+            dim,
+        )
+        return symbol
+
+    return _GuardedInputFact.create(
+        operand(lhs),
+        operand(rhs),
+        sources,
+        cast("bool", block),
+        cast("bool", equal),
+        param_names,
+    )
+
+
+def _guard_extractor(
+    guard: list[object], param_names: tuple[str, ...]
+) -> Callable[[Sequence[object]], Hashable]:
+    if guard[0] == "fact":
+        return _PreparedMetadataSpecializationExtractor(_guard_fact(guard, param_names))
     extractor = _guard_value(guard)
     if guard[0] in ("size", "stride", "td_layout"):
         return _PreparedMetadataSpecializationExtractor(extractor)
@@ -207,12 +239,16 @@ def load_cached_kernel(
     if schema is None:
         return None
     guards = tuple(cast("list[list[object]]", schema["guards"]))
-    if cache_key is not None and kernel._published_guards.get(signature) != guards:
+    published = kernel._published_guards.get(signature)
+    if cache_key is not None and (
+        published is None or published[: len(guards)] != guards
+    ):
         # Another binding already published this signature's schema with
         # different guards (or ones the cache cannot serialize). The published
         # schema is authoritative; equal results would not make it the same.
         return None
-    extractors = tuple(_guard_extractor(guard) for guard in guards)
+    param_names = tuple(kernel.signature.parameters)
+    extractors = tuple(_guard_extractor(guard, param_names) for guard in guards)
     compiler_seed_extractors = tuple(
         _CompilerSeedSpecializationExtractor(
             cast("CompilerHeuristicSpecializationFact", fact), reserved_sms
@@ -239,10 +275,22 @@ def load_cached_kernel(
         or cache_key.compiler_seed_results != compiler_seed_results
     ):
         return None
-    artifact = load_compiled_kernel(
-        binding_variant_key(artifact_key, schema, extra_results, compiler_seed_results)
-    )
-    if artifact is None:
+    # A binding saved before later guard facts were published is keyed by the
+    # schema up to them: its code fired none of them.
+    for count in range(
+        len(guards), sum(guard[0] != "fact" for guard in guards) - 1, -1
+    ):
+        artifact = load_compiled_kernel(
+            binding_variant_key(
+                artifact_key,
+                {**schema, "guards": list(guards[:count])},
+                extra_results[:count],
+                compiler_seed_results,
+            )
+        )
+        if artifact is not None:
+            break
+    else:
         return None
     runner = _CachedBoundKernel(
         kernel,
@@ -472,10 +520,13 @@ class _CachedBoundKernel(Generic[_R]):
             )
             # The frontend keys the same guards the runners published, so the
             # published schema, its guard facts and the sibling runners stay.
+            saved = cast("tuple[list[object], ...]", self._serialized_guards)
+            published = self.kernel._published_guards.get(signature)
             same_schema = (
-                normal._serialized_guards == self._serialized_guards
-                and self.kernel._published_guards.get(signature)
-                == self._serialized_guards
+                normal._serialized_guards
+                == tuple(guard for guard in saved if guard[0] != "fact")
+                and published is not None
+                and published[: len(saved)] == saved
                 and normal._compiler_seed_specialization_extractors
                 == self.kernel._compiler_seed_specialize_extra.get(signature)
             )
