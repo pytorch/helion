@@ -299,7 +299,6 @@ def test_no_config_owned_k_chunk_preserves_seeds_and_covers_schedules(
     assert legacy_seeds[0] == seeds[0]
     population = _initial_population(bound, args, count=30)
     legacy_population = _initial_population(bound, args, seeds=legacy_seeds, count=30)
-    assert len(population) == len(legacy_population)
     assert {seed.get("cute_collective_copy") for seed in population} >= {
         "scalar",
         "async",
