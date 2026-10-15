@@ -157,17 +157,17 @@ def ref_gdn_fwd_h(
 
 
 # %%
-# Testing Function
+# Input Generator
 # -------------
-def test(
+def make_inputs(
     batch: int,
     nheads: int,
     seqlen: int,
     chunk_size: int,
     dhead: int,
     dstate: int,
-    dtype: torch.dtype = HALF_DTYPE,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Create inputs for the example's correctness tests and benchmarks."""
     k = torch.randn(batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE)
     k = torch.nn.functional.rms_norm(k, [dhead])
     w = torch.randn(
@@ -195,7 +195,19 @@ def test(
         * torch.rand(batch, seqlen, nheads, dtype=torch.float32, device=DEVICE),
         dim=1,
     )
-    args = (k, w, u, g, chunk_size)
+    return k, w, u, g, chunk_size
+
+
+def test(
+    batch: int,
+    nheads: int,
+    seqlen: int,
+    chunk_size: int,
+    dhead: int,
+    dstate: int,
+    dtype: torch.dtype = HALF_DTYPE,
+) -> None:
+    args = make_inputs(batch, nheads, seqlen, chunk_size, dhead, dstate)
     run_example(helion_gdn_fwd_h, ref_gdn_fwd_h, args)
 
 
