@@ -51,7 +51,9 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         Args:
             kernel: The kernel to be autotuned.
             args: The arguments to be passed to the kernel.
-            population_size: The size of the population.
+            population_size: The size of the population. Twice this is also the
+                FROM_BEST_AVAILABLE compiler seed budget (see
+                _generate_best_available_population_flat).
             max_generations: The maximum number of generations to run.
             crossover_rate: The crossover rate for mutation.
             immediate_update: Whether to update population immediately after each evaluation.
@@ -66,8 +68,10 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var (handled in default_autotuner_fn).
                 If None is passed, defaults to FROM_RANDOM.
             best_available_pad_random: When True and using FROM_BEST_AVAILABLE, pad the
-                cached configs with random configs to reach 2x population size.
-                When False, use only the default and cached configs; random configs
+                cached configs with random configs to reach 2x population size. Outside
+                CuTe flash search, rows the compiler seed budget never trims are kept
+                even past that size.
+                When False, use only the seeds, default, and cached configs; random configs
                 are added only as a fallback when every one of them fails to compile
                 or run (see PopulationBasedSearch.benchmark_initial_population).
             finishing_rounds: Number of finishing rounds to run after the main search.
@@ -155,12 +159,19 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.initial_population_strategy
             == InitialPopulationStrategy.FROM_BEST_AVAILABLE
         ):
-            pop = self._generate_best_available_population_flat()
+            target = self.population_size * 2
+            pop = self._generate_best_available_population_flat(
+                compiler_seed_limit=target
+            )
             if self.best_available_pad_random:
-                target = self.population_size * 2
                 n_random = max(0, target - len(pop))
                 pop.extend(self.config_gen.random_flat() for _ in range(n_random))
-                return pop[:target]
+                # Outside flash, the budget already bounds the compiler
+                # seeds; rows past ``target`` are rows the budget never trims
+                # (explicit and protected seeds, the default, cached winners),
+                # so they are kept rather than sliced away.
+                if self.config_spec.cute_flash_search_enabled:
+                    return pop[:target]
             return pop
 
         return self.config_gen.random_population_flat(
