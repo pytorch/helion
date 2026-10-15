@@ -1607,6 +1607,9 @@ class DeviceFunction:
             from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
 
             kernel_body = fuse_fp8_pair_decode(kernel_body)
+            from .cute.fp8_vector_store import fuse_fp8_vector_stores
+
+            kernel_body = fuse_fp8_vector_stores(kernel_body)
             # Under fast_math, hoist loop-invariant floating-point
             # divisions out of inner tile loops, replacing each
             # ``x / scalar`` with a hoisted ``inv = 1.0 / scalar`` +

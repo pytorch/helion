@@ -20,6 +20,7 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
+from .fp8_vector_store import FP8_STORE_DTYPE_INFO
 from .memory_ops import tensor_has_specialized_base_alignment
 from .persistent_branch_vec import _DTYPE_INFO
 from .persistent_branch_vec import _and_terms
@@ -53,6 +54,8 @@ _CASTS = frozenset(
         "Float32",
         "Float16",
         "BFloat16",
+        "Float8E4M3FN",
+        "Float8E5M2",
         "Boolean",
     )
 )
@@ -908,6 +911,8 @@ class _Vectorizer:
                 assert root is not None
                 dtype = self.dtypes[root]
                 info = _DTYPE_INFO.get(dtype)
+                if site.store and info is None:
+                    info = FP8_STORE_DTYPE_INFO.get(dtype)
                 if info is None:
                     raise _Decline
                 carrier, itemsize, helper = info

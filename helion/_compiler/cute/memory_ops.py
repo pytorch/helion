@@ -88,6 +88,7 @@ from .cute_reshape import is_cute_thread_moving_reshape_value
 from .cute_reshape import run_deferred_rebound_checks
 from .cute_reshape import store_rebound_dims
 from .cute_reshape import tcgen05_rebound_store_error
+from .fp8_vector_store import FP8_STORAGE_DTYPES
 from .indexing import CUTE_SCALAR_LOAD_SITE_META
 from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
@@ -121,6 +122,9 @@ log = logging.getLogger(__name__)
 
 
 _CUTE_ALIGNMENT_MAX_BYTES = 32
+_CUTE_INTEGER_PACKET_STORE_DTYPES = frozenset(
+    {torch.int16, torch.uint16, torch.int32, torch.uint32}
+)
 
 
 def _specialized_int(
@@ -808,7 +812,11 @@ def _persistent_branch_vec_store_marker(
                 args=[
                     ast.Constant(value=block_id),
                     ast.Constant(value=vec_width),
-                    ast.Constant(value=_cute_scalar_storage_dtype(dtype)),
+                    ast.Constant(
+                        value=FP8_STORAGE_DTYPES.get(
+                            dtype, _cute_scalar_storage_dtype(dtype)
+                        )
+                    ),
                     pointer_expr,
                     value,
                     mask,
@@ -3530,6 +3538,44 @@ def _(state: CodegenState) -> ast.AST:
     )
     branch_vec_store_candidate: tuple[int, int] | None = None
 
+    if (
+        store_uses_pointer
+        and topk_lane_expr is None
+        and not value_readdressed
+        and (
+            tensor.dtype in FP8_STORAGE_DTYPES
+            or tensor.dtype in _CUTE_INTEGER_PACKET_STORE_DTYPES
+        )
+    ):
+        packet_context = _cute_vector_load_ctx(
+            state, tensor, subscript, index_exprs, extra_mask, for_store=True
+        )
+        if packet_context is not None and packet_context[2] == "unroll":
+            from ..reduction_strategy import PersistentReductionStrategy
+
+            width, block_id, _mode = packet_context
+            strategy = _cute_lane_strategy(state, block_id)
+            if (
+                isinstance(strategy, PersistentReductionStrategy)
+                and width in (2, 4, 8, 16)
+                # The late pass's alias model covers at most 16-byte stores.
+                and width * tensor.dtype.itemsize <= 16
+                and _persistent_vec_is_exact_aligned(
+                    state, strategy, index_exprs, tensor, width
+                )
+            ):
+                state.add_statement(
+                    _persistent_branch_vec_store_marker(
+                        block_id,
+                        width,
+                        tensor.dtype,
+                        _cute_scalar_pointer_expr(tensor_name, index_exprs),
+                        value,
+                        mask_expr,
+                    )
+                )
+                return ast.Constant(value=None)
+
     # Vectorized store: when this store's stride-1 axis is a vec-partitioned
     # lane loop (same predicates as the vec-load hoist, so the per-element
     # mask is provably uniform across the V lanes), collect the per-lane
@@ -5032,6 +5078,7 @@ def _cute_vector_load_ctx(
     extra_mask: ast.AST | None,
     *,
     allow_gathered_index: bool = False,
+    for_store: bool = False,
 ) -> tuple[int, int, str] | None:
     """Return (vec_width, lane_block_id, mode) when a vec load may be emitted.
 
@@ -5060,8 +5107,14 @@ def _cute_vector_load_ctx(
         return None
     if "None" in index_exprs:
         return None
-    if tensor.dtype not in _CUTE_VECTOR_DTYPES and not _cute_is_unroll_dtype(
-        tensor.dtype
+    packet_store = for_store and (
+        tensor.dtype in FP8_STORAGE_DTYPES
+        or tensor.dtype in _CUTE_INTEGER_PACKET_STORE_DTYPES
+    )
+    if (
+        tensor.dtype not in _CUTE_VECTOR_DTYPES
+        and not _cute_is_unroll_dtype(tensor.dtype)
+        and not packet_store
     ):
         return None
     # Only enable the vec path when the load's result eventually feeds a
@@ -5273,6 +5326,9 @@ def _cute_vector_load_ctx(
                     isinstance(strategy, LoopedReductionStrategy)
                     and strategy._cute_reduction_vec_mode == "unroll"
                 )
+                and not (
+                    packet_store and isinstance(strategy, PersistentReductionStrategy)
+                )
             )
         ):
             return None
@@ -5301,7 +5357,7 @@ def _cute_vector_load_ctx(
                 return None
             return vec_width, inner_block_id, "vec"
         if mode == "unroll":
-            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES and not packet_store:
                 return None
             capability = env.config_spec.target_device_capability
             max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
@@ -5347,7 +5403,7 @@ def _cute_vector_load_ctx(
         vec_width = vec_by_block.get(inner_block_id, 1)
         if vec_width <= 1:
             return None
-        if not _cute_is_unroll_dtype(tensor.dtype):
+        if not _cute_is_unroll_dtype(tensor.dtype) and not packet_store:
             return None
         capability = env.config_spec.target_device_capability
         max_bytes = 32 if capability is not None and capability >= (10, 0) else 16

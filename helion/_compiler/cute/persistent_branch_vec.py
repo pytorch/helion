@@ -19,6 +19,8 @@ from ..ast_read_writes import ReadWrites
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .cache_policy_loads import cache_hinted_load_helper
+from .fp8_vector_store import FP8_STORE_DTYPE_INFO
+from .fp8_vector_store import FP8_STORE_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -29,6 +31,8 @@ _SYNTHETIC_LANE_RE = re.compile(r"synthetic_lane_(\d+)")
 _DTYPE_INFO = {
     "cutlass.BFloat16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
     "cutlass.Float16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
+    "cutlass.Int16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
+    "cutlass.Uint16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
     "cutlass.Float32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
     "cutlass.Int32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
     "cutlass.Uint32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
@@ -414,6 +418,7 @@ def _plain_scalar_store_pointer(call: ast.Call) -> ast.expr | None:
 
 # Widest element count one 16-byte flush helper can write.
 _VECTOR_FLUSH_MAX_WIDTH = {
+    **dict.fromkeys(FP8_STORE_HELPERS, 16),
     "_cute_store_u16_vec": 8,
     "_cute_store_u32_vec": 4,
     "_cute_store_u16x8_l2_evict_last": 8,
@@ -1669,7 +1674,11 @@ class _BranchLocalPersistentVectorizer:
                 marker_block = _literal(store_marker.args[0], int)
                 marker_width = _literal(store_marker.args[1], int)
                 dtype = _literal(store_marker.args[2], str)
-                dtype_info = _DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                dtype_info = (
+                    _DTYPE_INFO.get(dtype, FP8_STORE_DTYPE_INFO.get(dtype))
+                    if isinstance(dtype, str)
+                    else None
+                )
                 mask_arg = store_marker.args[5]
                 mask = (
                     None

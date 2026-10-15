@@ -7,11 +7,102 @@ directly), so no ``@cute.jit`` wrapper is needed.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import cutlass
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector as _vector_dialect
 import cutlass.cute as cute
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+def store_u8_vec(
+    ptr: object,
+    vals: list,
+    *,
+    packet_store: Callable[[object, object], None] | None = None,
+) -> None:
+    """Store 2/4/8/16 byte lanes as one naturally aligned integer packet."""
+    store = cute.arch.store if packet_store is None else packet_store
+    if len(vals) == 16:
+        words = []
+        for start in (0, 8):
+            packed = cutlass.Uint64(0)
+            for index, value in enumerate(vals[start : start + 8]):
+                packed = packed | (cutlass.Uint64(value) << (8 * index))
+            words.append(packed.ir_value())
+        packet = _vector_dialect.from_elements(
+            ir.VectorType.get([2], cutlass.Uint64.mlir_type), words
+        )
+        store(ptr, packet)
+        return
+    carrier = {2: cutlass.Uint16, 4: cutlass.Uint32, 8: cutlass.Uint64}[len(vals)]
+    packed = carrier(0)
+    for index, value in enumerate(vals):
+        packed = packed | (carrier(value) << (8 * index))
+    store(ptr, packed)
+
+
+def _store_fp8_vec(
+    ptr: object,
+    vals: list,
+    dtype: type,
+    *,
+    packet_store: Callable[[object, object], None] | None = None,
+) -> None:
+    store = cute.arch.store if packet_store is None else packet_store
+    source_dtype = type(vals[0])
+    if source_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and all(
+        type(value) is source_dtype and isinstance(value.value, ir.Value)
+        for value in vals
+    ):
+        # Vector truncation has the scalar constructor's rounding and overflow
+        # semantics, and lets the CUDA lowering pair its FP8 conversions.
+        # Literal-backed wrappers still hold the original Python float;
+        # emitting them in the source dtype first would add another rounding.
+        source_type = ir.VectorType.get([len(vals)], source_dtype.mlir_type)
+        values = [value.ir_value() for value in vals]
+        source = _vector_dialect.from_elements(
+            source_type,
+            values,
+        )
+        converted = arith.truncf(
+            ir.VectorType.get([len(vals)], dtype.mlir_type), source
+        )
+        carrier = {
+            2: cutlass.Uint16,
+            4: cutlass.Uint32,
+            8: cutlass.Uint64,
+            16: cutlass.Uint64,
+        }[len(vals)]
+        packed = _vector_dialect.bitcast(
+            ir.VectorType.get([max(1, len(vals) // 8)], carrier.mlir_type), converted
+        )
+        if len(vals) == 16:
+            store(ptr, packed)
+            return
+        scalar = _vector_dialect.extract(packed, [], [0])
+        store(ptr, carrier(scalar))
+    else:
+        encoded = [dtype(value).bitcast(cutlass.Uint8) for value in vals]
+        if packet_store is None:
+            store_u8_vec(ptr, encoded)
+        else:
+            store_u8_vec(ptr, encoded, packet_store=packet_store)
+
+
+def store_fp8e4m3fn_vec(ptr: object, vals: list) -> None:
+    """Convert FP32/FP16/BF16 lanes to E4M3FN and store one byte packet."""
+    _store_fp8_vec(ptr, vals, cutlass.Float8E4M3FN)
+
+
+def store_fp8e5m2_vec(ptr: object, vals: list) -> None:
+    """Convert FP32/FP16/BF16 lanes to E5M2 and store one byte packet."""
+    _store_fp8_vec(ptr, vals, cutlass.Float8E5M2)
 
 
 def store_u16_vec(ptr: object, vals: list) -> None:
