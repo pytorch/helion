@@ -26,6 +26,7 @@ from ...language import creation_ops
 from ...language import memory_ops
 from ...language import tile_ops
 from ...language import view_ops
+from ...language.constexpr import ConstExpr
 from ...language.constexpr import specialize
 from ...language.tunable_ops import register_block_size
 from ..ast_extension import ExtendedAST
@@ -101,6 +102,7 @@ _READ_ONLY_TENSOR_METHODS = (
             "detach",
             "dim",
             "element_size",
+            "expand",
             "flatten",
             "is_contiguous",
             "ndimension",
@@ -167,11 +169,12 @@ def _shape_metadata(value: object) -> bool:
 
 
 def _read_only_host_dsl(call: ast.Call, callee: CallableType) -> bool:
-    # These exact DSL APIs specialize integer metadata or register a tile size;
-    # they do not mutate tensor storage. Opaque containers and tensor arguments
-    # are outside this proof. Nested argument calls are checked independently.
+    # These exact DSL APIs wrap or specialize integer metadata or register a
+    # tile size; they do not mutate tensor storage. Opaque containers and tensor
+    # arguments are outside this proof. Nested calls are checked independently.
     return any(
-        callee.value is function for function in (specialize, register_block_size)
+        callee.value is function
+        for function in (ConstExpr, specialize, register_block_size)
     ) and all(
         isinstance(argument, ExtendedAST)
         and (metadata_type := argument._type_info) is not None

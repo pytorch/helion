@@ -14870,28 +14870,51 @@ class TestCuteBackend(TestCase):
             ):
                 spec = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale)).config_spec
                 seeds = [dict(seed.config) for seed in spec.autotune_seed_configs()]
-            expected = {
-                (128, 3, 2): "pre_acc_wait",
-                (64, deep_ab_stages, 2): "pre_acc_wait",
-                (64, deep_ab_stages, 1): "pre_acc_wait",
-                (64, 23 - deep_ab_stages, 2): "missing",
-                (64, 23 - deep_ab_stages, 1): "missing",
-            }
             placements = {
                 (
                     seed["block_sizes"][2],
                     seed["tcgen05_ab_stages"],
                     seed.get("tcgen05_cluster_n", 1),
-                ): seed.get("tcgen05_aux_load_placement")
+                    seed.get("tcgen05_aux_load_placement"),
+                )
                 for seed in seeds
                 if seed["block_sizes"][:2] == [256, 256]
                 and seed.get("tcgen05_cluster_m") == 2
             }
-            self.assertEqual(
-                {key: placements.get(key, "missing") for key in expected},
-                expected,
-                scale_dtype,
-            )
+            # Preserve the legacy default-K/pre-wait seeds alongside the
+            # independently budgeted post-wait pipeline family.
+            for key in (
+                (128, 3, 2, "pre_acc_wait"),
+                (64, deep_ab_stages, 2, "pre_acc_wait"),
+                (64, deep_ab_stages, 1, "pre_acc_wait"),
+            ):
+                self.assertIn(key, placements, scale_dtype)
+            for cluster_n in (1, 2):
+                self.assertNotIn(
+                    (64, 23 - deep_ab_stages, cluster_n, "pre_acc_wait"),
+                    placements,
+                    scale_dtype,
+                )
+            if scale_dtype == torch.float32:
+                state = spec._cute_tcgen05_config
+                fragments = state._matmul_block_fragments()
+                assert fragments is not None
+                self.assertGreater(fragments[2].high, 128)
+                self.assertTrue(
+                    any(seed["block_sizes"][2] == fragments[2].high for seed in seeds)
+                )
+                paired = next(
+                    seed
+                    for seed in seeds
+                    if seed.get("tcgen05_cta_group") == "two"
+                    and seed["block_sizes"] == [256, 256, 64]
+                    and seed["tcgen05_ab_stages"] == 12
+                )
+                self.assertEqual(paired["tcgen05_aux_load_placement"], "post_acc_wait")
+                self.assertIn((64, 12, 1, "post_acc_wait"), placements)
+                limit = state._paired_pipeline_stage_limit(paired)
+                assert limit is not None
+                self.assertGreaterEqual(limit, 12)
 
     def test_matmul_mma_tcgen05_f32_rowvec_seeds_keep_the_stage_within_smem(
         self,

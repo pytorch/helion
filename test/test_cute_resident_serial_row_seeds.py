@@ -342,8 +342,12 @@ def test_inaccessible_tile_or_thread_fragment_is_not_silently_repaired(
         block_id = plan.coarse_block if field == "coarse" else plan.row_block
         item = spec.block_sizes[spec.block_sizes.block_id_to_index(block_id)]
         key, value = "max_size", 2
-    with patch.object(item, key, value):
+    original = getattr(item, key)
+    try:
+        setattr(item, key, value)
         assert not _family(bound)
+    finally:
+        setattr(item, key, original)
 
 
 def test_disabled_heuristics_keep_explicit_config_support() -> None:

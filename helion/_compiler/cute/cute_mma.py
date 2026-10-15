@@ -40,6 +40,7 @@ from torch.fx.node import Node
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
@@ -207,7 +208,6 @@ if TYPE_CHECKING:
     from ...language.matmul_ops import CuteTcgen05SearchPlan
     from ...runtime.config import Config
     from ..aten_lowering import LoweringContext
-    from ..compile_environment import CompileEnvironment
     from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
@@ -1218,11 +1218,9 @@ def _tcgen05_mma_output_tma_store_provable(
     requests the direct-entry seed never makes. An untraced fan-out is left
     to the store lowering, as in codegen.
 
-    ``candidate`` was analyzed with the DeviceIR, which also analyzes the
-    output stores; codegen analyzes the MMA from the graphs alone and stages
-    D row-major unless that view carries a store analysis (leading
-    passthrough or permuted operands), so the expected destination layout is
-    taken from the same graph-only view.
+    ``candidate`` was analyzed with the DeviceIR, which caches the output-store
+    layout. Graph-only codegen reuses that analysis, so both phases select the
+    destination's actual row-major or column-major layout.
     """
     if _tcgen05_grouped_rhs_keeps_store_protocol(candidate.operands.rhs):
         return True
@@ -4062,18 +4060,18 @@ def analyze_cute_mma_node(
         return None
     if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
         return None
-    output_store_analysis: _MmaOutputStoreAnalysis | None = None
+    cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
+    output_store_analysis = (
+        cached if isinstance(cached, _MmaOutputStoreAnalysis) else None
+    )
     needs_output_store_analysis = operands.has_leading_passthrough or (
         operands.lhs.source_to_logical_order is not None
         and operands.rhs.source_to_logical_order is not None
     )
-    # DeviceIR provides the complete graph set needed to compute and cache the
-    # store analysis for small-N search. Later codegen callers lack DeviceIR;
-    # operand forms that require this proof retrieve the cached result instead.
+    # DeviceIR provides the complete graph set needed to cache store analysis.
+    # Every later codegen caller reuses it, including ordinary contractions
+    # writing through a column-major view.
     if needs_output_store_analysis or device_ir is not None:
-        cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
-        if isinstance(cached, _MmaOutputStoreAnalysis):
-            output_store_analysis = cached
         if device_ir is not None:
             if operands.rhs.rhs_packed_group is not None:
                 graph_view = cast(
@@ -8396,11 +8394,41 @@ def _emit_mma_pipeline(
         and n_size % bn == 0
         and k_total_size % bk == 0
     )
+    # The new N-multicast edge family keeps every peer's tile origin in
+    # bounds and all roles on one identical, unsplit static tile stream.
+    # Its graph/alignment and schedule proof is also used by seed admission
+    # and normalization. Any other persistent cluster_n=2 N-edge config is
+    # rejected here; the shared non-TMA path that used to lower them cannot
+    # run a persistent cluster_m=2 launch anyway. The M-edge, double-edge and
+    # K-tail families keep their existing gates.
+    tcgen05_even_n_cluster_edge = (
+        env.config_spec._cute_tcgen05_config.n_edge_cluster_schedule_config_supported(
+            df.config.config
+        )
+    )
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_pid_is_persistent
+        and row_union_plan is None
+        and not tcgen05_grouped_static_persistent_requested
+        and tcgen05_cluster_n_requested == 2
+        and m_size % bm == 0
+        and n_size % bn != 0
+        and k_total_size % bk == 0
+        and not tcgen05_even_n_cluster_edge
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N-edge cluster_n=2 requires proved aligned native rank-2 "
+            "operands with K-major B, an even N tile count, and the unsplit "
+            "static role-local schedule with no scheduler warp, L2 grouping "
+            "or swizzle",
+        )
     tcgen05_n_edge_only = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
-        and tcgen05_cluster_n_requested == 1
+        and (tcgen05_cluster_n_requested == 1 or tcgen05_even_n_cluster_edge)
         and m_size % bm == 0
         and n_size % bn != 0
         and k_total_size % bk == 0
@@ -8517,7 +8545,9 @@ def _emit_mma_pipeline(
     tcgen05_role_local_m_edge_tma = (
         tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
-    tcgen05_role_local_n_edge_tma = tcgen05_n_edge_only and tcgen05_cluster_n == 1
+    tcgen05_role_local_n_edge_tma = tcgen05_n_edge_only and (
+        tcgen05_cluster_n == 1 or tcgen05_even_n_cluster_edge
+    )
     tcgen05_role_local_double_edge_tma = (
         tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
@@ -11686,6 +11716,13 @@ def _emit_mma_pipeline(
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
                 nm_explicit_store_wave=nm_explicit_store_wave and row_profile is None,
+                tmem_load_output_dtype_str=(
+                    epi_elem_dtype_str
+                    if output_column_major
+                    and tcgen05_is_two_cta
+                    and not tcgen05_nm_orientation
+                    else None
+                ),
                 a_k_major=tcgen05_mma_a_k_major,
                 b_k_major=tcgen05_mma_b_k_major,
                 c_layout=tcgen05_d_store_layout,
@@ -14135,16 +14172,17 @@ def _emit_mma_pipeline(
             # The narrow-subtile epilogues opt in by name
             # (``tcgen05_narrow_subtile_nounroll_k_loop``: promoted row-vector
             # rows and plain 16-bit stores on the 256-wide two-CTA tile,
-            # decided with their subtile); every other kernel keeps the
-            # unrolled ``range``.
+            # decided with their subtile). Column-major paired stores also
+            # use this loop form; every other kernel keeps the unrolled ``range``.
             tcgen05_use_nounroll_k_loop = (
                 (
                     tcgen05_explicit_epi_tile_configured
                     or tcgen05_narrow_subtile_nounroll_k_loop
+                    or output_column_major
                 )
                 and tcgen05_static_full_tiles
                 and tcgen05_is_two_cta
-                and (bk == 64 or tcgen05_nm_orientation)
+                and (bk == 64 or tcgen05_nm_orientation or output_column_major)
             )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,
@@ -15122,13 +15160,15 @@ def _tcgen05_use_2cta_instrs(
             not in (
                 torch.float16,
                 torch.bfloat16,
+                torch.float8_e4m3fn,
                 "cutlass.Float16",
                 "cutlass.BFloat16",
+                "cutlass.Float8E4M3FN",
             )
         ):
             raise exc.BackendUnsupported(
                 "cute",
-                "explicit two-CTA MMA requires M128/M256 half or bfloat16 "
+                "explicit two-CTA MMA requires M128/M256 half, bfloat16 or FP8 E4M3 "
                 "operands and tcgen05_cluster_m=2",
             )
         return True
@@ -15325,6 +15365,31 @@ def _tcgen05_candidate_exceeds_smem(
     support = get_cute_mma_support()
     if not tcgen05_supports_input_dtype(support, input_dtype):
         return False
+    if CompileEnvironment.has_current():
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        values = cast("dict[str, object]", config)
+        aligned_n = state._dense_aligned_n_plan(values)
+        if (
+            aligned_n is not None
+            and input_dtype == torch.float8_e4m3fn
+            and aligned_n.physical_tile == (bm, bn, bk)
+        ):
+            stages = _tcgen05_config_int(config, "tcgen05_ab_stages", 2)
+            return not 1 <= stages <= aligned_n.max_ab_stages
+        parameters = state._paired_pipeline_parameters(values)
+        if parameters is not None and parameters[:3] == (bm, bn, bk):
+            limit = state._paired_pipeline_stage_limit(values)
+            assert limit is not None
+            stages = _tcgen05_config_int(config, "tcgen05_ab_stages", 2)
+            return not 1 <= stages <= limit
+        parameters = state._one_cta_pipeline_parameters(values)
+        if parameters is not None and parameters[:3] == (bm, bn, bk):
+            limit = state._one_cta_pipeline_stage_limit(values)
+            assert limit is not None
+            # The native single-root proof prices AB, the actual output ring
+            # and bookkeeping together. Do not subtract the legacy reserve
+            # again; unrelated MMA/configs retain the ordinary prefilter.
+            return _tcgen05_config_int(config, "tcgen05_ab_stages", 2) > limit
     if cast("_ConfigLike", config).get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
         # Config normalization already checked the complete AB + epilogue +
         # bookkeeping allocation using the proven single-output facts. This
@@ -15362,12 +15427,56 @@ def _choose_mma_impl(
     input_device: torch.device | None = None,
     defer_grouped_worklist_smem_check: bool = False,
 ) -> str:
+    # Aligned-N schedules carry a public power-of-two tile around their physical
+    # width. Operand order and M/N axes already come from the frontend kernel.
+    aligned_n = None
+    if config is not None and CompileEnvironment.has_current():
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        aligned_n = state._dense_aligned_n_plan(cast("dict[str, object]", config))
+        if (
+            aligned_n is not None
+            and input_dtype == torch.float8_e4m3fn
+            and (bm, bn, bk) == aligned_n.public_tile
+        ):
+            bm, bn, bk = aligned_n.physical_tile
     tcgen05_cluster_m = 1
     if config is not None:
         tcgen05_cluster_m = _tcgen05_cluster_m(config)
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(config)
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     support = get_cute_mma_support()
+    if aligned_n is not None:
+        # A positive physical-width request owns a native collective layout.
+        # Falling back would reuse that layout with unrelated scalar threads.
+        if (
+            env_choice not in ("auto", "tcgen05")
+            or input_dtype != torch.float8_e4m3fn
+            or (bm, bn, bk) != aligned_n.physical_tile
+            or not tcgen05_supports_input_dtype(support, input_dtype)
+            or not _mma_impl_matches_problem_shape(
+                "tcgen05",
+                input_dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                tcgen05_cluster_m=tcgen05_cluster_m,
+                tcgen05_large_bn_proof=tcgen05_large_bn_proof,
+            )
+            or _tcgen05_candidate_exceeds_smem(
+                input_dtype,
+                input_device=input_device,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+                defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_tile_n requires its supported native tcgen05 implementation",
+            )
+        return "tcgen05"
     if env_choice != "auto":
         if env_choice not in support.supported_impls:
             raise exc.BackendUnsupported(
@@ -15563,6 +15672,7 @@ def _make_tcgen05_layout_plan_setup(
     explicit_epi_tile_m: int | None = None,
     explicit_epi_tile_n: int | None = None,
     nm_explicit_store_wave: bool = False,
+    tmem_load_output_dtype_str: str | None = None,
     a_k_major: bool = True,
     b_k_major: bool = False,
     c_layout: str = "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
@@ -15613,7 +15723,7 @@ def _make_tcgen05_layout_plan_setup(
         else (
             "cutlass.utils.blackwell_helpers.get_tmem_load_op("
             f"({epi_tile_m}, {bn}, {bk}), {plan.c_layout}, "
-            f"{acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
+            f"{tmem_load_output_dtype_str or acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
         )
     )
     return [

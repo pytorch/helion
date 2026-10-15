@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable
+import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import NamedTuple
@@ -16,6 +17,7 @@ from ...autotuner.config_fragment import IntegerFragment
 from ...autotuner.config_fragment import ListOf
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from ..compile_environment import FixedBlockSizeSource
 from .cute_warp_mma_gemm import MATMUL_FAMILIES
 from .cute_warp_mma_gemm import MATMUL_FAMILY_TCGEN05
 from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
@@ -32,6 +34,12 @@ from .cute_warp_mma_gemm import warp_mma_k_step
 from .cute_warp_mma_gemm import warp_mma_max_legal_warps
 from .cute_warp_mma_gemm import warp_mma_tile_reason
 from .cute_warp_mma_gemm import warp_mma_warp_layout
+from .dense_aligned_n import ALIGNED_N_CHOICES
+from .dense_aligned_n import TILE_N_KEY
+from .dense_aligned_n import DenseAlignedNPlan
+from .dense_aligned_n import carrier_n
+from .dense_aligned_n import dense_aligned_n_defaults
+from .dense_aligned_n import dense_aligned_n_plan
 from .epilogue_fanout import FANOUT_CONFIG_KEY
 from .epilogue_fanout import FANOUT_MODES
 from .epilogue_fanout import schedule_supported as fanout_schedule_supported
@@ -46,6 +54,9 @@ from .grouped_row_union import STARTUP_PREFILL_KEY
 from .grouped_row_union import TRANSPOSED_SCHEDULE
 from .grouped_row_union import physical_schedule
 from .grouped_row_union import schedule_supported as row_union_schedule_supported
+from .one_cta_pipeline import Tcgen05OneCtaPipelineFacts
+from .one_cta_pipeline import max_one_cta_pipeline_ab_stages
+from .one_cta_pipeline import one_cta_pipeline_supported
 from .pipeline_smem import TCGEN05_CTA_GROUP_CHOICES
 from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
@@ -223,16 +234,26 @@ from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_round_up_smem_bytes
 from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+from .tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
+from .tcgen05_schedule_facts import n_edge_cluster_geometry_supported
+from .tcgen05_schedule_facts import n_edge_cluster_schedule_defaults
+from .tcgen05_schedule_facts import n_edge_cluster_schedule_supported
+from .tcgen05_schedule_facts import native_tma_schedule_supported
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ...autotuner.block_id_sequence import BlockIdSequence
     from ...autotuner.config_fragment import BlockSizeFragment
+    from ...autotuner.config_spec import BlockSizeSpec
     from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import PidTypeLiteral
+    from ..compile_environment import BlockSizeInfo
+    from ..compile_environment import CompileEnvironment
+    from .dense_gemm import DenseGemmFacts
     from .epilogue_fanout import PairedFanoutPlan
     from .materialized_pdl import MaterializedOperandPdl
 
@@ -410,6 +431,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     FANOUT_CONFIG_KEY,
     TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
     TCGEN05_CTA_GROUP_CONFIG_KEY,
+    TILE_N_KEY,
     "tcgen05_cluster_m",
     "tcgen05_cluster_n",
     "tcgen05_ab_stages",
@@ -490,6 +512,27 @@ def parse_tcgen05_grouped_static_problem_signature(
 CUTE_TCGEN05_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(
     TCGEN05_STRATEGY_CONFIG_KEYS
 )
+# Ownership key: proved schedules may lift only this CuTe-owned pid veto.
+_TWO_CTA_PERSISTENT_PID_VETO = (
+    "tcgen05 two-CTA launch-grid contract does not allow persistent pid types here"
+)
+
+
+def _tcgen05_mma_impl_allowed() -> bool:
+    """Whether HELION_CUTE_MMA_IMPL admits tcgen05; read per call for tests."""
+    return os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower() in (
+        "auto",
+        "tcgen05",
+    )
+
+
+def _tile_in_fragments(
+    fragments: Sequence[BlockSizeFragment], tile: Sequence[int]
+) -> bool:
+    return all(
+        fragment.low <= value <= fragment.high
+        for fragment, value in zip(fragments, tile, strict=True)
+    )
 
 
 class CuteTcgen05Config:
@@ -561,6 +604,18 @@ class CuteTcgen05Config:
         self.epilogue_fanout_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
+        self.dense_gemm_facts: DenseGemmFacts | None = None
+        self.one_cta_pipeline_facts: Tcgen05OneCtaPipelineFacts | None = None
+        # (K block id, owned max_size revision, exact owning object) of the
+        # native K128 search cap that a proved dense pipeline may widen.
+        self._native_k_search_cap: tuple[int, int, BlockSizeSpec] | None = None
+        # The K block widened from that cap; seeds keep its former K128 geometry.
+        self._native_k_widened_block: BlockSizeSpec | None = None
+        self.full_tile_schedule_facts: Tcgen05FullTileScheduleFacts | None = None
+        self.full_tile_restored_pid_types: tuple[PidTypeLiteral, ...] = ()
+        self.full_tile_added_pairing: bool = False
+        self.n_edge_cluster_schedule_facts: Tcgen05FullTileScheduleFacts | None = None
+        self.n_edge_cluster_restored_pid_types: tuple[PidTypeLiteral, ...] = ()
         # Root identities from the typed operand-materialization dependency proof.
         self.materialized_operand_pdl_roots: MaterializedOperandPdl | None = None
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
@@ -586,6 +641,37 @@ class CuteTcgen05Config:
     @allowed_pid_types.setter
     def allowed_pid_types(self, value: tuple[PidTypeLiteral, ...]) -> None:
         self.config_spec.allowed_pid_types = value
+
+    def _preferred_persistent_pid_type(self) -> PidTypeLiteral | None:
+        return next(
+            (
+                pid
+                for pid in ("persistent_interleaved", "persistent_blocked")
+                if pid in self.allowed_pid_types
+            ),
+            None,
+        )
+
+    def _two_cta_restorable_persistent_pids(self) -> tuple[PidTypeLiteral, ...]:
+        """Persistent pids whose only veto is the CuTe two-CTA contract."""
+        reasons = self.config_spec.disallowed_pid_type_reasons
+        causes = self.config_spec.disallowed_pid_type_causes
+        return cast(
+            "tuple[PidTypeLiteral, ...]",
+            tuple(
+                pid
+                for pid in ("persistent_blocked", "persistent_interleaved")
+                if pid not in self.allowed_pid_types
+                and reasons.get(pid) == _TWO_CTA_PERSISTENT_PID_VETO
+                and causes.get(pid) == {_TWO_CTA_PERSISTENT_PID_VETO}
+            ),
+        )
+
+    def _apply_restored_pid_types(self, restored: tuple[PidTypeLiteral, ...]) -> None:
+        self.allowed_pid_types = (*self.allowed_pid_types, *restored)
+        for pid in restored:
+            self.config_spec.disallowed_pid_type_reasons.pop(pid)
+            self.config_spec.disallowed_pid_type_causes.pop(pid)
 
     def _config_block_index(self, block_id: int | None) -> int | None:
         if (
@@ -662,6 +748,10 @@ class CuteTcgen05Config:
 
     def register_pipeline_smem_facts(self, facts: Tcgen05PipelineSmemFacts) -> None:
         self.pipeline_smem_facts = facts
+        if facts.input_dtype_bytes == 1:
+            # Allocation knowledge alone must not resurrect FP8 schedules.
+            # The native TMA/schedule registrar owns their PID restrictions.
+            return
         if self.paired_pipeline_search_enabled():
             # The explicit instruction family owns its own 128-row geometry.
             # It need not satisfy the older 256x256 search projection.
@@ -671,6 +761,463 @@ class CuteTcgen05Config:
                         *self.allowed_pid_types,
                         cast("PidTypeLiteral", pid_type),
                     )
+
+    def _full_tile_schedule_tiles(
+        self, facts: Tcgen05FullTileScheduleFacts, *, cluster_m: int
+    ) -> list[tuple[int, int, int]]:
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return []
+        return [
+            (bm, bn, bk)
+            for bm in (64, 128, 256)
+            for bn in (16, 32, 64, 128, 256)
+            for bk in (32, 64, 128, 256)
+            if native_tma_schedule_supported(
+                facts, (bm, bn, bk), cluster_m=cluster_m, cluster_n=1
+            )
+            and _tile_in_fragments(fragments, (bm, bn, bk))
+        ]
+
+    def register_full_tile_schedule_facts(
+        self, facts: Tcgen05FullTileScheduleFacts
+    ) -> None:
+        """Restore only CuTe-owned search restrictions with a new tile proof.
+
+        The frontend's maximum tile can have a tail even when smaller legal
+        tiles do not. Also, a quarter-wave preference does not change the
+        correctness of an otherwise admitted paired-CTA instruction.
+        """
+        if self.full_tile_schedule_facts is not None:
+            assert self.full_tile_schedule_facts == facts
+            return
+        if facts.block_ids != self.matmul_block_ids:
+            return
+        if not self._full_tile_schedule_tiles(facts, cluster_m=1):
+            return
+        restored = self._two_cta_restorable_persistent_pids()
+        persistent = "persistent_interleaved" in (*self.allowed_pid_types, *restored)
+        added_pairing = (
+            persistent
+            and self.cluster_m_search_choices is not None
+            and 2 not in self.cluster_m_search_choices
+            and bool(self._full_tile_schedule_tiles(facts, cluster_m=2))
+        )
+        if not restored and not added_pairing:
+            return
+        self.full_tile_schedule_facts = facts
+        self.full_tile_restored_pid_types = restored
+        self.full_tile_added_pairing = added_pairing
+        self._apply_restored_pid_types(restored)
+
+    def _full_tile_schedule_config_supported(self, config: dict[str, object]) -> bool:
+        facts = self.full_tile_schedule_facts
+        view = self._matmul_config_view(config)
+        if (
+            facts is None
+            or view is None
+            or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto") != "auto"
+        ):
+            return False
+        blocks, mi, ni, ki = view
+        tile = (blocks[mi], blocks[ni], blocks[ki])
+        return native_tma_schedule_supported(
+            facts,
+            cast("tuple[int, int, int]", tile),
+            cluster_m=cast("int", config.get("tcgen05_cluster_m", 1)),
+            cluster_n=cast("int", config.get("tcgen05_cluster_n", 1)),
+        )
+
+    def _fix_full_tile_schedule_search_config(self, config: dict[str, object]) -> None:
+        if (
+            self.n_edge_cluster_schedule_config_supported(config)
+            or self._paired_pipeline_parameters(config) is not None
+        ):
+            return
+        if self.full_tile_schedule_facts is None:
+            return
+        added_pair = (
+            self.full_tile_added_pairing and config.get("tcgen05_cluster_m") == 2
+        )
+        restored_pid = config.get("pid_type") in self.full_tile_restored_pid_types
+        if not (added_pair or restored_pid):
+            return
+        if self._full_tile_schedule_config_supported(config):
+            if added_pair:
+                config["pid_type"] = "persistent_interleaved"
+            return
+        # Keep unsupported tails and ownership on the pre-existing flat path.
+        config["tcgen05_cluster_m"] = 1
+        config["tcgen05_cluster_n"] = 1
+        if restored_pid:
+            config["pid_type"] = "flat"
+
+    def full_tile_schedule_seed_configs(self) -> list[Config]:
+        facts = self.full_tile_schedule_facts
+        if facts is None:
+            return []
+        seeds: list[Config] = []
+        for cluster_m in (1, 2):
+            if (cluster_m == 1 and not self.full_tile_restored_pid_types) or (
+                cluster_m == 2 and not self.full_tile_added_pairing
+            ):
+                continue
+            tiles = self._full_tile_schedule_tiles(facts, cluster_m=cluster_m)
+            if cluster_m == 1 and tiles:
+                # Existing small-grid seeds cover narrow one-wave tiles. Supply
+                # the widest exact tile for multi-wave problems as well.
+                widest = max(bm * bn for bm, bn, _bk in tiles)
+                tiles = [tile for tile in tiles if tile[0] * tile[1] == widest]
+            for bm, bn, bk in tiles:
+                if bk not in (64, 128):
+                    continue
+                maximum = self.max_ab_stages_that_fit(
+                    bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
+                )
+                maximum = min(maximum, (facts.shape[2] + bk - 1) // bk)
+                for stages in dict.fromkeys((min(2, maximum), maximum)):
+                    if stages <= 0:
+                        continue
+                    values: dict[str, Any] = {
+                        "block_sizes": self._matmul_seed_block_sizes(
+                            bm=bm, bn=bn, bk=bk
+                        ),
+                        "pid_type": "persistent_interleaved",
+                        "tcgen05_cluster_m": cluster_m,
+                        "tcgen05_cluster_n": 1,
+                        "tcgen05_ab_stages": stages,
+                        "tcgen05_acc_stages": 2,
+                        "tcgen05_c_stages": 2,
+                    }
+                    if self.aux_kernel_detected and self.rowvec_aux_stage_fits(
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        cluster_m=cluster_m,
+                        ab_stages=stages,
+                        c_stages=2,
+                    ):
+                        values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        )
+                    seeds.append(Config(**values))
+        return seeds
+
+    def _n_edge_cluster_schedule_tiles(
+        self, facts: Tcgen05FullTileScheduleFacts
+    ) -> list[tuple[int, int, int]]:
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return []
+        return [
+            (256, bn, bk)
+            for bn in (128, 256)
+            for bk in (64, 128)
+            if n_edge_cluster_geometry_supported(facts, (256, bn, bk))
+            and _tile_in_fragments(fragments, (256, bn, bk))
+        ]
+
+    def register_n_edge_cluster_schedule_facts(
+        self, facts: Tcgen05FullTileScheduleFacts
+    ) -> None:
+        """Admit one unsplit multicast family from the native graph proof."""
+        if self.n_edge_cluster_schedule_facts is not None:
+            assert self.n_edge_cluster_schedule_facts == facts
+            return
+        if facts.block_ids != self.matmul_block_ids or not (
+            self._n_edge_cluster_schedule_tiles(facts)
+        ):
+            return
+        restored = self._two_cta_restorable_persistent_pids()
+        if "persistent_interleaved" not in (*self.allowed_pid_types, *restored):
+            return
+        self.n_edge_cluster_schedule_facts = facts
+        self.n_edge_cluster_restored_pid_types = restored
+        self._apply_restored_pid_types(restored)
+
+    def n_edge_cluster_schedule_config_supported(
+        self, config: dict[str, object]
+    ) -> bool:
+        facts = self.n_edge_cluster_schedule_facts
+        view = self._matmul_config_view(config)
+        if facts is None or view is None:
+            return False
+        blocks, mi, ni, ki = view
+        return n_edge_cluster_schedule_supported(
+            facts,
+            cast("tuple[int, int, int]", (blocks[mi], blocks[ni], blocks[ki])),
+            config,
+        )
+
+    def _fix_n_edge_cluster_schedule_search_config(
+        self, config: dict[str, object]
+    ) -> None:
+        facts = self.n_edge_cluster_schedule_facts
+        view = self._matmul_config_view(config)
+        if facts is None or view is None:
+            return
+        blocks, mi, ni, ki = view
+        if config.get("tcgen05_cluster_m") == config.get(
+            "tcgen05_cluster_n"
+        ) == 2 and n_edge_cluster_geometry_supported(
+            facts,
+            cast("tuple[int, int, int]", (blocks[mi], blocks[ni], blocks[ki])),
+        ):
+            config.update(n_edge_cluster_schedule_defaults())
+            config["pid_type"] = "persistent_interleaved"
+            config.pop("epilogue_subtile", None)
+        elif config.get("pid_type") in self.n_edge_cluster_restored_pid_types:
+            config["pid_type"] = "flat"
+            config["tcgen05_cluster_m"] = config["tcgen05_cluster_n"] = 1
+
+    def n_edge_cluster_schedule_seed_configs(self) -> list[Config]:
+        facts = self.n_edge_cluster_schedule_facts
+        if facts is None:
+            return []
+        return [
+            Config.from_dict(
+                {
+                    **n_edge_cluster_schedule_defaults(),
+                    "block_sizes": self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk),
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_cluster_m": 2,
+                    "tcgen05_cluster_n": 2,
+                    "tcgen05_ab_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                }
+            )
+            for bm, bn, bk in self._n_edge_cluster_schedule_tiles(facts)
+            if self.c_stages_fits(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=2,
+                ab_stages=2,
+                c_stages=2,
+                has_source_c=True,
+            )
+        ]
+
+    def _one_cta_pipeline_parameters(
+        self, config: dict[str, object]
+    ) -> tuple[int, int, int, int, int] | None:
+        facts = self.one_cta_pipeline_facts
+        view = self._matmul_config_view(config)
+        if (
+            facts is None
+            or view is None
+            or config.get("pid_type") not in self.allowed_pid_types
+            or self.materialized_matmul_block_ids
+        ):
+            return None
+        blocks, mi, ni, ki = view
+        tile = cast("tuple[int, int, int]", (blocks[mi], blocks[ni], blocks[ki]))
+        if not one_cta_pipeline_supported(facts, tile, config):
+            return None
+        return (
+            *tile,
+            cast("int", config.get("tcgen05_c_stages", 2)),
+            cast("int", config.get("tcgen05_acc_stages", 2)),
+        )
+
+    def _one_cta_pipeline_stage_limit(self, config: dict[str, object]) -> int | None:
+        parameters = self._one_cta_pipeline_parameters(config)
+        if parameters is None:
+            return None
+        facts = self.one_cta_pipeline_facts
+        assert facts is not None
+        bm, bn, bk, c_stages, acc_stages = parameters
+        return max_one_cta_pipeline_ab_stages(
+            facts.allocations,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            c_stages=c_stages,
+            acc_stages=acc_stages,
+        )
+
+    def one_cta_pipeline_seed_configs(self) -> list[Config]:
+        facts = self.one_cta_pipeline_facts
+        fragments = self._matmul_block_fragments()
+        pid = self._preferred_persistent_pid_type()
+        if facts is None or fragments is None or pid is None:
+            return []
+        seeds: list[Config] = []
+        for bm in (64, 128):
+            for bn in (16, 32, 64, 128, 256):
+                for bk in (32, 64, 128, 256):
+                    if not _tile_in_fragments(fragments, (bm, bn, bk)):
+                        continue
+                    blocks = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+                    assert blocks is not None
+                    config = Config(
+                        block_sizes=blocks,
+                        pid_type=pid,
+                        tcgen05_cluster_m=1,
+                        tcgen05_cluster_n=1,
+                        tcgen05_ab_stages=2,
+                        tcgen05_acc_stages=2,
+                        tcgen05_c_stages=2,
+                    )
+                    if facts.allocations.has_auxiliary_loads:
+                        config.config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                            "post_acc_wait"
+                        )
+                    maximum = self._one_cta_pipeline_stage_limit(config.config)
+                    if maximum is None:
+                        continue
+                    maximum = min(maximum, facts.schedule.shape[2] // bk)
+                    # Existing seeds already cover shallower generic rings.
+                    if maximum <= self._get_dtype_ab_stages_hard_cap(1) and bk != 256:
+                        continue
+                    config.config["tcgen05_ab_stages"] = maximum
+                    seeds.append(config)
+        return seeds
+
+    def cap_k_search(self, block: BlockSizeInfo, maximum: int) -> None:
+        """Apply the native K search ceiling, remembering a K128 cap it owns.
+
+        MMA analysis registers once per kernel, so this runs at most once.
+        """
+        try:
+            spec = self.config_spec.block_sizes.block_id_lookup(block.block_id)
+        except KeyError:
+            return
+        previous_max = spec.max_size
+        block.update_max_block(maximum)
+        # Own the cap only when it lowered a wider K search range.
+        if maximum == spec.max_size == 128 and previous_max >= 256:
+            self._native_k_search_cap = (
+                block.block_id,
+                spec.max_size_revision,
+                spec,
+            )
+
+    def widen_one_cta_pipeline_k_search(self, env: CompileEnvironment) -> bool:
+        """Replace an owned K128 cap only after the complete native proof."""
+        facts = self.one_cta_pipeline_facts
+        cap = self._native_k_search_cap
+        fragments = self._matmul_block_fragments()
+        if (
+            facts is None
+            or cap is None
+            or fragments is None
+            or cap[0] != facts.schedule.block_ids[2]
+            or facts.schedule.shape[2] % 256 != 0
+            or isinstance(
+                env.block_sizes[cap[0]].block_size_source, FixedBlockSizeSource
+            )
+        ):
+            return False
+        block = self.config_spec.block_sizes.block_id_lookup(cap[0])
+        if (
+            block is not cap[2]
+            or block.bounded_by_block_id is not None
+            or block.max_size != 128
+            or block.max_size_revision != cap[1]
+            or block.dim_max_size < 256
+        ):
+            return False
+        pid = self._preferred_persistent_pid_type()
+        if pid is None:
+            return False
+        for bm in (64, 128):
+            for bn in (16, 32, 64, 128, 256):
+                if not _tile_in_fragments(fragments[:2], (bm, bn)):
+                    continue
+                sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=256)
+                assert sizes is not None
+                config: dict[str, object] = {
+                    "block_sizes": sizes,
+                    "pid_type": pid,
+                    "tcgen05_aux_load_placement": "post_acc_wait",
+                }
+                limit = self._one_cta_pipeline_stage_limit(config)
+                if limit is None or limit < 2:
+                    continue
+                old_default = block._fragment(self.config_spec).default()
+                block.max_size = 256
+                block.default_size = old_default
+                self._native_k_widened_block = block
+                return True
+        return False
+
+    def widen_paired_pipeline_k_search(self, env: CompileEnvironment) -> bool:
+        """Replace only our K128 cap for a proved physical paired FP8 tile."""
+        facts = self.dense_gemm_facts
+        allocations = self.pipeline_smem_facts
+        cap = self._native_k_search_cap
+        fragments = self._matmul_block_fragments()
+        tile = (128, 64, 256)
+        if (
+            facts is None
+            or allocations is None
+            or not facts.output_column_major
+            or not allocations.output_column_major
+            or facts.input_dtype != torch.float8_e4m3fn
+            or cap is None
+            or fragments is None
+            or cap[0] != facts.block_ids[2]
+            or not _tile_in_fragments(fragments[:2], tile[:2])
+            or self._preferred_persistent_pid_type() is None
+            or not native_tma_schedule_supported(
+                Tcgen05FullTileScheduleFacts(
+                    facts.block_ids, facts.shape, facts.input_dtype, rhs_k_major=True
+                ),
+                tile,
+                cluster_m=2,
+                cluster_n=1,
+            )
+            or isinstance(
+                env.block_sizes[cap[0]].block_size_source, FixedBlockSizeSource
+            )
+        ):
+            return False
+        block = self.config_spec.block_sizes.block_id_lookup(cap[0])
+        if (
+            block is not cap[2]
+            or block.bounded_by_block_id is not None
+            or block.max_size != 128
+            or block.max_size_revision != cap[1]
+            or block.dim_max_size < 256
+            or max_pipeline_ab_stages(
+                allocations, bm=128, bn=64, bk=256, c_stages=2, acc_stages=2
+            )
+            < 2
+        ):
+            return False
+        old_default = block._fragment(self.config_spec).default()
+        block.max_size = 256
+        block.default_size = old_default
+        self._native_k_widened_block = block
+        return True
+
+    def _fp8_paired_pipeline_tile_supported(self, bm: int, bn: int, bk: int) -> bool:
+        """Keep allocation accounting within proved native paired schedules."""
+        shape = self.matmul_compile_time_static_extents
+        axes = self.matmul_block_ids
+        if (
+            not self.matmul_operands_tma_provable
+            or self.config_spec.target_device_capability not in ((10, 0), (10, 3))
+            or self.materialized_matmul_block_ids
+            or axes is None
+            or shape is None
+            or self.matmul_input_dtype != torch.float8_e4m3fn
+            or any(type(extent) is not int or extent <= 0 for extent in shape)
+        ):
+            return False
+        # K tails additionally need the RHS-major proof from native analysis.
+        # Exact tiles retain the conservative fallback for already-admitted grids.
+        facts = self.full_tile_schedule_facts or Tcgen05FullTileScheduleFacts(
+            axes, cast("tuple[int, int, int]", shape), torch.float8_e4m3fn
+        )
+        return native_tma_schedule_supported(
+            facts,
+            (bm, bn, bk),
+            cluster_m=2,
+            cluster_n=1,
+        )
 
     def paired_pipeline_search_enabled(self) -> bool:
         facts = self.pipeline_smem_facts
@@ -684,15 +1231,18 @@ class CuteTcgen05Config:
             or any(value is None or value <= 0 for value in extents)
         ):
             return False
+        if facts.input_dtype_bytes == 1:
+            return (
+                "persistent_blocked" in self.allowed_pid_types
+                and self._fp8_paired_pipeline_tile_supported(128, 128, 64)
+                and _tile_in_fragments(fragments, (128, 128, 64))
+            )
         m, n, k = cast("tuple[int, int, int]", extents)
         return (
             m % 128 == 0
             and n % 64 == 0
             and k % 64 == 0
-            and all(
-                fragment.low <= value <= fragment.high
-                for fragment, value in zip(fragments, (128, 64, 64), strict=True)
-            )
+            and _tile_in_fragments(fragments, (128, 64, 64))
         )
 
     def _paired_pipeline_parameters(
@@ -742,6 +1292,29 @@ class CuteTcgen05Config:
             or acc_stages not in (1, 2)
         ):
             return None
+        if facts.output_column_major:
+            bounds = self._matmul_search_bounds()
+            if bounds is None or any(
+                not low <= value <= high
+                for value, (low, high) in zip((bm, bn, bk), bounds, strict=True)
+            ):
+                return None
+        if facts.input_dtype_bytes == 1 and (
+            not self._fp8_paired_pipeline_tile_supported(bm, bn, bk)
+            or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY)
+            or config.get(TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY, 0) != 0
+            or config.get("tcgen05_num_epi_warps", 4) != 4
+            or config.get("tcgen05_aux_load_mode", "simt") != "simt"
+            or config.get("tcgen05_c_store_mode", "normal") not in ("normal", "direct")
+            or config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, "post_acc_wait")
+            not in ("post_acc_wait", "pre_acc_wait")
+            or config.get(FANOUT_CONFIG_KEY, "off") != "off"
+            or config.get("cute_materialized_operand_schedule", "off") != "off"
+            or config.get("cute_materialized_schedule", "off") != "off"
+            or config.get("cute_split_k_workspace")
+            or config.get("cute_split_k_schedule", "legacy") != "legacy"
+        ):
+            return None
         return cast(
             "tuple[int, int, int, int, int]", (bm, bn, bk, c_stages, acc_stages)
         )
@@ -760,6 +1333,12 @@ class CuteTcgen05Config:
             bk=bk,
             c_stages=c_stages,
             acc_stages=acc_stages,
+            aux_load_placement=cast(
+                "str",
+                config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, "post_acc_wait"),
+            ),
+            store_mode=cast("str", config.get("tcgen05_c_store_mode", "normal")),
+            epi_warps=cast("int", config.get("tcgen05_num_epi_warps", 4)),
         )
 
     def _materialized_paired_stage_limits(
@@ -868,6 +1447,9 @@ class CuteTcgen05Config:
     ) -> None:
         if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two":
             return
+        if self._dense_aligned_n_plan(config) is not None:
+            self._normalize_dense_aligned_n(config, fix_invalid=fix_invalid)
+            return
         region_limits = self._materialized_paired_stage_limits(config)
         if region_limits is not None:
             counts = config.get("tcgen05_region_ab_stages", [0] * len(region_limits))
@@ -896,8 +1478,8 @@ class CuteTcgen05Config:
             config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "auto"
             return
         raise InvalidConfig(
-            "tcgen05_cta_group='two' requires one row-major half/bfloat16 MMA "
-            "with a single output, no auxiliary tensor loads, a static "
+            "tcgen05_cta_group='two' requires one TMA-legal half/bfloat16 MMA "
+            "or proved native FP8 MMA with FP32 broadcasts, a single output, a static "
             "persistent two-CTA schedule, and supported shared-memory geometry"
         )
 
@@ -909,34 +1491,55 @@ class CuteTcgen05Config:
         fragments = self._matmul_block_fragments()
         assert facts is not None and extents is not None and fragments is not None
         m, n, k = cast("tuple[int, int, int]", extents)
+        pid = (
+            "persistent_blocked"
+            if "persistent_blocked" in self.allowed_pid_types
+            else self._preferred_persistent_pid_type()
+        )
+        if pid is None:
+            return []
         seeds: list[Config] = []
         for bm in (128, 256):
             for bn in (64, 128, 256):
-                for bk in (64, 128):
+                for bk in (64, 128, 256) if facts.input_dtype_bytes == 1 else (64, 128):
                     values = (bm, bn, bk)
                     if any(
-                        extent % value != 0
+                        (facts.input_dtype_bytes != 1 and extent % value != 0)
                         or not fragment.low <= value <= fragment.high
                         for extent, value, fragment in zip(
                             (m, n, k), values, fragments, strict=True
                         )
                     ):
                         continue
+                    if facts.input_dtype_bytes == 1 and not (
+                        self._fp8_paired_pipeline_tile_supported(bm, bn, bk)
+                    ):
+                        continue
                     block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
                     assert block_sizes is not None
-                    maximum = max_pipeline_ab_stages(
-                        facts, bm=bm, bn=bn, bk=bk, c_stages=2, acc_stages=acc_stages
+                    placements = (
+                        ("post_acc_wait", "pre_acc_wait")
+                        if facts.has_auxiliary_loads
+                        else ("post_acc_wait",)
                     )
-                    # Include a shallow ring so the tuner can choose occupancy
-                    # over latency hiding. Geometry and memory capacity decide
-                    # these seeds; no workload name or problem-size table does.
-                    for stages in dict.fromkeys((min(2, maximum), maximum)):
-                        if stages <= 0:
-                            continue
-                        seeds.append(
-                            Config(
+                    for placement in placements:
+                        maximum = max_pipeline_ab_stages(
+                            facts,
+                            bm=bm,
+                            bn=bn,
+                            bk=bk,
+                            c_stages=2,
+                            acc_stages=acc_stages,
+                            aux_load_placement=placement,
+                        )
+                        # Include shallow and deepest fitting rings without
+                        # changing the C/accumulator allocation or store protocol.
+                        for stages in dict.fromkeys((min(2, maximum), maximum)):
+                            if stages <= 0:
+                                continue
+                            seed = Config(
                                 block_sizes=block_sizes,
-                                pid_type="persistent_blocked",
+                                pid_type=pid,
                                 tcgen05_cta_group="two",
                                 tcgen05_cluster_m=2,
                                 tcgen05_cluster_n=1,
@@ -950,7 +1553,11 @@ class CuteTcgen05Config:
                                 tcgen05_flat_role_coordinates=False,
                                 **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
                             )
-                        )
+                            if facts.has_auxiliary_loads:
+                                seed.config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                                    placement
+                                )
+                            seeds.append(seed)
         return seeds
 
     def _small_grid_seed_configs(self) -> list[Config]:
@@ -1805,6 +2412,55 @@ class CuteTcgen05Config:
             return constraints.static_k // bk <= constraints.max_k_tiles
         return False
 
+    def cluster_m2_seed_bk_choices(self) -> tuple[int, ...]:
+        """Keep the largest legal K seed and earlier/default K geometries.
+
+        Search-range extensions preserve ``default_size`` so non-autotuned
+        configs stay stable. When a proved dense pipeline widened this K
+        block, its former native K128 ceiling, which may differ from that
+        default, is kept too. Preserve both geometries in the initial
+        population without replacing the expanded-high seed.
+        """
+        constraints = self.cluster_m2_search_constraints
+        fragments = self._matmul_block_fragments()
+        indices = self._matmul_block_indices()
+        if constraints is None or fragments is None or indices is None:
+            return ()
+        fragment = fragments[2]
+        if constraints.allow_edge_k_tail_family:
+            bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+            return (
+                (bk,)
+                if fragment.low <= bk <= fragment.high
+                and self.cluster_m2_bk_is_valid(bk, constraints)
+                else ()
+            )
+        bk = fragment.high
+        while bk >= fragment.low:
+            if self.cluster_m2_bk_is_valid(bk, constraints):
+                break
+            bk //= 2
+        else:
+            return ()
+        block = self.config_spec.block_sizes[indices[2]]
+        choices = [bk]
+        candidates = [block.default_size]
+        if self._native_k_widened_block is block:
+            # The native K128 ceiling that preceded the dense-pipeline widening.
+            candidates.insert(0, 128)
+        for candidate in candidates:
+            if (
+                candidate is not None
+                and block.bounded_by_block_id is None
+                and candidate not in choices
+                and fragment.low <= candidate <= fragment.high
+                and candidate > 0
+                and candidate & (candidate - 1) == 0
+                and self.cluster_m2_bk_is_valid(candidate, constraints)
+            ):
+                choices.append(candidate)
+        return tuple(choices)
+
     def _m_pair_block_m_is_valid(self) -> bool:
         """Whether block_m=512 (M-paired tiles) is admissible for this kernel.
 
@@ -2065,7 +2721,7 @@ class CuteTcgen05Config:
                 ]
         return Config(**seed_config)
 
-    def _plain_clc_seed_config(self) -> Config | None:
+    def _plain_clc_seed_config(self, *, bk: int | None = None) -> Config | None:
         """Autotune seed for the plain full-tile cluster_m=2 CLC family.
 
         Mirrors ``_c_input_seed_config``'s full-tile branch but for kernels
@@ -2093,13 +2749,11 @@ class CuteTcgen05Config:
             and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
         ):
             return None
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if self.cluster_m2_bk_is_valid(bk, constraints):
-                break
-            bk //= 2
-        else:
+        choices = self.cluster_m2_seed_bk_choices()
+        if not choices or (bk is not None and bk not in choices):
             return None
+        if bk is None:
+            bk = choices[0]
         ab_stages = (
             3
             if self.ab_stages_three_fits(
@@ -2289,7 +2943,9 @@ class CuteTcgen05Config:
             seed_config["indexing"] = ["tensor_descriptor"] * 3
         return Config(**seed_config)
 
-    def _plain_cluster_n2_seed_config(self, *, deep: bool = False) -> Config | None:
+    def _plain_cluster_n2_seed_config(
+        self, *, deep: bool = False, bk: int | None = None
+    ) -> Config | None:
         """Autotune seed for the 4-CTA (cluster 2x2) multicast family.
 
         B multicast on top of the 2-CTA A multicast halves B traffic, which
@@ -2338,6 +2994,7 @@ class CuteTcgen05Config:
         ):
             return None
         if deep:
+            assert bk is None, "deep seeds own their K tile"
             bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
             ab_stages = self._two_cta_deep_ab_stages(bk)
             if not (
@@ -2353,13 +3010,11 @@ class CuteTcgen05Config:
             ):
                 return None
         else:
-            bk = bk_fragment.high
-            while bk >= bk_fragment.low:
-                if self.cluster_m2_bk_is_valid(bk, constraints):
-                    break
-                bk //= 2
-            else:
+            choices = self.cluster_m2_seed_bk_choices()
+            if not choices or (bk is not None and bk not in choices):
                 return None
+            if bk is None:
+                bk = choices[0]
             # ab=3 only where the SMEM-budget gate admits it (B200-class
             # optin); sub-B200 devices keep the known-good ab=2 envelope.
             ab_stages = 3 if self.ab_stages_three_search_constraints is not None else 2
@@ -2702,6 +3357,21 @@ class CuteTcgen05Config:
                 clc_n2_seed_config["tcgen05_cluster_n"] = 2
                 clc_n2_seed_config["l2_groupings"] = [8]
                 seeds.append(Config(**clc_n2_seed_config))
+        # An expanded K ceiling must not evict earlier/default geometries'
+        # pipeline/aux placement. Rebuild each family at each K tile so its
+        # dependent shared-memory decisions remain valid.
+        for bk in self.cluster_m2_seed_bk_choices()[1:]:
+            alternate_n2 = self._plain_cluster_n2_seed_config(bk=bk)
+            if alternate_n2 is not None:
+                seeds.append(alternate_n2)
+            alternate_clc = self._plain_clc_seed_config(bk=bk)
+            if alternate_clc is not None:
+                seeds.append(alternate_clc)
+                if alternate_n2 is not None:
+                    clc_n2 = dict(alternate_clc.config)
+                    clc_n2["tcgen05_cluster_n"] = 2
+                    clc_n2["l2_groupings"] = [8]
+                    seeds.append(Config.from_dict(clc_n2))
         plain_m_pair_seed = self._plain_m_pair_seed_config()
         if plain_m_pair_seed is not None:
             seeds.append(plain_m_pair_seed)
@@ -2736,6 +3406,14 @@ class CuteTcgen05Config:
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
+            return
+        if self.n_edge_cluster_schedule_config_supported(config):
+            return
+        if self.full_tile_added_pairing and self._full_tile_schedule_config_supported(
+            config
+        ):
+            config["pid_type"] = "persistent_interleaved"
+            config.pop("epilogue_subtile", None)
             return
         config_view = self._matmul_config_view(config)
         if config_view is None:
@@ -3479,9 +4157,188 @@ class CuteTcgen05Config:
                     "reallocation"
                 )
 
+    def _matmul_search_bounds(
+        self,
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+        """Live M/N/K tile ranges; None when an outer tile bounds an axis."""
+        axes = self.matmul_block_ids
+        fragments = self._matmul_block_fragments()
+        if axes is None or fragments is None:
+            return None
+        bounds = []
+        for axis, fragment in zip(axes, fragments, strict=True):
+            spec = self.config_spec.block_sizes.block_id_lookup(axis)
+            if spec.bounded_by_block_id is not None:
+                return None
+            bounds.append(
+                (max(spec.min_size, fragment.low), min(spec.max_size, fragment.high))
+            )
+        return cast(
+            "tuple[tuple[int, int], tuple[int, int], tuple[int, int]]", tuple(bounds)
+        )
+
+    def _dense_aligned_n_bounds(
+        self,
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+        bounds = self._matmul_search_bounds()
+        # A pinned N block is an exact tile, not a carrier that may shrink.
+        if bounds is None or bounds[1][0] == bounds[1][1]:
+            return None
+        return bounds
+
+    def _dense_aligned_n_plan(
+        self, config: dict[str, object]
+    ) -> DenseAlignedNPlan | None:
+        if config.get(TILE_N_KEY, 0) == 0:
+            return None
+        view = self._matmul_config_view(config)
+        bounds = self._dense_aligned_n_bounds()
+        facts = self.dense_gemm_facts
+        if (
+            view is None
+            or bounds is None
+            or facts is None
+            or facts.block_ids != self.matmul_block_ids
+            or facts.shape != self.matmul_compile_time_static_extents
+            or facts.input_dtype != self.matmul_input_dtype
+            or config.get("pid_type") not in self.allowed_pid_types
+        ):
+            return None
+        blocks, mi, ni, ki = view
+        return dense_aligned_n_plan(
+            self.dense_gemm_facts,
+            config,
+            cast("tuple[int, int, int]", (blocks[mi], blocks[ni], blocks[ki])),
+            bounds=bounds,
+        )
+
+    def _dense_aligned_n_width_plans(
+        self, width: int
+    ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
+        """Normal-store seed values (in seed order) proved for one physical N."""
+        facts = self.dense_gemm_facts
+        if (
+            not self.search_enabled
+            or facts is None
+            # dense_aligned_n_plan needs 128-row tiles that divide M and a
+            # physical width that divides N; skip widths that cannot qualify.
+            or facts.shape[0] % 128
+            or facts.shape[1] % width
+            or not _tcgen05_mma_impl_allowed()
+        ):
+            return
+        pid = self._preferred_persistent_pid_type()
+        if pid is None:
+            return
+        for bk in (64, 128):
+            for acc_stages in (2, 1):
+                values: dict[str, Any] = {
+                    **dense_aligned_n_defaults(acc_stages=acc_stages),
+                    TILE_N_KEY: width,
+                    "block_sizes": self._matmul_seed_block_sizes(
+                        bm=128, bn=carrier_n(width), bk=bk
+                    ),
+                    "pid_type": pid,
+                    "tcgen05_c_stages": 2,
+                }
+                plan = self._dense_aligned_n_plan(values)
+                if plan is not None:
+                    yield values, plan
+
+    def _dense_aligned_n_widths(self) -> tuple[int, ...]:
+        """Physical widths with at least one proved seed, in seed order."""
+        return tuple(
+            width
+            for width in ALIGNED_N_CHOICES
+            if next(self._dense_aligned_n_width_plans(width), None) is not None
+        )
+
+    def dense_aligned_n_seed_configs(self) -> list[Config]:
+        seeds: list[Config] = [
+            Config.from_dict(values | {"tcgen05_ab_stages": depth})
+            for width in ALIGNED_N_CHOICES
+            for values, plan in self._dense_aligned_n_width_plans(width)
+            for depth in dict.fromkeys((min(2, plan.max_ab_stages), plan.max_ab_stages))
+        ]
+        # Preserve the ranked normal-store prefix exactly. Direct stores use
+        # the same conservative allocation bound and append only after their
+        # complete graph/geometry proof succeeds.
+        for seed in tuple(seeds):
+            values = seed.config | {"tcgen05_c_store_mode": "direct"}
+            if self._dense_aligned_n_plan(values) is not None:
+                seeds.append(Config.from_dict(values))
+        return seeds
+
+    def _normalize_dense_aligned_n(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        width = config.get(TILE_N_KEY, 0)
+        if type(width) is int and width == 0:
+            return
+        if type(width) is not int or width not in ALIGNED_N_CHOICES:
+            raise InvalidConfig(
+                "tcgen05_tile_n requires an aligned non-power-of-two N width"
+            )
+        if fix_invalid:
+            view = self._matmul_config_view(config)
+            if view is not None:
+                blocks, mi, ni, _ki = view
+                blocks = list(blocks)
+                blocks[mi], blocks[ni] = 128, carrier_n(width)
+                config["block_sizes"] = blocks
+            acc_stages = config.get("tcgen05_acc_stages", 2)
+            if type(acc_stages) is not int or acc_stages not in (1, 2):
+                acc_stages = 2
+            store_mode = config.get("tcgen05_c_store_mode", "normal")
+            if store_mode not in ("normal", "direct"):
+                store_mode = "normal"
+            config.update(
+                dense_aligned_n_defaults(
+                    acc_stages=acc_stages, store_mode=cast("str", store_mode)
+                )
+            )
+            if config.get("pid_type") not in self.allowed_pid_types or config.get(
+                "pid_type"
+            ) not in ("persistent_interleaved", "persistent_blocked"):
+                config["pid_type"] = self._preferred_persistent_pid_type()
+        plan = self._dense_aligned_n_plan(config)
+        if plan is None:
+            raise InvalidConfig(
+                "tcgen05_tile_n requires its proved full-M/N dense FP8 paired static schedule and unchanged tile bounds"
+            )
+        for key, value in dense_aligned_n_defaults(
+            acc_stages=cast("int", config.get("tcgen05_acc_stages", 2)),
+            store_mode=cast("str", config.get("tcgen05_c_store_mode", "normal")),
+        ).items():
+            config.setdefault(key, value)
+        depth = config.setdefault("tcgen05_ab_stages", 2)
+        if type(depth) is int and 1 <= depth <= plan.max_ab_stages:
+            return
+        if not fix_invalid:
+            raise InvalidConfig(
+                f"tcgen05_tile_n complete SMEM budget permits AB stages 1..{plan.max_ab_stages}"
+            )
+        config["tcgen05_ab_stages"] = (
+            max(1, min(depth, plan.max_ab_stages)) if type(depth) is int else 1
+        )
+
+    def project_dense_aligned_n_codegen(self, config: Config) -> Config:
+        if config.get(TILE_N_KEY, 0) == 0:
+            return config
+        plan = self._dense_aligned_n_plan(config.config)
+        if plan is None:
+            raise InvalidConfig("physical N projection lacks its typed dense plan")
+        indices = self._matmul_block_indices()
+        assert indices is not None
+        blocks = list(config.block_sizes)
+        for index, value in zip(indices, plan.physical_tile, strict=True):
+            blocks[index] = value
+        return Config.from_dict(config.config | {"block_sizes": blocks})
+
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        self._normalize_dense_aligned_n(config, fix_invalid=fix_invalid)
         self._normalize_warp_mma_family(config, fix_invalid=fix_invalid)
         self._normalize_batch_raster(config, fix_invalid=fix_invalid)
         # An explicit physical schedule owns its projection.  Validate the
@@ -4915,7 +5772,21 @@ class CuteTcgen05Config:
     def _validate_direct_entry_ab_stage_envelope(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        if self._dense_aligned_n_plan(config) is not None:
+            self._normalize_dense_aligned_n(config, fix_invalid=fix_invalid)
+            return
         ab_stages = config.get("tcgen05_ab_stages")
+        one_cta_limit = self._one_cta_pipeline_stage_limit(config)
+        if one_cta_limit is not None and type(ab_stages) is int:
+            if 0 < ab_stages <= one_cta_limit:
+                return
+            if fix_invalid and one_cta_limit > 0:
+                config["tcgen05_ab_stages"] = one_cta_limit
+                return
+            raise InvalidConfig(
+                "one-CTA FP8 pipeline and output store ring exceed per-CTA "
+                f"shared memory (maximum AB stages: {one_cta_limit})"
+            )
         if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
             fit_max = self._paired_pipeline_stage_limit(config)
             if fit_max is not None and type(ab_stages) is int:
@@ -5162,6 +6033,12 @@ class CuteTcgen05Config:
         config: dict[str, object],
         overrides: Mapping[str, object],
     ) -> None:
+        if "block_sizes" in overrides:
+            if overrides.get(TILE_N_KEY, 0) != 0:
+                raise InvalidConfig(
+                    "fixed block_sizes overrides cannot select a different physical N tile"
+                )
+            config[TILE_N_KEY] = 0
         if "pid_type" not in overrides:
             return
         if TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY in overrides:
@@ -5199,7 +6076,7 @@ class CuteTcgen05Config:
         key: str,
         config: dict[str, object],
     ) -> tuple[bool, object]:
-        if key == TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY:
+        if key in (TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, TILE_N_KEY):
             return True, 0
         if key == TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY:
             # The autotuner search surface for this key is the collapsed
@@ -5271,6 +6148,8 @@ class CuteTcgen05Config:
         return False
 
     def _fix_aux_edge_search_config(self, config: dict[str, object]) -> None:
+        if self.n_edge_cluster_schedule_config_supported(config):
+            return
         if not (self.search_enabled and self.aux_kernel_detected):
             return
         if not self._has_any_matmul_fact_edge_tile(config):
@@ -5482,14 +6361,12 @@ class CuteTcgen05Config:
         if not allow_persistent_pid_types:
             self.config_spec.disallow_pid_type(
                 "persistent_blocked",
-                reason="tcgen05 two-CTA launch-grid contract does not allow "
-                "persistent pid types here",
+                reason=_TWO_CTA_PERSISTENT_PID_VETO,
             )
             if not allow_cluster_m2_edge_k_tail_family:
                 self.config_spec.disallow_pid_type(
                     "persistent_interleaved",
-                    reason="tcgen05 two-CTA launch-grid contract does not allow "
-                    "persistent pid types here",
+                    reason=_TWO_CTA_PERSISTENT_PID_VETO,
                 )
         if allow_cluster_m2_search:
             assert cluster_m2_static_k_int is not None
@@ -5526,7 +6403,11 @@ class CuteTcgen05Config:
         paired_search = self.paired_pipeline_search_enabled() or bool(
             self.materialized_matmul_block_ids
         )
-        if paired_search:
+        if (
+            paired_search
+            or self.full_tile_added_pairing
+            or self.n_edge_cluster_schedule_facts is not None
+        ):
             cluster_m_choices = tuple(dict.fromkeys((*cluster_m_choices, 2)))
         # cluster_n=2 (the Quack-canonical 4-CTA cluster: B multicast on top
         # of the 2-CTA A multicast) is searchable on every cluster_m=2
@@ -5535,7 +6416,10 @@ class CuteTcgen05Config:
         # shape) and, with the generalized 4-CTA CLC broadcast, closes the
         # edge-family gap too (bf16 5000^3: 907 vs 852 TFLOP/s, matching
         # quack's dynamic-persistent 2x2 within 1%).
-        cluster_n_searchable = self.cluster_m2_search_constraints is not None
+        cluster_n_searchable = (
+            self.cluster_m2_search_constraints is not None
+            or self.n_edge_cluster_schedule_facts is not None
+        )
         cluster_n_choices: tuple[int, ...] = (
             (1, 2) if not for_search or cluster_n_searchable else (1,)
         )
@@ -5593,7 +6477,15 @@ class CuteTcgen05Config:
             ab_stages_max = self._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
         else:
             ab_stages_max = 2
+        # Physical N widths with a proved aligned-N seed (computed once).
+        aligned_widths = self._dense_aligned_n_widths()
         if self.pipeline_smem_facts is not None and (not for_search or paired_search):
+            ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        if aligned_widths:
+            ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
+        if self.one_cta_pipeline_facts is not None and (
+            not for_search or self._preferred_persistent_pid_type() is not None
+        ):
             ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
         if for_search:
             l2_swizzle_choices = tuple(
@@ -5687,6 +6579,11 @@ class CuteTcgen05Config:
             if for_search and direct_store_inert
             else None,
         )
+        # Validation admits every aligned width; search admits the proved ones.
+        if not for_search:
+            fragments[TILE_N_KEY] = EnumFragment((0, *ALIGNED_N_CHOICES))
+        elif aligned_widths:
+            fragments[TILE_N_KEY] = EnumFragment((0, *aligned_widths))
         # The register-MMA GEMM family and its warp count are searched only
         # where the plan admitted the family (``warp_mma_admitted``); every
         # tcgen05-enabled kernel validates the keys so an explicit request on
@@ -6626,6 +7523,16 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        if config.get(TILE_N_KEY, 0) != 0:
+            self._normalize_dense_aligned_n(config, fix_invalid=True)
+            config.pop("epilogue_subtile", None)
+            return
+        self._fix_n_edge_cluster_schedule_search_config(config)
+        self._fix_full_tile_schedule_search_config(config)
+        if self._one_cta_pipeline_parameters(config) is not None:
+            config.pop("epilogue_subtile", None)
+            self._validate_direct_entry_ab_stage_envelope(config, fix_invalid=True)
+            return
         if self._materialized_paired_stage_limits(config) is not None:
             # Each launch has its own proved axes and budget. The single-matrix
             # projection below cannot choose geometry for this complete recipe.

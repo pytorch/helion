@@ -1474,6 +1474,15 @@ class CuteBackend(Backend):
 
         env = CompileEnvironment.current()
         spec = env.config_spec._cute_tcgen05_config
+        dense = spec._dense_aligned_n_plan(fn.config.config)
+        if (
+            dense is not None
+            and env.canonical_block_id(block_id) in dense.block_ids[:2]
+        ):
+            return (
+                tuple(fn.resolved_block_size(axis) for axis in dense.block_ids)
+                == dense.physical_tile
+            )
         profile = physical_schedule(fn.config)
         axes = spec.matmul_block_ids
         return (
@@ -1490,8 +1499,9 @@ class CuteBackend(Backend):
     def codegen_config(self, config: Config) -> Config:
         from ..compile_environment import CompileEnvironment
 
-        return CompileEnvironment.current().config_spec._cute_tcgen05_config.project_row_union_codegen(
-            config
+        state = CompileEnvironment.current().config_spec._cute_tcgen05_config
+        return state.project_dense_aligned_n_codegen(
+            state.project_row_union_codegen(config)
         )
 
     # Bump when config_value_priors() changes its candidate distribution.

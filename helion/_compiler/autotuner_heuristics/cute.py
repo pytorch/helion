@@ -89,7 +89,6 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFA
 from ..cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
-from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
@@ -5964,10 +5963,24 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        spec = env.config_spec
         bk = cls._select_bk(env)
         if bk is None:
             raise AssertionError(f"{cls.name} get_seed_config called while ineligible")
+        return cls._seed_config_for_bk(env, bk)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        return [
+            seed
+            for bk in env.config_spec._cute_tcgen05_config.cluster_m2_seed_bk_choices()
+            if (seed := cls._seed_config_for_bk(env, bk)) is not None
+        ]
+
+    @classmethod
+    def _seed_config_for_bk(cls, env: CompileEnvironment, bk: int) -> Config | None:
+        spec = env.config_spec
 
         constraints = spec._tcgen05_cluster_m2_search_constraints
         edge_k_tail_family = (
@@ -6055,30 +6068,8 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
 
     @staticmethod
     def _select_bk(env: CompileEnvironment) -> int | None:
-        spec = env.config_spec
-        constraints = spec._tcgen05_cluster_m2_search_constraints
-        fragments = spec._tcgen05_matmul_block_fragments()
-        if constraints is None or fragments is None:
-            return None
-        bk_fragment = fragments[2]
-        if constraints.allow_edge_k_tail_family:
-            if (
-                bk_fragment.low
-                <= TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-                <= bk_fragment.high
-                and spec._tcgen05_cluster_m2_bk_is_valid(
-                    TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
-                    constraints,
-                )
-            ):
-                return TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-            return None
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if spec._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
-                return bk
-            bk //= 2
-        return None
+        choices = env.config_spec._cute_tcgen05_config.cluster_m2_seed_bk_choices()
+        return choices[0] if choices else None
 
     @staticmethod
     def _small_grid_tile_reachable(spec: ConfigSpec) -> bool:
@@ -6740,3 +6731,11 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         # search-projection (``_fix_target1_tvm_ffi_search_config``) and this
         # population seed emit the identical FFI envelope.
         return env.config_spec._tcgen05_full_tile_direct_entry_seed_config()
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        # The direct-entry family owns its exact K/stage tuple separately from
+        # the ordinary multi-seed family above.
+        return None
