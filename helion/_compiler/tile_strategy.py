@@ -5718,6 +5718,12 @@ def _is_proven_relocatable_call(
     name = _qualified_name(call.func)
     if name is None:
         return False
+    if name == "_cute_inline_asm_elementwise":
+        from .cute.pure_lane_packets import _pure_packet_call
+
+        # Reuse the packet pass's scalar-arithmetic proof: declared purity
+        # alone does not exclude hidden memory accesses or synchronization.
+        return _pure_packet_call(call)
     if name in _PURE_RELOCATABLE_NAMES or name in PURE_HELPERS:
         return True
     if name.startswith("cutlass."):
