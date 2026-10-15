@@ -70,7 +70,7 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
         bound.env,
         patch.object(
             CuteCollectiveMatmulHeuristic,
-            "_interleave_schedule_seeds",
+            "_interleave_bounded_k_seeds",
             side_effect=_legacy_order,
         ),
     ):
@@ -364,7 +364,7 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
         )
         with patch.object(
             CuteCollectiveMatmulHeuristic,
-            "_interleave_schedule_seeds",
+            "_interleave_bounded_k_seeds",
             side_effect=_legacy_order,
         ):
             legacy = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -382,7 +382,7 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
         helion.Config.from_dict(seed.config | {"gain": 1 << (index % 3)})
         for index, seed in enumerate(legacy)
     ]
-    interleaved = CuteCollectiveMatmulHeuristic._interleave_schedule_seeds(
+    interleaved = CuteCollectiveMatmulHeuristic._interleave_bounded_k_seeds(
         bound.config_spec, with_gain, ()
     )
     assert [

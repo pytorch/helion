@@ -2095,7 +2095,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         return result, tuple(parameters)
 
     @staticmethod
-    def _interleave_schedule_seeds(
+    def _interleave_bounded_k_seeds(
         spec: ConfigSpec,
         seeds: list[Config],
         parameters: tuple[str, ...],
@@ -2432,7 +2432,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
-        return cls._interleave_schedule_seeds(
+        return cls._interleave_bounded_k_seeds(
             spec, dedupe_configs(result), bounded_parameters
         )
 

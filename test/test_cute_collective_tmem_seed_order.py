@@ -55,7 +55,7 @@ def _legacy_registered_seeds(bound: BoundKernel) -> list[helion.Config]:
         bound.env,
         patch.object(
             CuteCollectiveMatmulHeuristic,
-            "_interleave_schedule_seeds",
+            "_interleave_bounded_k_seeds",
             side_effect=_legacy_order,
         ),
     ):
