@@ -2112,14 +2112,9 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         paired copy/recipe choices before repeating geometries. When the TMEM
         storage alternative is present, rotate through complete
         schedules as well as compute/copy/depth/chunk groups, retaining the
-        ranked geometry order within each. Without bounded-K, TMEM-operand,
-        register-recipe, or packet schedules, rotate through complete schedules
-        including native/TMEM seed reuse, recipes, epilogues, and bounds policies.
-        An otherwise ordinary list containing gathered-row seeds keeps its
-        existing order.
-        This only reorders existing seeds; the first seed, default promotion,
-        other heuristics, and search budget stay unchanged. Unrelated user
-        knobs never supply a grouping dimension.
+        ranked geometry order within each. This only reorders existing seeds;
+        the first seed, default promotion, other heuristics, and search budget
+        stay unchanged. Unrelated user knobs never supply a grouping dimension.
         """
         tmem_operand_schedules = any(
             seed.get("cute_collective_tmem_a", False) for seed in seeds
