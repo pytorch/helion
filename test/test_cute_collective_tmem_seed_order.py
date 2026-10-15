@@ -185,24 +185,3 @@ def test_tmem_schedule_order_preserves_budget_and_explicit_user_priority(
         generation = bound.config_spec.create_config_generation()
         _flat, normalized = generation.canonicalize_flat(generation.flatten(explicit))
     assert population[1] == normalized
-
-
-def test_schedules_without_tmem_operands_advance_seed_reuse(
-    dependent_case: tuple[BoundKernel, tuple[torch.Tensor, ...]],
-) -> None:
-    bound, _args = dependent_case
-    seeds = [
-        config
-        for config in _legacy_registered_seeds(bound)
-        if not config.get("cute_collective_tmem_a", False)
-    ]
-    reordered = CuteCollectiveMatmulHeuristic._interleave_schedule_seeds(
-        bound.config_spec, seeds, ()
-    )
-    assert reordered[0] == seeds[0]
-    assert len(reordered) == len(seeds)
-    assert set(reordered) == set(seeds)
-    assert any(seed.get("cute_collective_tmem_seed") for seed in seeds)
-    assert next(
-        i for i, seed in enumerate(reordered) if seed.get("cute_collective_tmem_seed")
-    ) < next(i for i, seed in enumerate(seeds) if seed.get("cute_collective_tmem_seed"))

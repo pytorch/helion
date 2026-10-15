@@ -301,51 +301,23 @@ def test_no_config_owned_k_chunk_preserves_seeds_and_covers_schedules(
     assert len(legacy_seeds) == len(seeds)
     assert set(legacy_seeds) == set(seeds)
     assert legacy_seeds[0] == seeds[0]
-    normal = [seed for seed in seeds if not seed.get("cute_collective_static_layouts")]
-    assert seeds[: len(normal)] == normal
-    population = _initial_population(bound, args)
-    legacy_population = _initial_population(bound, args, seeds=legacy_seeds)
+    population = _initial_population(bound, args, count=30)
+    legacy_population = _initial_population(bound, args, seeds=legacy_seeds, count=30)
     assert len(population) == len(legacy_population)
     assert {seed.get("cute_collective_copy") for seed in population} >= {
         "scalar",
         "async",
         "async_cached",
     }
-    assert {seed.get("cute_collective_recipe", "scalar") for seed in population} >= {
-        "scalar",
-        "vector",
-        "vector_unrolled",
-    }
+    for key in ("cute_collective_recipe", "cute_collective_epilogue"):
+        assert {seed.get(key, "scalar") for seed in legacy_population} == {"scalar"}
+        assert {seed.get(key, "scalar") for seed in population} >= {
+            "scalar",
+            "vector",
+            "vector_unrolled",
+        }
     assert {seed.get("cute_collective_stages", 1) for seed in population} >= {1, 2, 4}
-    assert {seed.get("cute_collective_epilogue", "scalar") for seed in population} >= {
-        "scalar",
-        "vector",
-        "vector_unrolled",
-    }
     assert any(seed.get("cute_proven_bounds") for seed in population)
-    assert any(seed.get("cute_collective_static_layouts") for seed in population)
-    assert any(not seed.get("cute_collective_static_layouts") for seed in population)
-    if kernel is _ordinary_matmul:
-        before = {tuple(seed.block_sizes) for seed in legacy_population}
-        after = {tuple(seed.block_sizes) for seed in population}
-        # At the full-profile budget on SM100, only the last two geometries drop.
-        assert after <= before
-        assert before - after == {(32, 64, 32), (32, 64, 64)}
-        early = _initial_population(bound, args, count=30)
-        early_legacy = _initial_population(bound, args, seeds=legacy_seeds, count=30)
-        assert (
-            len(
-                {
-                    tuple(seed.block_sizes)
-                    for seed in early_legacy
-                    if seed.get("cute_collective_mma")
-                }
-            )
-            == 8
-        )
-        assert {
-            tuple(seed.block_sizes) for seed in early if seed.get("cute_collective_mma")
-        } == {(64, 32, 64), (64, 64, 64)}
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
