@@ -1047,6 +1047,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_bias_fold",
         "cute_flash_bwd_tile_group",
         "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_aux_smem",
         "cute_flash_bwd_exp2_emu",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
@@ -1294,6 +1295,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_bias_fold",
         "cute_flash_bwd_tile_group",
         "cute_flash_bwd_stats_mma",
+        "cute_flash_bwd_aux_smem",
         "cute_flash_bwd_exp2_emu",
         "cute_flash_gate_warpgroups",
         *BLOCK_SCALED_CONFIG_KEYS,
@@ -1879,6 +1881,7 @@ class ConfigSpec:
         # backward-attention detector fires (see cute_flash_bwd.py). Pins the
         # (kv_tile, q_tile) block sizes to the 128x128 flash envelope.
         self.cute_flash_bwd_search_enabled: bool = False
+        self._cute_flash_bwd_aux_smem_candidates: tuple[int, ...] = ()
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self._cute_flash_bwd_persistent_allowed: bool = True
@@ -3342,6 +3345,7 @@ class ConfigSpec:
         flex: bool = False,
         tile_groups: tuple[int, ...] = (0,),
         fast_math: bool = False,
+        aux_smem_candidates: Sequence[int] = (),
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
@@ -3357,6 +3361,7 @@ class ConfigSpec:
         self._cute_flash_bwd_flex = flex
         self._cute_flash_bwd_tile_groups = tile_groups
         self._cute_flash_bwd_fast_math = fast_math
+        self._cute_flash_bwd_aux_smem_candidates = tuple(aux_smem_candidates)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
@@ -7122,6 +7127,17 @@ class ConfigSpec:
                     # Per-column LSE / delta terms through K-slice MMAs instead of
                     # broadcast smem loads in the compute passes (see _fit_smem_budget).
                     fields["cute_flash_bwd_stats_mma"] = EnumFragment(choices=(0, 1))
+                    from .._compiler.cute.cute_flash import flash_flex_aux_smem_choices
+
+                    aux_choices = flash_flex_aux_smem_choices(
+                        self._cute_flash_bwd_aux_smem_candidates
+                    )
+                    if len(aux_choices) > 1:
+                        # Byte budget of the hook's gathered aux tables staged in
+                        # shared memory (0 = global gathers; see fbwd_aux_smem_layout).
+                        fields["cute_flash_bwd_aux_smem"] = EnumFragment(
+                            choices=aux_choices
+                        )
                     if self._cute_flash_bwd_fast_math:
                         # Elements of every 16 sent to the polynomial exp2 on the
                         # FMA pipe (an approximation: fast_math kernels only).

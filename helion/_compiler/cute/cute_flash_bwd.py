@@ -2644,6 +2644,7 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
     targets = {match.kv_block_id: 128, match.q_block_id: 128}
     if not _flash_block_sizes_reachable(env, targets):
         return False
+    from .cute_flash_bwd_flex import fbwd_aux_smem_candidates
     from .cute_flash_bwd_flex import fbwd_tile_group_choices
 
     env.config_spec.enable_cute_flash_bwd_search(
@@ -2653,5 +2654,6 @@ def _detect_flex_bwd_search_surface(device_ir: DeviceIR) -> bool:
         flex=True,
         tile_groups=fbwd_tile_group_choices(match.plan),
         fast_math=bool(env.settings.fast_math),
+        aux_smem_candidates=fbwd_aux_smem_candidates(match.plan),
     )
     return True

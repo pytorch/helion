@@ -375,6 +375,7 @@ def flash_bwd_shared_storage(
     aug_stages: int = 0,
     stage_lse: bool = True,
     stage_delta: bool = True,
+    flex_aux_bytes: int = 0,
 ) -> type:
     """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
 
@@ -397,12 +398,15 @@ def flash_bwd_shared_storage(
     constant (128 x 16) A-operand slices (-1 columns) K / V are extended
     with, plus one full barrier per stage. ``stage_lse`` / ``stage_delta``
     keep the sLSE / sDelta register-path stagings (dropped when the term
-    rides the MMA).
+    rides the MMA). ``flex_aux_bytes`` > 0 adds the flex hook's staged aux
+    tables (``sFlexAux``, see ``flex_aux_smem_layout``), declared before the
+    1024-aligned tiles so a small region lives in the alignment padding.
     """
     steps_entries = max(steps, 1)
     assert dq_boxes in (4, 8), dq_boxes
     lse_entries = 2 * 128 if stage_lse else 1
     delta_entries = 2 * 128 if stage_delta else 1
+    flex_aux_words = max(flex_aux_bytes // 4, 1)
     if aug_stages > 0:
 
         @cute.struct
@@ -431,6 +435,9 @@ def flash_bwd_shared_storage(
             clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
             sLSE: cute.struct.MemRange[cutlass.Float32, lse_entries]
             sDelta: cute.struct.MemRange[cutlass.Float32, delta_entries]
+            sFlexAux: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
@@ -484,6 +491,10 @@ def flash_bwd_shared_storage(
         clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
         sLSE: cute.struct.MemRange[cutlass.Float32, lse_entries]
         sDelta: cute.struct.MemRange[cutlass.Float32, delta_entries]
+        # The flex hook's staged aux tables (see the forward's sFlexAux).
+        sFlexAux: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, flex_aux_words], 16
+        ]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
