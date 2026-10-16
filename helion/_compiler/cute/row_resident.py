@@ -346,6 +346,10 @@ def _stage(
         if analyzed is None or analyzed[1] is not mma:
             return None
         chain = analyzed[0]
+        if chain.runtime_scalars:
+            # The row-resident helper module sees only its own arguments, so
+            # it cannot render lifted scalar args or rank-0 loads inline.
+            return None
         for aux in chain.auxiliary_tensor_loads:
             if (
                 aux.broadcast_axis is not None

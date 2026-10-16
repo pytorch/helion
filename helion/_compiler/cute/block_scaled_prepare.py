@@ -137,6 +137,10 @@ def preparation_source(plan: Mapping[str, object]) -> str:
 
 
 def make_block_scaled_entry(plan: Mapping[str, object]) -> object:
+    if plan.get("format") == "mxfp8":
+        from .mxfp8_prepare import make_mxfp8_entry
+
+        return make_mxfp8_entry(plan)
     import cutlass
     import cutlass.cute as cute
 

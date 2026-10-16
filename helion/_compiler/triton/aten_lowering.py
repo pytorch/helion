@@ -14,12 +14,14 @@ from operator import getitem
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.utils import triton_type
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from ... import exc
+from ..._compat import is_hip
 from ..._utils import next_power_of_2
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -45,6 +47,8 @@ from ..aten_lowering import topk_lowering
 from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import _symint_sympy_expr
+from ..device_function import find_block_size_symbols
 from ..matmul_utils import emit_tl_dot_with_padding
 
 if TYPE_CHECKING:
@@ -325,20 +329,71 @@ def _triton_iota_expr(
     step: object = 1,
     dtype: torch.dtype | None = None,
 ) -> object:
+    from ..generate_ast import GenerateAST
+
     dtype = dtype or CompileEnvironment.current().index_dtype
     assert isinstance(dtype, torch.dtype)
 
-    # Pad static non-power-of-2 lengths to next power of 2
-    length_expr = "{length}"
-    if isinstance(length_arg, int) and length_arg != next_power_of_2(length_arg):
-        length_expr = str(next_power_of_2(length_arg))
+    # FX scalar nodes can retain expressions derived entirely from tunable
+    # block sizes. Resolve only those proven config constants here: their
+    # ordinary scalar rendering may be a runtime host argument, whereas arange
+    # requires a power-of-two compile-time extent. Keep the logical expression
+    # intact elsewhere so loads, stores and reductions retain their tail masks.
+    length = length_arg.meta["val"] if isinstance(length_arg, Node) else length_arg
+    env = CompileEnvironment.current()
+    block_id = (
+        env.resolve_block_id(length) if isinstance(length, torch.SymInt) else None
+    )
+    expr: str | None = None
+    reused_coordinate = False
+    if (
+        block_id is not None
+        and env.block_sizes[block_id].reduction
+        and isinstance(ctx.cg, GenerateAST)
+        and ctx.cg.active_device_loops.get(block_id)
+    ):
+        # A full-axis iota shares the reduction's physical tile and logical
+        # coordinate. Reusing that coordinate preserves both padded constexpr
+        # capacity and the offset of a rolled reduction's later tiles.
+        expr = ctx.cg.index_var(block_id)
+        reused_coordinate = True
+    elif isinstance(length, torch.SymInt):
+        expression = _symint_sympy_expr(length)
+        block_symbols, runtime_symbols = find_block_size_symbols(expression)
+        replacements: dict[sympy.Basic, sympy.Basic] = {}
+        if not runtime_symbols:
+            for symbol, block_id in block_symbols.items():
+                if env.block_sizes[block_id].reduction:
+                    break
+                value = ctx.cg.device_function.resolved_block_size(block_id)
+                if not isinstance(value, int):
+                    break
+                if expression == symbol and value == next_power_of_2(value):
+                    # A direct block extent already has a constexpr argument,
+                    # which can also be used outside a hl.tile loop.
+                    block_var = ctx.cg.device_function.block_size_var(
+                        env.canonical_block_id(block_id)
+                    )
+                    assert block_var is not None
+                    expr = f"tl.arange(0, {block_var})"
+                    break
+                replacements[symbol] = sympy.Integer(value)
+            else:
+                resolved = expression.xreplace(replacements)
+                if isinstance(resolved, sympy.Integer):
+                    length = int(resolved)
 
-    expr = f"tl.arange(0, {length_expr})"
+    if expr is None:
+        # Pad literal and config-derived non-power-of-two lengths alike.
+        length_expr = "{length}"
+        if isinstance(length, int):
+            length_expr = str(next_power_of_2(length))
+        expr = f"tl.arange(0, {length_expr})"
     if step != 1:
         expr = f"{{step}} * {expr}"
     if start != 0:
         expr = f"{{start}} + {expr}"
-    if dtype != torch.int32:
+    if reused_coordinate or dtype != torch.int32:
         expr = f"({expr}).to({triton_type(dtype)})"
     return expr_from_string(
         expr,
@@ -561,8 +616,8 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
     """Generate tl.topk-based topk implementation.
 
     torch.topk(input, k, dim=-1, largest=True, sorted=True) returns (values, indices).
-    We use tl.topk for values (when largest=True) or tl.sort (when largest=False).
-    For indices, we compute argsort using a ranking approach.
+    FP16/BF16/FP32 inputs select ordered value/index keys and gather the
+    original payloads. Other dtypes retain value selection and rank-based indices.
 
     Note: tl.topk/tl.sort only works on the last dimension currently.
     See: https://github.com/triton-lang/triton/blob/main/python/triton/language/standard.py
@@ -599,6 +654,9 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
     n_hint = env.size_hint(n) if isinstance(n, torch.SymInt) else n
     n_pow2 = next_power_of_2(n_hint)
     k_pow2 = next_power_of_2(k)
+
+    if input_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return _codegen_float_topk(ctx, tensor, input_tensor, k_pow2, largest)
 
     # Generate top-k values using tl.topk (for largest=True) or tl.sort (for largest=False)
     topk_vals = ctx.cg.device_function.new_var("topk_vals")
@@ -709,3 +767,134 @@ def codegen_topk(ctx: LoweringContext, node: Node) -> object:
         )
 
     return (expr_from_string(topk_vals), expr_from_string(topk_indices))
+
+
+def _codegen_float_topk(
+    ctx: LoweringContext,
+    tensor: ast.AST,
+    input_tensor: torch.Tensor,
+    k: int,
+    largest: bool,
+) -> tuple[ast.AST, ast.AST]:
+    """Select ordered value/index keys without quadratic rank tensors.
+
+    FP16/BF16 values promote exactly to FP32 for comparison. Original payloads
+    are gathered after selection, preserving signed zeros and NaN payload bits.
+    NaNs compare above infinity; equal values select the lowest original index.
+    Padding is outside the valid key range in either ordering direction.
+    """
+    fn = ctx.cg.device_function
+    env = CompileEnvironment.current()
+    shape = list(input_tensor.shape)
+    suffix = "[" + ", ".join(["None"] * (len(shape) - 1) + [":"]) + "]"
+    index = fn.new_var("topk_index")
+    bits = fn.new_var("topk_bits")
+    ordered = fn.new_var("topk_ordered")
+    keys = fn.new_var("topk_keys")
+    selected = fn.new_var("topk_selected")
+    indices = fn.new_var("topk_indices")
+    values = fn.new_var("topk_values")
+
+    def emit(source: str) -> None:
+        ctx.cg.add_statement(statement_from_string(source, tensor=tensor))
+
+    emit(f"{index} = tl.arange(0, {{tensor}}.shape[-1]).to(tl.uint32)")
+    emit(f"{bits} = {{tensor}}.to(tl.float32).to(tl.uint32, bitcast=True)")
+    emit(f"{bits} = tl.where(({bits} & 0x7fffffff) == 0, 0, {bits})")
+    emit(
+        f"{ordered} = tl.where(({bits} & 0x80000000) != 0, {bits} ^ 0xffffffff, {bits} ^ 0x80000000)"
+    )
+    emit(
+        f"{ordered} = tl.where(({bits} & 0x7fffffff) > 0x7f800000, 0xffffffff, {ordered})"
+    )
+    tie = f"({index} ^ 0xffffffff)" if largest else index
+    emit(f"{keys} = ({ordered}.to(tl.uint64) << 32) | {tie}{suffix}.to(tl.uint64)")
+
+    axis = env.resolve_block_id(shape[-1])
+    logical = (
+        env.block_sizes[axis].numel
+        if axis is not None and env.block_sizes[axis].reduction
+        else shape[-1]
+    )
+    masks = [f"({index}{suffix} < {fn.literal_expr(logical)})"]
+    # Reuse ordinary live-axis masks for independently tiled axes and tails.
+    # A padding value equal to a real infinity/NaN must still lose selection.
+    for dim, size in enumerate(shape):
+        block = env.resolve_block_id(size)
+        if block is not None and (mask := fn.codegen.mask_var(block)) is not None:
+            expand = fn.tile_strategy.expand_str(shape, dim)
+            masks.append(f"({mask}{expand})")
+    invalid = "0" if largest else "0xffffffffffffffff"
+    emit(
+        f"{keys} = tl.where({' & '.join(masks)}, {keys}, tl.full([], {invalid}, tl.uint64))"
+    )
+    # Older supported Triton versions only provide descending topk. Invert
+    # unsigned keys to select the smallest values with the same primitive.
+    topk_expr = (
+        f"tl.topk({keys}, {k})"
+        if largest
+        else f"tl.topk({keys} ^ 0xffffffffffffffff, {k}) ^ 0xffffffffffffffff"
+    )
+    topk_statement = f"{selected} = {topk_expr}"
+    capability = env.config_spec.target_device_capability
+    # GB300 measurements favor sort for one row per four-warp program in this
+    # crossover range. Multi-row tiles, smaller k, and other targets use topk.
+    if (
+        env.backend_name == "triton"
+        and not is_hip()
+        and capability is not None
+        and capability[0] == 10
+        and fn.config.num_warps == 4
+        and 32 <= k <= 512
+    ):
+        sorted_keys = fn.new_var("topk_sorted")
+        selected_shape = ", ".join(
+            [*(f"{sorted_keys}.shape[{dim}]" for dim in range(len(shape) - 1)), str(k)]
+        )
+        sort_statements = [
+            f"{sorted_keys} = tl.sort({keys}, descending={largest!r})",
+            f"{selected} = tl.gather({sorted_keys}, tl.broadcast_to(tl.arange(0, {k}){suffix}, [{selected_shape}]), axis={len(shape) - 1})",
+        ]
+        # Use physical extents so dynamic shapes specialize this decision again
+        # when their padded width or the number of rows per program changes.
+        condition = "{tensor}.shape[-1] == 1024 and {tensor}.numel == 1024"
+        sort_body = "\n    ".join(sort_statements)
+        emit(f"if {condition}:\n    {sort_body}\nelse:\n    {topk_statement}")
+    else:
+        # TileIR retains the gather-free top-k path.
+        emit(topk_statement)
+    decoded = f"{selected}.to(tl.uint32)"
+    if largest:
+        decoded = f"({decoded} ^ 0xffffffff)"
+    emit(f"{indices} = ({decoded}).to(tl.int64)")
+    if env.backend_name == "tileir":
+        # TileIR cannot legalize gather. Select original unsigned payload bits
+        # one output at a time, preserving NaNs/zeros without a K-by-N temporary.
+        payloads = fn.new_var("topk_payloads")
+        ordinal = fn.new_var("topk_ordinal")
+        slot = fn.new_var("topk_slot")
+        selected_index = fn.new_var("topk_selected_index")
+        payload = fn.new_var("topk_payload")
+        dim = len(shape) - 1
+        uint = fn.new_var("topk_payload_type")
+        # Producers such as division may retain FP32 despite a low-precision
+        # FX dtype. Preserve the actual Triton value until the output store.
+        emit(
+            f"{uint}: tl.constexpr = tl.uint16 if {{tensor}}.dtype.primitive_bitwidth == 16 else tl.uint32"
+        )
+        emit(f"{payloads} = {{tensor}}.to({uint}, bitcast=True).to(tl.uint32)")
+        emit(f"{ordinal} = tl.arange(0, {indices}.shape[-1]){suffix}")
+        emit(f"{values} = tl.full({indices}.shape, 0, tl.uint32)")
+        emit(
+            f"for {slot} in range({k}):\n"
+            f"    {selected_index} = tl.max(tl.where({ordinal} == {slot}, {indices}, 0), axis={dim})\n"
+            f"    {payload} = tl.max(tl.where({index}{suffix} == tl.expand_dims({selected_index}, {dim}), {payloads}, 0), axis={dim})\n"
+            f"    {values} = tl.where({ordinal} == {slot}, tl.expand_dims({payload}, {dim}), {values})"
+        )
+        emit(f"{values} = {values}.to({uint}).to({{tensor}}.dtype, bitcast=True)")
+    else:
+        # Dummy K-padding slots are not stored but still participate in tl.gather.
+        emit(
+            f"{values} = tl.gather({{tensor}}, tl.minimum({indices}, {{tensor}}.shape[-1] - 1).to(tl.int32), axis={len(shape) - 1})"
+        )
+    return expr_from_string(values), expr_from_string(indices)

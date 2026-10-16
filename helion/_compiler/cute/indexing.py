@@ -31,11 +31,37 @@ class CutePackedAffineLoad:
 @dataclasses.dataclass(frozen=True)
 class CuteSortableLoad:
     expr: ast.AST
+    tensor: torch.Tensor
+    value: torch.Tensor
+    extra_mask: torch.Tensor | None
     tensor_name: str
     index_exprs: tuple[str, ...]
-    sort_index_pos: int
     mask_expr: str | None
     dtype: torch.dtype
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteScalarLoadSite:
+    """Address pieces of a lowered scalar load.
+
+    Recorded on the load's fx node so ``hl.split`` can re-read the same tile
+    at other block-local coordinates instead of staging it in shared memory.
+    """
+
+    tensor_name: str
+    index_exprs: tuple[str, ...]
+    mask_expr: str | None
+    # ``mask_expr`` folds in ``hl.load(..., extra_mask=...)`` evaluated at this
+    # thread's own coordinates; it cannot be re-evaluated at another element.
+    has_extra_mask: bool
+    eviction_suffix: str
+    # Per load-output dim: ``(tensor_dim, block_id)``; ``None`` for a new unit
+    # axis from a ``None`` subscript. ``block_id`` is ``None`` when the dim's
+    # address is not a block index (partial slice, size-1 tensor dim, ...).
+    output_dims: tuple[tuple[int, int | None] | None, ...]
+
+
+CUTE_SCALAR_LOAD_SITE_META = "cute_scalar_load_site"
 
 
 @dataclasses.dataclass(frozen=True)

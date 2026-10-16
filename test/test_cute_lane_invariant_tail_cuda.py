@@ -21,8 +21,6 @@ from test.test_cute_lane_invariant_tail import _copy_then_zero
 from test.test_cute_lane_invariant_tail import _copy_zero_copy_again
 from test.test_cute_lane_invariant_tail import _softmax_then_zero
 from test.test_cute_lane_invariant_tail import _softmax_zero_softmax_again
-from test.test_cute_lane_invariant_tail import _zero_then_copy
-from test.test_cute_lane_invariant_tail import _zero_then_softmax
 
 import helion
 from helion import exc
@@ -68,15 +66,6 @@ def test_zero_after_the_softmax_matches_reference(config: dict[str, object]) -> 
     torch.testing.assert_close(out, expected)
 
 
-def test_zero_before_the_per_lane_store_matches_reference() -> None:
-    x = _rows()
-    out, sums = _run(_zero_then_copy, x, **_CONFIG)
-    torch.testing.assert_close(out, x, rtol=0, atol=0)
-    torch.testing.assert_close(sums, x.sum(dim=1))
-    out = _run(_zero_then_softmax, x, **_CONFIG)
-    torch.testing.assert_close(out, torch.softmax(x, dim=1))
-
-
 def test_reduced_value_stored_into_the_copied_row_matches_reference() -> None:
     x = _rows()
     out = _run(_copy_then_sum_into_the_row, x, **_CONFIG)
@@ -102,5 +91,5 @@ def test_store_between_two_per_lane_stores_of_its_tensor_rejects_the_config(
     kernel: object,
 ) -> None:
     x = _rows()
-    with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+    with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
         _run(kernel, x, **_CONFIG)

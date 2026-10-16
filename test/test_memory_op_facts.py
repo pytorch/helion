@@ -64,7 +64,7 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
         )
 
     @skipIfNotCUDA()
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_reduction_fact_indexing_slot_invariant(self):
         """The ReductionKernelFact is built after _collect_memory_op_facts, but the collector
         still runs after the reduction rolling, so every rolled-subgraph load/store keeps
@@ -147,7 +147,7 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
         self.assertEqual(operands.get("b"), "rhs")
 
     @skipIfNotCUDA()
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_dot_scaled_operand_roles(self):
         """dot_scaled's rhs matrix is arg 3 (mat2), not arg 1 (mat1_scale)."""
 

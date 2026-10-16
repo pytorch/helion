@@ -8,7 +8,9 @@ on:
       - release/*
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  # Also applies to main: a new push cancels the previous main run so bursts of
+  # landed PRs don't queue a full run (including B200 jobs) per commit.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -311,7 +313,6 @@ jobs:
         run: |
           set -e -o pipefail
           source .venv/bin/activate
-          uv pip install pytest-xdist
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
@@ -326,6 +327,8 @@ jobs:
           export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
           # -rf: print failed tests
           # --timeout: max allowed time for each test
+          # -n: xdist workers (test/conftest.py defaults the scheduler to worksteal).
+          # Without -n, conftest sizes the workers to the GPU, so always pass it.
           PARALLEL="-n4"
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
@@ -333,11 +336,11 @@ jobs:
           elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py --ignore=test/test_remote_copy.py"
-            PARALLEL=""
+            PARALLEL="-n0"
           elif [[ "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
-            PARALLEL=""
+            PARALLEL="-n0"
           else
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
@@ -347,13 +350,34 @@ jobs:
           # only needs a small allocation.
           # The MI350X runner also exposes a single GPU. Four workers sharing it
           # pushed the autotune and benchmark tests past their per-test timeout.
-          if [[ -n "$PARALLEL" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
+          if [[ "$PARALLEL" != "-n0" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
             PARALLEL="-n2"
+          fi
+          # B200 containers have 28 CPUs and most tests are CPU-bound compilation
+          # (the GPU sits mostly idle), so eight workers roughly halve the suite.
+          if [[ "$PARALLEL" != "-n0" && "${{ matrix.alias }}" == "b200" ]]; then
+            PARALLEL="-n8"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
+          fi
+          if [[ "${{ matrix.alias }}" == *mi350x* ]]; then
+            # The MI350X runner pods share their node's eight GPUs, and the
+            # container options pin every job to GPU 0: up to four test jobs
+            # ran on one GPU (OOMs with "0 bytes free", stalls) while the
+            # rest sat idle. Pick the least-used GPU as the tests start; the
+            # jitter keeps jobs that get here together from picking the same.
+            sleep $((RANDOM % 30))
+            GPU=$(python scripts/select_rocm_gpu.py) || { echo "::warning::GPU selection failed, staying on GPU 0"; GPU=0; }
+            export ROCR_VISIBLE_DEVICES=$GPU
+            rocminfo | grep -m1 "Uuid:.*GPU-" || true
+            # Inductor shuts its Triton-compile subprocess pool down after
+            # 60s idle, and the first compile after the test_autotune_* block
+            # waited on a pool that never answered until the per-test timeout
+            # killed the worker. Compile in the test process instead.
+            export TORCHINDUCTOR_COMPILE_THREADS=1
           fi
           TIMEOUT=60
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
@@ -379,13 +403,13 @@ jobs:
           # JAX and TorchTPU initialize the TPU runtime differently. Run the
           # physical remote-copy suites in fresh, sequential pytest processes.
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
-            pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
-            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
+            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
+            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
           fi
           # Each remote-copy test launches one process per GPU, so run this class
           # serially rather than assigning its tests to concurrent xdist workers.
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
-            pytest -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+            pytest -n0 -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
           fi
 
   test-notebooks:

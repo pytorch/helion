@@ -4,6 +4,7 @@ import contextvars
 import dataclasses
 import inspect
 import operator
+import random
 import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -32,7 +33,9 @@ from helion._compiler.cute.memory_ops import (
 )
 from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
+from helion._compiler.cute.memory_ops import _persistent_vec_alignment_prepared_guard
 from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_matrix_signature
+from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_prepared_guard
 from helion._compiler.cute.memory_ops import runtime_tensor_has_specialized_alignment
 from helion._compiler.cute.memory_ops import runtime_tensors_are_proven_disjoint
 from helion._compiler.device_function import DeviceFunction
@@ -60,6 +63,7 @@ from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
@@ -71,8 +75,92 @@ class _PrefixClassifier:
         return self.prefix, tuple(values)
 
 
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    config=helion.Config(
+        block_sizes=[4, 64], num_threads=[4, 64], cute_vector_widths=[1, 1]
+    ),
+)
+def _flagged_first_column_update(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        if flags[tile0.begin] > 0:
+            first = x[tile0, tile1.begin]
+            x[tile0, tile1] = x[tile0, tile1] + first[:, None] + 1.0
+    return x
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[32], cute_vector_widths=[1]),
+)
+def _add_into(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size()):
+        x[tile] = x[tile] + y[tile]
+    return x
+
+
 @onlyBackends(["cute"])
 class TestCuteRuntimeInputSpecialization(unittest.TestCase):
+    @skipIfRefEager("prepared calls guard compiled bound kernels")
+    def test_prepared_call_fact_guards_reject_realigned_and_aliased_inputs(
+        self,
+    ) -> None:
+        x = torch.randn(64, device=DEVICE)
+        y = torch.randn(64, device=DEVICE)
+        for _ in range(3):
+            _add_into(x.clone(), y)
+        prepared = _add_into._prepared_call
+        assert prepared is not None
+        # Both CuTe runtime-input classifiers run through fact guards, so a
+        # call with fresh tensors never re-runs them.
+        self.assertFalse(prepared._extra_guards)
+        self.assertEqual(len(prepared._fact_guards), 2)
+        self.assertTrue(
+            prepared.matches(
+                _add_into,
+                (torch.randn(64, device=DEVICE), torch.randn(64, device=DEVICE)),
+            )
+        )
+        # Identical metadata but a different pointer residue or an aliasing
+        # pair of storages must not run the prepared specialization.
+        backing = torch.randn(129, device=DEVICE)
+        unaligned = backing[1:65]
+        self.assertEqual(unaligned.stride(), x.stride())
+        self.assertFalse(prepared.matches(_add_into, (unaligned, y)))
+        shared = torch.randn(128, device=DEVICE)
+        self.assertFalse(prepared.matches(_add_into, (shared[:64], shared[64:])))
+        self.assertTrue(prepared.matches(_add_into, (x, y)))
+
+        expected = unaligned + y
+        torch.testing.assert_close(_add_into(unaligned, y), expected)
+        lhs, rhs = shared[:64], shared[64:]
+        expected = lhs + rhs
+        torch.testing.assert_close(_add_into(lhs, rhs), expected)
+
+    @skipIfRefEager("the disjointness fact keys compiled bound kernels")
+    def test_post_bind_alias_change_never_reuses_the_disjointness_proof(
+        self,
+    ) -> None:
+        # The branch is CTA-uniform only while ``flags`` and the in-place
+        # ``x`` are separate storages.  A later call whose aliasing differs
+        # reaches another bound kernel through the cache key, where the proof
+        # fails and the branch's race is refused; the first bound kernel and
+        # its proof serve only launches with the same storage overlaps.
+        x = torch.randn(8, 256, device=DEVICE)
+        flags = torch.ones(8, device=DEVICE)
+        separate = _flagged_first_column_update.bind((x, flags))
+        _flagged_first_column_update(x, flags)
+        aliased_x = torch.randn(8, 256, device=DEVICE)
+        aliased_flags = aliased_x.view(-1)[:8]
+        aliased = _flagged_first_column_update.bind((aliased_x, aliased_flags))
+        self.assertIsNot(aliased, separate)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "inside a branch"):
+            _flagged_first_column_update(aliased_x, aliased_flags)
+        again = (torch.randn(8, 256, device=DEVICE), torch.ones(8, device=DEVICE))
+        self.assertIs(_flagged_first_column_update.bind(again), separate)
+
     def test_conflicting_tcgen05_analysis_keys_still_publish_all_guards(self) -> None:
         first = sympy.Symbol("first")
         second = sympy.Symbol("second")
@@ -346,7 +434,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         bound._runtime_tensor_refs_by_name = {"value": weakref.ref(value)}
         bound._normalize_config = lambda config: config
         bound.format_kernel_decorator = lambda _config, _settings: "test"
-        bound.kernel = SimpleNamespace(settings=SimpleNamespace())
+        bound.kernel = SimpleNamespace(settings=SimpleNamespace(backend="triton"))
         observed: list[bool] = []
 
         def compile_config(_config: object) -> object:
@@ -543,7 +631,10 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         sources = (state_source, other_source)
         specialization = RuntimeInputSpecialization(
             sources=sources,
-            classifier_identity="state_ring_alias_test",
+            classifier_identity=(
+                "storage_span_disjoint_matrix_v1",
+                tuple(map(repr, sources)),
+            ),
             classifier=_tensor_storage_disjoint_matrix_signature,
             reusable_tensor_properties=frozenset(("storage_span",)),
         )
@@ -555,6 +646,9 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         fake_other = object()
         env = SimpleNamespace(
             input_sources={},
+            bound_runtime_input_specialization_results={
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY: bound_result
+            },
             runtime_arg_values_by_name={
                 "state": current_values[0],
                 "other": current_values[1],
@@ -564,12 +658,6 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             },
             tensor_input_source=lambda tensor: (
                 state_source if tensor is fake_state else other_source
-            ),
-            runtime_input_specialization_matches_bound=(
-                lambda key, result: (
-                    key == _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-                    and result == bound_result
-                )
             ),
         )
 
@@ -583,11 +671,16 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 )
             )
             current_result = specialization.classifier(current_values)
-            env.runtime_input_specialization_matches_bound = lambda key, result: (
-                key == _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-                and result == current_result
-            )
+            env.bound_runtime_input_specialization_results[
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+            ] = current_result
             self.assertTrue(
+                runtime_tensors_are_proven_disjoint(
+                    cast("Any", env), cast("Any", fake_state), cast("Any", fake_other)
+                )
+            )
+            env.runtime_arg_values_by_name["other"] = current_values[0]
+            self.assertFalse(
                 runtime_tensors_are_proven_disjoint(
                     cast("Any", env), cast("Any", fake_state), cast("Any", fake_other)
                 )
@@ -672,23 +765,32 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
 
         self.assertIs(bound(tensor), tensor)
 
-    def test_prepared_call_skips_reusable_classifier_until_storage_changes(
-        self,
-    ) -> None:
+    def test_prepared_call_checks_factory_guard_instead_of_classifier(self) -> None:
         tensor = torch.empty(8)
         calls = 0
 
         def classifier(values: Sequence[object]) -> Hashable:
             nonlocal calls
             calls += 1
-            return cast("torch.Tensor", values[0]).data_ptr()
+            return cast("torch.Tensor", values[0]).data_ptr() % 16
+
+        def factory(
+            source_extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+            expected: Hashable,
+        ) -> Callable[[Sequence[object]], bool]:
+            (extract,) = source_extractors
+            return lambda args: (
+                cast("torch.Tensor", extract(args)).data_ptr() % 16 == expected
+            )
 
         extractor = _RuntimeInputSpecializationExtractor(
             (lambda args: cast("Hashable", args[0]),),
             classifier,
             frozenset(("data_ptr",)),
+            prepared_guard_factory=factory,
         )
         expected = extractor((tensor,))
+        self.assertEqual(expected, 0)
         kernel = SimpleNamespace(
             _annotations=[torch.Tensor],
             _compute_is_distributed=lambda _args, **_kwargs: False,
@@ -703,56 +805,196 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             extra_guards=((extractor, expected),),
             is_distributed=False,
         )
+        self.assertFalse(prepared._extra_guards)
+        self.assertEqual(len(prepared._fact_guards), 1)
 
+        # Fresh tensors with the same fact match without the classifier.
         calls = 0
         self.assertTrue(prepared.matches(cast("Any", kernel), (tensor,)))
+        self.assertTrue(prepared.matches(cast("Any", kernel), (torch.empty(8),)))
         self.assertEqual(calls, 0)
 
-        replacement = torch.empty_like(tensor)
-        tensor.data = replacement.data
-        self.assertFalse(prepared.matches(cast("Any", kernel), (tensor,)))
-        self.assertEqual(calls, 1)
+        # Same metadata, different residue: the guard rejects the call.
+        unaligned = torch.empty(9)[1:]
+        self.assertEqual(unaligned.shape, tensor.shape)
+        self.assertEqual(unaligned.data_ptr() % 16, 4)
+        self.assertFalse(prepared.matches(cast("Any", kernel), (unaligned,)))
+        self.assertEqual(calls, 0)
 
         kernel._specialization_generation += 1
-        calls = 0
         self.assertFalse(prepared.matches(cast("Any", kernel), (tensor,)))
-        self.assertEqual(calls, 0)
 
-    def test_prepared_storage_guard_reuses_only_unchanged_exact_tensors(self) -> None:
-        first = torch.empty(8)
-        second = torch.empty(8)
-        calls = 0
+    def test_prepared_partition_keeps_classifiers_whose_guard_is_unusable(
+        self,
+    ) -> None:
+        tensor = torch.empty(8)
+        source = (lambda args: cast("Hashable", args[0]),)
 
         def classifier(values: Sequence[object]) -> Hashable:
-            nonlocal calls
-            calls += 1
-            return tuple(cast("torch.Tensor", value).data_ptr() for value in values)
+            return cast("torch.Tensor", values[0]).data_ptr()
 
-        extractor = _RuntimeInputSpecializationExtractor(
-            (
-                lambda args: cast("Hashable", args[0]),
-                lambda args: cast("Hashable", args[1]),
-            ),
+        def failing_factory(
+            source_extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+            expected: Hashable,
+        ) -> Callable[[Sequence[object]], bool]:
+            raise ValueError("no guard")
+
+        accepting = _RuntimeInputSpecializationExtractor(
+            source,
             classifier,
-            frozenset(("data_ptr", "storage_span")),
+            frozenset(("data_ptr",)),
+            prepared_guard_factory=lambda extractors, expected: lambda args: True,
         )
-        expected = extractor((first, second))
-        storage_guard, always_check, reusable = _partition_prepared_extra_guards(
-            (first, second),
-            ((extractor, expected),),
+        rejecting = _RuntimeInputSpecializationExtractor(
+            source,
+            classifier,
+            frozenset(("data_ptr",)),
+            prepared_guard_factory=lambda extractors, expected: lambda args: False,
         )
-        self.assertIsNotNone(storage_guard)
-        assert storage_guard is not None
-        self.assertFalse(always_check)
-        self.assertEqual(reusable, ((extractor, expected),))
-        self.assertTrue(storage_guard((first, second)))
+        failing = _RuntimeInputSpecializationExtractor(
+            source,
+            classifier,
+            frozenset(("data_ptr",)),
+            prepared_guard_factory=failing_factory,
+        )
+        expected = classifier((tensor,))
+        always_check, fact_guards = _partition_prepared_extra_guards(
+            (tensor,),
+            ((accepting, expected), (rejecting, expected), (failing, expected)),
+        )
+        # A guard that rejects its own arguments, or cannot be built, leaves
+        # the classifier on the always-check path rather than mis-dispatching.
+        self.assertEqual(always_check, ((rejecting, expected), (failing, expected)))
+        self.assertEqual(len(fact_guards), 1)
+        self.assertTrue(fact_guards[0]((tensor,)))
 
-        replacement = torch.empty_like(first)
-        original_version = first._version
-        first.data = replacement.data
-        self.assertEqual(first._version, original_version)
-        self.assertFalse(storage_guard((first, second)))
-        self.assertEqual(calls, 1)
+    def test_vec_alignment_prepared_guard_matches_classifier(self) -> None:
+        backing = torch.empty(64, dtype=torch.bfloat16)
+        aligned = backing[:16]
+        sources = (
+            lambda args: cast("Hashable", args[0]),
+            lambda args: cast("Hashable", args[1]),
+        )
+        expected = _persistent_vec_alignment_matrix_signature((aligned, 3))
+        guard = _persistent_vec_alignment_prepared_guard(sources, expected)
+        self.assertTrue(guard((aligned, 3)))
+        # The classifier keys 32-byte residues: a 32-byte shift is the same
+        # class, a 16-byte shift is not.
+        self.assertTrue(guard((backing[16:32], 3)))
+        self.assertFalse(guard((backing[8:24], 3)))
+        self.assertTrue(guard((torch.empty(16, dtype=torch.bfloat16), 3)))
+        self.assertFalse(guard((backing[1:17], 3)))
+        # Same shape/stride/dtype (pinned by the prepared argument guard):
+        # the predicate agrees with the classifier on every residue.
+        for offset in range(17):
+            candidate = backing[offset : offset + 16]
+            self.assertEqual(
+                guard((candidate, 3)),
+                _persistent_vec_alignment_matrix_signature((candidate, 3)) == expected,
+                offset,
+            )
+
+    def test_storage_disjoint_prepared_guard_matches_classifier(self) -> None:
+        sources = tuple(
+            (lambda args, _index=index: cast("Hashable", args[_index]))
+            for index in range(3)
+        )
+        backing = torch.empty(64)
+        other = torch.empty(64)
+        disjoint = (torch.empty(16), torch.empty(16), torch.empty(16))
+        overlapping = (backing[:16], backing[16:32], torch.empty(16))
+        candidates = (
+            disjoint,
+            overlapping,
+            (other[:16], other[16:32], torch.empty(16)),
+            (backing[:16], torch.empty(16), backing[32:48]),
+            (backing[:16], other[:16], torch.empty(16)),
+            (backing[:16], backing[16:32], backing[32:48]),
+        )
+        for prepared_args in (disjoint, overlapping):
+            expected = _tensor_storage_disjoint_matrix_signature(prepared_args)
+            guard = _tensor_storage_disjoint_prepared_guard(sources, expected)
+            self.assertTrue(guard(prepared_args))
+            for candidate in candidates:
+                self.assertEqual(
+                    guard(candidate),
+                    _tensor_storage_disjoint_matrix_signature(candidate) == expected,
+                )
+        expected = _tensor_storage_disjoint_matrix_signature(disjoint)
+        self.assertEqual(expected, (True, True, True))
+        guard = _tensor_storage_disjoint_prepared_guard(sources, expected)
+        self.assertFalse(guard(overlapping))
+        self.assertTrue(guard((torch.empty(16), torch.empty(16), torch.empty(16))))
+
+    def test_prepared_guards_agree_with_classifiers_on_random_storages(self) -> None:
+        rng = random.Random(0)
+        dtypes = (torch.float32, torch.float16, torch.int8, torch.float64)
+
+        def make_set(
+            spec: Sequence[tuple[torch.dtype, int]],
+        ) -> tuple[torch.Tensor, ...]:
+            # Views into shared pools (zero-size, tiny and large), private
+            # allocations with offsets, and empty tensors.
+            pools = [
+                torch.empty(rng.choice((0, 1, 7, 64, 129)), dtype=torch.uint8)
+                for _ in range(3)
+            ]
+            tensors: list[torch.Tensor] = []
+            for dtype, numel in spec:
+                element_size = torch.empty((), dtype=dtype).element_size()
+                nbytes = numel * element_size
+                pool = rng.choice(pools)
+                if rng.random() < 0.4 and nbytes and pool.numel() >= nbytes + 16:
+                    start = rng.randrange(
+                        0, (pool.numel() - nbytes) // element_size + 1
+                    )
+                    start *= element_size
+                    tensors.append(pool[start : start + nbytes].view(dtype))
+                    continue
+                base = torch.empty(numel + rng.randrange(0, 4), dtype=dtype)
+                offset = rng.randrange(0, base.numel() - numel + 1)
+                tensors.append(base[offset : offset + numel])
+            return tuple(tensors)
+
+        comparisons = 0
+        rejections = [0, 0]
+        for _ in range(300):
+            spec = [
+                (rng.choice(dtypes), rng.choice((0, 1, 3, 8)))
+                for _ in range(rng.randrange(2, 5))
+            ]
+            prepared = make_set(spec)
+            sources = tuple(
+                (lambda args, _index=index: cast("Hashable", args[_index]))
+                for index in range(len(spec))
+            )
+            guards = []
+            for classifier, factory in (
+                (
+                    _persistent_vec_alignment_matrix_signature,
+                    _persistent_vec_alignment_prepared_guard,
+                ),
+                (
+                    _tensor_storage_disjoint_matrix_signature,
+                    _tensor_storage_disjoint_prepared_guard,
+                ),
+            ):
+                expected = classifier(prepared)
+                guard = factory(sources, expected)
+                self.assertTrue(guard(prepared))
+                guards.append((guard, classifier, expected))
+            for _ in range(10):
+                # Same dtype/shape/stride as the prepared set, which is what
+                # the prepared argument guard pins before these run.
+                candidate = make_set(spec)
+                comparisons += 1
+                for which, (guard, classifier, expected) in enumerate(guards):
+                    agrees = classifier(candidate) == expected
+                    self.assertEqual(guard(candidate), agrees)
+                    rejections[which] += not agrees
+        self.assertEqual(comparisons, 3000)
+        # Both guards saw rejecting candidates, so the agreement is not vacuous.
+        self.assertTrue(all(count > 100 for count in rejections), rejections)
 
     def test_prepared_guard_keeps_content_classifiers_and_skips_metadata(self) -> None:
         tensor = torch.arange(4)
@@ -774,7 +1016,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             lambda values: cast("torch.Tensor", values[0]).data_ptr(),
             frozenset(("unknown",)),
         )
-        storage_guard, always_check, reusable = _partition_prepared_extra_guards(
+        always_check, fact_guards = _partition_prepared_extra_guards(
             (tensor,),
             (
                 (content_extractor, content_extractor((tensor,))),
@@ -785,7 +1027,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 ),
             ),
         )
-        self.assertIsNone(storage_guard)
+        self.assertFalse(fact_guards)
         self.assertEqual(
             always_check,
             (
@@ -793,7 +1035,6 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 (unknown_property_extractor, tensor.data_ptr()),
             ),
         )
-        self.assertFalse(reusable)
 
         tensor[0] = 3
         self.assertEqual(always_check[0][0]((tensor,)), 3)
@@ -934,12 +1175,11 @@ class TestLayoutProvenance(unittest.TestCase):
             for dim in range(tensor.ndim)
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
     def test_kernel_trace_does_not_mark_torch_empty_out_as_fresh(self) -> None:
         @helion.kernel(
             autotune_effort="none",
-            backend="triton",
             static_shapes=True,
         )
         def empty_out(x: torch.Tensor) -> torch.Tensor:
@@ -1149,6 +1389,163 @@ class TestLayoutProvenance(unittest.TestCase):
                         0,
                     )
                     self.assertIs(stride, harness.runtime_stride)
+
+
+@onlyBackends(["cute"])
+class TestDerivedInputStorageProvenance(unittest.TestCase):
+    def test_derived_storage_owner_offsets_and_alignment_are_separate(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=True)
+        )
+        real_x = torch.empty(4, 8)
+        with env:
+            x = env.to_fake(real_x, ArgumentOrigin("x"))
+            assert isinstance(x, torch.Tensor)
+            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": x}))
+            with patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ):
+                source = env.tensor_input_source(x)
+                for view in (x.flatten(), x.transpose(0, 1), x.flatten()[1:]):
+                    self.assertIsNone(env.tensor_input_source(view))
+                    self.assertEqual(env.tensor_storage_input_source(view), source)
+                self.assertEqual(
+                    env.tensor_descriptor_alignment_source(x.flatten()), source
+                )
+                self.assertIsNone(
+                    env.tensor_descriptor_alignment_source(x.flatten()[1:])
+                )
+                self.assertIsNone(env.tensor_storage_input_source(x.clone()))
+
+    def test_derived_storage_owner_rejects_ambiguity_and_unknown_layout(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=True)
+        )
+        real_x = torch.empty(4, 8)
+        with env:
+            x = env.to_fake(real_x, ArgumentOrigin("x"))
+            assert isinstance(x, torch.Tensor)
+            view = x.flatten()
+            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": x}))
+            with patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ):
+                self.assertIsNotNone(env.tensor_storage_input_source(view))
+                env._ambiguous_tensor_input_source_ids.add(id(x))
+                self.assertIsNone(env.tensor_storage_input_source(view))
+                env._ambiguous_tensor_input_source_ids.clear()
+                other = x[1:]
+                env.input_sources[other] = LocalSource("other", is_input=True)
+                self.assertIsNone(env.tensor_storage_input_source(view))
+                # Existing alignment selects the sole zero-offset owner, unchanged.
+                self.assertEqual(
+                    env.tensor_descriptor_alignment_source(view), env.input_sources[x]
+                )
+                env.input_sources.pop(other)
+                with (
+                    patch.object(env.settings, "static_shapes", False),
+                    patch.object(
+                        env, "tensor_layout_is_symbolically_exact", return_value=False
+                    ),
+                ):
+                    self.assertIsNone(env.tensor_storage_input_source(view))
+                    self.assertIsNone(env.tensor_descriptor_alignment_source(view))
+
+    def test_derived_storage_disjointness_uses_real_guard_and_lifetime(self) -> None:
+        from helion._compiler.cute.memory_ops import (
+            register_cute_tensor_alias_specializations,
+        )
+
+        real_x, real_out = torch.empty(4, 8), torch.empty(4)
+        aliases = (real_x.flatten()[:4], torch.from_dlpack(real_x).flatten()[:4])
+        env = CompileEnvironment(
+            torch.device("cpu"), helion.Settings(backend="cute", static_shapes=True)
+        )
+        with env:
+            x = env.to_fake(real_x, ArgumentOrigin("x"))
+            out = env.to_fake(real_out, ArgumentOrigin("out"))
+            assert isinstance(x, torch.Tensor) and isinstance(out, torch.Tensor)
+            derived = x.flatten()[1:]
+            host = SimpleNamespace(
+                params=SimpleNamespace(arguments={"x": x, "out": out})
+            )
+            key = _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+            with patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ):
+                with env.use_runtime_arg_values({"x": real_x, "out": real_out}):
+                    # Fake storage inequality alone is never sufficient.
+                    self.assertFalse(
+                        runtime_tensors_are_proven_disjoint(
+                            env, derived, out, allow_unbound=True
+                        )
+                    )
+                    register_cute_tensor_alias_specializations(env)
+                    self.assertFalse(
+                        runtime_tensors_are_proven_disjoint(env, derived, out)
+                    )
+                    self.assertTrue(
+                        runtime_tensors_are_proven_disjoint(
+                            env, derived, out, allow_unbound=True
+                        )
+                    )
+                    descriptor = env.runtime_input_specializations[key]
+                    env.bound_runtime_input_specialization_results[key] = (
+                        descriptor.classifier((real_x, real_out))
+                    )
+                    self.assertTrue(
+                        runtime_tensors_are_proven_disjoint(env, derived, out)
+                    )
+                # Bound runtime facts remain usable after weak construction inputs expire.
+                with env.use_runtime_arg_values({}):
+                    self.assertTrue(
+                        runtime_tensors_are_proven_disjoint(env, derived, out)
+                    )
+                for alias in aliases:
+                    with env.use_runtime_arg_values({"x": real_x, "out": alias}):
+                        self.assertFalse(
+                            runtime_tensors_are_proven_disjoint(env, derived, out)
+                        )
+                        self.assertFalse(
+                            runtime_tensors_are_proven_disjoint(
+                                env, derived, out, allow_unbound=True
+                            )
+                        )
+                env.bound_runtime_input_specialization_results[key] = (False,)
+                with env.use_runtime_arg_values({"x": real_x, "out": real_out}):
+                    self.assertFalse(
+                        runtime_tensors_are_proven_disjoint(
+                            env, derived, out, allow_unbound=True
+                        )
+                    )
+
+    def test_derived_storage_dispatch_rejects_later_aliasing_inputs(self) -> None:
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def viewed_scan(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            flat = x.flatten()
+            for tile in hl.tile(flat.numel(), block_size=32):
+                out[tile] = hl.cumsum(flat[tile], dim=0)
+            return out
+
+        x, out = torch.empty(4, 8), torch.empty(32)
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            patch(
+                "torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")
+            ),
+        ):
+            disjoint = viewed_scan.bind((x, out))
+            self.assertIn(
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+                disjoint.env.runtime_input_specializations,
+            )
+            for alias in (x.flatten(), torch.from_dlpack(x).flatten()):
+                self.assertIsNot(viewed_scan.bind((x, alias)), disjoint)
+            self.assertIs(viewed_scan.bind((x, torch.empty_like(out))), disjoint)
 
 
 if __name__ == "__main__":

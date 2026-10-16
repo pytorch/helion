@@ -146,6 +146,72 @@ def test_asymmetric_tma_also_orders_the_scalar_operand(tma_a: bool) -> None:
     assert ("smem_b[" in full) == tma_a
 
 
+def test_non_pipelined_consumer_binds_try_token_before_wait() -> None:
+    # Only the pipelined K loop pre-initialises the try token, so the
+    # non-pipelined consumer must bind it itself right before consumer_wait.
+    args = test_cute_lowerings.TestPerKiterTmaBuilders()._make_args(
+        use_tma_a=False, use_tma_b=True
+    )
+    consumer = _build_kloop_non_pipeline_consumer_if(args)
+    assert isinstance(consumer, ast.If)
+    exec_gate = next(
+        stmt
+        for stmt in consumer.body
+        if isinstance(stmt, ast.If) and ast.unparse(stmt.test) == "exec_active"
+    )
+    assert [ast.unparse(stmt) for stmt in exec_gate.body] == [
+        "cute.arch.sync_warp()",
+        "ab_consumer_try_token = ab_pipeline.consumer_try_wait(ab_consumer_state)",
+        "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
+    ]
+    skipped = _build_kloop_non_pipeline_consumer_if(
+        replace(args, skip_consumer_wait=True)
+    )
+    assert "consumer_try_token" not in ast.unparse(skipped)
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@skipUnlessBackends(["cute"])
+def test_m_major_lhs_matmul_binds_try_token_in_non_pipelined_kloop(
+    transpose_rhs: bool,
+) -> None:
+    # An M-major (stride(-2) == 1) fp16 A disables A-TMA while B stays
+    # TMA-eligible, which selects the non-pipelined mixed K loop. The
+    # generated kernel used to reference the consumer try token there
+    # without ever assigning it (NameError at DSL compile time).
+    kernel = helion.kernel(
+        matmul_custom_key.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+    )
+    m = n = k = 256
+    lhs = torch.empty((k, m), dtype=torch.float16).T
+    rhs = (
+        torch.empty((n, k), dtype=torch.float16).T
+        if transpose_rhs
+        else torch.empty((k, n), dtype=torch.float16)
+    )
+    bound = kernel._bind_isolated((lhs, rhs))
+    source = bound.to_code(helion.Config(block_sizes=[128, 16, 16]))
+    assert "cute.gemm(" in source
+    # The pipelined branch is the one that seeds the token with Boolean(0).
+    assert "tcgen05_ab_consumer_try_token = cutlass.Boolean(0)" not in source
+    wait = (
+        "tcgen05_ab_pipeline.consumer_wait("
+        "tcgen05_ab_consumer_state, tcgen05_ab_consumer_try_token)"
+    )
+    bind = (
+        "tcgen05_ab_consumer_try_token = "
+        "tcgen05_ab_pipeline.consumer_try_wait(tcgen05_ab_consumer_state)"
+    )
+    lines = [line.strip() for line in source.splitlines()]
+    wait_lines = [i for i, line in enumerate(lines) if line == wait]
+    assert wait_lines
+    for i in wait_lines:
+        assert lines[i - 1] == bind
+
+
 def test_two_cta_and_role_local_builder_has_no_scalar_barrier() -> None:
     args = test_cute_lowerings.TestPerKiterTmaBuilders()._make_args(
         is_two_cta=True, static_full_tiles=True

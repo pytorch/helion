@@ -155,6 +155,38 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, torch.stack(tensor_list).reshape(4, 4, -1))
 
+    def test_stack_load_dynamic_strides(self):
+        """A stack tensor reads its members through the example's stride
+        arguments, so dynamic shapes, non-contiguous examples, and a reused
+        kernel whose example's specialized inner dim keeps its size but not
+        its stride all load correctly (the stride was baked in or failed to
+        lower)."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def gather_stack(dev_ptrs: torch.Tensor, example: torch.Tensor) -> torch.Tensor:
+            m = hl.specialize(dev_ptrs.size(0))
+            n1 = example.size(0)
+            n2 = hl.specialize(example.size(1))
+            out = torch.empty([m, n1, n2], dtype=example.dtype, device=dev_ptrs.device)
+            for tile_1, tile_2 in hl.tile([n1, n2]):
+                tensors = hl.stacktensor_like(example, dev_ptrs[:])
+                out[:, tile_1, tile_2] = tensors[tile_1, tile_2]
+            return out
+
+        for name, make in (
+            ("contiguous", lambda: torch.randn(7, 8, device=DEVICE)),
+            ("padded", lambda: torch.randn(7, 16, device=DEVICE)[:, :8]),
+            ("transposed", lambda: torch.randn(8, 7, device=DEVICE).T),
+        ):
+            with self.subTest(example=name):
+                members = [make() for _ in range(4)]
+                dev_ptrs = torch.as_tensor(
+                    [t.data_ptr() for t in members], device=DEVICE, dtype=torch.uint64
+                )
+                torch.testing.assert_close(
+                    gather_stack(dev_ptrs, members[0]), torch.stack(members)
+                )
+
     def test_stack_mask(self):
         @helion.kernel
         def stack_load_w_mask(
@@ -271,6 +303,77 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
 
         for i, tensor in enumerate(tensor_list):
             assert tensor.eq(i).all().item()
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _stack_memory_proof_kernel(x, dev_ptrs, write: hl.constexpr):
+    count = hl.specialize(dev_ptrs.size(0))
+    out = torch.empty((count, x.size(0)), dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0), block_size=4):
+        tensors = hl.stacktensor_like(x, dev_ptrs[:])
+        if write:
+            tensors[tile] = x[tile][None, :]
+            out[:, tile] = x[tile][None, :]
+        else:
+            out[:, tile] = tensors[tile]
+    return out
+
+
+class TestStackTensorOwnershipCPU(TestCase):
+    def test_indirect_memory_keeps_load_ownership_conservative(self):
+        from unittest.mock import patch
+
+        from torch.fx import Node
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.local_atomic import _reachable_graphs
+        from helion._compiler.cute.register_loads import host_load_is_readonly
+        from helion._compiler.cute.register_loads import lane_private_load
+        from helion.language import memory_ops
+
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        ):
+            for width in (5, 16):
+                for write in (False, True):
+                    with self.subTest(width=width, write=write):
+                        x = torch.arange(width).float()
+                        pointers = torch.zeros(3, dtype=torch.uint64)
+                        bound = _cpu_bind(
+                            _stack_memory_proof_kernel, (x, pointers, write)
+                        )
+                        code = bound.to_code(bound.config_spec.default_config())
+                        self.assertTrue(code)
+                        host = bound.host_function
+                        graphs = _reachable_graphs(host.device_ir.graphs)
+                        loads = [
+                            node
+                            for graph in graphs
+                            for node in graph.graph.nodes
+                            if node.target is memory_ops.load
+                        ]
+                        checked = 0
+                        with bound.env, host:
+                            for load in loads:
+                                if write or not isinstance(load.args[0], Node):
+                                    # A disjoint pointer array says nothing about
+                                    # its pointees. Indirect writes can alias x.
+                                    self.assertFalse(
+                                        host_load_is_readonly(load, bound.env, graphs)
+                                    )
+                                    if not isinstance(load.args[0], Node):
+                                        self.assertFalse(
+                                            lane_private_load(load, bound.env)
+                                        )
+                                    checked += 1
+                        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":

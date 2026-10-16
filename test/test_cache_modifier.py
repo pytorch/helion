@@ -11,12 +11,17 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
+@skipIfCute(
+    "cache_modifier is a Triton tl.load/tl.store hint (an AMD CDNA tunable); "
+    "CuTe strips the keys and spells its .cs load as load_eviction_policies='streaming'"
+)
 class TestCacheModifier(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
     @skipIfTileIR("tileir backend will ignore `cache_modifier` hint")

@@ -10,8 +10,10 @@ import math
 from typing import TYPE_CHECKING
 
 from ... import exc
+from .simplify_proven_bounds import _axis_index
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -36,6 +38,11 @@ CUTE_REGISTER_TILE_MAX_ELEMENTS = 64
 CUTE_REGISTER_TILE_MAX_LIVE_VALUES = 3 * CUTE_REGISTER_TILE_MAX_ELEMENTS
 
 
+def thread_idx_axis(node: ast.AST) -> int | None:
+    """The axis of a ``cute.arch.thread_idx()[k]`` subscript, else ``None``."""
+    return _axis_index(node, "thread_idx")
+
+
 def tile_loop_thread_count(
     env: CompileEnvironment,
     device_ir: DeviceIR,
@@ -57,8 +64,10 @@ def tile_loop_thread_count(
         extents: list[int] = []
         seen: set[int] = set()
         for block_ids in path:
-            order = env.config_spec.loop_orders.config_get(
-                config.loop_orders, block_ids[0]
+            order = (
+                env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
+                if len(block_ids) > 1
+                else None
             ) or range(len(block_ids))
             for position in order:
                 block_id = block_ids[position]
@@ -79,6 +88,10 @@ def tile_loop_thread_count(
                 extent = threads if threads > 0 else size
                 if extent > 1:
                     extents.append(extent)
+        # A launch has three thread axes; tiles beyond them run as single
+        # thread lane loops (``PerThreadNDTileStrategy`` demotes them) and
+        # add no threads.
+        del extents[3:]
         for axis, extent in enumerate(extents):
             if axis == len(launch_extents):
                 launch_extents.append(extent)

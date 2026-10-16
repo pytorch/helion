@@ -57,6 +57,16 @@ class ConstExpr(NamedTuple):
         return bool(self.value)
 
 
+@_decorators.device_func_replacement(ConstExpr)
+def _constexpr_on_device(value: _T) -> _T:
+    """``hl.constexpr(value)`` called inside a device loop is ``value`` itself,
+    as type propagation sees it (``TypeInfo.from_example``).  The NamedTuple
+    wrapper would compare as a tuple (``hl.constexpr(k) == 0`` always False)
+    and coerce its value with bool() (``not hl.constexpr(k)`` guarded on the
+    first call's ``k``)."""
+    return value
+
+
 class ProcessGroupName(ConstExpr):
     """
     Used in type annotation to specify the argument as process group name.

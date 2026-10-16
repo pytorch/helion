@@ -15,6 +15,15 @@ from helion.autotuner.search_space_logger import SearchSpaceReport
 from helion.autotuner.search_space_logger import SearchSpaceTracker
 from helion.autotuner.search_space_logger import _dimension_from_info
 from helion.autotuner.search_space_logger import analyze_search_space
+from helion.autotuner.search_space_logger import canonical_config_id
+from helion.runtime.config import Config
+
+
+def test_canonical_config_id_preserves_existing_ids() -> None:
+    assert (
+        canonical_config_id(Config(block_sizes=[32], num_warps=4)) == "29d7df3c0d434e3e"
+    )
+    assert canonical_config_id(Config(clip=float("inf"))) == "d1993d5fd618154a"
 
 
 @dataclass

@@ -35,9 +35,7 @@ Pick a run name at the start (e.g. `softmax-2026-08-30`) and write ALL non-commi
 
 ## Shared machine
 
-Unless the prompt says otherwise, assume you are on a shared server with multiple GPUs and play nice with other users. Autotuning, benchmarking, and tests are sensitive to other load on the GPU, so run on an idle GPU by explicitly setting `CUDA_VISIBLE_DEVICES`. Before launching GPU jobs, check `nvidia-smi` for other processes; if a GPU is in use by someone else, avoid that GPU for the rest of the session — the other user is likely to reuse it.
-
-Parallel experiments and tests on different GPUs are fine, but performance varies between GPUs due to thermals and power limits, so keep comparisons apples-to-apples: stick to the same GPU for the same benchmark+shape, and never run a baseline on one GPU and compare its absolute number against one collected on a different GPU. Good ways to parallelize: run `HELION_BACKEND=triton` tests on one GPU and `HELION_BACKEND=cute` tests on another, shard different shapes or kernels across GPUs, or use a spare GPU to try out ideas or re-run autotuning to check robustness (autotuning is randomized).
+Follow the GPU Usage rules in `AGENTS.md`. Prefer GPUs you have not seen recently used by others, and stick to the same GPU for the same benchmark+shape. Good ways to parallelize: run `HELION_BACKEND=triton` tests on one GPU and `HELION_BACKEND=cute` tests on another, shard different shapes or kernels across GPUs, or use a spare GPU to try out ideas or re-run autotuning to check robustness (autotuning is randomized).
 
 ## Measurement pitfalls
 

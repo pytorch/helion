@@ -55,7 +55,9 @@ def combine_fn_helion(
     return combined_values, right_indices
 
 
-@helion.kernel()
+# fast_math: CuTe skips the atomic adds of +0.0 that non-boundary elements
+# contribute (only the sign of a zero reached by underflow can differ).
+@helion.kernel(fast_math=True)
 def segmented_reduction_helion(
     indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
 ) -> torch.Tensor:

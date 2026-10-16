@@ -268,6 +268,12 @@ def _memory_coverage(
 ) -> tuple[Counter[int], Counter[str]]:
     def rewrite(call: ast.Call) -> ast.expr | None:
         name = ast.unparse(call.func)
+        if name == "_cute_scalar_policy_load":
+            return ast.Call(
+                ast.Name("_read", ast.Load()),
+                [deepcopy(call.args[0]), ast.Constant(1)],
+                [],
+            )
         if name == "cute.arch.load":
             dtype = call.args[1]
             width = (

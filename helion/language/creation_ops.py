@@ -67,7 +67,7 @@ def zeros(
 @_decorators.api(tiles_as_sizes=True)
 def full(
     shape: list[object],
-    value: float,
+    value: float | torch.Tensor,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
 ) -> torch.Tensor:
@@ -80,7 +80,7 @@ def full(
 
     Args:
         shape: A list of sizes (or tile indices which are implicitly converted to sizes)
-        value: The value to fill the tensor with
+        value: The number or zero-dimensional tensor to fill the tensor with
         dtype: The data type of the tensor (default: torch.float32)
         device: Device must match the current compile environment device
 
@@ -112,7 +112,7 @@ def full(
 @_decorators.register_fake(full)
 def _full_fake(
     shape: list[int | torch.SymInt],
-    value: float,
+    value: float | torch.Tensor,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
 ) -> torch.Tensor:

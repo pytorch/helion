@@ -563,7 +563,9 @@ def test_rank3_rhs_grouped_nt_codegen_uses_nkg_tma_view() -> None:
     assert "tcgen05_rhs_safe_group" in code
     assert "tcgen05_rhs_group = (" in code
     assert ".layout.stride[0])).load()" in code
-    assert "while tcgen05_work_tile_valid:" in code
+    # The only residual statement is the pure ``group_id >= 0``, which needs
+    # no shared work-tile loop behind the roles.
+    assert "while tcgen05_work_tile_valid:" not in code
     assert "cute.slice_(tma_tensor_b" not in code
     assert "tma_tensor_b[tcgen05_rhs_safe_group" not in code
     assert any(
@@ -1085,6 +1087,14 @@ def _run_configured(
         out = bound(*args)
         torch.cuda.synchronize()
     return out
+
+
+def test_rank3_rhs_grouped_nt_persistent_runtime() -> None:
+    """The persistent rank3 NT matmul runs to completion and matches eager."""
+    _require_tcgen05_runtime_test()
+    args = _make_full_args()
+    out = _run_configured(_rank3_rhs_grouped_nt, args, _rank3_rhs_tma_config())
+    _assert_grouped_result(out, args)
 
 
 def test_rank3_rhs_grouped_static_native_runtime() -> None:

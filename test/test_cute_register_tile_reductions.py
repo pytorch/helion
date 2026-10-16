@@ -533,7 +533,7 @@ def test_chained_reductions_keep_the_rolled_lane_up_front(
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
-    ("kernel", "make_arguments", "block", "reduction_threads", "vec"),
+    ("kernel", "make_arguments", "block", "reduction_threads", "vec", "capability"),
     (
         pytest.param(
             col_sum_guarded,
@@ -541,6 +541,7 @@ def test_chained_reductions_keep_the_rolled_lane_up_front(
             32,
             8,
             4,
+            (10, 0),
             id="guard-inside-the-element-loops",
         ),
         pytest.param(
@@ -549,6 +550,7 @@ def test_chained_reductions_keep_the_rolled_lane_up_front(
             64,
             16,
             8,
+            (9, 0),
             id="bf16-tile-fp32-store",
         ),
         pytest.param(
@@ -557,6 +559,7 @@ def test_chained_reductions_keep_the_rolled_lane_up_front(
             32,
             8,
             4,
+            (10, 0),
             id="three-stashed-tiles",
         ),
     ),
@@ -567,16 +570,18 @@ def test_unschedulable_bodies_fall_back_to_the_rolled_lane(
     block: int,
     reduction_threads: int,
     vec: int,
+    capability: tuple[int, int],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # The device IR admits these bodies, so the register-tile nesting is
     # chosen, but the generated tile body has a statement the two-pass
-    # schedule cannot place (a guard inside the element loops, a per-element
-    # store, a live-value budget overrun).  The kernel is regenerated with the
+    # schedule cannot place (a guard inside the element loops, a 32-byte output
+    # packet on SM90, a live-value budget overrun). The kernel is regenerated with the
     # rolled lane nesting and compiles exactly as it did before register tiles
     # existed.
     arguments = make_arguments()
     bound = _cpu_bind(kernel, arguments)
+    bound.config_spec.target_device_capability = capability
     config = column_config(
         bound,
         block=block,
@@ -596,6 +601,24 @@ def test_unschedulable_bodies_fall_back_to_the_rolled_lane(
     assert "_lane_stash" not in code
     assert COLUMN_REDUCE not in code
     assert code == _rolled_code(bound, config)
+
+
+@skipUnlessBackends(["cute"])
+def test_bf16_register_tile_flushes_fp32_results_on_sm100(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    arguments = (torch.empty((128, 1024), dtype=torch.bfloat16),)
+    bound = _cpu_bind(col_sum_f32_out, arguments)
+    bound.config_spec.target_device_capability = (10, 0)
+    config = column_config(bound, block=64, tile_threads=8, reduction_threads=16, vec=8)
+    with caplog.at_level(logging.DEBUG, logger="helion._compiler.generate_ast"):
+        code = bound.to_code(config)
+    assert FALLBACK_LOG not in caplog.text
+    assert CONSTEXPR_OWNER in code
+    assert ROLLED_OWNER not in code
+    assert code.count(COLUMN_REDUCE) == 1
+    assert "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in code
+    assert code.count("_cute_store_u32_vec(out.iterator") == 1
 
 
 @skipUnlessBackends(["cute"])

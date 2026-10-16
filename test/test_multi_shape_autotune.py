@@ -39,6 +39,7 @@ from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.llm_seeded_lfbo import LLMSeededSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
 from helion.runtime.config import Config
@@ -576,6 +577,8 @@ class TestMultiShapeRuntime(unittest.TestCase):
 
 
 class _Log:
+    trace_enabled = False
+
     def __init__(self) -> None:
         self.debug_messages: list[object] = []
 
@@ -1352,7 +1355,7 @@ class TestMultiShapeSearchOrchestration(unittest.TestCase):
         search = BaseSearch.__new__(BaseSearch)
         search.args = args  # pyrefly: ignore [bad-assignment]
         search.settings = Settings(autotune_log=False, autotune_log_details=False)
-        search.log = Mock()
+        search.log = AutotuningLogger(search.settings)
         search.best_perf_so_far = math.inf
         search._autotune_metrics = AutotuneMetrics()
         search.config_spec = Mock()
@@ -1545,7 +1548,12 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
     def _make_search(
         llm_stage: _StageSearch, second_stage: _StageSearch
     ) -> tuple[LLMSeededSearch, list[bool]]:
-        kernel = SimpleNamespace(settings=Settings(), config_spec=SimpleNamespace())
+        kernel = SimpleNamespace(
+            settings=Settings(),
+            config_spec=SimpleNamespace(
+                backend=SimpleNamespace(supports_precompile=lambda: True)
+            ),
+        )
         search = LLMSeededSearch(
             kernel,
             _make_carrier(((object(), ()),)),

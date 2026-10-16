@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
 
 _STORES = frozenset(info[2] for info in _DTYPE_INFO.values())
-_GLOBALS_USED = _GLOBALS | _STORES | {"ir", "range", "_cute_inline_asm_elementwise"}
+_GLOBALS_USED = _GLOBALS | _STORES | {"ir", "range"}
 
 
 class _Expression(_PacketExpression):

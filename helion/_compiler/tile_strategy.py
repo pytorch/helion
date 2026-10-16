@@ -10,6 +10,7 @@ import operator
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import NoReturn
 from typing import TypeVar
 from typing import cast
 import weakref
@@ -23,14 +24,21 @@ from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
+from .ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from .ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.scalar_recipe import PURE_HELPERS
+from .cute.scalar_recipe import is_rounded_fp32_multiply
+from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
+from .device_function import TensorArg
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .program_id import FlatProgramIDs
@@ -45,12 +53,14 @@ from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..language.memory_ops import CuteTileVecStoreSite
     from ..runtime.config import Config
+    from .cute.integer_loop_reduction import Hoist
     from .cute.lane_loop_distribution import LanePlacement
     from .cute.lane_loop_distribution import LaneScope
     from .cute.memory_ops import CuteLaneRelocation
@@ -300,6 +310,7 @@ def _clone_lane_loop_with_body(loop: ast.For, body: list[ast.AST]) -> ast.For:
 # The marker never reaches the emitted kernel — the post-pass strips every
 # marker it processes.
 _HELION_LANE_REDUCE_MARKER = "_helion_lane_reduce"
+HELION_VECTOR_REDUCTION_OWNER_ATTR = "_helion_vector_reduction_owner"
 _CUTE_UNIFORM_GLOBAL_NAMES = frozenset(
     {
         "abs",
@@ -565,15 +576,24 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
         visit(statement, ())
 
 
-def _combine_expr(reduction_type: str, acc: str, val: str) -> str:
+def _combine_expr(
+    reduction_type: str, acc: str, val: str, dtype_ctor: str | None = None
+) -> str:
+    """Combine ``val`` into ``acc``; ``dtype_ctor`` is the accumulator's type
+    constructor (``_dtype_ctor_from_identity``), when known."""
     if reduction_type == "sum":
         return f"({acc}) + ({val})"
     if reduction_type == "prod":
         return f"({acc}) * ({val})"
-    if reduction_type == "max":
-        return f"({acc}) if ({acc}) > ({val}) else ({val})"
-    if reduction_type == "min":
-        return f"({acc}) if ({acc}) < ({val}) else ({val})"
+    if reduction_type in ("max", "min"):
+        from .cute.math_templates import nan_extremum_expr
+
+        return nan_extremum_expr(
+            reduction_type,
+            f"({acc})",
+            f"({val})",
+            float32=dtype_ctor == "cutlass.Float32",
+        )
     raise NotImplementedError(f"lane reduce combine {reduction_type!r}")
 
 
@@ -737,13 +757,21 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
 
 
 def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
+    if threads_in_group > 32:
+        from .. import exc
+
+        raise exc.BackendUnsupported(
+            "cute",
+            "lane reduction spanning multiple physical warps requires a proven "
+            "CTA reduction group",
+        )
     tg = f", threads_in_group={threads_in_group}"
     if reduction_type == "sum":
         return f"cute.arch.warp_reduction_sum({acc}{tg})"
     if reduction_type == "max":
-        return f"cute.arch.warp_reduction_max({acc}{tg})"
+        return f"cute.arch.warp_reduction_max({acc}, op=_cute_nan_max{tg})"
     if reduction_type == "min":
-        return f"cute.arch.warp_reduction(({acc}), lambda a, b: a if a < b else b{tg})"
+        return f"cute.arch.warp_reduction(({acc}), _cute_nan_min{tg})"
     if reduction_type == "prod":
         return f"cute.arch.warp_reduction(({acc}), lambda a, b: (a * b){tg})"
     raise NotImplementedError(f"lane warp reduce {reduction_type!r}")
@@ -804,8 +832,41 @@ def split_lane_loop_reductions(
 
     Operates bottom-up so nested lane loops are handled before their parents.
     Lane loops without markers are returned unchanged (their inner statements
-    are still recursed into so nested markers are processed).
+    are still recursed into so nested markers are processed).  The split
+    hoists the statements that read no lane out of its per-lane passes; an
+    atomic left inside a lane loop it is uniform along is then issued at the
+    loop's first lane (``pin_atomics_left_in_lane_loops``), as the lane-loop
+    distribution, which leaves a body with markers to this pass, did not.
     """
+    if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
+        return body
+    from .cute.lane_loop_distribution import pin_atomics_left_in_lane_loops
+
+    result = _split_lane_loop_reductions(
+        body,
+        uniform_names=uniform_names,
+        proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+        proven_tensor_stride_values=proven_tensor_stride_values,
+        thread_axis_names=thread_axis_names,
+        scalar_definitions=scalar_definitions,
+        rename_groups=rename_groups,
+        running_sums=running_sums,
+    )
+    pin_atomics_left_in_lane_loops(result)
+    return result
+
+
+def _split_lane_loop_reductions(
+    body: list[ast.AST],
+    *,
+    uniform_names: set[str] | None = None,
+    proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
+    proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
+    thread_axis_names: dict[str, frozenset[int]] | None = None,
+    scalar_definitions: dict[str, ast.AST] | None = None,
+    rename_groups: dict[str, str] | None = None,
+    running_sums: set[str] | None = None,
+) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
 
@@ -830,7 +891,7 @@ def split_lane_loop_reductions(
         )
         _update_proven_uniform_names(stmt, proven_uniform)
         _update_thread_axis_names(stmt, proven_thread_axes)
-        _update_scalar_definitions(stmt, proven_scalar_definitions)
+        _update_scalar_definitions(stmt, proven_scalar_definitions, rename_groups)
     return new_body
 
 
@@ -884,19 +945,27 @@ def _split_stmt_lane_reductions(
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
+    body_definitions = _loop_body_scalar_definitions(
+        stmt, scalar_definitions, thread_axis_names, rename_groups
+    )
+    exit_definitions = _loop_invariant_scalar_definitions(
+        stmt, scalar_definitions, rename_groups
+    )
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
         if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
             setattr(
                 stmt,
                 field,
-                split_lane_loop_reductions(
+                _split_lane_loop_reductions(
                     old,
                     uniform_names=set(uniform_names),
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     proven_tensor_stride_values=proven_tensor_stride_values,
                     thread_axis_names=dict(thread_axis_names),
-                    scalar_definitions=dict(scalar_definitions),
+                    scalar_definitions=dict(
+                        body_definitions if field == "body" else exit_definitions
+                    ),
                     rename_groups=rename_groups,
                     running_sums=running_sums,
                 ),
@@ -916,7 +985,7 @@ def _split_stmt_lane_reductions(
         proven_disjoint_tensor_pairs,
         proven_tensor_stride_values,
         thread_axis_names,
-        scalar_definitions,
+        body_definitions,
         rename_groups,
         running_sums,
     )
@@ -1208,7 +1277,7 @@ def _split_one_lane_loop(
         # state slot before performing several reductions over a free arange.
         lifted = _lift_lane_invariant_if(loop, lane_var, uniform_names, rename_groups)
         if lifted is not None:
-            return split_lane_loop_reductions(
+            return _split_lane_loop_reductions(
                 lifted,
                 uniform_names=set(uniform_names),
                 proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
@@ -1223,6 +1292,39 @@ def _split_one_lane_loop(
             # nesting; the reason stays in its debug log.
             raise register_tile_failure
         if any(_find_lane_reduce_call(node) is not None for node in ast.walk(loop)):
+            folded = _split_lane_loop_around_vector_lane(
+                loop,
+                lane_var,
+                uniform_names,
+                proven_disjoint_tensor_pairs,
+                proven_tensor_stride_values,
+                thread_axis_names,
+                scalar_definitions,
+                rename_groups,
+                running_sums,
+            )
+            if folded is not None:
+                return folded
+            if any(
+                isinstance(node, ast.For)
+                and not _is_serial_for(node)
+                and getattr(node, HELION_LANE_LOOP_VAR_ATTR, None) is None
+                and any(_find_lane_reduce_call(s) is not None for s in node.body)
+                for node in ast.walk(loop)
+            ):
+                # A ``cutlass.range_constexpr`` vector lane (``cute_vector_widths``
+                # > 1) holds the marker and the body is outside the shape the
+                # fold above proves (a collective or a matmul contribution in
+                # the vector lane, a marker input independent of the vector
+                # element, statements after the vector lane, a memory write
+                # anywhere in the loop, a constexpr loop that is not this
+                # lane's own vector lane): its complete reduction would need
+                # the vector unroll folded together with this lane loop.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "lane reduction nested in a constexpr vector lane "
+                    "(cute_vector_widths > 1) has no proved lowering",
+                )
             raise exc.BackendUnsupported(
                 "cute",
                 "lane reduction under a guard whose thread uniformity cannot be proven",
@@ -1453,7 +1555,7 @@ def _split_one_lane_loop(
         ctor = _dtype_ctor_from_identity(m.identity_expr)
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         update = statement_from_string(
-            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
         )
         accumulate_body.append(update)
         marker_updates[marker_index] = update
@@ -1494,6 +1596,7 @@ def _split_one_lane_loop(
         body,
         thread_axis_names,
         scalar_definitions,
+        rename_groups,
     )
 
     def is_lane_varying(stmt: ast.AST) -> bool:
@@ -1577,6 +1680,201 @@ def _split_one_lane_loop(
         rename_groups,
         running_sum=running_sum,
     )
+    return result
+
+
+def _vector_lane_fold_shape(
+    loop: ast.For, lane_var: str
+) -> tuple[list[ast.AST], ast.For] | None:
+    """``(prefix, vector lane)`` when every reduction marker of ``loop`` sits
+    at the top level of one trailing constexpr vector lane that
+    :func:`_split_lane_loop_around_vector_lane` can fold.
+
+    The shape is the per-element body of a lane-looped tile axis with
+    ``cute_vector_widths > 1``: ``prefix`` holds the lane base and the vector
+    loads hoisted above the ``cutlass.range_constexpr(V)`` loop (plain
+    assignments without a store, a collective or a marker), and the vector
+    lane walks the elements of each packet.  The vector lane must be the
+    wrapper loop the strategies build for ``lane_var`` (``vec_lane_{N}`` for
+    ``lane_{N}``, see ``VecLaneWrapper``); any other constexpr loop is a
+    serial unroll whose iterations the fold may not treat as lane
+    coordinates.  Every marker must be a plain reduction owned by
+    ``lane_var`` (no matmul contribution, no strided restore); the loop may
+    not hold a collective, a nested loop or a marker anywhere else, and
+    nothing may follow the vector lane.
+
+    Nothing in the loop may write memory.  The split proves its passes
+    reorder no aliasing access on the flat body, where the ``vec = lane``
+    sentinel is a definition of ``vec``: the alias expansion would rewrite a
+    packet-shifted address such as ``base + vec`` to ``lane * V + lane`` and
+    reason in the wrong iteration space, so a store in the vector lane could
+    be hoisted past a load of another lane's packet that the rolled loop
+    orders after it.  With no write, the passes only re-run loads and the
+    proof is trivially sound.
+    """
+    body: list[ast.AST] = list(loop.body)
+    if not body:
+        return None
+    vloop = body[-1]
+    if not (
+        isinstance(vloop, ast.For)
+        and _is_constexpr_lane_iter(vloop)
+        and getattr(vloop, HELION_LANE_LOOP_VAR_ATTR, None) is None
+        and isinstance(vloop.target, ast.Name)
+        and getattr(vloop, HELION_VEC_LANE_OF_ATTR, None) == lane_var
+        and not vloop.orelse
+    ):
+        return None
+    prefix = body[:-1]
+    if any(
+        not isinstance(stmt, ast.Assign)
+        or _has_side_effect(stmt)
+        or _find_lane_reduce_call(stmt) is not None
+        for stmt in prefix
+    ):
+        return None
+    if any(_has_observable_memory_write(stmt) for stmt in body):
+        return None
+    if _contains_unduplicatable_op(loop):
+        return None
+    markers = [
+        marker
+        for stmt in vloop.body
+        if (marker := _is_lane_reduce_marker_assign(stmt)) is not None
+    ]
+    if not markers or any(
+        marker.owner_lane != lane_var
+        or marker.matmul_contribution
+        or marker.strided_restore
+        for marker in markers
+    ):
+        return None
+    nested_markers = sum(
+        _is_lane_reduce_marker_assign(node) is not None for node in ast.walk(loop)
+    )
+    if nested_markers != len(markers):
+        return None
+    if any(
+        isinstance(node, (ast.For, ast.While))
+        for stmt in vloop.body
+        for node in ast.walk(stmt)
+    ):
+        return None
+    return prefix, vloop
+
+
+def _split_lane_loop_around_vector_lane(
+    loop: ast.For,
+    lane_var: str,
+    uniform_names: set[str],
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    proven_tensor_stride_values: dict[tuple[str, int], int],
+    thread_axis_names: dict[str, frozenset[int]],
+    scalar_definitions: dict[str, ast.AST],
+    rename_groups: dict[str, str],
+    running_sums: set[str] | None,
+) -> list[ast.AST] | None:
+    """Split a lane loop whose reduction markers sit in its constexpr vector lane.
+
+    ``cute_vector_widths > 1`` nests the per-element body of a lane-looped
+    tile axis in ``for vec in cutlass.range_constexpr(V)`` below the vector
+    load of each lane step, so a reduction over that axis reduces over the
+    lane steps AND the vector elements.  The vector lane is a second lane
+    coordinate rather than a serial loop: the two-pass / dependent split of
+    :func:`_split_one_lane_loop` applies unchanged to the flat body
+    ``prefix + [vec = lane] + elements``.  The sentinel assignment makes every
+    element-level value lane-varying and marks where the vector lane begins;
+    every marker input must depend on it, so each accumulate pass of the
+    split keeps the vector lane and folds all ``lanes x V`` elements.  Each
+    lane loop the split emits is re-nested at the sentinel: the prefix stays
+    per lane step and the element statements (with the accumulator updates
+    that follow them) go back under the constexpr loop, while the split's
+    lane-invariant tail already runs once outside both.  Returns ``None``
+    when the loop is outside the shape; a split decline propagates.
+    """
+    shape = _vector_lane_fold_shape(loop, lane_var)
+    if shape is None:
+        return None
+    prefix, vloop = shape
+    vec_var = cast("ast.Name", vloop.target).id
+    sentinel_index = len(prefix)
+    flat: list[ast.AST] = [
+        *prefix,
+        statement_from_string(f"{vec_var} = {lane_var}"),
+        *vloop.body,
+    ]
+    for index, stmt in enumerate(flat):
+        marker = _is_lane_reduce_marker_assign(stmt)
+        if marker is None:
+            continue
+        indices, _ = _backward_slice(flat[:index], {marker.input_name}, rename_groups)
+        if sentinel_index not in indices:
+            return None
+    lowered = _split_one_lane_loop(
+        _clone_lane_loop_with_body(loop, flat),
+        lane_var,
+        uniform_names,
+        proven_disjoint_tensor_pairs,
+        proven_tensor_stride_values,
+        thread_axis_names,
+        scalar_definitions,
+        rename_groups,
+        running_sums,
+    )
+    return _renest_vector_lane(lowered, lane_var, vloop, vec_var)
+
+
+def _renest_vector_lane(
+    statements: list[ast.AST], lane_var: str, vloop: ast.For, vec_var: str
+) -> list[ast.AST]:
+    """Move the statements after the ``vec = lane`` sentinel of every emitted
+    ``lane_var`` loop back under a copy of the constexpr vector lane."""
+
+    def is_sentinel(stmt: ast.AST) -> bool:
+        return (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == vec_var
+            and isinstance(stmt.value, ast.Name)
+            and stmt.value.id == lane_var
+        )
+
+    def renest(stmt: ast.AST) -> ast.AST:
+        for field in ("body", "orelse", "finalbody"):
+            old = getattr(stmt, field, None)
+            if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+                setattr(stmt, field, [renest(s) for s in old])
+        if (
+            isinstance(stmt, ast.For)
+            and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) == lane_var
+        ):
+            positions = [i for i, s in enumerate(stmt.body) if is_sentinel(s)]
+            if len(positions) == 1:
+                split_at = positions[0]
+                elements = stmt.body[split_at + 1 :]
+                nested: list[ast.stmt] = []
+                if elements:
+                    nested.append(
+                        create(
+                            ast.For,
+                            target=create(ast.Name, id=vec_var, ctx=ast.Store()),
+                            iter=ast.parse(ast.unparse(vloop.iter), mode="eval").body,
+                            body=elements,
+                            orelse=[],
+                            type_comment=None,
+                        )
+                    )
+                stmt.body = [*stmt.body[:split_at], *nested]
+        return stmt
+
+    result = [renest(stmt) for stmt in statements]
+    if any(is_sentinel(node) for stmt in result for node in ast.walk(stmt)):
+        raise exc.BackendUnsupported(
+            "cute",
+            "lane reduction nested in a constexpr vector lane left the vector "
+            "lane outside its lane loop",
+        )
     return result
 
 
@@ -1667,7 +1965,7 @@ def _validate_owned_lane_carry_schedule(
             expected.append(
                 statement_from_string(
                     f"{accumulator} = "
-                    f"{_combine_expr(marker.reduction_type, accumulator, value)}"
+                    f"{_combine_expr(marker.reduction_type, accumulator, value, ctor)}"
                 )
             )
         if not (
@@ -1787,6 +2085,9 @@ def _lift_lane_invariant_if(
     lane_var: str,
     uniform_names: set[str],
     rename_groups: Mapping[str, str] | None = None,
+    *,
+    unlooped: Collection[str] = (),
+    lane_setup: Collection[int] = (),
 ) -> list[ast.AST] | None:
     """Lift one lane-invariant guard that hides reduction markers.
 
@@ -1806,6 +2107,10 @@ def _lift_lane_invariant_if(
     guard ("lane reduction under a guard whose thread uniformity cannot be
     proven") or re-raises the register-tile failure, rather than restoring
     them.
+
+    The branches named in ``unlooped`` (``"body"``, ``"orelse"``) run without
+    the lane loop and without the statements of the loop body at the
+    ``lane_setup`` indices (``_sink_lane_loop_into_branches``).
     """
     from .ast_read_writes import ReadWrites
 
@@ -1848,15 +2153,24 @@ def _lift_lane_invariant_if(
         return None
 
     condition_index_set = set(condition_indices)
-    lane_prefix = [
-        _clone_stmt(stmt)
-        for idx, stmt in enumerate(prefix)
-        if idx not in condition_index_set
-    ]
+    lane_prefix = [idx for idx in range(len(prefix)) if idx not in condition_index_set]
 
-    def branch_loop(statements: list[ast.AST]) -> list[ast.stmt]:
+    def branch_loop(field: str) -> list[ast.stmt]:
+        statements = [_clone_stmt(stmt) for stmt in getattr(branch, field)]
+        if field in unlooped:
+            unlooped_body = [
+                *(
+                    _clone_stmt(prefix[idx])
+                    for idx in lane_prefix
+                    if idx not in lane_setup
+                ),
+                *statements,
+            ]
+            if unlooped_body:
+                return cast("list[ast.stmt]", unlooped_body)
+            return [ast.Pass()] if field == "body" else []
         branch_body = [
-            *(_clone_stmt(stmt) for stmt in lane_prefix),
+            *(_clone_stmt(prefix[idx]) for idx in lane_prefix),
             *statements,
         ]
         if not branch_body:
@@ -1871,10 +2185,124 @@ def _lift_lane_invariant_if(
     lifted_if = create(
         ast.If,
         test=_clone_expr(branch.test),
-        body=branch_loop([_clone_stmt(stmt) for stmt in branch.body]),
-        orelse=branch_loop([_clone_stmt(stmt) for stmt in branch.orelse]),
+        body=branch_loop("body"),
+        orelse=branch_loop("orelse"),
     )
+    if getattr(branch, HELION_BLOCK_UNIFORM_ATTR, False):
+        setattr(lifted_if, HELION_BLOCK_UNIFORM_ATTR, True)
     return [*(_clone_stmt(stmt) for stmt in condition_nodes), lifted_if]
+
+
+def sink_lane_loops_into_uniform_branches(
+    body: list[ast.AST],
+    *,
+    uniform_names: set[str],
+    rename_groups: Mapping[str, str],
+) -> list[ast.AST]:
+    """Move each synthetic lane loop into the uniform branches it encloses.
+
+    Synthetic reduction lanes wrap the complete grid body, so a reduction
+    under a thread-uniform guard (``if pid == 0:`` in an ``hl.grid``) sits
+    below the guard inside its lane loop, out of reach of the serial-loop
+    interchange that runs before the splitter lifts the guard
+    (``_lift_lane_invariant_if``).  The reductions of mutually exclusive
+    branches also each sit in the other branch's lane loop, whose lane they
+    never read: the owner check rejects such a marker, and the full nest
+    would repeat its branch once per foreign lane.  Lift such a guard ahead
+    of both, and run a branch that reads none of the loop's coordinates
+    outside the loop.  Bottom-up, so in a nest every loop ends up around only
+    the branches that read it.
+    """
+    if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
+        return body
+
+    def visit(statements: list[ast.AST], uniform: set[str]) -> list[ast.AST]:
+        result: list[ast.AST] = []
+        for stmt in statements:
+            for field in ("body", "orelse", "finalbody"):
+                children = getattr(stmt, field, None)
+                if isinstance(children, list) and all(
+                    isinstance(child, ast.stmt) for child in children
+                ):
+                    setattr(stmt, field, visit(children, set(uniform)))
+            lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+            emitted: list[ast.AST] = [stmt]
+            if (
+                isinstance(stmt, ast.For)
+                and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == lane_var
+            ):
+                sunk = _sink_lane_loop_into_branches(
+                    stmt, stmt.target.id, uniform, rename_groups
+                )
+                if sunk is not None:
+                    # A loop kept around a branch may end in that branch's
+                    # own guard (an ``elif`` chain).
+                    emitted = visit(sunk, set(uniform))
+            for statement in emitted:
+                _update_proven_uniform_names(statement, uniform)
+            result.extend(emitted)
+        return result
+
+    return visit(body, {*_CUTE_UNIFORM_GLOBAL_NAMES, *uniform_names})
+
+
+def _sink_lane_loop_into_branches(
+    loop: ast.For,
+    lane_var: str,
+    uniform_names: set[str],
+    rename_groups: Mapping[str, str],
+) -> list[ast.AST] | None:
+    """``loop`` moved into the branches of its final guard, or None.
+
+    The guard must hold a reduction marker.  A branch runs outside the loop,
+    without the lane setup the loop body computes before the guard, when
+    that setup is pure and the branch and the rest of the loop body read
+    none of the loop's coordinates (its lane and the names computed from it,
+    across iterations too) and keep their effect run once instead of once
+    per lane (``runs_once_outside_lane``).
+    """
+    from .ast_read_writes import ReadWrites
+    from .cute.lane_loop_distribution import runs_once_outside_lane
+
+    if not loop.body or not isinstance(guard := loop.body[-1], ast.If):
+        return None
+    if not any(_find_lane_reduce_call(node) is not None for node in ast.walk(guard)):
+        return None
+    prefix = loop.body[:-1]
+    # The guard is lane-invariant: every iteration runs the same branch.
+    coordinates = _forward_live_names(
+        [*prefix, *guard.body, *guard.orelse], {lane_var}, rename_groups
+    )
+
+    def reads_lane(stmt: ast.AST) -> bool:
+        return any(
+            rename_groups.get(name, name) in coordinates
+            for name in ReadWrites.from_ast(stmt).reads
+        )
+
+    def runs_outside(statements: Iterable[ast.AST]) -> bool:
+        return all(
+            not reads_lane(stmt) and runs_once_outside_lane(stmt, lane_var)
+            for stmt in statements
+        )
+
+    lane_setup = {idx for idx, stmt in enumerate(prefix) if reads_lane(stmt)}
+    unlooped: list[str] = []
+    if not any(_has_side_effect(prefix[idx]) for idx in lane_setup) and runs_outside(
+        stmt for idx, stmt in enumerate(prefix) if idx not in lane_setup
+    ):
+        unlooped = [
+            field for field in ("body", "orelse") if runs_outside(getattr(guard, field))
+        ]
+    return _lift_lane_invariant_if(
+        loop,
+        lane_var,
+        uniform_names,
+        rename_groups,
+        unlooped=unlooped,
+        lane_setup=lane_setup,
+    )
 
 
 def _is_proven_uniform_name(name: str, uniform_names: set[str]) -> bool:
@@ -1971,23 +2399,29 @@ def _update_thread_axis_names(
 def _update_scalar_definitions(
     stmt: ast.AST,
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: Mapping[str, str] | None = None,
 ) -> None:
     """Track simple generated scalar assignments for predicate proofs."""
     from .ast_read_writes import ReadWrites
 
-    writes = set(ReadWrites.from_ast(stmt).writes)
-    invalidated = set(writes)
+    renames = rename_groups or {}
+    invalidated = {renames.get(name, name) for name in ReadWrites.from_ast(stmt).writes}
     changed = True
     while changed:
         changed = False
         for name, expression in list(scalar_definitions.items()):
             if (
-                name in invalidated
-                or set(ReadWrites.from_ast(expression).reads) & invalidated
+                renames.get(name, name) in invalidated
+                or {
+                    renames.get(read, read)
+                    for read in ReadWrites.from_ast(expression).reads
+                }
+                & invalidated
             ):
                 scalar_definitions.pop(name)
-                if name not in invalidated:
-                    invalidated.add(name)
+                canonical = renames.get(name, name)
+                if canonical not in invalidated:
+                    invalidated.add(canonical)
                     changed = True
     if (
         isinstance(stmt, ast.Assign)
@@ -2001,6 +2435,7 @@ def _statement_provenance_before(
     body: list[ast.AST],
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: Mapping[str, str] | None = None,
 ) -> tuple[
     dict[int, dict[str, frozenset[int]]],
     dict[int, dict[str, ast.AST]],
@@ -2014,7 +2449,7 @@ def _statement_provenance_before(
         thread_axes_before[id(stmt)] = dict(local_thread_axes)
         scalar_defs_before[id(stmt)] = dict(local_scalar_defs)
         _update_thread_axis_names(stmt, local_thread_axes)
-        _update_scalar_definitions(stmt, local_scalar_defs)
+        _update_scalar_definitions(stmt, local_scalar_defs, rename_groups)
     return thread_axes_before, scalar_defs_before
 
 
@@ -2094,14 +2529,9 @@ def _split_staged_matmul_lane_reductions(
         for index in collective_indices:
             statement = body[index]
             assert isinstance(statement, ast.Assign)
-            call = statement.value
-            if not (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id in _CHUNK_REDUCTION_HELPERS
-                and len(call.args) >= 3
-                and _dtype_ctor_from_identity(ast.unparse(call.args[2]))
-                == "cutlass.Float32"
+            if (
+                _stashed_collective_dtype(statement.value, body[:index])
+                != "cutlass.Float32"
             ):
                 return None
             name = names[index]
@@ -2160,6 +2590,7 @@ def _split_dependent_lane_reductions(
         body,
         thread_axis_names,
         scalar_definitions,
+        rename_groups,
     )
 
     # Every stage indexes a prefix of the marker-free body below.
@@ -2195,7 +2626,7 @@ def _split_dependent_lane_reductions(
         acc_body.append(
             statement_from_string(
                 f"{acc_var} = "
-                f"{_combine_expr(marker.reduction_type, acc_var, combine_val)}"
+                f"{_combine_expr(marker.reduction_type, acc_var, combine_val, ctor)}"
             )
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
@@ -2265,6 +2696,44 @@ def _split_dependent_lane_reductions(
 
 
 _LANE_STASH_COUNTER = itertools.count()
+
+
+def _stashed_collective_dtype(value: ast.AST, before: Sequence[ast.AST]) -> str | None:
+    """The dtype constructor of a collective reduction a lane stash may hold.
+
+    A grouped helper names its accumulator dtype in its identity argument; a
+    ``cute.arch.warp_reduction_*`` returns its input's type, proven when the
+    input is a dtype constructor call or a name ``before`` last binds to one.
+    Anything else (a matmul, an unrecognized collective) is ``None``.
+    """
+    if not isinstance(value, ast.Call):
+        return None
+    name = _qualified_name(value.func)
+    if name in _CHUNK_REDUCTION_HELPERS and len(value.args) >= 3:
+        return _dtype_ctor_from_identity(ast.unparse(value.args[2]))
+    if name is None or not name.startswith("cute.arch.warp_reduction_"):
+        return None
+    if not value.args:
+        return None
+    reduced = value.args[0]
+    if isinstance(reduced, ast.Name):
+        definitions = [
+            statement.value
+            for statement in before
+            if isinstance(statement, ast.Assign)
+            and _plain_assignment_name(statement) == reduced.id
+        ]
+        if not definitions:
+            return None
+        reduced = definitions[-1]
+    if (
+        isinstance(reduced, ast.Call)
+        and (ctor := _qualified_name(reduced.func)) is not None
+        and ctor.startswith("cutlass.")
+        and len(reduced.args) == 1
+    ):
+        return ctor
+    return None
 
 
 def _stash_dtype_for_value(
@@ -2689,7 +3158,7 @@ def _split_lane_loop_with_register_stash(
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         acc_body.append(
             statement_from_string(
-                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
             )
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
@@ -3022,7 +3491,10 @@ def _lane_reduce_owner_expr(
             return None
         if reduce_axis in store_axes.unique_predicate:
             return None
-        if reduce_axis in store_axes.predicate or reduce_axis in store_axes.value:
+        if reduce_axis in store_axes.value or (
+            reduce_axis in store_axes.predicate
+            and reduce_axis not in store_axes.bounded_zero_safe_predicate
+        ):
             raise exc.BackendUnsupported(
                 "cute",
                 "cannot infer unique ownership for a thread-varying store",
@@ -3127,6 +3599,7 @@ class _StoreThreadAxes(NamedTuple):
     predicate: set[int]
     unique_predicate: set[int]
     zero_safe_predicate: set[int]
+    bounded_zero_safe_predicate: frozenset[int] = frozenset()
 
 
 def _contains_sync_threads(stmt: ast.AST) -> bool:
@@ -3420,11 +3893,143 @@ def _is_generated_block_extent(
     return isinstance(node, ast.Name) and node.id.startswith("_BLOCK_SIZE_")
 
 
+_SCALAR_INTEGER_BOUNDS_ATTR = "_helion_scalar_integer_bounds"
+
+
+def _scalar_integer_bounds(
+    node: ast.AST,
+    scalar_definitions: dict[str, ast.AST],
+    seen: frozenset[str] = frozenset(),
+) -> tuple[int, int] | None:
+    """Bound simple generated coordinates without signed Int32 overflow.
+
+    Loop-index ranges annotate proof-only name expressions in the scalar
+    context; they never replace an expression in emitted code. Unknown loads,
+    calls, cyclic aliases, and narrowing or overflowing arithmetic decline.
+    """
+    bounds: tuple[int, int] | None = None
+    if isinstance(node, ast.Name):
+        bounds = getattr(node, _SCALAR_INTEGER_BOUNDS_ATTR, None)
+        if bounds is None and node.id in scalar_definitions and node.id not in seen:
+            return _scalar_integer_bounds(
+                scalar_definitions[node.id], scalar_definitions, seen | {node.id}
+            )
+    elif isinstance(node, ast.Constant) and type(node.value) is int:
+        bounds = node.value, node.value
+    elif _direct_thread_coordinate(node) is not None:
+        # CUDA permits at most 1024 threads per block. Using that upper bound
+        # also covers smaller and multidimensional launches conservatively.
+        bounds = 0, MAX_THREADS_PER_BLOCK - 1
+    elif isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        if ast.unparse(node.func) in ("int", "cutlass.Int32", "cutlass.Int64"):
+            bounds = _scalar_integer_bounds(node.args[0], scalar_definitions, seen)
+    elif isinstance(node, ast.UnaryOp):
+        operand = _scalar_integer_bounds(node.operand, scalar_definitions, seen)
+        if operand is not None:
+            if isinstance(node.op, ast.UAdd):
+                bounds = operand
+            elif isinstance(node.op, ast.USub):
+                bounds = -operand[1], -operand[0]
+    elif isinstance(node, ast.BinOp):
+        left = _scalar_integer_bounds(node.left, scalar_definitions, seen)
+        right = _scalar_integer_bounds(node.right, scalar_definitions, seen)
+        if left is not None and right is not None:
+            if isinstance(node.op, ast.Add):
+                bounds = left[0] + right[0], left[1] + right[1]
+            elif isinstance(node.op, ast.Sub):
+                bounds = left[0] - right[1], left[1] - right[0]
+            elif isinstance(node.op, ast.Mult):
+                products = [a * b for a in left for b in right]
+                bounds = min(products), max(products)
+    if bounds is None or not -(2**31) <= bounds[0] <= bounds[1] < 2**31:
+        return None
+    return bounds
+
+
+def _loop_invariant_scalar_definitions(
+    statement: ast.AST,
+    scalar_definitions: dict[str, ast.AST],
+    rename_groups: Mapping[str, str],
+) -> dict[str, ast.AST]:
+    """Invalidate body writes before any iteration, including carry aliases."""
+    from .ast_read_writes import ReadWrites
+
+    if not isinstance(statement, (ast.For, ast.While)):
+        return scalar_definitions
+    definitions = dict(scalar_definitions)
+    writes = set(ReadWrites.from_ast(statement).writes)
+    if isinstance(statement, ast.For):
+        # ReadWrites treats induction names as local to the loop; incoming
+        # proof facts for a shadowed name must nevertheless be retired.
+        writes.update(
+            node.id for node in ast.walk(statement.target) if isinstance(node, ast.Name)
+        )
+    canonical_writes = {rename_groups.get(name, name) for name in writes}
+    changed = True
+    while changed:
+        changed = False
+        for name, expression in list(definitions.items()):
+            reads = set(ReadWrites.from_ast(expression).reads)
+            if any(
+                rename_groups.get(value, value) in canonical_writes
+                for value in (name, *reads)
+            ):
+                definitions.pop(name)
+                canonical_writes.add(rename_groups.get(name, name))
+                changed = True
+    return definitions
+
+
+def _loop_body_scalar_definitions(
+    statement: ast.AST,
+    scalar_definitions: dict[str, ast.AST],
+    thread_axis_names: dict[str, frozenset[int]],
+    rename_groups: Mapping[str, str] | None = None,
+) -> dict[str, ast.AST]:
+    """Bound a thread-uniform positive-step induction in its lexical body."""
+    definitions = _loop_invariant_scalar_definitions(
+        statement, scalar_definitions, rename_groups or {}
+    )
+    if not isinstance(statement, ast.For) or not isinstance(statement.target, ast.Name):
+        return definitions
+    index = ast.Name(id=statement.target.id, ctx=ast.Load())
+    # Kill old aliases of the target even when this loop has no proved range.
+    _update_scalar_definitions(
+        ast.Assign(targets=[statement.target], value=index), definitions, rename_groups
+    )
+    call = statement.iter
+    if not (
+        isinstance(call, ast.Call)
+        and ast.unparse(call.func) in ("range", "cutlass.range_constexpr")
+        and not call.keywords
+        and 1 <= len(call.args) <= 3
+        and not any(_thread_axes_read_by(arg, thread_axis_names) for arg in call.args)
+    ):
+        return definitions
+    start = ast.Constant(0) if len(call.args) == 1 else call.args[0]
+    stop = call.args[0] if len(call.args) == 1 else call.args[1]
+    step = call.args[2] if len(call.args) == 3 else ast.Constant(1)
+    begin = _scalar_integer_bounds(start, scalar_definitions)
+    end = _scalar_integer_bounds(stop, scalar_definitions)
+    stride = _scalar_integer_bounds(step, scalar_definitions)
+    positive_step = stride is not None and stride[0] > 0
+    if (
+        begin is not None
+        and end is not None
+        and begin[0] < end[1]
+        and (positive_step or _is_generated_block_extent(step, scalar_definitions))
+    ):
+        setattr(index, _SCALAR_INTEGER_BOUNDS_ATTR, (begin[0], end[1] - 1))
+    return definitions
+
+
 def _predicate_accepts_zero_thread_axis(
     predicate: ast.AST,
     axis: int,
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    *,
+    require_bounded: bool = False,
 ) -> bool:
     """Prove a generated bound remains true after selecting axis lane zero.
 
@@ -3442,6 +4047,7 @@ def _predicate_accepts_zero_thread_axis(
             axis,
             thread_axis_names,
             scalar_definitions,
+            require_bounded=require_bounded,
         )
     if isinstance(predicate, ast.BoolOp) and isinstance(predicate.op, ast.And):
         return all(
@@ -3450,6 +4056,7 @@ def _predicate_accepts_zero_thread_axis(
                 axis,
                 thread_axis_names,
                 scalar_definitions,
+                require_bounded=require_bounded,
             )
             for value in predicate.values
         )
@@ -3462,9 +4069,22 @@ def _predicate_accepts_zero_thread_axis(
         return False
     lhs = _resolve_scalar_definition(predicate.left, scalar_definitions)
     rhs = _resolve_scalar_definition(predicate.comparators[0], scalar_definitions)
+    literal_end = _literal_int_expr(rhs)
+    bounded_coordinate = (
+        literal_end is not None
+        and 0 < literal_end < 2**31
+        and _scalar_integer_bounds(lhs, scalar_definitions) is not None
+    )
     return (
         axis not in _thread_axes_read_by(rhs, thread_axis_names)
-        and _is_generated_block_extent(rhs, scalar_definitions)
+        and (
+            _is_generated_block_extent(rhs, scalar_definitions)
+            or (require_bounded and bounded_coordinate)
+        )
+        and (
+            not require_bounded
+            or _scalar_integer_bounds(lhs, scalar_definitions) is not None
+        )
         and (
             coefficient := _thread_axis_linear_coefficient(
                 lhs,
@@ -3574,6 +4194,21 @@ def _store_thread_axes(
                 for predicate, axes in zip(predicates, predicate_axes, strict=True)
             )
         },
+        frozenset(
+            axis
+            for axis in all_predicate_axes
+            if all(
+                axis not in axes
+                or _predicate_accepts_zero_thread_axis(
+                    predicate,
+                    axis,
+                    thread_axis_names,
+                    scalar_definitions,
+                    require_bounded=True,
+                )
+                for predicate, axes in zip(predicates, predicate_axes, strict=True)
+            )
+        ),
     )
 
 
@@ -4081,7 +4716,7 @@ def _rereduce_restored_lane_markers(
         value = f"{ctor}({share})" if ctor is not None else share
         loop_body.append(
             statement_from_string(
-                f"{total} = {_combine_expr(marker.reduction_type, total, value)}"
+                f"{total} = {_combine_expr(marker.reduction_type, total, value, ctor)}"
             )
         )
         finalized.append(
@@ -4097,7 +4732,7 @@ def _rereduce_restored_lane_markers(
         for _, marker in markers
     ]
     thread_axes_before, scalar_defs_before = _statement_provenance_before(
-        body, thread_axis_names, scalar_definitions
+        body, thread_axis_names, scalar_definitions, rename_groups
     )
     for stmt in tail:
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
@@ -4156,6 +4791,8 @@ def _restore_per_lane_markers(
     loop: ast.For,
     markers: list[tuple[int, _LaneReduceMarker]],
     rename_groups: Mapping[str, str] | None = None,
+    *,
+    lane_var: str | None = None,
 ) -> ast.For:
     """Keep the lane loop whole when a two-pass split is unsafe.
 
@@ -4175,10 +4812,14 @@ def _restore_per_lane_markers(
     declined here; :func:`_restore_lane_markers` totals the shares across
     the lanes for a lane-invariant tail instead.  The interchange proof removes its
     already-materialized marker consumers separately.
+
+    ``loop`` is the lane loop itself, or (``lane_var`` given) a serial loop
+    nested in the lane loop ``lane_var`` whose body holds the markers.
     """
     body = list(loop.body)
-    assert isinstance(loop.target, ast.Name)
-    lane_var = loop.target.id
+    if lane_var is None:
+        assert isinstance(loop.target, ast.Name)
+        lane_var = loop.target.id
     if any(
         marker.owner_lane is not None
         and (
@@ -4458,10 +5099,16 @@ def _lane_varying_names(
 
 def _is_serial_for(stmt: ast.AST) -> bool:
     """Return True when ``stmt`` is an ordinary serial ``for`` loop (a device
-    serial loop), NOT a per-thread lane loop."""
+    serial loop), NOT a per-thread lane loop.
+
+    A ``cutlass.range_constexpr`` unroll (the constexpr vector lane of a
+    ``cute_vector_widths`` partition) is a lane dimension as well, never a
+    serial device loop, so markers nested in it are left to the lane split.
+    """
     return (
         isinstance(stmt, ast.For)
         and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) is None
+        and not _is_constexpr_lane_iter(stmt)
     )
 
 
@@ -4472,29 +5119,51 @@ def _clone_stmt(stmt: ast.AST) -> ast.AST:
     both re-run the shared (side-effect-free) producers. Splicing the same node
     objects into two places in the tree breaks AST walking, so each reused
     statement is rebuilt from its source text into a fresh ExtendedAST node.
+    The atomics keep the lane loops they are uniform along
+    (``HELION_ATOMIC_UNIFORM_LANES_ATTR``) and the lane loops inside keep
+    their lane variable (``HELION_LANE_LOOP_VAR_ATTR``) for the pins of
+    ``pin_atomics_left_in_lane_loops``.
     """
-    return statement_from_string(ast.unparse(stmt))
+    clone = statement_from_string(ast.unparse(stmt))
+    for kind, attr in (
+        (ast.Call, HELION_ATOMIC_UNIFORM_LANES_ATTR),
+        (ast.For, HELION_LANE_LOOP_VAR_ATTR),
+    ):
+        copies = [node for node in ast.walk(clone) if isinstance(node, kind)]
+        originals = [node for node in ast.walk(stmt) if isinstance(node, kind)]
+        for original, copy in zip(originals, copies, strict=True):
+            value = getattr(original, attr, None)
+            if value is not None:
+                setattr(copy, attr, value)
+    return clone
 
 
 def _clone_expr(node: ast.AST) -> ast.AST:
     return expr_from_string(ast.unparse(node))
 
 
-def _forward_live_names(body: list[ast.AST], roots: set[str]) -> set[str]:
+def _forward_live_names(
+    body: list[ast.AST],
+    roots: set[str],
+    rename_groups: Mapping[str, str] | None = None,
+) -> set[str]:
     """Names produced by the forward slice that (transitively) consumes any
-    name in ``roots`` within ``body``."""
+    name in ``roots`` within ``body``, compared through ``rename_groups``
+    (canonical names, see ``_backward_slice``) when given."""
     from .ast_read_writes import ReadWrites
 
-    tainted = set(roots)
+    renames = rename_groups or {}
+    tainted = {renames.get(name, name) for name in roots}
     changed = True
     while changed:
         changed = False
         for stmt in body:
             rw = ReadWrites.from_ast(stmt)
-            if set(rw.reads) & tainted:
-                for w in rw.writes:
-                    if w not in tainted:
-                        tainted.add(w)
+            if {renames.get(name, name) for name in rw.reads} & tainted:
+                for write in rw.writes:
+                    name = renames.get(write, write)
+                    if name not in tainted:
+                        tainted.add(name)
                         changed = True
     return tainted
 
@@ -4569,6 +5238,164 @@ def _interchange_stmt(
     )
 
 
+def _flatten_vector_reduction_lane(
+    loop: ast.For, vector_loop: ast.For, lane_var: str
+) -> ast.For:
+    """Restore one complete scalar domain before the ordinary reduction split.
+
+    The strategy records this ownership when it emits the reduction marker.
+    Flattening preserves the original (outer, vector) visitation order. Only
+    pure coordinate preparation and proved read-only packet loads may move from
+    once per outer lane to once per element. Stores, staging, and unproved
+    carries must decline. The existing splitter still checks all
+    producer/consumer aliasing.
+    """
+    from .ast_read_writes import ReadWrites
+
+    def unsupported() -> NoReturn:
+        raise exc.BackendUnsupported(
+            "cute", "vector lane reduction has no complete scalar ownership proof"
+        )
+
+    def extent(node: ast.For) -> int:
+        call = node.iter
+        if not (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) in ("range", "cutlass.range_constexpr")
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and type(call.args[0].value) is int
+            and call.args[0].value > 0
+            and not node.orelse
+        ):
+            unsupported()
+        return call.args[0].value
+
+    outer_size, vector_size = extent(loop), extent(vector_loop)
+    if not isinstance(vector_loop.target, ast.Name):
+        unsupported()
+    vector_var = vector_loop.target.id
+    if vector_var == lane_var or loop.body[-1] is not vector_loop:
+        unsupported()
+    prefix = loop.body[:-1]
+    body_rw = ReadWrites.from_list(vector_loop.body)
+    body_writes = set(body_rw.writes) | set(body_rw.inplace_writes)
+    prefix_writes = set(ReadWrites.from_list(prefix).writes)
+    # A packet load may be replayed at each scalar coordinate only when the
+    # complete element body is read-only. No store, atomic, synchronization,
+    # unknown call, or vector-address mutation may cross the repeated read.
+    readonly_body = all(
+        _plain_assignment_name(statement) is not None
+        and not _has_observable_memory_write(statement)
+        and all(
+            _qualified_name(node.func) == "_helion_lane_reduce"
+            or _is_proven_relocatable_call(node, allow_load=True)
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+        )
+        for statement in vector_loop.body
+    )
+
+    def readonly_packet(statement: ast.AST) -> bool:
+        if not readonly_body or not isinstance(statement, ast.Assign):
+            return False
+        call = statement.value
+        if not (
+            isinstance(call, ast.Call)
+            and _qualified_name(call.func) == "cute.arch.load"
+            and len(call.args) == 2
+            and not call.keywords
+        ):
+            return False
+        dtype = call.args[1]
+        if not (
+            isinstance(dtype, ast.Call)
+            and _qualified_name(dtype.func) == "ir.VectorType.get"
+            and len(dtype.args) == 2
+            and not dtype.keywords
+            and isinstance(dtype.args[0], ast.List)
+            and len(dtype.args[0].elts) == 1
+            and isinstance(dtype.args[0].elts[0], ast.Constant)
+            and type(dtype.args[0].elts[0].value) is int
+            and dtype.args[0].elts[0].value == vector_size
+            and _qualified_name(dtype.args[1])
+            in {"cutlass.Uint16.mlir_type", "cutlass.Uint32.mlir_type"}
+        ):
+            return False
+        return all(
+            node is call
+            or node is dtype
+            or _is_proven_relocatable_call(node, allow_load=False)
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+        )
+
+    prepared: set[str] = set()
+    for statement in prefix:
+        name = _plain_assignment_name(statement)
+        packet = readonly_packet(statement)
+        if (
+            name is None
+            or not (
+                packet or _is_proven_relocatable_assignment(statement, allow_load=False)
+            )
+            or name in body_writes | prepared | {lane_var, vector_var}
+            or any(
+                isinstance(node, ast.Subscript)
+                and not (
+                    isinstance(node.value, ast.Call)
+                    and ast.unparse(node.value.func)
+                    in ("cute.arch.thread_idx", "cute.arch.block_idx")
+                    or packet
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "stride"
+                    and isinstance(node.value.value, ast.Attribute)
+                    and node.value.value.attr == "layout"
+                    and isinstance(node.value.value.value, ast.Name)
+                    and isinstance(node.slice, ast.Constant)
+                    and type(node.slice.value) is int
+                    and node.slice.value >= 0
+                )
+                for node in ast.walk(statement)
+            )
+        ):
+            unsupported()
+        reads = set(ReadWrites.from_ast(statement).reads)
+        # A prefix value cannot depend on state changed by an element, nor on
+        # its own prior-iteration value. Earlier coordinate definitions are OK.
+        if reads & (body_writes | (prefix_writes - prepared) | {vector_var}):
+            unsupported()
+        prepared.add(name)
+    if body_writes & {lane_var, vector_var} or any(
+        isinstance(
+            node, (ast.Break, ast.Continue, ast.Return, ast.Yield, ast.While, ast.For)
+        )
+        for statement in vector_loop.body
+        for node in ast.walk(statement)
+    ):
+        unsupported()
+    for statement in vector_loop.body:
+        marker = _is_lane_reduce_marker_assign(statement)
+        if marker is not None and marker.owner_lane != lane_var:
+            unsupported()
+
+    class Coordinates(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if isinstance(node.ctx, ast.Load):
+                if node.id == lane_var:
+                    return expr_from_string(f"({lane_var} // {vector_size})")
+                if node.id == vector_var:
+                    return expr_from_string(f"({lane_var} % {vector_size})")
+            return node
+
+    flattened = [
+        Coordinates().visit(_clone_stmt(statement))
+        for statement in [*prefix, *vector_loop.body]
+    ]
+    return _create_lane_loop(lane_var, outer_size * vector_size, flattened)
+
+
 def _interchange_one_lane_loop(
     loop: ast.For,
     lane_var: str,
@@ -4585,10 +5412,17 @@ def _interchange_one_lane_loop(
     # (``cute/register_tile_reductions.py``).
     mb_index: int | None = None
     for idx, stmt in enumerate(body):
-        if _is_serial_for(stmt) and any(
-            (marker := _is_lane_reduce_marker_assign(s)) is not None
-            and marker.owner_lane in (None, lane_var)
-            for s in cast("ast.For", stmt).body
+        if (
+            isinstance(stmt, ast.For)
+            and (
+                _is_serial_for(stmt)
+                or getattr(stmt, HELION_VECTOR_REDUCTION_OWNER_ATTR, None) == lane_var
+            )
+            and any(
+                (marker := _is_lane_reduce_marker_assign(s)) is not None
+                and marker.owner_lane in (None, lane_var)
+                for s in stmt.body
+            )
         ):
             if mb_index is not None:
                 # More than one candidate serial loop: not the simple pattern.
@@ -4597,6 +5431,10 @@ def _interchange_one_lane_loop(
     if mb_index is None:
         return [loop]
     mb_loop = cast("ast.For", body[mb_index])
+    if getattr(mb_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, None) == lane_var:
+        # These slots partition the SAME reduced axis, unlike an independent
+        # serial row loop. Reducing each slot separately overwrites the output.
+        return [_flatten_vector_reduction_lane(loop, mb_loop, lane_var)]
     lane_prefix = body[:mb_index]
     lane_suffix = body[mb_index + 1 :]
     mb_body: list[ast.AST] = list(mb_loop.body)
@@ -4627,14 +5465,13 @@ def _interchange_one_lane_loop(
         # The lane reduction inside the serial loop is not consumed by a
         # broadcast store, so the interchange does not apply. Markers nested in
         # a serial loop are not reachable by ``split_lane_loop_reductions`` (it
-        # only rewrites top-level lane loops), so restore them to their raw
-        # per-lane inputs to avoid leaving an unprocessed marker behind.
-        restored: list[ast.stmt] = [cast("ast.stmt", s) for s in mb_body]
-        for idx, m in markers:
-            restored[idx] = statement_from_string(
-                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
-            )
-        mb_loop.body = restored
+        # only rewrites top-level lane loops), so finalize them in place like
+        # an unsplittable lane loop would: a legacy unowned marker restores
+        # its raw per-lane input and a ``strided_restore`` marker whose
+        # consumers are lane carries folds it across its thread group, while
+        # any other owned marker denotes a full reduction over the lane that
+        # a raw per-lane input cannot complete and declines loudly.
+        _restore_per_lane_markers(mb_loop, markers, lane_var=lane_var)
         return [loop]
 
     # A name is lane-varying if it (transitively) depends on the lane var across
@@ -4807,6 +5644,7 @@ def _plain_assignment_name(stmt: ast.AST) -> str | None:
 
 _PURE_RELOCATABLE_NAMES = frozenset(
     {
+        "_cute_python_mod",
         "abs",
         "bool",
         "float",
@@ -4873,10 +5711,14 @@ def _is_proven_relocatable_call(
             return allow_load
         if call.func.attr == "bitcast":
             return True
+    if is_rounded_fp32_multiply(call):
+        # ``mul.rn.f32`` over two registers: a product kept separately rounded
+        # (``scalar_recipe_rounding``), as pure as the ``*`` it replaces.
+        return True
     name = _qualified_name(call.func)
     if name is None:
         return False
-    if name in _PURE_RELOCATABLE_NAMES:
+    if name in _PURE_RELOCATABLE_NAMES or name in PURE_HELPERS:
         return True
     if name.startswith("cutlass."):
         member = name.rsplit(".", 1)[-1]
@@ -4891,6 +5733,8 @@ def _is_proven_relocatable_call(
     if name in {
         "cute.arch.block_dim",
         "cute.arch.block_idx",
+        "cute.arch.fmax",
+        "cute.arch.fmin",
         "cute.arch.grid_dim",
         "cute.arch.lane_idx",
         "cute.arch.thread_idx",
@@ -5275,6 +6119,7 @@ def hoist_lane_invariant_chunk_recurrence(
     *,
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
+    required: set[str] | None = None,
 ) -> list[ast.AST]:
     """Restructure ``for chunk: for lane: <dot_acc recurrence>`` nests so the
     lane-invariant rescale, chunk-entry stores, and final accumulator combine
@@ -5283,18 +6128,28 @@ def hoist_lane_invariant_chunk_recurrence(
     Tightly gated: only fires on a serial chunk loop whose single inner lane
     loop has the verified dataflow described by :func:`_find_dot_acc_recurrence`
     and whose running-sum reset sits in the same statement list before it.
+    ``required`` names the running sums that are only exact restructured
+    (``CuteDeviceFunctionState.chunk_recurrence_running_sums``); one left
+    as emitted is rejected.
     """
-    if running_sums is not None and not running_sums:
-        return body
-
-    thread_axes_before, scalar_defs_before = _collect_statement_provenance(body)
-    return _hoist_lane_invariant_chunk_recurrence(
-        body,
-        rename_groups or {},
-        running_sums,
-        thread_axes_before,
-        scalar_defs_before,
-    )
+    rewritten: set[str] = set()
+    if running_sums is None or running_sums:
+        thread_axes_before, scalar_defs_before = _collect_statement_provenance(body)
+        body = _hoist_lane_invariant_chunk_recurrence(
+            body,
+            rename_groups or {},
+            running_sums,
+            thread_axes_before,
+            scalar_defs_before,
+            rewritten,
+        )
+    if required is not None and required - rewritten:
+        raise exc.BackendUnsupported(
+            "cute",
+            "a matmul accumulator recurrence in a K loop is not restructured to "
+            "update once per tile",
+        )
+    return body
 
 
 def _hoist_lane_invariant_chunk_recurrence(
@@ -5303,6 +6158,7 @@ def _hoist_lane_invariant_chunk_recurrence(
     running_sums: set[str] | None,
     thread_axes_before: dict[int, dict[str, frozenset[int]]],
     scalar_defs_before: dict[int, dict[str, ast.AST]],
+    rewritten: set[str],
 ) -> list[ast.AST]:
     from .ast_read_writes import ReadWrites
 
@@ -5321,6 +6177,7 @@ def _hoist_lane_invariant_chunk_recurrence(
                         running_sums,
                         thread_axes_before,
                         scalar_defs_before,
+                        rewritten,
                     ),
                 )
 
@@ -5373,6 +6230,7 @@ def _hoist_lane_invariant_chunk_recurrence(
             )
         new_body.pop(reset_idx)
         assert isinstance(stmt, ast.For)
+        rewritten.add(info.dot_acc_var)
         new_body.append(
             _rewrite_chunk_recurrence(
                 stmt,
@@ -5761,6 +6619,8 @@ class LoopDimInfo:
     begin_expr: sympy.Expr | None = None
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
+    # Absolute end of a root-grid dim; None for device loops.
+    grid_end_expr: sympy.Expr | None = None
     # True when the generated extent mask checks both the logical begin and end.
     mask_has_lower_bound: bool = False
 
@@ -5779,6 +6639,44 @@ class LoopDimInfo:
         return shape_env_size_hint(shape_env, expected) == shape_env_size_hint(
             shape_env, self.end_expr
         )
+
+    def is_end_matching_keyed(self, size: int | torch.SymInt) -> bool:
+        """``is_end_matching`` for every input the bound kernel serves: input
+        sizes that match only at these values key the bound kernel on their
+        equality (``CompileEnvironment.keyed_size_equalities``)."""
+        expected = _to_sympy(size)
+        if expected == self.end_expr:
+            return True
+        if (
+            self.end_expr is None
+            or _has_unbacked(self.end_expr)
+            or _has_unbacked(expected)
+        ):
+            return False
+        env = CompileEnvironment.current()
+        # Specialized sizes are keyed by their values already.
+        expected = env.specialize_expr(expected)
+        end = env.specialize_expr(self.end_expr)
+        if expected == end:
+            return True
+        static = env.shape_env._maybe_evaluate_static(sympy.Eq(expected, end))
+        if static is not None:
+            return bool(static)
+        sources = env.shape_env.var_to_sources
+        if (
+            not isinstance(expected, sympy.Symbol)
+            or not all(
+                sources.get(symbol)
+                for symbol in end.free_symbols
+                if isinstance(symbol, sympy.Symbol)
+            )
+            or not sources.get(expected)
+            or shape_env_size_hint(env.shape_env, expected)
+            != shape_env_size_hint(env.shape_env, end)
+        ):
+            return False
+        env.keyed_size_equalities.add((expected, end))
+        return True
 
 
 @dataclasses.dataclass
@@ -5816,6 +6714,7 @@ class DeviceLoopOrGridState:
 
 @dataclasses.dataclass
 class DeviceLoopState(DeviceLoopOrGridState):
+    integer_reduction_hoist: Hoist | None = dataclasses.field(default=None, init=False)
     for_node: ast.For
     inner_statements: list[ast.AST]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
@@ -5828,8 +6727,8 @@ class DeviceLoopState(DeviceLoopOrGridState):
     # the blocks each distributes, the vec partitions among them and the
     # per-lane index / mask definitions at the top of the innermost body.
     # Unlike a grid's (``DeviceGridState.wrap_body``) the nest is built
-    # around the body before the body exists and is never redistributed;
-    # ``check_lane_loop_nest`` rejects it unless it is the tile program.
+    # around the body before the body exists; ``check_lane_loop_nest`` keeps
+    # it when it is the tile program and redistributes or rejects it otherwise.
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_loop_block_ids: dict[str, frozenset[int]] = dataclasses.field(
         default_factory=dict
@@ -5843,6 +6742,10 @@ class DeviceLoopState(DeviceLoopOrGridState):
     # Run once the loop body is complete (CuTe: restore the tile-vector stores
     # whose deferred flush a later access of their tensor would observe).
     body_finalizers: list[Callable[[], None]] = dataclasses.field(default_factory=list)
+    # Each carried output of the body mapped to its initial value, the two
+    # names the phi after the loop merges into one variable (set once the
+    # body is complete, before ``check_lane_loop_nest``).
+    carried_names: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def lane_index_definitions(self) -> tuple[list[ast.AST], frozenset[str]]:
         return _lane_index_definitions(
@@ -5917,9 +6820,13 @@ class DeviceLoopState(DeviceLoopOrGridState):
         Every statement of the body runs inside every lane loop, so one whose
         values ignore a loop repeats once per iteration.  The full-nest check
         of the lane-loop distribution accepts the nest when every repetition
-        is idempotent, pins an atomic that is uniform along a loop's tile axis
-        to the loop's first lane and rejects the rest
-        (``cute/lane_loop_distribution.py``).  Only the live loops are
+        is idempotent and pins an atomic that is uniform along a loop's tile
+        axis to the loop's first lane (``cute/lane_loop_distribution.py``);
+        the body's carries count as the variables the phis after the loop
+        make them (``carried_names``).  An inexact nest (a carry beside the
+        per-K-lane products of the scalar matmul fallback updated once per
+        lane) is redistributed like a grid body, each statement inside only
+        the loops it depends on, or rejected.  Only the live loops are
         checked: a loop none of whose names the body reads (a tile indexed
         only by its ``begin``) is spliced away by the dead-code elimination
         and repeats nothing, as in ``DeviceGridState.wrap_body``, and a pin
@@ -5936,7 +6843,9 @@ class DeviceLoopState(DeviceLoopOrGridState):
         from .ast_read_writes import ReadWrites
         from .cute.lane_loop_distribution import LanePlacement
         from .cute.lane_loop_distribution import add_thread_barriers
-        from .cute.lane_loop_distribution import check_full_nest
+        from .cute.lane_loop_distribution import distribute_lane_loops
+        from .cute.lane_loop_distribution import full_nest_inexactness
+        from .cute.lane_loop_distribution import inexact_nest_error
 
         setup = {id(statement) for statement in self.lane_setup_statements}
         body = [
@@ -5973,18 +6882,37 @@ class DeviceLoopState(DeviceLoopOrGridState):
             self.tile_masks,
         )
         rename_groups = _current_rename_groups()
+        # The repetition checks read a carry as the one variable the phi
+        # after the loop makes of it.
+        carried_groups = _merge_carried_names(rename_groups, self.carried_names)
+        placement: list[ast.AST | LanePlacement] | None = None
         if live_loops:
-            check_full_nest(body, scopes, rename_groups=rename_groups)
-        # The nest as emitted: the body inside every live loop.
+            reason = full_nest_inexactness(body, scopes, rename_groups=carried_groups)
+            if reason is not None:
+                # A statement whose values ignore a loop repeats once per
+                # iteration of the nest built around the body (a carry beside
+                # the per-K-lane products of the scalar matmul fallback).
+                # Place each statement inside only the loops it depends on, as
+                # for a grid body (``DeviceGridState.wrap_body``), or reject.
+                placement = distribute_lane_loops(
+                    body, scopes, rename_groups=carried_groups
+                )
+                if placement is None:
+                    raise inexact_nest_error(reason)
+        # The nest as emitted: the body inside every live loop, or the placement.
         items: list[ast.AST | LanePlacement] = list(body)
         loops = [LanePlacement(lane_var, items) for lane_var, _extent in live_loops]
         for outer, inner in itertools.pairwise(loops):
             outer.items = [inner]
+        nest: list[ast.AST | LanePlacement] = [loops[0]] if loops else items
+        loop_body = items
+        if placement is not None:
+            nest = loop_body = placement
         axis_sizes, definitions, masks, constants, enclosing = _thread_barrier_context(
             self
         )
         add_thread_barriers(
-            [loops[0]] if loops else items,
+            nest,
             scopes,
             rename_groups=rename_groups,
             axis_sizes=axis_sizes,
@@ -5995,11 +6923,14 @@ class DeviceLoopState(DeviceLoopOrGridState):
             # a branch some threads skip would deadlock.
             allow_barriers=not _in_divergent_control_flow(),
             loop_variables=self.loop_variables(),
-            loop_body=items,
+            loop_body=loop_body,
             loop_shifts=self.tile_begin_shifts(),
             # The loops around the body: those around this loop, then its own.
             loop_headers=[*enclosing, *self.loop_headers()],
         )
+        if placement is not None:
+            self._emit_lane_placement(placement, setup_by_lane)
+            return
         for loop in loops:
             _apply_wrapper_barriers(
                 self.vec_lane_wrappers.get(loop.lane_var), loop.barriers
@@ -6036,6 +6967,62 @@ class DeviceLoopState(DeviceLoopOrGridState):
             *statements,
         ]
         self._splice_lane_loops(dead)
+
+    def _emit_lane_placement(
+        self,
+        placement: list[ast.AST | LanePlacement],
+        setup_by_lane: dict[str, list[ast.AST]],
+    ) -> None:
+        """Replace the lane loop nest around the body with ``placement``.
+
+        Each loop instance reuses its loop of the nest (for a vec wrapper, the
+        outer loop with its attached statements, the instance in its V-loop)
+        with the loop's setup at the top.  The dead loops leave with the
+        nest, and the statements outside every loop join the body of the
+        innermost device loop, which becomes ``inner_statements``.
+        """
+        from .cute.lane_loop_distribution import LanePlacement
+
+        def enclosing_child(loop: ast.For) -> ast.For:
+            return next(
+                child
+                for child in loop.body
+                if isinstance(child, ast.For)
+                and _encloses(child, self.inner_statements)
+            )
+
+        parent = self.for_node
+        nest = enclosing_child(parent)
+        while getattr(nest, HELION_LANE_LOOP_VAR_ATTR, None) is None:
+            parent, nest = nest, enclosing_child(nest)
+        lane_loops: dict[str, ast.For] = {}
+        loop = nest
+        while True:
+            if (lane_var := getattr(loop, HELION_LANE_LOOP_VAR_ATTR, None)) is not None:
+                lane_loops[lane_var] = loop
+            if loop.body is self.inner_statements:
+                break
+            loop = enclosing_child(loop)
+
+        def materialize(items: list[ast.AST | LanePlacement]) -> list[ast.AST]:
+            result: list[ast.AST] = []
+            for item in items:
+                if not isinstance(item, LanePlacement):
+                    result.append(item)
+                    continue
+                wrapper = self.vec_lane_wrappers.get(item.lane_var)
+                _apply_wrapper_barriers(wrapper, item.barriers)
+                inner = [*setup_by_lane[item.lane_var], *materialize(item.items)]
+                if wrapper is None:
+                    lane_loops[item.lane_var].body = inner  # type: ignore[assignment]
+                else:
+                    wrapper.vloop.body = inner  # type: ignore[assignment]
+                result.append(lane_loops[item.lane_var])
+            return result
+
+        position = parent.body.index(nest)
+        parent.body[position : position + 1] = materialize(placement)  # type: ignore[assignment]
+        self.inner_statements = cast("list[ast.AST]", parent.body)
 
     def _splice_lane_loops(self, lane_vars: set[str]) -> None:
         """Take the lane loops of ``lane_vars`` out of the nest around the body, their bodies in their place.
@@ -6149,6 +7136,13 @@ class VecLaneWrapper:
     # body directly into the enclosing scope when this flag is set.
     elide_outer_loop: bool = False
 
+    def __post_init__(self) -> None:
+        # The lane reduction split tells this V-loop from any other constexpr
+        # loop in the lane body by the lane variable it is nested in.
+        lane_target = self.outer_for.target
+        assert isinstance(lane_target, ast.Name)
+        setattr(self.vloop, HELION_VEC_LANE_OF_ATTR, lane_target.id)
+
 
 def _cute_lane_coordinates(lane_var: str, wrapper: VecLaneWrapper | None) -> set[str]:
     """A lane loop's own coordinates: its lane variable and, when vectorized,
@@ -6235,13 +7229,52 @@ def _lane_loop_is_live(
 
 
 def _current_rename_groups() -> dict[str, str]:
-    """Every alias the device function will rename, mapped to its canonical name."""
+    """Every alias the device function will rename, mapped to its canonical name.
+
+    A tensor argument viewing another's storage (``alias = x.view(...)`` on
+    the host) is mapped to the first such argument too: the lane-loop and
+    thread-barrier passes key memory dependences on these names, and a store
+    through one view must order a load through the other.
+    """
     try:
-        renames = DeviceFunction.current()._variable_renames
+        fn = DeviceFunction.current()
     except NoCurrentFunction:
         # Unit tests build the loop states outside a device function.
         return {}
-    return {name: aliases[0] for name, aliases in renames.items()}
+    groups = {name: aliases[0] for name, aliases in fn._variable_renames.items()}
+    storage_owners: dict[int, str] = {}
+    for arg in fn.arguments:
+        if isinstance(arg, TensorArg):
+            owner = storage_owners.setdefault(
+                id(arg.fake_value.untyped_storage()), arg.name
+            )
+            if owner != arg.name:
+                groups.setdefault(arg.name, owner)
+    return groups
+
+
+def _merge_carried_names(
+    rename_groups: Mapping[str, str], carried_names: Mapping[str, str]
+) -> dict[str, str]:
+    """``rename_groups`` with each carried output and its initial value
+    mapped to one canonical name.
+
+    The phi after a device loop merges the two only once the loop statement
+    is complete; the repetition checks of its body need them as one variable
+    already (``DeviceLoopState.carried_names``).
+    """
+    groups = dict(rename_groups)
+    for output, initial in carried_names.items():
+        old = groups.get(output, output)
+        new = groups.get(initial, initial)
+        if old == new:
+            continue
+        for name, canonical in list(groups.items()):
+            if canonical == old:
+                groups[name] = new
+        groups[old] = new
+        groups[output] = new
+    return groups
 
 
 def _assign_lane_setup(
@@ -6576,9 +7609,25 @@ class DeviceGridState(DeviceLoopOrGridState):
     # loops OUTSIDE the one-vector tile wrappers (register-tile reductions,
     # see ``nest_reduction_lane_outside_vector_tiles``).
     constexpr_lane_vars: set[str] = dataclasses.field(default_factory=set)
+    # The thread extents of the root tile's own axes when the grid became
+    # active, before the body's reductions added theirs to
+    # ``thread_axis_sizes`` (``GenerateAST.set_active_loops``).
+    root_axis_sizes: dict[int, int] = dataclasses.field(default_factory=dict)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
+
+    def lane_defined_names(self) -> set[str]:
+        """The names only the lane loops define: the lane variables, the vec
+        lanes' own, and the per-lane index / mask definitions."""
+        from .ast_read_writes import ReadWrites
+
+        names = {lane_var for lane_var, _extent in self.lane_loops}
+        for wrapper in self.vec_lane_wrappers.values():
+            names.update((wrapper.vec_lane_var, wrapper.base_index_var))
+        for stmt in self.lane_setup_statements:
+            names.update(ReadWrites.from_ast(stmt).writes)
+        return names
 
     def add_lane_loop(
         self,
@@ -7078,6 +8127,10 @@ class TileStrategy:
         """
         return self.offset_var(block_idx)
 
+    def grid_origin_var(self, block_idx: int) -> str:
+        """Return the CTA's logical tile origin, without a thread/lane offset."""
+        return self.offset_var(block_idx)
+
     def index_var(self, block_idx: int) -> str:
         return self.index_vars[block_idx]
 
@@ -7250,7 +8303,8 @@ class TileStrategy:
         Args:
             state: The codegen state
             use_proxy_ends: If True, use proxy_ends from state.proxy_args (for device loops)
-            ends_override: If provided, use these ends instead of block_sizes.numel (for data-dependent bounds)
+            ends_override: The absolute ends of a root grid; like a device loop's
+                ends they bound ``tile.end``, ``tile.count`` and the tile extent
         """
         env = CompileEnvironment.current()
         block_id_to_info = {}
@@ -7280,8 +8334,13 @@ class TileStrategy:
             if len(state.ast_args) >= 2 and isinstance(state.ast_args[1], list):
                 begin_values = state.ast_args[1]
         if isinstance(state.proxy_args, (list, tuple)):
-            if len(state.proxy_args) >= 2 and isinstance(
-                state.proxy_args[1], (list, tuple, torch.Size)
+            # Root grids pass ``(begin_or_end, end, step)``: a list in their
+            # second slot holds the ends, not the begins.
+            root_grid = state.ast_args is None and len(state.proxy_args) == 3
+            if (
+                not root_grid
+                and len(state.proxy_args) >= 2
+                and isinstance(state.proxy_args[1], (list, tuple, torch.Size))
             ):
                 proxy_begins = normalize_dim_values(state.proxy_args[1])
                 if begin_values is None:
@@ -7323,8 +8382,8 @@ class TileStrategy:
                     end_var_name=None,
                     end_expr=end_expr,
                 )
-        elif ends_override is not None:
-            # Data-dependent bounds: use the provided ends
+        else:
+            assert ends_override is not None
             for idx, (block_id, end) in enumerate(
                 zip(self.block_ids, ends_override, strict=True)
             ):
@@ -7344,43 +8403,25 @@ class TileStrategy:
                     end_expr = _to_sympy(end)
                     end_var_name = state.sympy_expr(end_expr)
                 else:
-                    # Tensor (data-dependent) - end_expr is None, but we still need end_var
+                    # Tensor (data-dependent): no sympy end, so name its load
                     end_expr = None
-                    end_var_name = None
-                block_id_to_info[block_id] = LoopDimInfo(
-                    begin_var_name=begin_var_name,
-                    begin_expr=begin_expr,
-                    end_var_name=end_var_name,
-                    end_expr=end_expr,
-                )
-        else:
-            for idx, block_id in enumerate(self.block_ids):
-                block_size_info = env.block_sizes[block_id]
-                begin_expr = None
-                begin_var_name = None
-                if proxy_begins is not None:
-                    begin = proxy_begins[idx]
-                    if isinstance(begin, (int, torch.SymInt)):
-                        begin_expr = _to_sympy(begin)
-                if begin_values is not None:
-                    begin_var_name = state.codegen.lift(
-                        begin_to_ast(begin_values[idx]),
-                        dce=True,
-                        prefix="begin",
+                    end_var_name = state.codegen.lift(
+                        begin_to_ast(end), dce=True, prefix="end"
                     ).id
-                if block_size_info.size is None:
-                    # Data-dependent bound - skip numel, it will be handled elsewhere
-                    end_expr = None
-                    end_var_name = None
-                else:
-                    end_expr = block_size_info.numel
-                    end_var_name = state.sympy_expr(end_expr)
                 block_id_to_info[block_id] = LoopDimInfo(
                     begin_var_name=begin_var_name,
                     begin_expr=begin_expr,
                     end_var_name=end_var_name,
                     end_expr=end_expr,
                 )
+
+        # Root grid arguments carry the absolute logical bounds.
+        if state.ast_args is None and len(state.proxy_args) == 3:
+            begin_or_end, end, _ = state.proxy_args
+            grid_ends = normalize_dim_values(begin_or_end if end is None else end)
+            for block_id, grid_end in zip(self.block_ids, grid_ends, strict=True):
+                if isinstance(grid_end, (int, torch.SymInt, sympy.Expr)):
+                    block_id_to_info[block_id].grid_end_expr = _to_sympy(grid_end)
 
         return block_id_to_info
 
@@ -7544,6 +8585,17 @@ class BlockSizeTileStrategy(TileStrategy):
             if offset is not None:
                 return offset
 
+        if (
+            env.backend.name == "cute"
+            and len(HostFunction.current().device_ir.phases) > 1
+        ):
+            # All barrier phases share the launch layout. Use the dispatcher's
+            # kernel-wide reservation, including axes absent from this phase,
+            # so the body's tile indices agree with the launch block dimensions.
+            offset = self.fn.tile_strategy.thread_axis_for_strategy(self)
+            if offset is not None:
+                return offset
+
         seen: set[int] = set()
         active_reduction_axes = 0
         active_non_reduction_axes = 0
@@ -7557,7 +8609,10 @@ class BlockSizeTileStrategy(TileStrategy):
                 if env.backend.reduction_axis_first() and isinstance(
                     loop_state.strategy, ReductionStrategy
                 ):
-                    active_reduction_axes += axes
+                    # A reduction with one live thread reserves no axis (see
+                    # ``planned_reduction_axes`` below).
+                    if loop_state.strategy._reduction_thread_count() > 1:
+                        active_reduction_axes += axes
                 else:
                     active_non_reduction_axes += axes
 
@@ -7573,26 +8628,19 @@ class BlockSizeTileStrategy(TileStrategy):
         # more elements than the tile holds. Reserve one axis per reduction
         # that actually spreads across threads; single-thread reductions
         # (thread_idx is constant 0 on their axis) may share an axis safely.
-        reduction_strategies = [
-            strategy
-            for strategy in self.fn.tile_strategy.strategies
-            if isinstance(strategy, ReductionStrategy)
-        ]
-        planned_reduction_axes = max(
-            sum(
-                1
-                for strategy in reduction_strategies
-                if strategy._reduction_thread_count() > 1
-            ),
-            1
-            if any(strategy.thread_axes_used() > 0 for strategy in reduction_strategies)
-            else 0,
-        )
+        # The reservation is kernel-wide (it also counts reductions of other
+        # root loops and ``hl.barrier()`` phases);
+        # ``TileStrategyDispatch.thread_axis_for_strategy`` applies the same
+        # reservation so the launch block dims agree with the axes the body
+        # indexes.
+        planned_reduction_axes = self.fn.tile_strategy.reserved_reduction_axes()
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
             for block_id in self.block_ids
         ):
-            return active_non_reduction_axes + active_reduction_axes
+            return self._check_launch_thread_axis(
+                active_non_reduction_axes + active_reduction_axes
+            )
         reserved_reduction_axes = max(planned_reduction_axes, active_reduction_axes)
         offset = reserved_reduction_axes + active_non_reduction_axes
         tile_axes = set(range(offset, offset + self.thread_axes_used()))
@@ -7617,6 +8665,29 @@ class BlockSizeTileStrategy(TileStrategy):
                     f"{self.block_ids} and reduction/slice block "
                     f"{strategy.block_index} both require axis {axes}",
                 )
+        return self._check_launch_thread_axis(offset)
+
+    def _check_launch_thread_axis(self, offset: int) -> int:
+        """Return ``offset``, the first thread axis the body gives this
+        strategy, after checking that the launch layout agrees.
+
+        The launch block dims, the surplus-thread masks and every shared
+        memory exchange read the layout from
+        ``TileStrategyDispatch.thread_axis_for_strategy``; a body indexing
+        another axis would run with the wrong thread counts (rows of the tile
+        never launched, or launched without their masks).
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name != "cute" or self.thread_axes_used() == 0:
+            return offset
+        planned = self.fn.tile_strategy.thread_axis_for_strategy(self)
+        if planned is not None and planned != offset:
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"thread-axis layout mismatch: the kernel body places tile "
+                f"blocks {self.block_ids} on thread axis {offset} but the launch "
+                f"layout plans axis {planned}",
+            )
         return offset
 
     def select_pid_strategy(self) -> ProgramIDs:
@@ -7690,6 +8761,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         self._mask_elision_decided = False
         self._mask_var: str | None = self.new_var("mask", dce=True)
         self._offsets_var = self.new_var("offsets", dce=True)
+        self._grid_origin_vars: dict[int, str] = {}
+        # The trip count each block's index is decoded from the flat offset
+        # with, recorded by the codegen.
+        self.trip_counts: dict[int, sympy.Expr | str] = {}
 
         key = (*self.block_ids,)
         assert key not in fn.block_size_var_cache
@@ -7704,6 +8779,38 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
     def offset_var(self, block_idx: int) -> str:
         raise NotImplementedError("offset_var not used in FlattenedTileStrategy")
+
+    def grid_origin_var(self, block_idx: int) -> str:
+        if block_idx not in self._grid_origin_vars:
+            raise exc.InvalidConfig(
+                "computed fragments require rectangular flattened grid tiles"
+            )
+        return self._grid_origin_vars[block_idx]
+
+    def _record_grid_origins(
+        self,
+        state: CodegenState,
+        pid_var: str,
+        block_size_var: str,
+        begins: list[object],
+        steps: list[object | None],
+    ) -> None:
+        if CompileEnvironment.current().backend.name != "cute":
+            return
+        if self.block_size == 1:
+            # A singleton flat tile is a singleton Cartesian tile on every
+            # axis, including nonzero begins and scalar iteration strides.
+            self._grid_origin_vars.update(self.index_vars)
+        elif len(self.block_ids) == 1 and steps[0] in (None, 1):
+            block_id = self.block_ids[0]
+            origin = self.offset_vars[block_id]
+            expression = f"({pid_var}) * ({block_size_var})"
+            if begins[0] != 0:
+                expression = f"({self._expr_str(begins[0])}) + ({expression})"
+            state.add_statement(f"{origin} = {expression}")
+            self._grid_origin_vars[block_id] = origin
+        # A multi-axis flattened interval is not a Cartesian tile. Do not
+        # reinterpret its scalar per-thread coordinates as independent origins.
 
     def mask_var(self, block_idx: int) -> str | None:
         if not self._mask_elision_decided:
@@ -7884,6 +8991,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 if cute_scalar_tile
                 else self._range_trip_count(begin, end, step)
             )
+            self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
@@ -8002,6 +9110,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 if isinstance(state.device_function.pid, ForEachProgramID):
                     pids.shared_pid_var = state.device_function.pid.shared_pid_var
                 pids.append(PIDInfo(pid_var, block_size_var, trip_count, block_id))
+                self._record_grid_origins(
+                    state, pid_var, block_size_var, [begin], [step]
+                )
                 state.add_statement(
                     env.backend.arange_expr(
                         offsets_var,
@@ -8068,6 +9179,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+        self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
 
         # A CuTe grid whose block size is 1 does not claim a thread axis: its
         # ``offsets = pid * 1 + thread_idx[axis]`` term is always 0 (launch dim
@@ -8558,14 +9670,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        # Only use ends_override if there are data-dependent (tensor) bounds
-        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
-        if has_tensor_ends:
-            block_id_to_info = self._create_block_id_info_dict(
-                state, ends_override=ends
-            )
-        else:
-            block_id_to_info = self._create_block_id_info_dict(state)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
@@ -9028,6 +10133,41 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return min(thread_extent, size)
         return thread_extent
 
+    def _demote_blocks_beyond_thread_axes(self, state: CodegenState) -> None:
+        """Serve blocks that would land on CUDA thread axis >= 3 with lanes.
+
+        A launch only has x/y/z thread axes. Once the enclosing loops and
+        reductions have claimed them (``_thread_axis_offset``), every further
+        block of this strategy is demoted to what ``num_threads=1`` means:
+        thread extent 1 and a single thread's lane loop walking the whole
+        tile. This only changes the thread layout, never the elements the tile
+        covers, so it is safe to decide per call site at codegen time.
+        """
+        if self.mma_mode or CompileEnvironment.current().backend.name != "cute":
+            return
+        axis = self._thread_axis_offset(state)
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            block_size = block_size_by_id[block_id]
+            if not self._uses_thread_axis_for_block(block_id, block_size):
+                continue
+            if axis < 3:
+                axis += 1
+                continue
+            size = self._configured_block_size_int(block_size)
+            if size is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"thread axis {axis}: block {block_id} needs a static block "
+                    "size to run as a lane loop",
+                )
+            self._shared_thread_extents[block_id] = 1
+            if size > 1 and block_id not in self._lane_var_by_block:
+                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            if size % vec:
+                self._cute_lane_vec_width_by_block.pop(block_id, None)
+
     def _maybe_apply_cute_cluster(
         self, env: CompileEnvironment, state: CodegenState
     ) -> None:
@@ -9287,6 +10427,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         return exprs
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        self._demote_blocks_beyond_thread_axes(state)
         if not self._lane_var_by_block and not self._shared_thread_extents:
             return super().codegen_grid(state)
 
@@ -9561,13 +10702,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
-        if has_tensor_ends:
-            block_id_to_info = self._create_block_id_info_dict(
-                state, ends_override=ends
-            )
-        else:
-            block_id_to_info = self._create_block_id_info_dict(state)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         lane_loops = [
             (
                 self._lane_var_by_block[block_id],
@@ -9601,7 +10736,39 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             vec_lane_wrappers=vec_wrappers,
         )
 
+    def _lane_nesting_order(self, state: CodegenState) -> list[int]:
+        """Block ids of this device loop's serial lanes, outermost first.
+
+        A thread visits the same elements in any lane nesting, so follow
+        ``loop_order`` except that a lane whose block is reduced in the loop
+        body nests inside the others: the lane reduction lowering finalizes a
+        reduction in its owner lane, which must be the innermost rolled lane
+        (``validate_lane_reduce_owners``).
+        """
+        from .inductor_lowering import ReductionLowering
+
+        env = CompileEnvironment.current()
+        graph_info = getattr(state.codegen, "_cute_active_graph_info", None)
+        reduced = (
+            set()
+            if graph_info is None
+            else {
+                env.canonical_block_id(lowering.block_index)
+                for node in graph_info.graph.nodes
+                if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+            }
+        )
+        return sorted(
+            (
+                block_id
+                for block_id in (self.block_ids[i] for i in self.loop_order)
+                if block_id in self._lane_var_by_block
+            ),
+            key=lambda block_id: env.canonical_block_id(block_id) in reduced,
+        )
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        self._demote_blocks_beyond_thread_axes(state)
         if (
             not self._lane_var_by_block
             and not self._shared_thread_extents
@@ -9624,9 +10791,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         # inner constexpr loop, so per-thread bytes-per-load grow from
         # ``sizeof(dtype)`` to ``V * sizeof(dtype)`` (LDG.64 / LDG.128).
         lane_loops_meta: list[tuple[int, str, int, int]] = []
-        for block_id in (self.block_ids[i] for i in self.loop_order):
-            if block_id not in self._lane_var_by_block:
-                continue
+        for block_id in self._lane_nesting_order(state):
             lane_var = self._lane_var_by_block[block_id]
             extent = self._elements_per_thread_for_block(block_id)
             vec_width = self._cute_lane_vec_width_by_block.get(block_id, 1)
@@ -9950,8 +11115,8 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         # which ``_cute_vector_load_ctx`` gates per tensor.
         self._cute_lane_layout: str = "blocked"
         self._cute_flat_multi: bool = len(block_ids) > 1
-        # ``pid * BLOCK`` of the lane-looped grid: the flattened index var
-        # aliases its offset var, so the tile base is recorded separately.
+        # ``begin + pid * BLOCK`` of the lane-looped grid: the flattened index
+        # var aliases its offset var, so the tile base is recorded separately.
         self._cute_tile_base_expr: str | None = None
         self._cute_lane_vec_width_by_block: dict[int, int] = {}
         self._cute_vec_lane_var_by_block: dict[int, str] = {}
@@ -10022,7 +11187,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         return self._num_threads
 
     def cute_tile_base_expr(self, block_id: int) -> str | None:
-        """Uniform ``pid * BLOCK`` of a single lane-looped flattened block.
+        """Uniform ``begin + pid * BLOCK`` of a single lane-looped flattened block.
 
         ``offset_var`` is the per-element index here (``indices = offsets``),
         so the tile base is recorded by ``codegen_grid`` instead.  ``None``
@@ -10036,7 +11201,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         # ``offset_var`` is the per-element index on this strategy, so
         # ``tile.begin`` must not fall back to it (it would broadcast
         # ``w[tile.begin]`` per element). A single lane-looped block records
-        # its uniform ``pid * BLOCK`` base; otherwise (multi-block flattened
+        # its uniform ``begin + pid * BLOCK`` base; otherwise (multi-block flattened
         # tiles, grids without a lane loop) derive the tile start from the
         # per-element index: tiles are aligned to their static block size, so
         # ``index - index % BLOCK`` is the same value for every element of the
@@ -10150,6 +11315,14 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         lane_strided = self._cute_lane_layout == "strided" and isinstance(
             thread_extent, int
         )
+        begins, ends, steps = self._extract_root_bounds(state)
+        # ``offsets`` is the element's index (``indices = offsets``), so the
+        # tile begin folds into the uniform tile base.  A tile with begins
+        # never flattens, so only a single block can start past zero; its
+        # bounds are static here (data-dependent extents take the N-D
+        # strategy).
+        assert len(block_ids) == 1 or all(begin == 0 for begin in begins)
+        begin = _to_sympy(cast("int | torch.SymInt", begins[0]))
 
         if vec_width > 1 and (
             (
@@ -10163,6 +11336,10 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             # See the matmul-fallback lane-loop-suppression and the
             # epilogue-subtile smem-staging notes in
             # ``PerThreadNDTileStrategy.codegen_grid``.
+            vec_width = 1
+        if vec_width > 1 and not env.known_multiple(begin, vec_width):
+            # A packet is V-aligned only when every lane base is: the tile
+            # begin must be a multiple of V.
             vec_width = 1
         if vec_width > 1:
             # Same outer x constexpr-V lane partition as
@@ -10236,6 +11413,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             )
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
+            self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
@@ -10251,29 +11429,35 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if mask_var is not None:
             lane_setup_statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < ({state.sympy_expr(total_numel)})"
+                    f"{mask_var} = {offsets_var} < "
+                    f"({state.sympy_expr(begin + total_numel)})"
                 )
             )
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
-        self._cute_tile_base_expr = f"({pid_var}) * ({block_size_var})"
+        tile_base = f"({pid_var}) * ({block_size_var})"
+        if begin != 0:
+            # Parenthesized: consumers splice the base into larger
+            # expressions (``tile.id`` divides it by the block size).
+            tile_base = f"(({state.sympy_expr(begin)}) + {tile_base})"
+        self._cute_tile_base_expr = tile_base
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+        self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
         if vec_width > 1 and lane_strided:
             # The strided vec base folds the thread index in itself.
-            state.add_statement(
-                f"{offsets_base_var} = ({pid_var}) * ({block_size_var})"
-            )
+            state.add_statement(f"{offsets_base_var} = {tile_base}")
         elif lane_strided:
-            # ``offsets_base = pid*BS + tid`` (per-lane term adds lane*NT).
+            # ``offsets_base = begin + pid*BS + tid`` (per-lane term adds
+            # lane*NT).
             state.add_statement(
-                f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', 1, axis=axis)}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(tile_base, 1, axis=axis)}"
             )
         else:
             state.add_statement(
-                f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(tile_base, self._elements_per_thread, axis=axis)}"
             )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -10282,7 +11466,9 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             shared_pid.codegen(state)
         else:
             state.device_function.set_pid(pids)
-        block_id_to_info = self._create_block_id_info_dict(state)
+        # Absolute ends, as in ``FlattenedTileStrategy.codegen_grid``:
+        # ``tile.end`` and ``tile.count`` read them next to ``begin``.
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
         lane_loops = []
         if self._lane_var is not None:
             lane_loops = [(self._lane_var, self._elements_per_thread)]
@@ -10328,6 +11514,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
+            self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:

@@ -20,6 +20,7 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_cluster_online_pair import softmax_two_pass_kernel
 
 import helion
+from helion._compiler.cute.cluster_online_pair import fuse_cluster_online_pair
 from helion._compiler.cute.duplicate_reduction_carries import (
     eliminate_duplicate_cluster_maxima,
 )
@@ -473,9 +474,16 @@ def test_duplicate_proof_preserves_backend_loop_metadata() -> None:
 
 
 @cache
-def _cluster_source(dtype: torch.dtype, columns: int, cluster: int) -> str:
+def _cluster_source(
+    dtype: torch.dtype, columns: int, cluster: int, *, fast_math: bool = True
+) -> str:
+    # The packed pair matches the distributed scale (``_helion_scaled_*``),
+    # which, like the pair's rescaled exponentials, needs fast_math.
     kernel = helion.kernel(
-        softmax_two_pass_kernel.fn, backend="cute", static_shapes=True, fast_math=False
+        softmax_two_pass_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        fast_math=fast_math,
     )
     return kernel._bind_isolated((torch.empty(32, columns, dtype=dtype),)).to_code(
         helion.Config(
@@ -512,7 +520,175 @@ def test_static_cluster_keeps_one_exchange_with_global_first_tile_poison(
     pair_index = code.index("mi = _pair_gmax_0")
     poison_index = code.index("operator.eq(mi,", pair_index)
     assert poison_index > pair_index
-    assert "fastmath=True" not in code
+    assert f"cluster_n={cluster}, scale=1.4426950408889634, fastmath=True)" in code
+
+
+def test_default_settings_pair_with_exact_exponentials() -> None:
+    """Without fast_math the exchanges still pair, but every exponential
+    keeps its exact ``(x - max) * C`` form: sweep B's in the zero-guarded
+    frame of the CTA maximum, sweep C's recomputed from the global one
+    instead of rescaling cached values."""
+    code = _cluster_source(torch.bfloat16, 32768, 2, fast_math=False)
+    assert code.count("_cute_grouped_reduce_cluster_online_pair(") == 1
+    assert "_cute_grouped_reduce_cluster(" not in code
+    assert "cluster_n=2, scale=1.4426950408889634, fastmath=False)" in code
+    assert "_pair_frame_0 = cutlass.Float32(0) if _pair_negative_inf_0 else mi" in code
+    assert "v_5 = v_4 - _pair_frame_0" in code
+    assert "v_12 = v_11 - mi\n" in code
+    assert "v_13 = cute.math.exp2(cutlass.Float32(v_12) * 1.4426950408889634)\n" in code
+    assert code.index("mi = _pair_gmax_0") < code.index("v_12 = v_11 - mi")
+    for absent in (
+        "_helion_scaled_",
+        "_pair_exp_cache_",
+        "_pair_rescale_",
+        "fastmath=True",
+    ):
+        assert absent not in code
+
+
+# The default-settings (exact exponent) form of a cluster-split softmax row.
+_EXACT_ONLINE_PAIR = """
+_cluster_red_buf = cute.arch.alloc_smem(cutlass.Float32, 16)
+_cluster_red_mbar = cute.arch.alloc_smem(cutlass.Int64, 1)
+if cutlass.Int32(cute.arch.thread_idx()[0]) == 0:
+    cute.arch.mbarrier_init(_cluster_red_mbar, 1)
+_cluster_red_buf_2 = cute.arch.alloc_smem(cutlass.Float32, 16)
+_cluster_red_mbar_2 = cute.arch.alloc_smem(cutlass.Int64, 1)
+if cutlass.Int32(cute.arch.thread_idx()[0]) == 0:
+    cute.arch.mbarrier_init(_cluster_red_mbar_2, 1)
+mi = cutlass.Float32(float('-inf'))
+for tile in range(cutlass.Int32(0), cutlass.Int32(N), cutlass.Int32(BLOCK)):
+    acc_max = cutlass.Float32(float('-inf'))
+    for lane in range(8):
+        for vec in cutlass.range_constexpr(8):
+            acc_max = cute.arch.fmax(acc_max, cutlass.Float32(x[lane * 8 + vec]), nan=True)
+    lane_id = cutlass.Int32(cute.arch.thread_idx()[0])
+    result = _cute_grouped_reduce_cluster(acc_max, 'max', cutlass.Float32(float('-inf')), lane_id, _cluster_red_buf, _cluster_red_mbar, group_span=256, cluster_n=2)
+    v_0 = cutlass.Float32(result)
+    mi_copy_0 = mi
+    mi = cute.math.max(cutlass.Float32(mi_copy_0), cutlass.Float32(v_0), propagate_nan=True)
+di = cutlass.Float32(0.0)
+for tile in range(cutlass.Int32(0), cutlass.Int32(N), cutlass.Int32(BLOCK)):
+    acc = cutlass.Float32(0)
+    for lane in range(8):
+        mi_copy_1 = mi
+        for vec in cutlass.range_constexpr(8):
+            v_4 = cutlass.Float32(x[lane * 8 + vec])
+            v_5 = v_4 - mi_copy_1
+            v_6 = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)
+            acc = acc + cutlass.Float32(cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634))
+    lane_id_2 = cutlass.Int32(cute.arch.thread_idx()[0])
+    result_2 = _cute_grouped_reduce_cluster(acc, 'sum', cutlass.Float32(0), lane_id_2, _cluster_red_buf_2, _cluster_red_mbar_2, group_span=256, cluster_n=2)
+    sum_1 = cutlass.Float32(result_2)
+    di = di + sum_1
+for tile in range(cutlass.Int32(0), cutlass.Int32(N), cutlass.Int32(BLOCK)):
+    for lane in range(8):
+        for vec in cutlass.range_constexpr(8):
+            v_11 = cutlass.Float32(x[lane * 8 + vec])
+            v_12 = v_11 - mi
+            v_13 = cute.math.exp2(cutlass.Float32(v_12) * 1.4426950408889634)
+            out[lane * 8 + vec] = v_13 / di
+"""
+
+
+def _fuse_exact(source: str) -> str:
+    body = fuse_cluster_online_pair(
+        ast.parse(source).body, {"N": 4096, "BLOCK": 4096}, fast_math=False
+    )
+    return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+
+def test_exact_pair_moves_only_sweep_b_into_the_cta_frame() -> None:
+    code = _fuse_exact(_EXACT_ONLINE_PAIR)
+    assert "_cute_grouped_reduce_cluster(" not in code
+    assert "_cute_grouped_reduce_block(acc_max, 'max'" in code
+    assert (
+        "_pair_gmax_0, result_2 = _cute_grouped_reduce_cluster_online_pair(acc, mi, "
+        "lane_id_2, _cluster_red_buf_2, _cluster_red_mbar_2, group_span=256, "
+        "cluster_n=2, scale=1.4426950408889634, fastmath=False)\n    mi = _pair_gmax_0"
+    ) in code
+    assert "_pair_frame_0 = cutlass.Float32(0) if _pair_negative_inf_0 else mi" in code
+    assert "v_5 = v_4 - _pair_frame_0" in code
+    # Sweep C is untouched: it reads the global maximum.
+    assert "v_12 = v_11 - mi\n" in code
+    assert "_cluster_red_buf = " not in code
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        # ``mi`` used other than as an exponent's subtrahend.
+        (
+            "v_4 = cutlass.Float32(x[lane * 8 + vec])",
+            "v_4 = cutlass.Float32(x[lane * 8 + vec]) * mi_copy_1",
+        ),
+        # The shift used outside the exponent.
+        (
+            "acc = acc + cutlass.Float32(cute.math.exp2(",
+            "acc = acc + v_5 + cutlass.Float32(cute.math.exp2(",
+        ),
+        # A term that does not scale with the frame.
+        ("acc = acc + cutlass.Float32(", "acc = acc * 2.0 + cutlass.Float32("),
+        # Two exponent scales.
+        (
+            "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)",
+            "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 2.0)",
+        ),
+        # An exponential that escapes into a store.
+        (
+            "acc = acc + cutlass.Float32(cute.math.exp2(",
+            "out[vec] = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)\n            acc = acc + cutlass.Float32(cute.math.exp2(",
+        ),
+        # A copy of the (now CTA-local) maximum read after the exchange.
+        ("v_12 = v_11 - mi\n", "v_12 = v_11 - mi_copy_1\n"),
+        # The CTA-frame accumulator read after the exchange.
+        ("di = di + sum_1", "di = di + sum_1 + acc"),
+        # A minuend other than the element the max reduced: another tensor,
+        # a shifted or scaled element.  The CTA frame could overflow, and an
+        # all--inf slice of x would drop finite terms.
+        (
+            "v_4 = cutlass.Float32(x[lane * 8 + vec])",
+            "v_4 = cutlass.Float32(y[lane * 8 + vec])",
+        ),
+        (
+            "v_4 = cutlass.Float32(x[lane * 8 + vec])",
+            "v_4 = cutlass.Float32(x[lane * 8 + vec]) + bias",
+        ),
+        (
+            "v_4 = cutlass.Float32(x[lane * 8 + vec])",
+            "v_4 = cutlass.Float32(x[lane * 8 + vec]) * 2.0",
+        ),
+        (
+            "v_4 = cutlass.Float32(x[lane * 8 + vec])",
+            "v_4 = cutlass.Float32(x[lane * 8 + vec + 1])",
+        ),
+        # The max reduced over something else than the exponent's minuend.
+        (
+            "cutlass.Float32(x[lane * 8 + vec]), nan=True)",
+            "cute.math.min(cutlass.Float32(x[lane * 8 + vec]), 0.0), nan=True)",
+        ),
+        # A NaN-dropping max.
+        (
+            "cutlass.Float32(x[lane * 8 + vec]), nan=True)",
+            "cutlass.Float32(x[lane * 8 + vec]))",
+        ),
+        # An accumulator update the matcher does not model.
+        (
+            "acc = acc + cutlass.Float32(cute.math.exp2(",
+            "acc += cutlass.Float32(1.0)\n            acc = acc + cutlass.Float32(cute.math.exp2(",
+        ),
+        # A named exponential with another use.
+        (
+            "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)",
+            "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)\n            out[vec] = v_6",
+        ),
+    ],
+)
+def test_exact_pair_declines_frame_dependent_uses(old: str, new: str) -> None:
+    assert old in _EXACT_ONLINE_PAIR
+    code = _fuse_exact(_EXACT_ONLINE_PAIR.replace(old, new, 1))
+    assert "_cute_grouped_reduce_cluster_online_pair(" not in code
+    assert code.count("_cute_grouped_reduce_cluster(") == 2
 
 
 @cache
@@ -589,7 +765,10 @@ def _cluster_softmax_oracle(values: torch.Tensor, *, repaired: bool) -> torch.Te
             namespace = {
                 "cutlass": SimpleNamespace(Float32=np.float32),
                 "cute": SimpleNamespace(
-                    math=SimpleNamespace(exp2=np.exp2, fma=_fp32_array_fma)
+                    math=SimpleNamespace(
+                        exp2=lambda value, fastmath=False: np.exp2(value),
+                        fma=_fp32_array_fma,
+                    )
                 ),
                 "mi": np.float32(local_max[index].item()),
                 input_name: values[index].numpy(),

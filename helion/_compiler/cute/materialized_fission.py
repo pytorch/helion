@@ -418,7 +418,7 @@ def _shape_only(node: ast.AST, tensor_names: set[str]) -> bool:
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id in tensor_names
-            and node.func.attr in ("size", "stride", "dim", "ndimension")
+            and node.func.attr in ("size", "stride", "dim", "ndimension", "numel")
             and not node.keywords
             and all(_shape_only(arg, tensor_names) for arg in node.args)
         )

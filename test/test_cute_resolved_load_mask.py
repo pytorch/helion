@@ -21,6 +21,7 @@ from test.test_cute_collective_native_seeded import _mamba_sizes
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.memory_ops import _cute_resolved_load_mask
+from helion._compiler.host_function import HostFunction
 from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
@@ -87,7 +88,12 @@ def test_full_slice_preserves_resolved_axis_mask(
         ),
     )
     predicate = ast.Name(id="predicate", ctx=ast.Load()) if extra else None
-    with patch.object(CompileEnvironment, "current", return_value=env):
+    with (
+        patch.object(CompileEnvironment, "current", return_value=env),
+        patch.object(
+            HostFunction, "current", return_value=SimpleNamespace(expr_to_origin={})
+        ),
+    ):
         if alias == "different_mask":
             with pytest.raises(
                 helion.exc.BackendUnsupported, match="ambiguous coordinate bounds"

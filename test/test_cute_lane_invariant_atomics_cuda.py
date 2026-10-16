@@ -16,6 +16,7 @@ from test.test_cute_lane_invariant_atomics import _NESTED
 from test.test_cute_lane_invariant_atomics import _NESTED_3D
 from test.test_cute_lane_invariant_atomics import _NESTED_INNER_SERIAL
 from test.test_cute_lane_invariant_atomics import _NESTED_SCALAR
+from test.test_cute_lane_invariant_atomics import _ONE_PER_THREAD
 from test.test_cute_lane_invariant_atomics import _ROW
 from test.test_cute_lane_invariant_atomics import _begin_count_then_copy
 from test.test_cute_lane_invariant_atomics import _col_count_then_copy
@@ -161,6 +162,8 @@ def test_per_element_atomics_match_reference() -> None:
 
 @pytest.mark.parametrize("packet_flush", [False, True], ids=["values", "packet"])
 def test_byte_conversion_and_count_match_reference(packet_flush: bool) -> None:
+    if packet_flush and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("signed-byte BF16 packets are restricted to sm_100a")
     packed = torch.randint(-128, 128, (8, 256), dtype=torch.int8, device=CUDA_DEVICE)
     counter = torch.zeros((1,), dtype=torch.int32, device=CUDA_DEVICE)
     out = _run(
@@ -194,6 +197,18 @@ def test_unplaceable_lane_invariant_atomics_reject_the_config() -> None:
     counter = torch.zeros((1,), dtype=torch.int32, device=CUDA_DEVICE)
     with pytest.raises(exc.BackendUnsupported, match="leader thread"):
         _run(_count_then_offset_the_copy, (x, counter), **_LANES)
+
+
+def test_leader_atomic_result_reaches_every_thread_of_its_tile() -> None:
+    x = torch.zeros((8, 64), device=CUDA_DEVICE)
+    counter = torch.zeros((1,), dtype=torch.int32, device=CUDA_DEVICE)
+    out = _run(_count_then_offset_the_copy, (x, counter), **_ONE_PER_THREAD)
+    tiles = _tiles(tuple(x.shape), _ONE_PER_THREAD)
+    assert counter.item() == tiles
+    # Every element of a tile holds the tile's ticket; the tickets are distinct.
+    per_tile = out.view(2, 4, 2, 32).permute(0, 2, 1, 3).reshape(tiles, -1)
+    assert bool((per_tile == per_tile[:, :1]).all())
+    assert sorted(per_tile[:, 0].tolist()) == list(range(tiles))
 
 
 def _small_integers(shape: tuple[int, ...]) -> torch.Tensor:

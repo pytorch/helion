@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import typing
 import unittest
@@ -8,6 +9,8 @@ from unittest.mock import patch
 from packaging import version
 import pytest
 import torch
+from torch._decomp.decompositions import silu as core_silu
+import torch._inductor.decomposition as inductor_decomp
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -39,7 +42,6 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -48,6 +50,11 @@ from helion.runtime.ref_mode import is_ref_mode_enabled
 
 _orig_cudnn_fp32_precision: str = "none"
 _orig_float32_matmul_precision: str = "none"
+
+_CUTE_LINEAR_ATTN_SKIP = (
+    "[C, C] intra-chunk tiles (causal mask, q @ k^T, hl.zeros([t, C, C])) bind "
+    "one block id to two axes; cute's SIMT lowering has one lane per block id"
+)
 
 
 def _compile_only(
@@ -71,6 +78,31 @@ def _compile_only(
         bound._config = config
         return bound
     return bound.compile_config(config)
+
+
+@contextlib.contextmanager
+def _core_silu_decomposition() -> typing.Iterator[None]:
+    """Trace ``aten.silu`` with the core decomposition instead of Inductor's.
+
+    Inductor's custom silu decomposition (pytorch PR #171723) changes the
+    codegen between torch 2.9 and nightly.  ``fast_random_decomps()`` caches
+    a copy of the decomposition table, so the cache is cleared on entry, for
+    the patch to take effect, and again on exit: otherwise every later kernel
+    in the process traces silu with the core decomposition.
+    """
+
+    def clear_cache() -> None:
+        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
+            inductor_decomp.fast_random_decomps.cache_clear()
+
+    clear_cache()
+    try:
+        with patch.dict(
+            inductor_decomp.decompositions, {torch.ops.aten.silu.default: core_silu}
+        ):
+            yield
+    finally:
+        clear_cache()
 
 
 def setUpModule() -> None:
@@ -345,7 +377,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             static_shapes=True,
         )
 
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute", "triton"])
     def test_matmul_layernorm_half_dtype_multi_k_tile(self):
         """Guards K-loop accumulator precision when inputs are half-precision.
 
@@ -370,7 +402,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul_layernorm",
             args,
             expected,
-            block_sizes=[32, 256],
+            # [32, 256] keeps a whole [32, 1024] fp32 accumulator per program,
+            # which overflows Triton's shared memory and is refused by CuTe;
+            # [16, 16] still accumulates 64 K tiles.
+            block_sizes=[32, 256] if _get_backend() == "pallas" else [16, 16],
             static_shapes=True,
             atol=0.02,
             rtol=0.2,
@@ -389,10 +424,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         _compile_only(mod.matmul_layernorm, args, block_sizes=[16, 16])
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
-    )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -476,7 +507,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm_scaled(self):
         # Match TritonBench: non-unit tensor-wise scales and a column-major B
@@ -667,33 +698,41 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @parametrize("reduction_block_size", (32, 1024))
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("Test requires compiling a specific reduction config")
-    @skipUnlessTensorDescriptor("Test configs require tensor descriptor support")
+    @skipIfFn(
+        lambda: _get_backend() != "cute" and not _compat.supports_tensor_descriptor(),
+        "Test configs require tensor descriptor support",
+    )
     def test_welford_bfloat16_accuracy(self, reduction_block_size):
         from examples.welford import eager_layer_norm
         from examples.welford import welford
 
-        config = helion.Config(
-            atomic_indexing=[],
-            block_sizes=[16, reduction_block_size, 256],
-            indexing=[
-                "pointer",
-                "pointer",
-                "pointer",
-                "tensor_descriptor",
-                "pointer",
-            ],
-            load_eviction_policies=["last", "first", "", "last"],
-            num_stages=1,
-            num_warps=4,
-            pid_type="flat",
-            range_flattens=[None, None, None],
-            range_multi_buffers=[None, None, None],
-            range_num_stages=[0, 0, 0],
-            range_unroll_factors=[0, 0, 0],
-        )
+        if _get_backend() == "cute":
+            # The Triton config below pins Triton-only knobs (indexing,
+            # num_warps, range hints); cute checks the same reduction tiling.
+            config = helion.Config(block_sizes=[16, reduction_block_size, 256])
+        else:
+            config = helion.Config(
+                atomic_indexing=[],
+                block_sizes=[16, reduction_block_size, 256],
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                ],
+                load_eviction_policies=["last", "first", "", "last"],
+                num_stages=1,
+                num_warps=4,
+                pid_type="flat",
+                range_flattens=[None, None, None],
+                range_multi_buffers=[None, None, None],
+                range_num_stages=[0, 0, 0],
+                range_unroll_factors=[0, 0, 0],
+            )
 
         torch.manual_seed(1337)
         rows, columns = 4096, 1024
@@ -813,6 +852,60 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="rms_norm_fwd",
             block_sizes=[16],
             indexing="pointer",
+        )
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_rope_fwd(self):
+        batch, q_heads, k_heads, seq_len, head_dim = 1, 4, 2, 128, 64
+        q = torch.randn(
+            [batch, q_heads, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            [batch, k_heads, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        angles = torch.randn(
+            [batch, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        cos, sin = angles.cos(), angles.sin()
+        mod = import_path(EXAMPLES_DIR / "rope.py")
+        check_example(
+            "rope",
+            (q, k, cos, sin),
+            mod.rope_pytorch(q, k, cos, sin),
+            fn_name="rope_fwd",
+            block_sizes=[1, 32],
+        )
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_rope_bwd(self):
+        batch, q_heads, k_heads, seq_len, head_dim = 1, 4, 2, 128, 64
+        q = torch.randn(
+            [batch, q_heads, seq_len, head_dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        k = torch.randn(
+            [batch, k_heads, seq_len, head_dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        angles = torch.randn(
+            [batch, seq_len, head_dim], device=DEVICE, dtype=torch.bfloat16
+        )
+        cos, sin = angles.cos(), angles.sin()
+        mod = import_path(EXAMPLES_DIR / "rope.py")
+        q_out, k_out = mod.rope_pytorch(q, k, cos, sin)
+        grad_q_out = torch.randn_like(q_out)
+        grad_k_out = torch.randn_like(k_out)
+        torch.autograd.backward((q_out, k_out), (grad_q_out, grad_k_out))
+        check_example(
+            "rope",
+            (grad_q_out, grad_k_out, cos, sin),
+            (q.grad, k.grad),
+            fn_name="rope_bwd",
+            block_sizes=[1, 32],
         )
 
     def test_swiglu_bwd(self):
@@ -1052,31 +1145,39 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_sparse_attn_indexer(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        torch.manual_seed(0)
         args = mod.indexer_inputs(num_tokens=128, kv_len=512)
-        # The reference einsum runs in bf16, so kernel-vs-reference diffs are
-        # pure schedule noise: one head's O(11) score rounds by ~11*2^-8 and
-        # the 32-head sum random-walks to ~sqrt(32) of that (~0.25 abs).
+        # Kernel and reference both round each head's bf16 score before the
+        # weighted sum, so they agree exactly except where a different fp32
+        # accumulation order lands a score on the other side of a bf16 rounding
+        # boundary; see MAX_MISMATCH_PCT in the example. Positions outside the
+        # window are -inf on both sides and compare equal.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits",
             block_sizes=[16, 128],
-            atol=0.3,
+            atol=1e-2,
+            max_mismatch_pct=mod.MAX_MISMATCH_PCT,
+            max_mismatched_abs_diff=mod.MAX_MISMATCHED_ABS_DIFF,
         )
 
     @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        torch.manual_seed(0)
         args = mod.indexer_inputs(num_tokens=1, kv_len=512)
-        # Same schedule-noise bound as test_sparse_attn_indexer above.
+        # Same rounding-boundary budget as test_sparse_attn_indexer above.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits_decode",
             block_sizes=[1, 128],
-            atol=0.3,
+            atol=1e-2,
+            max_mismatch_pct=mod.MAX_MISMATCH_PCT,
+            max_mismatched_abs_diff=mod.MAX_MISMATCHED_ABS_DIFF,
         )
 
     @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
@@ -1343,11 +1444,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
-    )
-    @onlyBackends(["triton", "pallas"])
+    @onlyBackends(["triton", "pallas", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     @xfailIfPallasInterpret("unsupported torch.float8_e4m3fn dtype")
     def test_fp8_attention(self):
@@ -1506,6 +1603,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Regression test: large batch, small dim."""
         self._run_layernorm_bwd(batch_size=1152 * 1000, dim=16, seed=1)
 
+    # MI350X CI intermittently returns wrong values for a few rows of
+    # this reduce-then-normalize kernel (tens to hundreds of elements off
+    # by up to 0.35, different rows on each failure) while every CUDA job
+    # passes; the two-pass softmax backward and the looped layernorms in
+    # test_autodiff.py and test_unroll_tuples.py fail the same way.  Seen
+    # since 2026-10-11 on one triton-rocm build; not reproduced outside CI.
+    @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_softmax_bwd(self):
         m, n = 2048, 2048
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
@@ -1576,6 +1680,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
+    @skipIfRefEager("checks the decomposition cache; runs no kernel")
+    def test_core_silu_decomposition_does_not_outlive_its_patch(self):
+        # A patched decomposition table left in fast_random_decomps()'s cache
+        # changed the codegen of every later kernel in the process (the CuTe
+        # flash_gated tests failed after the HSTU examples).
+        silu = torch.ops.aten.silu.default
+        inductor_silu = inductor_decomp.select_decomp_table()[silu]
+        with _core_silu_decomposition():
+            self.assertIs(inductor_decomp.select_decomp_table()[silu], core_silu)
+        self.assertIs(inductor_decomp.select_decomp_table()[silu], inductor_silu)
+
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
@@ -1628,17 +1743,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             q, k, v, seq_offsets, None, max_seq_len
         )
 
-        # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-        # This ensures consistent codegen both torch 2.9 (stable) and nightly versions.
-        from torch._decomp.decompositions import silu
-        import torch._inductor.decomposition as inductor_decomp
-
-        # Clear cache since fast_random_decomps() caches a copy of decompositions
-        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-            inductor_decomp.fast_random_decomps.cache_clear()
-        with patch.dict(
-            inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-        ):
+        with _core_silu_decomposition():
             check_example(
                 "jagged_hstu_attn",
                 args,
@@ -1656,7 +1761,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             ("default", "medium", 1.5, 5e-2),
         ],
     )
-    @onlyBackends(["pallas"])
+    @onlyBackends(["pallas", "cute"])
     def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
         torch.manual_seed(0)
         num_sequnces = 4
@@ -1690,23 +1795,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
             expected = mod.reference_jagged_hstu_attention(*args)
 
-            # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-            # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
-            from torch._decomp.decompositions import silu
-            import torch._inductor.decomposition as inductor_decomp
-
-            if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-                inductor_decomp.fast_random_decomps.cache_clear()
-
             with (
                 patch.object(
                     mod.jagged_hstu_attention.settings,
                     "dot_precision",
                     helion_precision,
                 ),
-                patch.dict(
-                    inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-                ),
+                _core_silu_decomposition(),
             ):
                 # Clear the cache to ensure the modified settings are used.
                 mod.jagged_hstu_attention._bound_kernels.clear()
@@ -2257,6 +2352,41 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 8, 8, 8, 8, 8, 8],
         )
 
+    @skipIfFn(
+        lambda: _get_backend() != "cute",
+        "CuTe lane-reduction coverage for the example's default shape",
+    )
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_layer_norm_lane_split(self):
+        # M=32 features over 16-wide tiles gives a 16-lane / 1-thread lane
+        # loop whose per-lane row sums are updated by the inner jagged loop
+        # under an SSA alias before the lane reduction feeds the carried mean.
+        num_rows, max_cols, M = 16, 32, 32
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        eps = 1e-6
+        args = (x_data, x_offsets, eps)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
+        expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
+
+        check_example(
+            "jagged_layer_norm",
+            args,
+            expected,
+            fn_name="jagged_layer_norm_kernel",
+            block_sizes=[16] * 7,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
     def test_exp_fwd(self):
         x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
         args = (x,)
@@ -2770,6 +2900,87 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
+    def _flex_attention_block_mask_cases(self):
+        """Run the example with multi-block causal and 2D-neighborhood BlockMasks.
+
+        Yields ``(out, lse, expected, expected_lse)`` per mask, the references
+        computed from the dense mask.
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+        from torch.nn.attention.flex_attention import create_mask
+
+        z, h, n_ctx, head_dim = 2, 2, 512, 64
+        q, k, v = [
+            torch.randn((z, h, n_ctx, head_dim), dtype=HALF_DTYPE, device=DEVICE)
+            for _ in range(3)
+        ]
+
+        def causal(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        def neighborhood(b, h, q_idx, kv_idx):
+            # 2D 32x16 canvas, 5x5 window: leaves fully masked rows in partial blocks
+            q_x, q_y = q_idx // 16, q_idx % 16
+            kv_x, kv_y = kv_idx // 16, kv_idx % 16
+            return ((q_x - kv_x).abs() <= 2) & ((q_y - kv_y).abs() <= 2)
+
+        mod = import_path(EXAMPLES_DIR / "flex_attention.py")
+        config = helion.Config(block_sizes=[64, 64])
+        original_configs = mod.helion_flex_attention_kernel.configs
+        self.addCleanup(
+            setattr, mod.helion_flex_attention_kernel, "configs", original_configs
+        )
+        mod.helion_flex_attention_kernel.configs = [config]
+        for mask_mod in (causal, neighborhood):
+            block_mask = create_block_mask(mask_mod, z, h, n_ctx, n_ctx, device=DEVICE)
+            visited = block_mask.kv_num_blocks + block_mask.full_kv_num_blocks
+            self.assertGreater(visited.max().item(), 1)
+            out, lse = mod.helion_flex_attention(
+                q, k, v, block_mask=block_mask, return_lse=True
+            )
+            dense = create_mask(mask_mod, z, h, n_ctx, n_ctx, device=DEVICE)
+            expected = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=dense
+            )
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(
+                head_dim
+            )
+            expected_lse = torch.logsumexp(
+                scores.masked_fill(~dense, float("-inf")), dim=-1
+            )
+            yield out, lse, expected, expected_lse
+
+    @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    def test_flex_attention_block_mask(self):
+        """Multi-block BlockMasks: kv_indices are block ids, masks broadcast over kv,
+        and partially masked rows must not produce NaN."""
+        for (
+            out,
+            _lse,
+            expected,
+            _expected_lse,
+        ) in self._flex_attention_block_mask_cases():
+            self.assertFalse(torch.isnan(out).any().item())
+            torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @xfailIfPallas(
+        "the (B, H, M) lse is stored one head per grid step, but H is the sublane "
+        "dim of its TPU block and a block of 1 head is not expressible, so the "
+        "Pallas backend keeps the whole H extent in the block and each step "
+        "leaves the other heads' rows undefined"
+    )
+    def test_flex_attention_block_mask_lse(self):
+        """The LSE matches torch.logsumexp over the dense mask (natural log; -inf for
+        rows with no visible key)."""
+        for (
+            _out,
+            lse,
+            _expected,
+            expected_lse,
+        ) in self._flex_attention_block_mask_cases():
+            torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
@@ -2966,6 +3177,16 @@ class TestExamples(RefEagerTestBase, TestCase):
                 )
                 kernel.settings.autotune_effort = "none"
 
+        if _get_backend() == "triton" and torch.version.cuda is not None:
+            # Sixteen warps avoid Triton 3.7.1's loop-to-dot layout-conversion
+            # failure in this correctness-only schedule. Keep the tiled loops
+            # and arithmetic intact, and restore production configs afterward.
+            kernel = engine.chunk_bwd_wy_dL_delta_helion
+            self.addCleanup(kernel.reset)
+            self.addCleanup(setattr, kernel, "configs", kernel.configs)
+            kernel.configs = [helion.Config(block_sizes=[16, 16, 16], num_warps=16)]
+            kernel.reset()
+
     def _run_linear_example(self, name: str, method: str = "test") -> None:
         import importlib
 
@@ -2980,70 +3201,70 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
+    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
 
@@ -3196,18 +3417,21 @@ class TestExamples(RefEagerTestBase, TestCase):
         # use_beta_sigmoid_in_kernel); our engine wants a per-timestep log-decay and
         # an activated beta, so reproduce FLA's elementwise transforms here.
         def preprocess(q, g, beta, kw):
-            A_log, dt_bias = kw.get("A_log"), kw.get("dt_bias")
-            if A_log is not None:
+            if kw.get("use_gate_in_kernel", False):
+                A_log, dt_bias = kw["A_log"], kw.get("dt_bias")
                 # gate == FLA naive_gdn_gate (fla/ops/gated_delta_rule/gate.py):
                 # https://github.com/fla-org/flash-linear-attention/blob/6bd90692588c81fe102ee6e12ac70686359658a2/fla/ops/gated_delta_rule/gate.py#L20
-                g = g + dt_bias if dt_bias is not None else g
-                g = -A_log.float().exp() * F.softplus(g.float())
+                g = g.float()
+                g = g + dt_bias.float() if dt_bias is not None else g
+                g = -A_log.float().exp() * F.softplus(g)
             # beta == FLA fused_beta_sigmoid, scale=2 if allow_neg_eigval else 1
             # (fla/ops/gated_delta_rule/chunk.py, use_beta_sigmoid_in_kernel branch):
             # https://github.com/fla-org/flash-linear-attention/blob/6bd90692588c81fe102ee6e12ac70686359658a2/fla/ops/gated_delta_rule/chunk.py#L286
-            scale = 2.0 if kw.get("allow_neg_eigval") else 1.0
-            beta = scale * torch.sigmoid(beta.float())
-            return g.to(q.dtype), beta.to(q.dtype)
+            if kw.get("use_beta_sigmoid_in_kernel", False):
+                scale = 2.0 if kw.get("allow_neg_eigval") else 1.0
+                beta = scale * torch.sigmoid(beta.float())
+            # Older FLA versions activate these inputs in the layer itself.
+            return g, beta
 
         self._linear_attn_monkeypatch_test(
             LinearAttentionVariant.GATED_DELTA_RULE,

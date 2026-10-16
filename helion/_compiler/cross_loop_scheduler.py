@@ -994,6 +994,8 @@ class StaticPipelinePlan:
     done_roots: frozenset[int] = frozenset()
     # Roots after every synchronized root: they neither wait nor publish.
     trailing_roots: frozenset[int] = frozenset()
+    # Per-key cross-rank counters for the peer dependencies no edge carries.
+    peer_counters: tuple[ReadinessCounterPlan, ...] = ()
 
     def __post_init__(self) -> None:
         if self.dispatch_mode not in ("static", "dynamic"):
@@ -1020,7 +1022,7 @@ class StaticPipelinePlan:
             raise ValueError("root-barrier edge must reference source-ordered roots")
 
         continuation_roots: list[int] = []
-        for counter in self.readiness_counters:
+        for counter in (*self.readiness_counters, *self.peer_counters):
             if not _supports_emitted_counter_plan_lowering(
                 counter,
                 root_domains,
@@ -2969,10 +2971,18 @@ def build_static_pipeline_plan(
         for edge in dependency_graph.edges
         for dependency in edge.access_dependencies
     }
+    peer_graph = dependency_graph.peer_counter_graph()
+    peer_counters = _keyed_peer_counters(
+        peer_graph,
+        root_domains=root_domains,
+        site_domains=site_domains,
+        prove_nonnegative=prove_nonnegative,
+        charge=charge,
+    )
+    keyed_obligations = _covered_obligations(peer_counters)
+    peer_pairs = peer_graph.obligations_by_root_pair()
     peer_edges = frozenset(
-        (producer, consumer)
-        for producer, consumer, transport in transports
-        if transport == "peer_counter"
+        pair for pair, obligations in peer_pairs if not obligations <= keyed_obligations
     )
     cross_rank_roots = frozenset(
         root
@@ -3177,8 +3187,86 @@ def build_static_pipeline_plan(
         proposal,
         peer_edges=peer_edges,
         # Parity and credit already keep in-band roots from reusing live buffers.
-        done_roots=frozenset(root for edge in peer_edges for root in edge),
+        done_roots=_unordered_reuse_roots(
+            tuple(pair for pair, _ in peer_pairs),
+            peer_edges,
+            peer_counters,
+            dependency_graph.inband_read_roots,
+            proposal.root_barrier_edges,
+        ),
+        peer_counters=peer_counters,
     )
+
+
+def _unordered_reuse_roots(
+    peer_pairs: tuple[tuple[int, int], ...],
+    peer_edges: frozenset[tuple[int, int]],
+    peer_counters: tuple[ReadinessCounterPlan, ...],
+    inband_read_roots: frozenset[int],
+    root_barrier_edges: frozenset[tuple[int, int]],
+) -> frozenset[int]:
+    """Roots of the peer pairs whose next-launch writes need the done barrier.
+
+    A pair's data and counter are reused safely once every rank's readers ended.
+    A root ends before every rank's launch does if each launch waits on all its
+    tasks: through a whole-root peer edge, inband words polled in full, or a
+    local root barrier into such a root. A writer whose every task waits on every
+    rank runs after their launches.
+    """
+    gated = {consumer for _, consumer in peer_edges} | {
+        consumer.consumer_root
+        for plan in peer_counters
+        for consumer in plan.consumers
+        if consumer.consumer_site_id is None
+        and consumer.keys_by_consumer.has_total_source()
+    }
+    ended = {producer for producer, _ in peer_edges} | inband_read_roots
+    while grown := {p for p, c in root_barrier_edges if c in ended} - ended:
+        ended |= grown
+    return frozenset(
+        root
+        for producer, consumer in peer_pairs
+        if producer not in gated and consumer not in ended
+        for root in (producer, consumer)
+    )
+
+
+def _keyed_peer_counters(
+    peer_graph: TileDependencyGraph,
+    *,
+    root_domains: tuple[CoordinateDomain, ...],
+    site_domains: tuple[CoordinateDomain | None, ...],
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+    charge: Callable[[int], bool],
+) -> tuple[ReadinessCounterPlan, ...]:
+    """Multi-key peer events with one root producer and later root consumers.
+
+    Every producer task adds one on every rank, so a launch adds a fixed count.
+    """
+    result: list[ReadinessCounterPlan] = []
+    for event in _build_readiness_events(
+        peer_graph,
+        root_domains=root_domains,
+        site_domains=site_domains,
+        prove_nonnegative=prove_nonnegative,
+        charge=charge,
+    ):
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+        producer = event.producers[0]
+        if (
+            len(event.producers) == 1
+            and producer.producer_site_id is None
+            and event.readiness_key_domain.size > 1
+            and (plan.uniform_arrival_count() or 0) > 0
+            and all(
+                consumer.consumer_site_id is None
+                and consumer.consumer_root > producer.producer_root
+                for consumer in event.consumers
+            )
+            and _supports_emitted_counter_plan_lowering(plan, root_domains)
+        ):
+            result.append(plan)
+    return tuple(result)
 
 
 def _select_root_barrier_edges(

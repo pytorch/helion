@@ -25,7 +25,7 @@ from .pattern_search import PatternSearch
 from .search_space_logger import canonical_config_id
 from helion._dist_utils import sync_seed
 
-_CUTE_FLASH_LANE_POLICY_VERSION = 14
+_CUTE_FLASH_LANE_POLICY_VERSION = 16
 _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION = 2
 _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION = 2
 _FLASH_TERMINAL_COORDINATE_POLICY = "same_leaf_full_surface_normalized_coordinate_v2"
@@ -34,6 +34,7 @@ _FLASH_TERMINAL_CONFIRMATION_TARGET_MS = 5000.0
 _FLASH_TERMINAL_MEASUREMENT_POLICY = "mirrored_rotating_batched_wall_v2"
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
@@ -688,14 +689,46 @@ class LFBOPatternSearch(PatternSearch):
         )
         first_main_generation = 1 + qualification_generations
         phase = self._autotune_metrics.search_phase_metrics
-        if (
-            phase is not None
-            and phase.get("family_probe_required") is True
-            and phase.get("family_probe_complete") is not True
-        ):
+        if phase is not None and phase.get("completed") is not True:
             if self._autotune_budget_exceeded_across_ranks():
                 return self._finalize()
-            raise exc.AutotuneError("required CuTe flash family probe did not complete")
+            # Main search cannot replace missing qualification witnesses. Keep
+            # the recorded failure and stop before promotion or final selection.
+            failures = [
+                (
+                    f"passes={phase.get('qualification_passes_completed')}/"
+                    f"{phase.get('qualification_passes_planned')}"
+                )
+            ]
+            for key in (
+                "schedule_anchor_complete",
+                "compound_catalog_complete",
+                "family_probe_complete",
+            ):
+                if phase.get(key) is False:
+                    failures.append(f"{key}=False")
+            for key in ("leaf_results", "clc_families", "compound_transfers"):
+                rows = phase.get(key, [])
+                assert isinstance(rows, list)
+                for row in rows:
+                    if row["complete"] is True:
+                        continue
+                    detail = (
+                        f"{key}: family={row['family']}, "
+                        f"compound_packet={row.get('compound_packet')}, "
+                        f"softmax_disc={row['softmax_disc']}"
+                    )
+                    if key == "compound_transfers":
+                        detail += (
+                            " successful transfers="
+                            f"{len(row['successful_transfer_config_ids'])}/"
+                            f"{row['transfer_target_count']}"
+                        )
+                    failures.append(detail)
+            raise exc.AutotuneError(
+                "required CuTe flash structural qualification did not complete: "
+                + "; ".join(failures)
+            )
 
         starting_paths = self._select_starting_paths()
         starting_points = [member for member, _constraints in starting_paths]
@@ -1778,28 +1811,8 @@ class LFBOPatternSearch(PatternSearch):
                             leaves_with_candidates.add(leaf)
                         continue
 
-                    if kind == "ordinary":
-                        members = successful_leaf_members(leaf)
-                        if not members:
-                            parent_decisions.append(
-                                {
-                                    "job_index": job_index,
-                                    "kind": kind,
-                                    "pipeline_lane": None,
-                                    "selection_kind": "ranked_parent",
-                                    "candidate_results": [],
-                                    "selected_config_id": None,
-                                    "generated_config_ids": [],
-                                }
-                            )
-                            continue
-                        member = members[0]
-                        quota = policy.pipeline_candidates_per_leaf_per_round
-                        neighbor_limit = qualification_neighbor_limit
-                        ordinary_neighbor_limit += neighbor_limit
-                        constraints = self._flash_leaf_constraints(leaf)
-                    else:
-                        assert lane is not None and kind == "conditional"
+                    if kind == "conditional":
+                        assert lane is not None
                         neighbor_limit = next(conditional_limit_iter)
                         neighbor_limit_by_lane[lane] = (
                             neighbor_limit_by_lane.get(lane, 0) + neighbor_limit
@@ -1811,26 +1824,70 @@ class LFBOPatternSearch(PatternSearch):
                             and member.perfs
                             if self._flash_member_matches_pipeline_lane(member, lane)
                         ]
-                        if not members:
-                            parent_decisions.append(
+                        parent_candidate_results = ranked_decision_results(members)
+                        parent, added, parent_search = (
+                            self._flash_conditional_parent_candidates(
+                                members,
+                                leaf,
+                                (*self._flash_leaf_constraints(leaf), lane),
                                 {
-                                    "job_index": job_index,
-                                    "kind": kind,
-                                    "pipeline_lane": (
-                                        self._flash_pipeline_lane_metric(lane)
-                                    ),
-                                    "selection_kind": "ranked_parent",
-                                    "candidate_results": [],
-                                    "selected_config_id": None,
-                                    "generated_config_ids": [],
-                                }
+                                    member.config
+                                    for member in qualified_population.values()
+                                },
+                                neighbor_limit,
                             )
-                            continue
-                        member = min(members, key=self._flash_member_rank_key)
-                        # One scheduled job contributes one child. Repeating the
-                        # job N times makes the policy's N accounting linear.
-                        quota = 1
-                        constraints = (*self._flash_leaf_constraints(leaf), lane)
+                        )
+                        ids = add_members(
+                            novel_unbenchmarked_members(added)[:1], round_members
+                        )
+                        visited.update(member.config for member in added)
+                        parent_decisions.append(
+                            {
+                                "job_index": job_index,
+                                "kind": kind,
+                                "pipeline_lane": self._flash_pipeline_lane_metric(lane),
+                                "selection_kind": "ranked_parent",
+                                "candidate_results": parent_candidate_results,
+                                "selected_config_id": (
+                                    None
+                                    if parent is None
+                                    else canonical_config_id(parent.config)
+                                ),
+                                "generated_config_ids": ids,
+                                "conditional_parent_search": parent_search,
+                            }
+                        )
+                        leaf_round_ids.extend(ids)
+                        lane_round_ids[lane].extend(ids)
+                        conditional_ids = lane_metrics[(leaf, lane)][
+                            "conditional_candidate_ids"
+                        ]
+                        assert isinstance(conditional_ids, list)
+                        conditional_ids.extend(ids)
+                        if ids:
+                            leaves_with_candidates.add(leaf)
+                        continue
+
+                    assert kind == "ordinary"
+                    members = successful_leaf_members(leaf)
+                    if not members:
+                        parent_decisions.append(
+                            {
+                                "job_index": job_index,
+                                "kind": kind,
+                                "pipeline_lane": None,
+                                "selection_kind": "ranked_parent",
+                                "candidate_results": [],
+                                "selected_config_id": None,
+                                "generated_config_ids": [],
+                            }
+                        )
+                        continue
+                    member = members[0]
+                    quota = policy.pipeline_candidates_per_leaf_per_round
+                    neighbor_limit = qualification_neighbor_limit
+                    ordinary_neighbor_limit += neighbor_limit
+                    constraints = self._flash_leaf_constraints(leaf)
 
                     parent_candidate_results = ranked_decision_results(members)
                     parent_config_id = canonical_config_id(member.config)
@@ -3533,7 +3590,7 @@ class LFBOPatternSearch(PatternSearch):
             else min(policy.retained_families, live_family_count)
         )
         self._autotune_metrics.search_phase_metrics = {
-            "phase": "cute_flash_structural_qualification_v22",
+            "phase": "cute_flash_structural_qualification_v24",
             "cute_flash_lane_policy_version": _CUTE_FLASH_LANE_POLICY_VERSION,
             "completed": bool(
                 rounds_completed == qualification_passes_planned
@@ -4128,6 +4185,7 @@ class LFBOPatternSearch(PatternSearch):
         fixed_flat_values: Mapping[int, object] | None = None,
         config_gen: ConfigGeneration | None = None,
         num_neighbors: int | None = None,
+        proposal_callback: Callable[[FlatConfig], None] | None = None,
     ) -> list[FlatConfig]:
         """
         Generate neighboring configurations randomly within a specified radius.
@@ -4203,6 +4261,8 @@ class LFBOPatternSearch(PatternSearch):
                     for idx, pattern_neighbors in indices_to_change:
                         new_flat[idx] = random.choice(pattern_neighbors)
 
+            if proposal_callback is not None:
+                proposal_callback(new_flat)
             # Only add if it's different from the base
             if new_flat != base:
                 neighbors.append(new_flat)
@@ -4737,6 +4797,141 @@ class LFBOPatternSearch(PatternSearch):
         transcript["completed"] = True
         return finish_transcript(current)
 
+    def _flash_conditional_parent_candidates(
+        self,
+        members: Sequence[PopulationMember],
+        leaf: FlashStructuralLeaf,
+        constraints: tuple[tuple[str, object], ...],
+        known_configs: set[Config],
+        neighbor_limit: int,
+    ) -> tuple[PopulationMember | None, list[PopulationMember], dict[str, object]]:
+        """Find one conditional child within a shared ranked-parent budget.
+
+        A parent's projected neighborhood can already be measured even when
+        another parent in the same lane has novel children. Keep the complete
+        attempt ledger so strict qualification can distinguish that local
+        saturation from exhaustion of the lane.
+        """
+        ranked = sorted(members, key=self._flash_member_rank_key)
+        parent_count = min(len(ranked), max(0, neighbor_limit))
+        allocations = [
+            (index + 1) * neighbor_limit // parent_count
+            - index * neighbor_limit // parent_count
+            for index in range(parent_count)
+        ]
+        attempts: list[dict[str, object]] = []
+        ledger: dict[str, object] = {
+            "schema_version": 2,
+            "neighbor_limit": neighbor_limit,
+            "radius": self.radius,
+            "known_config_ids": sorted(map(canonical_config_id, known_configs)),
+            "allocations": [
+                {"parent_config_id": canonical_config_id(parent.config), "limit": limit}
+                for parent, limit in zip(ranked, allocations, strict=False)
+            ],
+            "attempts": attempts,
+            "consumed": 0,
+            "selected_parent_config_id": None,
+            "selected_child_config_id": None,
+        }
+        consumed_total = 0
+        for parent, limit in zip(ranked, allocations, strict=False):
+            generation = self._flash_leaf_config_generation(leaf, constraints)
+            assert generation is not None
+            base, parent_config = generation.canonicalize_flat(
+                generation.flatten(parent.config)
+            )
+            owned_indices = generation.flash_owned_coordinate_indices(parent_config)
+            proposals: list[dict[str, object]] = []
+            candidates: list[PopulationMember] = []
+            proposed_configs: set[Config] = set()
+
+            def record_proposal(
+                raw: FlatConfig,
+                kind: str,
+                *,
+                generation: ConfigGeneration = generation,
+                proposals: list[dict[str, object]] = proposals,
+                candidates: list[PopulationMember] = candidates,
+                proposed_configs: set[Config] = proposed_configs,
+            ) -> None:
+                record: dict[str, object] = {
+                    "kind": kind,
+                    "raw_flat_values": copy.deepcopy(raw),
+                    "config": None,
+                    "config_id": None,
+                    "outcome": "invalid",
+                }
+                proposals.append(record)
+                try:
+                    _, local = generation.canonicalize_flat(raw)
+                    flat, config = self.config_gen.canonicalize_flat(
+                        self.config_gen.flatten(local)
+                    )
+                except exc.InvalidConfig:
+                    return
+                record["config"] = dict(config.config)
+                record["config_id"] = canonical_config_id(config)
+                if self._flash_structural_leaf_from_config(config) != leaf or any(
+                    config.config.get(key) != value for key, value in constraints
+                ):
+                    record["outcome"] = "constraint_mismatch"
+                elif not self._backend_config_is_viable(config):
+                    record["outcome"] = "backend_invalid"
+                elif config in known_configs:
+                    record["outcome"] = "known"
+                elif config in proposed_configs:
+                    record["outcome"] = "duplicate"
+                else:
+                    record["outcome"] = "novel"
+                    proposed_configs.add(config)
+                    candidates.append(PopulationMember(_unset_fn, [], flat, config))
+
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
+                projections = generation.coordinate_neighbor_projections(
+                    base,
+                    radius=self.radius,
+                    limit=limit,
+                    frozen_indices=owned_indices,
+                )
+                for projection in projections:
+                    raw = copy.deepcopy(base)
+                    raw[projection.flat_index] = copy.deepcopy(projection.to_value)
+                    record_proposal(raw, "coordinate")
+                remaining = limit - len(proposals)
+                random_state = random.getstate() if remaining else None
+                if remaining:
+                    LFBOPatternSearch._generate_neighbors(
+                        self,
+                        base,
+                        config_gen=generation,
+                        num_neighbors=remaining,
+                        proposal_callback=lambda raw: record_proposal(raw, "random"),
+                    )
+            assert len(proposals) == limit
+            attempt: dict[str, object] = {
+                "parent_config_id": canonical_config_id(parent.config),
+                "owned_coordinate_indices": owned_indices,
+                "allocated": limit,
+                "consumed": len(proposals),
+                "random_state": random_state,
+                "proposals": proposals,
+                "novel_config_ids": [
+                    canonical_config_id(item.config) for item in candidates
+                ],
+            }
+            attempts.append(attempt)
+            consumed_total += len(proposals)
+            ledger["consumed"] = consumed_total
+            if not candidates:
+                continue
+            selected = self._surrogate_select([parent, *candidates], 2)
+            child = next(item for item in selected if item.config != parent.config)
+            ledger["selected_parent_config_id"] = canonical_config_id(parent.config)
+            ledger["selected_child_config_id"] = canonical_config_id(child.config)
+            return parent, [child], ledger
+        return None, [], ledger
+
     def _generate_flash_leaf_neighbors(
         self,
         current: PopulationMember,
@@ -5057,6 +5252,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         fixed_flat_values: Mapping[int, object] | None = None,
         config_gen: ConfigGeneration | None = None,
         num_neighbors: int | None = None,
+        proposal_callback: Callable[[FlatConfig], None] | None = None,
     ) -> list[FlatConfig]:
         """
         Generate neighbors via greedy tree traversal with incremental encoding.
@@ -5074,12 +5270,13 @@ class LFBOTreeSearch(LFBOPatternSearch):
         Returns all distinct candidates.
         Falls back to the parent's random neighbor generation if no surrogate is fitted.
         """
-        if config_gen is not None:
+        if config_gen is not None or proposal_callback is not None:
             return super()._generate_neighbors(
                 base,
                 fixed_flat_values=fixed_flat_values,
                 config_gen=config_gen,
                 num_neighbors=num_neighbors,
+                proposal_callback=proposal_callback,
             )
 
         surrogate = self.surrogate

@@ -118,6 +118,21 @@ def test_packet_values_addresses_and_scalar_tails(width: int, length: int, start
     )
 
 
+@pytest.mark.parametrize("width", [4, 8])
+@pytest.mark.parametrize("length", [0, 3, 17, 32])
+def test_snapshot_gate_preserves_packet_induction_names(width: int, length: int):
+    source = _SOURCE.replace("vec_lane_0", "packet_element")
+    original = ast.parse(source.replace("WIDTH", str(width)))
+    transformed, changed = _rewrite(source, width)
+    # The packet prefilter accepts this name, but its delegated affine emitter
+    # does not. Traversal eligibility must not broaden the emitter's contract.
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(original)
+    expected, _ = _run(original, 0, length)
+    actual, _ = _run(transformed, 0, length)
+    assert actual == expected
+
+
 @pytest.mark.parametrize("width", (4, 8))
 def test_packet_memory_surrounds_unchanged_lane_arithmetic(width: int):
     module, changed = _rewrite(_SOURCE, width)

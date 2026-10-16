@@ -8,6 +8,7 @@ import contextlib
 import functools
 import math
 import os
+import sys
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
@@ -15,8 +16,10 @@ from typing import Sequence
 
 import torch
 
+from ... import _compat
 from ... import exc
 from ..backend import Backend
+from ..backend import BackendState
 from ..backend import LauncherInfo
 from ..backend import log
 
@@ -60,11 +63,23 @@ class TritonBackend(Backend):
         return "triton"
 
     @property
-    def experimental(self) -> bool:
-        return False
+    def state(self) -> BackendState:
+        return BackendState.STABLE
+
+    @property
+    def supports_debug_dtype_asserts(self) -> bool:
+        return True
 
     @property
     def supports_eager_prepared_call(self) -> bool:
+        return True
+
+    @property
+    def supports_inductor_fusion(self) -> bool:
+        return True
+
+    @property
+    def dynamo_inline_capture_loses_view_writes(self) -> bool:
         return True
 
     def transform_host_arg(
@@ -96,36 +111,23 @@ class TritonBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         if key == "host_tensor_descriptors":
-            from ..._compat import supports_host_tensor_descriptor
-
-            return self.name == "triton" and supports_host_tensor_descriptor()
+            return self.name == "triton" and _compat.supports_host_tensor_descriptor()
         if key == "cross_loop_pipeline":
-            from ..._compat import is_hip
-
-            return self.name == "triton" and not is_hip()
+            return self.name == "triton" and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":
-            from ..._compat import is_hip
-
-            return is_hip()
+            return _compat.is_hip()
         if key == "matrix_instr_nonkdim":
-            from ..._compat import supports_amd_cdna_tunables
-
-            return supports_amd_cdna_tunables()
+            return _compat.supports_amd_cdna_tunables()
         if key == "xcd_remap":
-            from ..._compat import supports_amd_cdna_tunables
-
             # Accepted on all AMD CDNA.  On single-XCD devices it normalizes to a
             # no-op (ConfigSpec.normalize) and is excluded from the search space
             # (ConfigSpec.flat_config) rather than rejected.
-            return supports_amd_cdna_tunables()
+            return _compat.supports_amd_cdna_tunables()
 
-        from ..._compat import get_mtia_tunable_fragments
-        from ..._compat import supports_mtia_tunables
-
-        if key in get_mtia_tunable_fragments():
-            return supports_mtia_tunables()
+        if key in _compat.get_mtia_tunable_fragments():
+            return _compat.supports_mtia_tunables()
         return super().supports_config_key(key)
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
@@ -267,6 +269,11 @@ class TritonBackend(Backend):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"tl.cast({expr_str}, {dtype_str})"
 
+    def join_cast_template(self) -> str | None:
+        # A 16-bit true division stays fp32 (the consumer casts), so a value
+        # can hold fp32 although its FX dtype is fp16/bf16.
+        return "{x}.to({like}.dtype)"
+
     def arange_expr(
         self,
         offsets_var: str,
@@ -345,6 +352,11 @@ class TritonBackend(Backend):
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"triton.next_power_of_2({expr})"
 
+    def dynamic_rdim_size_expr(self, expr: str) -> str:
+        # As in static_rdim_size: an empty axis still needs a length-1 block,
+        # and triton.next_power_of_2(0) is 0.
+        return f"max({self.next_power_of_2_host_expr(expr)}, 1)"
+
     @property
     def function_decorator(self) -> str:
         return "triton.jit"
@@ -412,6 +424,7 @@ class TritonBackend(Backend):
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
+            "helion_triton_helpers": "from helion.runtime.triton import helpers as helion_triton_helpers",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
@@ -451,11 +464,35 @@ class TritonBackend(Backend):
         threads_in_group: int | None = None,
         dtype: torch.dtype | None = None,
     ) -> str:
-        if reduction_type in {"sum", "max", "min"}:
-            return f"tl.{reduction_type}({input_name}, {dim})"
+        if dtype is not None and reduction_type in {"sum", "prod"}:
+            # Accumulate in the computation dtype (fp32 for fp16/bf16) as torch
+            # does; tl.sum of an fp16 tensor adds in fp16.
+            input_name = f"{input_name}.to({self.dtype_str(dtype)})"
+        if reduction_type == "sum":
+            return f"tl.sum({input_name}, {dim})"
+        if reduction_type in {"max", "min"}:
+            # tl.max/tl.min drop NaN; torch.amax/amin propagate it.
+            return (
+                f"helion_triton_helpers.{reduction_type}_propagate_nan"
+                f"({input_name}, {dim})"
+            )
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        if reduction_type == "prod":
+            # Inductor's ops.mul casts the product to the reduction's output
+            # dtype; for an fp16 prod that would turn the fp32 loop-carried
+            # accumulator into fp16, which Triton rejects.
+            return f"{acc} * {val}.to({self.dtype_str(dtype)})"
+        return super().reduction_combine_expr(reduction_type, acc, val, dtype)
 
     def is_indexed_reduction(self, reduction_type: str) -> bool:
         return reduction_type in {"argmin", "argmax"}
@@ -524,6 +561,17 @@ class TritonBackend(Backend):
             for x in config
             if x.startswith("_triton_config_")
         ]
+
+        from ..compile_environment import CompileEnvironment
+
+        # Generate zebin during Intel XPU compilation so parallel candidate
+        # precompilation includes native code generation, thereby reducing kernel first-launch latency.
+        if (
+            sys.platform == "linux"
+            and CompileEnvironment.current().device.type == "xpu"
+            and "_triton_config_generate_native_code" not in config
+        ):
+            args.append("generate_native_code=True")
 
         from ...autotuner.config_spec import _get_backend_tunable_keys
 
@@ -616,6 +664,9 @@ class TritonBackend(Backend):
                 graph = HostFunction.current().device_ir.tile_dependency_graph
                 assert graph is not None
                 out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
+        env = CompileEnvironment.current()
+        if env.pdl_entry or env.pdl_exit:
+            out.append("launch_pdl=True")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="

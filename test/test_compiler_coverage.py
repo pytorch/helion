@@ -813,3 +813,101 @@ def test_actual_autotune_loop_delivers_all_added_witnesses_to_first_benchmark(
     assert all(config in delivered for config in added)
     assert all(config in search._pinned_finalist_configs for config in added)
     assert len(delivered) == len(set(delivered))
+
+
+def test_supplemental_coverage_keeps_every_previous_declared_row_and_rng():
+    from dataclasses import replace
+
+    old_spec = make_spec()
+    spec = make_spec()
+    previous = spec.compiler_coverage_groups
+    spec._compiler_coverage_groups = ()
+    spec._compiler_coverage_fields = ()
+    for index, group in enumerate(previous):
+        spec.register_compiler_coverage_group(
+            replace(
+                group,
+                supplemental_witnesses=(
+                    CoverageWitness(
+                        Config(block_sizes=[64], old_choice=91 + index), group.domain[1]
+                    ),
+                ),
+            )
+        )
+    old = make_search(old_spec, count=20)
+    full = make_search(spec, count=20)
+    random.seed(811)
+    expected = old._generate_initial_population_flat()
+    state = random.getstate()
+    random.seed(811)
+    actual = full._generate_initial_population_flat()
+    assert random.getstate() == state
+    assert actual[: len(expected)] == expected
+    assert len(actual) == len(expected) + len(previous)
+    for row in actual[len(expected) :]:
+        assert full.config_gen.unflatten(row) in full._pinned_finalist_configs
+    assert all(
+        "supplemental_witnesses" not in group.policy()
+        for group in old_spec.compiler_coverage_groups
+    )
+    assert all(
+        "supplemental_witnesses" in group.policy()
+        for group in spec.compiler_coverage_groups
+    )
+
+
+def test_supplemental_witnesses_share_validation_and_limits():
+    from dataclasses import replace
+
+    group = make_spec().compiler_coverage_groups[0]
+    witness = CoverageWitness(Config(block_sizes=[32], old_choice=91), "a")
+    replaced = replace(group, supplemental_witnesses=[witness])
+    assert type(replaced.supplemental_witnesses) is tuple
+    with pytest.raises(ValueError, match="At most four"):
+        replace(group, supplemental_witnesses=(witness, witness))
+    with pytest.raises(ValueError, match="Unknown coverage mode"):
+        replace(
+            group, supplemental_witnesses=(CoverageWitness(witness.carrier, "unknown"),)
+        )
+    with pytest.raises(FrozenInstanceError):
+        replaced.supplemental_witnesses = ()
+
+
+def test_deferred_coverage_preserves_supplemental_and_warm_prefix():
+    from dataclasses import replace
+
+    spec = make_spec()
+    first, second, third = spec.compiler_coverage_groups
+    first = replace(first, witnesses=first.witnesses[:1])
+    second = replace(
+        second,
+        supplemental_witnesses=(
+            CoverageWitness(Config(block_sizes=[64], old_choice=91), True),
+        ),
+    )
+    third = replace(third, deferred=True)
+    old_groups = (first, second)
+    spec._compiler_coverage_groups = old_groups
+    generation = spec.create_config_generation()
+    cached = Mock(
+        return_value=(Config(block_sizes=[32], old_choice=92, coverage_mode="b"),)
+    )
+    before = random.getstate()
+    old, old_outcomes = append_compiler_coverage(
+        [], generation, cached_configs=cached, pin=Mock()
+    )
+    spec._compiler_coverage_groups = (*old_groups, third)
+    cached.reset_mock()
+    actual, outcomes = append_compiler_coverage(
+        [], generation, cached_configs=cached, pin=Mock()
+    )
+    assert random.getstate() == before
+    assert actual[: len(old)] == old
+    assert outcomes[: len(old_outcomes)] == old_outcomes
+    assert any(entry.origin == "cache" for entry in old_outcomes)
+    assert len(actual) == len(old) + 1
+    assert cached.call_count == 1
+    assert "deferred" not in first.policy()
+    assert third.policy()["deferred"] is True
+    with pytest.raises(ValueError, match="Boolean"):
+        replace(third, deferred=1)

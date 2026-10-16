@@ -35,18 +35,28 @@ jobs:
         run: |
           uv venv --python ${{ matrix.python-version }}
 
+      # download.pytorch.org occasionally times out mid-install (uv gives up
+      # after its own three retries), so retry each install with a backoff.
       - name: Install PyTorch
         run: |
+          set -eux
           source .venv/bin/activate
-          uv pip install -U --pre nvidia-nvshmem-cu13 --index-url https://download.pytorch.org/whl/nightly/cu130
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry uv pip install -U --pre nvidia-nvshmem-cu13 --index-url https://download.pytorch.org/whl/nightly/cu130
+          retry uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
 
       - name: Install lint dependencies
         run: |
+          set -eux
           source .venv/bin/activate
-          uv pip install pyrefly==1.1.1
-          uv pip install .'[dev,pallas-cpu]'
-          ./scripts/install_cute.sh
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry uv pip install pyrefly==1.1.1
+          retry uv pip install .'[dev,pallas-cpu]'
+          retry ./scripts/install_cute.sh
 
       - name: Run pre-commit
         run: |

@@ -46,6 +46,21 @@ def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _reshape_view_lhs_gemm(x3: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    b, m, k = x3.shape
+    _, n = w.shape
+    # Host-side view: neither an input nor a fresh allocation. It inherits its
+    # input's recorded base alignment, so codegen proves its TMA descriptor.
+    x2 = x3.reshape([b * m, k])
+    out = torch.empty((b * m, n), dtype=x3.dtype, device=x3.device)
+    for tile_m, tile_n in hl.tile((b * m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x2[tile_m, tile_k], w[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out.view(b, m, n)
+
+
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
@@ -152,6 +167,69 @@ def test_ineligible_bind_has_no_ordinary_ffi_search_coordinate(
         assert not tc.full_tile_direct_entry_seed_eligible()
         assert tc.full_tile_direct_entry_seed_config() is None
         assert "tcgen05_tvm_ffi_launch" not in tc.optional_fragments(for_search=True)
+
+
+def _assert_ffi_seed_declined(bound: BoundKernel) -> None:
+    with bound.env:
+        tc = bound.config_spec._cute_tcgen05_config
+        assert tc.matmul_operands_tma_provable is False
+        assert not tc.full_tile_direct_entry_seed_eligible()
+        assert tc.full_tile_direct_entry_seed_config() is None
+        assert "tcgen05_tvm_ffi_launch" not in tc.optional_fragments(for_search=True)
+        # The fact is decided before the seed heuristics run, so the FFI
+        # population seed is withheld as well, not just the default projection.
+        assert all(
+            seed.config.get("tcgen05_tvm_ffi_launch") is not True
+            for seed in bound.config_spec.compiler_seed_configs
+        )
+        generator = ConfigGeneration(bound.config_spec)
+        default = generator.unflatten(generator.default_flat())
+        assert default.config.get("tcgen05_tvm_ffi_launch") is not True
+        assert default.config.get("tcgen05_flat_role_coordinates") is not True
+        assert default.config["tcgen05_layout_strategy"] == "default"
+        assert default.config["tcgen05_cluster_m"] == 1
+
+
+def test_reshape_view_lhs_keeps_ffi_seed() -> None:
+    # examples/broadcast_matmul.py at (16, 512, 768, 1024): the flattened
+    # 8192x768x1024 GEMM is shape-eligible for the direct-entry seed and its
+    # LHS is a pointer-preserving view of one aligned input. The bind-time
+    # proof must agree with codegen, which proves such views through the
+    # input's recorded base alignment, so the validated FFI default stays.
+    args = (
+        torch.empty((16, 512, 768), dtype=torch.bfloat16, device=CPU_DEVICE),
+        torch.empty((768, 1024), dtype=torch.bfloat16, device=CPU_DEVICE),
+    )
+    kernel = helion.kernel(_reshape_view_lhs_gemm, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    with bound.env:
+        tc = bound.config_spec._cute_tcgen05_config
+        assert tc.matmul_operands_tma_provable is True
+        assert tc.full_tile_direct_entry_seed_eligible()
+        assert "tcgen05_tvm_ffi_launch" in tc.optional_fragments(for_search=True)
+
+
+@pytest.mark.parametrize("misalignment", ["stride", "base"])
+def test_unaligned_input_declines_ffi_seed(misalignment: str) -> None:
+    # A 772-element bf16 row stride is 1544 bytes and a 4-element storage
+    # offset is 8 bytes: neither is 16-byte aligned, so the live TensorMap
+    # alignment classifier declines exactly as codegen would, and the plain
+    # cluster_m=1 default is projected instead of the TMA-only FFI seed.
+    if misalignment == "stride":
+        lhs = torch.empty((8192, 772), dtype=torch.bfloat16, device=CPU_DEVICE)[:, :768]
+    else:
+        lhs = torch.empty(8192 * 768 + 4, dtype=torch.bfloat16, device=CPU_DEVICE)[
+            4:
+        ].view(8192, 768)
+    args = (lhs, torch.empty((768, 1024), dtype=torch.bfloat16, device=CPU_DEVICE))
+    kernel = helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True)
+    _assert_ffi_seed_declined(kernel.bind(args))
+    # The identical GEMM over aligned inputs keeps the validated FFI default.
+    bound = _bind(torch.bfloat16, (8192, 1024, 768))
+    with bound.env:
+        tc = bound.config_spec._cute_tcgen05_config
+        assert tc.matmul_operands_tma_provable is True
+        assert tc.full_tile_direct_entry_seed_eligible()
 
 
 def test_missing_ab_budget_retains_ffi_decline() -> None:

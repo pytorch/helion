@@ -201,6 +201,11 @@ def aux_tensor_load_kind(
 
     Returns one of:
 
+    - ``("scalar", None)``: a rank-0 aux load (``scale[()]``) — the
+      underlying tensor, the load result and the index list are all
+      rank 0. The value is uniform over the output tile; the chain
+      classifier turns it into a ``_RuntimeScalarExpr`` leaf (never an
+      aux descriptor) rendered inline as one FP32 base-pointer read.
     - ``("exact", None)``: the canonical 2-D ``aux[tile_m, tile_n]``
       shape — the underlying tensor's rank equals the carrier rank,
       the load result shape matches the carrier tile shape, and the
@@ -309,6 +314,12 @@ def aux_tensor_load_kind(
     if aux_tensor_val is None:
         return None
     aux_tensor_shape = tuple(aux_tensor_val.shape)
+    if len(aux_tensor_shape) == 0:
+        # Rank-0 aux (``scale[()]``): a single tile-uniform element with no
+        # tile geometry to match against the carrier.
+        if len(aux_shape) == 0 and len(index_list) == 0:
+            return ("scalar", None)
+        return None
 
     # Collective MMA treats every axis before the trailing matrix pair as a
     # block-size-1 passthrough. Normalize that carrier here, where auxiliary

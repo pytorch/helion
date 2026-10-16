@@ -4,9 +4,10 @@ At (2, 16, 2048, 128) bf16 the XSA kernel (``examples/xsa.py``) ran 2.2x slower
 on the persistent FA4 families than on the flat one.  Three general changes
 cover it:
 
-- the loop-invariant reciprocal hoist now descends into ``while`` bodies, so a
-  persistent role loop no longer keeps one IEEE divide (a slow-path CALL) per
-  element (covered in ``test_cute_hoist_loop_invariant_recip.py``);
+- under the ``fast_math`` setting, the loop-invariant reciprocal hoist now
+  descends into ``while`` bodies, so a persistent role loop no longer keeps
+  one IEEE divide (a slow-path CALL) per element (covered in
+  ``test_cute_hoist_loop_invariant_recip.py``);
 - ``cute_flash_row_epilogue_warps`` moves the row program from the correction
   warpgroup (64 registers, both Q tiles in sequence, the next tile's rescales
   queued behind it) to the softmax warpgroups (200 registers, both Q tiles in
@@ -29,6 +30,7 @@ from helion._compiler.backend import CuteBackend
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 
@@ -67,11 +69,15 @@ _WS = {
 _CORRECTION = {"cute_flash_row_epilogue_warps": "correction"}
 
 
-def _xsa_kernel() -> helion.Kernel:
+def _xsa_kernel(*, fast_math: bool = False) -> helion.Kernel:
     from examples.xsa import xsa_kernel
 
     return helion.kernel(
-        xsa_kernel.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        xsa_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        fast_math=fast_math,
     )
 
 
@@ -285,10 +291,11 @@ def test_fused_row_epilogue_surfaces_have_complete_structural_coverage(
 
 
 def test_target_seed_round_trips_under_the_fused_row_body() -> None:
-    # The GB300 hd64 fp16 tuning policy carries whole-row-only values.  The
-    # plain body seeds them verbatim; a fused row epilogue cannot take them,
-    # so its seed must already equal its normalized form (the seed round-trip
-    # check runs under the same flags as normalization).
+    # The GB300 hd64 fp16 target carries whole-row-only values. The exact
+    # template legality check excludes it from the fused surface rather than
+    # silently changing its family/packet. Generic raw seeds still carry
+    # inactive aliases; their actual transfer must preserve resolved behavior
+    # and every compatible paired-family seed.
     common = {
         "dtype": torch.float16,
         "num_bh": 8,
@@ -307,36 +314,78 @@ def test_target_seed_round_trips_under_the_fused_row_body() -> None:
     assert fused.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] is True
     assert fused.config[cute_flash.FLASH_SP_ROW_SUM_KEY] == "fragment"
     assert fused.config[cute_flash.FLASH_KV_TILE_N_KEY] == 128
-    # The measured structure (family, schedule, transport) is kept.
-    for key in (
-        cute_flash.FLASH_PIPELINE_FAMILY_KEY,
-        cute_flash.FLASH_E2E_SCHEDULE_KEY,
-        cute_flash.FLASH_STAT_TRANSPORT_KEY,
-        cute_flash.FLASH_KV_STAGE_KEY,
-    ):
-        assert fused.config[key] == plain.config[key]
-    effective = cute_flash.flash_effective_config_values(
-        cute_flash.resolve_flash_config(
-            64,
-            256,
-            fused.config,
-            dtype=torch.float16,
-            num_bh=8,
-            standard_dense_output=True,
-            has_row_epilogue=True,
-            plain_row_body=False,
-        )
-    )
-    assert all(
-        effective[key] == value
-        for key, value in fused.config.items()
-        if key in effective
-    )
-    # The fused seeds of the search population are canonical as well.
+    assert plain.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta"
+    assert fused.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+    assert fused.config[cute_flash.FLASH_PERSISTENT_KEY] is True
     seeds = cute_flash.flash_attention_seed_configs(
         64, 256, has_row_epilogue=True, plain_row_body=False, **common
     )
     assert fused in seeds
+    assert plain not in seeds
+    spec = ConfigSpec(
+        backend=CuteBackend(),
+        target_device_capability=(10, 3),
+        device=torch.device("cpu"),
+        num_sm=152,
+    )
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=256,
+        num_bh=8,
+        dtype=torch.float16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        is_causal=False,
+        standard_dense_output=True,
+        has_row_epilogue=True,
+        plain_row_body=False,
+    )
+    spec.compiler_seed_configs = seeds
+    generation = ConfigGeneration(spec)
+    normalized = []
+    for seed in seeds:
+        flat, config = generation.canonicalize_flat(generation.flatten(seed))
+        assert spec.normalized_config(config) == config
+        assert generation.unflatten(flat) == config
+        assert cute_flash.resolve_flash_config(
+            64,
+            256,
+            config.config,
+            has_row_epilogue=True,
+            plain_row_body=False,
+            **common,
+        ) == cute_flash.resolve_flash_config(
+            64,
+            256,
+            seed.config,
+            has_row_epilogue=True,
+            plain_row_body=False,
+            **common,
+        )
+        normalized.append(config)
+    messages = []
+    transferred = [
+        config for _, config in generation.seed_flat_config_pairs(messages.append)
+    ]
+    assert not messages
+    assert transferred == list(dict.fromkeys(normalized))
+    # Preserve both canonical paired families and all four paired schedules.
+    assert {
+        (
+            config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY],
+            config.config[cute_flash.FLASH_E2E_SCHEDULE_KEY],
+        )
+        for config in transferred
+        if config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+        in ("fa4_2cta", "fa4_2cta_tma_4d")
+    } == {
+        ("fa4_2cta", "16/4"),
+        ("fa4_2cta", "16/6"),
+        ("fa4_2cta", "16/8"),
+        ("fa4_2cta", "8/2"),
+        ("fa4_2cta_tma_4d", "16/4"),
+    }
 
 
 @onlyBackends(["cute"])
@@ -460,7 +509,7 @@ def test_row_epilogue_warps_is_searched_only_with_a_row_program() -> None:
 @onlyBackends(["cute"])
 def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
-    code = _code(_xsa_kernel(), (q, k, v), **_FA4_2CTA)
+    code = _code(_xsa_kernel(fast_math=True), (q, k, v), **_FA4_2CTA)
     softmax0 = _role(code, "warp_idx < 4")
     softmax1 = _role(code, "(warp_idx >= 4) & (warp_idx < 8)")
     correction = _role(code, "(warp_idx >= 8) & (warp_idx < 12)")
@@ -530,8 +579,8 @@ def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> 
     )
     assert "cute.arch.mbarrier_init(flash_aux_full_ptr + flash_st, 1)" in code
     assert "_flash_tma_aux0, _flash_mEpiAux0t" in code
-    # The reciprocal hoist reaches into the persistent while loop and the chunk
-    # loop walks element pairs with packed FMA-pipe ops.
+    # Under fast_math the reciprocal hoist reaches into the persistent while
+    # loop, and the chunk loop walks element pairs with packed FMA-pipe ops.
     assert "_helion_inv_div_0 = 1.0 / _ep0_v7" in softmax0
     divides = [line for line in softmax0.splitlines() if "/ _ep0_v7" in line]
     assert divides and all(
@@ -548,7 +597,7 @@ def test_softmax_route_stages_aux_through_smem_on_the_2cta_persistent_body() -> 
 @onlyBackends(["cute"])
 def test_correction_route_keeps_the_program_in_the_correction_warps() -> None:
     q, k, v = _qkv(1, 2, 512, 128, torch.bfloat16)
-    code = _code(_xsa_kernel(), (q, k, v), **_FA4_2CTA, **_CORRECTION)
+    code = _code(_xsa_kernel(fast_math=True), (q, k, v), **_FA4_2CTA, **_CORRECTION)
     correction = _role(code, "(warp_idx >= 8) & (warp_idx < 12)")
     softmax0 = _role(code, "warp_idx < 4")
     assert "_ep0_t2r, _ep0_r2s" in correction and "_ep1_t2r, _ep1_r2s" in correction
@@ -558,7 +607,7 @@ def test_correction_route_keeps_the_program_in_the_correction_warps() -> None:
         "_flash_tma_aux0" not in code and "flash_aux_full_ptr + 0, flash_sm" not in code
     )
     assert "_ep_gaux00 = cute.flat_divide(_flash_mEpiAux0" in correction
-    # The hoist still applies inside the persistent loop.
+    # The fast_math hoist still applies inside the persistent loop.
     assert "_helion_inv_div_0 = 1.0 / _ep0_v7" in correction
 
 

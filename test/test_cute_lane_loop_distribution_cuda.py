@@ -364,6 +364,8 @@ _BYTE_CASES = [
 def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
     columns: int, packet_flush: bool
 ) -> None:
+    if packet_flush and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("signed-byte BF16 packets are restricted to sm_100a")
     # The zeroing store precedes the lane loop (see the GPU-free companion),
     # so the flush overwrites the zero.  Kept in the nest, the second lane
     # iteration zeroed the element again after the first iteration's flush.
@@ -406,6 +408,8 @@ def _copy_zero_copy(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
     packet_flush: bool,
 ) -> None:
+    if packet_flush and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("signed-byte BF16 packets are restricted to sm_100a")
     # The zeroing store follows the loop (see the GPU-free companion): the
     # copy's last element is zero and the second copy is untouched, over two
     # lane iterations per thread.
@@ -486,12 +490,13 @@ def test_masked_tile_uniform_store_after_per_lane_stores_matches_reference(
 def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
     x = _small_integers((8, 512))
     out = torch.full((8, 512), -7.0, device=CUDA_DEVICE)
-    with pytest.raises(
-        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
-    ):
-        _run(
-            _zero_first_column_then_copy_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
-        )
+    # The zeroing store leaves the lane loop the device loop built around
+    # the body (see the GPU-free companion); the copy then overwrites it.
+    result = _run(
+        _zero_first_column_then_copy_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
+    )
+    torch.testing.assert_close(result, x, rtol=0, atol=0)
+    out = torch.full((8, 512), -7.0, device=CUDA_DEVICE)
     result = _run(
         _copy_then_zero_first_column_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
     )
@@ -1109,18 +1114,26 @@ def test_packet_store_beside_the_previous_elements_read_matches_reference(
 ) -> None:
     # One packet of four per thread: vector lane 0 reads the previous
     # thread's element 3, which that thread's flush stores; the barrier
-    # between the read and the flush orders the threads.
+    # between the read and the flush orders the threads.  Each tile is its
+    # own CTA, and nothing orders two CTAs: the first element of every later
+    # tile may read the previous tile's element before or after its store.
     run = _compiled(
         _read_previous_then_store,
         tuple(_small_integers(shape) for _ in range(3)),
         **_ONE_PACKET_PER_THREAD_CONFIG,
     )
+    block = _ONE_PACKET_PER_THREAD_CONFIG["block_sizes"][0]
+    tile_begins = torch.arange(block, shape[0], block, device=CUDA_DEVICE)
     for _ in range(_RUNS):
         x = _small_integers(shape)
         v = _small_integers(shape)
         y = torch.full(shape, -7.0, device=CUDA_DEVICE)
         expected_y = torch.cat([torch.zeros_like(x[:1]), x[:-1]])
         run(x, v, y)  # pyrefly: ignore [not-callable]
+        stored = v[tile_begins - 1]
+        expected_y[tile_begins] = torch.where(
+            y[tile_begins] == stored, stored, expected_y[tile_begins]
+        )
         torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
         torch.testing.assert_close(x, v, rtol=0, atol=0)
 

@@ -201,10 +201,11 @@ def _add_on_every_rank(  # noqa: ANN202
     offset,  # noqa: ANN001
     world_size: tl.constexpr,
     lanes: tl.constexpr,
+    sem: tl.constexpr = "release",  # pyrefly: ignore[bad-function-definition]
 ):
-    """Add 1 with system-scope release to one uint64 word on every rank.
+    """Add 1 at system scope to one uint64 word on every rank.
 
-    The caller syncs the CTA first, so the release covers all of its stores.
+    The caller syncs the CTA first, so a release covers all of its stores.
     """
     ranks = tl.arange(0, lanes)
     bases = tl.load(
@@ -216,9 +217,145 @@ def _add_on_every_rank(  # noqa: ANN202
         bases.to(tl.pointer_type(tl.uint64)) + offset,
         tl.cast(1, tl.uint64),
         mask=ranks < world_size,
-        sem="release",
+        sem=sem,
         scope="sys",
     )
+
+
+@triton.jit
+def _store_on_every_rank(  # noqa: ANN202
+    buffer_ptrs,  # noqa: ANN001
+    offset,  # noqa: ANN001
+    value,  # noqa: ANN001
+    world_size: tl.constexpr,
+    lanes: tl.constexpr,
+):
+    """Store one tagged uint64 word, relaxed at system scope, on every rank."""
+    ranks = tl.arange(0, lanes)
+    bases = tl.load(
+        buffer_ptrs.to(tl.pointer_type(tl.uint64)) + ranks,
+        mask=ranks < world_size,
+        other=0,
+    )
+    tl.inline_asm_elementwise(
+        "{ .reg .pred p; setp.ne.b32 p, $3, 0; "
+        "@p st.relaxed.sys.global.u64 [$1], $2; mov.u32 $0, 0; }",
+        "=r,l,l,r",
+        [
+            bases.to(tl.pointer_type(tl.uint64)) + offset,
+            tl.cast(value, tl.uint64) + tl.zeros([lanes], tl.uint64),
+            (ranks < world_size).to(tl.int32),
+        ],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _hold_after_fallback(  # noqa: ANN202
+    state,  # noqa: ANN001
+    started,  # noqa: ANN001
+    world_size: tl.constexpr,
+    epoch,  # noqa: ANN001
+    held,  # noqa: ANN001
+):
+    """If the last launch read rows of this rank's buffer that no task wrote
+    (``held``), wait until every rank has started this launch, so none still
+    reads them."""
+    if held:
+        for rank in tl.static_range(world_size):
+            _wait_at_least(state + started + rank, epoch)
+
+
+@triton.jit
+def _sync_threads(threads: tl.constexpr):  # noqa: ANN202
+    """Barrier 0 over the first ``threads`` threads, ordering their memory ops."""
+    tl.inline_asm_elementwise(
+        f"bar.sync 0, {threads}; mov.u32 $0, 0;",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _shared_capture(value):  # noqa: ANN001, ANN202
+    """Identity that a warp-specialized loop captures through shared memory; a pure
+    tensor capture is instead recomputed from its producers in every partition."""
+    if value.type.is_block() and not value.dtype.is_ptr():
+        if value.dtype.primitive_bitwidth == 64:
+            value = tl.inline_asm_elementwise(
+                "mov.b64 $0, $1;",
+                "=l,l",
+                [value.to(tl.int64, bitcast=True)],
+                dtype=tl.int64,
+                is_pure=False,
+                pack=1,
+            ).to(value.dtype, bitcast=True)
+        elif value.dtype.primitive_bitwidth == 32:
+            value = tl.inline_asm_elementwise(
+                "mov.b32 $0, $1;",
+                "=r,r",
+                [value.to(tl.int32, bitcast=True)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            ).to(value.dtype, bitcast=True)
+    return value
+
+
+# Inlined: Triton 3.8 rejects non-inlined calls inside warp-specialized loops.
+# No reductions: their full-CTA barriers deadlock on parked WS worker warps.
+@triton.jit
+def _scatter_cover(  # noqa: ANN202
+    state,  # noqa: ANN001
+    ptrs,  # noqa: ANN001
+    source,  # noqa: ANN001
+    epoch,  # noqa: ANN001
+    records,  # noqa: ANN001
+    done,  # noqa: ANN001
+    cover,  # noqa: ANN001
+    votes,  # noqa: ANN001
+    tasks: tl.constexpr,
+    lanes: tl.constexpr,
+    keys: tl.constexpr,
+    world_size: tl.constexpr,
+    threads: tl.constexpr,
+):
+    """Mark the keys ``source``'s scatter tasks wrote this launch in the local
+    cover table. 1 on every thread once each task recorded its rows or was
+    skipped, so an unmarked key is one no task wrote."""
+    parity = tl.cast(epoch & 1, tl.int64)
+    tag = tl.cast(epoch, tl.uint32)
+    remote = tl.load(ptrs.to(tl.pointer_type(tl.uint64)) + source)
+    remote = remote.to(tl.pointer_type(tl.uint64)) + records + parity * tasks * lanes
+    marks = state + done + parity * world_size * tasks + source * tasks
+    # Lanes that see a missing task bump this CTA's vote word past ``seen``.
+    vote = state + votes + tl.program_id(0)
+    seen = tl.load(vote, volatile=True)
+    _sync_threads(threads)
+    block: tl.constexpr = 8 * threads
+    for start in range(0, tasks * lanes, block):
+        index = start + tl.arange(0, block)
+        valid = index < tasks * lanes
+        mark = tl.load(marks + index // lanes, mask=valid, other=0, volatile=True)
+        record = tl.load(remote + index, mask=valid, other=0, volatile=True)
+        live = tl.cast(mark >> 32, tl.uint32) == tag
+        skipped = (mark & 0xFFFFFFFF) == 0xFFFFFFFF
+        written = tl.cast(record >> 32, tl.uint32) == tag
+        tl.store(vote + index * 0, seen + 1, mask=valid & ~(live & (skipped | written)))
+        key = tl.cast((record >> 1) & 0x7FFFFFFF, tl.int64)
+        tl.store(
+            state + cover + source * keys + key,
+            epoch,
+            mask=valid & written & ((record & 1) != 0) & (key < keys),
+        )
+    # Also orders the cover stores before every thread's reads.
+    _sync_threads(threads)
+    return (tl.load(vote, volatile=True) == seen).to(tl.int32)
 
 
 @triton.jit

@@ -140,11 +140,14 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension.
         n (int): Number of cols.
     """
-    # Pallas lowers the K reduction as tiled dot_general calls accumulated in
-    # fp32, while torch.matmul uses a single full-K dot. The different
-    # accumulation order can move a few outputs across a bf16 rounding boundary.
-    max_mismatch_pct = 1e-4 if _get_backend() == "pallas" else None
-    max_mismatched_abs_diff = 0.5 if max_mismatch_pct is not None else None
+    # Pallas tiles the K reduction and the CuTe backend runs the cast operand
+    # through its tensor-core GEMM, so the fp32 accumulation order differs from
+    # torch.matmul's full-K dot. bf16 x bf16 products are exact in fp32, so the
+    # only effect is on outputs that nearly cancel: a tiny fraction lands on the
+    # other side of a bf16 rounding boundary (by up to a few units on cute,
+    # where partial sums reach ~1e7).
+    max_mismatch_pct = 1e-4 if _get_backend() in ("pallas", "cute") else None
+    max_mismatched_abs_diff = 0.5 if _get_backend() == "pallas" else None
 
     x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
     w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)

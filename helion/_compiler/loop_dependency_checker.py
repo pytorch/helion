@@ -4,8 +4,6 @@ import ast
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from .device_ir import GraphInfo
 
 
@@ -13,140 +11,262 @@ if TYPE_CHECKING:
 INTRA_LOOP_RAW_BARRIER_META = "_needs_debug_barrier_before"
 
 
-def collect_host_tensor_aliases(body: list[ast.stmt]) -> dict[str, str]:
-    """Collect conservative base-storage aliases from host-wrapper statements."""
-    aliases: dict[str, str] = {}
-    for stmt in body:
-        if not isinstance(stmt, ast.For):
-            _update_host_aliases(stmt, aliases)
-    return aliases
+# A root shared by every kernel argument: the caller may pass one tensor twice
+# or overlapping views, so two arguments are never provably distinct storage.
+HOST_ARGUMENT_ROOT = "<argument>"
+# With ``distinct_arguments`` each argument gets ``<argument NAME>`` instead.
+_ARGUMENT_ROOT_PREFIX = "<argument"
+# A value whose storage cannot be traced (e.g. computed from globals only).
+HOST_UNKNOWN_ROOT = "<unknown>"
 
-
-def canonical_host_tensor_name(name: str, aliases: dict[str, str]) -> str:
-    """Resolve ``name`` through aliases collected by collect_host_tensor_aliases."""
-    return _canonical_alias(name, aliases)
-
-
-_ALIAS_PRESERVING_METHODS = frozenset(
+# Calls that return a new tensor sharing storage with nothing else.
+_FRESH_TORCH_FUNCTIONS = frozenset(
     {
-        "as_strided",
-        "detach",
-        "expand",
-        "flatten",
-        "movedim",
-        "narrow",
-        "permute",
-        "reshape",
-        "select",
-        "squeeze",
-        "swapaxes",
-        "swapdims",
-        "transpose",
-        "unbind",
-        "unflatten",
-        "unsqueeze",
-        "view",
+        "arange",
+        "clone",
+        "empty",
+        "empty_like",
+        "empty_strided",
+        "eye",
+        "full",
+        "full_like",
+        "linspace",
+        "ones",
+        "ones_like",
+        "rand",
+        "rand_like",
+        "randint",
+        "randint_like",
+        "randn",
+        "randn_like",
+        "randperm",
+        "tensor",
+        "zeros",
+        "zeros_like",
     }
+)
+_FRESH_TENSOR_METHODS = frozenset(
+    {"clone", "new_empty", "new_full", "new_ones", "new_tensor", "new_zeros"}
 )
 
 
-def _canonical_alias(name: str, aliases: dict[str, str]) -> str:
-    """Resolve a host name to the base storage name tracked by the analysis."""
-    path: list[str] = []
-    while (base := aliases.get(name)) is not None and base != name:
-        path.append(name)
-        name = base
-    for alias in path:
-        aliases[alias] = name
-    return name
+def is_host_argument_root(root: str) -> bool:
+    """Whether ``root`` (of ``collect_host_tensor_roots``) is a kernel argument."""
+    return root.startswith(_ARGUMENT_ROOT_PREFIX)
 
 
-def _alias_base_name(expr: ast.expr, aliases: dict[str, str]) -> str | None:
-    """Return the conservative base name for a host-side tensor alias expression.
+def collect_host_tensor_roots(
+    body: list[ast.stmt], arg_names: set[str], *, distinct_arguments: bool = False
+) -> dict[str, frozenset[str]]:
+    """Conservative storage roots of every name the host code binds.
 
-    Basic slicing and the standard view-like tensor methods preserve storage.
-    Treating an advanced-indexing subscript as an alias is conservative: it can
-    add a dependency but cannot remove one.
+    A root is :data:`HOST_ARGUMENT_ROOT` (``<argument NAME>`` per argument when
+    ``distinct_arguments``, for callers that may assume the caller passes
+    distinct tensors), an allocation site (a call listed in
+    ``_FRESH_TORCH_FUNCTIONS`` / ``_FRESH_TENSOR_METHODS``), or
+    :data:`HOST_UNKNOWN_ROOT`.  Any other value is assumed to alias every
+    tensor it is computed from: a view, a no-op conversion or an unknown op
+    may return its input.  Every binding of a name anywhere in the host code
+    (nested ``if`` / ``with`` / ``for`` blocks too) contributes, so the roots
+    hold whichever binding runs.  Two host tensors are provably distinct only
+    if neither has the unknown root and their roots are disjoint.
     """
-    if isinstance(expr, ast.Name):
-        return _canonical_alias(expr.id, aliases)
-    if isinstance(expr, ast.Subscript):
-        return _alias_base_name(expr.value, aliases)
-    if isinstance(expr, ast.Attribute) and expr.attr in {"T", "mT", "data"}:
-        return _alias_base_name(expr.value, aliases)
-    if isinstance(expr, ast.Call):
-        if (
-            isinstance(expr.func, ast.Attribute)
-            and isinstance(expr.func.value, ast.Name)
-            and expr.func.value.id == "torch"
-            and expr.func.attr in _ALIAS_PRESERVING_METHODS
-            and expr.args
-        ):
-            return _alias_base_name(expr.args[0], aliases)
-        if (
-            isinstance(expr.func, ast.Attribute)
-            and expr.func.attr in _ALIAS_PRESERVING_METHODS
-        ):
-            return _alias_base_name(expr.func.value, aliases)
-    return None
+    bindings: list[tuple[str, ast.expr]] = []
+
+    def bind(target: ast.expr, value: ast.expr) -> None:
+        # ``x[i] = v`` copies into x's storage and does not rebind x, but an
+        # attribute store may (``x.data = v``), so it counts as a binding.
+        if isinstance(target, ast.Name):
+            bindings.append((target.id, value))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                bind(element, value)
+        elif isinstance(target, (ast.Starred, ast.Attribute)):
+            bind(target.value, value)
+
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind(target, node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            if node.value is not None:
+                bind(node.target, node.value)
+        elif isinstance(node, (ast.For, ast.comprehension)):
+            bind(node.target, node.iter)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            bind(node.optional_vars, node.context_expr)
+
+    roots: dict[str, frozenset[str]] = {
+        name: frozenset(
+            {f"<argument {name}>" if distinct_arguments else HOST_ARGUMENT_ROOT}
+        )
+        for name in arg_names
+    }
+    for name, _value in bindings:
+        roots.setdefault(name, frozenset())
+
+    def name_roots(name: ast.Name) -> frozenset[str]:
+        # A shape, a size or another scalar cannot share tensor storage, so
+        # ``x.view(rows, cols)`` aliases x and not the tensor ``rows`` came from.
+        if _holds_no_storage(name):
+            return frozenset()
+        return roots.get(name.id, frozenset())
+
+    def expr_roots(expr: ast.expr) -> frozenset[str]:
+        if isinstance(expr, ast.Call) and _is_fresh_allocation(expr):
+            return frozenset({f"<allocation {expr.lineno}:{expr.col_offset}>"})
+        result: frozenset[str] = frozenset()
+        for child in ast.iter_child_nodes(expr):
+            if isinstance(child, ast.Name):
+                result |= name_roots(child)
+            elif isinstance(child, ast.expr):
+                result |= expr_roots(child)
+        return result
+
+    changed = True
+    while changed:
+        changed = False
+        for name, value in bindings:
+            value_roots = (
+                name_roots(value) if isinstance(value, ast.Name) else expr_roots(value)
+            )
+            merged = roots[name] | value_roots
+            if merged != roots[name]:
+                roots[name] = merged
+                changed = True
+    return {
+        name: name_roots or frozenset({HOST_UNKNOWN_ROOT})
+        for name, name_roots in roots.items()
+    }
 
 
-def _target_names(target: ast.expr) -> tuple[str, ...]:
-    if isinstance(target, ast.Name):
-        return (target.id,)
-    if isinstance(target, (ast.List, ast.Tuple)):
-        return tuple(name for element in target.elts for name in _target_names(element))
-    return ()
+def _holds_no_storage(name: ast.Name) -> bool:
+    """Whether type propagation proved ``name`` holds no tensor storage."""
+    from .ast_extension import ExtendedAST
+    from .type_info import CollectionType
+    from .type_info import LiteralType
+    from .type_info import NumericType
+    from .type_info import StringType
+    from .type_info import TileIndexType
+
+    def scalar(type_info: object) -> bool:
+        if isinstance(type_info, (NumericType, LiteralType, StringType, TileIndexType)):
+            return True
+        if isinstance(type_info, CollectionType):
+            elements = type_info.element_types
+            if isinstance(elements, dict):
+                return all(scalar(element) for element in elements.values())
+            if isinstance(elements, (list, tuple)):
+                return all(scalar(element) for element in elements)
+        return False
+
+    return isinstance(name, ExtendedAST) and scalar(name._type_info)
 
 
-def _update_alias_target(
-    target: ast.expr,
-    value: ast.expr,
-    aliases: dict[str, str],
-) -> None:
-    """Apply one host assignment to the conservative storage-alias map."""
-    if isinstance(target, ast.Name):
-        base = _alias_base_name(value, aliases)
-        if base is None:
-            aliases.pop(target.id, None)
-        else:
-            aliases[target.id] = base
-        return
-
-    if not isinstance(target, (ast.List, ast.Tuple)):
-        return
-
-    # Pairwise tuple/list assignment preserves the more precise base for each
-    # element.  Calls such as ``q, k, v = qkv.unbind(0)`` return multiple views
-    # of one storage, so every unpacked name conservatively aliases the call's
-    # receiver even though the RHS is not an AST tuple.
-    if isinstance(value, (ast.List, ast.Tuple)) and len(target.elts) == len(value.elts):
-        for target_element, value_element in zip(target.elts, value.elts, strict=True):
-            _update_alias_target(target_element, value_element, aliases)
-        return
-
-    base = _alias_base_name(value, aliases)
-    for name in _target_names(target):
-        if base is None:
-            aliases.pop(name, None)
-        else:
-            aliases[name] = base
+def _is_fresh_allocation(call: ast.Call) -> bool:
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if isinstance(func.value, ast.Name) and func.value.id == "torch":
+        return func.attr in _FRESH_TORCH_FUNCTIONS
+    return func.attr in _FRESH_TENSOR_METHODS
 
 
-def _update_host_aliases(stmt: ast.stmt, aliases: dict[str, str]) -> None:
-    """Update base-storage aliases from a host-wrapper assignment."""
-    value: ast.expr | None = None
-    targets: tuple[ast.expr, ...] = ()
-    if isinstance(stmt, ast.Assign):
-        targets = tuple(stmt.targets)
-        value = stmt.value
-    elif isinstance(stmt, ast.AnnAssign):
-        targets = (stmt.target,)
-        value = stmt.value
-    if value is None:
-        return
-    for target in targets:
-        _update_alias_target(target, value, aliases)
+def _storage_ids(graphs: list[GraphInfo], graph_id: int, obj: object) -> set[int]:
+    import torch
+
+    from .device_ir import NodeArgsGraphInfo
+
+    if isinstance(obj, (list, tuple)):
+        result: set[int] = set()
+        for item in obj:
+            result.update(_storage_ids(graphs, graph_id, item))
+        return result
+    if not isinstance(obj, torch.fx.Node):
+        return set()
+    graph_info = graphs[graph_id]
+    value = obj.meta.get("val")
+    result = {id(value.untyped_storage())} if isinstance(value, torch.Tensor) else set()
+    if (
+        obj.op == "placeholder"
+        and obj.graph is graph_info.graph
+        and isinstance(graph_info, NodeArgsGraphInfo)
+    ):
+        result.update(
+            _storage_ids(graphs, graph_id, graph_info.placeholder_to_outer_arg(obj))
+        )
+    if result:
+        return result
+    for arg in obj.args:
+        result.update(_storage_ids(graphs, graph_id, arg))
+    return result
+
+
+def graph_memory_access_storage_ids(
+    graphs: list[GraphInfo], graph_id: int
+) -> tuple[set[int], set[int]]:
+    """Return storage identities read and written by a graph and its subgraphs."""
+    from ..language import memory_ops
+    from ..language._tracing_ops import _for_loop
+    from ..language._tracing_ops import _for_loop_step
+    from ..language._tracing_ops import _if
+    from ..language._tracing_ops import _while_loop
+    from ..language.atomic_ops import ATOMIC_OPS
+    from .device_ir import IfGraphInfo
+    from .device_ir import WhileLoopGraphInfo
+
+    reads: set[int] = set()
+    writes: set[int] = set()
+
+    def update_from_subgraph(subgraph_id: int) -> None:
+        subgraph_reads, subgraph_writes = graph_memory_access_storage_ids(
+            graphs, subgraph_id
+        )
+        reads.update(subgraph_reads)
+        writes.update(subgraph_writes)
+
+    for node in graphs[graph_id].graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target is memory_ops.load:
+            reads.update(_storage_ids(graphs, graph_id, node.args[0]))
+            continue
+        if node.target is memory_ops.store:
+            writes.update(_storage_ids(graphs, graph_id, node.args[0]))
+            continue
+        if node.target in ATOMIC_OPS:
+            storage_ids = _storage_ids(graphs, graph_id, node.args[0])
+            reads.update(storage_ids)
+            writes.update(storage_ids)
+            continue
+        # Handle subgraphs for control flow constructs
+        if node.target in (_for_loop, _for_loop_step):
+            subgraph_id = node.args[0]
+            assert isinstance(subgraph_id, int)
+            update_from_subgraph(subgraph_id)
+            continue
+        if node.target is _if:
+            subgraph_id = node.args[1]
+            assert isinstance(subgraph_id, int)
+            update_from_subgraph(subgraph_id)
+            if_info = graphs[subgraph_id]
+            assert isinstance(if_info, IfGraphInfo)
+            if if_info.else_branch is not None:
+                else_graph_id = (
+                    if_info.else_branch
+                    if isinstance(if_info.else_branch, int)
+                    else if_info.else_branch.graph_id
+                )
+                update_from_subgraph(else_graph_id)
+            continue
+        if node.target is _while_loop:
+            subgraph_id = node.args[1]
+            assert isinstance(subgraph_id, int)
+            body_info = graphs[subgraph_id]
+            assert isinstance(body_info, WhileLoopGraphInfo)
+            update_from_subgraph(body_info.cond_graph_id)
+            update_from_subgraph(subgraph_id)
+    return reads, writes
 
 
 def mark_intra_loop_raw_barriers(
@@ -163,8 +283,7 @@ def mark_intra_loop_raw_barriers(
     an element written by one thread is read back by another with no
     synchronization in between -- a data race (observed corrupting ~0.8% of
     outputs on B200). Helion already inserts ``tl.debug_barrier()`` for the
-    analogous hazard *between* sequential top-level loops
-    (``needs_inter_loop_debug_barrier_for_global_raw``); this extends the same
+    analogous hazard *between* sequential top-level loops; this extends the same
     guarantee to a store->load *within* one loop body.
 
     We mark the load's FX node; the Triton ``load`` codegen emits a
@@ -197,37 +316,6 @@ class _IntraLoopRawBarrierMarker:
         self.graphs = graphs
         self.mark_in_divergent_control_flow = mark_in_divergent_control_flow
 
-    def _storage_ids(self, graph_id: int, obj: object) -> set[int]:
-        import torch
-
-        from .device_ir import NodeArgsGraphInfo
-
-        if isinstance(obj, (list, tuple)):
-            result: set[int] = set()
-            for item in obj:
-                result.update(self._storage_ids(graph_id, item))
-            return result
-        if not isinstance(obj, torch.fx.Node):
-            return set()
-        graph_info = self.graphs[graph_id]
-        value = obj.meta.get("val")
-        result = (
-            {id(value.untyped_storage())} if isinstance(value, torch.Tensor) else set()
-        )
-        if (
-            obj.op == "placeholder"
-            and obj.graph is graph_info.graph
-            and isinstance(graph_info, NodeArgsGraphInfo)
-        ):
-            result.update(
-                self._storage_ids(graph_id, graph_info.placeholder_to_outer_arg(obj))
-            )
-        if result:
-            return result
-        for arg in obj.args:
-            result.update(self._storage_ids(graph_id, arg))
-        return result
-
     def run_graph(
         self, graph_id: int, written: set[int], *, divergent: bool = False
     ) -> set[int]:
@@ -245,12 +333,12 @@ class _IntraLoopRawBarrierMarker:
             if node.op != "call_function":
                 continue
             if node.target is memory_ops.store:
-                pending.update(self._storage_ids(graph_id, node.args[0]))
+                pending.update(_storage_ids(self.graphs, graph_id, node.args[0]))
                 continue
             if node.target is memory_ops.load:
                 if node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
                     pending.clear()
-                elif pending & self._storage_ids(graph_id, node.args[0]):
+                elif pending & _storage_ids(self.graphs, graph_id, node.args[0]):
                     if divergent and not self.mark_in_divergent_control_flow:
                         # Cannot place a convergent barrier here; leave the
                         # hazard pending so a later uniform load re-arms it.
@@ -307,19 +395,3 @@ class _IntraLoopRawBarrierMarker:
                 # The condition executes at least once; the body may not execute.
                 pending = condition_pending | body_pending
         return pending
-
-
-def needs_inter_loop_debug_barrier_for_global_raw(
-    prev_global_writes: set[str],
-    host_loop_reads: frozenset[str],
-    *,
-    global_barrier_tensor_names: Callable[[frozenset[str]], set[str]],
-) -> bool:
-    """Whether to emit ``tl.debug_barrier()`` before the next sequential device loop.
-
-    Returns True when the union of host-named global writes accumulated from
-    all prior siblings (since the last emitted barrier) intersects the current
-    loop's host-named read set.
-    """
-    cur_global_reads = global_barrier_tensor_names(host_loop_reads)
-    return bool(prev_global_writes & cur_global_reads)

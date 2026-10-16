@@ -491,7 +491,6 @@ class TestTileDependency(TestCase):
                 _access(0, root=1, kind="store"),
                 _access(1, root=1, kind="load", owner_rank=1),
             ),
-            (_access(0, root=1, kind="store", owner_rank=1),),
             (
                 _access(0, root=1, kind="store", owner_rank=1, atomic=True),
                 _access(1, root=1, kind="load", owner_rank=2),
@@ -505,7 +504,8 @@ class TestTileDependency(TestCase):
                 exc.CrossLoopSchedulingError, "root 1 may race with another rank"
             ):
                 build_tile_dependency_graph(accesses, [[0], [1]])
-        # Loads, atomics and local pairs.
+        # Loads, atomics, local pairs and pushes: overlapping stores within one
+        # root are the program's race on every rank, as they are locally.
         plan = build_tile_dependency_graph(
             (
                 _access(0, root=1, kind="load"),
@@ -516,6 +516,8 @@ class TestTileDependency(TestCase):
                 ),
                 _access(4, root=1, allocation_id=2, kind="store"),
                 _access(5, root=1, allocation_id=2, kind="load"),
+                _access(6, root=1, allocation_id=3, kind="store", owner_rank=1),
+                _access(7, root=1, allocation_id=3, kind="store"),
             ),
             [[0], [1]],
         )
@@ -1389,8 +1391,8 @@ class TestTileDependency(TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
-    @skipIfTileIR("implicit tile-dependency scheduling is Triton-only")
-    @onlyBackends(["triton"])
+    @skipIfTileIR("implicit tile-dependency lowering is unavailable on TileIR")
+    @onlyBackends(["triton", "cute"])
     def test_ssa_copies_keep_allocation_identity(self) -> None:
         x = torch.empty(64, 32, device=DEVICE)
         host = read_through_alias.bind((x,)).host_function

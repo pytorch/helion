@@ -336,6 +336,9 @@ class DeviceFunction:
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
         self.wrapper_only_params: list[str] = []
+        # Optional parameter annotations of wrapper-only params (e.g. TMA
+        # descriptors passed as ``cutlass.GridConstant[...]``).
+        self.wrapper_only_param_annotations: dict[str, str] = {}
         self._tensor_properties: dict[tuple[object, ...], TensorPropertyArg] = {}
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
@@ -429,10 +432,12 @@ class DeviceFunction:
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
         # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
-        # awaiting their first use, and the inband accesses emitted so far.
+        # awaiting their first use, the inband accesses emitted so far, and the
+        # done-word asm of each root with inband scatter stores.
         self.peer_state: PeerState | None = None
         self.inband_polls: list[InbandPoll] = []
         self.inband_access_ids: set[int] = set()
+        self.inband_scatter_done: dict[int, str] = {}
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -678,6 +683,18 @@ class DeviceFunction:
             return None
         return bool(resolved)
 
+    def constexpr_taken_graph_id(self, if_node: torch.fx.Node) -> int | None:
+        """The graph id of the side an ``_if`` node takes when its test is a
+        constant for this config (``evaluate_constexpr_condition``), or
+        ``None`` when the test is decided at runtime."""
+        test, if_graph_id, else_graph_id, *_ = if_node.args
+        taken = self.evaluate_constexpr_condition(
+            test.meta["val"] if isinstance(test, torch.fx.Node) else test
+        )
+        if taken is None:
+            return None
+        return cast("int", if_graph_id if taken else else_graph_id)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 
@@ -744,6 +761,13 @@ class DeviceFunction:
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
+        if env.codegen_name in ("triton", "cute"):
+            from .integer_power import prepare_integer_powers
+
+            # Expressions already evaluated on the host or in a device local
+            # need no new arithmetic. Prove integer powers only for the residual
+            # expression that will actually be evaluated in this device scope.
+            expr = prepare_integer_powers(expr, self)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
@@ -1087,6 +1111,14 @@ class DeviceFunction:
         self.arguments.append(rv)
         return True
 
+    def resolved_int_constexpr(self, name: str) -> int | None:
+        """Return a registered constexpr's value as an int, if it is a static literal."""
+        arg = self._constexpr_args.get(name)
+        if arg is None:
+            return None
+        host_str = arg.host_str()
+        return int(host_str) if host_str.isdigit() else None
+
     def constexpr_arg_with_host_def(self, name: str, value: object) -> None:
         """Create a constexpr argument and add its host-side definition if needed."""
         created = self.constexpr_arg(name, value)
@@ -1247,7 +1279,10 @@ class DeviceFunction:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
         wrapper_only_params.extend(self.triton_persistent_state_args)
-        args.extend(create_arg(name) for name in wrapper_only_params)
+        args.extend(
+            create_arg(name, self.wrapper_only_param_annotations.get(name))
+            for name in wrapper_only_params
+        )
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -1289,16 +1324,30 @@ class DeviceFunction:
                 dependent_launch = [
                     statement_from_string("cute.arch.griddepcontrol_wait()")
                 ]
+        env = CompileEnvironment.current()
+        if (
+            self.triton_persistent_state_specs
+            and env.pdl_exit + env.pdl_entry
+            and "wait" not in env.pdl_entry
+        ):
+            raise exc.PdlStateWithoutWait
+        pdl = {
+            "wait": "tl.extra.cuda.gdc_wait()",
+            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
+        }
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
                 *dependent_launch,
+                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
+                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
+        constexpr_values: dict[str, int] = {}
         if backend.name == "cute":
             from .cute.fuse_two_pass_loads import fuse_two_pass_loads
             from .cute.uniform_comparison import lower_uniform_comparisons
@@ -1329,7 +1378,7 @@ class DeviceFunction:
             # trip counts. Three sources: literal constexpr inlined args,
             # host-side literal assignments to constexpr-named variables,
             # and the inlined module-level constexpr decls.
-            constexpr_values: dict[str, int] = {}
+            constexpr_values = {}
             for arg in constexpr_to_inline:
                 try:
                     value = int(arg.host_str())
@@ -1390,10 +1439,12 @@ class DeviceFunction:
                 )
                 exact_thread_block_dims = thread_block_dims = (288, 1, 1)
                 thread_block_dims_are_exact = True
-            if self.cute_state.collective_register_chain_block_dims is not None:
-                exact_thread_block_dims = thread_block_dims = (
-                    self.cute_state.collective_register_chain_block_dims
-                )
+            owned_block_dims = (
+                self.cute_state.collective_register_chain_block_dims
+                or self.cute_state.owned_root_block_dims
+            )
+            if owned_block_dims is not None:
+                exact_thread_block_dims = thread_block_dims = owned_block_dims
                 thread_block_dims_are_exact = True
             # Autotuner-selected reload mode per rolled or persistent
             # reduction dim ("auto" / "register" / "gmem").
@@ -1477,6 +1528,7 @@ class DeviceFunction:
                 kernel_body,
                 running_sum_accumulators=self.cute_matmul_running_sums,
                 rename_groups=rename_groups,
+                unfoldable_vec_lanes=self.cute_state.unfoldable_vec_lanes,
             )
             if self.cute_state.simt_cluster_n > 1:
                 from .cute.duplicate_reduction_carries import (
@@ -1561,12 +1613,14 @@ class DeviceFunction:
             from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
 
             kernel_body = fuse_fp8_pair_decode(kernel_body)
-            # Hoist loop-invariant floating-point divisions out of inner
-            # tile loops, replacing each ``x / scalar`` with a hoisted
-            # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
-            # B200 div is ~22 cycles vs ~2 for multiply, so the softmax
-            # consume sweep (~12672 divides per row) sees a measured
-            # +20% bench gain on (4096, 12672) fp16.
+            # Under fast_math, hoist loop-invariant floating-point
+            # divisions out of inner tile loops, replacing each
+            # ``x / scalar`` with a hoisted ``inv = 1.0 / scalar`` +
+            # ``x * inv`` in the loop body.  B200 div is ~22 cycles vs ~2
+            # for multiply, so the softmax consume sweep (~12672 divides
+            # per row) sees a measured +20% bench gain on (4096, 12672)
+            # fp16.  The rewrite rounds differently and fires only in the
+            # loops a config creates, so it needs the setting.
             from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
 
             # Pass the post-renames map so the invariance analysis can
@@ -1577,7 +1631,9 @@ class DeviceFunction:
             # loop and capture its stale initial value.
             rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
             kernel_body = hoist_loop_invariant_recips(
-                kernel_body, rename_groups=rename_groups
+                kernel_body,
+                rename_groups=rename_groups,
+                fast_math=CompileEnvironment.current().settings.fast_math,
             )
             # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
             # ``cute.math.fma`` (the DSL's arith ops carry no contract
@@ -1615,6 +1671,21 @@ class DeviceFunction:
                 if not unrolled:
                     raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
+            # Preserve the global FMA decisions above. This optional pass
+            # moves only raw packet loads/cache writes across a proven
+            # single-trip reduction; arithmetic and PDL waits stay in place.
+            if exact_thread_block_dims is not None:
+                from .cute.prefetch_reduction_packets import prefetch_reduction_packets
+
+                kernel_body = prefetch_reduction_packets(
+                    kernel_body,
+                    constexpr_values=constexpr_values,
+                    thread_block_dims=exact_thread_block_dims,
+                    tensor_dtypes=tensor_dtypes,
+                    reload_modes=reload_modes,
+                    argument_names={arg.name for arg in self.arguments},
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                )
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside
             # the body, issue iter N+1's load BEFORE iter N's compute
@@ -1864,11 +1935,12 @@ class DeviceFunction:
             )
             # Fuse an online-softmax (max, sum) pair of cluster reduces into
             # ONE packed DSM exchange: the max reduce relocalizes to a
-            # CTA-local block reduce, the sum site exchanges the
+            # CTA-local block reduce, and the sum site exchanges the
             # ``(local_max, local_sum)`` pair once and folds with the
-            # online-softmax rescale, and the write sweep reuses the sum
-            # sweep's cached exp values.  Saves a full cluster round-trip
-            # per row (+5..9% at cluster_n 2..16 on B200 softmax).
+            # online-softmax rescale.  Under fast_math the write sweep also
+            # reuses the sum sweep's cached exp values; otherwise it keeps
+            # computing them exactly.  Saves a full cluster round-trip per
+            # row (+5..9% at cluster_n 2..16 on B200 softmax).
             from .cute.cluster_online_pair import fuse_cluster_online_pair
 
             kernel_body = fuse_cluster_online_pair(
@@ -1877,6 +1949,37 @@ class DeviceFunction:
                 rename_groups=rename_groups,
                 fast_math=CompileEnvironment.current().settings.fast_math,
             )
+            if self.config.get("cute_register_row", False):
+                from .cute.register_row_reduction import lower_register_row_reduction
+
+                if self.config.get("cute_register_row_tensor_copy", False):
+                    from .cute.register_row_tensor_copy import (
+                        context_from_device_function,
+                    )
+
+                    kernel_body = lower_register_row_reduction(
+                        kernel_body,
+                        constexpr_values,
+                        tensor_copy_context=context_from_device_function(
+                            self,
+                            exact_thread_block_dims or (0, 0, 0),
+                            tensor_dtypes,
+                        ),
+                    )
+                else:
+                    kernel_body = lower_register_row_reduction(
+                        kernel_body, constexpr_values
+                    )
+            elif self.config.get("cute_cluster_warp_online", False):
+                from .cute.rolled_cluster_online_pair import (
+                    fuse_rolled_cluster_online_pair,
+                )
+
+                kernel_body = fuse_rolled_cluster_online_pair(kernel_body)
+            if self.config.get("cute_independent_reduction", False):
+                from .cute.rolled_vector_reduction import split_rolled_vector_sums
+
+                kernel_body = split_rolled_vector_sums(kernel_body)
             # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
             # flush to zero), so it is gated on the fast_math SETTING —
             # tuned configs must never change numerics.
@@ -1902,6 +2005,20 @@ class DeviceFunction:
             kernel_body = lower_full_tile_bounds(
                 kernel_body, self, param_args, constexpr_values, rename_groups
             )
+            if self.config.get("cute_warp_fp32_redux", False):
+                from .cute.native_warp_reduction import enable_fp32_warp_redux
+
+                kernel_body = enable_fp32_warp_redux(kernel_body)
+            if self.config.get("cute_scalar_epilogue", False):
+                from .cute.scalar_epilogue import lower_scalar_epilogue
+
+                kernel_body = lower_scalar_epilogue(
+                    kernel_body,
+                    self,
+                    constexpr_values,
+                    thread_block_dims,
+                    proven_disjoint_tensor_pairs,
+                )
             if self.config.get("cute_rng_packet", False):
                 from .cute.philox_packets import lower_philox_packets
 
@@ -1934,11 +2051,39 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.backend import validate_thread_axis_accesses
             from .cute.boolean_guards import reassociate_boolean_guards
+
+            if self.config.get("cute_register_row", False):
+                from .cute.online_chunk_reduction import lower_online_chunk_reduction
+
+                definition.body = lower_online_chunk_reduction(
+                    definition.body, constexpr_values
+                )
 
             # Type facts must see the final binding names, including every
             # loop-carried alias, before changing the SDK's Boolean tree shape.
             definition.body = reassociate_boolean_guards(definition.body)
+            if self.config.get("cute_fragment_published_scalars", False):
+                for request in self.cute_state.published_scalar_requests:
+                    request.lower(
+                        definition.body,
+                        {k: v[0] for k, v in self._variable_renames.items()},
+                        self.new_var,
+                    )
+            if self.config.get("cute_fragment_register_producers", False):
+                for request in self.cute_state.register_producer_requests:
+                    request.lower(
+                        definition.body,
+                        {k: v[0] for k, v in self._variable_renames.items()},
+                        self.new_var,
+                    )
+            validate_thread_axis_accesses([*prefix, definition])
+            from .cute.scalar_policy_loads import lower_scalar_policy_loads
+
+            # Keep ordinary load/effect recognition intact through all memory
+            # scheduling, including the late published/register-producer cuts.
+            definition.body = lower_scalar_policy_loads(definition.body)
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"
@@ -1991,15 +2136,19 @@ class DeviceFunction:
         inputs cannot overlap an external input or a separately allocated
         output.  Two external inputs are disjoint only when the current runtime
         storage spans do not overlap and that predicate is part of the bound
-        kernel cache key.  Origin type alone is insufficient: host-local
+        kernel cache key.  The predicate compares whole storages, so it also
+        covers host-side views (``x.view(...)``) through the input whose
+        storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
         from .cute.memory_ops import runtime_tensors_are_proven_disjoint
 
         env = CompileEnvironment.current()
         host_function = HostFunction.current()
-        input_storages = {id(tensor.untyped_storage()) for tensor in env.input_sources}
-        origins: dict[str, tuple[str, int, bool, torch.Tensor]] = {}
+        input_storages = {
+            id(tensor.untyped_storage()): tensor for tensor in env.input_sources
+        }
+        origins: dict[str, tuple[str, int, torch.Tensor | None]] = {}
         for arg in self.arguments:
             if not isinstance(arg, TensorArg):
                 continue
@@ -2010,33 +2159,24 @@ class DeviceFunction:
                 origins[arg.name] = (
                     root,
                     storage,
-                    storage not in input_storages,
-                    arg.fake_value,
+                    arg.fake_value
+                    if arg.fake_value in env.input_sources
+                    else input_storages.get(storage),
                 )
         return {
             frozenset((left_name, right_name))
-            for left_name, (
-                left_root,
-                left_storage,
-                left_is_fresh,
-                left_tensor,
-            ) in origins.items()
-            for right_name, (
-                right_root,
-                right_storage,
-                right_is_fresh,
-                right_tensor,
-            ) in origins.items()
+            for left_name, (left_root, left_storage, left_input) in origins.items()
+            for right_name, (right_root, right_storage, right_input) in origins.items()
             if left_name < right_name
             and left_root != right_root
             and left_storage != right_storage
             and (
-                left_is_fresh
-                or right_is_fresh
+                left_input is None
+                or right_input is None
                 or runtime_tensors_are_proven_disjoint(
                     env,
-                    left_tensor,
-                    right_tensor,
+                    left_input,
+                    right_input,
                 )
             )
         }
@@ -2261,13 +2401,19 @@ class DeviceFunction:
         Remove variables that are not used in the function body.
         """
 
-        for _ in range(8):
-            rw = ReadWrites.from_list([*self.preamble, *self.body])
+        rename_groups = {
+            name: aliases[0] for name, aliases in self._variable_renames.items()
+        }
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
+        while True:
+            previous_rw = rw
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
-            dead_lane_loop_elimination(self.body)
-            dead_lane_loop_elimination(self.preamble)
-        rw = ReadWrites.from_list([*self.preamble, *self.body])
+            dead_lane_loop_elimination(self.body, rename_groups)
+            dead_lane_loop_elimination(self.preamble, rename_groups)
+            rw = ReadWrites.from_list([*self.preamble, *self.body])
+            if rw == previous_rw:
+                break
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).
