@@ -433,6 +433,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "gathered_mma_tma",
                     "block_scaled_mma",
                     "helion_mma_dag_tma",
+                    "helion_mma_dag_alias",
                 }
                 for plan in self.cute_wrapper_plans
             )
@@ -3044,6 +3045,14 @@ def _generate_ast(
                                 resolved[key[:-5] + "_bind_idx"] = host_arg_positions[
                                     arg_name
                                 ]
+                    # The cute_mma_dag alias guard names every tensor
+                    # argument of its program (the names stay for the
+                    # launcher's error message).
+                    tensor_names = resolved.get("tensor_names")
+                    if isinstance(tensor_names, list):
+                        resolved["tensor_idx"] = [
+                            launcher_arg_positions[str(name)] for name in tensor_names
+                        ]
                     resolved_plans.append(resolved)
                 return resolved_plans
 

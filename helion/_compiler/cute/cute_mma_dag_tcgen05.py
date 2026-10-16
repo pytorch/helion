@@ -118,6 +118,7 @@ from .cute_mma_dag_codegen import _Emitter
 from .cute_mma_dag_codegen import _Evaluator
 from .cute_mma_dag_codegen import _shape
 from .cute_mma_dag_codegen import emit_mma_dag_module_statements
+from .cute_mma_dag_codegen import mma_dag_alias_plan
 from .cute_warp_mma_gemm import _swizzled_chunk
 from .matmul_utils import strip_new_vars
 
@@ -1573,6 +1574,7 @@ def codegen_mma_dag_tcgen05(cg: GenerateAST, plan: MmaDagPlan) -> None:
                 f"cutlass.GridConstant[{_RT}.cuda.TensorMap]"
             )
         cg.cute_wrapper_plans.append(wrapper)
+    cg.cute_wrapper_plans.append(mma_dag_alias_plan(df, plan.program))
     df.cute_state.owned_root_block_dims = (plan.threads, 1, 1)
 
 

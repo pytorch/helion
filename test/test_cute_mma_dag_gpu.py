@@ -8,8 +8,11 @@ and the stage / store / exchange knobs being pure data movement."""
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
+import sys
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -20,6 +23,8 @@ from helion._testing import skipUnlessBackends
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
+    from types import ModuleType
 
 pytestmark = [
     skipUnlessBackends(["cute"]),
@@ -1319,6 +1324,42 @@ def test_a_root_dot_rescaling_its_loops_carry_matches_the_triton_backend(
         assert torch.equal(lhs, rhs)
 
 
+def test_aliased_arguments_are_refused_at_launch() -> None:
+    # ``_rmw_two_names`` reads s_in and writes s_out; compiled against
+    # distinct fakes, the s_in reads are hoisted ahead of the loop.  Passing
+    # one tensor under both names is refused by the launcher's alias guard
+    # on the first (marshalling) launch and on the metadata-guarded
+    # relaunches alike; distinct tensors run and match Triton.
+    fn = _probe_kernels()._rmw_two_names
+    g = torch.Generator(device=DEVICE).manual_seed(17)
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=17)
+    s_in = _randn(g, 2, 64, dtype=torch.float32)
+    s_out = torch.empty_like(s_in)
+    args = (t["k"], t["v"], s_in, s_out)
+    source, out = _run_cute(fn, args, _config([64, 64], 4, 2))
+    assert "'kind': 'helion_mma_dag_alias'" in source
+    ref_out = torch.empty_like(s_in)
+    ref = _run_triton(fn, (t["k"], t["v"], s_in, ref_out), [64, 64])
+    assert torch.equal(out[0], ref[0])
+    # s_out carries a row sum of the fragment (another reduction order).
+    torch.testing.assert_close(s_out, ref_out, atol=1e-3, rtol=1e-4)
+    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(_config([64, 64], 4, 2))
+    compiled = bound.compile_config(normalized)
+    s = s_in.clone()
+    with pytest.raises(helion.exc.BackendUnsupported, match="'s_in' and 's_out' alias"):
+        compiled(t["k"], t["v"], s, s)
+    compiled(*args)
+    compiled(*args)
+    with pytest.raises(helion.exc.BackendUnsupported, match="'s_in' and 's_out' alias"):
+        compiled(t["k"], t["v"], s, s)
+    with pytest.raises(helion.exc.BackendUnsupported, match="'s_in' and 's_out' alias"):
+        compiled(t["k"], t["v"], s[:, 32:], s)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("n", (0, 3))
 def test_a_zero_trip_outer_loop_matches_the_triton_backend(n: int) -> None:
     # The nested ring's first prologue, peeled ahead of the outer ``for``, read
@@ -1343,3 +1384,198 @@ def test_a_zero_trip_outer_loop_matches_the_triton_backend(n: int) -> None:
     assert "if 0 < n:" in source
     ref = _run_triton(kernels._grid_nest_steps, args, [64, 32])
     _assert_close(out, ref)
+
+
+def _load_module(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[path.stem] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_standalone_export_keeps_the_alias_guard(tmp_path: Path) -> None:
+    # The standalone export allowlisted the alias plan as launcher-only
+    # metadata, so the exported wrapper ran aliased arguments on the stale
+    # hoisted loads.  The launch table carries the plan's positions and store
+    # flags and the exported launcher refuses what the in-process guard
+    # refuses; distinct arguments run and match Triton.
+    fn = _probe_kernels()._rmw_two_names
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=19)
+    g = torch.Generator(device=DEVICE).manual_seed(19)
+    s_in = _randn(g, 2, 64, dtype=torch.float32)
+    s_out = torch.empty_like(s_in)
+    args = (t["k"], t["v"], s_in, s_out)
+    bound = helion.kernel(fn, backend="cute", static_shapes=True).bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(_config([64, 64], 4, 2))
+    code = bound.to_code(
+        normalized, options=helion.OutputCodeOptions(allow_helion_deps=False)
+    )
+    assert "((0, 1, 2, 3, 4), (False, False, True, False, True))" in code
+    path = tmp_path / "native_rmw_two_names.py"
+    path.write_text(code)
+    exported = _load_module(path)
+    h_out = exported._rmw_two_names(*args)
+    torch.cuda.synchronize()
+    ref_out = torch.empty_like(s_in)
+    ref = _run_triton(fn, (t["k"], t["v"], s_in, ref_out), [64, 64])
+    _assert_close((h_out,), ref)
+    torch.testing.assert_close(s_out, ref_out, atol=1e-3, rtol=1e-4)
+    # Arguments aliasing differently from the export's trip the exporter's
+    # input-alias facts guard first; the span check is reached by an export
+    # whose own arguments alias: two same-layout windows of one buffer
+    # sharing a row (the kernel compiles against distinct storages still).
+    s = s_in.clone()
+    with pytest.raises(ValueError, match="aliasing does not match"):
+        exported._rmw_two_names(t["k"], t["v"], s, s)
+    wide = _randn(g, 3, 64, dtype=torch.float32)
+    windows = (t["k"], t["v"], wide[:2], wide[1:])
+    aliased = helion.kernel(fn, backend="cute", static_shapes=True).bind(windows)
+    with aliased.env:
+        normalized = aliased.config_spec.normalized_config(_config([64, 64], 4, 2))
+    path = tmp_path / "native_rmw_two_names_aliased.py"
+    path.write_text(
+        aliased.to_code(
+            normalized, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+    )
+    exported_aliased = _load_module(path)
+    with pytest.raises(ValueError, match="Tensor arguments alias"):
+        exported_aliased._rmw_two_names(*windows)
+    with pytest.raises(ValueError, match="Tensor arguments alias"):
+        exported_aliased._rmw_two_names(t["k"], t["v"], wide[1:], wide[1:])
+    exported._rmw_two_names(*args)
+    torch.cuda.synchronize()
+
+
+def test_the_fast_relaunch_guards_decide_on_real_tensors() -> None:
+    # The C++ tensor guard stands in for the Python metadata guards when it
+    # passes; when it misses for a property the launch does not care about
+    # (requires_grad) the Python guards keep the fast path -- no marshalling
+    # launch -- and the result is the same.  (A different layout is not a
+    # launcher matter: a static-shapes kernel is specialized on it and the
+    # Helion kernel object rebinds.)
+    import helion.runtime.cute.launcher as launcher_module
+
+    fn = _probe_kernels()._rmw_two_names
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=23)
+    g = torch.Generator(device=DEVICE).manual_seed(23)
+    s_in = _randn(g, 2, 64, dtype=torch.float32)
+    s_out = torch.empty_like(s_in)
+    args = (t["k"], t["v"], s_in, s_out)
+    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(_config([64, 64], 4, 2))
+    compiled = bound.compile_config(normalized)
+    expected = compiled(*args).clone()
+    compiled(*args)
+    cute_kernel = compiled.__globals__["_helion__rmw_two_names"]
+    fastpath = cute_kernel._helion_cute_fastpath
+    assert isinstance(fastpath, launcher_module._CuteFastRelaunch)
+    assert fastpath.cxx_guards is not None
+    assert fastpath.raw_grid == (2,) and fastpath.raw_kwargs == {"block": (128, 1, 1)}
+    marshalled: list[str] = []
+    original = launcher_module._launch_cute_marshalled
+
+    def counting(kernel_object: object, *rest: object) -> object:
+        marshalled.append(kernel_object.__name__)
+        return original(kernel_object, *rest)
+
+    cxx_misses: list[bool] = []
+    cxx_check = fastpath.cxx_check
+    assert cxx_check is not None
+
+    def spying_check(*tensors: object) -> bool:
+        hit = cxx_check(*tensors)
+        cxx_misses.append(not hit)
+        return hit
+
+    fastpath.cxx_check = spying_check
+    with patch.object(launcher_module, "_launch_cute_marshalled", counting):
+        out = compiled(*args)
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cxx_misses == [False]
+        k_grad = t["k"].clone().requires_grad_(True)
+        out = compiled(k_grad, t["v"], s_in, torch.empty_like(s_in))
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+        assert cxx_misses == [False, True] and marshalled == []
+
+
+def test_a_negative_zero_scalar_does_not_relaunch_the_positive_zero() -> None:
+    # -0.0 == 0.0 let the relaunch reuse the pinned +0.0 and divide by the
+    # wrong sign of zero.  Launched with 0.0, 0.0, -0.0, -0.0, 2.0, -0.0 the
+    # kernel matches eager, infinities' signs included.
+    fn = _probe_kernels()._div_scalar
+    g = torch.Generator(device=DEVICE).manual_seed(29)
+    k = (_randn(g, 2, 8, 64, 64, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+    v = (_randn(g, 2, 8, 64, 64, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+    rowsum = torch.einsum("bncd,bnce->bde", k.float(), v.float()).sum(-1)
+    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+    bound = kernel.bind((0.0, k, v, torch.empty((2, 64), device=DEVICE)))
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(_config([64, 64], 4, 2))
+    compiled = bound.compile_config(normalized)
+    for scale in (0.0, 0.0, -0.0, -0.0, 2.0, -0.0):
+        out = torch.empty((2, 64), device=DEVICE)
+        compiled(scale, k, v, out)
+        torch.cuda.synchronize()
+        ref = rowsum / scale
+        assert torch.equal(out.isinf(), ref.isinf()), scale
+        assert torch.equal(torch.signbit(out), torch.signbit(ref)), scale
+        finite = ~ref.isinf()
+        torch.testing.assert_close(out[finite], ref[finite], atol=1e-3, rtol=1e-4)
+
+
+def test_the_raw_launch_record_follows_the_fastpaths_grid() -> None:
+    # With the record cleared (the state a concurrent first launch could
+    # leave), a launch with another grid must not record its spelling on a
+    # fastpath pinned to the host's grid, so the raw relaunch never launches
+    # the pinned grid for it.
+    import helion.runtime.cute.launcher as launcher_module
+
+    fn = _probe_kernels()._rmw_two_names
+    t = _inputs(bh=2, n=8, d=64, dv=64, dtype=torch.bfloat16, seed=31)
+    g = torch.Generator(device=DEVICE).manual_seed(31)
+    s_in = _randn(g, 2, 64, dtype=torch.float32)
+    state: dict[str, object] = {"grid": None, "kernel": None}
+
+    def launcher(
+        cute_kernel: object, grid: tuple[int, ...], *args: object, **kwargs: object
+    ) -> object:
+        state["kernel"] = cute_kernel
+        forced = state["grid"]
+        return launcher_module.default_cute_launcher(
+            cute_kernel, forced if forced is not None else grid, *args, **kwargs
+        )
+
+    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+    bound = kernel.bind((t["k"], t["v"], s_in, torch.empty_like(s_in)))
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(_config([64, 64], 4, 2))
+    compiled = bound.compile_config(normalized)
+
+    def rows_written(forced: tuple[int, ...] | None) -> list[bool]:
+        state["grid"] = forced
+        out = torch.full_like(s_in, -7.0)
+        compiled(t["k"], t["v"], s_in, out, _launcher=launcher)
+        torch.cuda.synchronize()
+        return [bool((out[row] != -7.0).any()) for row in range(2)]
+
+    assert rows_written(None) == [True, True]
+    assert rows_written(None) == [True, True]
+    fastpath = state["kernel"]._helion_cute_fastpath  # type: ignore[attr-defined]
+    assert fastpath.grid == (2, 1, 1) and fastpath.raw_grid == (2,)
+    fastpath.raw_grid = None
+    fastpath.raw_kwargs = None
+    # One CTA only, twice: no record is taken from it.
+    assert rows_written((1,)) == [True, False]
+    assert fastpath.raw_grid is None
+    assert rows_written((1,)) == [True, False]
+    # The host's own grid records and relaunches fast.
+    assert rows_written(None) == [True, True]
+    assert fastpath.raw_grid == (2,)
+    assert rows_written(None) == [True, True]

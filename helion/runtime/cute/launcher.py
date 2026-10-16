@@ -11,6 +11,7 @@ requires a CuTe/cutlass install.
 from __future__ import annotations
 
 import base64
+import bisect
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextlib import suppress
@@ -25,12 +26,14 @@ import json
 import linecache
 import logging
 import math
+import operator
 import os
 import sys
 import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
+from typing import NoReturn
 from typing import cast
 import weakref
 
@@ -732,6 +735,11 @@ def _append_cute_wrapper_plan(
                 "    grid_z = cutlass.Int32(1)",
             ]
         )
+        return
+
+    if kind == "helion_mma_dag_alias":
+        # cute_mma_dag: launch-time argument metadata for the alias guard
+        # (``_MmaDagAliasGuard``); nothing to prepare on the host.
         return
 
     if kind == "helion_mma_dag_tma":
@@ -2376,6 +2384,145 @@ def _validate_gdn_recurrence_launch_args(
     # k, w and u are read through TMA tensor maps.
     if any(tensor.data_ptr() % GDN_TMA_ALIGNMENT_BYTES for tensor in tensors[:3]):
         raise exc.BackendUnsupported("cute", "gdn recurrence TMA base is misaligned")
+
+
+def _tensor_byte_span(tensor: torch.Tensor) -> int:
+    """Bytes from the tensor's first element to one past its last (the span
+    of storage its view can touch; 0 for an empty tensor)."""
+    if tensor.numel() == 0:
+        return 0
+    last = 0
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        last += (size - 1) * stride
+    return (last + 1) * tensor.element_size()
+
+
+_MMA_DAG_ALIAS_PASSED_LIMIT = 64
+
+
+class _MmaDagAliasGuard:
+    """Refuses a cute_mma_dag launch whose tensor arguments alias.
+
+    The planner admits a program whose loads and stores touch distinct
+    storages and the emitter hoists side loads and stages tiles ahead of
+    the stores on that proof.  The proof is over the fake tensors the
+    kernel is compiled against (one storage per argument), so a caller
+    passing one tensor, or two views of one buffer, under two names is
+    only visible here: the byte span of every stored argument must not
+    overlap any other tensor argument's.  Two loads may alias freely (the
+    engine passes views of one tensor and the same tensor twice).
+
+    The spans follow from the pinned tensor metadata, so a guard built for
+    one launch holds for the fast relaunches that share that metadata; the
+    per-launch work is the pointers, and a launch repeating a pointer set
+    that passed recently (the allocator cycles through a few blocks for a
+    workload's fresh outputs) is not checked again.  A stored span overlaps
+    another iff more than one span (its own) begins before it ends and
+    does not end before it begins: two bisections per store over the
+    sorted begins and ends; only a failure names the pair.
+    """
+
+    __slots__ = ("indices", "names", "passed", "pick", "spans", "stores")
+
+    def __init__(self, plan: dict[str, object], args: tuple[object, ...]) -> None:
+        indices = plan.get("tensor_idx")
+        names = plan.get("tensor_names")
+        stored = plan.get("stored")
+        if (
+            not isinstance(indices, list)
+            or not isinstance(names, list)
+            or not isinstance(stored, list)
+            or len(indices) != len(names)
+            or len(indices) != len(stored)
+        ):
+            raise exc.BackendUnsupported("cute", "invalid mma_dag alias plan")
+        kept: list[int] = []
+        kept_names: list[str] = []
+        stores: list[int] = []
+        spans: list[int] = []
+        for index, name, is_store in zip(indices, names, stored, strict=True):
+            if type(index) is not int or not isinstance(name, str):
+                raise exc.BackendUnsupported("cute", "invalid mma_dag alias plan")
+            tensor = args[index]
+            if not isinstance(tensor, torch.Tensor):
+                raise exc.BackendUnsupported(
+                    "cute", f"mma_dag argument {name!r} is not a tensor"
+                )
+            span = _tensor_byte_span(tensor)
+            if span == 0:
+                continue
+            if is_store:
+                stores.append(len(kept))
+            kept.append(index)
+            kept_names.append(name)
+            spans.append(span)
+        self.indices = tuple(kept)
+        self.names = tuple(kept_names)
+        self.spans = tuple(spans)
+        self.stores = tuple(stores)
+        # The guarded tensors of a launch (``args[index]`` for each index).
+        self.pick = cast(
+            "Callable[[tuple[object, ...]], Sequence[torch.Tensor]]",
+            operator.itemgetter(*kept)
+            if len(kept) > 1
+            else (lambda args: tuple(args[index] for index in kept)),
+        )
+        self.passed: set[tuple[int, ...]] = set()
+
+    def check(self, args: tuple[object, ...]) -> None:
+        self.check_begins(tuple(map(torch.Tensor.data_ptr, self.pick(args))))
+
+    def check_begins(self, begins: tuple[int, ...]) -> None:
+        """``check`` on the guarded tensors' data pointers in ``indices``
+        order (the fast relaunch gathers them once for every guard)."""
+        if begins in self.passed:
+            return
+        ends = tuple(map(operator.add, begins, self.spans))
+        sorted_begins = sorted(begins)
+        sorted_ends = sorted(ends)
+        for store in self.stores:
+            if (
+                bisect.bisect_left(sorted_begins, ends[store])
+                - bisect.bisect_right(sorted_ends, begins[store])
+                > 1
+            ):
+                self.refuse(store, begins, ends)
+        if len(self.passed) >= _MMA_DAG_ALIAS_PASSED_LIMIT:
+            self.passed.clear()
+        self.passed.add(begins)
+
+    def refuse(
+        self, store: int, begins: tuple[int, ...], ends: tuple[int, ...]
+    ) -> NoReturn:
+        other = next(
+            index
+            for index in range(len(begins))
+            if index != store
+            and begins[index] < ends[store]
+            and begins[store] < ends[index]
+        )
+        first, second = sorted((store, other))
+        raise exc.BackendUnsupported(
+            "cute",
+            f"cute_mma_dag arguments {self.names[first]!r} and "
+            f"{self.names[second]!r} alias (their storage overlaps); the "
+            "kernel reads and writes them as distinct tensors",
+        )
+
+
+def _mma_dag_alias_guard(
+    cute_kernel: object, args: tuple[object, ...]
+) -> _MmaDagAliasGuard | None:
+    plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "helion_mma_dag_alias"
+    ]
+    if not plans:
+        return None
+    if len(plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple mma_dag alias plans")
+    return _MmaDagAliasGuard(plans[0], args)
 
 
 def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -> None:
@@ -6642,6 +6789,10 @@ def _build_cute_schema_and_args(
         # views, so the runtime tensors must match the compiled geometry.
         _validate_gdn_recurrence_launch_args(gdn_recurrence_plans[0], args)
 
+    alias_guard = _mma_dag_alias_guard(cute_kernel, args)
+    if alias_guard is not None:
+        alias_guard.check(args)
+
     launch_args.extend(grid)
     # The stream is intentionally NOT appended here; it is sampled fresh per
     # launch by the caller so CUDA graph capture sees the capture stream.
@@ -6790,7 +6941,12 @@ class _CuteFastRelaunch:
     2. writes each tensor arg's ``data_ptr()`` into its probe-verified
        ``exe_args`` slot (tensor pointers marshal by value),
     3. refreshes the CUDA stream slot(s), and
-    4. invokes the executor's ``run_compiled_program``.
+    4. launches: a C-API ``JitExecutor`` is entered directly through its
+       ``capi_func`` with a fastpath-owned copy of the packed ``void*``
+       array it would build from ``exe_args`` on every call (the pointer
+       and stream slots are written into that copy in steps 2-3), and its
+       ``cuda_result`` is checked as ``run_compiled_program`` would; any
+       other executor still goes through ``run_compiled_program``.
 
     Slot discovery is probe-verified at build time: tensor slots by
     re-marshalling with per-tensor shifted pointers, stream slots by
@@ -6804,6 +6960,8 @@ class _CuteFastRelaunch:
     """
 
     __slots__ = (
+        "alias_guard",
+        "alias_pick",
         "arg_count",
         "block",
         "by_ref_writers",
@@ -6813,6 +6971,8 @@ class _CuteFastRelaunch:
         "constexpr_flags",
         "cuda_error",
         "cuda_result",
+        "cxx_check",
+        "cxx_guards",
         "device_index",
         "exe_args",
         "executor",
@@ -6821,6 +6981,14 @@ class _CuteFastRelaunch:
         "last_raw",
         "lock",
         "packed_args",
+        "pick_tensors",
+        "pointer_indices",
+        "pointer_masks",
+        "pointer_writers",
+        "pointer_slots",
+        "raw_grid",
+        "raw_kwargs",
+        "scalar_fast",
         "scalar_guards",
         "tensor_guard",
         "tensor_guards",
@@ -6857,8 +7025,62 @@ class _CuteFastRelaunch:
         last_raw: int,
         keepalive: tuple[object, ...],
         packed_launch: _CutePackedLaunch | None = None,
+        alias_guard: _MmaDagAliasGuard | None = None,
+        cxx_guards: object | None = None,
     ) -> None:
         self.executor = executor
+        self.alias_guard = alias_guard
+        # One C++ check of every tensor's dtype / device / shape / stride
+        # (``_cute_cxx_tensor_guards``); the Python guards decide when it
+        # misses (it also pins requires_grad and the dispatch keys).
+        self.cxx_guards = cxx_guards
+        self.cxx_check: Callable[..., bool] | None = (
+            None if cxx_guards is None else cast("Any", cxx_guards).check
+        )
+        self.pick_tensors = _cute_tuple_picker(tuple(g[0] for g in tensor_guards))
+        # Scalars: an exact (type, value) match; the normalizing guard
+        # decides otherwise (Sym* values, NaN).
+        self.scalar_fast = tuple(
+            (
+                guard.index,
+                _CUTE_SCALAR_TYPES[guard.scalar_kind],
+                float.fromhex(cast("str", guard.scalar_value))
+                if guard.scalar_kind == "float"
+                else guard.scalar_value,
+            )
+            for guard in scalar_guards
+        )
+        # The data pointers are gathered once, in ``tensor_slots`` order,
+        # for the compiled alignment check, the alias guard and the patch.
+        self.pointer_indices = tuple(index for index, _slot, _writer in tensor_slots)
+        alignments = {g[0]: g[6] for g in tensor_guards}
+        self.pointer_masks = tuple(
+            alignments.get(index, 1) - 1 for index in self.pointer_indices
+        )
+        # The by-reference cells and the by-value slots the pointers patch, as
+        # two plain lists paired with the gathered pointers.
+        self.pointer_writers = tuple(
+            (position, writer)
+            for position, (_index, _slot, writer) in enumerate(tensor_slots)
+            if writer is not None
+        )
+        self.pointer_slots = tuple(
+            (position, slot)
+            for position, (_index, slot, writer) in enumerate(tensor_slots)
+            if writer is None
+        )
+        self.alias_pick: Callable[[Sequence[int]], tuple[int, ...]] | None = None
+        if alias_guard is not None and all(
+            index in self.pointer_indices for index in alias_guard.indices
+        ):
+            self.alias_pick = _cute_tuple_picker(
+                tuple(self.pointer_indices.index(i) for i in alias_guard.indices)
+            )
+        # The launch as the generated host code spells it (grid tuple and
+        # keyword arguments), recorded by the entry after the first launch
+        # so the relaunch compares them without normalizing.
+        self.raw_grid: tuple[int, ...] | None = None
+        self.raw_kwargs: dict[str, object] | None = None
         self.exe_args = exe_args
         self.tensor_guards = tensor_guards
         self.tensor_guard = _compile_cute_fastpath_tensor_guard(tensor_guards)
@@ -6898,12 +7120,64 @@ class _CuteFastRelaunch:
             or grid != self.grid
             or block != self.block
             or compile_options != self.compile_options
-            or not self.tensor_guard(args)
         ):
             return _CUTE_FASTPATH_MISS
-        for guard in self.scalar_guards:
-            if not guard.matches(args, self.constexpr_flags):
+        return self.launch(args)
+
+    def try_launch_raw(
+        self,
+        args: tuple[object, ...],
+        grid: tuple[int, ...],
+        kwargs: dict[str, object],
+    ) -> tuple[bool, object]:
+        """``try_launch`` on the launch as the host code spells it (before
+        the entry normalizes grid, block and options)."""
+        if (
+            grid != self.raw_grid
+            or kwargs != self.raw_kwargs
+            or len(args) != self.arg_count
+        ):
+            return _CUTE_FASTPATH_MISS
+        return self.launch(args)
+
+    def launch(self, args: tuple[object, ...]) -> tuple[bool, object]:
+        """Guards, then the relaunch, for a launch whose grid / block /
+        options and argument count already matched."""
+        # One C++ check of every tensor (``_cute_cxx_tensor_guards``); when it
+        # is absent or misses, the compiled metadata guard (dtype, shape,
+        # stride, device, compiled pointer alignment) decides.
+        cxx_check = self.cxx_check
+        if (
+            cxx_check is None or not cxx_check(*self.pick_tensors(args))
+        ) and not self.tensor_guard(args):
+            return _CUTE_FASTPATH_MISS
+        for position, (index, kind, value) in enumerate(self.scalar_fast):
+            arg = args[index]
+            if (
+                type(arg) is not kind
+                or arg != value
+                # -0.0 == 0.0, but a float travels by value and is pinned in
+                # the argument array: the sign of a zero must match too.
+                or (
+                    kind is float
+                    and arg == 0.0
+                    and math.copysign(1.0, arg)
+                    != math.copysign(1.0, cast("float", value))
+                )
+            ) and not self.scalar_guards[position].matches(args, self.constexpr_flags):
                 return _CUTE_FASTPATH_MISS
+        pointers = [
+            cast("torch.Tensor", args[index]).data_ptr()
+            for index in self.pointer_indices
+        ]
+        # The compiled schema's pointer alignment (no pointer equality).
+        if any(map(operator.and_, pointers, self.pointer_masks)):
+            return _CUTE_FASTPATH_MISS
+        if self.alias_guard is not None:
+            if self.alias_pick is not None:
+                self.alias_guard.check_begins(self.alias_pick(pointers))
+            else:
+                self.alias_guard.check(args)
         raw = torch._C._cuda_getCurrentRawStream(self.device_index)
         with self.lock:
             # The slots are poked in the pre-packed C array of a CuTe DSL
@@ -6912,13 +7186,10 @@ class _CuteFastRelaunch:
             # ``exe_args`` itself through ``run_compiled_program``.
             packed_args = self.packed_args
             slots = cast("Any", self.exe_args if packed_args is None else packed_args)
-            # tensor_slots entries: (arg_index, exe_slot_or_None, writer_or_None)
-            for index, slot, writer in self.tensor_slots:
-                ptr = cast("torch.Tensor", args[index]).data_ptr()
-                if writer is not None:
-                    cast("Any", writer).value = ptr
-                else:
-                    slots[cast("int", slot)] = ptr
+            for position, writer in self.pointer_writers:
+                cast("Any", writer).value = pointers[position]
+            for position, slot in self.pointer_slots:
+                slots[slot] = pointers[position]
             if raw != self.last_raw:
                 for stream_writer in self.by_ref_writers:
                     cast("Any", stream_writer).value = raw
@@ -6930,7 +7201,10 @@ class _CuteFastRelaunch:
                     True,
                     cast("Any", self.executor).run_compiled_program(self.exe_args),
                 )
-            cast("Any", self.capi_func)(packed_args)
+            try:
+                cast("Any", self.capi_func)(packed_args)
+            except Exception as error:
+                _cute_raise_direct_launch_crash(error)
             cuda_result = self.cuda_result
             if cuda_result is None:
                 return (True, None)
@@ -6938,6 +7212,57 @@ class _CuteFastRelaunch:
             if error_code == 0:
                 return (True, 0)
             raise cast("Any", self.cuda_error)(error_code)
+
+
+_CUTE_SCALAR_TYPES: dict[str, type] = {"bool": bool, "int": int, "float": float}
+
+
+def _cute_tuple_picker(
+    indices: tuple[int, ...],
+) -> Callable[[Sequence[Any]], tuple[Any, ...]]:
+    """``lambda items: tuple(items[i] for i in indices)`` at C speed."""
+    if len(indices) > 1:
+        return cast(
+            "Callable[[Sequence[Any]], tuple[Any, ...]]", operator.itemgetter(*indices)
+        )
+    if len(indices) == 1:
+        (index,) = indices
+        return lambda items: (items[index],)
+    return lambda items: ()
+
+
+def _cute_cxx_tensor_guards(
+    args: tuple[object, ...],
+    tensor_guards: Sequence[tuple[Any, ...]],
+) -> object | None:
+    """Dynamo's C++ tensor guard over the launch's tensor arguments: one
+    call checks every tensor's type, dtype, device, requires_grad, dispatch
+    keys, sizes and strides against this launch's.  None when the guard is
+    unavailable or does not accept these tensors (the Python guards then
+    decide alone)."""
+    try:
+        from torch._C._dynamo.guards import TensorGuards
+    except ImportError:  # pragma: no cover - older torch
+        return None
+    tensors = [args[guard[0]] for guard in tensor_guards]
+    if not tensors or not all(type(t) is torch.Tensor for t in tensors):
+        return None
+    try:
+        # (The stub types the per-tensor lists as flat; the binding takes
+        # one list of concrete sizes / strides per tensor.)
+        guards = TensorGuards(
+            *tensors,
+            dynamic_dims_sizes=cast("Any", [list(guard[4]) for guard in tensor_guards]),
+            dynamic_dims_strides=cast(
+                "Any", [list(guard[5]) for guard in tensor_guards]
+            ),
+        )
+        if not guards.check(*tensors):
+            return None
+    except Exception:
+        log.debug("CuTe fastpath: C++ tensor guards unavailable", exc_info=True)
+        return None
+    return guards
 
 
 @dataclass(frozen=True)
@@ -6970,19 +7295,25 @@ def _cute_packed_launch(executor: object, exe_args: list[object]) -> object | No
     jit_executor = sys.modules.get("cutlass.base_dsl.jit_executor")
     if jit_executor is None or not isinstance(executor, jit_executor.JitExecutor):
         return None
-    create_cuda_runtime_error = sys.modules[
-        "cutlass.base_dsl.runtime.cuda"
-    ].create_cuda_runtime_error
-    source = executor._get_invoke_packed_args(list(exe_args))
-    total = len(exe_args) + executor._num_extra_args
-    packed_args = (ctypes.c_void_p * total)()
-    ctypes.memmove(packed_args, source, ctypes.sizeof(ctypes.c_void_p) * total)
-    return _CutePackedLaunch(
-        packed_args=packed_args,
-        capi_func=executor.capi_func,
-        cuda_result=executor.cuda_result,
-        cuda_error=create_cuda_runtime_error,
-    )
+    try:
+        create_cuda_runtime_error = sys.modules[
+            "cutlass.base_dsl.runtime.cuda"
+        ].create_cuda_runtime_error
+        source = executor._get_invoke_packed_args(list(exe_args))
+        total = len(exe_args) + executor._num_extra_args
+        packed_args = (ctypes.c_void_p * total)()
+        ctypes.memmove(packed_args, source, ctypes.sizeof(ctypes.c_void_p) * total)
+        return _CutePackedLaunch(
+            packed_args=packed_args,
+            capi_func=executor.capi_func,
+            cuda_result=executor.cuda_result,
+            cuda_error=create_cuda_runtime_error,
+        )
+    except Exception:
+        # A packing-internals change in cutlass gives up only the direct C
+        # entry; the fastpath keeps the ``run_compiled_program`` launch.
+        log.debug("CuTe direct C-API launch unavailable", exc_info=True)
+        return None
 
 
 def _compile_cute_fastpath_tensor_guard(
@@ -7036,6 +7367,13 @@ def _compile_cute_fastpath_tensor_guard(
             item.append(f"{tensor}.data_ptr() % {int(alignment)} == 0")
         checks.append(f"({' and '.join(item)})")
     return eval(f"lambda args: {' and '.join(checks) if checks else 'True'}", namespace)
+
+
+def _cute_raise_direct_launch_crash(error: Exception) -> NoReturn:
+    """Wrap a C-API entry failure as ``run_compiled_program`` does."""
+    from cutlass.base_dsl.common import DSLRuntimeError
+
+    raise DSLRuntimeError("Runtime Crash", cause=error)
 
 
 def _cute_maybe_build_fastpath(
@@ -7339,6 +7677,10 @@ def _cute_build_fast_relaunch(
             packed_launch=cast(
                 "_CutePackedLaunch | None", _cute_packed_launch(executor, exe_args)
             ),
+            # The metadata guards above pin the spans the alias guard
+            # computed from this launch's tensors.
+            alias_guard=_mma_dag_alias_guard(cute_kernel, args),
+            cxx_guards=_cute_cxx_tensor_guards(args, tensor_guards),
         )
     except Exception:
         return None
@@ -7401,6 +7743,51 @@ def default_cute_launcher(
     *args: object,
     **kwargs: object,
 ) -> object:
+    # The relaunch of a kernel launched before, compared as the host code
+    # spells the launch (every tensor and scalar argument still guarded).
+    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    if fastpath.__class__ is _CuteFastRelaunch:
+        hit, result = fastpath.try_launch_raw(args, grid, kwargs)
+        if hit:
+            return result
+    return _default_cute_launcher_normalized(
+        cute_kernel, grid, args, kwargs, dict(kwargs)
+    )
+
+
+def _cute_record_raw_launch(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    raw_kwargs: dict[str, object],
+    grid_xyz: tuple[int, int, int],
+    block_xyz: tuple[int, int, int],
+    compile_options: str | None,
+) -> None:
+    """Record how the host code spells the launch the fast relaunch just
+    served or was built for (``try_launch_raw`` compares against it) -- only
+    when this call's normalized grid, block and options are the fastpath's:
+    a concurrent first launch with another grid must not leave its spelling
+    on a fastpath pinned to a different one."""
+    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    if (
+        fastpath.__class__ is _CuteFastRelaunch
+        and fastpath.raw_grid is None
+        and fastpath.grid == grid_xyz
+        and fastpath.block == block_xyz
+        and fastpath.compile_options == compile_options
+    ):
+        # kwargs first: a raw check that sees the grid must see them too.
+        fastpath.raw_kwargs = raw_kwargs
+        fastpath.raw_grid = grid
+
+
+def _default_cute_launcher_normalized(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    raw_kwargs: dict[str, object],
+) -> object:
     block = kwargs.pop("block", (256, 1, 1))
     cute_compile_options = kwargs.pop("cute_compile_options", None)
     if cute_compile_options is not None and not isinstance(cute_compile_options, str):
@@ -7437,21 +7824,29 @@ def default_cute_launcher(
             args_tuple, grid_xyz, block_xyz, cute_compile_options
         )
         if hit:
+            _cute_record_raw_launch(
+                cute_kernel, grid, raw_kwargs, grid_xyz, block_xyz, cute_compile_options
+            )
             return result
     # Under-aligned TMA/vector operands of the staged plan kinds never reach
     # the compiled wrapper: the fast path's alignment guard rejected them
     # above, and the copies below are what the slower paths see and cache.
     staging = _cute_stage_under_aligned_operands(cute_kernel, args_tuple)
     if staging is None:
-        return _launch_cute_marshalled(
+        result = _launch_cute_marshalled(
             cute_kernel, args_tuple, grid_xyz, block_xyz, cute_compile_options
         )
-    staged_args, copy_backs = staging
-    result = _launch_cute_marshalled(
-        cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+    else:
+        staged_args, copy_backs = staging
+        result = _launch_cute_marshalled(
+            cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+        )
+        for destination, copy in copy_backs:
+            destination.copy_(copy)
+    # The marshalled launch may have built the fastpath for this launch.
+    _cute_record_raw_launch(
+        cute_kernel, grid, raw_kwargs, grid_xyz, block_xyz, cute_compile_options
     )
-    for destination, copy in copy_backs:
-        destination.copy_(copy)
     return result
 
 

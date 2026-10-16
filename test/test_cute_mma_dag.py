@@ -40,6 +40,15 @@ from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
+from helion.runtime.cute.launcher import _MmaDagAliasGuard
+
+# The standalone launcher imports cuda-python (its wrapper annotation) and
+# cutlass at module level; an environment without them (a CPU-only or a
+# Triton-only CI runner) skips this module at collection.
+pytest.importorskip("cuda.bindings.driver")
+pytest.importorskip("cutlass")
+
+from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -3000,7 +3009,9 @@ def test_dqkw_is_admitted_as_a_three_level_nest() -> None:
     assert tail.count(f"{RT}.stg_v2_f32(") == 16
     assert tail.count(f"{RT}.stg_b32(") == 8
     assert "md_aw" in tail and tail.count(f"{RT}.ldmatrix_x4_trans(md_x8") == 4
-    assert tail.rstrip().endswith("cute.arch.barrier()")
+    # (up to the first column-0 line: the body ends with host metadata)
+    kernel_tail = re.split(r"\n(?=\S)", tail, maxsplit=1)[0]
+    assert kernel_tail.rstrip().endswith("cute.arch.barrier()")
     assert tail.count(f"{RT}.mma_bf16(") == 32
 
 
@@ -4724,13 +4735,35 @@ def _store_between(k: torch.Tensor, dL: torch.Tensor, x: torch.Tensor) -> torch.
     return out
 
 
+def _div_scalar(
+    scale: float, k: torch.Tensor, v: torch.Tensor, s_out: torch.Tensor
+) -> torch.Tensor:
+    """Divides a row sum by a float argument: the sign of a zero matters."""
+    BH = k.size(0)
+    N = k.size(1)
+    D = k.size(3)
+    DV = v.size(3)
+    h_out = torch.empty([BH, D, DV], dtype=torch.float32, device=k.device)
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
+        for i_t in hl.grid(N):
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+        s_out[idx, tile_d] = h_acc.sum(-1) / scale
+        h_out[idx, tile_d, tile_dv] = h_acc
+    return h_out
+
+
 def _rmw_two_names(
     k: torch.Tensor, v: torch.Tensor, s_in: torch.Tensor, s_out: torch.Tensor
 ) -> torch.Tensor:
     """Reads s_in, writes s_out: distinct storages at compile time, so the
     s_in reads are hoisted -- the caller may still pass one tensor twice
     (the matcher's fakes have one storage per argument, so two argument
-    names bound to one tensor are invisible to it)."""
+    names bound to one tensor are invisible to it; the launcher refuses
+    them)."""
     BH = k.size(0)
     N = k.size(1)
     D = k.size(3)
@@ -4765,10 +4798,65 @@ def test_a_program_that_loads_and_stores_one_storage_is_not_mine() -> None:
     dl = torch.empty((16, 64, 64), dtype=torch.bfloat16, device=CPU_DEVICE)
     bound = _bind_fn(_store_between, (t3["q"], dl, x))
     assert bound.config_spec.cute_mma_dag is None
+    # Two names with distinct storages are admitted and the s_in reads
+    # hoisted: the lowering cannot see a caller passing one tensor twice,
+    # so the host source names the program's tensor arguments and which
+    # it stores to for the launcher's alias guard.
     s_in = torch.empty((2, 64), dtype=torch.float32, device=CPU_DEVICE)
     bound = _bind_fn(_rmw_two_names, (t["k"], t["v"], s_in, s))
     assert bound.config_spec.cute_mma_dag is not None
-    assert "s_in" in _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
+    source = _source(bound, _config(64, 64, warps=4, stages=2))
+    assert "md_sl" in _kernel_body(source)
+    assert (
+        "_helion_cute_wrapper_plans = [{'kind': 'helion_mma_dag_alias', "
+        "'tensor_names': ['k', 'v', 'h_out', 's_in', 's_out'], "
+        "'stored': [False, False, True, False, True], "
+        "'tensor_idx': [0, 1, 2, 3, 4]}]"
+    ) in source
+
+
+def test_the_alias_guard_refuses_a_stored_argument_that_overlaps_another() -> None:
+    # The launcher's guard over the plan above: byte spans of the stored
+    # arguments against every other tensor argument.  Pointers are the only
+    # per-launch input, so CPU tensors exercise it.
+    plan = {
+        "kind": "helion_mma_dag_alias",
+        "tensor_names": ["k", "v", "h_out", "s_in", "s_out"],
+        "stored": [False, False, True, False, True],
+        "tensor_idx": [0, 1, 2, 3, 4],
+    }
+    k = torch.empty((2, 8, 64, 64), dtype=torch.bfloat16)
+    v = torch.empty((2, 8, 64, 64), dtype=torch.bfloat16)
+    h = torch.empty((2, 64, 64), dtype=torch.float32)
+    s = torch.empty((2, 64), dtype=torch.float32)
+    s2 = torch.empty((2, 64), dtype=torch.float32)
+    guard = _MmaDagAliasGuard(plan, (k, v, h, s, s2))
+    guard.check((k, v, h, s, s2))
+    with pytest.raises(BackendUnsupported, match="'s_in' and 's_out' alias"):
+        guard.check((k, v, h, s, s))
+    # A view of a stored tensor under another name, and two stored names
+    # sharing storage, alias as well.
+    with pytest.raises(BackendUnsupported, match="'s_in' and 's_out' alias"):
+        guard.check((k, v, h, s2[:, 32:], s2))
+    with pytest.raises(BackendUnsupported, match="'h_out' and 's_out' alias"):
+        guard.check((k, v, h, s, h.view(-1)[:128].view(2, 64)))
+    # Two loads of one tensor are fine (the engine passes k twice to dv),
+    # as are disjoint slices of one buffer and interleaved loads.
+    guard.check((k, k, h, s, s2))
+    wide = torch.empty((4, 64), dtype=torch.float32)
+    guard.check((k, v, h, wide[:2], wide[2:]))
+    strided = torch.empty((2, 8, 64, 128), dtype=torch.bfloat16)
+    guard.check((strided[..., :64], strided[..., 64:], h, s, s2))
+    # Spans follow the view: a strided stored view whose span covers a
+    # loaded tensor's bytes is refused even where no element coincides.
+    both = torch.empty((2, 128), dtype=torch.float32)
+    with pytest.raises(BackendUnsupported, match="'s_in' and 's_out' alias"):
+        guard.check((k, v, h, both[:, 1::2], both[:, 0::2]))
+    # Empty tensors never alias; the pointers of empty allocations collide.
+    empty = torch.empty((0, 64), dtype=torch.float32)
+    guard0 = _MmaDagAliasGuard(plan, (k, v, h, empty, empty))
+    guard0.check((k, v, h, empty, empty))
+    assert guard0.indices == (0, 1, 2)
 
 
 # --------------------------------------------------------------------------
@@ -5135,6 +5223,42 @@ def test_a_nested_bound_naming_the_outer_index_is_not_mine() -> None:
         assert not matcher.bound_varies(
             shape_env.create_symintnode(host_symbol + 1, hint=4)
         )
+
+
+def test_the_standalone_launcher_runs_the_alias_check() -> None:
+    # The standalone export allowlisted the alias plan as launcher-only
+    # metadata and the exported wrapper ran with no check.  The launch table
+    # now carries the plan's positions and store flags and the exported
+    # launcher checks the spans like ``_MmaDagAliasGuard``.
+    indices = (0, 1, 2, 3, 4)
+    stored = (False, False, True, False, True)
+    k = torch.empty((2, 8, 64, 64), dtype=torch.bfloat16)
+    v = torch.empty((2, 8, 64, 64), dtype=torch.bfloat16)
+    h = torch.empty((2, 64, 64), dtype=torch.float32)
+    s = torch.empty((2, 64), dtype=torch.float32)
+    s2 = torch.empty((2, 64), dtype=torch.float32)
+    _standalone_validate_mma_dag_aliases((k, v, h, s, s2), indices, stored)
+    with pytest.raises(ValueError, match="alias"):
+        _standalone_validate_mma_dag_aliases((k, v, h, s, s), indices, stored)
+    with pytest.raises(ValueError, match="alias"):
+        _standalone_validate_mma_dag_aliases((k, v, h, s2[:, 32:], s2), indices, stored)
+    with pytest.raises(ValueError, match="alias"):
+        h_view = h.view(-1)[:128].view(2, 64)
+        _standalone_validate_mma_dag_aliases((k, v, h, s, h_view), indices, stored)
+    # Two loads of one tensor, disjoint slices of one buffer and empty
+    # tensors pass; a strided stored view's span covers the other's bytes.
+    _standalone_validate_mma_dag_aliases((k, k, h, s, s2), indices, stored)
+    wide = torch.empty((4, 64), dtype=torch.float32)
+    _standalone_validate_mma_dag_aliases((k, v, h, wide[:2], wide[2:]), indices, stored)
+    empty = torch.empty((0, 64), dtype=torch.float32)
+    _standalone_validate_mma_dag_aliases((k, v, h, empty, empty), indices, stored)
+    both = torch.empty((2, 128), dtype=torch.float32)
+    with pytest.raises(ValueError, match="alias"):
+        _standalone_validate_mma_dag_aliases(
+            (k, v, h, both[:, 1::2], both[:, 0::2]), indices, stored
+        )
+    with pytest.raises(ValueError, match="tensor layout"):
+        _standalone_validate_mma_dag_aliases((k, v, h, s, 1.0), indices, stored)
 
 
 def _seed_knobs(config: helion.Config) -> tuple[list[int], str, int, int, str]:
