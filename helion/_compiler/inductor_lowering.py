@@ -995,7 +995,6 @@ class ReductionLowering(InductorLowering):
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
         if len(reduction_ranges) != 1:
-            # TODO(jansel): can this happen?
             raise NotImplementedError("multiple reduction dimensions")
         # In Inductor IR, reduction_ranges holds sizes, not loop vars.
         # Support both symbolic and constant sizes by allocating/looking up
@@ -1084,7 +1083,6 @@ class ReductionLowering(InductorLowering):
 
         dims = self._get_reduction_dims(node.meta["orig_node"], repr_input)
         if len(dims) != 1:
-            # TODO(jansel): support multiple reduction dims
             raise exc.MultipleReductionDims
 
         env = CompileEnvironment.current()

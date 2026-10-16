@@ -7,15 +7,18 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from ...language import _MEMORY_OPS
 from ...language.matmul_ops import MATMUL_FACT_ID_META
+from ...language.memory_ops import load
+from ..compile_environment import CompileEnvironment
 from ..device_ir import ForLoopGraphInfo
+from ..indexing_strategy import SubscriptIndexing
 from ..inductor_lowering import ReductionLowering
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
-    from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
 
 
@@ -57,3 +60,25 @@ def active_block_ids(
                     if block_id is not None
                 )
     return frozenset(result)
+
+
+def unused_block_ids(graphs: Sequence[GraphInfo], block_ids: set[int]) -> set[int]:
+    """The ``block_ids`` nothing in ``graphs`` uses."""
+    env = CompileEnvironment.current()
+    unused = block_ids - active_block_ids(graphs, (), env)
+    for graph in graphs:
+        for node in graph.graph.nodes:
+            # stores and atomics use rdims through their subscripts (a load's
+            # val has them), which were shaped when traced, so this
+            # allocates nothing
+            if (
+                node.target in _MEMORY_OPS
+                and node.target is not load
+                and isinstance(node.args[0], torch.fx.Node)
+                and isinstance(tensor := node.args[0].meta["val"], torch.Tensor)
+                and isinstance(node.args[1], (list, tuple))
+            ):
+                index = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
+                shape = SubscriptIndexing.compute_shape(tensor, [*index])
+                unused.difference_update(map(env.get_block_id, shape))
+    return unused

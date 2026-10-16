@@ -408,7 +408,10 @@ class InvalidReductionDim(BaseError):
 
 
 class MultipleReductionDims(BaseError):
-    message = "Multiple reduction dims are not supported."
+    message = (
+        "Only sum, mean, amax and amin over explicit, distinct dims can reduce "
+        "multiple dims at once."
+    )
 
 
 class ReductionDimInvalidForShape(BaseError):
