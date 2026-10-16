@@ -578,6 +578,8 @@ class ForEachProgramID(ProgramIDs):
     # pyrefly: ignore [bad-override]
     shared_pid_var: str
     cases: list[ProgramIDs] = dataclasses.field(default_factory=list)
+    case_bodies: list[list[ast.AST]] = dataclasses.field(default_factory=list)
+    case_branches: list[ast.If] = dataclasses.field(default_factory=list)
     case_phases: list[int] = dataclasses.field(default_factory=list)
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list, init=False)
     barrier_after_root: set[int] = dataclasses.field(default_factory=set)
@@ -605,6 +607,20 @@ class ForEachProgramID(ProgramIDs):
 
     def codegen_test(self, state: CodegenState) -> ast.AST:
         return expr_from_string(f"{self.shared_pid_var} < ({self._cdiv_sum(state)})")
+
+    def codegen_dispatch(self) -> list[ast.AST]:
+        """Connect the ordered cases without a linear-depth dispatch chain."""
+
+        def emit_cases(begin: int, end: int) -> list[ast.AST]:
+            if end - begin == 1:
+                return self.case_bodies[begin]
+            middle = (begin + end) // 2
+            branch = self.case_branches[middle - 1]
+            branch.body = cast("list[ast.stmt]", emit_cases(begin, middle))
+            branch.orelse = cast("list[ast.stmt]", emit_cases(middle, end))
+            return [branch]
+
+        return emit_cases(0, len(self.case_bodies))
 
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None

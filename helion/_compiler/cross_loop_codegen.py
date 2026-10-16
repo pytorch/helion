@@ -211,26 +211,6 @@ def _clone_opaque_statements_with_loop_segments(
     return cloned
 
 
-def _extract_case_bodies(
-    owner: ForEachProgramID,
-    base_body: list[ast.stmt],
-) -> list[list[ast.stmt]]:
-    if len(owner.cases) == 1:
-        return [base_body]
-    assert len(base_body) >= 2
-    node = base_body[1]
-    result: list[list[ast.stmt]] = []
-    while isinstance(node, ast.If):
-        result.append(node.body)
-        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-            node = node.orelse[0]
-            continue
-        result.append(node.orelse)
-        break
-    assert len(result) == len(owner.cases)
-    return result
-
-
 def _case_pid_info(case: ProgramIDs) -> list[PIDInfo]:
     if isinstance(case, L2GroupingProgramIDs):
         assert case.parent_strategy is not None
@@ -1440,15 +1420,7 @@ def emit_cross_loop_schedule(
     )
     worker = typed_program_id(0)
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
-    base_body = cast(
-        "list[ast.stmt]",
-        owner._prepare_persistent_body(
-            device_function.body,
-            device_function,
-            strategy.virtual_pid_var,
-        ),
-    )
-    case_bodies = _extract_case_bodies(owner, base_body)
+    case_bodies = cast("list[list[ast.stmt]]", owner.case_bodies)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
     target_device_capability = (
         CompileEnvironment.current().config_spec.target_device_capability
